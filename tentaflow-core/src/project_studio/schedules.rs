@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use tentaflow_protocol::project_studio::access::{ProjectArea, ProjectPermissionLevel};
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, TimeZone, Utc};
@@ -896,7 +897,14 @@ fn notify_blocked(project: &DueProject, schedule: &ScheduleRecord, reason: &str)
     })
     .to_string();
     for member in members {
-        if member.role != "owner" && member.role != "manager" {
+        let permitted = super::repository::get_project(&project.org_id, &project.project_id)
+            .ok()
+            .flatten()
+            .and_then(|record| {
+                super::repository::project_access(&record, &member.user_id, false).ok()
+            })
+            .is_some_and(|access| access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin));
+        if !permitted {
             continue;
         }
         super::notifications::notify(
@@ -970,8 +978,13 @@ pub async fn trigger_once(
         name: project.name.clone(),
         dir_path: project.dir_path.clone(),
     };
-    let archived = project.status == "archived";
-    let outcome = fire(ctx, &due, archived, pool, schedule, actor).await;
+    let current = super::repository::get_project(&project.org_id, &project.project_id)
+        .ok()
+        .flatten();
+    let outcome = match current {
+        Some(current) => fire(ctx, &current, pool, schedule, actor).await,
+        None => TriggerOutcome::refused("skipped", "project access unavailable"),
+    };
     // Only the loop announces a block: a human who just pressed "run now" is
     // already looking at the reason, and a bell entry per click is noise.
     if outcome.outcome == "blocked" && actor.is_empty() {
@@ -996,8 +1009,7 @@ pub async fn trigger_once(
 /// trivial reason never touches the network.
 async fn fire(
     ctx: &TriggerCtx,
-    project: &DueProject,
-    archived: bool,
+    project: &ProjectRecord,
     pool: &DbPool,
     schedule: &ScheduleRecord,
     actor: &str,
@@ -1007,8 +1019,20 @@ async fn fire(
         return TriggerOutcome::refused("skipped", "poprzedni przebieg nadal trwa");
     }
     // 2. An archived project is read-only.
-    if archived {
+    if project.status == "archived" {
         return TriggerOutcome::refused("skipped", "projekt jest zarchiwizowany");
+    }
+    let principal = if actor.is_empty() {
+        schedule.created_by.as_str()
+    } else {
+        actor
+    };
+    let access = match super::repository::project_access(project, principal, false) {
+        Ok(access) => access,
+        Err(error) => return TriggerOutcome::refused("error", error.to_string()),
+    };
+    if !access.allows(ProjectArea::Tests, ProjectPermissionLevel::Write) {
+        return TriggerOutcome::refused("skipped", "project test write access revoked");
     }
 
     let automated = schedule.run_type == "auto" || schedule.run_type == "perf";
@@ -1017,6 +1041,9 @@ async fn fire(
     //    Checked BEFORE the case set, so an approval withdrawn after the save
     //    reports as 'blocked' (a decision to reverse) and not as 'skipped'.
     let environment = if automated {
+        if !access.allows(ProjectArea::Environments, ProjectPermissionLevel::Read) {
+            return TriggerOutcome::refused("skipped", "project environment access revoked");
+        }
         let environment = match super::environments::get(pool, &schedule.environment_id) {
             Ok(Some(env)) => env,
             Ok(None) => return TriggerOutcome::refused("blocked", "srodowisko nie istnieje"),
@@ -1055,7 +1082,7 @@ async fn fire(
     }
 
     let Some(environment) = environment else {
-        return fire_manual(project, pool, schedule, &cases, actor);
+        return fire_manual(project, pool, schedule, &cases, principal, actor);
     };
 
     let runnable_language = cases
@@ -1131,7 +1158,7 @@ async fn fire(
         &cases,
         &runner,
         &schedule.perf_profile_json,
-        &schedule.created_by,
+        principal,
     ) {
         Ok(prepared) => prepared,
         Err(e) => return TriggerOutcome::refused("error", e.to_string()),
@@ -1183,6 +1210,8 @@ async fn fire(
         prepared.submit_items,
         submit_env,
         deadline,
+        project.project_id.clone(),
+        project.org_id.clone(),
     )
     .await
     {
@@ -1192,7 +1221,7 @@ async fn fire(
 
     super::activity::record(
         pool,
-        actor,
+        principal,
         if actor.is_empty() { "system" } else { "user" },
         "run.started_auto",
         "run",
@@ -1218,12 +1247,20 @@ async fn fire(
 /// Manual schedules create a normal execution sheet: no environment, no runner
 /// and no address re-check — a human executes it.
 fn fire_manual(
-    project: &DueProject,
+    project: &ProjectRecord,
     pool: &DbPool,
     schedule: &ScheduleRecord,
     cases: &[super::auto_runs::AutoCase],
+    principal: &str,
     actor: &str,
 ) -> TriggerOutcome {
+    for user_id in assignees_of(schedule) {
+        let permitted = super::repository::project_access(project, &user_id, false)
+            .is_ok_and(|access| access.allows(ProjectArea::Tests, ProjectPermissionLevel::Write));
+        if !permitted {
+            return TriggerOutcome::refused("skipped", "scheduled assignee test access revoked");
+        }
+    }
     let case_ids: Vec<String> = cases.iter().map(|c| c.case_id.clone()).collect();
     let snapshots = match super::runs::approved_case_snapshots(pool, &case_ids) {
         Ok(snapshots) => snapshots,
@@ -1248,7 +1285,7 @@ fn fire_manual(
         &schedule.assignment_mode,
         &snapshots,
         &assignees,
-        &schedule.created_by,
+        principal,
     ) {
         Ok(created) => created,
         Err(e) => return TriggerOutcome::refused("error", e.to_string()),
@@ -1256,7 +1293,7 @@ fn fire_manual(
 
     super::activity::record(
         pool,
-        actor,
+        principal,
         if actor.is_empty() { "system" } else { "user" },
         "run.created",
         "run",
@@ -1309,7 +1346,14 @@ fn notify_breaker(project: &DueProject, schedule: &ScheduleRecord) {
     })
     .to_string();
     for member in members {
-        if member.role != "owner" && member.role != "manager" {
+        let permitted = super::repository::get_project(&project.org_id, &project.project_id)
+            .ok()
+            .flatten()
+            .and_then(|record| {
+                super::repository::project_access(&record, &member.user_id, false).ok()
+            })
+            .is_some_and(|access| access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin));
+        if !permitted {
             continue;
         }
         super::notifications::notify(
@@ -1401,18 +1445,13 @@ async fn fire_project(ctx: &TriggerCtx, project: &DueProject, now: DateTime<Utc>
             dir_path: project.dir_path.clone(),
         };
         tokio::spawn(async move {
-            let record = ProjectRecord {
-                project_id: project.project_id.clone(),
-                org_id: project.org_id.clone(),
-                name: project.name.clone(),
-                description: String::new(),
-                status: "active".to_string(),
-                template: String::new(),
-                modules_json: String::new(),
-                owner_user_id: String::new(),
-                dir_path: project.dir_path.clone(),
-                created_at: String::new(),
-                updated_at: String::new(),
+            let record = match super::repository::get_project(&project.org_id, &project.project_id)
+            {
+                Ok(Some(record)) => record,
+                _ => {
+                    let _ = refresh_hint(&project.project_id, &project.org_id);
+                    return;
+                }
             };
             let outcome = trigger_once(&ctx, &record, &pool, &schedule, &scheduled_for, "").await;
             if outcome.outcome == "error" {
@@ -1496,19 +1535,25 @@ mod unit_tests {
     }
 
     fn project_record() -> ProjectRecord {
-        ProjectRecord {
-            project_id: format!("sched-{}", uuid::Uuid::new_v4()),
-            org_id: "org-t".to_string(),
-            name: "Projekt".to_string(),
-            description: String::new(),
-            status: "active".to_string(),
-            template: "tests".to_string(),
-            modules_json: "[]".to_string(),
-            owner_user_id: "u1".to_string(),
-            dir_path: "/tmp/none".to_string(),
-            created_at: String::new(),
-            updated_at: String::new(),
-        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = super::super::db::init(&tmp.path().join("projects.db"));
+        let project_id = format!("sched-{}", uuid::Uuid::new_v4());
+        super::super::repository::create_project(
+            &project_id,
+            "org-t",
+            &format!("Schedule {project_id}"),
+            "",
+            "tests",
+            "[\"tests\"]",
+            "u1",
+            &tmp.path().to_string_lossy(),
+            &[],
+        )
+        .expect("create schedule project");
+        std::mem::forget(tmp);
+        super::super::repository::get_project("org-t", &project_id)
+            .expect("get project")
+            .expect("project")
     }
 
     fn ts(raw: &str) -> DateTime<Utc> {
@@ -1974,5 +2019,159 @@ mod unit_tests {
         assert_eq!(kpis.schedules_enabled, 3);
         assert_eq!(kpis.schedules_blocked, 2);
         assert_eq!(kpis.ml_links, 1);
+    }
+    #[tokio::test]
+    async fn manual_run_now_tracks_and_revalidates_the_invoking_principal() {
+        use crate::services::transport::Transport;
+        use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let ctx = trigger_ctx();
+        let project = project_record();
+        let pool = super::super::project_db::open(&project.project_id).expect("content db");
+        seed_auto(&pool, "sc-principal", "e-principal");
+        for user_id in ["run-now-author", "run-now-invoker"] {
+            super::super::repository::add_members(
+                &project.project_id,
+                &[super::super::models::MemberInput {
+                    user_id: user_id.into(),
+                    functions: vec!["tester".into()],
+                    project_admin: false,
+                    expires_at: None,
+                }],
+                "u1",
+            )
+            .expect("member");
+        }
+        {
+            let conn = pool.write().expect("write");
+            conn.execute("UPDATE schedules SET created_by = 'run-now-author' WHERE schedule_id = 'sc-principal'", []).expect("author");
+            conn.execute("UPDATE environments SET base_url = 'http://127.0.0.1:8080', approval_status = 'approved', is_private_address = 1 WHERE environment_id = 'e-principal'", []).expect("approved local environment");
+        }
+        super::super::db::pool().expect("registry").write().expect("write")
+            .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = 'run-now-author'", [&project.project_id]).expect("expire author");
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("runner socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server_stop = stop.clone();
+        let server_cancellations = cancellations.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !server_stop.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("runner accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .expect("read timeout");
+                let mut bytes = [0; 8192];
+                let count = match stream.read(&mut bytes) {
+                    Ok(0) => continue,
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => panic!("runner request: {error}"),
+                };
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let body = if request.contains(" /health ") {
+                    r#"{"isolated":true,"toolchains":[{"language":"python"}]}"#
+                } else if request.contains("/cancel ") {
+                    server_cancellations.fetch_add(1, Ordering::Relaxed);
+                    "{}"
+                } else if request.contains("/status ") {
+                    r#"{"status":"running","items":[]}"#
+                } else {
+                    r#"{"job_id":"principal-job"}"#
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("runner response");
+            }
+        });
+        let mut service = NewService::minimal(
+            super::super::auto_runs::RUNNER_ENGINE_ID,
+            DeployMethod::External,
+            Transport::HttpDirect,
+        );
+        service.category = super::super::auto_runs::RUNNER_CATEGORY.into();
+        service.status = ServiceStatus::Running;
+        service.endpoint_url = Some(endpoint);
+        let service_id = crate::services_repo::services::insert(
+            &ctx.core_db.write().expect("core write"),
+            &service,
+        )
+        .expect("runner service");
+        pool.write()
+            .expect("write")
+            .execute(
+                "UPDATE schedules SET runner_service_id = ?1 WHERE schedule_id = 'sc-principal'",
+                [service_id.to_string()],
+            )
+            .expect("selected runner");
+        let schedule = get(&pool, "sc-principal").expect("schedule").expect("row");
+        let automatic = trigger_once(&ctx, &project, &pool, &schedule, "", "").await;
+        assert_eq!(
+            automatic.outcome, "skipped",
+            "expired author cannot fire automatically"
+        );
+        let manual = trigger_once(&ctx, &project, &pool, &schedule, "", "run-now-invoker").await;
+        assert_eq!(manual.outcome, "started", "{}", manual.reason);
+        assert_eq!(
+            super::super::runs::get_run(&pool, &manual.run_id)
+                .expect("run")
+                .expect("row")
+                .0
+                .created_by,
+            "run-now-invoker"
+        );
+        let actor: String = pool.read().expect("read").query_row("SELECT actor_user_id FROM activity_log WHERE object_id = ?1 AND action = 'run.started_auto' ORDER BY id DESC LIMIT 1", [&manual.run_id], |row| row.get(0)).expect("audit actor");
+        assert_eq!(actor, "run-now-invoker");
+        tokio::time::sleep(
+            super::super::auto_runs::POLL_INTERVAL + std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(
+            cancellations.load(Ordering::Relaxed),
+            0,
+            "expired schedule author must not cancel another principal's run"
+        );
+        super::super::db::pool().expect("registry").write().expect("write")
+            .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = 'run-now-invoker'", [&project.project_id]).expect("expire invoker");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            let run = super::super::runs::get_run(&pool, &manual.run_id)
+                .expect("run")
+                .expect("row")
+                .0;
+            if run.status == "cancelled" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "revoked invoker's run was not cancelled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(cancellations.load(Ordering::Relaxed), 1);
+        stop.store(true, Ordering::Relaxed);
+        server.join().expect("runner thread");
     }
 }

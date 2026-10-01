@@ -135,6 +135,7 @@ impl ProjectKnowledgeNodeAdapter {
         ctx.usage_sink.record(&node.id, response.usage);
 
         let org = Self::org_scope(ctx);
+        knowledge::require_member(&org, project_id, Self::user_scope(ctx)?)?;
         let hits = knowledge::search(
             &ctx.vectors,
             &org,
@@ -286,9 +287,16 @@ mod tests {
         let project_id = uuid::Uuid::new_v4().to_string();
         let dir = root.join("projects").join(&project_id);
         std::fs::create_dir_all(&dir).expect("create project dir");
-        let member_rows: Vec<(String, String)> = members
+        let member_rows: Vec<crate::project_studio::models::MemberInput> = members
             .iter()
-            .map(|(u, r)| (u.to_string(), r.to_string()))
+            .map(
+                |(user, function)| crate::project_studio::models::MemberInput {
+                    user_id: user.to_string(),
+                    functions: vec![function.to_string()],
+                    project_admin: false,
+                    expires_at: None,
+                },
+            )
             .collect();
         repository::create_project(
             &project_id,
@@ -438,7 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_hits_and_citations_for_member() {
-        let project_id = seed_project("owner-1", &[("member-1", "viewer")]);
+        let project_id = seed_project("owner-1", &[("member-1", "observer")]);
         let pool = project_db::open(&project_id).expect("open project pool");
         repository::create_source(&pool, "src-1", "document", "Specs", "{}", "owner-1")
             .expect("create source");
@@ -598,6 +606,74 @@ mod tests {
         match &out.payload {
             FlowValue::Json(v) => assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(0)),
             other => panic!("expected Json, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn query_rechecks_access_after_a_real_delayed_embedding() {
+        use crate::flow_engine::dispatchers_impl::EmbeddingsDispatcherImpl;
+        use crate::project_studio::ingest::access_test_support::{
+            advertise_model, seed_passage, DelayedModel, ModelReply,
+        };
+
+        for change in ["expiry", "module"] {
+            let state = crate::dispatch::state::AppState::for_test();
+            let actor = format!("knowledge-reader-{}", uuid::Uuid::new_v4());
+            let project_id = seed_project("knowledge-owner", &[(&actor, "developer")]);
+            let pool = project_db::open(&project_id).expect("content");
+            repository::create_source(
+                &pool,
+                "access-source",
+                "document",
+                "Private specification",
+                "{}",
+                "knowledge-owner",
+            )
+            .expect("source");
+            let vectors = crate::services::vector_namespace_manager(&state.db);
+            seed_passage(&vectors, "org-1", &project_id, "PRIVATE-ADAPTER-PASSAGE");
+            assert_eq!(
+                knowledge::search(&vectors, "org-1", &project_id, &[0.1, 0.2, 0.3], &[], 10)
+                    .expect("positive retrieval")
+                    .len(),
+                1
+            );
+            let mut http = DelayedModel::new(ingest::EMBEDDINGS_ALIAS, ModelReply::Embedding);
+            advertise_model(
+                &state,
+                "embeddings",
+                ingest::EMBEDDINGS_ALIAS,
+                &http.endpoint,
+            );
+            let mut ctx = stub_ctx();
+            ctx.user_id = Some(actor.clone());
+            ctx.org_id = Some("org-1".into());
+            ctx.vectors = vectors.clone();
+            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone()));
+            let selected = node(json!({"project_id":project_id,"operation":"search"}));
+            let request = input(FlowValue::Text("private project specification".into()));
+            let search = tokio::spawn(async move {
+                ProjectKnowledgeNodeAdapter::new()
+                    .execute(&selected, &[request], &ctx)
+                    .await
+            });
+            http.wait_request().await;
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                    "UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2",
+                    rusqlite::params![project_id, actor],
+                ).expect("expire during embedding");
+            } else {
+                repository::update_project_modules("org-1", &project_id, "[]")
+                    .expect("disable knowledge during embedding");
+            }
+            http.release();
+            let error = search
+                .await
+                .expect("adapter execution")
+                .expect_err("current permission must prevent retrieval");
+            assert_eq!(error.to_string(), "project not found or access denied");
+            assert!(!error.to_string().contains("PRIVATE-ADAPTER-PASSAGE"));
+            http.finish();
         }
     }
 }

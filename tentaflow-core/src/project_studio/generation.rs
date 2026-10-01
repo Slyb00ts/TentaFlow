@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
-use super::models::{GenerationRunRecord, ProjectRole};
+use super::models::GenerationRunRecord;
 use crate::db::DbPool;
 
 /// Envelope meta key of the server-minted binding — set atomically at spawn
@@ -762,7 +762,7 @@ fn validate_case_args(
 }
 
 /// Executes one `core.project_case_save` call. `Err(message)` becomes a
-/// recoverable `[TOOL_ERROR]` for the model. The membership + editor role of
+/// recoverable `[TOOL_ERROR]` for the model. The current test write access of
 /// the run's user principal is re-checked on EVERY call (a revoked member
 /// stops mid-generation). One transaction: case (draft/pending/agent) +
 /// version v1 + lazily-created tags + generation_run_sources + the
@@ -775,12 +775,15 @@ pub fn save_generated_case(
     agent_run_id: &str,
     args: &Value,
 ) -> std::result::Result<Value, String> {
-    super::knowledge::require_member(org_id, &binding.project_id, user_id)
+    let project = super::knowledge::require_member(org_id, &binding.project_id, user_id)
         .map_err(|e| e.to_string())?;
-    let role = super::repository::effective_role(&binding.project_id, user_id)
-        .map_err(|e| e.to_string())?;
-    if !matches!(role, Some(r) if r >= ProjectRole::Editor) {
-        return Err("the generation owner no longer has editor access to this project".to_string());
+    let access =
+        super::repository::project_access(&project, user_id, false).map_err(|e| e.to_string())?;
+    if !access.allows(
+        tentaflow_protocol::project_studio::access::ProjectArea::Tests,
+        tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Write,
+    ) {
+        return Err("the generation owner no longer has test write access".to_string());
     }
     let pool = super::project_db::open(&binding.project_id).map_err(|e| e.to_string())?;
     let generation = get_generation(&pool, &binding.gen_id)
@@ -1369,7 +1372,7 @@ mod unit_tests {
         assert!(fence < hostile);
     }
 
-    fn central_project_with_editor(user_id: &str) -> (String, DbPool) {
+    fn central_project_with_generator(user_id: &str) -> (String, DbPool) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _ = super::super::db::init(&tmp.path().join("projects.db"));
         let project_id = format!("gen-{}", uuid::Uuid::new_v4());
@@ -1384,7 +1387,12 @@ mod unit_tests {
             "[\"knowledge\",\"tests\"]",
             "owner-gen",
             &dir.to_string_lossy(),
-            &[(user_id.to_string(), "editor".to_string())],
+            &[super::super::models::MemberInput {
+                user_id: user_id.to_string(),
+                functions: vec!["tester".to_string()],
+                project_admin: false,
+                expires_at: None,
+            }],
         )
         .expect("create project");
         let pool = super::super::project_db::open(&project_id).expect("open pool");
@@ -1420,7 +1428,7 @@ mod unit_tests {
         );
 
         let user = format!("editor-{}", uuid::Uuid::new_v4());
-        let (project_id, pool) = central_project_with_editor(&user);
+        let (project_id, pool) = central_project_with_generator(&user);
         let gen_id = uuid::Uuid::new_v4().to_string();
         insert_generation(
             &pool,

@@ -7,8 +7,8 @@
 //! is what ties the steps together.
 //!
 //! Permissions are the Project Studio rules, applied to the ACTOR: a task goes
-//! to a project member (a tester or better for a test item), a manager may not
-//! remove another manager (only the owner may), the owner cannot leave without
+//! to an active project writer for its area; project administrators manage
+//! memberships, and the owner cannot leave without
 //! handing the project to a member. An organization administrator handing over
 //! a departing person's work is the one place an administrator writes to
 //! projects they are not a member of: the operation only moves that person's own
@@ -26,12 +26,14 @@ use super::{
     Action, ApplyCx, Category, HandoverProvider, Held, ListCx, Planned, Reason, Recorded, Returned,
     Step, WorkProvider,
 };
-use crate::project_studio::models::ProjectRole;
 use crate::project_studio::{
     activity, db as ps_db, ml_link, notifications, project_db, repository, runs, tasks,
 };
 use crate::services::org_structure::availability::DeputyScope;
 use crate::services::org_structure::error::Result;
+use tentaflow_protocol::project_studio::access::{
+    ProjectAccessWire, ProjectArea, ProjectPermissionLevel,
+};
 
 /// A project as the handover sees it.
 pub(super) struct ProjectFacts {
@@ -39,22 +41,26 @@ pub(super) struct ProjectFacts {
     pub name: String,
     pub archived: bool,
     pub owner: String,
-    members: Vec<(String, ProjectRole)>,
+    members: Vec<(String, ProjectAccessWire)>,
 }
 
 impl ProjectFacts {
-    pub fn role_of(&self, user: &str) -> Option<ProjectRole> {
+    pub fn access_of(&self, user: &str) -> Option<&ProjectAccessWire> {
         self.members
             .iter()
             .find(|(id, _)| id == user)
-            .map(|(_, role)| *role)
+            .map(|(_, access)| access)
     }
 
-    /// The members who can take something needing `min`, but the person.
-    fn eligible(&self, min: ProjectRole, person: &str) -> HashSet<String> {
+    fn eligible(
+        &self,
+        area: ProjectArea,
+        minimum: ProjectPermissionLevel,
+        person: &str,
+    ) -> HashSet<String> {
         self.members
             .iter()
-            .filter(|(id, role)| id != person && *role >= min)
+            .filter(|(id, access)| id != person && access.allows(area, minimum))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -62,7 +68,7 @@ impl ProjectFacts {
     fn managers(&self, person: &str) -> Vec<String> {
         self.members
             .iter()
-            .filter(|(id, role)| id != person && *role == ProjectRole::Manager)
+            .filter(|(id, access)| id != person && access.can_manage_members)
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -96,8 +102,11 @@ impl ProjectDirectory {
             Some(record) => {
                 let members = repository::list_members(project_id)?
                     .into_iter()
-                    .filter_map(|m| ProjectRole::from_slug(&m.role).map(|role| (m.user_id, role)))
-                    .collect();
+                    .map(|m| {
+                        let access = repository::project_access(&record, &m.user_id, false)?;
+                        Ok((m.user_id, access))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 Some(Rc::new(ProjectFacts {
                     id: record.project_id,
                     name: record.name,
@@ -120,15 +129,22 @@ impl ProjectDirectory {
         }
         let mut ids: Vec<String> = match only {
             Some(id) => vec![id.to_string()],
-            None => repository::member_roles_for_user(user)?
-                .into_keys()
-                .collect(),
+            None => repository::list_projects(&self.org_id, true)?
+                .into_iter()
+                .filter_map(
+                    |project| match repository::member_access(&project.project_id, user) {
+                        Ok(Some(_)) => Some(Ok(project.project_id)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
+                .collect::<anyhow::Result<Vec<_>>>()?,
         };
         ids.sort();
         let mut out = Vec::new();
         for id in ids {
             if let Some(facts) = self.facts(&id)? {
-                if facts.role_of(user).is_some() {
+                if facts.access_of(user).is_some() {
                     out.push(facts);
                 }
             }
@@ -214,7 +230,11 @@ impl HandoverProvider for TaskProvider<'_> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
             let pool = open_pool(&facts.id)?;
-            let eligible = facts.eligible(ProjectRole::Viewer, cx.user_id);
+            let eligible = facts.eligible(
+                ProjectArea::Tasks,
+                ProjectPermissionLevel::Write,
+                cx.user_id,
+            );
             let managers = facts.managers(cx.user_id);
             for task in tasks::open_tasks_of(&pool, cx.user_id)? {
                 let candidates = Candidates {
@@ -249,11 +269,12 @@ impl HandoverProvider for TaskProvider<'_> {
 fn taker_of<'a>(
     item: &'a Planned,
     facts: &ProjectFacts,
-    min: ProjectRole,
+    area: ProjectArea,
+    minimum: ProjectPermissionLevel,
 ) -> std::result::Result<&'a str, &'static str> {
     let taker = item.taker.as_deref().ok_or("taker_required")?;
-    match facts.role_of(taker) {
-        Some(role) if role >= min => Ok(taker),
+    match facts.access_of(taker) {
+        Some(access) if access.allows(area, minimum) => Ok(taker),
         _ => Err("taker_not_eligible"),
     }
 }
@@ -269,7 +290,12 @@ impl WorkProvider for TaskProvider<'_> {
         if facts.archived {
             return Ok(Step::Refused("project_archived"));
         }
-        let taker = match taker_of(item, &facts, ProjectRole::Viewer) {
+        let taker = match taker_of(
+            item,
+            &facts,
+            ProjectArea::Tasks,
+            ProjectPermissionLevel::Write,
+        ) {
             Ok(taker) => taker,
             Err(reason) => return Ok(Step::Refused(reason)),
         };
@@ -333,7 +359,10 @@ impl WorkProvider for TaskProvider<'_> {
         if task.assigned_to != taker {
             return Ok(Returned::Kept("changed"));
         }
-        if facts.role_of(&item.from_user).is_none() {
+        if facts
+            .access_of(&item.from_user)
+            .is_none_or(|access| !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Write))
+        {
             return Ok(Returned::Kept("not_member"));
         }
         if !tasks::reassign_open(&pool, task_id, taker, &item.from_user)? {
@@ -379,7 +408,11 @@ impl HandoverProvider for TestItemProvider<'_> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
             let pool = open_pool(&facts.id)?;
-            let eligible = facts.eligible(ProjectRole::Tester, cx.user_id);
+            let eligible = facts.eligible(
+                ProjectArea::Tests,
+                ProjectPermissionLevel::Write,
+                cx.user_id,
+            );
             let managers = facts.managers(cx.user_id);
             for item in runs::open_items_of(&pool, cx.user_id)? {
                 let candidates = Candidates {
@@ -421,7 +454,12 @@ impl WorkProvider for TestItemProvider<'_> {
         if facts.archived {
             return Ok(Step::Refused("project_archived"));
         }
-        let taker = match taker_of(item, &facts, ProjectRole::Tester) {
+        let taker = match taker_of(
+            item,
+            &facts,
+            ProjectArea::Tests,
+            ProjectPermissionLevel::Write,
+        ) {
             Ok(taker) => taker,
             Err(reason) => return Ok(Step::Refused(reason)),
         };
@@ -479,8 +517,8 @@ impl WorkProvider for TestItemProvider<'_> {
             return Ok(Returned::Kept("changed"));
         }
         if facts
-            .role_of(&item.from_user)
-            .is_none_or(|role| role < ProjectRole::Tester)
+            .access_of(&item.from_user)
+            .is_none_or(|access| !access.allows(ProjectArea::Tests, ProjectPermissionLevel::Write))
         {
             return Ok(Returned::Kept("not_member"));
         }
@@ -518,31 +556,47 @@ pub(super) struct MembershipProvider<'a> {
     pub projects: &'a ProjectDirectory,
 }
 
-/// Who removes: an organization administrator, or a member with a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Remover {
-    Administrator,
-    Member(ProjectRole),
+pub(crate) enum MemberRemoval {
+    Removed,
+    Missing,
+    HoldsWork,
+    Owner,
 }
 
-/// What removing a member takes, by the rules of `member_remove` (only the
-/// owner removes a manager) and `ownership_transfer` (the owner cannot leave
-/// without handing the project over).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RemovalRule {
-    End,
-    HandOwnershipFirst,
-    OnlyOwnerRemovesManager,
-}
-
-pub(super) fn removal_rule(target: ProjectRole, remover: Remover) -> RemovalRule {
-    match (target, remover) {
-        (ProjectRole::Owner, _) => RemovalRule::HandOwnershipFirst,
-        (ProjectRole::Manager, Remover::Member(role)) if role != ProjectRole::Owner => {
-            RemovalRule::OnlyOwnerRemovesManager
-        }
-        _ => RemovalRule::End,
+pub(crate) fn remove_project_member(
+    org_id: &str,
+    project_id: &str,
+    user: &str,
+    actor: &str,
+    details: &str,
+) -> Result<MemberRemoval> {
+    let Some(project) = repository::get_project(org_id, project_id)? else {
+        return Ok(MemberRemoval::Missing);
+    };
+    if project.owner_user_id == user {
+        return Ok(MemberRemoval::Owner);
     }
+    let pool = open_pool(project_id)?;
+    if !tasks::open_tasks_of(&pool, user)?.is_empty()
+        || !runs::open_items_of(&pool, user)?.is_empty()
+    {
+        return Ok(MemberRemoval::HoldsWork);
+    }
+    if !repository::remove_member(project_id, user)? {
+        return Ok(MemberRemoval::Missing);
+    }
+    activity::record(
+        &pool,
+        actor,
+        "user",
+        "member.removed",
+        "member",
+        user,
+        details,
+    );
+    spawn_ml_sync(project_id);
+    Ok(MemberRemoval::Removed)
 }
 
 impl HandoverProvider for MembershipProvider<'_> {
@@ -556,9 +610,13 @@ impl HandoverProvider for MembershipProvider<'_> {
             return Ok(out);
         }
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
-            let role = facts.role_of(cx.user_id).unwrap_or(ProjectRole::Viewer);
-            let owner = role == ProjectRole::Owner;
-            let eligible = facts.eligible(ProjectRole::Viewer, cx.user_id);
+            let owner = facts.owner == cx.user_id;
+            let eligible = facts
+                .members
+                .iter()
+                .filter(|(id, access)| id != cx.user_id && access.has_access)
+                .map(|(id, _)| id.clone())
+                .collect::<HashSet<_>>();
             let managers = facts.managers(cx.user_id);
             let candidates = Candidates {
                 eligible: Some(&eligible),
@@ -569,7 +627,11 @@ impl HandoverProvider for MembershipProvider<'_> {
                 key: member_key(&facts.id),
                 category: Category::Membership,
                 title: facts.name.clone(),
-                role: role.slug().into(),
+                role: if owner {
+                    "owner".into()
+                } else {
+                    "member".into()
+                },
                 state: String::new(),
                 project_id: Some(facts.id.clone()),
                 project_name: Some(facts.name.clone()),
@@ -593,26 +655,18 @@ impl HandoverProvider for MembershipProvider<'_> {
 impl MembershipProvider<'_> {
     /// Removes the membership if the person no longer holds open work there.
     fn end_now(&self, cx: &ApplyCx<'_>, project_id: &str, user: &str) -> Result<Step> {
-        let pool = open_pool(project_id)?;
-        if !tasks::open_tasks_of(&pool, user)?.is_empty()
-            || !runs::open_items_of(&pool, user)?.is_empty()
-        {
-            return Ok(Step::Refused("still_holds_work"));
-        }
-        if !repository::remove_member(project_id, user)? {
-            return Ok(Step::Skipped("no_longer_held"));
-        }
-        activity::record(
-            &pool,
-            cx.actor,
-            "user",
-            "member.removed",
-            "member",
+        match remove_project_member(
+            cx.org_id,
+            project_id,
             user,
+            cx.actor,
             &json!({ "handover_id": cx.handover_id, "reason": cx.reason.as_str() }).to_string(),
-        );
-        spawn_ml_sync(project_id);
-        Ok(Step::Done(json!({})))
+        )? {
+            MemberRemoval::Removed => Ok(Step::Done(json!({}))),
+            MemberRemoval::Missing => Ok(Step::Skipped("no_longer_held")),
+            MemberRemoval::HoldsWork => Ok(Step::Refused("still_holds_work")),
+            MemberRemoval::Owner => Ok(Step::Refused("hand_ownership_first")),
+        }
     }
 }
 
@@ -627,40 +681,40 @@ impl WorkProvider for MembershipProvider<'_> {
         if facts.archived {
             return Ok(Step::Refused("project_archived"));
         }
-        let Some(role) = facts.role_of(cx.from_user) else {
+        if facts.access_of(cx.from_user).is_none() {
             return Ok(Step::Skipped("no_longer_held"));
-        };
-        let remover = if cx.actor_is_admin {
-            Remover::Administrator
-        } else {
-            match repository::effective_role(project_id, cx.actor)? {
-                Some(role) => Remover::Member(role),
-                None => return Ok(Step::Refused("not_permitted")),
+        }
+        if !cx.actor_is_admin
+            && facts
+                .access_of(cx.actor)
+                .is_none_or(|access| !access.can_manage_members)
+        {
+            return Ok(Step::Refused("not_permitted"));
+        }
+        if facts.owner == cx.from_user {
+            if !cx.actor_is_admin && cx.actor != facts.owner {
+                return Ok(Step::Refused("ownership_required"));
             }
-        };
-        match removal_rule(role, remover) {
-            RemovalRule::OnlyOwnerRemovesManager => {
-                return Ok(Step::Refused("only_owner_removes_manager"))
-            }
-            RemovalRule::HandOwnershipFirst => {
-                let taker = match taker_of(item, &facts, ProjectRole::Viewer) {
-                    Ok(taker) => taker,
-                    Err(reason) => return Ok(Step::Refused(reason)),
-                };
-                repository::transfer_ownership(project_id, cx.from_user, taker)?;
-                let pool = open_pool(project_id)?;
-                activity::record(
-                    &pool,
-                    cx.actor,
-                    "user",
-                    "ownership.transferred",
-                    "project",
-                    project_id,
-                    &json!({ "from": cx.from_user, "to": taker, "handover_id": cx.handover_id })
-                        .to_string(),
-                );
-            }
-            RemovalRule::End => {}
+            let taker = item.taker.as_deref().filter(|user| {
+                facts
+                    .access_of(user)
+                    .is_some_and(|access| access.has_access)
+            });
+            let Some(taker) = taker else {
+                return Ok(Step::Refused("taker_not_eligible"));
+            };
+            repository::transfer_ownership(project_id, cx.from_user, taker)?;
+            let pool = open_pool(project_id)?;
+            activity::record(
+                &pool,
+                cx.actor,
+                "user",
+                "ownership.transferred",
+                "project",
+                project_id,
+                &json!({ "from": cx.from_user, "to": taker, "handover_id": cx.handover_id })
+                    .to_string(),
+            );
         }
         if cx.date > cx.today {
             return Ok(Step::Scheduled(json!({})));
@@ -679,7 +733,7 @@ impl WorkProvider for MembershipProvider<'_> {
         match self.projects.facts(project_id)? {
             None => Ok(Step::Refused("project_missing")),
             Some(facts) if facts.archived => Ok(Step::Refused("project_archived")),
-            Some(facts) if facts.role_of(&item.from_user).is_none() => {
+            Some(facts) if facts.access_of(&item.from_user).is_none() => {
                 Ok(Step::Skipped("no_longer_held"))
             }
             Some(_) => self.end_now(cx, project_id, &item.from_user),
@@ -712,39 +766,5 @@ mod tests {
         assert_eq!(parse_key("member:p-1", "task"), None);
         // A prefix must be a whole word: "tasks:..." is not a task key.
         assert_eq!(parse_key("tasks:p-1:t-9", "task"), None);
-    }
-
-    #[test]
-    fn the_owner_hands_the_project_over_before_leaving() {
-        for remover in [
-            Remover::Administrator,
-            Remover::Member(ProjectRole::Owner),
-            Remover::Member(ProjectRole::Manager),
-        ] {
-            assert_eq!(
-                removal_rule(ProjectRole::Owner, remover),
-                RemovalRule::HandOwnershipFirst
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_owner_or_an_administrator_removes_a_manager() {
-        assert_eq!(
-            removal_rule(ProjectRole::Manager, Remover::Member(ProjectRole::Manager)),
-            RemovalRule::OnlyOwnerRemovesManager
-        );
-        assert_eq!(
-            removal_rule(ProjectRole::Manager, Remover::Member(ProjectRole::Owner)),
-            RemovalRule::End
-        );
-        assert_eq!(
-            removal_rule(ProjectRole::Manager, Remover::Administrator),
-            RemovalRule::End
-        );
-        assert_eq!(
-            removal_rule(ProjectRole::Editor, Remover::Member(ProjectRole::Manager)),
-            RemovalRule::End
-        );
     }
 }

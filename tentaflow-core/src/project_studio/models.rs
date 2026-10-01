@@ -1,42 +1,9 @@
-// ===== File: project_studio/models.rs — row types + role hierarchy for Project Studio =====
-//
-// Plain data records mirroring the SQLite rows (central `projects.db` and the
-// per-project `project.db`), plus the project role lattice used by every
-// authorization gate in `dispatch/project_studio.rs`.
+// ============ File: project_studio/models.rs — persisted rows and project access invariants ============
 
-/// Project member role. Ordered lattice: viewer < tester < editor < manager <
-/// owner — a gate requiring `Editor` accepts editor, manager and owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ProjectRole {
-    Viewer,
-    Tester,
-    Editor,
-    Manager,
-    Owner,
-}
-
-impl ProjectRole {
-    pub fn slug(self) -> &'static str {
-        match self {
-            ProjectRole::Viewer => "viewer",
-            ProjectRole::Tester => "tester",
-            ProjectRole::Editor => "editor",
-            ProjectRole::Manager => "manager",
-            ProjectRole::Owner => "owner",
-        }
-    }
-
-    pub fn from_slug(slug: &str) -> Option<Self> {
-        match slug {
-            "viewer" => Some(ProjectRole::Viewer),
-            "tester" => Some(ProjectRole::Tester),
-            "editor" => Some(ProjectRole::Editor),
-            "manager" => Some(ProjectRole::Manager),
-            "owner" => Some(ProjectRole::Owner),
-            _ => None,
-        }
-    }
-}
+mod access;
+pub use access::{
+    default_project_functions, evaluate_project_access, function_level, validate_member_input,
+};
 
 // =============================================================================
 // Central registry rows (projects.db)
@@ -61,9 +28,31 @@ pub struct ProjectRecord {
 pub struct MemberRecord {
     pub project_id: String,
     pub user_id: String,
-    pub role: String,
+    pub functions: Vec<String>,
+    pub project_admin: bool,
+    pub expires_at: Option<String>,
     pub invited_by: String,
     pub created_at: String,
+}
+
+impl MemberRecord {
+    pub fn is_active_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.expires_at.as_ref().is_none_or(|expires_at| {
+            chrono::DateTime::parse_from_rfc3339(expires_at).is_ok_and(|expires| expires > now)
+        })
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.is_active_at(chrono::Utc::now())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberInput {
+    pub user_id: String,
+    pub functions: Vec<String>,
+    pub project_admin: bool,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +89,15 @@ pub struct SourceRecord {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+pub fn source_write_area(kind: &str) -> tentaflow_protocol::project_studio::access::ProjectArea {
+    use tentaflow_protocol::project_studio::access::ProjectArea;
+    if matches!(kind, "git" | "zip") {
+        ProjectArea::Repos
+    } else {
+        ProjectArea::Knowledge
+    }
 }
 
 /// Source row plus the aggregates the list screen needs (file/chunk counters
@@ -534,18 +532,200 @@ pub struct NotificationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
+    use tentaflow_protocol::project_studio::access::{
+        ProjectArea, ProjectPermissionLevel as Level,
+    };
+
+    fn project() -> ProjectRecord {
+        ProjectRecord {
+            project_id: "p".to_string(),
+            org_id: "o".to_string(),
+            name: "Access".to_string(),
+            description: String::new(),
+            status: "active".to_string(),
+            template: "custom".to_string(),
+            modules_json: "[\"tasks\",\"tests\",\"knowledge\",\"docs\",\"chat\",\"security\"]"
+                .to_string(),
+            owner_user_id: "owner".to_string(),
+            dir_path: "unused".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn member(functions: &[&str], project_admin: bool) -> MemberRecord {
+        MemberRecord {
+            project_id: "p".to_string(),
+            user_id: "member".to_string(),
+            functions: functions.iter().map(|value| value.to_string()).collect(),
+            project_admin,
+            expires_at: None,
+            invited_by: "owner".to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0)
+            .single()
+            .expect("instant")
+    }
 
     #[test]
-    fn role_lattice_orders_viewer_to_owner() {
-        assert!(ProjectRole::Viewer < ProjectRole::Tester);
-        assert!(ProjectRole::Tester < ProjectRole::Editor);
-        assert!(ProjectRole::Editor < ProjectRole::Manager);
-        assert!(ProjectRole::Manager < ProjectRole::Owner);
-        assert_eq!(
-            ProjectRole::from_slug("manager"),
-            Some(ProjectRole::Manager)
+    fn functions_take_the_maximum_grant_for_each_area() {
+        let catalogue = default_project_functions();
+        assert_eq!(catalogue.len(), 9);
+        let developer = evaluate_project_access(
+            &project(),
+            Some(&member(&["developer"], false)),
+            &catalogue,
+            false,
+            now(),
         );
-        assert_eq!(ProjectRole::from_slug("root"), None);
-        assert_eq!(ProjectRole::Owner.slug(), "owner");
+        assert_eq!(developer.level(ProjectArea::Tests), Level::Read);
+        assert_eq!(developer.level(ProjectArea::Repos), Level::Write);
+        let combined = evaluate_project_access(
+            &project(),
+            Some(&member(&["developer", "tester"], false)),
+            &catalogue,
+            false,
+            now(),
+        );
+        assert_eq!(combined.level(ProjectArea::Tests), Level::Admin);
+        assert_eq!(combined.level(ProjectArea::Repos), Level::Write);
+        assert!(combined.allows(ProjectArea::Tests, Level::Write));
+        assert!(!combined.allows(ProjectArea::Settings, Level::Write));
+    }
+
+    #[test]
+    fn project_admin_requires_explicit_confidential_grants_and_enabled_modules() {
+        let catalogue = default_project_functions();
+        let admin = member(&["developer"], true);
+        let access = evaluate_project_access(&project(), Some(&admin), &catalogue, false, now());
+        assert_eq!(access.level(ProjectArea::Tests), Level::Admin);
+        assert_eq!(access.level(ProjectArea::SecurityConfidential), Level::None);
+        assert!(access.can_manage_members);
+        let security_admin = member(&["developer", "security"], true);
+        let explicit =
+            evaluate_project_access(&project(), Some(&security_admin), &catalogue, false, now());
+        assert_eq!(
+            explicit.level(ProjectArea::SecurityConfidential),
+            Level::Admin
+        );
+        let mut disabled = project();
+        disabled.modules_json = "[\"knowledge\"]".to_string();
+        let access =
+            evaluate_project_access(&disabled, Some(&security_admin), &catalogue, false, now());
+        assert!(!access.allows(ProjectArea::Tests, Level::Read));
+        assert!(!access.allows(ProjectArea::SecurityConfidential, Level::Read));
+        assert!(!access.can_create_tasks);
+    }
+
+    #[test]
+    fn app_admin_inspection_does_not_grant_mutation_or_confidential_access() {
+        let access =
+            evaluate_project_access(&project(), None, &default_project_functions(), true, now());
+        assert!(access.has_access);
+        assert!(access.allows(ProjectArea::Knowledge, Level::Read));
+        assert!(!access.allows(ProjectArea::Knowledge, Level::Write));
+        assert!(!access.can_manage_members);
+        assert!(!access.can_manage_settings);
+        assert!(!access.allows(ProjectArea::SecurityConfidential, Level::Read));
+        assert!(access.can_create_tasks);
+    }
+
+    #[test]
+    fn membership_without_functions_can_create_tasks_but_has_no_content_grants() {
+        let empty_member = member(&[], false);
+        let access = evaluate_project_access(
+            &project(),
+            Some(&empty_member),
+            &default_project_functions(),
+            false,
+            now(),
+        );
+        assert!(access.has_access);
+        assert!(access.can_create_tasks);
+        assert_eq!(access.level(ProjectArea::Tasks), Level::None);
+        assert!(!access.allows(ProjectArea::Tasks, Level::Read));
+        let no_member =
+            evaluate_project_access(&project(), None, &default_project_functions(), false, now());
+        assert!(!no_member.has_access);
+        assert!(!no_member.can_create_tasks);
+    }
+
+    #[test]
+    fn expiry_is_enforced_at_the_instant_and_invalid_expiry_fails_closed() {
+        let mut temporary = member(&["tester"], true);
+        temporary.expires_at = Some("2026-09-30T14:00:00+02:00".to_string());
+        assert!(!temporary.is_active_at(now()));
+        let access = evaluate_project_access(
+            &project(),
+            Some(&temporary),
+            &default_project_functions(),
+            false,
+            now(),
+        );
+        assert!(!access.has_access);
+        assert!(!access.project_admin);
+        assert!(!access.can_create_tasks);
+        temporary.expires_at = Some("2026-09-30T12:00:01Z".to_string());
+        assert!(temporary.is_active_at(now()));
+        temporary.expires_at = Some("invalid".to_string());
+        assert!(!temporary.is_active_at(now()));
+    }
+
+    #[test]
+    fn archived_project_access_is_read_only_and_ownership_is_not_admin() {
+        let mut owned = member(&["observer"], false);
+        owned.user_id = "owner".to_string();
+        let access = evaluate_project_access(
+            &project(),
+            Some(&owned),
+            &default_project_functions(),
+            false,
+            now(),
+        );
+        assert!(access.is_owner);
+        assert!(!access.project_admin);
+        assert!(!access.can_manage_members);
+        let mut archived = project();
+        archived.status = "archived".to_string();
+        let access = evaluate_project_access(
+            &archived,
+            Some(&member(&["tester"], true)),
+            &default_project_functions(),
+            false,
+            now(),
+        );
+        assert!(access.allows(ProjectArea::Tests, Level::Read));
+        assert!(!access.allows(ProjectArea::Tests, Level::Write));
+        assert!(!access.can_manage_members);
+        assert!(!access.can_create_tasks);
+        assert!(!access.can_manage_settings);
+    }
+
+    #[test]
+    fn membership_validation_rejects_unknown_duplicate_and_expired_values() {
+        let mut input = MemberInput {
+            user_id: "member".to_string(),
+            functions: vec!["developer".to_string()],
+            project_admin: false,
+            expires_at: Some("2026-10-01T14:00:00+02:00".to_string()),
+        };
+        let catalogue = default_project_functions();
+        let validated = validate_member_input(&input, &catalogue, now()).expect("valid");
+        assert_eq!(
+            validated.expires_at.as_deref(),
+            Some("2026-10-01T12:00:00Z")
+        );
+        input.functions.push("developer".to_string());
+        assert!(validate_member_input(&input, &catalogue, now()).is_err());
+        input.functions = vec!["unknown".to_string()];
+        assert!(validate_member_input(&input, &catalogue, now()).is_err());
+        input.functions.clear();
+        input.expires_at = Some(now().to_rfc3339());
+        assert!(validate_member_input(&input, &catalogue, now()).is_err());
     }
 }

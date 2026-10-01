@@ -12,8 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Project row for the registry list and detail views. `my_role` is `None` for
-/// an org admin inspecting a project they are not a member of.
+pub mod access;
+
+/// Project row with the caller's authoritative area permissions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectInfo {
     pub project_id: String,
@@ -33,6 +34,8 @@ pub struct ProjectInfo {
     pub my_role: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub access: access::ProjectAccessWire,
 }
 
 /// Project member with display data resolved server-side.
@@ -41,11 +44,23 @@ pub struct MemberInfo {
     pub user_id: String,
     pub display_name: String,
     pub email: String,
-    /// 'owner' | 'manager' | 'editor' | 'tester' | 'viewer'.
+    /// Reserved wire field; always empty.
     pub role: String,
     pub invited_by: String,
     pub invited_by_name: String,
     pub created_at: String,
+    #[serde(default)]
+    pub functions: Vec<String>,
+    #[serde(default)]
+    pub project_admin: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub is_owner: bool,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub access: access::ProjectAccessWire,
 }
 
 /// Member entry sent by the client when creating a project or adding members.
@@ -53,6 +68,12 @@ pub struct MemberInfo {
 pub struct MemberInputWire {
     pub user_id: String,
     pub role: String,
+    #[serde(default)]
+    pub functions: Vec<String>,
+    #[serde(default)]
+    pub project_admin: bool,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 /// Lightweight user reference for member-candidate pickers.
@@ -860,6 +881,8 @@ pub enum ProjectStudioPayload {
     ProjectsListResponse {
         projects: Vec<ProjectInfo>,
         can_create: bool,
+        #[serde(default)]
+        can_administer: bool,
     },
     ProjectCreateRequest {
         name: String,
@@ -2275,13 +2298,7 @@ pub enum ProjectStudioPayload {
         status: String,
         error: Option<String>,
     },
-    // ================================================================
-    // Append-only past this point. F5+ additions (REST/MCP facades,
-    // mesh sync) go into a NEW sub-enum instead: this one is nearing
-    // the 256-variant budget of the frame format.
-    // Never insert above: reordering existing variants breaks the wire
-    // contract with older peers, so new variants go strictly at the end.
-    // ================================================================
+    Access(access::ProjectAccessPayload),
 }
 
 #[cfg(test)]
@@ -2298,7 +2315,10 @@ mod tests {
             modules: vec!["knowledge".to_string(), "chat".to_string()],
             members: vec![MemberInputWire {
                 user_id: "u1".to_string(),
-                role: "editor".to_string(),
+                role: String::new(),
+                functions: vec!["developer".to_string(), "tester".to_string()],
+                project_admin: false,
+                expires_at: Some("2026-12-31T23:59:59Z".to_string()),
             }],
         };
         let bytes = crate::cbor::encode(&payload).expect("encode");
@@ -2624,5 +2644,62 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
             .collect()
+    }
+
+    #[test]
+    fn project_access_wire_golden() {
+        use access::{
+            ProjectAccessPayload, ProjectAccessWire, ProjectArea, ProjectAreaAccessWire,
+            ProjectPermissionLevel,
+        };
+        let member = MemberInputWire {
+            user_id: "u1".to_string(),
+            role: String::new(),
+            functions: vec!["developer".to_string(), "tester".to_string()],
+            project_admin: false,
+            expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+        };
+        assert_eq!(crate::cbor::encode(&member).expect("member"),hex_bytes("a567757365725f696462753164726f6c65606966756e6374696f6e738269646576656c6f706572667465737465726d70726f6a6563745f61646d696ef46a657870697265735f617474323032362d31322d33315432333a35393a35395a"));
+        let change = ProjectStudioPayload::Access(ProjectAccessPayload::MemberAccessSetRequest {
+            project_id: "p1".to_string(),
+            user_id: "u1".to_string(),
+            functions: vec!["developer".to_string(), "security".to_string()],
+            project_admin: false,
+            expires_at: None,
+        });
+        assert_eq!(crate::cbor::encode(&change).expect("access change"),hex_bytes("a166416363657373a1764d656d62657241636365737353657452657175657374a56a70726f6a6563745f696462703167757365725f69646275316966756e6374696f6e738269646576656c6f7065726873656375726974796d70726f6a6563745f61646d696ef46a657870697265735f6174f6"));
+        let access = ProjectAccessWire {
+            has_access: true,
+            project_admin: false,
+            app_admin: false,
+            is_owner: false,
+            archived: false,
+            functions: vec!["developer".to_string(), "tester".to_string()],
+            expires_at: None,
+            enabled_modules: vec!["tasks".to_string(), "tests".to_string()],
+            areas: vec![
+                ProjectAreaAccessWire {
+                    area: ProjectArea::Tasks,
+                    level: ProjectPermissionLevel::Write,
+                    enabled: true,
+                },
+                ProjectAreaAccessWire {
+                    area: ProjectArea::Tests,
+                    level: ProjectPermissionLevel::Admin,
+                    enabled: true,
+                },
+            ],
+            can_create_tasks: true,
+            can_manage_members: false,
+            can_manage_settings: false,
+        };
+        assert_eq!(crate::cbor::encode(&access).expect("access"),hex_bytes("ac6a6861735f616363657373f56d70726f6a6563745f61646d696ef4696170705f61646d696ef46869735f6f776e6572f4686172636869766564f46966756e6374696f6e738269646576656c6f706572667465737465726a657870697265735f6174f66f656e61626c65645f6d6f64756c657382657461736b7365746573747365617265617382a36461726561657461736b73656c6576656c65777269746567656e61626c6564f5a36461726561657465737473656c6576656c6561646d696e67656e61626c6564f57063616e5f6372656174655f7461736b73f57263616e5f6d616e6167655f6d656d62657273f47363616e5f6d616e6167655f73657474696e6773f4"));
+        assert_eq!(
+            crate::cbor::decode::<ProjectAccessWire>(
+                &crate::cbor::encode(&access).expect("encode")
+            )
+            .expect("decode"),
+            access
+        );
     }
 }

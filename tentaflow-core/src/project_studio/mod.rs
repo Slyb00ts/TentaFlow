@@ -48,6 +48,7 @@ pub const VALID_MODULES: &[&str] = &["knowledge", "tests", "docs", "chat", "task
 pub fn init() -> Result<DbPool> {
     let pool = db::init(&crate::paths::data_dir().join("projects.db"))?;
     heal_project_dir_paths(&pool);
+    ml_link::restore_grant_index()?;
     project_db::spawn_idle_sweeper();
     Ok(pool)
 }

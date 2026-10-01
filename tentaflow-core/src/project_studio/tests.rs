@@ -492,19 +492,37 @@ pub fn restore_version(
     Ok(CaseUpdateOutcome::Saved(new_version))
 }
 
-/// Requirement of a status transition: the minimum project role and whether a
-/// reason is mandatory (every downgrade). `None` = transition not allowed.
-pub fn transition_requirement(from: &str, to: &str) -> Option<(super::models::ProjectRole, bool)> {
-    use super::models::ProjectRole::{Editor, Manager};
+/// Minimum test-area grant and mandatory downgrade reason for each transition.
+pub fn transition_requirement(
+    from: &str,
+    to: &str,
+) -> Option<(tentaflow_protocol::project_studio::access::ProjectPermissionLevel, bool)> {
+    use tentaflow_protocol::project_studio::access::ProjectPermissionLevel::{Admin, Write};
     match (from, to) {
-        ("draft", "review") => Some((Editor, false)),
-        ("review", "approved") => Some((Manager, false)),
-        ("approved", "deprecated") => Some((Manager, false)),
-        // Downgrades — always with a reason.
-        ("review", "draft") => Some((Editor, true)),
-        ("approved", "review") | ("approved", "draft") => Some((Manager, true)),
-        ("deprecated", "draft") => Some((Manager, true)),
+        ("draft", "review") => Some((Write, false)),
+        ("review", "approved") | ("approved", "deprecated") => Some((Admin, false)),
+        ("review", "draft") => Some((Write, true)),
+        ("approved", "review") | ("approved", "draft") | ("deprecated", "draft") => Some((Admin, true)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::transition_requirement;
+    use tentaflow_protocol::project_studio::access::ProjectPermissionLevel::{Admin, Write};
+
+    #[test]
+    fn transitions_require_test_write_or_admin_and_downgrade_reasons() {
+        assert_eq!(transition_requirement("draft", "review"), Some((Write, false)));
+        assert_eq!(transition_requirement("review", "draft"), Some((Write, true)));
+        assert_eq!(transition_requirement("review", "approved"), Some((Admin, false)));
+        assert_eq!(transition_requirement("approved", "deprecated"), Some((Admin, false)));
+        for (from, to) in [("approved", "draft"), ("approved", "review"), ("deprecated", "draft")] {
+            assert_eq!(transition_requirement(from, to), Some((Admin, true)));
+        }
+        assert_eq!(transition_requirement("draft", "approved"), None);
+        assert_eq!(transition_requirement("approved", "approved"), None);
     }
 }
 

@@ -1150,6 +1150,9 @@ fn bump_failed_polls(pool: &DbPool, run_id: &str) -> Result<u32> {
 pub struct WatchTask {
     pub pool: DbPool,
     pub run_id: String,
+    pub project_id: String,
+    pub org_id: String,
+    pub user_id: String,
     pub dir_path: PathBuf,
     pub endpoint_url: String,
     pub job_id: String,
@@ -1246,6 +1249,9 @@ async fn watch_loop(
     let WatchTask {
         pool,
         run_id,
+        project_id,
+        org_id,
+        user_id,
         dir_path,
         endpoint_url,
         job_id,
@@ -1264,6 +1270,22 @@ async fn watch_loop(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
+        let authorized = super::repository::get_project(&org_id, &project_id)
+            .ok()
+            .flatten()
+            .and_then(|project| super::repository::project_access(&project, &user_id, false).ok())
+            .is_some_and(|access| {
+                access.allows(
+                    tentaflow_protocol::project_studio::access::ProjectArea::Tests,
+                    tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Write,
+                ) && access.allows(
+                    tentaflow_protocol::project_studio::access::ProjectArea::Environments,
+                    tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+                )
+            });
+        if !authorized {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if cancel.load(Ordering::Relaxed) {
             let endpoint = endpoint_url.clone();
             let job = job_id.clone();
@@ -1472,7 +1494,32 @@ pub async fn submit_and_watch(
     items: Vec<SubmitItem>,
     environment: SubmitEnvironment,
     watchdog_deadline_ms: i64,
+    project_id: String,
+    org_id: String,
 ) -> Result<String> {
+    let user_id = super::runs::get_run(&pool, &run_id)?
+        .ok_or_else(|| anyhow!("run not found"))?
+        .0
+        .created_by;
+    let authorized = (|| -> Result<()> {
+        let project = super::repository::get_project(&org_id, &project_id)?
+            .ok_or_else(|| anyhow!("project not found"))?;
+        let access = super::repository::project_access(&project, &user_id, false)?;
+        if !access.allows(
+            tentaflow_protocol::project_studio::access::ProjectArea::Tests,
+            tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Write,
+        ) || !access.allows(
+            tentaflow_protocol::project_studio::access::ProjectArea::Environments,
+            tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+        ) {
+            bail!("project execution access denied");
+        }
+        Ok(())
+    })();
+    if let Err(error) = authorized {
+        finish_run(&pool, &run_id, "error", &error.to_string())?;
+        return Err(error);
+    }
     let submit_endpoint = endpoint_url.clone();
     let submit_run_id = run_id.clone();
     // Kept for artifact redaction — the watcher needs the plaintext to scrub it
@@ -1499,6 +1546,9 @@ pub async fn submit_and_watch(
     start_watcher(WatchTask {
         pool,
         run_id,
+        project_id,
+        org_id,
+        user_id,
         dir_path,
         endpoint_url,
         job_id: job_id.clone(),
@@ -1630,6 +1680,9 @@ pub fn run_try_item(
     deadline_ms: i64,
     mut on_event: impl FnMut(&str, &str),
 ) -> Result<serde_json::Value> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
     let job_id = submit_run(
         endpoint_url,
         try_id,
@@ -2065,5 +2118,122 @@ mod unit_tests {
         assert!(select_runner(vec![healthy.clone()], "", "node").is_err());
         assert!(select_runner(vec![dead.clone()], "2", "python").is_err());
         assert!(select_runner(vec![healthy], "99", "python").is_err());
+    }
+    #[tokio::test]
+    async fn revoked_prepared_run_is_finished_before_runner_submission() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = super::super::db::init(&tmp.path().join("projects.db"));
+        let id = format!("prepared-revoke-{}", uuid::Uuid::new_v4());
+        let actor = format!("tester-{id}");
+        let dir = tmp.path().join(&id);
+        std::fs::create_dir_all(&dir).expect("project directory");
+        let (pool, _) = super::super::project_db::open_pool_at(&dir).expect("content");
+        super::super::repository::create_project(
+            &id,
+            "org-prepared",
+            &id,
+            "",
+            "custom",
+            "[\"tests\"]",
+            "prepared-owner",
+            &dir.to_string_lossy(),
+            &[super::super::models::MemberInput {
+                user_id: actor.clone(),
+                functions: vec!["tester".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .expect("project");
+        seed_case(&pool, "prepared-case", "api");
+        let cases =
+            resolve_cases(&pool, "", &["prepared-case".into()], "", 10, true).expect("cases");
+        let runner = DiscoveredRunner {
+            service_id: "7".into(),
+            engine_id: RUNNER_ENGINE_ID.into(),
+            display_name: "Test runner".into(),
+            endpoint_url: "http://127.0.0.1:1".into(),
+            status: "running".into(),
+            health: Some(RunnerHealth {
+                isolated: true,
+                toolchains: vec![RunnerToolchainInfo {
+                    language: "python".into(),
+                    frameworks: vec![],
+                    version: String::new(),
+                }],
+            }),
+        };
+        let prepared = create_and_prepare_run(
+            &pool,
+            "Prepared run",
+            "",
+            "auto",
+            "env-prepared",
+            &cases,
+            &runner,
+            "{}",
+            &actor,
+        )
+        .expect("prepare real run");
+        assert_eq!(prepared.submit_items.len(), 1);
+        assert_eq!(
+            super::super::runs::get_run(&pool, &prepared.run_id)
+                .expect("run")
+                .expect("row")
+                .0
+                .status,
+            "running"
+        );
+        super::super::db::pool().expect("registry").write().expect("write").execute(
+            "UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = ?2",
+            params![id, actor],
+        ).expect("revoke prepared principal");
+        let run_id = prepared.run_id.clone();
+        let error = submit_and_watch(
+            pool.clone(),
+            prepared.run_id,
+            dir,
+            runner.endpoint_url,
+            prepared.submit_items,
+            SubmitEnvironment {
+                base_url: "https://example.invalid".into(),
+                auth_type: "none".into(),
+                secret: String::new(),
+                extra_headers: serde_json::json!({}),
+                host_allowlist: vec![],
+            },
+            now_ms() + MAX_RUN_SECS * 1000,
+            id,
+            "org-prepared".into(),
+        )
+        .await
+        .expect_err("revoked principal cannot submit");
+        assert!(error.to_string().contains("execution access denied"));
+        let (run, counts) = super::super::runs::get_run(&pool, &run_id)
+            .expect("run")
+            .expect("row");
+        assert_eq!(run.status, "error");
+        assert!(run.finished_at.is_some());
+        assert_eq!(counts.pending, 0);
+        assert!(list_auto_items(&pool, &run_id)
+            .expect("items")
+            .iter()
+            .all(|item| item.status == "error"));
+        assert!(get_meta(&pool, &run_id)
+            .expect("meta")
+            .expect("row")
+            .runner_job_id
+            .is_empty());
+        let running: u32 = pool
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT COUNT(*) FROM test_runs WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("occupied run slots");
+        assert_eq!(running, 0);
+        std::mem::forget(tmp);
     }
 }

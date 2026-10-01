@@ -39,7 +39,7 @@ use crate::routing::router::Router;
 
 /// Archive layout version. An import refuses anything it does not understand
 /// rather than guessing.
-pub const ARCHIVE_VERSION: u32 = 1;
+pub const ARCHIVE_VERSION: u32 = 2;
 
 const MANIFEST_ENTRY: &str = "manifest.json";
 /// Entry prefixes an import will unpack. Anything else is a foreign archive (or
@@ -146,6 +146,8 @@ pub struct ArchiveManifest {
     pub embedding: Option<EmbeddingMeta>,
     pub inventory: Inventory,
     pub files: Vec<FileEntry>,
+    #[serde(default)]
+    pub functions: Vec<tentaflow_protocol::project_studio::access::ProjectFunctionWire>,
 }
 
 // =============================================================================
@@ -534,6 +536,8 @@ fn build_export(
     tx: &tokio::sync::broadcast::Sender<BusMessage>,
     task: &ExportTask,
 ) -> Result<(u64, Inventory)> {
+    let functions = super::repository::list_functions(&task.project_id)?;
+    super::repository::validate_function_catalogue(&functions)?;
     let pool = super::project_db::open(&task.project_id)?;
     emit(tx, job_id, "collecting", "zbieranie zawartosci projektu", 5);
 
@@ -570,6 +574,7 @@ fn build_export(
             "description": task.project.description,
             "template": task.project.template,
             "modules": task.project.modules,
+            "functions": functions,
         });
         files.push(write_bytes(
             &mut zip,
@@ -620,6 +625,7 @@ fn build_export(
             embedding: embedding.clone(),
             inventory: inventory.clone(),
             files: files.clone(),
+            functions: functions.clone(),
         };
         write_bytes(&mut zip, MANIFEST_ENTRY, &serde_json::to_vec(&manifest)?)?;
         let mut out = zip.finish()?;
@@ -711,6 +717,7 @@ pub fn read_manifest(zip_path: &Path) -> Result<ArchiveManifest> {
             super::project_db::LATEST_SCHEMA_VERSION
         );
     }
+    super::repository::validate_function_catalogue(&manifest.functions)?;
     Ok(manifest)
 }
 
@@ -1059,6 +1066,7 @@ fn apply_import(
     dir: &Path,
     staging: &Path,
 ) -> Result<()> {
+    super::repository::validate_function_catalogue(&task.manifest.functions)?;
     emit(tx, job_id, "extracting", "rozpakowywanie archiwum", 10);
     extract_all(&task.archive_path, staging, &task.manifest)?;
 
@@ -1123,6 +1131,7 @@ fn apply_import(
         &dir.to_string_lossy(),
         &[],
     )?;
+    super::repository::restore_function_catalogue(project_id, &task.manifest.functions)?;
     update_job(job_id, |j| j.project_id = project_id.to_string());
     let _ = super::schedules::refresh_hint(project_id, &task.org_id);
 
@@ -1482,6 +1491,7 @@ mod unit_tests {
             embedding: None,
             inventory: Inventory::default(),
             files,
+            functions: super::super::models::default_project_functions(),
         };
         zip.start_file(MANIFEST_ENTRY.to_string(), stored_options())
             .expect("start manifest");
@@ -1554,6 +1564,7 @@ mod unit_tests {
             embedding,
             inventory: Inventory::default(),
             files: Vec::new(),
+            functions: super::super::models::default_project_functions(),
         };
 
         // Path A — identical fingerprint: the file is moved verbatim. The local
@@ -1825,6 +1836,27 @@ mod unit_tests {
             &[],
         )
         .expect("registry row");
+        let mut developer = super::super::repository::list_functions(&project_id)
+            .expect("catalogue")
+            .into_iter()
+            .find(|function| function.function_id == "developer")
+            .expect("developer");
+        developer.name = "Engineering".to_string();
+        developer
+            .grants
+            .iter_mut()
+            .find(|grant| {
+                grant.area == tentaflow_protocol::project_studio::access::ProjectArea::Knowledge
+            })
+            .expect("knowledge grant")
+            .level = tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read;
+        super::super::repository::save_function(&project_id, &developer)
+            .expect("customised builtin");
+        let mut external = developer.clone();
+        external.function_id = "external_reviewer".to_string();
+        external.name = "External reviewer".to_string();
+        external.builtin = false;
+        super::super::repository::save_function(&project_id, &external).expect("custom function");
 
         let export_ref = format!("psexp_{}", uuid::Uuid::new_v4());
         let dest = tmp.path().join(format!("{export_ref}.zip"));
@@ -1906,9 +1938,21 @@ mod unit_tests {
         assert_eq!(record.owner_user_id, "importer-1");
         assert_eq!(record.org_id, "org-target");
         assert_eq!(record.template, "tests");
+        let membership = super::super::repository::member_access(&target_id, "importer-1")
+            .expect("membership")
+            .expect("owner member");
+        assert!(membership.project_admin);
+        assert_eq!(membership.functions.len(), 9);
+        assert!(membership.expires_at.is_none());
         assert_eq!(
-            super::super::repository::member_role(&target_id, "importer-1").expect("role"),
-            Some("owner".to_string())
+            super::super::repository::list_members(&target_id)
+                .expect("members")
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::super::repository::list_functions(&target_id).expect("restored catalogue"),
+            import.manifest.functions
         );
 
         let (pool, _) = super::super::project_db::open_pool_at(&target_dir).expect("open target");

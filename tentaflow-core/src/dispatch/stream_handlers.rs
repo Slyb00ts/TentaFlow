@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use tentaflow_protocol::project_studio::access::{ProjectArea, ProjectPermissionLevel};
 use tentaflow_protocol::{
     ChatStreamChunk, ChatStreamEnd, FlowInputValue, FlowInvokeChunk, FlowInvokeEnd, MessageBody,
     SessionAuth,
@@ -1691,31 +1692,14 @@ fn project_studio_ingest_stream_handler(
         }
     };
 
-    // IDOR guard: project_studio.read + project in the subscriber's org +
-    // real membership (or project_studio.admin — inspection outside
-    // membership) + the job MUST belong to this project (job_id is a
-    // process-global log_bus key; without this check any logged-in user who
-    // knows a job_id could watch someone else's ingest).
-    let Some(org) = ctx.org_context.as_ref() else {
-        let _ = push_end(&sub, None);
-        return;
-    };
-    if !super::project_studio::has_read(&ctx) {
-        let _ = push_end(&sub, None);
-        return;
-    }
-    match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
-        Ok(Some(_)) => {}
-        _ => {
-            let _ = push_end(&sub, None);
-            return;
-        }
-    }
-    let is_member = matches!(
-        crate::project_studio::repository::member_role(&project_id, &org.user_id),
-        Ok(Some(_))
-    );
-    if !is_member && !super::project_studio::is_admin(&ctx) {
+    if project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )
+    .is_none()
+    {
         let _ = push_end(&sub, None);
         return;
     }
@@ -1747,7 +1731,31 @@ fn project_studio_ingest_stream_handler(
 
         use crate::deploy::log_bus::BusMessage;
         loop {
-            match rx.recv().await {
+            if project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Knowledge,
+                ProjectPermissionLevel::Read,
+            )
+            .is_none()
+            {
+                return;
+            }
+            let message = match tokio::time::timeout(CS_REVALIDATE_EVERY, rx.recv()).await {
+                Ok(message) => message,
+                Err(_) => continue,
+            };
+            if project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Knowledge,
+                ProjectPermissionLevel::Read,
+            )
+            .is_none()
+            {
+                return;
+            }
+            match message {
                 Ok(BusMessage::Line(line)) => {
                     let chunk = ProjectStudioPayload::IngestStreamChunk {
                         job_id: line.deploy_id,
@@ -1825,18 +1833,23 @@ fn project_studio_archive_stream_handler(
         let _ = push_end(&sub, None);
         return;
     };
-    let Some(org) = ctx.org_context.as_ref() else {
-        let _ = push_end(&sub, None);
-        return;
-    };
-    if !super::project_studio::has_read(&ctx) {
-        let _ = push_end(&sub, None);
-        return;
-    }
     // A bare job id must never expose progress to an unrelated user.
-    let owned = crate::project_studio::archive::job(&job_id)
-        .is_some_and(|job| job.owner_user_id == org.user_id);
-    if !owned {
+    let guarded_job_id = job_id.clone();
+    let allowed = move |ctx: &HandlerContext| {
+        let Some(org) = ctx.org_context.as_ref() else {
+            return false;
+        };
+        if !super::project_studio::has_read(ctx) {
+            return false;
+        }
+        crate::project_studio::archive::job(&guarded_job_id).is_some_and(|job| {
+            job.owner_user_id == org.user_id
+                && (job.export_ref.is_empty()
+                    || super::project_studio::require_project_access(ctx, org, &job.project_id)
+                        .is_ok_and(|(_, access)| access.project_admin))
+        })
+    };
+    if !allowed(&ctx) {
         let _ = push_end(&sub, None);
         return;
     }
@@ -1855,7 +1868,15 @@ fn project_studio_archive_stream_handler(
         };
         use crate::deploy::log_bus::BusMessage;
         loop {
-            match rx.recv().await {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, rx.recv()).await;
+            if !allowed(&ctx) {
+                return;
+            }
+            let received = match received {
+                Ok(received) => received,
+                Err(_) => continue,
+            };
+            match received {
                 Ok(BusMessage::Line(line)) => {
                     let chunk = ProjectStudioPayload::ArchiveStreamChunk {
                         job_id: line.deploy_id,
@@ -2034,37 +2055,28 @@ fn project_studio_chat_stream_handler(
         );
     };
 
-    // Guards, uniform denial (no existence leak): project_studio.read →
-    // project in the caller's org → REAL membership (chats are personal
-    // content, so no project_studio.admin bypass) → the chat belongs to the
-    // caller (get_chat filters by user_id).
     let Some(org) = ctx.org_context.as_ref() else {
         end_error(&sub, &chat_id, "chat not found".into());
         return;
     };
-    if !super::project_studio::has_read(&ctx) {
+    let Some(_project) = project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Write,
+    ) else {
         end_error(&sub, &chat_id, "chat not found".into());
         return;
-    }
-    let project = match crate::project_studio::repository::get_project(&org.org_id, &project_id) {
-        Ok(Some(p)) => p,
-        _ => {
-            end_error(&sub, &chat_id, "chat not found".into());
-            return;
-        }
     };
-    // Archived projects are read-only — same contract as `require_active` in
-    // the request/response handlers (bad_request "project is archived"), so
-    // the UI shows the actual state instead of a phantom "chat not found".
-    if project.status == "archived" {
-        end_error(&sub, &chat_id, "project is archived".into());
-        return;
-    }
-    if !matches!(
-        crate::project_studio::repository::member_role(&project_id, &org.user_id),
-        Ok(Some(_))
-    ) {
-        end_error(&sub, &chat_id, "chat not found".into());
+    if project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )
+    .is_none()
+    {
+        end_error(&sub, &chat_id, "project knowledge access denied".into());
         return;
     }
     let chat =
@@ -2103,7 +2115,24 @@ fn project_studio_chat_stream_handler(
     let router = ctx.state.router.clone();
     let db = ctx.state.db.clone();
 
+    let ctx = Arc::new(ctx);
     tokio::spawn(async move {
+        let allowed = |ctx: &HandlerContext, project_id: &str| {
+            project_studio_stream_guard(
+                ctx,
+                project_id,
+                ProjectArea::Chat,
+                ProjectPermissionLevel::Write,
+            )
+            .is_some()
+                && project_studio_stream_guard(
+                    ctx,
+                    project_id,
+                    ProjectArea::Knowledge,
+                    ProjectPermissionLevel::Read,
+                )
+                .is_some()
+        };
         let Some(fd) = router.flow_dispatcher().cloned() else {
             end_error(&sub, &chat_id, "flow dispatcher unavailable".into());
             return;
@@ -2181,7 +2210,18 @@ fn project_studio_chat_stream_handler(
 
         let mut stream = exec.stream;
         let mut full_text = String::new();
-        while let Some(item) = stream.next().await {
+        loop {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, stream.next()).await;
+            if !allowed(&ctx, &project_id) {
+                cancel.cancel();
+                end_error(&sub, &chat_id, "project chat access denied".into());
+                return;
+            }
+            let item = match received {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
             match item {
                 Ok(EnvelopeDelta::Llm(c)) => {
                     if c.text_delta.is_empty() {
@@ -2216,7 +2256,20 @@ fn project_studio_chat_stream_handler(
         // The final envelope carries the retrieval citations accumulated by the
         // shell's retrieval loop and pinned by `rag_finalize`
         // (meta["rag_citations"]).
-        let (citations_json, flow_error) = match exec.outcome.await {
+        let mut outcome = exec.outcome;
+        let outcome = loop {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, &mut outcome).await;
+            if !allowed(&ctx, &project_id) {
+                cancel.cancel();
+                end_error(&sub, &chat_id, "project chat access denied".into());
+                return;
+            }
+            match received {
+                Ok(outcome) => break outcome,
+                Err(_) => continue,
+            }
+        };
+        let (citations_json, flow_error) = match outcome {
             Ok(outcome) => {
                 let cites = outcome
                     .final_envelope
@@ -2233,6 +2286,11 @@ fn project_studio_chat_stream_handler(
                 return;
             }
         };
+        if !allowed(&ctx, &project_id) {
+            cancel.cancel();
+            end_error(&sub, &chat_id, "project chat access denied".into());
+            return;
+        }
         if let Some(e) = flow_error {
             end_error(&sub, &chat_id, e);
             return;
@@ -2247,7 +2305,12 @@ fn project_studio_chat_stream_handler(
         let session_for_persist = chat.session_id.clone();
         let assistant_text = full_text;
         let cites_for_persist = citations_json.clone();
+        let persist_ctx = ctx.clone();
+        let persist_project = project_id.clone();
         let message_id = tokio::task::spawn_blocking(move || {
+            if !allowed(&persist_ctx, &persist_project) {
+                return Err(anyhow::anyhow!("project chat access denied"));
+            }
             crate::db::repository::append_project_chat_message(
                 &db_persist,
                 &session_for_persist,
@@ -2266,6 +2329,10 @@ fn project_studio_chat_stream_handler(
         };
         let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
 
+        if !allowed(&ctx, &project_id) {
+            end_error(&sub, &chat_id, "project chat access denied".into());
+            return;
+        }
         if let Some(cites) = citations_json.as_deref() {
             let chunk = ProjectStudioPayload::ChatStreamChunk {
                 chat_id: chat_id.clone(),
@@ -2318,21 +2385,13 @@ inventory::submit! {
 fn project_studio_stream_guard(
     ctx: &HandlerContext,
     project_id: &str,
+    area: ProjectArea,
+    minimum: ProjectPermissionLevel,
 ) -> Option<crate::project_studio::models::ProjectRecord> {
-    let org = ctx.org_context.as_ref()?;
-    if !super::project_studio::has_read(&ctx) {
-        return None;
-    }
-    let project =
-        crate::project_studio::repository::get_project(&org.org_id, project_id).ok()??;
-    let is_member = matches!(
-        crate::project_studio::repository::member_role(project_id, &org.user_id),
-        Ok(Some(_))
-    );
-    if !is_member && !super::project_studio::is_admin(&ctx) {
-        return None;
-    }
-    Some(project)
+    let org = super::project_studio::require_read(ctx).ok()?;
+    super::project_studio::require_project(ctx, org, project_id, area, minimum)
+        .ok()
+        .map(|(project, _access)| project)
 }
 
 /// Builds the wire item for one automated run item (used by the "item" marker).
@@ -2393,7 +2452,14 @@ fn project_studio_run_auto_stream_handler(
             return;
         }
     };
-    if project_studio_stream_guard(&ctx, &project_id).is_none() {
+    if project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )
+    .is_none()
+    {
         let _ = push_end(&sub, None);
         return;
     }
@@ -2423,7 +2489,31 @@ fn project_studio_run_auto_stream_handler(
         };
         use crate::deploy::log_bus::BusMessage;
         loop {
-            match rx.recv().await {
+            if project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Tests,
+                ProjectPermissionLevel::Read,
+            )
+            .is_none()
+            {
+                return;
+            }
+            let message = match tokio::time::timeout(CS_REVALIDATE_EVERY, rx.recv()).await {
+                Ok(message) => message,
+                Err(_) => continue,
+            };
+            if project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Tests,
+                ProjectPermissionLevel::Read,
+            )
+            .is_none()
+            {
+                return;
+            }
+            match message {
                 Ok(BusMessage::Line(line)) => {
                     let mut chunk = ProjectStudioPayload::RunAutoStreamChunk {
                         run_id: run_id.clone(),
@@ -2593,7 +2683,12 @@ fn project_studio_try_run_stream_handler(
         end_error(&sub, &try_id, "case not found".into());
         return;
     };
-    let Some(project) = project_studio_stream_guard(&ctx, &project_id) else {
+    let Some(project) = project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    ) else {
         end_error(&sub, &try_id, "case not found".into());
         return;
     };
@@ -2601,12 +2696,15 @@ fn project_studio_try_run_stream_handler(
         end_error(&sub, &try_id, "project is archived".into());
         return;
     }
-    // A try run executes untrusted code — the editor tier, not the read tier.
-    if !matches!(
-        crate::project_studio::repository::effective_role(&project_id, &org.user_id),
-        Ok(Some(role)) if role >= crate::project_studio::models::ProjectRole::Editor
-    ) {
-        end_error(&sub, &try_id, "requires the editor project role".into());
+    if project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Read,
+    )
+    .is_none()
+    {
+        end_error(&sub, &try_id, "environment access denied".into());
         return;
     }
 
@@ -2801,6 +2899,30 @@ fn project_studio_try_run_stream_handler(
             }
         };
 
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            auto_runs::unregister_try_run(&try_id);
+            end_error(&sub, &try_id, "try run cancelled before execution".into());
+            return;
+        }
+        if project_studio_stream_guard(
+            &ctx,
+            &project_id,
+            ProjectArea::Tests,
+            ProjectPermissionLevel::Write,
+        )
+        .is_none()
+            || project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Environments,
+                ProjectPermissionLevel::Read,
+            )
+            .is_none()
+        {
+            auto_runs::unregister_try_run(&try_id);
+            end_error(&sub, &try_id, "project execution access denied".into());
+            return;
+        }
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
         let endpoint = runner.endpoint_url.clone();
         let try_for_task = try_id.clone();
@@ -2821,7 +2943,34 @@ fn project_studio_try_run_stream_handler(
             )
         });
 
-        while let Some((kind, line)) = event_rx.recv().await {
+        loop {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, event_rx.recv()).await;
+            if project_studio_stream_guard(
+                &ctx,
+                &project_id,
+                ProjectArea::Tests,
+                ProjectPermissionLevel::Write,
+            )
+            .is_none()
+                || project_studio_stream_guard(
+                    &ctx,
+                    &project_id,
+                    ProjectArea::Environments,
+                    ProjectPermissionLevel::Read,
+                )
+                .is_none()
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = execution.await;
+                auto_runs::unregister_try_run(&try_id);
+                end_error(&sub, &try_id, "project execution access denied".into());
+                return;
+            }
+            let (kind, line) = match received {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
             let (kind, phase, line) = if kind == "phase" {
                 ("phase".to_string(), line, String::new())
             } else {
@@ -2950,19 +3099,17 @@ fn project_studio_code_assist_stream_handler(
         end_error(&sub, "case not found".into());
         return;
     };
-    let Some(project) = project_studio_stream_guard(&ctx, &project_id) else {
+    let Some(project) = project_studio_stream_guard(
+        &ctx,
+        &project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    ) else {
         end_error(&sub, "case not found".into());
         return;
     };
     if project.status == "archived" {
         end_error(&sub, "project is archived".into());
-        return;
-    }
-    if !matches!(
-        crate::project_studio::repository::effective_role(&project_id, &org.user_id),
-        Ok(Some(role)) if role >= crate::project_studio::models::ProjectRole::Editor
-    ) {
-        end_error(&sub, "requires the editor project role".into());
         return;
     }
 
@@ -3005,7 +3152,17 @@ fn project_studio_code_assist_stream_handler(
     let org_id = org.org_id.clone();
     let router = ctx.state.router.clone();
 
+    let ctx = Arc::new(ctx);
     tokio::spawn(async move {
+        let allowed = |ctx: &HandlerContext, project_id: &str| {
+            project_studio_stream_guard(
+                ctx,
+                project_id,
+                ProjectArea::Tests,
+                ProjectPermissionLevel::Write,
+            )
+            .is_some()
+        };
         let Some(fd) = router.flow_dispatcher().cloned() else {
             end_error(&sub, "flow dispatcher unavailable".into());
             return;
@@ -3055,7 +3212,18 @@ fn project_studio_code_assist_stream_handler(
 
         let mut stream = exec.stream;
         let mut full_text = String::new();
-        while let Some(item) = stream.next().await {
+        loop {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, stream.next()).await;
+            if !allowed(&ctx, &project_id) {
+                cancel.cancel();
+                end_error(&sub, "project test access denied".into());
+                return;
+            }
+            let item = match received {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
             match item {
                 Ok(EnvelopeDelta::Llm(c)) => {
                     if c.text_delta.is_empty() {
@@ -3081,11 +3249,35 @@ fn project_studio_code_assist_stream_handler(
                 }
             }
         }
-        if let Ok(outcome) = exec.outcome.await {
-            if let Some(e) = outcome.error {
-                end_error(&sub, e);
+        let mut outcome = exec.outcome;
+        let outcome = loop {
+            let received = tokio::time::timeout(CS_REVALIDATE_EVERY, &mut outcome).await;
+            if !allowed(&ctx, &project_id) {
+                cancel.cancel();
+                end_error(&sub, "project test access denied".into());
                 return;
             }
+            match received {
+                Ok(outcome) => break outcome,
+                Err(_) => continue,
+            }
+        };
+        match outcome {
+            Ok(outcome) => {
+                if let Some(error) = outcome.error {
+                    end_error(&sub, error);
+                    return;
+                }
+            }
+            Err(_) => {
+                end_error(&sub, "flow execution failed".into());
+                return;
+            }
+        }
+        if !allowed(&ctx, &project_id) {
+            cancel.cancel();
+            end_error(&sub, "project test access denied".into());
+            return;
         }
         let _ = push_end_async(
             &sub,
@@ -6831,5 +7023,667 @@ mod tests {
             "the facts node must have run and found nothing — a missing key would \
              mean the hop was gated off before it ever looked"
         );
+    }
+    #[tokio::test]
+    async fn project_try_run_requires_test_write_and_environment_read_at_start_and_cancel() {
+        use super::super::subscription::{SubscriptionKey, SubscriptionRegistry};
+        use super::super::HandlerContext;
+        use crate::project_studio::{auto_runs, models::MemberInput, project_db, repository};
+        use crate::services::rbac::middleware::OrgContext;
+        use tentaflow_protocol::project_studio::access::{
+            ProjectArea, ProjectAreaGrantWire, ProjectFunctionWire, ProjectPermissionLevel,
+        };
+        use tentaflow_protocol::project_studio::ProjectStudioPayload;
+        use tentaflow_protocol::{MessageBody, ProtocolErrorCode, SessionAuth};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
+        let project_id = format!("try-grants-{}", uuid::Uuid::new_v4());
+        let actor = format!("actor-{project_id}");
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project directory");
+        repository::create_project(
+            &project_id,
+            "org-try-grants",
+            &project_id,
+            "",
+            "custom",
+            "[\"tests\"]",
+            "try-grants-owner",
+            &dir.to_string_lossy(),
+            &[],
+        )
+        .expect("project");
+        let mut function = ProjectFunctionWire {
+            function_id: "try-author".into(),
+            name: "Try author".into(),
+            description: String::new(),
+            builtin: false,
+            grants: ProjectArea::ALL
+                .iter()
+                .map(|&area| ProjectAreaGrantWire {
+                    area,
+                    level: if area == ProjectArea::Tests {
+                        ProjectPermissionLevel::Write
+                    } else {
+                        ProjectPermissionLevel::None
+                    },
+                })
+                .collect(),
+        };
+        repository::save_function(&project_id, &function).expect("function");
+        repository::add_members(
+            &project_id,
+            &[MemberInput {
+                user_id: actor.clone(),
+                functions: vec![function.function_id.clone()],
+                project_admin: false,
+                expires_at: None,
+            }],
+            "try-grants-owner",
+        )
+        .expect("actor");
+        let pool = project_db::open(&project_id).expect("content");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute("INSERT INTO environments(environment_id,name,env_type,base_url,auth_type,approval_status,is_private_address,requested_by) \
+                VALUES('try-env','Try environment','api','http://127.0.0.1:8090','none','approved',1,'try-grants-owner')", []).expect("approved environment");
+            conn.execute("INSERT INTO test_cases(case_id,kind,title,language,content_json,status,created_by) \
+                VALUES('try-case','api','Try case','python',?1,'approved','try-grants-owner')",
+                [r#"{"script":"def test_smoke(api_client): assert True"}"#]).expect("code case");
+        }
+        let state = super::super::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(
+            &state,
+            "projekty",
+            &["project_studio.read"],
+        );
+        let ctx = || HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0x76; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: actor.clone(),
+                org_id: "org-try-grants".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        let registry = SubscriptionRegistry::new();
+        let handler =
+            find_stream_handler("ProjectStudioTryRunStartRequest").expect("stream registered");
+        for (correlation, environment_allowed) in [(1, false), (2, true)] {
+            if environment_allowed {
+                function
+                    .grants
+                    .iter_mut()
+                    .find(|grant| grant.area == ProjectArea::Environments)
+                    .expect("environment cell")
+                    .level = ProjectPermissionLevel::Read;
+                repository::save_function(&project_id, &function)
+                    .expect("explicit environment grant");
+            }
+            let (sub, mut rx) = registry.create(SubscriptionKey::new(0, correlation), None);
+            (handler.handler_fn)(
+                MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunStartRequest {
+                    project_id: project_id.clone(),
+                    try_id: format!("try-{correlation}-{project_id}"),
+                    case_id: "try-case".into(),
+                    environment_id: "try-env".into(),
+                    content_json_override: String::new(),
+                    language: "python".into(),
+                    perf_profile_json: "{}".into(),
+                }),
+                ctx(),
+                sub,
+            );
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("stream response")
+                .expect("terminal frame");
+            let SubscriptionEvent::End(Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::TryRunStreamEnd {
+                    error: Some(error), ..
+                },
+            ))) = frame
+            else {
+                panic!("unexpected frame: {frame:?}")
+            };
+            if environment_allowed {
+                assert!(
+                    error.contains("no running test runner"),
+                    "authorized request reaches real runner discovery: {error}"
+                );
+            } else {
+                assert_eq!(error, "environment access denied");
+            }
+        }
+        let try_id = format!("cancel-{project_id}");
+        let cancel = auto_runs::register_try_run(&try_id, &actor).expect("registered try");
+        function
+            .grants
+            .iter_mut()
+            .find(|grant| grant.area == ProjectArea::Environments)
+            .expect("environment cell")
+            .level = ProjectPermissionLevel::None;
+        repository::save_function(&project_id, &function).expect("remove environment grant");
+        let cancel_request =
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunCancelRequest {
+                project_id: project_id.clone(),
+                try_id: try_id.clone(),
+            });
+        assert_eq!(
+            super::super::project_studio::project_studio_dispatch(&cancel_request, &ctx())
+                .await
+                .expect_err("cancel also reads execution environment")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        function
+            .grants
+            .iter_mut()
+            .find(|grant| grant.area == ProjectArea::Environments)
+            .expect("environment cell")
+            .level = ProjectPermissionLevel::Read;
+        repository::save_function(&project_id, &function).expect("restore environment grant");
+        assert!(matches!(
+            super::super::project_studio::project_studio_dispatch(&cancel_request, &ctx())
+                .await
+                .expect("authorized cancel"),
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunCancelResult { ok: true })
+        ));
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        auto_runs::unregister_try_run(&try_id);
+        std::mem::forget(tmp);
+    }
+    #[tokio::test]
+    async fn queued_try_run_rechecks_revocation_and_cancellation_before_any_submit() {
+        use super::super::subscription::{SubscriptionKey, SubscriptionRegistry};
+        use super::super::HandlerContext;
+        use crate::project_studio::{
+            auto_runs, environments, models::MemberInput, project_db, repository,
+        };
+        use crate::services::rbac::middleware::OrgContext;
+        use crate::services::transport::Transport;
+        use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use tentaflow_protocol::project_studio::ProjectStudioPayload;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        let state = super::super::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(
+            &state,
+            "projekty",
+            &["project_studio.read"],
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
+        let project_id = format!("try-queue-{}", uuid::Uuid::new_v4());
+        let actor = format!("actor-{project_id}");
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project directory");
+        repository::create_project(
+            &project_id,
+            "org-try-queue",
+            &project_id,
+            "",
+            "custom",
+            "[\"tests\"]",
+            "queue-owner",
+            &dir.to_string_lossy(),
+            &[MemberInput {
+                user_id: actor.clone(),
+                functions: vec!["tester".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .expect("project");
+        let pool = project_db::open(&project_id).expect("content");
+        let secret =
+            environments::encrypt_secret(&state.settings_cipher, "QUEUE-ENVIRONMENT-SECRET")
+                .expect("encrypted environment");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute("INSERT INTO environments(environment_id,name,env_type,base_url,auth_type,secret_enc,approval_status,is_private_address,requested_by) \
+                VALUES('queue-env','Queue environment','api','http://127.0.0.1:8090','bearer',?1,'approved',1,'queue-owner')", [secret]).expect("approved environment");
+            conn.execute("INSERT INTO test_cases(case_id,kind,title,language,content_json,status,created_by) \
+                VALUES('queue-case','api','Queue case','python',?1,'approved','queue-owner')", [r#"{"script":"def test_smoke(api_client): assert True"}"#]).expect("code case");
+        }
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("runner listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server_stop = stop.clone();
+        let server_submissions = submissions.clone();
+        let server_health = health_requests.clone();
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed) {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .expect("read timeout");
+                let mut bytes = [0; 16_384];
+                let count = match socket.read(&mut bytes) {
+                    Ok(0) => continue,
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => panic!("runner request: {error}"),
+                };
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let body = if request.starts_with("GET /health ") {
+                    server_health.fetch_add(1, Ordering::Relaxed);
+                    r#"{"isolated":true,"toolchains":[{"language":"python"}]}"#
+                } else if request.starts_with("POST /runs ") {
+                    server_submissions.fetch_add(1, Ordering::Relaxed);
+                    r#"{"job_id":"queue-job"}"#
+                } else if request.contains("/status ") {
+                    r#"{"status":"completed","items":[]}"#
+                } else {
+                    "{}"
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).expect("runner response");
+            }
+        });
+        let mut service = NewService::minimal(
+            auto_runs::RUNNER_ENGINE_ID,
+            DeployMethod::External,
+            Transport::HttpDirect,
+        );
+        service.category = auto_runs::RUNNER_CATEGORY.into();
+        service.status = ServiceStatus::Running;
+        service.endpoint_url = Some(endpoint);
+        crate::services_repo::services::insert(&state.db.write().expect("core write"), &service)
+            .expect("runner service");
+        let ctx = || HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0x78; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: actor.clone(),
+                org_id: "org-try-queue".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        let registry = SubscriptionRegistry::new();
+        let handler =
+            find_stream_handler("ProjectStudioTryRunStartRequest").expect("stream handler");
+        let mut errors = Vec::new();
+        for (correlation, scenario) in [(1, "revoked"), (2, "cancelled")] {
+            let held_slots = auto_runs::try_run_semaphore()
+                .acquire_many(2)
+                .await
+                .expect("occupy both execution slots");
+            crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                "UPDATE project_members SET expires_at = NULL WHERE project_id = ?1 AND user_id = ?2", rusqlite::params![project_id, actor],
+            ).expect("active initial grant");
+            let try_id = format!("{scenario}-{project_id}");
+            let (sub, mut rx) = registry.create(SubscriptionKey::new(0, correlation), None);
+            (handler.handler_fn)(
+                MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunStartRequest {
+                    project_id: project_id.clone(),
+                    try_id: try_id.clone(),
+                    case_id: "queue-case".into(),
+                    environment_id: "queue-env".into(),
+                    content_json_override: String::new(),
+                    language: "python".into(),
+                    perf_profile_json: "{}".into(),
+                }),
+                ctx(),
+                sub,
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while health_requests.load(Ordering::Relaxed) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "real runner discovery never completed"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv())
+                    .await
+                    .is_err(),
+                "held execution slots keep the authorized try queued"
+            );
+            if scenario == "revoked" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                    "UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = ?2", rusqlite::params![project_id, actor],
+                ).expect("revoke while queued");
+            } else {
+                assert!(
+                    auto_runs::cancel_try_run(&try_id, &actor),
+                    "queued try has registered its existing cancel flag"
+                );
+            }
+            drop(held_slots);
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("queued try ends after slot release")
+                .expect("terminal frame");
+            let SubscriptionEvent::End(Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::TryRunStreamEnd {
+                    error: Some(error), ..
+                },
+            ))) = frame
+            else {
+                panic!("unexpected frame: {frame:?}")
+            };
+            errors.push(error);
+            assert!(
+                !auto_runs::cancel_try_run(&try_id, &actor),
+                "denied queued try is unregistered"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        server.join().expect("runner server");
+        assert!(errors[0].contains("execution access denied"));
+        assert!(errors[1].contains("cancelled"));
+        assert_eq!(
+            submissions.load(Ordering::Relaxed),
+            0,
+            "neither revoked nor cancelled queued work may submit its environment secret"
+        );
+        assert_eq!(auto_runs::try_run_semaphore().available_permits(), 2);
+        std::mem::forget(tmp);
+    }
+
+    #[tokio::test]
+    async fn project_chat_and_assist_recheck_idle_and_final_outcome_before_reply() {
+        use super::super::subscription::{SubscriptionKey, SubscriptionRegistry};
+        use super::super::HandlerContext;
+        use crate::db::models::{AgentParams, FlowParams};
+        use crate::project_studio::ingest::access_test_support::{
+            advertise_model, DelayedModel, ModelReply,
+        };
+        use crate::project_studio::{models::MemberInput, project_db, repository};
+        use crate::services::rbac::middleware::OrgContext;
+        use tentaflow_protocol::project_studio::ProjectStudioPayload;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        for surface in ["chat", "assist"] {
+            for boundary in ["idle", "outcome"] {
+                let state = super::super::state::AppState::for_test();
+                super::super::app_gate::test_support::install_app(
+                    &state,
+                    "projekty",
+                    &["project_studio.read"],
+                );
+                let root = tempfile::tempdir().expect("tempdir");
+                let _ = crate::project_studio::db::init(&root.path().join("projects.db"));
+                let project_id = format!("stream-auth-{}", uuid::Uuid::new_v4());
+                let actor = format!("actor-{project_id}");
+                let dir = root.path().join(&project_id);
+                std::fs::create_dir_all(&dir).expect("project directory");
+                repository::create_project(
+                    &project_id,
+                    "org-stream-auth",
+                    &project_id,
+                    "",
+                    "custom",
+                    "[\"knowledge\",\"chat\",\"tests\"]",
+                    "stream-owner",
+                    &dir.to_string_lossy(),
+                    &[MemberInput {
+                        user_id: actor.clone(),
+                        functions: vec!["developer".into(), "tester".into()],
+                        project_admin: false,
+                        expires_at: None,
+                    }],
+                )
+                .expect("project");
+                let pool = project_db::open(&project_id).expect("content");
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                let agent_id = format!("access-{suffix}");
+                let entry_model = format!("project-flow-{suffix}");
+                let leaf_model = format!("http-model-{suffix}");
+                let agent = AgentParams {
+                    id: &agent_id,
+                    name: &agent_id,
+                    display_name: None,
+                    description: "Controlled project reply",
+                    system_prompt: None,
+                    model: Some(&entry_model),
+                    tools_json: "[]",
+                    skills_json: "{}",
+                    params_json: "{}",
+                    max_iterations: 1,
+                    timeout_secs: 60,
+                    max_subagents: 0,
+                    max_spawn_depth: 1,
+                    flow_id: None,
+                    routable: true,
+                    is_enabled: true,
+                    on_child_complete: "notify",
+                    allowed_agents_json: None,
+                    runtime_json: crate::agents::LLM_RUNTIME_JSON,
+                    actor_user_id: None,
+                };
+                // Chat bindings resolve through the core directory, while assist uses the request's core DB.
+                crate::db::repository::upsert_agent(
+                    &crate::db::global_pool().expect("core directory"),
+                    &agent,
+                )
+                .expect("chat binding agent");
+                crate::db::repository::upsert_agent(&state.db, &agent)
+                    .expect("assist binding agent");
+                repository::set_setting(
+                    &pool,
+                    "agents",
+                    &serde_json::json!({"chat":agent_id,"generator_api":agent_id}).to_string(),
+                )
+                .expect("project bindings");
+                let graph = serde_json::json!({"nodes":[
+                    {"id":"trigger","type":"trigger","config":{}},
+                    {"id":"answer","type":"llm","config":{"model":leaf_model}},
+                    {"id":"output","type":"output","config":{"mode":"stream"}}
+                ],"edges":[
+                    {"from_node":"trigger","to_node":"answer","from_port":"text","to_port":"in","data_type":"text"},
+                    {"from_node":"answer","to_node":"output","from_port":"stream","to_port":"text","data_type":"text"}
+                ]}).to_string();
+                let flow =
+                    crate::db::repository::get_flow(&state.db, crate::db::seed::RAG_QUERY_FLOW_ID)
+                        .expect("flow")
+                        .expect("seeded RAG flow");
+                crate::db::repository::update_flow(
+                    &state.db,
+                    &flow.id,
+                    flow.version,
+                    &FlowParams {
+                        name: "Controlled project response",
+                        description: Some("Real streaming authorization regression"),
+                        is_default: false,
+                        service_type: Some("chat"),
+                        flow_json: &graph,
+                        status: "active",
+                        published_model_name: None,
+                        actor_user_id: None,
+                    },
+                )
+                .expect("real LLM flow");
+                crate::db::repository::create_flow_model_binding(
+                    &state.db,
+                    &flow.id,
+                    &entry_model,
+                    100,
+                )
+                .expect("assist entry binding");
+                let mut http = DelayedModel::new(
+                    &leaf_model,
+                    if boundary == "idle" {
+                        ModelReply::IdleChat
+                    } else {
+                        ModelReply::ChatToken
+                    },
+                );
+                advertise_model(&state, "llm", &leaf_model, &http.endpoint);
+                let chat = repository::create_chat(&project_id, &actor, "Authorization turn")
+                    .expect("private chat");
+                let ctx = HandlerContext {
+                    session: SessionAuth::UserSession {
+                        user_id: [0x79; 16],
+                        role: None,
+                    },
+                    correlation_id: 1,
+                    connection_id: 0,
+                    resume_secret: None,
+                    state: state.clone(),
+                    origin: crate::dispatch::RequestOrigin::Local,
+                    org_context: Some(OrgContext {
+                        user_id: actor.clone(),
+                        org_id: "org-stream-auth".into(),
+                        role_id: "role-test".into(),
+                        permissions: Default::default(),
+                    }),
+                };
+                if boundary == "outcome" {
+                    let registry_path: String = crate::project_studio::db::pool()
+                        .expect("registry")
+                        .read()
+                        .expect("read")
+                        .query_row(
+                            "SELECT file FROM pragma_database_list WHERE name='main'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .expect("registry file");
+                    let conn = state.db.write().expect("core write");
+                    conn.execute("ATTACH DATABASE ?1 AS project_registry", [&registry_path])
+                        .expect("attach registry for final audit boundary");
+                    conn.execute_batch(&format!("CREATE TEMP TRIGGER revoke_project_outcome AFTER UPDATE OF status ON flow_executions WHEN NEW.status='completed' \
+                        BEGIN UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id='{project_id}' AND user_id='{actor}'; END;")).expect("revoke during the actual completed-flow audit before outcome delivery");
+                }
+                let registry = SubscriptionRegistry::new();
+                let (sub, mut rx) = registry.create(SubscriptionKey::new(0, 1), None);
+                let (name, request) = if surface == "chat" {
+                    (
+                        "ProjectStudioChatStreamRequest",
+                        MessageBody::ProjectStudioBody(ProjectStudioPayload::ChatStreamRequest {
+                            project_id: project_id.clone(),
+                            chat_id: chat.chat_id.clone(),
+                            message: "Explain this project".into(),
+                        }),
+                    )
+                } else {
+                    (
+                        "ProjectStudioCodeAssistRequest",
+                        MessageBody::ProjectStudioBody(ProjectStudioPayload::CodeAssistRequest {
+                            project_id: project_id.clone(),
+                            case_id: String::new(),
+                            kind: "api".into(),
+                            selection: "assert True".into(),
+                            instruction: "Improve this assertion".into(),
+                            full_content: "def test_api(api_client): assert True".into(),
+                        }),
+                    )
+                };
+                (find_stream_handler(name)
+                    .expect("registered handler")
+                    .handler_fn)(request, ctx, sub);
+                http.wait_request().await;
+                if boundary == "idle" {
+                    crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                        "UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project_id, actor],
+                    ).expect("revoke while model stays silent");
+                } else {
+                    http.release();
+                }
+                let terminal = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                    loop {
+                        let frame = rx.recv().await.expect("authorization terminal frame");
+                        if let SubscriptionEvent::End(body) = frame {
+                            break body.expect("terminal body");
+                        }
+                    }
+                })
+                .await
+                .expect("idle/final authorization revalidation must terminate the stream");
+                match terminal {
+                    MessageBody::ProjectStudioBody(ProjectStudioPayload::ChatStreamEnd {
+                        status,
+                        error: Some(error),
+                        message_id,
+                        ..
+                    }) => {
+                        assert_eq!(surface, "chat");
+                        assert_eq!(status, "error");
+                        assert!(error.contains("access denied"), "{error}");
+                        assert!(message_id.is_empty());
+                    }
+                    MessageBody::ProjectStudioBody(ProjectStudioPayload::CodeAssistStreamEnd {
+                        proposal,
+                        error: Some(error),
+                    }) => {
+                        assert_eq!(surface, "assist");
+                        assert!(error.contains("access denied"), "{error}");
+                        assert!(
+                            proposal.is_empty(),
+                            "a revoked run cannot return its final proposal"
+                        );
+                    }
+                    other => panic!("revoked {surface}/{boundary} produced {other:?}"),
+                }
+                let replies: i64 = state.db.read().expect("read").query_row("SELECT COUNT(*) FROM conversation_messages WHERE session_id=?1 AND role='assistant'", [&chat.session_id], |row| row.get(0)).expect("persisted replies");
+                assert_eq!(
+                    replies, 0,
+                    "a revoked {surface}/{boundary} may not persist a reply"
+                );
+                if boundary == "idle" {
+                    http.release();
+                }
+                http.finish();
+                if boundary == "outcome" {
+                    let conn = state.db.write().expect("core write");
+                    conn.execute_batch(
+                        "DROP TRIGGER revoke_project_outcome; DETACH DATABASE project_registry;",
+                    )
+                    .expect("remove audit boundary fixture");
+                    let member = repository::member_access(&project_id, &actor)
+                        .expect("member")
+                        .expect("record");
+                    assert!(
+                        !member.is_active(),
+                        "the real flow outcome audit executed the revocation"
+                    );
+                }
+                std::mem::forget(root);
+            }
+        }
     }
 }

@@ -15,6 +15,9 @@
 //     path is the module that walks it, not a flag on the wire.
 
 use std::collections::{HashMap, HashSet};
+use tentaflow_protocol::project_studio::access::{
+    ProjectAccessWire, ProjectArea, ProjectPermissionLevel,
+};
 
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, OptionalExtension};
@@ -115,6 +118,8 @@ pub fn insert(
             created_by
         ],
     )?;
+    drop(conn);
+    super::repository::set_setting(pool, CAPABILITY_MAP_MIGRATED, "1")?;
     Ok(())
 }
 
@@ -161,31 +166,23 @@ fn granted_key(link_id: &str) -> String {
     format!("ml_link_granted:{link_id}")
 }
 
-fn granted_users(pool: &DbPool, link_id: &str) -> HashSet<String> {
-    super::repository::get_setting(pool, &granted_key(link_id))
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .map(|list| list.into_iter().collect())
-        .unwrap_or_default()
+fn granted_users(pool: &DbPool, link_id: &str) -> Result<HashSet<String>> {
+    let Some(raw) = super::repository::get_setting(pool, &granted_key(link_id))? else {
+        return Ok(HashSet::new());
+    };
+    Ok(serde_json::from_str::<Vec<String>>(&raw)?
+        .into_iter()
+        .collect())
 }
 
-fn set_granted_users(pool: &DbPool, link_id: &str, users: &HashSet<String>) {
+fn set_granted_users(pool: &DbPool, link_id: &str, users: &HashSet<String>) -> Result<()> {
     let mut list: Vec<&String> = users.iter().collect();
     list.sort();
-    if let Err(e) = super::repository::set_setting(
-        pool,
-        &granted_key(link_id),
-        &serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()),
-    ) {
-        tracing::warn!(link_id, "ml link grant ledger write failed: {e}");
-    }
+    super::repository::set_setting(pool, &granted_key(link_id), &serde_json::to_string(&list)?)
 }
 
-fn clear_granted_users(pool: &DbPool, link_id: &str) {
-    if let Err(e) = super::repository::set_setting(pool, &granted_key(link_id), "[]") {
-        tracing::warn!(link_id, "ml link grant ledger clear failed: {e}");
-    }
+fn clear_granted_users(pool: &DbPool, link_id: &str) -> Result<()> {
+    super::repository::set_setting(pool, &granted_key(link_id), "[]")
 }
 
 /// Switches the sync off after an unrecoverable authorization failure. An
@@ -209,54 +206,220 @@ fn disable_sync(pool: &DbPool, link_id: &str) {
 /// Default project-role → ML-role mapping: everyone who may change project
 /// content becomes an ML editor, everyone else a viewer.
 pub fn default_role_map() -> Vec<(String, String)> {
-    [
-        ("owner", "editor"),
-        ("manager", "editor"),
-        ("editor", "editor"),
-        ("tester", "viewer"),
-        ("viewer", "viewer"),
-    ]
-    .into_iter()
-    .map(|(p, m)| (p.to_string(), m.to_string()))
-    .collect()
+    [("read", "viewer"), ("write", "editor"), ("admin", "editor")]
+        .into_iter()
+        .map(|(level, role)| (level.to_string(), role.to_string()))
+        .collect()
 }
 
 pub fn role_map_from_json(json: &str) -> Vec<(String, String)> {
-    match serde_json::from_str::<Vec<(String, String)>>(json) {
-        Ok(map) if !map.is_empty() => map,
-        _ => default_role_map(),
-    }
+    serde_json::from_str::<Vec<(String, String)>>(json)
+        .ok()
+        .filter(|map| validate_role_map(map).is_ok())
+        .unwrap_or_default()
 }
 
 pub fn role_map_to_json(map: &[(String, String)]) -> String {
     serde_json::to_string(map).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Validates a wire-supplied mapping: known project roles, ML roles limited to
-/// editor/viewer, no duplicates.
 pub fn validate_role_map(map: &[(String, String)]) -> Result<()> {
-    let mut seen: Vec<&str> = Vec::with_capacity(map.len());
-    for (project_role, ml_role) in map {
-        if super::models::ProjectRole::from_slug(project_role).is_none() {
-            bail!("unknown project role '{project_role}'");
+    let mut seen = HashSet::new();
+    for (level, role) in map {
+        if !["read", "write", "admin"].contains(&level.as_str()) {
+            bail!("unknown project permission level '{level}'");
         }
-        if !ML_ROLES.contains(&ml_role.as_str()) {
-            bail!("ML Studio only grants 'editor' or 'viewer' (got '{ml_role}')");
+        if !ML_ROLES.contains(&role.as_str()) || (level == "read" && role != "viewer") {
+            bail!("ML role exceeds project capability");
         }
-        if seen.contains(&project_role.as_str()) {
-            bail!("duplicate mapping for role '{project_role}'");
+        if !seen.insert(level) {
+            bail!("duplicate mapping for permission level '{level}'");
         }
-        seen.push(project_role);
     }
     Ok(())
 }
 
-/// ML role for one project role, or `None` when the mapping drops it (a role
-/// left out of the map gets NO ML access).
-fn ml_role_for(map: &[(String, String)], project_role: &str) -> Option<String> {
+fn ml_role_for(map: &[(String, String)], access: &ProjectAccessWire) -> Option<String> {
+    let level = if access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Write) {
+        if access.level(ProjectArea::Knowledge) == ProjectPermissionLevel::Admin {
+            "admin"
+        } else {
+            "write"
+        }
+    } else if access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read) {
+        "read"
+    } else {
+        return None;
+    };
     map.iter()
-        .find(|(p, _)| p == project_role)
-        .map(|(_, m)| m.clone())
+        .find(|(key, _)| key == level)
+        .map(|(_, role)| role.clone())
+}
+
+const CAPABILITY_MAP_MIGRATED: &str = "ml_capability_map_migrated";
+
+pub fn migrate_capability_maps(pool: &DbPool) -> Result<()> {
+    if super::repository::get_setting(pool, CAPABILITY_MAP_MIGRATED)?.is_some() {
+        return Ok(());
+    }
+    for link in list(pool)? {
+        let parsed = serde_json::from_str::<Vec<(String, String)>>(&link.role_map_json).ok();
+        let map = match parsed {
+            Some(old) if old.is_empty() => default_role_map(),
+            Some(old)
+                if old.iter().any(|(key, _)| {
+                    ["owner", "manager", "editor", "tester", "viewer"].contains(&key.as_str())
+                }) =>
+            {
+                let mut migrated = Vec::new();
+                if old
+                    .iter()
+                    .any(|(key, _)| key == "tester" || key == "viewer")
+                {
+                    migrated.push(("read".to_string(), "viewer".to_string()));
+                }
+                if let Some((_, role)) = old.iter().find(|(key, _)| key == "editor") {
+                    if ML_ROLES.contains(&role.as_str()) {
+                        migrated.push(("write".to_string(), role.clone()));
+                    }
+                }
+                let admin_roles = old.iter().filter(|(key, role)| {
+                    (key == "owner" || key == "manager") && ML_ROLES.contains(&role.as_str())
+                });
+                if let Some(role) = admin_roles
+                    .map(|(_, role)| role)
+                    .max_by_key(|role| role.as_str() == "editor")
+                {
+                    migrated.push(("admin".to_string(), role.clone()));
+                }
+                migrated
+            }
+            Some(map) if validate_role_map(&map).is_ok() => map,
+            _ => Vec::new(),
+        };
+        let conn = pool.write().map_err(write_err)?;
+        conn.execute(
+            "UPDATE ml_links SET role_map_json = ?2 WHERE link_id = ?1",
+            params![link.link_id, role_map_to_json(&map)],
+        )?;
+    }
+    super::repository::set_setting(pool, CAPABILITY_MAP_MIGRATED, "1")?;
+    Ok(())
+}
+
+pub fn restore_grant_index() -> Result<()> {
+    let registry = super::db::pool()?;
+    let projects = {
+        let conn = registry.read().map_err(read_err)?;
+        let mut stmt =
+            conn.prepare("SELECT project_id, dir_path FROM projects ORDER BY project_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (project_id, dir_path) in projects {
+        if !std::path::Path::new(&dir_path).join("project.db").is_file() {
+            bail!("project '{project_id}' database missing during ML grant index restore");
+        }
+        let (pool, _) = super::project_db::open_pool_at(std::path::Path::new(&dir_path))?;
+        migrate_capability_maps(&pool)?;
+        for link in list(&pool)? {
+            let users = granted_users(&pool, &link.link_id)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            super::repository::replace_ml_grants(
+                &project_id,
+                &link.link_id,
+                &link.ml_project_id,
+                &users,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn relinquish_membership(ml_project_id: &str, user_id: &str) -> Result<()> {
+    let origins = super::repository::ml_grant_origins(ml_project_id, user_id)?;
+    for (project_id, link_id) in origins {
+        let pool = super::project_db::open(&project_id)?;
+        let mut conn = pool.write().map_err(write_err)?;
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [granted_key(&link_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut users = match raw {
+            Some(raw) => serde_json::from_str::<Vec<String>>(&raw)?,
+            None => Vec::new(),
+        };
+        users.retain(|user| user != user_id);
+        tx.execute("INSERT INTO settings(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![granted_key(&link_id), serde_json::to_string(&users)?])?;
+        tx.execute("INSERT INTO settings(key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [format!("ml_link_manual:{link_id}:{user_id}")])?;
+        tx.commit()?;
+    }
+    super::repository::remove_ml_grant(ml_project_id, user_id)
+}
+
+pub fn current_member_role(
+    ml_project_id: &str,
+    user_id: &str,
+    stored: Option<String>,
+) -> Result<Option<String>> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    if stored == "owner" {
+        return Ok(Some(stored));
+    }
+    let origins = super::repository::ml_grant_origins(ml_project_id, user_id)?;
+    if origins.is_empty() {
+        return Ok(Some(stored));
+    }
+    let org_id: Option<String> = {
+        let ml = crate::ml_studio::db::pool()?;
+        let conn = ml.read().map_err(read_err)?;
+        conn.query_row(
+            "SELECT org_id FROM projects WHERE project_id = ?1",
+            [ml_project_id],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    let Some(org_id) = org_id else {
+        return Ok(None);
+    };
+    let mut desired = None;
+    for (project_id, link_id) in origins {
+        let Some(project) = super::repository::get_project(&org_id, &project_id)? else {
+            continue;
+        };
+        let access = super::repository::project_access(&project, user_id, false)?;
+        let pool = super::project_db::open(&project_id)?;
+        let Some(link) = get(&pool, &link_id)? else {
+            continue;
+        };
+        if link.ml_project_id != ml_project_id {
+            continue;
+        }
+        if let Some(role) = ml_role_for(&role_map_from_json(&link.role_map_json), &access) {
+            if role == "editor" || desired.is_none() {
+                desired = Some(role);
+            }
+        }
+    }
+    Ok(desired.map(|role| {
+        if stored == "viewer" {
+            stored.clone()
+        } else {
+            role
+        }
+    }))
 }
 
 // =============================================================================
@@ -433,17 +596,16 @@ pub struct SyncOutcome {
 
 /// Owner of the ML project, verified to still exist in the core user directory.
 /// `None` means the link can no longer write anything.
-fn available_owner(ml_project_id: &str) -> Option<String> {
-    let owner = crate::ml_studio::repository::list_members(ml_project_id)
-        .ok()?
+fn available_owner(ml_project_id: &str) -> Result<Option<String>> {
+    let Some(owner) = crate::ml_studio::repository::list_members(ml_project_id)?
         .into_iter()
-        .find(|m| m.role == "owner")?
-        .user_id;
-    let core = crate::db::global_pool()?;
-    crate::db::repository::get_user_role(&core, &owner)
-        .ok()
-        .flatten()?;
-    Some(owner)
+        .find(|member| member.role == "owner" && member.status == "active")
+        .map(|member| member.user_id)
+    else {
+        return Ok(None);
+    };
+    let core = crate::db::global_pool().ok_or_else(|| anyhow!("core database unavailable"))?;
+    Ok(crate::db::repository::get_user_role(&core, &owner)?.map(|_| owner))
 }
 
 /// Applies the project's member list to ONE link. Idempotent: it computes the
@@ -456,7 +618,16 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
         record_sync_result(pool, &link.link_id, &outcome.result);
         return outcome;
     }
-    let Some(owner) = available_owner(&link.ml_project_id) else {
+    let owner = match available_owner(&link.ml_project_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            outcome.result = "partial".into();
+            outcome.errors.push(error.to_string());
+            record_sync_result(pool, &link.link_id, &outcome.result);
+            return outcome;
+        }
+    };
+    let Some(owner) = owner else {
         // A link that cannot write must say so: silent drift is worse than a
         // stopped sync, because the project list would keep implying access
         // that ML Studio never granted.
@@ -478,14 +649,40 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
             return outcome;
         }
     };
+    let project = match crate::ml_studio::repository::get_project(&owner, &link.ml_project_id)
+        .and_then(|ml| ml.ok_or_else(|| anyhow!("ML project missing")))
+        .and_then(|ml| super::repository::get_project(&ml.project.org_id, project_id))
+    {
+        Ok(Some(project)) => project,
+        _ => {
+            outcome.result = "partial".into();
+            outcome.errors.push("project unavailable".into());
+            return outcome;
+        }
+    };
     let mut desired: HashMap<String, String> = HashMap::new();
     for member in members {
         if member.user_id == owner {
-            // The ML owner row is never touched — demoting it would lock the
-            // link out of its own project.
             continue;
         }
-        match ml_role_for(&role_map, &member.role) {
+        let manual = super::repository::get_setting(
+            pool,
+            &format!("ml_link_manual:{}:{}", link.link_id, member.user_id),
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if manual {
+            continue;
+        }
+        let access = match super::repository::project_access(&project, &member.user_id, false) {
+            Ok(access) => access,
+            Err(error) => {
+                outcome.errors.push(error.to_string());
+                continue;
+            }
+        };
+        match ml_role_for(&role_map, &access) {
             Some(role) => {
                 desired.insert(member.user_id, role);
             }
@@ -509,9 +706,40 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
         .map(|m| (m.user_id.clone(), m.role.clone()))
         .collect();
 
-    let mut granted = granted_users(pool, &link.link_id);
+    let mut granted = match granted_users(pool, &link.link_id) {
+        Ok(users) => users,
+        Err(error) => {
+            outcome.result = "partial".into();
+            outcome.errors.push(error.to_string());
+            return outcome;
+        }
+    };
+    // Persist provenance before an external membership can become observable.
+    // A failed grant is harmlessly reserved; a successful untracked grant is not.
+    granted.extend(
+        desired
+            .keys()
+            .filter(|user| !current_map.contains_key(*user))
+            .cloned(),
+    );
+    if let Err(error) = set_granted_users(pool, &link.link_id, &granted).and_then(|_| {
+        super::repository::replace_ml_grants(
+            project_id,
+            &link.link_id,
+            &link.ml_project_id,
+            &granted.iter().cloned().collect::<Vec<_>>(),
+        )
+    }) {
+        outcome.result = "partial".into();
+        outcome.errors.push(error.to_string());
+        record_sync_result(pool, &link.link_id, &outcome.result);
+        return outcome;
+    }
     for (user_id, role) in &desired {
         match current_map.get(user_id) {
+            Some(_) if !granted.contains(user_id) => {
+                outcome.skipped += 1;
+            }
             Some(existing) if existing == role => {
                 granted.insert(user_id.clone());
             }
@@ -559,7 +787,20 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
     // A user who is no longer an ML member at all (removed in ML Studio) leaves
     // the ledger too, so a later re-invite there is not treated as ours.
     granted.retain(|user_id| desired.contains_key(user_id) || current_map.contains_key(user_id));
-    set_granted_users(pool, &link.link_id, &granted);
+    if let Err(error) = set_granted_users(pool, &link.link_id, &granted) {
+        outcome.result = "partial".into();
+        outcome.errors.push(error.to_string());
+        record_sync_result(pool, &link.link_id, &outcome.result);
+        return outcome;
+    }
+    if let Err(error) = super::repository::replace_ml_grants(
+        project_id,
+        &link.link_id,
+        &link.ml_project_id,
+        &granted.iter().cloned().collect::<Vec<_>>(),
+    ) {
+        outcome.errors.push(error.to_string());
+    }
 
     outcome.result = if outcome.errors.is_empty() {
         "ok".to_string()
@@ -648,9 +889,21 @@ pub fn create_from_project(
         return Err(anyhow!("ML project created but linking failed: {e}"));
     }
 
-    let (mapped, skipped, granted) =
-        apply_role_map(project_id, &ml_project_id, creator_user_id, role_map);
-    set_granted_users(pool, &link_id, &granted);
+    let (mapped, skipped, granted) = apply_role_map(
+        pool,
+        &link_id,
+        project_id,
+        &ml_project_id,
+        creator_user_id,
+        role_map,
+    )?;
+    set_granted_users(pool, &link_id, &granted)?;
+    super::repository::replace_ml_grants(
+        project_id,
+        &link_id,
+        &ml_project_id,
+        &granted.iter().cloned().collect::<Vec<_>>(),
+    )?;
     record_sync_result(pool, &link_id, "ok");
     Ok((link_id, ml_project_id, mapped, skipped))
 }
@@ -659,15 +912,19 @@ pub fn create_from_project(
 /// they are already the ML owner, and ML Studio refuses a self-invite. Returns
 /// the users actually granted, which seeds the link's grant ledger.
 fn apply_role_map(
+    pool: &DbPool,
+    link_id: &str,
     project_id: &str,
     ml_project_id: &str,
     creator_user_id: &str,
     role_map: &[(String, String)],
-) -> (u32, u32, HashSet<String>) {
+) -> Result<(u32, u32, HashSet<String>)> {
     let mut granted = HashSet::new();
-    let Ok(members) = super::repository::list_members(project_id) else {
-        return (0, 0, granted);
-    };
+    let members = super::repository::list_members(project_id)?;
+    let ml = crate::ml_studio::repository::get_project(creator_user_id, ml_project_id)?
+        .ok_or_else(|| anyhow!("ML project missing"))?;
+    let project = super::repository::get_project(&ml.project.org_id, project_id)?
+        .ok_or_else(|| anyhow!("project unavailable"))?;
     let mut mapped = 0u32;
     let mut skipped = 0u32;
     for member in members {
@@ -675,78 +932,80 @@ fn apply_role_map(
             skipped += 1;
             continue;
         }
-        let Some(role) = ml_role_for(role_map, &member.role) else {
+        let access = super::repository::project_access(&project, &member.user_id, false)?;
+        let Some(role) = ml_role_for(role_map, &access) else {
             skipped += 1;
             continue;
         };
-        let existing = crate::ml_studio::repository::member_role(ml_project_id, &member.user_id)
-            .ok()
-            .flatten();
-        let applied = match existing {
-            Some(current) if current == role => Ok(()),
-            Some(_) => crate::ml_studio::repository::set_member_role(
-                ml_project_id,
-                creator_user_id,
-                &member.user_id,
-                &role,
-            )
-            .map(|_| ()),
-            None => crate::ml_studio::repository::invite_member(
-                ml_project_id,
-                creator_user_id,
-                &member.user_id,
-                &role,
-            )
-            .map(|_| ()),
-        };
-        match applied {
-            Ok(()) => {
-                mapped += 1;
-                granted.insert(member.user_id);
-            }
-            Err(e) => {
-                skipped += 1;
-                tracing::warn!(
+        if crate::ml_studio::repository::member_role(ml_project_id, &member.user_id)?.is_some() {
+            skipped += 1;
+            continue;
+        }
+        granted.insert(member.user_id.clone());
+        set_granted_users(pool, link_id, &granted)?;
+        super::repository::replace_ml_grants(
+            project_id,
+            link_id,
+            ml_project_id,
+            &granted.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        match crate::ml_studio::repository::invite_member(
+            ml_project_id,
+            creator_user_id,
+            &member.user_id,
+            &role,
+        ) {
+            Ok(_) => mapped += 1,
+            Err(error) => {
+                granted.remove(&member.user_id);
+                set_granted_users(pool, link_id, &granted)?;
+                super::repository::replace_ml_grants(
+                    project_id,
+                    link_id,
                     ml_project_id,
-                    user_id = %member.user_id,
-                    "ml role mapping failed: {e}"
-                );
+                    &granted.iter().cloned().collect::<Vec<_>>(),
+                )?;
+                return Err(error);
             }
         }
     }
-    (mapped, skipped, granted)
+    Ok((mapped, skipped, granted))
 }
 
 /// Removes the ML memberships this link granted (never the ML owner) and drops
 /// the link. The ML project itself is never deleted — it may hold datasets and
 /// trained models that outlive the link.
-pub fn detach(pool: &DbPool, link: &MlLinkRecord, revoke_members: bool) -> Result<u32> {
+pub fn detach(
+    pool: &DbPool,
+    project_id: &str,
+    link: &MlLinkRecord,
+    revoke_members: bool,
+) -> Result<u32> {
     let mut removed = 0u32;
-    if revoke_members {
-        if let Some(owner) = available_owner(&link.ml_project_id) {
-            let granted = granted_users(pool, &link.link_id);
-            if let Ok(current) = crate::ml_studio::repository::list_members(&link.ml_project_id) {
-                for member in current {
-                    // Only what this link granted is taken back; the ML
-                    // project's own team outlives the link, like its datasets.
-                    if member.role == "owner" || !granted.contains(&member.user_id) {
-                        continue;
-                    }
-                    if crate::ml_studio::repository::remove_member(
-                        &link.ml_project_id,
-                        &owner,
-                        &member.user_id,
-                    )
-                    .is_ok()
-                    {
-                        removed += 1;
-                    }
-                }
+    if revoke_members && summary(&link.ml_project_id)?.is_some() {
+        let granted = granted_users(pool, &link.link_id)?;
+        let current = crate::ml_studio::repository::list_members(&link.ml_project_id)?;
+        let owned = current
+            .into_iter()
+            .filter(|member| member.role != "owner" && granted.contains(&member.user_id))
+            .collect::<Vec<_>>();
+        if !owned.is_empty() {
+            let owner = available_owner(&link.ml_project_id)?.ok_or_else(|| {
+                anyhow!("ML project owner unavailable; mirrored grants cannot be revoked")
+            })?;
+            for member in owned {
+                crate::ml_studio::repository::remove_member(
+                    &link.ml_project_id,
+                    &owner,
+                    &member.user_id,
+                )?;
+                removed += 1;
             }
         }
     }
     delete(pool, &link.link_id)?;
-    clear_granted_users(pool, &link.link_id);
+    clear_granted_users(pool, &link.link_id)?;
+    super::repository::clear_ml_grants(project_id, &link.link_id)?;
     Ok(removed)
 }
 
@@ -763,48 +1022,97 @@ mod unit_tests {
         pool
     }
 
-    /// The five project roles collapse onto ML Studio's two, a role left out of
-    /// the map grants NOTHING, and a bogus mapping is refused.
+    fn knowledge_access(level: ProjectPermissionLevel) -> ProjectAccessWire {
+        ProjectAccessWire {
+            has_access: true,
+            areas: vec![
+                tentaflow_protocol::project_studio::access::ProjectAreaAccessWire {
+                    area: ProjectArea::Knowledge,
+                    level,
+                    enabled: true,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn role_map_collapses_five_project_roles_onto_two() {
+    fn capability_mapping_is_bounded_and_empty_or_invalid_maps_deny() {
         let map = default_role_map();
-        assert_eq!(map.len(), 5);
-        for (project_role, expected) in [
-            ("owner", "editor"),
-            ("manager", "editor"),
-            ("editor", "editor"),
-            ("tester", "viewer"),
-            ("viewer", "viewer"),
+        assert_eq!(map.len(), 3);
+        for (level, expected) in [
+            (ProjectPermissionLevel::Read, "viewer"),
+            (ProjectPermissionLevel::Write, "editor"),
+            (ProjectPermissionLevel::Admin, "editor"),
         ] {
             assert_eq!(
-                ml_role_for(&map, project_role).as_deref(),
-                Some(expected),
-                "role {project_role} maps wrong"
+                ml_role_for(&map, &knowledge_access(level)).as_deref(),
+                Some(expected)
             );
         }
-        validate_role_map(&map).expect("default map is valid");
-
-        // A partial map drops the roles it omits.
-        let partial = vec![("manager".to_string(), "editor".to_string())];
-        assert_eq!(ml_role_for(&partial, "manager").as_deref(), Some("editor"));
-        assert!(ml_role_for(&partial, "tester").is_none());
-
+        let partial = vec![("admin".to_string(), "editor".to_string())];
+        assert_eq!(
+            ml_role_for(&partial, &knowledge_access(ProjectPermissionLevel::Admin)).as_deref(),
+            Some("editor")
+        );
+        assert!(ml_role_for(&partial, &knowledge_access(ProjectPermissionLevel::Write)).is_none());
         for bad in [
-            vec![("root".to_string(), "editor".to_string())],
-            vec![("manager".to_string(), "owner".to_string())],
+            vec![("owner".into(), "editor".into())],
+            vec![("read".into(), "editor".into())],
+            vec![("write".into(), "owner".into())],
             vec![
-                ("manager".to_string(), "editor".to_string()),
-                ("manager".to_string(), "viewer".to_string()),
+                ("write".into(), "editor".into()),
+                ("write".into(), "viewer".into()),
             ],
         ] {
-            assert!(validate_role_map(&bad).is_err(), "accepted {bad:?}");
+            assert!(validate_role_map(&bad).is_err());
         }
+        assert_eq!(role_map_from_json(&role_map_to_json(&map)), map);
+        assert!(role_map_from_json("nonsense").is_empty());
+        assert!(role_map_from_json("[]").is_empty());
+        assert!(ml_role_for(&[], &knowledge_access(ProjectPermissionLevel::Admin)).is_none());
+    }
 
-        // The JSON round-trip keeps the mapping, and junk falls back to the default.
-        let json = role_map_to_json(&map);
-        assert_eq!(role_map_from_json(&json), map);
-        assert_eq!(role_map_from_json("nonsense"), default_role_map());
-        assert_eq!(role_map_from_json("[]"), default_role_map());
+    #[test]
+    fn legacy_mapping_upgrade_runs_once_and_preserves_new_explicit_deny() {
+        let pool = pool();
+        insert(
+            &pool,
+            "legacy",
+            "ml-legacy",
+            "",
+            "linked_existing",
+            true,
+            r#"[["owner","viewer"],["manager","editor"],["editor","viewer"],["tester","viewer"]]"#,
+            "u",
+        )
+        .expect("link");
+        pool.write()
+            .expect("write")
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                [CAPABILITY_MAP_MIGRATED],
+            )
+            .expect("old marker");
+        migrate_capability_maps(&pool).expect("upgrade");
+        let map = role_map_from_json(
+            &get(&pool, "legacy")
+                .expect("get")
+                .expect("link")
+                .role_map_json,
+        );
+        assert!(map.contains(&("read".into(), "viewer".into())));
+        assert!(map.contains(&("write".into(), "viewer".into())));
+        assert!(map.contains(&("admin".into(), "editor".into())));
+        update(&pool, "legacy", "", true, "[]").expect("explicit deny");
+        migrate_capability_maps(&pool).expect("already upgraded");
+        assert_eq!(
+            get(&pool, "legacy")
+                .expect("get")
+                .expect("link")
+                .role_map_json,
+            "[]"
+        );
     }
 
     /// Link rows: the per-project cap is countable, `ml_project_id` is unique
@@ -888,18 +1196,34 @@ mod unit_tests {
             &format!("Projekt {project_id}"),
             "",
             "tests",
-            "[]",
+            "[\"knowledge\"]",
             &creator,
-            "/tmp/none",
+            &tmp.path().join(&project_id).to_string_lossy(),
             &[
-                (manager.clone(), "manager".to_string()),
-                (tester.clone(), "tester".to_string()),
-                (viewer.clone(), "viewer".to_string()),
+                super::super::models::MemberInput {
+                    user_id: manager.clone(),
+                    functions: vec!["pm".into()],
+                    project_admin: true,
+                    expires_at: None,
+                },
+                super::super::models::MemberInput {
+                    user_id: tester.clone(),
+                    functions: vec!["tester".into()],
+                    project_admin: false,
+                    expires_at: None,
+                },
+                super::super::models::MemberInput {
+                    user_id: viewer.clone(),
+                    functions: vec!["observer".into()],
+                    project_admin: false,
+                    expires_at: None,
+                },
             ],
         )
         .expect("create project");
 
-        let pool = pool();
+        std::fs::create_dir_all(tmp.path().join(&project_id)).expect("project dir");
+        let pool = super::super::project_db::open(&project_id).expect("project db");
         let (link_id, ml_project_id, mapped, skipped) = create_from_project(
             &pool,
             &project_id,
@@ -928,7 +1252,14 @@ mod unit_tests {
         assert_eq!(ml_role(&viewer).as_deref(), Some("viewer"));
 
         // A promoted tester is UPDATED, not re-invited.
-        super::super::repository::set_member_role(&project_id, &tester, "editor").expect("promote");
+        super::super::repository::set_member_access(
+            &project_id,
+            &tester,
+            &["developer".into()],
+            false,
+            None,
+        )
+        .expect("promote");
         let link = get(&pool, &link_id).expect("get").expect("row");
         let outcome = sync_link(&project_id, &pool, &link);
         assert_eq!(outcome.result, "ok", "errors: {:?}", outcome.errors);
@@ -952,7 +1283,7 @@ mod unit_tests {
         assert!(!refreshed.last_sync_at.is_empty());
 
         // A role left OUT of the map grants nothing and is counted as skipped.
-        let narrow = vec![("manager".to_string(), "editor".to_string())];
+        let narrow = vec![("admin".to_string(), "editor".to_string())];
         update(&pool, &link_id, "wizja", true, &role_map_to_json(&narrow)).expect("narrow map");
         let link = get(&pool, &link_id).expect("get").expect("row");
         let outcome = sync_link(&project_id, &pool, &link);
@@ -971,7 +1302,7 @@ mod unit_tests {
         // Detaching with revoke removes what the link granted, never the owner,
         // and leaves the ML project itself in place.
         let link = get(&pool, &link_id).expect("get").expect("row");
-        let removed = detach(&pool, &link, true).expect("detach");
+        let removed = detach(&pool, &project_id, &link, true).expect("detach");
         assert_eq!(removed, 1, "only the mapped manager membership is revoked");
         assert!(ml_role(&manager).is_none());
         assert_eq!(ml_role(&creator).as_deref(), Some("owner"));
@@ -1004,7 +1335,7 @@ mod unit_tests {
             "tests",
             "[]",
             &ghost,
-            "/tmp/none",
+            &tmp.path().join(&project_id).to_string_lossy(),
             &[],
         )
         .expect("create project");
@@ -1017,7 +1348,8 @@ mod unit_tests {
         )
         .expect("ml project");
 
-        let pool = pool();
+        std::fs::create_dir_all(tmp.path().join(&project_id)).expect("project dir");
+        let pool = super::super::project_db::open(&project_id).expect("project db");
         let link_id = uuid::Uuid::new_v4().to_string();
         insert(
             &pool,
@@ -1085,10 +1417,15 @@ mod unit_tests {
             &format!("Projekt {project_id}"),
             "",
             "tests",
-            "[]",
+            "[\"knowledge\"]",
             &owner,
-            "/tmp/none",
-            &[(mate.clone(), "manager".to_string())],
+            &tmp.path().join(&project_id).to_string_lossy(),
+            &[super::super::models::MemberInput {
+                user_id: mate.clone(),
+                functions: vec!["pm".into()],
+                project_admin: true,
+                expires_at: None,
+            }],
         )
         .expect("create project");
 
@@ -1105,7 +1442,8 @@ mod unit_tests {
         crate::ml_studio::repository::invite_member(&ml_project_id, &owner, &outsider, "editor")
             .expect("invite outsider");
 
-        let pool = pool();
+        std::fs::create_dir_all(tmp.path().join(&project_id)).expect("project dir");
+        let pool = super::super::project_db::open(&project_id).expect("project db");
         let link_id = uuid::Uuid::new_v4().to_string();
         insert(
             &pool,
@@ -1146,8 +1484,279 @@ mod unit_tests {
 
         // Detaching takes back nothing else either.
         let link = get(&pool, &link_id).expect("get").expect("row");
-        assert_eq!(detach(&pool, &link, true).expect("detach"), 0);
+        assert_eq!(detach(&pool, &project_id, &link, true).expect("detach"), 0);
         assert_eq!(ml_role(&outsider).as_deref(), Some("editor"));
         assert_eq!(ml_role(&owner).as_deref(), Some("owner"));
+    }
+    #[tokio::test]
+    async fn mirrored_ml_requests_recheck_expiry_and_manual_grants_relinquish_provenance() {
+        use crate::dispatch::{HandlerContext, RequestOrigin};
+        use crate::services::rbac::OrgContext;
+        use tentaflow_protocol::{
+            MessageBody, MlStudioPayload, MlStudioProjectDetailRequest, ProtocolErrorCode,
+            SessionAuth,
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = super::super::db::init(&tmp.path().join("projects.db"));
+        let _ = crate::ml_studio::db::init(&tmp.path().join("ml_studio.db"));
+        let state = crate::dispatch::state::AppState::for_test();
+        let owner = format!("ml-owner-{}", uuid::Uuid::new_v4());
+        let user = format!("ml-member-{}", uuid::Uuid::new_v4());
+        let newcomer = format!("ml-new-{}", uuid::Uuid::new_v4());
+        seed_core_user(&owner);
+        let project_id = format!("ml-expiry-{}", uuid::Uuid::new_v4());
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project directory");
+        super::super::repository::create_project(
+            &project_id,
+            "org-ml",
+            &project_id,
+            "",
+            "custom",
+            "[\"knowledge\"]",
+            &owner,
+            &dir.to_string_lossy(),
+            &[super::super::models::MemberInput {
+                user_id: user.clone(),
+                functions: vec!["developer".into()],
+                project_admin: false,
+                expires_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+            }],
+        )
+        .expect("project");
+        let pool = super::super::project_db::open(&project_id).expect("content db");
+        let (link_id, ml_id, _, _) = create_from_project(
+            &pool,
+            &project_id,
+            "org-ml",
+            &owner,
+            &project_id,
+            "recognition",
+            "",
+            true,
+            &default_role_map(),
+        )
+        .expect("ML link");
+        crate::dispatch::app_gate::test_support::install_app(
+            &state,
+            "ml-studio",
+            &["mlstudio.read", "mlstudio.write"],
+        );
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0x33; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            origin: RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: user.clone(),
+                org_id: "org-ml".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        let request = MessageBody::MlStudioBody(MlStudioPayload::ProjectDetailRequest(
+            MlStudioProjectDetailRequest {
+                project_id: ml_id.clone(),
+            },
+        ));
+        assert!(crate::dispatch::ml_studio::ml_studio_project_detail(&request, &ctx).is_ok());
+        let dataset = crate::ml_studio::repository::create_dataset(
+            &user,
+            &ml_id,
+            "Current access",
+            "distill",
+            1,
+            2,
+            "{}",
+            b"question,answer\nA,B\n",
+        )
+        .expect("real dataset");
+        let run_id = crate::ml_studio::repository::create_training_run(
+            &ml_id,
+            "{}",
+            Some(&dataset.dataset_id),
+        )
+        .expect("real training run");
+        let status_request =
+            MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateStatusRequest(
+                tentaflow_protocol::MlStudioDistillGenerateStatusRequest {
+                    dataset_id: dataset.dataset_id.clone(),
+                },
+            ));
+        let jobs_request = MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewRequest(
+            tentaflow_protocol::MlStudioJobsOverviewRequest {},
+        ));
+        assert!(
+            crate::dispatch::ml_studio::ml_studio_distill_generate_status(&status_request, &ctx)
+                .await
+                .is_ok()
+        );
+        let jobs = crate::dispatch::ml_studio::ml_studio_jobs_overview(&jobs_request, &ctx)
+            .await
+            .expect("jobs before expiry");
+        let MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewResponse(jobs)) = jobs else {
+            panic!("jobs response");
+        };
+        assert!(jobs.jobs.iter().any(|job| job.run_id == run_id));
+
+        super::super::db::pool().expect("registry").write().expect("write")
+            .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = ?2", params![project_id, user]).expect("expire");
+        assert_eq!(
+            crate::ml_studio::db::pool()
+                .expect("ML pool")
+                .read()
+                .expect("read")
+                .query_row(
+                    "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+                    params![ml_id, user],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("cached grant"),
+            "editor"
+        );
+        assert_eq!(
+            crate::dispatch::ml_studio::ml_studio_project_detail(&request, &ctx)
+                .expect_err("current expiry overrides cached grant")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert!(crate::ml_studio::repository::member_role(&ml_id, &user)
+            .expect("current grant")
+            .is_none());
+        assert!(
+            crate::ml_studio::repository::get_dataset(&user, &dataset.dataset_id)
+                .expect("dataset guard")
+                .is_none()
+        );
+        assert!(crate::ml_studio::repository::list_projects(&user)
+            .expect("projects")
+            .iter()
+            .all(|summary| summary.project.project_id != ml_id));
+        assert_eq!(
+            crate::dispatch::ml_studio::ml_studio_distill_generate_status(&status_request, &ctx)
+                .await
+                .expect_err("expired distill status")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        let jobs = crate::dispatch::ml_studio::ml_studio_jobs_overview(&jobs_request, &ctx)
+            .await
+            .expect("jobs after expiry");
+        let MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewResponse(jobs)) = jobs else {
+            panic!("jobs response");
+        };
+        assert!(jobs.jobs.iter().all(|job| job.run_id != run_id));
+        assert_eq!(
+            current_member_role(&ml_id, &owner, Some("owner".into()))
+                .expect("owner remains independent")
+                .as_deref(),
+            Some("owner")
+        );
+
+        super::super::repository::add_members(
+            &project_id,
+            &[super::super::models::MemberInput {
+                user_id: newcomer.clone(),
+                functions: vec!["developer".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+            &owner,
+        )
+        .expect("new member");
+        pool.write().expect("write").execute_batch("CREATE TRIGGER deny_ml_ledger BEFORE INSERT ON settings WHEN NEW.key LIKE 'ml_link_granted:%' BEGIN SELECT RAISE(ABORT, 'ledger write denied'); END;").expect("deny ledger writes");
+        let link = get(&pool, &link_id).expect("get").expect("link");
+        let failed = sync_link(&project_id, &pool, &link);
+        assert_eq!(
+            failed.applied_add, 0,
+            "an untracked grant must not be issued"
+        );
+        assert!(!failed.errors.is_empty());
+        assert!(crate::ml_studio::repository::member_role(&ml_id, &newcomer)
+            .expect("new membership")
+            .is_none());
+        assert!(
+            super::super::repository::ml_grant_origins(&ml_id, &newcomer)
+                .expect("origins")
+                .is_empty()
+        );
+        assert!(
+            relinquish_membership(&ml_id, &user).is_err(),
+            "manual marker and ledger commit together"
+        );
+        assert_eq!(
+            super::super::repository::ml_grant_origins(&ml_id, &user)
+                .expect("old provenance")
+                .len(),
+            1
+        );
+        assert!(super::super::repository::get_setting(
+            &pool,
+            &format!("ml_link_manual:{link_id}:{user}")
+        )
+        .expect("marker")
+        .is_none());
+        pool.write()
+            .expect("write")
+            .execute_batch("DROP TRIGGER deny_ml_ledger;")
+            .expect("allow writes");
+
+        crate::ml_studio::repository::set_member_role(&ml_id, &owner, &user, "editor")
+            .expect("manual grant");
+        relinquish_membership(&ml_id, &user).expect("relinquish");
+        assert!(super::super::repository::ml_grant_origins(&ml_id, &user)
+            .expect("origins")
+            .is_empty());
+        assert!(!granted_users(&pool, &link_id)
+            .expect("ledger")
+            .contains(&user));
+        assert!(
+            crate::dispatch::ml_studio::ml_studio_project_detail(&request, &ctx).is_ok(),
+            "a real manual grant stays independent of project expiry"
+        );
+        let result = sync_link(&project_id, &pool, &link);
+        assert_eq!(result.result, "ok", "{:?}", result.errors);
+        assert_eq!(
+            crate::ml_studio::repository::member_role(&ml_id, &user)
+                .expect("manual membership")
+                .as_deref(),
+            Some("editor")
+        );
+        assert!(super::super::repository::ml_grant_origins(&ml_id, &user)
+            .expect("manual origins")
+            .is_empty());
+        let missing = tmp.path().join("missing-content");
+        super::super::repository::create_project(
+            "0",
+            "org-ml",
+            "Missing content database",
+            "",
+            "custom",
+            "[]",
+            &owner,
+            &missing.to_string_lossy(),
+            &[],
+        )
+        .expect("broken registry fixture");
+        let restore =
+            restore_grant_index().expect_err("startup cannot use a partially restored index");
+        assert!(restore.to_string().contains("project '0' database missing"));
+        assert!(
+            !missing.exists(),
+            "backfill must not create a fresh content database"
+        );
+        assert_eq!(
+            super::super::repository::ml_grant_origins(&ml_id, &newcomer)
+                .expect("valid persisted origin")
+                .len(),
+            1
+        );
+        super::super::repository::delete_project_rows("0").expect("remove broken fixture");
+        std::mem::forget(tmp);
     }
 }

@@ -6521,13 +6521,16 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ProjectStudioBody(ProjectCreateRequest). payload: { name, description, template, modules:[], members:[{userId,role}] }. */
+  /** Creates a project with authoritative member functions and access. */
   projectStudioProjectCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const modules = Array.isArray(payload.modules) ? payload.modules.map(String) : [];
     const members = (Array.isArray(payload.members) ? payload.members : []).map((m) => ({
       user_id: String(m.userId ?? m.user_id ?? ''),
       role: String(m.role ?? ''),
+      functions: (Array.isArray(m.functions) ? m.functions : []).map(String),
+      project_admin: !!(m.projectAdmin ?? m.project_admin ?? false),
+      expires_at: m.expiresAt ?? m.expires_at ?? null,
     }));
     const body = _wasm.encodeProjectStudioProjectCreateRequest(
       String(payload.name ?? ''),
@@ -6593,12 +6596,15 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ProjectStudioBody(MembersAddRequest). payload: { projectId, members:[{userId,role}] }. */
+  /** Adds members with functions, administrator flag and an optional RFC3339 expiry. */
   projectStudioMembersAddRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const members = (Array.isArray(payload.members) ? payload.members : []).map((m) => ({
       user_id: String(m.userId ?? m.user_id ?? ''),
       role: String(m.role ?? ''),
+      functions: (Array.isArray(m.functions) ? m.functions : []).map(String),
+      project_admin: !!(m.projectAdmin ?? m.project_admin ?? false),
+      expires_at: m.expiresAt ?? m.expires_at ?? null,
     }));
     const body = _wasm.encodeProjectStudioMembersAddRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
@@ -6615,6 +6621,54 @@ export const encode = {
       String(payload.userId ?? payload.user_id ?? ''),
       String(payload.role ?? ''),
     );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioCatalogueGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioCatalogueGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioFunctionSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const fn = payload.function ?? {};
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      function: {
+        function_id: String(fn.functionId ?? fn.function_id ?? ''),
+        name: String(fn.name ?? ''),
+        description: String(fn.description ?? ''),
+        builtin: !!fn.builtin,
+        grants: (Array.isArray(fn.grants) ? fn.grants : []).map((grant) => ({
+          area: String(grant.area ?? ''),
+          level: String(grant.level ?? 'none'),
+        })),
+      },
+    };
+    const body = _wasm.encodeProjectStudioFunctionSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioFunctionDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioFunctionDeleteRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.functionId ?? payload.function_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioMemberAccessSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      user_id: String(payload.userId ?? payload.user_id ?? ''),
+      functions: (Array.isArray(payload.functions) ? payload.functions : []).map(String),
+      project_admin: !!(payload.projectAdmin ?? payload.project_admin ?? false),
+      expires_at: payload.expiresAt ?? payload.expires_at ?? null,
+    };
+    const body = _wasm.encodeProjectStudioMemberAccessSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

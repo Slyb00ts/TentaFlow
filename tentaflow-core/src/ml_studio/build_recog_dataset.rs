@@ -261,6 +261,7 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// pattern). `status` is "running" | "succeeded" | "failed".
 #[derive(Clone, Debug)]
 pub struct BuildProgress {
+    pub project_id: String,
     pub status: String,
     pub files_total: u64,
     pub files_done: u64,
@@ -274,6 +275,7 @@ pub struct BuildProgress {
 impl Default for BuildProgress {
     fn default() -> Self {
         BuildProgress {
+            project_id: String::new(),
             status: "running".to_string(),
             files_total: 0,
             files_done: 0,
@@ -376,7 +378,13 @@ pub fn spawn_build(
     }
 
     let build_id = uuid::Uuid::new_v4().to_string();
-    set_progress(&build_id, BuildProgress::default());
+    set_progress(
+        &build_id,
+        BuildProgress {
+            project_id: project_id.clone(),
+            ..Default::default()
+        },
+    );
 
     let build_id_task = build_id.clone();
     tokio::spawn(async move {

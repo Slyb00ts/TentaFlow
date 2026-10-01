@@ -26,6 +26,9 @@ import { Router } from '/js/router.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
+import { openActionMenu, openConfirmWindow } from '/js/lib/actions/index.js';
+import { openHandover } from '/js/modules/org-structure/handover-nav.js';
+import { PROJECT_AREAS, PERMISSION_LEVELS, BUILTIN_FUNCTIONS, allowsArea, canCreateTask, projectTabs, catalogueLabel, memberGroup, expiryToInstant, expiryToLocal } from './project-studio-access.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -58,11 +61,6 @@ import '/js/components/tf-status-pill.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-kanban.js';
 import '/js/components/tf-combobox.js';
-
-// Project roles ordered by capability; assignable set excludes 'owner'
-// (ownership moves only via the explicit transfer action).
-const ROLE_RANK = { viewer: 0, tester: 1, editor: 2, manager: 3, owner: 4 };
-const ASSIGNABLE_ROLES = ['manager', 'editor', 'tester', 'viewer'];
 
 // Wizard templates map 1:1 to the wire `template` field; modules are the
 // initial toggles for step 2 (knowledge is always locked on).
@@ -146,7 +144,7 @@ const ARTIFACT_ICON = {
 // from the server: recomputing them here would disagree with the firing loop
 // around DST transitions.
 const SCHEDULE_KINDS = ['interval', 'cron', 'once'];
-const SCHEDULE_RUN_TYPES = ['manual', 'auto', 'perf'];
+const RUN_TYPES = ['manual', 'auto', 'perf'];
 const SCHEDULE_OUTCOME_CHIP = { started: 'ok', skipped: 'info', blocked: 'warn', error: 'err' };
 const SCHEDULE_LAST_CHIP = {
   running: 'accent', completed: 'ok', cancelled: 'warn', error: 'err',
@@ -156,12 +154,10 @@ const INTERVAL_RE = /^\d+[mhd]$/;
 const DAILY_CRON_RE = /^([0-5]?\d)\s+([01]?\d|2[0-3])\s+\*\s+\*\s+\*$/;
 const SCHEDULE_RUNS_LIMIT = 50;
 
-// ML Studio only knows 'editor' and 'viewer', so the five project roles
-// collapse onto two. The default map mirrors the server-side seed.
-const PROJECT_ROLES = ['owner', 'manager', 'editor', 'tester', 'viewer'];
+const ML_PROJECT_LEVELS = ['read', 'write', 'admin'];
 const ML_ROLES = ['editor', 'viewer'];
 const ML_DEFAULT_ROLE_MAP = {
-  owner: 'editor', manager: 'editor', editor: 'editor', tester: 'viewer', viewer: 'viewer',
+  read: 'viewer', write: 'editor', admin: 'editor',
 };
 
 // Board columns map 1:1 onto tasks.status; card order is NOT persisted in F4
@@ -188,7 +184,8 @@ const state = {
   canCreate: false,
   projects: [],
   listFilter: 'active',
-  roleFilter: 'all',
+  functionFilter: 'all',
+  catalogues: new Map(),
   listView: 'cards',
   searchQuery: '',
   // Open project context
@@ -218,8 +215,9 @@ const state = {
   chatUnsub: null,
   // Members / settings
   members: [],
+  functions: [],
   memberQuery: '',
-  memberRoleFilter: 'all',
+  memberFunctionFilter: 'all',
   settings: null,
   agentOptions: [],
   // Open tf-window cleanups (wizard, source, invite, delete, preview, prompt).
@@ -344,26 +342,77 @@ function isMe(userId) {
   return String(userId).toLowerCase().replace(/-/g, '') === hex;
 }
 
-function roleLabel(role) {
-  return ROLE_RANK[role] !== undefined ? t(`role_${role}`) : String(role || '—');
+function projectAccess(project = state.project) {
+  return project?.access || {};
 }
 
-function myRole() {
-  const role = state.project?.my_role ?? state.project?.myRole;
-  if (role) return role;
-  // Org admin inspecting a project they are not a member of gets my_role=None;
-  // the server still authorizes every call, the UI just unlocks manager tools.
-  return state.isAdmin ? 'manager' : 'viewer';
+const canArea = (area, minimum = 'read') => allowsArea(projectAccess(), area, minimum);
+const canManageMembers = () => !!fv(projectAccess(), 'can_manage_members') && !projectAccess().archived;
+const canTransferOwnership = () => !!fv(projectAccess(), 'is_owner') && !projectAccess().archived;
+const canSendChat = () => canArea('chat', 'write') && canArea('knowledge');
+const canTryRun = () => canArea('tests', 'write') && canArea('environments');
+const canGenerateTests = () => canArea('tests', 'write') && canArea('knowledge');
+const canRunSchedule = (schedule) => canArea('tests', 'write') && (fv(schedule, 'run_type') === 'manual' || canArea('environments'));
+const canLifecycle = (project = state.project) => !!fv(projectAccess(project), 'has_access') && (!!fv(projectAccess(project), 'is_owner') || !!fv(projectAccess(project), 'app_admin'));
+
+function functionLabel(definition) {
+  return catalogueLabel(definition, 'name', t);
 }
 
-function roleRank() {
-  return ROLE_RANK[myRole()] ?? 0;
+function functionDescription(definition) {
+  return catalogueLabel(definition, 'description', t);
 }
 
-const canEdit = () => roleRank() >= ROLE_RANK.editor;
-const canManage = () => roleRank() >= ROLE_RANK.manager;
-const canTest = () => roleRank() >= ROLE_RANK.tester;
-const isOwner = () => myRole() === 'owner';
+function functionChips(functions, catalogue = state.functions) {
+  if (!functions?.length) return `<span class="ps-field-hint">${escapeHtml(t('functions_none'))}</span>`;
+  return functions.map((id) => {
+    const definition = catalogue.find((entry) => fv(entry, 'function_id') === id);
+    return `<tf-chip status="info">${escapeHtml(definition ? functionLabel(definition) : id)}</tf-chip>`;
+  }).join(' ');
+}
+
+function accessSummary(project) {
+  const access = projectAccess(project);
+  if (fv(access, 'is_owner')) return t('access_owner');
+  if (fv(access, 'project_admin')) return t('access_project_admin');
+  if (fv(access, 'app_admin')) return t('access_app_admin');
+  return t('access_member');
+}
+
+async function loadCatalogue(id) {
+  const response = await ApiBinary.one('projectStudioCatalogueGetRequest', { projectId: id });
+  const functions = Array.isArray(response.functions) ? response.functions : [];
+  state.catalogues.set(id, functions);
+  return functions;
+}
+
+function memberAccessFields(member, catalogue, suffix = '') {
+  const assigned = member.functions || [];
+  return `
+    <div class="ps-access-form" data-access-form="${escapeAttr(suffix)}">
+      <div class="ps-field-label">${escapeHtml(t('functions_label'))}</div>
+      <div class="ps-function-choices">
+        ${catalogue.map((definition) => `<tf-checkbox data-member-function="${escapeAttr(fv(definition, 'function_id'))}"
+          label="${escapeAttr(functionLabel(definition))}" ${assigned.includes(fv(definition, 'function_id')) ? 'checked' : ''}></tf-checkbox>`).join('')}
+      </div>
+      <tf-checkbox data-project-admin label="${escapeAttr(t('access_project_admin'))}" ${fv(member, 'project_admin') ? 'checked' : ''}></tf-checkbox>
+      <div class="ps-field-hint">${escapeHtml(t('access_admin_hint'))}</div>
+      <tf-input data-member-expiry type="datetime-local" step="1" label="${escapeAttr(t('members_expiry'))}"
+        value="${escapeAttr(expiryToLocal(fv(member, 'expires_at')))}" ${fv(member, 'is_owner') ? 'disabled' : ''}
+        hint="${escapeAttr(t(fv(member, 'is_owner') ? 'members_expiry_owner_hint' : 'members_expiry_hint', { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }))}"></tf-input>
+    </div>`;
+}
+
+function readMemberAccess(host) {
+  let expiresAt;
+  try { expiresAt = expiryToInstant(host.querySelector('[data-member-expiry]')?.value || ''); }
+  catch { throw new Error(t('members_expiry_invalid')); }
+  return {
+    functions: [...host.querySelectorAll('[data-member-function]')].filter((item) => item.checked).map((item) => item.dataset.memberFunction),
+    projectAdmin: host.querySelector('[data-project-admin]')?.checked === true,
+    expiresAt,
+  };
+}
 
 function orientationLabel(project) {
   const template = project.template;
@@ -400,9 +449,9 @@ const ProjectStudioScreen = {
         </div>
         <div class="ps-filters-row">
           <tf-filter-chips id="ps-filter" mode="single"></tf-filter-chips>
-          <tf-select id="ps-role-filter" value="${escapeAttr(state.roleFilter)}">
-            <option value="all">${escapeHtml(t('filter_role_any'))}</option>
-            ${['owner', ...ASSIGNABLE_ROLES].map((r) => `<option value="${r}">${escapeHtml(roleLabel(r))}</option>`).join('')}
+          <tf-select id="ps-function-filter" value="${escapeAttr(state.functionFilter)}">
+            <option value="all">${escapeHtml(t('project_function_filter'))}</option>
+            ${BUILTIN_FUNCTIONS.map((definition) => `<option value="${definition.functionId}">${escapeHtml(functionLabel(definition))}</option>`).join('')}
           </tf-select>
           <tf-segmented id="ps-view-mode" value="${escapeAttr(state.listView)}">
             <option value="cards" icon="apps">${escapeHtml(t('view_cards'))}</option>
@@ -420,7 +469,7 @@ const ProjectStudioScreen = {
   async mount() {
     const me = await ApiBinary.one('authMeRequest').catch(() => null);
     state.me = me;
-    state.isAdmin = (me?.role ?? 'user').toLowerCase() === 'admin';
+    state.isAdmin = false;
 
     byId('ps-refresh')?.addEventListener('click', () => loadProjects());
     byId('ps-new')?.addEventListener('click', () => openWizard());
@@ -437,8 +486,8 @@ const ProjectStudioScreen = {
         loadProjects();
       });
     }
-    byId('ps-role-filter')?.addEventListener('change', (e) => {
-      state.roleFilter = e.detail?.value ?? 'all';
+    byId('ps-function-filter')?.addEventListener('change', (e) => {
+      state.functionFilter = e.detail?.value ?? 'all';
       renderProjectGrid();
     });
     byId('ps-view-mode')?.addEventListener('change', (e) => {
@@ -471,6 +520,8 @@ const ProjectStudioScreen = {
     state.chatId = null;
     state.chatMessages = [];
     state.members = [];
+    state.functions = [];
+    state.catalogues.clear();
     state.settings = null;
     state.searchQuery = '';
     state.listFilter = 'active';
@@ -639,7 +690,16 @@ async function loadProjects() {
       includeArchived: state.listFilter !== 'active',
     });
     state.projects = Array.isArray(resp.projects) ? resp.projects : [];
-    state.canCreate = !!(resp.canCreate ?? resp.can_create);
+    state.canCreate = !!fv(resp, 'can_create');
+    state.catalogues.clear();
+    state.isAdmin = !!fv(resp, 'can_administer');
+    await Promise.allSettled(state.projects.map((project) => loadCatalogue(fv(project, 'project_id'))));
+    const functionFilter = byId('ps-function-filter');
+    if (functionFilter) {
+      const choices = new Map();
+      for (const catalogue of state.catalogues.values()) for (const definition of catalogue) choices.set(fv(definition, 'function_id'), definition);
+      functionFilter.setOptions([{ value: 'all', label: t('project_function_filter') }, ...[...choices].map(([value, definition]) => ({ value, label: functionLabel(definition) }))], state.functionFilter);
+    }
   } catch (err) {
     toast(`${t('load_failed')}: ${err.message}`, 'error');
     return;
@@ -680,7 +740,7 @@ function visibleProjects() {
   return state.projects.filter((p) => {
     if (state.listFilter === 'active' && p.status !== 'active') return false;
     if (state.listFilter === 'archived' && p.status !== 'archived') return false;
-    if (state.roleFilter !== 'all' && (p.my_role ?? p.myRole) !== state.roleFilter) return false;
+    if (state.functionFilter !== 'all' && !projectAccess(p).functions?.includes(state.functionFilter)) return false;
     if (query) {
       const haystack = `${p.name} ${p.description || ''}`.toLowerCase();
       if (!haystack.includes(query)) return false;
@@ -692,20 +752,19 @@ function visibleProjects() {
 function projectCardHtml(project) {
   const projectId = project.project_id ?? project.projectId;
   const archived = project.status === 'archived';
-  const role = project.my_role ?? project.myRole;
+  const access = projectAccess(project);
   const memberCount = project.member_count ?? project.memberCount ?? 0;
   const sourceCount = project.source_count ?? project.sourceCount ?? 0;
   const sourcesReady = project.sources_ready ?? project.sourcesReady ?? 0;
-  const projectRank = ROLE_RANK[role] ?? (state.isAdmin ? ROLE_RANK.manager : 0);
   const menuItems = [
     `<tf-menu-item action="open" icon="external-link">${escapeHtml(t('action_open'))}</tf-menu-item>`,
   ];
-  if (projectRank >= ROLE_RANK.manager) {
+  if (canLifecycle(project)) {
     menuItems.push(archived
       ? `<tf-menu-item action="unarchive" icon="refresh">${escapeHtml(t('action_unarchive'))}</tf-menu-item>`
       : `<tf-menu-item action="archive" icon="clock">${escapeHtml(t('action_archive'))}</tf-menu-item>`);
   }
-  if (role === 'owner' || (state.isAdmin && !role)) {
+  if (canLifecycle(project)) {
     menuItems.push('<tf-menu-divider></tf-menu-divider>');
     menuItems.push(`<tf-menu-item action="delete" icon="trash" danger>${escapeHtml(t('action_delete'))}</tf-menu-item>`);
   }
@@ -724,7 +783,8 @@ function projectCardHtml(project) {
         <span class="ps-card-stat">${sprite('database')}<b>${sourcesReady}/${sourceCount}</b>&nbsp;${escapeHtml(t('stat_sources'))}</span>
       </div>
       <div class="ps-card-foot">
-        ${role ? `<tf-chip status="accent">${escapeHtml(t('your_role'))}: ${escapeHtml(roleLabel(role))}</tf-chip>` : ''}
+        <tf-chip status="accent">${escapeHtml(accessSummary(project))}</tf-chip>
+        ${functionChips(access.functions, state.catalogues.get(projectId) || [])}
         <tf-chip status="info">${escapeHtml(orientationLabel(project))}</tf-chip>
         <div class="ps-card-menu-wrap">
           <tf-button variant="ghost" size="sm" icon="chevron-down" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
@@ -764,7 +824,7 @@ function renderProjectTable(host, visible) {
     <tf-table id="ps-projects-table">
       <tf-column key="name" label="${escapeAttr(t('table_col_project'))}" renderer="html"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('table_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="role" label="${escapeAttr(t('table_col_role'))}" renderer="chip"></tf-column>
+      <tf-column key="functions" label="${escapeAttr(t('functions_label'))}" renderer="html"></tf-column>
       <tf-column key="modules" label="${escapeAttr(t('table_col_modules'))}"></tf-column>
       <tf-column key="members" label="${escapeAttr(t('stat_members'))}" renderer="num"></tf-column>
       <tf-column key="sources" label="${escapeAttr(t('stat_sources'))}"></tf-column>
@@ -774,14 +834,13 @@ function renderProjectTable(host, visible) {
   const table = byId('ps-projects-table');
   table.rows = visible.map((p) => {
     const archived = p.status === 'archived';
-    const role = p.my_role ?? p.myRole;
     const modules = Array.isArray(p.modules) ? p.modules : [];
     return {
       _id: p.project_id ?? p.projectId,
       name: `<div class="tf-table__cell-title">${escapeHtml(p.name)}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(p.description || '')}</div>`,
       status: chipCell(archived ? 'warn' : 'ok', t(archived ? 'status_archived' : 'status_active')),
-      role: chipCell(role === 'owner' ? 'accent' : 'info', role ? roleLabel(role) : '—'),
+      functions: `<tf-chip status="accent">${escapeHtml(accessSummary(p))}</tf-chip> ${functionChips(projectAccess(p).functions, state.catalogues.get(fv(p, 'project_id')) || [])}`,
       modules: modules.map((m) => t(`module_${m}`)).join(', ') || '—',
       members: Number(p.member_count ?? p.memberCount ?? 0),
       sources: `${p.sources_ready ?? p.sourcesReady ?? 0}/${p.source_count ?? p.sourceCount ?? 0}`,
@@ -865,7 +924,7 @@ function confirmDeleteProject(project, { fromList = false } = {}) {
   openDeleteWindow({
     title: t('delete_project_title'),
     targetName: project.name,
-    targetSub: t('delete_project_sub', { members: memberCount, role: roleLabel(project.my_role ?? project.myRole ?? myRole()) }),
+    targetSub: t('delete_project_access_sub', { members: memberCount, access: accessSummary(project) }),
     warning: t('delete_project_warning'),
     items: [
       { icon: 'database', name: t('delete_item_kb'), sub: t('delete_item_kb_sub', { count: sourceCount }) },
@@ -898,8 +957,7 @@ function openWizard() {
     step: 1,
     template: 'tests',
     modules: new Set(TEMPLATES.find((tp) => tp.id === 'tests').modules),
-    // [{ userId, displayName, email, role }] — the creator becomes owner
-    // server-side and is rendered as a fixed first row.
+    // The creator becomes owner and permanent project administrator server-side.
     members: [],
     candidates: [],
   };
@@ -945,13 +1003,11 @@ function openWizard() {
     <div data-step-panel="3" hidden>
       <div class="ps-wizard-team-bar">
         <tf-searchbox id="ps-wz-member-search" placeholder="${escapeAttr(t('wizard_member_search'))}" debounce="250"></tf-searchbox>
-        <tf-select id="ps-wz-member-role" value="tester">
-          ${ASSIGNABLE_ROLES.map((r) => `<option value="${r}" ${r === 'tester' ? 'selected' : ''}>${escapeHtml(roleLabel(r))}</option>`).join('')}
-        </tf-select>
+
       </div>
       <div class="ps-candidate-list" data-candidates hidden></div>
       <div data-team-host></div>
-      <div class="ps-field-hint">${escapeHtml(t('wizard_team_hint'))}</div>
+      <div class="ps-field-hint">${escapeHtml(t('invite_functions_hint'))}</div>
     </div>
 
     <div class="ps-form-error" data-form-error hidden></div>
@@ -996,27 +1052,22 @@ function openWizard() {
     const host = body.querySelector('[data-team-host]');
     if (!host) return;
     const selfRow = `
-      <div class="ps-member-row">
+      <div class="ps-member-person">
         <div class="ps-av-mini">${escapeHtml(initials(state.me?.username))}</div>
         <div class="ps-member-main">
           <div class="ps-member-name">${escapeHtml(state.me?.username || '')} <tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip></div>
         </div>
-        <tf-chip status="info">${escapeHtml(roleLabel('owner'))}</tf-chip>
+        <tf-chip status="accent">${escapeHtml(t('access_owner'))}</tf-chip>
       </div>
     `;
-    const rows = wz.members.map((m, i) => `
-      <div class="ps-member-row">
-        <div class="ps-av-mini">${escapeHtml(initials(m.displayName))}</div>
-        <div class="ps-member-main">
-          <div class="ps-member-name">${escapeHtml(m.displayName)}</div>
-          <div class="ps-member-mail">${escapeHtml(m.email || '')}</div>
+    const rows = wz.members.map((member, index) => `
+      <div class="ps-wizard-access" data-team-member="${index}">
+        <div class="ps-members-toolbar">
+          <div class="ps-member-main"><b>${escapeHtml(member.displayName)}</b><div class="ps-member-mail">${escapeHtml(member.email || '')}</div></div>
+          <tf-button variant="ghost" size="sm" icon="trash" data-team-remove="${index}" title="${escapeAttr(t('wizard_member_remove'))}"></tf-button>
         </div>
-        <tf-select class="ps-member-role" data-team-role="${i}" value="${escapeAttr(m.role)}">
-          ${ASSIGNABLE_ROLES.map((r) => `<option value="${r}" ${r === m.role ? 'selected' : ''}>${escapeHtml(roleLabel(r))}</option>`).join('')}
-        </tf-select>
-        <tf-button variant="ghost" size="sm" icon="trash" data-team-remove="${i}" title="${escapeAttr(t('wizard_member_remove'))}"></tf-button>
-      </div>
-    `).join('');
+        ${memberAccessFields(member, BUILTIN_FUNCTIONS, String(index))}
+      </div>`).join('');
     host.innerHTML = selfRow + rows;
   };
 
@@ -1077,7 +1128,7 @@ function openWizard() {
         description,
         template: wz.template,
         modules: [...wz.modules],
-        members: wz.members.map((m) => ({ userId: m.userId, role: m.role })),
+        members: wz.members.map((member, index) => ({ userId: member.userId, ...readMemberAccess(body.querySelector(`[data-team-member="${index}"]`)) })),
       });
       const projectId = resp.projectId ?? resp.project_id;
       toast(t('create_ok'), 'success');
@@ -1155,12 +1206,13 @@ function openWizard() {
       const userId = candidate.dataset.candidate;
       const user = wz.candidates.find((u) => (u.user_id ?? u.userId) === userId);
       if (user) {
-        const role = String(body.querySelector('#ps-wz-member-role')?.value || 'tester');
         wz.members.push({
           userId,
           displayName: user.display_name ?? user.displayName ?? '',
           email: user.email || '',
-          role,
+          functions: ['tester'],
+          projectAdmin: false,
+          expiresAt: null,
         });
         renderTeam();
         renderCandidates();
@@ -1175,11 +1227,16 @@ function openWizard() {
     }
   });
 
-  body.addEventListener('change', (e) => {
-    const roleSel = e.target.closest('[data-team-role]');
-    if (!roleSel) return;
-    const idx = Number(roleSel.dataset.teamRole);
-    if (wz.members[idx]) wz.members[idx].role = e.detail?.value ?? roleSel.value;
+  body.addEventListener('change', (event) => {
+    const row = event.target.closest('[data-team-member]');
+    if (!row) return;
+    const member = wz.members[Number(row.dataset.teamMember)];
+    if (!member) return;
+    member.functions = [...row.querySelectorAll('[data-member-function]')].filter((item) => item.checked).map((item) => item.dataset.memberFunction);
+    member.projectAdmin = row.querySelector('[data-project-admin]')?.checked === true;
+    const local = row.querySelector('[data-member-expiry]')?.value || '';
+    const date = local ? new Date(local) : null;
+    member.expiresAt = date && Number.isFinite(date.getTime()) ? date.toISOString() : null;
   });
 
   renderModules();
@@ -1212,6 +1269,8 @@ async function openProject(projectId, deep = null) {
   stopChatStream();
   stopTestsLive();
   state.project = project;
+  try { state.functions = await loadCatalogue(projectId); }
+  catch (error) { state.project = null; toast(`${t('members_failed')}: ${error.message}`, 'error'); return; }
   state.tab = 'overview';
   state.kbView = 'sources';
   state.kbHits = null;
@@ -1231,8 +1290,7 @@ async function openProject(projectId, deep = null) {
   if (!projectView) return;
   projectView.hidden = false;
 
-  const modules = Array.isArray(project.modules) ? project.modules : [];
-  if (deep?.tab && (deep.tab === 'overview' || modules.includes(deep.tab) || deep.tab === 'members' || deep.tab === 'connections')) {
+  if (deep?.tab && projectTabs(projectAccess()).includes(deep.tab)) {
     state.tab = deep.tab;
   }
   if (deep?.sub && state.tab === 'tests' && TESTS_SEGMENTS.includes(deep.sub)) {
@@ -1265,6 +1323,9 @@ async function refreshProjectHeader() {
     const resp = await ApiBinary.one('projectStudioProjectGetRequest', { projectId });
     if (resp.project) {
       state.project = resp.project;
+      try { state.functions = await loadCatalogue(projectId); }
+  catch (error) { state.project = null; toast(`${t('members_failed')}: ${error.message}`, 'error'); return; }
+      if (!projectTabs(projectAccess()).includes(state.tab)) state.tab = 'overview';
       renderProjectShell();
       renderTabsValue();
       await switchTab(state.tab);
@@ -1275,18 +1336,8 @@ async function refreshProjectHeader() {
 }
 
 function enabledTabs() {
-  const modules = Array.isArray(state.project?.modules) ? state.project.modules : [];
-  const tabs = [{ id: 'overview', icon: 'chart-line' }];
-  if (modules.includes('knowledge')) tabs.push({ id: 'knowledge', icon: 'database' });
-  if (modules.includes('tests')) tabs.push({ id: 'tests', icon: 'list' });
-  if (modules.includes('tasks')) tabs.push({ id: 'tasks', icon: 'check' });
-  if (modules.includes('chat')) tabs.push({ id: 'chat', icon: 'message' });
-  // Connections are not a project module: every project can be linked to ML
-  // Studio, and the link list is readable by every member.
-  tabs.push({ id: 'connections', icon: 'brain' });
-  tabs.push({ id: 'members', icon: 'users' });
-  if (canManage()) tabs.push({ id: 'settings', icon: 'settings' });
-  return tabs;
+  const icons = { overview: 'chart-line', knowledge: 'database', tests: 'list', tasks: 'check', chat: 'message', connections: 'brain', members: 'users', settings: 'settings' };
+  return projectTabs(projectAccess()).map((id) => ({ id, icon: icons[id] }));
 }
 
 // Header subtitle carries the project context the mockup shows: what the
@@ -1324,15 +1375,17 @@ function renderProjectShell() {
       </span>
       <span slot="badges" class="ps-head-badges">
         <tf-chip status="accent">${sprite('users')} ${escapeHtml(t('head_members', { count: memberCount }))}</tf-chip>
-        <tf-chip>${escapeHtml(t('your_role'))}: <b>${escapeHtml(roleLabel(myRole()))}</b></tf-chip>
+        <tf-chip>${escapeHtml(accessSummary(project))}</tf-chip>
+        ${functionChips(projectAccess().functions)}
         <tf-chip status="info">${sprite('database')} ${escapeHtml(t('head_sources', { count: sourceCount }))}</tf-chip>
         <tf-chip status="info">${sprite('grid-rows')} ${escapeHtml(t('modules_chip'))}: ${escapeHtml(orientationLabel(project))}</tf-chip>
       </span>
       <span slot="actions">
         ${bellHtml()}
-        ${canManage() ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
+        ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" data-new-task>${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
+        ${fv(projectAccess(), 'has_access') && fv(projectAccess(), 'project_admin') ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
         <tf-button variant="ghost" icon="users" data-goto-members ${state.tab === 'members' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_members'))}</tf-button>
-        ${canManage() ? `<tf-button variant="ghost" icon="settings" data-goto-settings ${state.tab === 'settings' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
+        ${canArea('settings') ? `<tf-button variant="ghost" icon="settings" data-goto-settings ${state.tab === 'settings' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
       </span>
     </tf-detail-header>
 
@@ -1355,6 +1408,7 @@ function renderProjectShell() {
     if (link.getAttribute('href') === '#project') selectTab('overview');
     else closeProject();
   });
+  host.querySelector('[data-new-task]')?.addEventListener('click', () => openTaskWindow({}));
   host.querySelector('[data-export]')?.addEventListener('click', () => openExportWindow());
   host.querySelector('[data-goto-members]')?.addEventListener('click', () => selectTab('members'));
   host.querySelector('[data-goto-settings]')?.addEventListener('click', () => selectTab('settings'));
@@ -1387,7 +1441,9 @@ function selectTab(tab) {
 }
 
 async function switchTab(tab) {
+  if (!projectTabs(projectAccess()).includes(tab)) tab = 'overview';
   state.tab = tab;
+  renderTabsValue();
   syncBreadcrumbTab();
   // Leaving the chat tab must not leak the active stream subscription.
   if (tab !== 'chat') stopChatStream();
@@ -1466,25 +1522,26 @@ async function renderOverview() {
   const modules = Array.isArray(state.project?.modules) ? state.project.modules : [];
 
   const quickActions = [];
-  if (modules.includes('knowledge') && canEdit()) {
+  if (canCreateTask(projectAccess())) quickActions.push({ id: 'new-task', icon: 'plus', name: t('tasks_new'), sub: t('qa_new_task_sub') });
+  if (canArea('knowledge', 'write') || canArea('repos', 'write')) {
     quickActions.push({ id: 'add-source', icon: 'database', name: t('qa_add_source'), sub: t('qa_add_source_sub') });
   }
-  if (modules.includes('knowledge')) {
+  if (canArea('knowledge')) {
     quickActions.push({ id: 'kb-search', icon: 'search', name: t('qa_search'), sub: t('qa_search_sub') });
   }
-  if (modules.includes('tests')) {
+  if (canArea('tests')) {
     quickActions.push({ id: 'tests', icon: 'list', name: t('qa_tests'), sub: t('qa_tests_sub') });
   }
-  if (modules.includes('tasks')) {
+  if (canArea('tasks')) {
     quickActions.push({ id: 'tasks', icon: 'check', name: t('qa_tasks'), sub: t('qa_tasks_sub') });
   }
-  if (modules.includes('chat')) {
+  if (canArea('chat')) {
     quickActions.push({ id: 'chat', icon: 'message', name: t('qa_chat'), sub: t('qa_chat_sub') });
   }
   quickActions.push({ id: 'members', icon: 'users', name: t('qa_members'), sub: t('qa_members_sub') });
 
   const kv = (snake, camel) => Number(kpis?.[snake] ?? kpis?.[camel] ?? 0);
-  const hasTests = modules.includes('tests');
+  const hasTests = canArea('tests');
 
   // The dashboard answers four questions — what do we have, how good is it,
   // what is broken, is the knowledge ready. Every other counter lives next to
@@ -1501,15 +1558,15 @@ async function renderOverview() {
         delta-type="neutral"></tf-stat-card>` : '';
   const passCard = hasTests ? `
       <tf-stat-card id="ps-kpi-pass" icon="check" label="${escapeAttr(t('kpi_pass_rate'))}" value="—"></tf-stat-card>` : '';
-  const defectsCard = modules.includes('tasks') ? `
+  const defectsCard = canArea('tasks') ? `
       <tf-stat-card id="ps-kpi-defects" icon="alert" label="${escapeAttr(t('kpi_defects'))}" value="${defectsOpen}"
         accent="${defectsOpen > 0 ? 'danger' : 'success'}"
         delta="${escapeAttr(t('kpi_tasks_open_suffix', { count: tasksOpen }))}"
         delta-type="${defectsOpen > 0 ? 'warn' : 'neutral'}"></tf-stat-card>` : '';
-  const knowledgeCard = `
+  const knowledgeCard = canArea('knowledge') ? `
       <tf-stat-card icon="database" label="${escapeAttr(t('kpi_sources'))}" value="${sourcesReady}/${sourcesTotal}"
         delta="${escapeAttr(openJobs > 0 ? t('kpi_open_jobs', { count: openJobs }) : t('kpi_sources_ready_suffix', { count: sourcesReady }))}"
-        delta-type="${openJobs > 0 ? 'warn' : 'neutral'}"></tf-stat-card>`;
+        delta-type="${openJobs > 0 ? 'warn' : 'neutral'}"></tf-stat-card>` : '';
 
   // Charts only make sense for a project that runs tests.
   const chartsRow = hasTests ? `
@@ -1543,16 +1600,16 @@ async function renderOverview() {
       <tf-section-card title="${escapeAttr(t('quick_actions_title'))}" icon="play">
         <div class="ps-quick-actions">
           ${quickActions.map((qa) => `
-            <div class="ps-quick-action" data-qa="${escapeAttr(qa.id)}" role="button" tabindex="0">
+            <tf-button variant="ghost" class="ps-quick-action" data-qa="${escapeAttr(qa.id)}">
               <div class="ps-qa-ico">${sprite(qa.icon)}</div>
               <div>
                 <div class="ps-qa-name">${escapeHtml(qa.name)}</div>
                 <div class="ps-qa-sub">${escapeHtml(qa.sub)}</div>
               </div>
-            </div>
+            </tf-button>
           `).join('')}
         </div>
-        ${sourcesReady > 0 && hasTests && canEdit() ? `
+        ${sourcesReady > 0 && hasTests && canArea('tests', 'write') ? `
           <div class="ps-qa-banner" id="ps-qa-generate">
             <div class="ps-qa-banner-head">${sprite('sparkle')}<span>${escapeHtml(t('qa_generate_title'))}</span></div>
             <div class="ps-qa-banner-body">${escapeHtml(t('qa_generate_body'))}
@@ -1573,6 +1630,7 @@ async function renderOverview() {
       else if (id === 'kb-search') { state.kbView = 'search'; selectTab('knowledge'); }
       else if (id === 'tests') selectTab('tests');
       else if (id === 'tasks') selectTab('tasks');
+      else if (id === 'new-task') openTaskWindow({});
       else if (id === 'chat') selectTab('chat');
       else if (id === 'members') selectTab('members');
     });
@@ -1781,6 +1839,19 @@ async function loadSources() {
   state.sources = Array.isArray(resp.sources) ? resp.sources : [];
 }
 
+function canSourceWrite(source) {
+  return !!source && canArea(['git', 'zip'].includes(source.kind) ? 'repos' : 'knowledge', 'write');
+}
+
+function canRefreshRepo() {
+  return canArea('repos', 'write') && canArea('settings', 'write');
+}
+
+function canFileWrite(file) {
+  const sourceId = fv(file, 'source_id') || state.files.sourceId;
+  return canSourceWrite(state.sources.find((source) => fv(source, 'source_id') === sourceId));
+}
+
 function sourceRowHtml(source) {
   const sourceId = source.source_id ?? source.sourceId;
   const status = source.status;
@@ -1789,7 +1860,7 @@ function sourceRowHtml(source) {
   const running = job && job.status === 'running';
   const fileCount = source.file_count ?? source.fileCount ?? 0;
   const chunkCount = source.chunk_count ?? source.chunkCount ?? 0;
-  const mutable = canEdit();
+  const mutable = canSourceWrite(source);
 
   let config = {};
   try { config = JSON.parse(source.config_json ?? source.configJson ?? '{}') || {}; } catch { config = {}; }
@@ -1821,7 +1892,7 @@ function sourceRowHtml(source) {
   if (mutable) {
     // Git sources fetch + delta re-index ("Odśwież"); everything else re-runs
     // the full ingest.
-    if (source.kind === 'git') {
+    if (source.kind === 'git' && canRefreshRepo()) {
       actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-refresh="${escapeAttr(sourceId)}">${escapeHtml(t('source_refresh'))}</tf-button>`);
     } else {
       actions.push(`<tf-button variant="ghost" size="sm" icon="refresh" data-reingest="${escapeAttr(sourceId)}" title="${escapeAttr(t('action_reingest'))}"></tf-button>`);
@@ -1833,7 +1904,7 @@ function sourceRowHtml(source) {
       <tf-button variant="ghost" size="sm" icon="chevron-down" data-source-more title="${escapeAttr(t('action_more'))}"></tf-button>
       <tf-menu placement="bottom-end" data-source-menu>
         <tf-menu-item action="edit" icon="edit">${escapeHtml(t('action_edit'))}</tf-menu-item>
-        ${source.kind === 'git' ? `<tf-menu-item action="refresh" icon="refresh">${escapeHtml(t('source_refresh'))}</tf-menu-item>` : ''}
+        ${source.kind === 'git' && canRefreshRepo() ? `<tf-menu-item action="refresh" icon="refresh">${escapeHtml(t('source_refresh'))}</tf-menu-item>` : ''}
         ${source.kind === 'api_spec' ? `<tf-menu-item action="endpoints" icon="code">${escapeHtml(t('source_endpoints'))}</tf-menu-item>` : ''}
         <tf-menu-item action="reingest" icon="refresh">${escapeHtml(t('action_reingest'))}</tf-menu-item>
         <tf-menu-item action="files" icon="file-text">${escapeHtml(t('action_show_files'))}</tf-menu-item>
@@ -1884,7 +1955,7 @@ async function renderSources() {
     <tf-section-card title="${escapeAttr(t('sources_title'))}" icon="database">
       <span slot="subtitle">${escapeHtml(t('sources_stats', { ready, indexing, errors }))}</span>
       <span slot="actions">
-        ${canEdit() ? `<tf-button variant="primary" size="sm" icon="plus" id="ps-add-source">${escapeHtml(t('add_source'))}</tf-button>` : ''}
+        ${canArea('knowledge', 'write') || canArea('repos', 'write') ? `<tf-button variant="primary" size="sm" icon="plus" id="ps-add-source">${escapeHtml(t('add_source'))}</tf-button>` : ''}
       </span>
       <div id="ps-sources-list">
         ${state.sources.length
@@ -2179,13 +2250,13 @@ function openSourceWindow() {
   });
 
   const sw = {
-    kind: 'document',
+    kind: canArea('knowledge', 'write') ? 'document' : 'git',
     // [{ file, progress (0-100 | null), ref }]
     files: [],
     busy: false,
   };
 
-  const kindsHtml = SOURCE_KINDS.map((k) => `
+  const kindsHtml = SOURCE_KINDS.filter((kind) => canArea(['git', 'zip'].includes(kind.id) ? 'repos' : 'knowledge', 'write')).map((k) => `
     <div class="ps-choice-card ${sw.kind === k.id ? 'is-selected' : ''}"
          data-kind="${escapeAttr(k.id)}" role="button" tabindex="0">
       <div class="ps-cc-ico">${sprite(k.icon)}</div>
@@ -2225,7 +2296,7 @@ function openSourceWindow() {
           hint="${escapeAttr(t('source_git_subdir_hint'))}"></tf-input>
       </div>
       <tf-input id="ps-src-git-token" type="password" label="${escapeAttr(t('source_git_token_label'))}"
-        hint="${escapeAttr(t('source_git_token_hint'))}"></tf-input>
+        hint="${escapeAttr(t('source_git_token_hint'))}" ${canRefreshRepo() ? '' : 'disabled'}></tf-input>
       <div class="ps-field-hint">${escapeHtml(t('source_git_limits_hint'))}</div>
     </div>
     <div data-kind-form="zip" hidden>
@@ -2280,6 +2351,7 @@ function openSourceWindow() {
     `).join('');
   };
 
+  body.querySelectorAll('[data-kind-form]').forEach((form) => { form.hidden = form.dataset.kindForm !== sw.kind; });
   body.querySelector('[data-kind-grid]')?.addEventListener('click', (e) => {
     const card = e.target.closest('[data-kind]');
     if (!card || sw.busy) return;
@@ -2455,12 +2527,12 @@ function openSourceEditWindow(source) {
         <tf-input id="ps-src-edit-branch" label="${escapeAttr(t('source_git_branch_label'))}" value="${escapeAttr(config.branch || 'main')}"></tf-input>
         <tf-input id="ps-src-edit-subdir" label="${escapeAttr(t('source_git_subdir_label'))}" value="${escapeAttr(config.subdir || '')}"></tf-input>
       </div>
-      <tf-input id="ps-src-edit-token" type="password" label="${escapeAttr(t('source_git_token_label'))}"
+      ${canRefreshRepo() ? `<tf-input id="ps-src-edit-token" type="password" label="${escapeAttr(t('source_git_token_label'))}"
         hint="${escapeAttr(t('source_token_update_hint'))}"></tf-input>
       <div class="ps-token-actions">
         <tf-button variant="ghost" size="sm" icon="key" id="ps-src-token-save">${escapeHtml(t('source_token_save'))}</tf-button>
         <tf-button variant="ghost" size="sm" icon="trash" id="ps-src-token-clear">${escapeHtml(t('source_token_clear'))}</tf-button>
-      </div>
+      </div>` : ''}
     ` : ''}
     <div class="ps-form-error" data-form-error hidden></div>
   `;
@@ -2856,7 +2928,7 @@ async function renderFilePreviewPane(fileId) {
       <tf-chip status="${FILE_STATUS_CHIP[file.status] || 'info'}">${escapeHtml(t(`file_status_${file.status}`))}</tf-chip>
       <span class="ps-toolbar-spacer"></span>
       <tf-button variant="ghost" size="sm" icon="copy" id="ps-files-copy-path">${escapeHtml(t('files_copy_path'))}</tf-button>
-      ${canEdit() ? `<tf-button variant="ghost" size="sm" icon="trash" id="ps-files-remove">${escapeHtml(t('files_remove_from_index'))}</tf-button>` : ''}
+      ${canFileWrite(file) ? `<tf-button variant="ghost" size="sm" icon="trash" id="ps-files-remove">${escapeHtml(t('files_remove_from_index'))}</tf-button>` : ''}
     </div>
     ${truncated ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('preview_truncated'))}</span></div>` : ''}
     <tf-code-editor id="ps-files-code" language="${escapeAttr(codeLanguageFor(file.path))}" readonly></tf-code-editor>
@@ -2907,6 +2979,7 @@ function renderFilesTable() {
   table.rows = state.files.rows.map((f) => ({
     _id: f.file_id ?? f.fileId,
     _status: f.status,
+    _file: f,
     path: f.path,
     status: { status: FILE_STATUS_CHIP[f.status] || 'info', label: t(`file_status_${f.status}`) },
     // Skip/error reason surfaces inline (skipped files carry it in `error`).
@@ -2926,7 +2999,7 @@ function renderFilesTable() {
     previewBtn.setAttribute('title', t('kb_preview'));
     previewBtn.addEventListener('click', (e) => { e.stopPropagation(); openFilePreview(live()._id); });
     wrap.appendChild(previewBtn);
-    if (canEdit()) {
+    if (canFileWrite(row._file)) {
       const delBtn = document.createElement('tf-button');
       delBtn.setAttribute('variant', 'ghost');
       delBtn.setAttribute('size', 'sm');
@@ -3030,7 +3103,7 @@ async function renderChat() {
   panel.innerHTML = `
     <div class="ps-chat-layout">
       <div class="ps-chat-list">
-        <tf-button variant="primary" size="sm" icon="plus" id="ps-chat-new">${escapeHtml(t('chat_new'))}</tf-button>
+        <tf-button variant="primary" size="sm" icon="plus" id="ps-chat-new" ${canSendChat() ? '' : 'hidden'}>${escapeHtml(t('chat_new'))}</tf-button>
         <div class="ps-chat-private-hint">${sprite('eye')}${escapeHtml(t('chat_private_hint'))}</div>
         <div id="ps-chat-convs"></div>
       </div>
@@ -3107,7 +3180,7 @@ function renderChatConvs() {
           <div class="ps-conv-title">${escapeHtml(c.title || t('chat_untitled'))}</div>
           <div class="ps-conv-sub">${escapeHtml(c.last_message_preview ?? c.lastMessagePreview ?? '')}</div>
         </div>
-        <div class="ps-conv-actions">
+        <div class="ps-conv-actions" ${canArea('chat', 'write') ? '' : 'hidden'}>
           <tf-button variant="ghost" size="sm" icon="edit" data-conv-rename="${escapeAttr(chatId)}" title="${escapeAttr(t('chat_rename'))}"></tf-button>
           <tf-button variant="ghost" size="sm" icon="trash" data-conv-delete="${escapeAttr(chatId)}" title="${escapeAttr(t('chat_delete'))}"></tf-button>
         </div>
@@ -3122,8 +3195,8 @@ function renderChatHeader() {
   if (title) title.textContent = chat ? (chat.title || t('chat_untitled')) : t('chat_new_conversation');
   const renameBtn = byId('ps-chat-rename');
   const deleteBtn = byId('ps-chat-delete');
-  if (renameBtn) renameBtn.hidden = !chat;
-  if (deleteBtn) deleteBtn.hidden = !chat;
+  if (renameBtn) renameBtn.hidden = !chat || !canArea('chat', 'write');
+  if (deleteBtn) deleteBtn.hidden = !chat || !canArea('chat', 'write');
 }
 
 async function selectChat(chatId) {
@@ -3208,7 +3281,7 @@ function renderChatMessages() {
   host.scrollTop = host.scrollHeight;
   const composer = byId('ps-chat-composer');
   if (composer) {
-    if (state.chatBusy) composer.setAttribute('disabled', '');
+    if (state.chatBusy || !canSendChat()) composer.setAttribute('disabled', '');
     else composer.removeAttribute('disabled');
   }
 }
@@ -3218,7 +3291,7 @@ function nowTime() {
 }
 
 async function sendChatMessage(text) {
-  if (state.chatBusy) return;
+  if (state.chatBusy || !canSendChat()) return;
 
   // First message of a fresh thread creates the chat with a derived title.
   if (!state.chatId) {
@@ -3373,315 +3446,350 @@ async function renderMembers() {
   const panel = byId('ps-tab-panel');
   if (!panel) return;
   try {
-    const resp = await ApiBinary.one('projectStudioMembersListRequest', { projectId: projectId() });
-    state.members = Array.isArray(resp.members) ? resp.members : [];
-  } catch (err) {
-    panel.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('members_failed')}: ${err.message}`)}</div>`;
+    const [response, functions] = await Promise.all([
+      ApiBinary.one('projectStudioMembersListRequest', { projectId: projectId() }),
+      loadCatalogue(projectId()),
+    ]);
+    state.members = Array.isArray(response.members) ? response.members : [];
+    state.functions = functions;
+    state.memberAgents = null;
+    if (canArea('settings')) {
+      const settingsResponse = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
+      state.memberAgents = Array.isArray(settingsResponse.settings?.agents) ? settingsResponse.settings.agents : [];
+    }
+  } catch (error) {
+    panel.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('members_failed')}: ${error.message}`)}</div>`;
     return;
   }
   if (state.tab !== 'members') return;
-
   panel.innerHTML = `
-    <div class="ps-banner-info">${sprite('shield')}<span>${escapeHtml(t('members_banner'))}</span></div>
+    <div class="ps-access-heading">
+      <div><h2>${escapeHtml(t('functions_title'))}</h2><div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div></div>
+      ${canManageMembers() ? `<tf-button variant="primary" icon="plus" id="ps-invite">${escapeHtml(t('members_invite'))}</tf-button>` : ''}
+    </div>
     <div class="ps-members-toolbar">
       <tf-searchbox id="ps-members-search" placeholder="${escapeAttr(t('members_search_placeholder'))}" debounce="200"></tf-searchbox>
-      <tf-select id="ps-members-role-filter" value="${escapeAttr(state.memberRoleFilter)}">
-        <option value="all">${escapeHtml(t('members_filter_all'))}</option>
-        <option value="owner">${escapeHtml(roleLabel('owner'))}</option>
-        ${ASSIGNABLE_ROLES.map((r) => `<option value="${r}">${escapeHtml(roleLabel(r))}</option>`).join('')}
+      <tf-select id="ps-members-function-filter" value="${escapeAttr(state.memberFunctionFilter)}">
+        <option value="all">${escapeHtml(t('functions_filter_all'))}</option>
+        ${state.functions.map((definition) => `<option value="${escapeAttr(fv(definition, 'function_id'))}">${escapeHtml(functionLabel(definition))}</option>`).join('')}
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
-      ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-invite">${escapeHtml(t('members_invite'))}</tf-button>` : ''}
+      <span class="ps-field-hint">${escapeHtml(t('members_enabled_modules'))}: ${escapeHtml((fv(projectAccess(), 'enabled_modules') || []).map((module) => t(`module_${module}`)).join(', '))}</span>
     </div>
-    <tf-section-card title="${escapeAttr(t('members_title'))}" icon="users">
-      <span slot="subtitle">${escapeHtml(t('members_count', { count: state.members.length }))}</span>
-      <div id="ps-members-list"></div>
-    </tf-section-card>
-    <tf-section-card title="${escapeAttr(t('roles_legend_title'))}" icon="shield">
-      <div class="ps-role-legend">
-        ${['owner', 'manager', 'editor', 'tester', 'viewer'].map((r) => `
-          <div class="ps-rl-item">
-            <div class="ps-rl-top"><tf-chip status="${r === 'owner' ? 'accent' : 'info'}">${escapeHtml(roleLabel(r))}</tf-chip></div>
-            <div class="ps-rl-desc">${escapeHtml(t(`role_${r}_desc`))}</div>
-          </div>
-        `).join('')}
-      </div>
-    </tf-section-card>
-  `;
-
-  byId('ps-members-search')?.addEventListener('search', (e) => {
-    state.memberQuery = String(e.detail?.value ?? '');
+    <div id="ps-members-list"></div>
+    ${state.memberAgents !== null ? `<tf-section-card title="${escapeAttr(t('members_agents'))}" icon="brain">
+      <span slot="subtitle">${escapeHtml(t('members_agents_hint'))}</span>
+      <div class="ps-agent-bindings">${state.memberAgents.filter((binding) => fv(binding, 'agent_id')).map((binding) => `
+        <div class="ps-agent-binding"><tf-chip status="accent">${escapeHtml(t(`agents_fn_${binding.function}`))}</tf-chip>
+          <span>${escapeHtml(fv(binding, 'agent_name') || fv(binding, 'agent_id'))}</span>
+          <span class="ps-field-hint">${escapeHtml(fv(binding, 'model_label') || '')}</span></div>`).join('') || `<div class="ps-field-hint">${escapeHtml(t('members_agents_empty'))}</div>`}</div>
+    </tf-section-card>` : ''}
+    <tf-section-card title="${escapeAttr(t('function_catalogue'))}" icon="shield">
+      <span slot="actions">${canManageMembers() ? `<tf-button variant="ghost" size="sm" icon="plus" id="ps-function-new">${escapeHtml(t('function_new'))}</tf-button>` : ''}</span>
+      <div class="ps-function-catalogue" id="ps-function-catalogue"></div>
+      <details class="ps-access-matrix">
+        <summary>${escapeHtml(t('access_matrix'))}</summary>
+        <div class="ps-field-hint">${escapeHtml(t('access_matrix_hint'))}</div>
+        <div class="ps-permission-key">${PERMISSION_LEVELS.map((level) => `<tf-chip status="${permissionChipStatus(level)}">${permissionLetter(level)} · ${escapeHtml(t(`access_level_${level}`))}</tf-chip>`).join('')}</div>
+        <div class="ps-matrix-scroll"><tf-table id="ps-permission-matrix">
+          <tf-column key="area" label="${escapeAttr(t('access_area'))}" renderer="html"></tf-column>
+          ${state.functions.map((definition, index) => `<tf-column key="function${index}" label="${escapeAttr(functionLabel(definition))}" renderer="html"></tf-column>`).join('')}
+        </tf-table></div>
+      </details>
+    </tf-section-card>`;
+  byId('ps-members-search').value = state.memberQuery;
+  byId('ps-members-search')?.addEventListener('search', (event) => {
+    state.memberQuery = String(event.detail?.value || '');
     renderMembersList();
   });
-  byId('ps-members-role-filter')?.addEventListener('change', (e) => {
-    state.memberRoleFilter = e.detail?.value ?? e.target.value ?? 'all';
+  byId('ps-members-function-filter')?.addEventListener('change', (event) => {
+    state.memberFunctionFilter = event.detail?.value || 'all';
     renderMembersList();
   });
-  byId('ps-invite')?.addEventListener('click', () => openInviteWindow());
-
+  byId('ps-invite')?.addEventListener('click', openInviteWindow);
+  byId('ps-function-new')?.addEventListener('click', () => openFunctionWindow());
   renderMembersList();
+  renderFunctionCatalogue();
+}
+
+function permissionChipStatus(level) {
+  return ({ none: 'info', read: 'info', write: 'ok', admin: 'accent' })[level] || 'info';
+}
+
+function permissionLetter(level) {
+  return ({ none: '—', read: 'R', write: 'W', admin: 'A' })[level] || '—';
+}
+
+function areaLabel(area) {
+  return t(`access_area_${area.replace('.', '_')}`);
+}
+
+function effectiveAccessHtml(access) {
+  const grants = (access?.areas || []).filter((grant) => grant.enabled && grant.level !== 'none');
+  const create = canCreateTask(access) ? `<tf-chip status="accent">${escapeHtml(t('tasks_new'))}</tf-chip>` : '';
+  return grants.length || create ? `<div class="ps-effective-access">${grants.map((grant) => `<tf-chip status="${permissionChipStatus(grant.level)}" title="${escapeAttr(t(`access_level_${grant.level}`))}">${escapeHtml(areaLabel(grant.area))} ${permissionLetter(grant.level)}</tf-chip>`).join(' ')} ${create}</div>`
+    : `<span class="ps-field-hint">${escapeHtml(t('access_level_none'))}</span>`;
 }
 
 function renderMembersList() {
   const host = byId('ps-members-list');
   if (!host) return;
   const query = state.memberQuery.trim().toLowerCase();
-  const visible = state.members.filter((m) => {
-    if (state.memberRoleFilter !== 'all' && m.role !== state.memberRoleFilter) return false;
-    if (query) {
-      const haystack = `${m.display_name ?? m.displayName ?? ''} ${m.email || ''}`.toLowerCase();
-      if (!haystack.includes(query)) return false;
-    }
-    return true;
-  });
-  if (!visible.length) {
-    host.innerHTML = `<tf-empty-state icon="users" title="${escapeAttr(t('members_empty'))}"></tf-empty-state>`;
-    return;
-  }
-
-  const head = `
-    <div class="ps-member-head">
-      <span></span>
-      <span>${escapeHtml(t('members_col_user'))}</span>
-      <span>${escapeHtml(t('members_col_invited_by'))}</span>
-      <span>${escapeHtml(t('members_col_joined'))}</span>
-      <span>${escapeHtml(t('members_col_role'))}</span>
-      <span>${escapeHtml(t('members_col_actions'))}</span>
-    </div>
-  `;
-
-  host.innerHTML = head + visible.map((m) => {
-    const userId = m.user_id ?? m.userId;
-    const displayName = m.display_name ?? m.displayName ?? '';
-    const self = isMe(userId);
-    const memberIsOwner = m.role === 'owner';
-    // Managers reassign non-owner roles; ownership moves only via transfer.
-    const canChangeRole = canManage() && !memberIsOwner;
-    const canRemove = canManage() && !memberIsOwner && !self;
-    const canTransfer = isOwner() && !memberIsOwner && !self;
-
-    const roleCell = memberIsOwner
-      ? `<tf-chip status="accent">${sprite('key')} ${escapeHtml(roleLabel('owner'))}</tf-chip>`
-      : canChangeRole
-        ? `<tf-select class="ps-member-role" data-role-user="${escapeAttr(userId)}" value="${escapeAttr(m.role)}">
-            ${ASSIGNABLE_ROLES.map((r) => `<option value="${r}" ${r === m.role ? 'selected' : ''}>${escapeHtml(roleLabel(r))}</option>`).join('')}
-          </tf-select>`
-        : `<tf-chip status="info">${escapeHtml(roleLabel(m.role))}</tf-chip>`;
-
-    return `
-      <div class="ps-member-row" data-member="${escapeAttr(userId)}">
-        <div class="ps-av-mini">${escapeHtml(initials(displayName))}</div>
-        <div class="ps-member-main">
-          <div class="ps-member-name">${escapeHtml(displayName)} ${self ? `<tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip>` : ''}</div>
-          <div class="ps-member-mail">${escapeHtml(m.email || '')}</div>
-        </div>
-        <div class="ps-member-invited">${escapeHtml(m.invited_by_name ?? m.invitedByName ?? '—')}</div>
-        <div class="ps-member-invited">${escapeHtml(formatTimestamp(m.created_at ?? m.createdAt))}</div>
-        ${roleCell}
-        <div class="ps-member-actions">
-          ${canTransfer ? `<tf-button variant="ghost" size="sm" icon="key" data-transfer="${escapeAttr(userId)}" title="${escapeAttr(t('members_transfer'))}"></tf-button>` : ''}
-          ${canRemove ? `<tf-button variant="ghost" size="sm" icon="trash" data-remove-member="${escapeAttr(userId)}" title="${escapeAttr(t('members_remove'))}"></tf-button>` : ''}
-        </div>
-      </div>
-    `;
-  }).join('') + `
-    <div class="ps-table-footer">${escapeHtml(t('members_footer', {
-      shown: visible.length,
-      total: state.members.length,
-      owners: state.members.filter((m) => m.role === 'owner').length,
-      managers: state.members.filter((m) => m.role === 'manager').length,
-      testers: state.members.filter((m) => m.role === 'tester').length,
-    }))}</div>
-  `;
-
-  host.querySelectorAll('[data-role-user]').forEach((sel) => {
-    sel.addEventListener('change', async (e) => {
-      const userId = sel.dataset.roleUser;
-      const role = e.detail?.value ?? sel.value;
-      try {
-        await ApiBinary.one('projectStudioMemberRoleSetRequest', { projectId: projectId(), userId, role });
-        const member = state.members.find((m) => (m.user_id ?? m.userId) === userId);
-        if (member) member.role = role;
-        toast(t('members_role_ok'), 'success');
-      } catch (err) {
-        toast(`${t('members_role_failed')}: ${err.message}`, 'error');
-        renderMembersList();
-      }
+  const visible = state.members.filter((member) =>
+    (state.memberFunctionFilter === 'all' || member.functions?.includes(state.memberFunctionFilter))
+    && (!query || `${fv(member, 'display_name')} ${member.email || ''}`.toLowerCase().includes(query)));
+  const groups = ['people', 'temporary', 'expired'];
+  host.innerHTML = groups.map((group) => {
+    const rows = visible.filter((member) => memberGroup(member) === group);
+    return `<tf-section-card title="${escapeAttr(t(`members_${group}`))}" icon="${group === 'people' ? 'users' : 'clock'}">
+      <span slot="subtitle">${rows.length}</span>
+      ${rows.length ? `<tf-table data-member-table="${group}" actions-label="${escapeAttr(t('action_more'))}">
+        <tf-column key="person" label="${escapeAttr(t('members_people'))}" renderer="html"></tf-column>
+        <tf-column key="functions" label="${escapeAttr(t('functions_label'))}" renderer="html"></tf-column>
+        <tf-column key="access" label="${escapeAttr(t('access_summary'))}" renderer="html"></tf-column>
+        <tf-column key="expiry" label="${escapeAttr(t('members_expiry'))}" renderer="html"></tf-column>
+      </tf-table>` : `<div class="ps-field-hint">${escapeHtml(t('members_empty'))}</div>`}
+    </tf-section-card>`;
+  }).join('') + `<div class="ps-table-footer">${escapeHtml(t('members_access_footer', {
+    shown: visible.length, total: state.members.length,
+    admins: state.members.filter((member) => member.active && fv(member, 'project_admin')).length,
+    temporary: state.members.filter((member) => memberGroup(member) === 'temporary').length,
+  }))}</div>`;
+  for (const group of groups) {
+    const table = host.querySelector(`[data-member-table="${group}"]`);
+    if (!table) continue;
+    table.rowKey = '_id';
+    table.rows = visible.filter((member) => memberGroup(member) === group).map((member) => {
+      const userId = fv(member, 'user_id');
+      const name = fv(member, 'display_name') || userId;
+      return {
+        _id: userId, _member: member,
+        person: `<div class="ps-member-person"><div class="ps-av-mini">${escapeHtml(initials(name))}</div><div><b>${escapeHtml(name)}</b>
+          ${isMe(userId) ? `<tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip>` : ''}
+          <div class="ps-member-mail">${escapeHtml(member.email || '')}</div>
+          <div class="ps-member-markers">${fv(member, 'is_owner') ? `<tf-chip status="accent">${escapeHtml(t('access_owner'))}</tf-chip>` : ''}
+          ${fv(member, 'project_admin') ? `<tf-chip status="accent">${escapeHtml(t('access_project_admin'))}</tf-chip>` : ''}</div></div></div>`,
+        functions: `<div class="ps-member-function-chips">${functionChips(member.functions)}</div>`,
+        access: effectiveAccessHtml(member.access),
+        expiry: `${escapeHtml(fv(member, 'expires_at') ? formatTimestamp(fv(member, 'expires_at')) : t('members_permanent'))}
+          ${member.active ? '' : `<tf-chip status="warn">${escapeHtml(t('members_expired_badge'))}</tf-chip>`}`,
+      };
     });
-  });
-  host.querySelectorAll('[data-remove-member]').forEach((btn) => {
-    btn.addEventListener('click', () => removeMember(btn.dataset.removeMember));
-  });
-  host.querySelectorAll('[data-transfer]').forEach((btn) => {
-    btn.addEventListener('click', () => transferOwnership(btn.dataset.transfer));
+    if (canManageMembers() || canTransferOwnership()) table.rowActions = (row) => {
+      const button = document.createElement('tf-button');
+      button.setAttribute('variant', 'ghost');
+      button.setAttribute('size', 'sm');
+      button.setAttribute('icon', 'more');
+      button.setAttribute('title', t('action_more'));
+      button.addEventListener('click', () => {
+        const member = row._member;
+        const owner = !!fv(member, 'is_owner');
+        const self = isMe(row._id);
+        const items = [];
+        if (canManageMembers()) items.push({ label: t('access_edit'), icon: 'edit', run: () => openMemberAccessWindow(member) });
+        if (canTransferOwnership() && !owner && !self) items.push({ label: t('members_transfer'), icon: 'key', disabled: !member.active, reason: t('members_expired_badge'), run: () => transferOwnership(row._id) });
+        if (canManageMembers()) items.push({ label: t('members_handover'), icon: 'arrow', danger: true, disabled: owner || self,
+          reason: t(owner ? 'members_owner_handover' : 'members_self_remove'),
+          run: () => openHandover({ userId: row._id, reason: 'project_removal', projectId: projectId() }) });
+        openActionMenu(button, items, fv(member, 'display_name') || row._id);
+      });
+      return button;
+    };
+  }
+}
+
+function renderFunctionCatalogue() {
+  const host = byId('ps-function-catalogue');
+  if (!host) return;
+  host.innerHTML = state.functions.map((definition, index) => `<div class="ps-function-row">
+    <div><b>${escapeHtml(functionLabel(definition))}</b><div class="ps-field-hint">${escapeHtml(functionDescription(definition))}</div></div>
+    ${definition.builtin ? `<tf-chip status="info">${escapeHtml(t('function_builtin'))}</tf-chip>` : ''}
+    ${canManageMembers() ? `<tf-button variant="ghost" size="sm" icon="more" data-function-menu="${index}" title="${escapeAttr(t('action_more'))}"></tf-button>` : ''}
+  </div>`).join('');
+  host.querySelectorAll('[data-function-menu]').forEach((button) => button.addEventListener('click', () => {
+    const definition = state.functions[Number(button.dataset.functionMenu)];
+    const items = [{ label: t('function_edit'), icon: 'edit', run: () => openFunctionWindow(definition) }];
+    if (!definition.builtin) items.push({ label: t('function_delete'), icon: 'trash', danger: true, run: () => {
+      openConfirmWindow({ kind: 'delete', subject: { name: functionLabel(definition), icon: 'shield' }, anchor: button,
+        title: t('function_delete'), submitLabel: t('action_delete'),
+        consequence: t('function_delete_message', { name: functionLabel(definition) }),
+        onSubmit: async () => {
+          const response = await ApiBinary.one('projectStudioFunctionDeleteRequest', { projectId: projectId(), functionId: fv(definition, 'function_id') });
+          if (!response.ok) throw new Error(t('members_failed'));
+          toast(t('function_delete_ok'), 'success');
+          await refreshProjectHeader();
+        },
+      });
+    } });
+    openActionMenu(button, items, functionLabel(definition));
+  }));
+  const matrix = byId('ps-permission-matrix');
+  matrix.style.minWidth = `${Math.max(800, state.functions.length * 145 + 180)}px`;
+  matrix.rows = PROJECT_AREAS.map((area) => {
+    const enabled = projectAccess().areas?.find((grant) => grant.area === area)?.enabled;
+    const row = { area: `<b>${escapeHtml(areaLabel(area))}</b>${enabled ? '' : `<div class="ps-field-hint">${escapeHtml(t('access_module_disabled'))}</div>`}` };
+    state.functions.forEach((definition, index) => {
+      const level = definition.grants.find((grant) => grant.area === area)?.level || 'none';
+      row[`function${index}`] = `<tf-chip status="${permissionChipStatus(level)}" title="${escapeAttr(t(`access_level_${level}`))}">${permissionLetter(level)} · ${escapeHtml(t(`access_level_${level}`))}</tf-chip>`;
+    });
+    return row;
   });
 }
 
-async function removeMember(userId) {
-  const member = state.members.find((m) => (m.user_id ?? m.userId) === userId);
-  if (!member) return;
-  const ok = await TfWindow.confirm({
-    title: t('members_remove_title'),
-    message: t('members_remove_message', { name: escapeHtml(member.display_name ?? member.displayName ?? '') }),
-    confirmLabel: t('members_remove'),
-    cancelLabel: t('action_cancel'),
-    danger: true,
+function openFunctionWindow(definition = null) {
+  if (!canManageMembers()) return;
+  const { body, foot, cleanup } = openWindow({ title: t(definition ? 'function_edit' : 'function_new'), icon: 'shield', width: 720 });
+  body.innerHTML = `
+    <div class="ps-access-catalogue-fields">
+      <tf-input data-function-id label="${escapeAttr(t('function_id'))}" value="${escapeAttr(fv(definition, 'function_id') || '')}" ${definition ? 'disabled' : ''}></tf-input>
+      <tf-input data-function-name label="${escapeAttr(t('function_name'))}" value="${escapeAttr(definition ? functionLabel(definition) : '')}" maxlength="128"></tf-input>
+      <tf-textarea data-function-description label="${escapeAttr(t('function_description'))}" rows="3"></tf-textarea>
+    </div>
+    <div class="ps-function-grants">${PROJECT_AREAS.map((area) => {
+      const level = definition?.grants.find((grant) => grant.area === area)?.level || 'none';
+      return `<tf-select data-function-area="${escapeAttr(area)}" label="${escapeAttr(areaLabel(area))}" value="${level}">
+        ${PERMISSION_LEVELS.map((value) => `<option value="${value}" ${value === level ? 'selected' : ''}>${escapeHtml(t(`access_level_${value}`))}</option>`).join('')}</tf-select>`;
+    }).join('')}</div>
+    <div class="ps-form-error" data-form-error hidden></div>`;
+  body.querySelectorAll('[data-function-area]').forEach((select) => {
+    select.setOptions(PERMISSION_LEVELS.map((value) => ({ value, label: t(`access_level_${value}`) })), definition?.grants.find((grant) => grant.area === select.dataset.functionArea)?.level || 'none');
   });
-  if (!ok) return;
-  try {
-    await ApiBinary.one('projectStudioMemberRemoveRequest', { projectId: projectId(), userId });
-    toast(t('members_remove_ok'), 'success');
-    await renderMembers();
-  } catch (err) {
-    toast(`${t('members_remove_failed')}: ${err.message}`, 'error');
-  }
+  body.querySelector('[data-function-description]').value = definition ? functionDescription(definition) : '';
+  foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    button.setAttribute('disabled', '');
+    try {
+      const response = await ApiBinary.one('projectStudioFunctionSaveRequest', {
+        projectId: projectId(), function: {
+          functionId: String(body.querySelector('[data-function-id]').value || '').trim(),
+          name: definition && String(body.querySelector('[data-function-name]').value || '').trim() === functionLabel(definition) ? definition.name : String(body.querySelector('[data-function-name]').value || '').trim(),
+          description: definition && String(body.querySelector('[data-function-description]').value || '').trim() === functionDescription(definition) ? definition.description : String(body.querySelector('[data-function-description]').value || '').trim(),
+          builtin: definition?.builtin === true,
+          grants: [...body.querySelectorAll('[data-function-area]')].map((select) => ({ area: select.dataset.functionArea, level: select.value })),
+        },
+      });
+      if (!response.ok) throw new Error(t('members_failed'));
+      cleanup();
+      toast(t('function_save_ok'), 'success');
+      await refreshProjectHeader();
+    } catch (error) {
+      const message = body.querySelector('[data-form-error]');
+      message.hidden = false;
+      message.textContent = error.message;
+      button.removeAttribute('disabled');
+    }
+  });
+}
+
+function openMemberAccessWindow(member) {
+  if (!canManageMembers()) return;
+  const { body, foot, cleanup } = openWindow({ title: t('access_edit'), subtitle: fv(member, 'display_name') || fv(member, 'user_id'), icon: 'users', width: 640 });
+  body.innerHTML = `${memberAccessFields(member, state.functions)}<div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    try {
+      const access = readMemberAccess(body);
+      button.setAttribute('disabled', '');
+      const response = await ApiBinary.one('projectStudioMemberAccessSetRequest', { projectId: projectId(), userId: fv(member, 'user_id'), ...access });
+      if (!response.ok) throw new Error(t('members_failed'));
+      cleanup();
+      toast(t('access_saved'), 'success');
+      await refreshProjectHeader();
+    } catch (error) {
+      const message = body.querySelector('[data-form-error]');
+      message.hidden = false;
+      message.textContent = error.message;
+      button.removeAttribute('disabled');
+    }
+  });
 }
 
 async function transferOwnership(userId) {
-  const member = state.members.find((m) => (m.user_id ?? m.userId) === userId);
-  if (!member) return;
-  const ok = await TfWindow.confirm({
-    title: t('members_transfer_title'),
-    message: t('members_transfer_message', { name: escapeHtml(member.display_name ?? member.displayName ?? '') }),
-    confirmLabel: t('members_transfer'),
-    cancelLabel: t('action_cancel'),
-    danger: true,
-  });
+  const member = state.members.find((entry) => fv(entry, 'user_id') === userId);
+  if (!member || !canTransferOwnership()) return;
+  const ok = await TfWindow.confirm({ title: t('members_transfer_title'),
+    message: t('members_transfer_message', { name: escapeHtml(fv(member, 'display_name') || '') }),
+    confirmLabel: t('members_transfer'), cancelLabel: t('action_cancel'), danger: true });
   if (!ok) return;
   try {
     await ApiBinary.one('projectStudioOwnershipTransferRequest', { projectId: projectId(), newOwnerUserId: userId });
     toast(t('members_transfer_ok'), 'success');
     await refreshProjectHeader();
-  } catch (err) {
-    toast(`${t('members_transfer_failed')}: ${err.message}`, 'error');
-  }
+  } catch (error) { toast(`${t('members_transfer_failed')}: ${error.message}`, 'error'); }
 }
 
 function openInviteWindow() {
-  const { body, foot, cleanup } = openWindow({
-    title: t('invite_title'),
-    icon: 'users',
-    width: 560,
-  });
-
-  const inv = {
-    // [{ userId, displayName, email }]
-    selected: [],
-    candidates: [],
-  };
-
+  if (!canManageMembers()) return;
+  const { body, foot, cleanup } = openWindow({ title: t('invite_title'), icon: 'users', width: 640 });
+  const invite = { selected: [], candidates: [] };
   body.innerHTML = `
-    <div class="ps-field">
-      <span class="ps-field-label">${escapeHtml(t('invite_search_label'))}</span>
-      <tf-searchbox id="ps-invite-search" placeholder="${escapeAttr(t('wizard_member_search'))}" debounce="250"></tf-searchbox>
-      <div class="ps-selected-chips" data-invite-chips></div>
-      <div class="ps-candidate-list" data-invite-candidates hidden></div>
-    </div>
-    <tf-select id="ps-invite-role" label="${escapeAttr(t('invite_role_label'))}" value="tester">
-      ${ASSIGNABLE_ROLES.map((r) => `<option value="${r}" ${r === 'tester' ? 'selected' : ''}>${escapeHtml(roleLabel(r))}</option>`).join('')}
-    </tf-select>
-    <div class="ps-field-hint">${escapeHtml(t('invite_hint'))}</div>
-    <div class="ps-form-error" data-form-error hidden></div>
-  `;
-  foot.innerHTML = `
-    <div class="ps-footer-left"></div>
-    <div class="ps-footer-right">
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
-      <tf-button variant="primary" icon="plus" data-action="save">${escapeHtml(t('invite_submit'))}</tf-button>
-    </div>
-  `;
-
+    <tf-searchbox data-invite-search placeholder="${escapeAttr(t('wizard_member_search'))}" debounce="250"></tf-searchbox>
+    <div class="ps-selected-chips" data-invite-chips></div>
+    <div class="ps-candidate-list" data-invite-candidates hidden></div>
+    ${memberAccessFields({ functions: ['tester'], projectAdmin: false, expiresAt: null }, state.functions)}
+    <div class="ps-field-hint">${escapeHtml(t('invite_functions_hint'))}</div>
+    <div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="plus" data-action="save">${escapeHtml(t('invite_submit'))}</tf-button></div>`;
   const renderSelected = () => {
     const host = body.querySelector('[data-invite-chips]');
-    if (!host) return;
-    host.innerHTML = inv.selected.map((u, i) => `
-      <tf-chip status="accent" removable data-invite-chip="${i}">${escapeHtml(u.displayName)}</tf-chip>
-    `).join('');
-    host.querySelectorAll('[data-invite-chip]').forEach((chip) => {
-      chip.addEventListener('remove', () => {
-        inv.selected.splice(Number(chip.dataset.inviteChip), 1);
-        renderSelected();
-        renderCandidates();
-      });
-    });
-  };
-
-  const renderCandidates = () => {
-    const host = body.querySelector('[data-invite-candidates]');
-    if (!host) return;
-    const chosen = new Set(inv.selected.map((u) => u.userId));
-    const rows = inv.candidates
-      .filter((u) => !chosen.has(u.user_id ?? u.userId))
-      .map((u) => {
-        const userId = u.user_id ?? u.userId;
-        return `
-          <div class="ps-candidate-row" data-invite-candidate="${escapeAttr(userId)}" role="button" tabindex="0">
-            <div class="ps-av-mini">${escapeHtml(initials(u.display_name ?? u.displayName))}</div>
-            <div>
-              <div class="ps-candidate-name">${escapeHtml(u.display_name ?? u.displayName ?? '')}</div>
-              <div class="ps-candidate-mail">${escapeHtml(u.email || '')}</div>
-            </div>
-          </div>
-        `;
-      }).join('');
-    host.hidden = !rows;
-    host.innerHTML = rows;
-  };
-
-  body.querySelector('#ps-invite-search')?.addEventListener('search', async (e) => {
-    const query = String(e.detail?.value ?? '').trim();
-    if (!query) {
-      inv.candidates = [];
-      renderCandidates();
-      return;
-    }
-    try {
-      const resp = await ApiBinary.one('projectStudioMemberCandidatesRequest', {
-        projectId: projectId(), query, limit: 12,
-      });
-      inv.candidates = Array.isArray(resp.users) ? resp.users : [];
-    } catch {
-      inv.candidates = [];
-    }
-    renderCandidates();
-  });
-
-  body.addEventListener('click', (e) => {
-    const row = e.target.closest('[data-invite-candidate]');
-    if (!row) return;
-    const userId = row.dataset.inviteCandidate;
-    const user = inv.candidates.find((u) => (u.user_id ?? u.userId) === userId);
-    if (user) {
-      inv.selected.push({
-        userId,
-        displayName: user.display_name ?? user.displayName ?? '',
-        email: user.email || '',
-      });
+    host.innerHTML = invite.selected.map((person, index) => `<tf-chip status="accent" removable data-invite-chip="${index}">${escapeHtml(fv(person, 'display_name') || fv(person, 'user_id'))}</tf-chip>`).join('');
+    host.querySelectorAll('[data-invite-chip]').forEach((chip) => chip.addEventListener('remove', () => {
+      invite.selected.splice(Number(chip.dataset.inviteChip), 1);
       renderSelected();
       renderCandidates();
+    }));
+  };
+  const renderCandidates = () => {
+    const host = body.querySelector('[data-invite-candidates]');
+    const chosen = new Set(invite.selected.map((person) => fv(person, 'user_id')));
+    const rows = invite.candidates.filter((person) => !chosen.has(fv(person, 'user_id')));
+    host.hidden = !rows.length;
+    host.innerHTML = rows.map((person) => `<tf-button variant="ghost" data-invite-candidate="${escapeAttr(fv(person, 'user_id'))}">${escapeHtml(`${fv(person, 'display_name') || ''} · ${person.email || ''}`)}</tf-button>`).join('');
+  };
+  body.querySelector('[data-invite-search]').addEventListener('search', async (event) => {
+    const query = String(event.detail?.value || '').trim();
+    if (!query) { invite.candidates = []; renderCandidates(); return; }
+    try {
+      const response = await ApiBinary.one('projectStudioMemberCandidatesRequest', { projectId: projectId(), query, limit: 12 });
+      invite.candidates = Array.isArray(response.users) ? response.users : [];
+      renderCandidates();
+    } catch (error) {
+      const message = body.querySelector('[data-form-error]');
+      message.hidden = false;
+      message.textContent = error.message;
     }
   });
-
-  foot.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn) return;
-    if (btn.dataset.action === 'cancel') { cleanup(); return; }
-    const errEl = body.querySelector('[data-form-error]');
-    if (!inv.selected.length) {
-      if (errEl) { errEl.hidden = false; errEl.textContent = t('err_invite_empty'); }
-      return;
-    }
-    const role = String(body.querySelector('#ps-invite-role')?.value || 'tester');
+  body.addEventListener('click', (event) => {
+    const candidate = event.target.closest('[data-invite-candidate]');
+    if (!candidate) return;
+    const person = invite.candidates.find((entry) => fv(entry, 'user_id') === candidate.dataset.inviteCandidate);
+    if (person && !invite.selected.some((entry) => fv(entry, 'user_id') === fv(person, 'user_id'))) invite.selected.push(person);
+    renderSelected();
+    renderCandidates();
+  });
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
     try {
-      const resp = await ApiBinary.one('projectStudioMembersAddRequest', {
-        projectId: projectId(),
-        members: inv.selected.map((u) => ({ userId: u.userId, role })),
-      });
-      toast(t('invite_ok', { count: Number(resp.added ?? inv.selected.length) }), 'success');
+      if (!invite.selected.length) throw new Error(t('err_invite_empty'));
+      const access = readMemberAccess(body);
+      button.setAttribute('disabled', '');
+      const response = await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: invite.selected.map((person) => ({ userId: fv(person, 'user_id'), ...access })) });
+      toast(t('invite_ok', { count: Number(response.added) }), 'success');
       cleanup();
-      await renderMembers();
-    } catch (err) {
-      if (errEl) { errEl.hidden = false; errEl.textContent = `${t('invite_failed')}: ${err.message}`; }
+      await refreshProjectHeader();
+    } catch (error) {
+      const message = body.querySelector('[data-form-error]');
+      message.hidden = false;
+      message.textContent = error.message;
+      button.removeAttribute('disabled');
     }
   });
 }
@@ -3715,6 +3823,7 @@ async function renderSettings() {
 
   const settings = state.settings || {};
   const archived = state.project?.status === 'archived';
+  const mutable = canArea('settings', 'write');
   const agents = Array.isArray(settings.agents) ? settings.agents : [];
   const tags = Array.isArray(settings.tags) ? settings.tags : [];
   const enabledModules = new Set(
@@ -3834,18 +3943,22 @@ async function renderSettings() {
           <div class="ps-sr-label">${escapeHtml(t(archived ? 'danger_unarchive_label' : 'danger_archive_label'))}</div>
           <div class="ps-sr-desc">${escapeHtml(t('danger_archive_desc'))}</div>
         </div>
-        <tf-button variant="ghost" icon="clock" id="ps-danger-archive">${escapeHtml(t(archived ? 'action_unarchive' : 'action_archive'))}</tf-button>
+        <tf-button variant="ghost" icon="clock" id="ps-danger-archive" ${canLifecycle() ? '' : 'disabled'}>${escapeHtml(t(archived ? 'action_unarchive' : 'action_archive'))}</tf-button>
       </div>
       <div class="ps-danger-row">
         <div class="ps-sr-main">
           <div class="ps-sr-label">${escapeHtml(t('danger_delete_label'))}</div>
           <div class="ps-sr-desc">${escapeHtml(t('danger_delete_desc'))}</div>
         </div>
-        <tf-button variant="danger-solid" icon="trash" id="ps-danger-delete" ${isOwner() ? '' : `disabled title="${escapeAttr(t('danger_owner_only'))}"`}>${escapeHtml(t('action_delete'))}</tf-button>
+        <tf-button variant="danger-solid" icon="trash" id="ps-danger-delete" ${canLifecycle() ? '' : `disabled title="${escapeAttr(t('danger_owner_only'))}"`}>${escapeHtml(t('action_delete'))}</tf-button>
       </div>
     </div>
   `;
 
+  if (!mutable) panel.querySelectorAll('tf-input, tf-textarea, tf-select, tf-toggle, tf-button').forEach((control) => {
+    if (canLifecycle() && ['ps-danger-archive', 'ps-danger-delete'].includes(control.id)) return;
+    control.setAttribute('disabled', '');
+  });
   const descField = panel.querySelector('#ps-set-desc');
   if (descField) descField.value = settings.description ?? state.project?.description ?? '';
 
@@ -3995,7 +4108,7 @@ async function renderSettings() {
     setProjectArchived(projectId(), !archived);
   });
   byId('ps-danger-delete')?.addEventListener('click', () => {
-    if (isOwner()) confirmDeleteProject(state.project);
+    if (canLifecycle()) confirmDeleteProject(state.project);
   });
 }
 
@@ -4116,7 +4229,7 @@ async function ensureF2Members() {
 
 // Members allowed to execute tests (tester and above).
 function testerMembers() {
-  return (f2().membersCache || []).filter((m) => (ROLE_RANK[m.role] ?? 0) >= ROLE_RANK.tester);
+  return (f2().membersCache || []).filter((member) => member.active && allowsArea(member.access, 'tests', 'write'));
 }
 
 function memberName(userId) {
@@ -4280,7 +4393,7 @@ async function renderTests() {
   panel.innerHTML = `
     <div class="ps-subnav">
       <tf-segmented id="ps-tests-seg" value="${escapeAttr(testsSegValue())}">
-        ${TESTS_SEGMENTS.map((seg) => `<option value="${seg}" icon="${TESTS_SEG_ICON[seg]}">${escapeHtml(t(`tests_seg_${seg}`))}</option>`).join('')}
+        ${TESTS_SEGMENTS.filter((seg) => seg !== 'environments' || canArea('environments')).map((seg) => `<option value="${seg}" icon="${TESTS_SEG_ICON[seg]}">${escapeHtml(t(`tests_seg_${seg}`))}</option>`).join('')}
       </tf-segmented>
     </div>
     <div id="ps-tests-host"></div>
@@ -4300,6 +4413,7 @@ function syncTestsSeg() {
 }
 
 async function renderTestsView() {
+  if (['environments', 'env-approvals'].includes(f2().view) && !canArea('environments')) f2().view = 'cases';
   const host = byId('ps-tests-host');
   if (!host) return;
   syncTestsSeg();
@@ -4402,10 +4516,10 @@ async function renderCasesView() {
         ${selectOpt('agent', flt.origin, t('origin_agent'))}
       </tf-select>
     </div>
-    ${canEdit() ? `
+    ${canArea('tests', 'write') ? `
       <div class="ps-tests-toolbar ps-cases-actions">
         <tf-button variant="ghost" icon="download" id="ps-cases-import">${escapeHtml(t('cases_import_csv'))}</tf-button>
-        <tf-button variant="ghost" icon="sparkle" id="ps-cases-generate">${escapeHtml(t('cases_generate'))}</tf-button>
+        <tf-button variant="ghost" icon="sparkle" id="ps-cases-generate" ${canGenerateTests() ? '' : 'disabled'}>${escapeHtml(t('cases_generate'))}</tf-button>
         <span class="ps-new-case-wrap">
           <tf-button variant="primary" icon="plus" id="ps-cases-new">${escapeHtml(t('cases_new'))}</tf-button>
           <tf-menu placement="bottom-end" id="ps-cases-new-menu">
@@ -4416,10 +4530,10 @@ async function renderCasesView() {
     ` : ''}
     <div class="ps-bulk-bar" id="ps-cases-bulk" hidden>
       <span class="ps-bulk-count" id="ps-cases-bulk-count"></span>
-      ${canEdit() ? `<tf-button variant="ghost" size="sm" icon="send" data-bulk="review">${escapeHtml(t('bulk_to_review'))}</tf-button>` : ''}
-      ${canManage() ? `<tf-button variant="ghost" size="sm" icon="check" data-bulk="approved">${escapeHtml(t('bulk_approve'))}</tf-button>` : ''}
-      ${canManage() ? `<tf-button variant="ghost" size="sm" icon="ban" data-bulk="deprecated">${escapeHtml(t('bulk_deprecate'))}</tf-button>` : ''}
-      ${canEdit() ? `<tf-button variant="ghost" size="sm" icon="trash" data-bulk="delete">${escapeHtml(t('bulk_delete'))}</tf-button>` : ''}
+      ${canArea('tests', 'write') ? `<tf-button variant="ghost" size="sm" icon="send" data-bulk="review">${escapeHtml(t('bulk_to_review'))}</tf-button>` : ''}
+      ${canArea('tests', 'admin') ? `<tf-button variant="ghost" size="sm" icon="check" data-bulk="approved">${escapeHtml(t('bulk_approve'))}</tf-button>` : ''}
+      ${canArea('tests', 'admin') ? `<tf-button variant="ghost" size="sm" icon="ban" data-bulk="deprecated">${escapeHtml(t('bulk_deprecate'))}</tf-button>` : ''}
+      ${canArea('tests', 'write') ? `<tf-button variant="ghost" size="sm" icon="trash" data-bulk="delete">${escapeHtml(t('bulk_delete'))}</tf-button>` : ''}
       <tf-button variant="ghost" size="sm" icon="x" data-bulk="clear">${escapeHtml(t('bulk_clear'))}</tf-button>
     </div>
     <div id="ps-cases-table-host"></div>
@@ -4519,8 +4633,8 @@ function renderCasesTable() {
       btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
       wrap.appendChild(btn);
     };
-    mk('edit', t(canEdit() ? 'action_edit' : 'cases_open'), () => openCaseEditor(live()._id));
-    if (canEdit()) {
+    mk('edit', t(canArea('tests', 'write') ? 'action_edit' : 'cases_open'), () => openCaseEditor(live()._id));
+    if (canArea('tests', 'write')) {
       mk('copy', t('cases_duplicate'), () => duplicateCase(live()._id));
       mk('trash', t('action_delete'), () => deleteCaseFromList(live()._row));
     }
@@ -4899,7 +5013,7 @@ async function renderCaseEditor() {
   const ed = f2().editor;
   if (!host || !ed) { f2().view = 'cases'; return renderCasesView(); }
   await loadProjectTags();
-  if (!state.sources.length) {
+  if (canArea('knowledge') && !state.sources.length) {
     try { await loadSources(); } catch { /* linked-source picker stays empty */ }
   }
   if (!ed.loaded) {
@@ -4914,29 +5028,29 @@ async function renderCaseEditor() {
 
   const codeCase = isCodeKind(ed.kind);
   if (codeCase) {
-    // The code editor needs the runner toolchains (language availability) and
-    // the approved environments (try-run target).
     await loadRunners();
-    try { await loadEnvironments(); } catch { /* the try-run guard reports it */ }
+    if (canArea('environments')) {
+      try { await loadEnvironments(); } catch { /* the try-run guard reports it */ }
+    }
     if (state.tab !== 'tests' || f2().view !== 'case-editor') return;
     const approved = approvedEnvironments();
     if (!ed.envId && approved.length === 1) ed.envId = fv(approved[0], 'environment_id');
   }
   const info = ed.info;
   const status = info?.status || 'draft';
-  const editable = canEdit() && (!info || status === 'draft' || status === 'review');
+  const editable = canArea('tests', 'write') && (!info || status === 'draft' || status === 'review');
   const statusActions = [];
   if (info) {
-    if (status === 'draft' && canEdit()) {
+    if (status === 'draft' && canArea('tests', 'write')) {
       statusActions.push(`<tf-button variant="ghost" icon="send" data-status="review">${escapeHtml(t('case_send_review'))}</tf-button>`);
     }
-    if (status === 'review' && canManage()) {
+    if (status === 'review' && canArea('tests', 'admin')) {
       statusActions.push(`<tf-button variant="ghost" icon="check" data-status="approved">${escapeHtml(t('case_approve'))}</tf-button>`);
     }
-    if (status === 'review' && canManage()) {
+    if (status === 'review' && canArea('tests', 'admin')) {
       statusActions.push(`<tf-button variant="ghost" icon="chevron-left" data-status="draft" data-needs-reason>${escapeHtml(t('case_back_to_draft'))}</tf-button>`);
     }
-    if (status === 'approved' && canManage()) {
+    if (status === 'approved' && canArea('tests', 'admin')) {
       statusActions.push(`<tf-button variant="ghost" icon="ban" data-status="deprecated" data-needs-reason>${escapeHtml(t('case_deprecate'))}</tf-button>`);
     }
   }
@@ -4957,7 +5071,7 @@ async function renderCaseEditor() {
       <div class="ps-editor-actions">
         ${statusActions.join('')}
         ${editable ? `<tf-button variant="primary" icon="check" id="ps-case-save">${escapeHtml(t('action_save'))}</tf-button>` : ''}
-        ${info && canEdit() ? `<tf-button variant="ghost" icon="trash" id="ps-case-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
+        ${info && canArea('tests', 'write') ? `<tf-button variant="ghost" icon="trash" id="ps-case-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
       </div>
     </div>
     ${info && fv(info, 'status_reason') ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('case_status_reason', { reason: fv(info, 'status_reason') }))}</span></div>` : ''}
@@ -5264,13 +5378,13 @@ function codeCaseSectionsHtml(ed, editable) {
             return `<option value="${lang.id}" ${lang.id === ed.language ? 'selected' : ''} ${lang.executable ? '' : 'disabled'}>${escapeHtml(`${lang.id} — ${suffix}`)}</option>`;
           }).join('')}
         </tf-select>
-        <tf-select id="ps-code-env" label="${escapeAttr(t('code_env_label'))}" value="${escapeAttr(ed.envId)}">
+        ${canArea('environments') ? `<tf-select id="ps-code-env" label="${escapeAttr(t('code_env_label'))}" value="${escapeAttr(ed.envId)}">
           <option value="">${escapeHtml(approved.length ? t('assign_choose') : t('code_env_missing'))}</option>
           ${approved.map((env) => `<option value="${escapeAttr(fv(env, 'environment_id'))}" ${fv(env, 'environment_id') === ed.envId ? 'selected' : ''}>${escapeHtml(`${env.name} — ${fv(env, 'base_url')}`)}</option>`).join('')}
-        </tf-select>
+        </tf-select>` : ''}
         <span class="ps-toolbar-spacer"></span>
-        ${canEdit() ? `
-          <tf-button variant="ghost" icon="play" id="ps-code-try">${escapeHtml(t('code_try_run'))}</tf-button>
+        ${canArea('tests', 'write') ? `
+          <tf-button variant="ghost" icon="play" id="ps-code-try" ${canTryRun() ? '' : `disabled title="${escapeAttr(`${areaLabel('environments')} · ${t('access_level_none')}`)}"`}>${escapeHtml(t('code_try_run'))}</tf-button>
           <tf-button variant="ghost" icon="stop" id="ps-code-try-stop" hidden>${escapeHtml(t('code_try_stop'))}</tf-button>
         ` : ''}
       </div>
@@ -5282,7 +5396,7 @@ function codeCaseSectionsHtml(ed, editable) {
       ${codeConfigHtml(ed, editable)}
     </tf-section-card>
 
-    ${canEdit() ? `
+    ${canArea('tests', 'write') ? `
       <tf-section-card class="ps-ai-panel" title="${escapeAttr(t('ai_panel_title'))}" icon="sparkle">
         <span slot="subtitle">${escapeHtml(t('ai_panel_sub'))}</span>
         <div class="ps-ai-chips" id="ps-ai-chips">
@@ -5424,7 +5538,7 @@ function setTryRunButtons(running) {
 // T03 "Uruchom próbnie": ephemeral execution of the UNSAVED editor content
 // against an approved environment. Nothing is persisted as a run.
 async function startTryRun(ed) {
-  if (ed.tryRun?.running) return;
+  if (ed.tryRun?.running || !canTryRun()) return;
   collectCodeConfig(ed);
   if (!ed.caseId) { toast(t('code_try_needs_save'), 'error'); return; }
   if (!ed.script.trim()) { toast(t('err_case_script'), 'error'); return; }
@@ -5897,6 +6011,7 @@ async function restoreCaseVersion(ed, version) {
 // =============================================================================
 
 function openGenerationWindow() {
+  if (!canGenerateTests()) return;
   const { body, foot, cleanup } = openWindow({
     title: t('gen_win_title'),
     subtitle: t('gen_win_sub'),
@@ -6091,7 +6206,7 @@ function openGenerationWindow() {
   });
 
   const start = async () => {
-    if (gw.busy) return;
+    if (gw.busy || !canGenerateTests()) return;
     gw.busy = true;
     try {
       const resp = await ApiBinary.one('projectStudioGenerationStartRequest', {
@@ -6133,7 +6248,7 @@ function openGenerationWindow() {
 
   // Ready sources + org agents load lazily so opening the window stays instant.
   (async () => {
-    if (!state.sources.length) {
+    if (canArea('knowledge') && !state.sources.length) {
       try { await loadSources(); } catch { /* source list stays empty */ }
     }
     renderSources();
@@ -6189,7 +6304,7 @@ async function renderGenerationsView() {
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
       <tf-button variant="ghost" icon="refresh" id="ps-gens-refresh">${escapeHtml(t('action_refresh'))}</tf-button>
-      ${canEdit() ? `<tf-button variant="primary" icon="sparkle" id="ps-gens-new">${escapeHtml(t('cases_generate'))}</tf-button>` : ''}
+      ${canArea('tests', 'write') ? `<tf-button variant="primary" icon="sparkle" id="ps-gens-new" ${canGenerateTests() ? '' : 'disabled'}>${escapeHtml(t('cases_generate'))}</tf-button>` : ''}
     </div>
     <div id="ps-gens-table-host"></div>
   `;
@@ -6266,7 +6381,7 @@ function renderGenerationsTable() {
     open.addEventListener('click', (e) => { e.stopPropagation(); openGenDetail(live()._id); });
     wrap.appendChild(open);
     const status = row._row.status;
-    if (canManage() && status !== 'running' && status !== 'review') {
+    if (canArea('tests', 'admin') && status !== 'running' && status !== 'review') {
       const del = document.createElement('tf-button');
       del.setAttribute('variant', 'ghost');
       del.setAttribute('size', 'sm');
@@ -6356,8 +6471,8 @@ async function renderGenDetailView() {
         <tf-chip status="info">${escapeHtml(t('gens_progress', { generated, accepted: Number(fv(run, 'cases_accepted') ?? 0), rejected: Number(fv(run, 'cases_rejected') ?? 0) }))}</tf-chip>
       </div>
       <div class="ps-editor-actions">
-        ${running && (initiator || canManage()) ? `<tf-button variant="ghost" icon="ban" id="ps-gen-cancel">${escapeHtml(t('gen_cancel'))}</tf-button>` : ''}
-        ${!running && run.status !== 'review' && canManage() ? `<tf-button variant="ghost" icon="trash" id="ps-gen-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
+        ${running && canArea('tests', 'write') && (initiator || canArea('tests', 'admin')) ? `<tf-button variant="ghost" icon="ban" id="ps-gen-cancel">${escapeHtml(t('gen_cancel'))}</tf-button>` : ''}
+        ${!running && run.status !== 'review' && canArea('tests', 'admin') ? `<tf-button variant="ghost" icon="trash" id="ps-gen-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
       </div>
     </div>
     ${run.error ? `<div class="ps-form-error">${escapeHtml(run.error)}</div>` : ''}
@@ -6381,7 +6496,7 @@ async function renderGenDetailView() {
       <tf-section-card title="${escapeAttr(t('gen_review_title'))}" icon="eye">
         <span slot="subtitle">${escapeHtml(t('gen_review_sub', { count: gd.pendingCases.length }))}</span>
         <span slot="actions">
-          ${canEdit() ? `
+          ${canArea('tests', 'write') ? `
             <tf-button variant="ghost" size="sm" id="ps-gen-select-all">${escapeHtml(t('gen_select_all'))}</tf-button>
             <tf-button variant="primary" size="sm" icon="check" id="ps-gen-accept">${escapeHtml(t('gen_accept_selected'))}</tf-button>
             <tf-button variant="danger-solid" size="sm" icon="x" id="ps-gen-reject">${escapeHtml(t('gen_reject_selected'))}</tf-button>
@@ -6576,7 +6691,7 @@ async function loadEnvironments(force = false) {
 }
 
 function approvedEnvironments() {
-  return (f2().envs.rows || []).filter((e) => fv(e, 'approval_status') === 'approved');
+  return canArea('environments') ? (f2().envs.rows || []).filter((e) => fv(e, 'approval_status') === 'approved') : [];
 }
 
 async function renderEnvironmentsView() {
@@ -6611,7 +6726,7 @@ async function renderEnvironmentsView() {
           ${escapeHtml(t('envs_approvals_btn'))}${s.envPending > 0 ? ` (${s.envPending})` : ''}
         </tf-button>
       ` : ''}
-      ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-envs-new">${escapeHtml(t('envs_new'))}</tf-button>` : ''}
+      ${canArea('environments', 'write') ? `<tf-button variant="primary" icon="plus" id="ps-envs-new">${escapeHtml(t('envs_new'))}</tf-button>` : ''}
     </div>
     <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('envs_intro'))}</span></div>
     <div id="ps-envs-table-host"></div>
@@ -6678,7 +6793,7 @@ function renderEnvironmentsTable() {
     const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'ps-file-actions';
-    if (!canManage()) return wrap;
+    if (!canArea('environments', 'write')) return wrap;
     const edit = document.createElement('tf-button');
     edit.setAttribute('variant', 'ghost');
     edit.setAttribute('size', 'sm');
@@ -7027,7 +7142,7 @@ async function renderSuitesView() {
         <option value="deprecated">${escapeHtml(t('suites_health_deprecated'))}</option>
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
-      ${canEdit() ? `<tf-button variant="primary" icon="plus" id="ps-suites-new">${escapeHtml(t('suites_new'))}</tf-button>` : ''}
+      ${canArea('tests', 'write') ? `<tf-button variant="primary" icon="plus" id="ps-suites-new">${escapeHtml(t('suites_new'))}</tf-button>` : ''}
     </div>
     <div id="ps-suites-table-host"></div>
   `;
@@ -7105,7 +7220,7 @@ function renderSuitesTable() {
       btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
       wrap.appendChild(btn);
     };
-    if (canEdit()) {
+    if (canArea('tests', 'write')) {
       mk('edit', t('action_edit'), () => openSuiteEditor(live()._id));
       mk('play', t('suites_run'), () => openRunWindow({ suiteId: live()._id }));
       mk('trash', t('action_delete'), () => deleteSuite(live()._row));
@@ -7187,7 +7302,7 @@ async function renderSuiteEditor() {
     return;
   }
   if (state.tab !== 'tests' || f2().view !== 'suite-editor') return;
-  const editable = canEdit();
+  const editable = canArea('tests', 'write');
 
   host.innerHTML = `
     <div class="ps-suite-head">
@@ -7501,7 +7616,7 @@ async function renderRunsView() {
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
       <tf-button variant="ghost" icon="refresh" id="ps-runs-refresh">${escapeHtml(t('action_refresh'))}</tf-button>
-      ${canEdit() ? `<tf-button variant="primary" icon="plus" id="ps-runs-new">${escapeHtml(t('runs_new'))}</tf-button>` : ''}
+      ${canArea('tests', 'write') ? `<tf-button variant="primary" icon="plus" id="ps-runs-new">${escapeHtml(t('runs_new'))}</tf-button>` : ''}
     </div>
     <div id="ps-runs-table-host"></div>
   `;
@@ -7597,7 +7712,7 @@ function renderRunsTable() {
       openRunByType(r._id, fv(r._row, 'run_type'));
     });
     wrap.appendChild(open);
-    if (canManage() && row._row.status !== 'running') {
+    if (canArea('tests', 'admin') && row._row.status !== 'running') {
       const del = document.createElement('tf-button');
       del.setAttribute('variant', 'ghost');
       del.setAttribute('size', 'sm');
@@ -7652,6 +7767,7 @@ function deleteRun(run) {
 // T08 — new run window. `prefill` supports { suiteId, suiteName } (from the
 // suites list) and { fromFailedRunId, fromFailedLabel } (from run results).
 async function openRunWindow(prefill = {}) {
+  if (!canArea('tests', 'write') || (prefill.runType && prefill.runType !== 'manual' && !canTryRun())) return;
   const { body, foot, cleanup } = openWindow({
     title: t('run_win_title'),
     subtitle: t('run_win_sub'),
@@ -7691,11 +7807,7 @@ async function openRunWindow(prefill = {}) {
     </div>
     <div class="ps-field" style="margin-bottom:12px;">
       <span class="ps-field-label">${escapeHtml(t('run_type_label'))}</span>
-      <tf-segmented id="ps-run-type" value="${escapeAttr(rw.runType)}">
-        <option value="manual">${escapeHtml(t('run_type_manual'))}</option>
-        <option value="auto">${escapeHtml(t('run_type_auto'))}</option>
-        <option value="perf">${escapeHtml(t('run_type_perf'))}</option>
-      </tf-segmented>
+      <tf-segmented id="ps-run-type" value="${escapeAttr(rw.runType)}"></tf-segmented>
       <div class="ps-field-hint" data-run-type-hint>${escapeHtml(t('run_type_manual_hint'))}</div>
     </div>
     <div class="ps-banner-warn" data-runner-missing hidden>${sprite('alert')}<span>${escapeHtml(t('run_runner_missing'))}</span></div>
@@ -7763,6 +7875,7 @@ async function openRunWindow(prefill = {}) {
     </div>
     <div class="ps-form-error" data-form-error hidden></div>
   `;
+  body.querySelector('#ps-run-type').setOptions(RUN_TYPES.map((value) => ({ value, label: t(`run_type_${value}`), disabled: value !== 'manual' && !canTryRun() })), rw.runType);
   foot.innerHTML = `
     <div class="ps-footer-left"></div>
     <div class="ps-footer-right">
@@ -7881,6 +7994,10 @@ async function openRunWindow(prefill = {}) {
   };
 
   body.querySelector('#ps-run-type')?.addEventListener('change', (e) => {
+    if (e.detail?.value !== 'manual' && !canTryRun()) {
+      e.target.setAttribute('value', rw.runType);
+      return;
+    }
     rw.runType = e.detail?.value ?? rw.runType;
     showError(null);
     syncRunType();
@@ -7932,6 +8049,7 @@ async function openRunWindow(prefill = {}) {
     const btn = e.target.closest('[data-action]');
     if (!btn || rw.busy) return;
     if (btn.dataset.action === 'cancel') { cleanup(); return; }
+    if (!canArea('tests', 'write') || (isAutomated() && !canTryRun())) return;
     rw.name = String(body.querySelector('#ps-run-name')?.value ?? '').trim();
     rw.envNote = String(body.querySelector('#ps-run-env')?.value ?? '').trim();
     if (rw.name.length < 3) { showError(t('err_run_name')); return; }
@@ -8065,9 +8183,11 @@ async function openRunWindow(prefill = {}) {
 
     // Automated runs need an APPROVED environment and (optionally) an explicit
     // runner; an empty runner lets the server match one by toolchain.
-    try {
-      await loadEnvironments();
-    } catch { /* the select stays empty and the guard below blocks the start */ }
+    if (canArea('environments')) {
+      try {
+        await loadEnvironments();
+      } catch { /* the select stays empty and the guard below blocks the start */ }
+    }
     const approved = approvedEnvironments();
     rw.environmentId = approved.length === 1 ? fv(approved[0], 'environment_id') : '';
     body.querySelector('#ps-run-environment')?.setOptions([
@@ -8139,7 +8259,7 @@ async function renderRunDetailView() {
   const openItems = Number(run.pending ?? 0) + Number(fv(run, 'in_progress') ?? 0);
   const runDuration = runElapsed(run);
   const creator = isMe(fv(run, 'created_by'));
-  const canClose = running && (canManage() || creator);
+  const canClose = running && canArea('tests', 'write') && (canArea('tests', 'admin') || creator);
   const failedCount = Number(run.failed ?? 0) + Number(run.blocked ?? 0);
   const myItems = rd.items.filter((it) => {
     const assignee = fv(it, 'assigned_to');
@@ -8164,10 +8284,10 @@ async function renderRunDetailView() {
       </div>
       <div class="ps-editor-actions">
         <tf-button variant="ghost" icon="download" id="ps-run-export">${escapeHtml(t('run_export_csv'))}</tf-button>
-        ${canEdit() && failedCount > 0 && !running ? `<tf-button variant="ghost" icon="rotate" id="ps-run-from-failed">${escapeHtml(t('run_new_from_failed'))}</tf-button>` : ''}
+        ${canArea('tests', 'write') && failedCount > 0 && !running ? `<tf-button variant="ghost" icon="rotate" id="ps-run-from-failed">${escapeHtml(t('run_new_from_failed'))}</tf-button>` : ''}
         ${canClose ? `<tf-button variant="ghost" icon="check" id="ps-run-close">${escapeHtml(t('run_close'))}</tf-button>` : ''}
         ${canClose ? `<tf-button variant="ghost" icon="ban" id="ps-run-cancel">${escapeHtml(t('run_cancel'))}</tf-button>` : ''}
-        ${canManage() && !running ? `<tf-button variant="ghost" icon="trash" id="ps-run-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
+        ${canArea('tests', 'admin') && !running ? `<tf-button variant="ghost" icon="trash" id="ps-run-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
       </div>
     </div>
 
@@ -8190,7 +8310,7 @@ async function renderRunDetailView() {
     </div>
     <div class="ps-run-progressbar" id="ps-run-stacked"></div>
 
-    ${canTest() && running ? `
+    ${canArea('tests', 'write') && running ? `
       <tf-section-card title="${escapeAttr(t('run_my_items_title'))}" icon="user">
         <span slot="subtitle">${escapeHtml(t('run_my_items_sub', { count: myItems.length }))}</span>
         <span slot="actions">
@@ -8511,7 +8631,7 @@ async function renderAutoRunView() {
     + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
   const pct = Math.min(100, Math.round((done / total) * 100));
   const creator = isMe(fv(run, 'created_by'));
-  const canCancel = running && (canManage() || creator);
+  const canCancel = running && canArea('tests', 'write') && (canArea('tests', 'admin') || creator);
 
   host.innerHTML = `
     <div class="ps-editor-head">
@@ -8531,7 +8651,7 @@ async function renderAutoRunView() {
       <div class="ps-editor-actions">
         <tf-button variant="ghost" icon="refresh" id="ps-auto-refresh">${escapeHtml(t('refresh'))}</tf-button>
         <tf-button variant="ghost" icon="download" id="ps-auto-export">${escapeHtml(t('run_export_csv'))}</tf-button>
-        ${canEdit() && !running ? `<tf-button variant="ghost" icon="rotate" id="ps-auto-again">${escapeHtml(t('auto_run_again'))}</tf-button>` : ''}
+        ${canArea('tests', 'write') && !running ? `<tf-button variant="ghost" icon="rotate" id="ps-auto-again">${escapeHtml(t('auto_run_again'))}</tf-button>` : ''}
         ${canCancel ? `<tf-button variant="danger-solid" icon="stop" id="ps-auto-stop">${escapeHtml(t('auto_stop'))}</tf-button>` : ''}
       </div>
     </div>
@@ -8651,7 +8771,7 @@ function buildAutoItemExpansion(item) {
   wrap.innerHTML = `
     ${item.message ? `<div class="ps-code-block">${escapeHtml(item.message)}</div>` : `<div class="ps-field-hint">${escapeHtml(t('auto_item_no_message'))}</div>`}
     <div class="ps-artifact-row">
-      ${!canTest() ? `<span class="ps-field-hint">${escapeHtml(t('artifact_needs_tester'))}</span>`
+      ${!canArea('tests') ? `<span class="ps-field-hint">${escapeHtml(t('access_read_only'))}</span>`
         : artifacts.length ? artifacts.map((art, i) => `
         <tf-button variant="ghost" size="sm" icon="${ARTIFACT_ICON[fv(art, 'kind')] || 'paperclip'}" data-artifact="${i}">
           ${escapeHtml(fv(art, 'name') || t(`artifact_kind_${fv(art, 'kind')}`))} · ${escapeHtml(formatBytes(Number(fv(art, 'size_bytes') ?? 0)))}
@@ -10088,6 +10208,7 @@ async function renderTasksTab() {
   const panel = byId('ps-tab-panel');
   if (!panel) return;
   const tv = state.tasksView || (state.tasksView = freshTasksState());
+  if (!canArea(tv.mode === 'board' ? 'board' : 'tasks')) tv.mode = canArea('tasks') ? 'list' : 'board';
   const board = tv.mode === 'board';
   await ensureF2Members();
   try {
@@ -10102,8 +10223,8 @@ async function renderTasksTab() {
   panel.innerHTML = `
     <div class="ps-tests-toolbar">
       <tf-segmented id="ps-tasks-mode" value="${escapeAttr(tv.mode)}">
-        <option value="list">${escapeHtml(t('tasks_view_list'))}</option>
-        <option value="board">${escapeHtml(t('tasks_view_board'))}</option>
+        <option value="list" ${canArea('tasks') ? '' : 'disabled'}>${escapeHtml(t('tasks_view_list'))}</option>
+        <option value="board" ${canArea('board') ? '' : 'disabled'}>${escapeHtml(t('tasks_view_board'))}</option>
       </tf-segmented>
       <tf-searchbox id="ps-tasks-search" placeholder="${escapeAttr(t('tasks_search_placeholder'))}" debounce="300" value="${escapeAttr(tv.filters.search)}"></tf-searchbox>
       <tf-segmented id="ps-tasks-f-type" value="${escapeAttr(tv.filters.type || 'all')}">
@@ -10126,7 +10247,7 @@ async function renderTasksTab() {
         <span>${escapeHtml(t('tasks_filter_mine'))}</span>
       </div>
       <span class="ps-toolbar-spacer"></span>
-      ${canTest() ? `<tf-button variant="primary" icon="plus" id="ps-tasks-new">${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
+      ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" id="ps-tasks-new">${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
     </div>
     <div id="ps-tasks-table-host">
       ${(board ? tv.boardRows : tv.rows).length ? '' : `<tf-empty-state icon="check" title="${escapeAttr(t('tasks_empty'))}"></tf-empty-state>`}
@@ -10136,7 +10257,7 @@ async function renderTasksTab() {
   const reload = () => { tv.page = 1; renderTasksTab(); };
   byId('ps-tasks-mode')?.addEventListener('change', (e) => {
     const mode = e.detail?.value === 'board' ? 'board' : 'list';
-    if (mode === tv.mode) return;
+    if (mode === tv.mode || !canArea(mode === 'board' ? 'board' : 'tasks')) return;
     tv.mode = mode;
     writeTasksViewMode(projectId(), mode);
     reload();
@@ -10234,6 +10355,7 @@ function syncTasksFooter() {
 // creation form ({ taskType?, links?, titlePrefill?, status? } — the tester
 // desk prefills defect links, the kanban prefills the column).
 async function openTaskWindow(opts = {}) {
+  if (opts.taskId ? !(canArea('tasks') || canArea('board')) : !canCreateTask(projectAccess())) return;
   const tw = {
     taskId: opts.taskId || null,
     taskType: opts.taskType || 'task',
@@ -10279,8 +10401,9 @@ async function openTaskWindow(opts = {}) {
   }
 
   const isAuthor = tw.info ? isMe(fv(tw.info, 'created_by')) : true;
-  const mayEdit = canEdit() || isAuthor || isMe(tw.assignedTo);
-  const mayDelete = tw.taskId && (canManage() || isAuthor);
+  const mayEdit = tw.taskId ? canArea('tasks', 'write') : canCreateTask(projectAccess());
+  const maySetStatus = !!tw.taskId && (canArea('tasks', 'write') || canArea('board', 'write'));
+  const mayDelete = tw.taskId && canArea('tasks', 'write') && (canArea('tasks', 'admin') || (isAuthor && !Number(fv(tw.info, 'comment_count'))));
 
   const { body, foot, cleanup } = openWindow({
     title: tw.taskId ? t('task_win_title', { no: taskNoLabel(tw.info) }) : t('task_win_new_title'),
@@ -10289,7 +10412,7 @@ async function openTaskWindow(opts = {}) {
     width: 760,
   });
 
-  const testers = testerMembers();
+  const testers = (f2().membersCache || []).filter((member) => member.active && allowsArea(member.access, 'tasks', 'write'));
   body.innerHTML = `
     <div class="ps-field" style="margin-bottom:12px;">
       <span class="ps-field-label">${escapeHtml(t('task_type_label'))}</span>
@@ -10302,7 +10425,7 @@ async function openTaskWindow(opts = {}) {
       <tf-input id="ps-task-title" label="${escapeAttr(t('task_title_label'))}" value="${escapeAttr(tw.title)}" ${mayEdit ? '' : 'readonly'}></tf-input>
     </div>
     <div class="ps-field" style="margin-bottom:12px;">
-      <tf-textarea id="ps-task-desc" rows="4" label="${escapeAttr(t('task_desc_label'))}" hint="${escapeAttr(t('task_desc_hint'))}" ${mayEdit ? '' : 'readonly'}></tf-textarea>
+      <tf-textarea id="ps-task-desc" rows="4" label="${escapeAttr(t('task_desc_label'))}" hint="${escapeAttr(t('task_desc_hint'))}" ${mayEdit ? '' : 'disabled'}></tf-textarea>
     </div>
     <div class="ps-task-grid">
       <tf-select id="ps-task-severity" label="${escapeAttr(t('task_severity_label'))}" value="${escapeAttr(tw.severity)}" ${mayEdit ? '' : 'disabled'}>
@@ -10312,7 +10435,7 @@ async function openTaskWindow(opts = {}) {
       <tf-select id="ps-task-priority" label="${escapeAttr(t('task_priority_label'))}" value="${escapeAttr(tw.priority)}" ${mayEdit ? '' : 'disabled'}>
         ${PRIORITIES.map((x) => `<option value="${x}" ${x === tw.priority ? 'selected' : ''}>${escapeHtml(t(`prio_${x}`))}</option>`).join('')}
       </tf-select>
-      <tf-select id="ps-task-status" label="${escapeAttr(t('task_status_label'))}" value="${escapeAttr(tw.status)}" ${mayEdit ? '' : 'disabled'}>
+      <tf-select id="ps-task-status" label="${escapeAttr(t('task_status_label'))}" value="${escapeAttr(tw.status)}" ${mayEdit || maySetStatus ? '' : 'disabled'}>
         ${TASK_STATUSES.map((x) => `<option value="${x}" ${x === tw.status ? 'selected' : ''}>${escapeHtml(t(`task_status_${x}`))}</option>`).join('')}
       </tf-select>
       <tf-select id="ps-task-assignee" label="${escapeAttr(t('task_assignee_label'))}" value="${escapeAttr(tw.assignedTo)}" ${mayEdit ? '' : 'disabled'}>
@@ -10328,13 +10451,13 @@ async function openTaskWindow(opts = {}) {
     <div class="ps-field" style="margin-bottom:12px;">
       <span class="ps-field-label">${escapeHtml(t('case_attachments_title'))}</span>
       <div id="ps-task-atts"></div>
-      ${mayEdit ? `<tf-file-input id="ps-task-att-input" multiple label="${escapeAttr(t('attachment_dropzone'))}"></tf-file-input>` : ''}
+      ${mayEdit && canArea('tasks', 'write') ? `<tf-file-input id="ps-task-att-input" multiple label="${escapeAttr(t('attachment_dropzone'))}"></tf-file-input>` : ''}
     </div>
     ${tw.taskId ? `
       <div class="ps-field">
         <span class="ps-field-label">${escapeHtml(t('task_comments_label', { count: tw.comments.length }))}</span>
         <div class="ps-task-comments" id="ps-task-comments"></div>
-        ${canTest() ? `
+        ${canArea('tasks', 'write') ? `
           <div class="ps-task-comment-add">
             <tf-textarea id="ps-task-comment-input" rows="2" placeholder="${escapeAttr(t('task_comment_placeholder'))}"></tf-textarea>
             <tf-button variant="ghost" icon="send" id="ps-task-comment-send">${escapeHtml(t('task_comment_send'))}</tf-button>
@@ -10350,7 +10473,7 @@ async function openTaskWindow(opts = {}) {
     </div>
     <div class="ps-footer-right">
       <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
-      ${mayEdit ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}
+      ${mayEdit || maySetStatus ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}
     </div>
   `;
 
@@ -10410,8 +10533,8 @@ async function openTaskWindow(opts = {}) {
             <div class="ps-task-comment-body">${escapeHtml(fv(c, 'body_md') || '')}</div>
           </div>
           <div class="ps-task-comment-actions">
-            ${own ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${i}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}
-            ${own || canManage() ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${i}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
+            ${own && canArea('tasks', 'write') ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${i}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}
+            ${canArea('tasks', 'write') && (own || canArea('tasks', 'admin')) ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${i}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
           </div>
         </div>
       `;
@@ -10519,9 +10642,22 @@ async function openTaskWindow(opts = {}) {
         await ApiBinary.one('projectStudioTaskDeleteRequest', { projectId: projectId(), taskId: tw.taskId });
         toast(t('task_deleted'), 'success');
         cleanup();
-        if (state.tab === 'tasks') await renderTasksTab();
+        if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
       } catch (err) {
         showError(`${t('task_delete_failed')}: ${err.message}`);
+      }
+      return;
+    }
+    if (!mayEdit && maySetStatus) {
+      tw.busy = true;
+      btn.setAttribute('disabled', '');
+      try {
+        await ApiBinary.one('projectStudioTaskStatusSetRequest', { projectId: projectId(), taskId: tw.taskId, status: tw.status });
+        toast(t('task_saved', { no: taskNoLabel(tw.info) }), 'success');
+        cleanup();
+        if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
+      } catch (error) {
+        tw.busy = false; btn.removeAttribute('disabled'); showError(`${t('task_save_failed')}: ${error.message}`);
       }
       return;
     }
@@ -10548,7 +10684,7 @@ async function openTaskWindow(opts = {}) {
       });
       toast(t('task_saved', { no: `${tw.taskType === 'defect' ? 'D' : 'T'}-${Number(fv(resp, 'task_no') ?? 0)}` }), 'success');
       cleanup();
-      if (state.tab === 'tasks') await renderTasksTab();
+      if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
     } catch (err) {
       tw.busy = false;
       btn.removeAttribute('disabled');
@@ -10967,7 +11103,7 @@ async function renderSchedulesView(reload = true) {
       <span class="ps-toolbar-spacer"></span>
       ${s.schedules.serverTimezone ? `<tf-chip status="info">${escapeHtml(t('sch_timezone_chip', { zone: s.schedules.serverTimezone }))}</tf-chip>` : ''}
       <tf-button variant="ghost" icon="refresh" id="ps-sch-refresh">${escapeHtml(t('refresh'))}</tf-button>
-      ${canManage() ? `<tf-button variant="primary" icon="plus" id="ps-sch-new">${escapeHtml(t('sch_new'))}</tf-button>` : ''}
+      ${canArea('tests', 'admin') ? `<tf-button variant="primary" icon="plus" id="ps-sch-new">${escapeHtml(t('sch_new'))}</tf-button>` : ''}
     </div>
     <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('sch_intro'))}</span></div>
     <div id="ps-sch-table-host">
@@ -11046,13 +11182,15 @@ function buildScheduleRowActions(row, live = () => row) {
   const wrap = document.createElement('div');
   wrap.style.cssText = 'display:flex; align-items:center; gap:4px; justify-content:flex-end;';
 
-  if (canManage()) {
+  if (canArea('tests', 'admin')) {
     const toggle = document.createElement('tf-toggle');
     if (row.enabled) toggle.setAttribute('checked', '');
+    if (!row.enabled && !canRunSchedule(row)) toggle.setAttribute('disabled', '');
     toggle.setAttribute('title', t(row.enabled ? 'sch_toggle_on' : 'sch_toggle_off'));
     toggle.addEventListener('change', async (e) => {
       e.stopPropagation();
       const enabled = !!(e.detail?.checked ?? toggle.hasAttribute('checked'));
+      if (!canArea('tests', 'admin') || (enabled && !canRunSchedule(live()))) return;
       try {
         await ApiBinary.one('projectStudioScheduleSetEnabledRequest', {
           projectId: projectId(), scheduleId: fv(live(), 'schedule_id'), enabled,
@@ -11076,9 +11214,9 @@ function buildScheduleRowActions(row, live = () => row) {
     wrap.appendChild(btn);
   };
 
-  if (canEdit()) action('play', t('sch_run_now'), 'ghost', () => runScheduleNow(live()));
+  if (canRunSchedule(row)) action('play', t('sch_run_now'), 'ghost', () => runScheduleNow(live()));
   action('clock', t('sch_history'), 'ghost', () => openScheduleRunsWindow(live()));
-  if (canManage()) {
+  if (canArea('tests', 'admin')) {
     action('edit', t('action_edit'), 'ghost', () => openScheduleWindow(live()));
     action('trash', t('action_delete'), 'ghost', () => confirmDeleteSchedule(live()));
   }
@@ -11114,6 +11252,7 @@ function buildScheduleExpansion(row) {
 }
 
 async function runScheduleNow(row) {
+  if (!canRunSchedule(row)) return;
   const scheduleId = fv(row, 'schedule_id');
   try {
     const resp = await ApiBinary.one('projectStudioScheduleRunNowRequest', { projectId: projectId(), scheduleId });
@@ -11258,6 +11397,7 @@ function intervalMinutes(expr) {
 // T13 window — create / edit. The whole definition travels in one ScheduleSave,
 // so every field on the form is written, including the cleared ones.
 function openScheduleWindow(schedule) {
+  if (!canArea('tests', 'admin')) return;
   const editing = !!schedule;
   const { body, foot, cleanup } = openWindow({
     title: t(editing ? 'sch_win_edit_title' : 'sch_win_new_title'),
@@ -11270,7 +11410,7 @@ function openScheduleWindow(schedule) {
   const serverZone = s.schedules.serverTimezone || '';
   const kind = editing ? (fv(schedule, 'schedule_kind') || 'interval') : 'interval';
   const sw = {
-    runType: editing ? (fv(schedule, 'run_type') || 'auto') : 'auto',
+    runType: editing ? (fv(schedule, 'run_type') || 'auto') : canTryRun() ? 'auto' : 'manual',
     source: editing && !fv(schedule, 'suite_id') ? 'cases' : 'suite',
     suiteId: editing ? (fv(schedule, 'suite_id') || '') : '',
     caseIds: new Set(editing && Array.isArray(fv(schedule, 'case_ids')) ? fv(schedule, 'case_ids') : []),
@@ -11304,9 +11444,7 @@ function openScheduleWindow(schedule) {
 
     <div class="ps-field">
       <span class="ps-field-label">${escapeHtml(t('run_type_label'))}</span>
-      <tf-segmented id="ps-sch-runtype" value="${escapeAttr(sw.runType)}">
-        ${SCHEDULE_RUN_TYPES.map((x) => `<option value="${x}">${escapeHtml(t(`run_type_${x}`))}</option>`).join('')}
-      </tf-segmented>
+      <tf-segmented id="ps-sch-runtype" value="${escapeAttr(sw.runType)}"></tf-segmented>
       <div class="ps-field-hint" data-sch-runtype-hint></div>
     </div>
 
@@ -11409,6 +11547,7 @@ function openScheduleWindow(schedule) {
     </div>
     <div class="ps-form-error" data-form-error hidden></div>
   `;
+  body.querySelector('#ps-sch-runtype').setOptions(RUN_TYPES.map((value) => ({ value, label: t(`run_type_${value}`), disabled: value !== 'manual' && !canTryRun() })), sw.runType);
   foot.innerHTML = `
     <div class="ps-footer-left"></div>
     <div class="ps-footer-right">
@@ -11468,12 +11607,14 @@ function openScheduleWindow(schedule) {
     const automated = isAutomated();
     const autoBox = body.querySelector('[data-sch-auto]');
     const manualBox = body.querySelector('[data-sch-manual]');
-    if (autoBox) autoBox.hidden = !automated;
+    if (autoBox) autoBox.hidden = !automated || !canTryRun();
     if (manualBox) manualBox.hidden = automated;
     const perfBox = body.querySelector('[data-sch-perf]');
     if (perfBox) perfBox.hidden = sw.runType !== 'perf';
     const hint = body.querySelector('[data-sch-runtype-hint]');
     if (hint) hint.textContent = t(`run_type_${sw.runType}_hint`);
+    const save = foot.querySelector('[data-action="save"]');
+    if (save) save.toggleAttribute('disabled', !canArea('tests', 'admin') || (automated && !canTryRun()));
     syncEnvWarning();
   };
 
@@ -11527,7 +11668,7 @@ function openScheduleWindow(schedule) {
           <tf-checkbox data-sch-assignee="${escapeAttr(userId)}" ${sw.assignees.has(userId) ? 'checked' : ''}></tf-checkbox>
           <div class="ps-pane-row-main">
             <div class="ps-pane-row-title">${escapeHtml(fv(m, 'display_name') || '')}</div>
-            <tf-chip status="info">${escapeHtml(roleLabel(m.role))}</tf-chip>
+            ${functionChips(m.functions)}
           </div>
         </div>
       `;
@@ -11551,6 +11692,10 @@ function openScheduleWindow(schedule) {
   };
 
   body.querySelector('#ps-sch-runtype')?.addEventListener('change', (e) => {
+    if (e.detail?.value !== 'manual' && !canTryRun()) {
+      e.target.setAttribute('value', sw.runType);
+      return;
+    }
     sw.runType = e.detail?.value ?? sw.runType;
     syncRunType();
   });
@@ -11587,6 +11732,7 @@ function openScheduleWindow(schedule) {
     const btn = e.target.closest('[data-action]');
     if (!btn || sw.busy) return;
     if (btn.dataset.action === 'cancel') { cleanup(); return; }
+    if (!canArea('tests', 'admin') || (isAutomated() && !canTryRun())) return;
 
     const name = String(body.querySelector('#ps-sch-name')?.value ?? '').trim();
     if (name.length < 3) { showError(t('sch_err_name')); return; }
@@ -11679,10 +11825,12 @@ function openScheduleWindow(schedule) {
       sw.pool = [];
     }
     renderCasePool();
-    try {
-      await loadEnvironments();
-    } catch {
-      /* the select stays empty and the save guard blocks an automated schedule */
+    if (canArea('environments')) {
+      try {
+        await loadEnvironments();
+      } catch {
+        /* the select stays empty and the save guard blocks an automated schedule */
+      }
     }
     const approved = approvedEnvironments();
     body.querySelector('#ps-sch-env')?.setOptions([
@@ -11714,7 +11862,7 @@ async function loadMlLinks() {
   const conn = connections();
   const resp = await ApiBinary.one('projectStudioMlLinksListRequest', { projectId: projectId() });
   conn.links = Array.isArray(resp.links) ? resp.links : [];
-  conn.canManage = !!(fv(resp, 'can_manage'));
+  conn.canManage = !!fv(resp, 'can_manage') && canArea('settings', 'write') && canArea('repos', 'write');
   conn.loaded = true;
   return conn.links;
 }
@@ -11930,24 +12078,24 @@ function confirmDetachMlLink(link) {
   });
 }
 
-// Role-map editor shared by the create / attach / settings windows: the five
-// project roles collapse onto ML Studio's two.
+// The link maps explicit Knowledge levels onto ML Studio membership grants.
 function roleMapHtml(roleMap) {
   return `
     <div class="ps-role-map">
       <div class="ps-role-map-head">
-        <span>${escapeHtml(t('ml_role_project'))}</span>
+        <span>${escapeHtml(t('ml_permission_project'))}</span>
         <span>${escapeHtml(t('ml_role_ml'))}</span>
       </div>
-      ${PROJECT_ROLES.map((role) => `
+      ${ML_PROJECT_LEVELS.map((role) => `
         <div class="ps-role-map-row">
-          <span><tf-chip status="${role === 'owner' ? 'accent' : 'info'}">${escapeHtml(roleLabel(role))}</tf-chip></span>
-          <tf-select data-role-map="${escapeAttr(role)}" value="${escapeAttr(roleMap[role])}">
-            ${ML_ROLES.map((mlRole) => `<option value="${mlRole}" ${mlRole === roleMap[role] ? 'selected' : ''}>${escapeHtml(t(`ml_role_${mlRole}`))}</option>`).join('')}
+          <span><tf-chip status="${role === 'admin' ? 'accent' : 'info'}">${escapeHtml(t(`access_level_${role}`))}</tf-chip></span>
+          <tf-select data-role-map="${escapeAttr(role)}" value="${escapeAttr(roleMap[role] || '')}">
+            <option value="">${escapeHtml(t('access_level_none'))}</option>
+            ${(role === 'read' ? ['viewer'] : ML_ROLES).map((mlRole) => `<option value="${mlRole}" ${mlRole === roleMap[role] ? 'selected' : ''}>${escapeHtml(t(`ml_role_${mlRole}`))}</option>`).join('')}
           </tf-select>
         </div>
       `).join('')}
-    </div>
+    </div><div class="ps-field-hint">${escapeHtml(t('ml_permission_hint'))}</div>
   `;
 }
 
@@ -11955,22 +12103,23 @@ function wireRoleMap(body, roleMap) {
   body.querySelectorAll('[data-role-map]').forEach((sel) => {
     sel.addEventListener('change', (e) => {
       const value = e.detail?.value ?? sel.value ?? 'viewer';
-      roleMap[sel.dataset.roleMap] = ML_ROLES.includes(value) ? value : 'viewer';
+      if (ML_ROLES.includes(value)) roleMap[sel.dataset.roleMap] = value;
+      else delete roleMap[sel.dataset.roleMap];
     });
   });
 }
 
 function roleMapEntries(roleMap) {
-  return PROJECT_ROLES.map((role) => ({ projectRole: role, mlRole: roleMap[role] }));
+  return ML_PROJECT_LEVELS.filter((level) => ML_ROLES.includes(roleMap[level])).map((level) => ({ projectRole: level, mlRole: roleMap[level] }));
 }
 
 function readRoleMap(link) {
-  const map = { ...ML_DEFAULT_ROLE_MAP };
+  const map = {};
   const wire = Array.isArray(fv(link, 'role_map')) ? fv(link, 'role_map') : [];
   for (const entry of wire) {
     const role = fv(entry, 'project_role');
     const mlRole = fv(entry, 'ml_role');
-    if (PROJECT_ROLES.includes(role) && ML_ROLES.includes(mlRole)) map[role] = mlRole;
+    if (ML_PROJECT_LEVELS.includes(role) && ML_ROLES.includes(mlRole)) map[role] = mlRole;
   }
   return map;
 }
@@ -11985,7 +12134,7 @@ function openMlCreateWindow() {
   const cw = { roleMap: { ...ML_DEFAULT_ROLE_MAP }, types: [], busy: false };
 
   body.innerHTML = `
-    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('ml_create_banner'))}</span></div>
+    <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('ml_permission_hint'))}</span></div>
     <div class="ps-ml-form-grid">
       <tf-input id="ps-ml-name" label="${escapeAttr(t('ml_name_label'))}"
         value="${escapeAttr(state.project?.name ? t('ml_name_default', { name: state.project.name }) : '')}"
@@ -11997,14 +12146,14 @@ function openMlCreateWindow() {
     </div>
     <div class="ps-banner-warn" data-ml-types-error hidden>${sprite('alert')}<span>${escapeHtml(t('ml_types_failed'))}</span></div>
     <div class="ps-field">
-      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      <span class="ps-field-label">${escapeHtml(t('ml_permission_project'))}</span>
       ${roleMapHtml(cw.roleMap)}
     </div>
     <div class="ps-toggle-inline">
       <tf-toggle id="ps-ml-sync" checked></tf-toggle>
       <span>${escapeHtml(t('ml_sync_label'))}</span>
     </div>
-    <div class="ps-field-hint">${escapeHtml(t('ml_sync_hint'))}</div>
+    <div class="ps-field-hint">${escapeHtml(t('ml_permission_hint'))}</div>
     <div class="ps-form-error" data-form-error hidden></div>
   `;
   foot.innerHTML = `
@@ -12096,7 +12245,7 @@ function openMlAttachWindow() {
     </div>
     <tf-input id="ps-ml-label" label="${escapeAttr(t('ml_label_label'))}" hint="${escapeAttr(t('ml_label_hint'))}"></tf-input>
     <div class="ps-field">
-      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      <span class="ps-field-label">${escapeHtml(t('ml_permission_project'))}</span>
       ${roleMapHtml(aw.roleMap)}
     </div>
     <div class="ps-toggle-inline">
@@ -12188,14 +12337,14 @@ function openMlSettingsWindow(link) {
       <div><span>${escapeHtml(t('ml_info_last_sync_result'))}</span><b>${escapeHtml(fv(link, 'last_sync_result') || '—')}</b></div>
     </div>
     <div class="ps-field">
-      <span class="ps-field-label">${escapeHtml(t('ml_role_map_title'))}</span>
+      <span class="ps-field-label">${escapeHtml(t('ml_permission_project'))}</span>
       ${roleMapHtml(uw.roleMap)}
     </div>
     <div class="ps-toggle-inline">
       <tf-toggle id="ps-ml-set-sync" ${fv(link, 'sync_permissions') ? 'checked' : ''}></tf-toggle>
       <span>${escapeHtml(t('ml_sync_label'))}</span>
     </div>
-    <div class="ps-field-hint">${escapeHtml(t('ml_sync_hint'))}</div>
+    <div class="ps-field-hint">${escapeHtml(t('ml_permission_hint'))}</div>
     <div class="ps-form-error" data-form-error hidden></div>
   `;
   foot.innerHTML = `
@@ -12237,11 +12386,8 @@ function openMlSettingsWindow(link) {
 // Z01 (F4) — kanban task board
 // =============================================================================
 
-// Mirrors the TaskSave rule enforced server-side: the author, the assignee and
-// anyone from editor upwards may move a card; everyone else sees it read-only.
-function canMoveTask(task) {
-  if (canEdit()) return true;
-  return isMe(fv(task, 'created_by')) || isMe(fv(task, 'assigned_to'));
+function canMoveTask() {
+  return canArea('board', 'write');
 }
 
 // Card order is NOT persisted in F4 — the board sorts by priority and then by
@@ -12282,7 +12428,7 @@ function taskCardModel(task) {
   }
 
   const menu = [{ id: 'open', label: t('action_open'), icon: 'external-link' }];
-  if (canManage() || isMe(fv(task, 'created_by'))) {
+  if (canArea('tasks', 'write') && (canArea('tasks', 'admin') || (isMe(fv(task, 'created_by')) && !Number(fv(task, 'comment_count'))))) {
     menu.push({ id: 'delete', label: t('action_delete'), icon: 'trash', danger: true });
   }
 
@@ -12294,7 +12440,7 @@ function taskCardModel(task) {
     badgeKind: type === 'defect' ? 'danger' : 'info',
     badgeIcon: type === 'defect' ? 'alert' : 'check',
     accent: severity === 'critical' ? 'danger' : null,
-    disabled: !canMoveTask(task),
+    disabled: !canMoveTask(),
     meta,
     footer: {
       left: dueDate ? { icon: 'clock', text: dueDate } : null,
@@ -12332,7 +12478,7 @@ function renderTaskBoard() {
     label: t(`task_status_${col.id}`),
     accent: col.accent,
   }));
-  board.readOnly = !canTest();
+  board.readOnly = !canArea('board', 'write');
   board.cards = boardSortedTasks(tv.boardRows).map(taskCardModel);
 
   board.addEventListener('card-open', (e) => {
@@ -12340,7 +12486,7 @@ function renderTaskBoard() {
     if (taskId) openTaskWindow({ taskId });
   });
   board.addEventListener('column-add', (e) => {
-    if (!canTest()) return;
+    if (!canCreateTask(projectAccess())) return;
     openTaskWindow({ status: e.detail?.columnId });
   });
   board.addEventListener('card-menu', async (e) => {
@@ -12355,7 +12501,7 @@ function renderTaskBoard() {
   board.addEventListener('card-move', async (e) => {
     const { cardId, to } = e.detail || {};
     const task = tv.boardRows.find((row) => fv(row, 'task_id') === cardId);
-    if (!task || !to || task.status === to) return;
+    if (!task || !to || task.status === to || !canArea('board', 'write')) return;
     const previous = task.status;
     task.status = to;
     try {

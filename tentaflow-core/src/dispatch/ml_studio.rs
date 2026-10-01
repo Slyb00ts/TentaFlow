@@ -224,6 +224,7 @@ pub fn ml_studio_project_detail(
         }
     };
     let org = require_read(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     let summary = repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -327,6 +328,7 @@ pub fn ml_studio_project_members_list(
         }
     };
     let org = require_read(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -381,6 +383,8 @@ pub fn ml_studio_project_invite(
         &payload.role,
     )
     .map_err(action_err)?;
+    crate::project_studio::ml_link::relinquish_membership(&payload.project_id, &payload.invitee_user_id)
+        .map_err(db_err)?;
     let names = repository::resolve_display_names(std::slice::from_ref(&member.user_id));
     Ok(MessageBody::MlStudioBody(
         MlStudioPayload::ProjectInviteResponse(MlStudioProjectInviteResponse {
@@ -408,6 +412,8 @@ pub fn ml_studio_project_member_remove(
     require_project_owner(&org.user_id, &payload.project_id)?;
     repository::remove_member(&payload.project_id, &org.user_id, &payload.user_id)
         .map_err(action_err)?;
+    crate::project_studio::ml_link::relinquish_membership(&payload.project_id, &payload.user_id)
+        .map_err(db_err)?;
     Ok(MessageBody::MlStudioBody(
         MlStudioPayload::ProjectMemberRemoveResponse(MlStudioProjectMemberRemoveResponse {
             project_id: payload.project_id.clone(),
@@ -440,6 +446,8 @@ pub fn ml_studio_project_member_role_set(
         &payload.role,
     )
     .map_err(action_err)?;
+    crate::project_studio::ml_link::relinquish_membership(&payload.project_id, &payload.user_id)
+        .map_err(db_err)?;
     let names = repository::resolve_display_names(std::slice::from_ref(&member.user_id));
     Ok(MessageBody::MlStudioBody(
         MlStudioPayload::ProjectMemberRoleSetResponse(MlStudioProjectMemberRoleSetResponse {
@@ -638,6 +646,7 @@ pub fn ml_studio_recog_dataset_register(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -913,6 +922,7 @@ pub fn ml_studio_dataset_upload(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1075,6 +1085,7 @@ pub fn ml_studio_dataset_upload_chunk(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1230,6 +1241,7 @@ pub fn ml_studio_recog_stage_media(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1355,6 +1367,7 @@ pub fn ml_studio_recog_build_dataset(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1413,14 +1426,16 @@ pub fn ml_studio_recog_build_status(
             ))
         }
     };
-    let _org = require_write(ctx)?;
+    let org = require_write(ctx)?;
 
     let prog = build_recog_dataset::build_progress(&payload.build_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "build not found"))?;
 
+    require_project_member(&org.user_id, &prog.project_id)?;
+
     // Resolve the registered dataset summary once the build succeeded.
     let dataset = match prog.dataset_id.as_deref() {
-        Some(id) => repository::get_dataset(&_org.user_id, id)
+        Some(id) => repository::get_dataset(&org.user_id, id)
             .map_err(db_err)?
             .as_ref()
             .map(to_dataset_summary),
@@ -1461,6 +1476,7 @@ pub fn ml_studio_datasets_list(
         }
     };
     let org = require_read(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     let datasets = repository::list_datasets(&org.user_id, &payload.project_id)
         .map_err(|e| {
             if e.to_string().contains("not a member") {
@@ -1498,6 +1514,7 @@ pub fn ml_studio_dataset_profile(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
 
     let table: TableProfile = serde_json::from_str(&dataset.profile_json)
         .map_err(|e| ProtocolError::internal(format!("stored profile is corrupt: {}", e)))?;
@@ -1533,6 +1550,7 @@ pub fn ml_studio_dataset_rows(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     // Dataset w trakcie generacji / nowo utworzony (row_count==0) nie ma jeszcze
     // raw_data — to NIE błąd, zwracamy 0 wierszy + pochodzenie (meta). Ale realny
     // błąd DB dla NIEPUSTEGO datasetu MUSI się wypropagować — inaczej GUI dostałoby
@@ -1598,6 +1616,7 @@ pub fn ml_studio_dataset_rows_save(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     require_project_editor(&org.user_id, &dataset.project_id)?;
 
     // GUARD: dataset w trakcie generacji (distill_status=pending) NIE może być
@@ -1673,6 +1692,7 @@ pub fn ml_studio_tabular_train(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1689,6 +1709,7 @@ pub fn ml_studio_tabular_train(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     let ext = if dataset.kind == "xlsx" {
         "xlsx"
     } else {
@@ -2234,6 +2255,7 @@ pub async fn ml_studio_ft_train_start(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -2336,6 +2358,7 @@ pub async fn ml_studio_ft_train_start(
                 .ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
                 })?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
             let dataset_hash = crate::ml_studio::train_recognition::blob_content_hash(&raw);
             // Multi-rig (dist.nnodes>1): A = orkiestrator + worker rank-1, B = master
             // rank-0. master_addr = LAN-IP B z rejestru mesh (mDNS) — „mamy IP, bo po
@@ -2479,6 +2502,7 @@ pub async fn ml_studio_distill_generate(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id).map_err(db_err)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
 
@@ -2522,12 +2546,10 @@ pub async fn ml_studio_distill_generate_status(
     // get_dataset jest auth-scoped (None gdy user nie jest czlonkiem projektu) —
     // bez tego dowolny user moglby pollowac status cudzego datasetu po id.
     let org = require_write(ctx)?;
-    if repository::get_dataset(&org.user_id, &payload.dataset_id)
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
-        .is_none()
-    {
-        return Err(ProtocolError::not_found("dataset not found"));
-    }
+        .ok_or_else(|| ProtocolError::not_found("dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     let resp = match crate::ml_studio::distill::distill_status(&payload.dataset_id) {
         Some(p) => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
             status: p.status,
@@ -2841,6 +2863,7 @@ pub async fn ml_studio_recog_train_start(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -2909,6 +2932,7 @@ pub async fn ml_studio_recog_train_start(
                 .ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
                 })?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
@@ -3224,6 +3248,7 @@ pub async fn ml_studio_classifier_train_start(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -3321,6 +3346,7 @@ pub async fn ml_studio_classifier_train_start(
                 .ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
                 })?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
@@ -3460,6 +3486,7 @@ pub async fn ml_studio_ocr_train_start(
         }
     };
     let org = require_write(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -3552,6 +3579,7 @@ pub async fn ml_studio_ocr_train_start(
                 .ok_or_else(|| {
                     ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
                 })?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
@@ -4113,6 +4141,7 @@ pub fn ml_studio_recog_autolabel_dataset(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     require_project_editor(&org.user_id, &dataset.project_id)?;
 
     // Decoding + per-image inference is minutes of work for a large dataset, so it
@@ -6669,6 +6698,7 @@ pub fn ml_studio_recog_import_recordings(
         .map_err(db_err)?
         .filter(|d| d.project_id == payload.project_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_member(&org.user_id, &dataset.project_id)?;
     if dataset.kind != "coco_path" {
         return Err(ProtocolError::bad_request(
             "dataset is not a recognition (coco_path) dataset",
@@ -6730,6 +6760,7 @@ pub fn ml_studio_recog_import_recordings_status(
     let progress = import_recordings::import_progress(&payload.job_id)
         .filter(|p| p.owner_user_id == org.user_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "import job not found"))?;
+    require_project_member(&org.user_id, &progress.project_id)?;
 
     let outcomes = progress
         .outcomes

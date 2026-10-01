@@ -452,6 +452,9 @@ impl ToolExecNodeAdapter {
                         provenance: ctx.provenance(),
                     })
                     .await;
+                if let Err(error) = project_knowledge::require_member(&org, project_id, user_id) {
+                    return error_result(call, error.to_string());
+                }
                 match embed {
                     Ok(response) => match response
                         .vectors
@@ -1918,6 +1921,137 @@ mod tests {
                 Some(default),
                 "{name} powinien dostac budzet"
             );
+        }
+    }
+    #[tokio::test]
+    async fn project_search_rechecks_access_after_a_real_delayed_embedding() {
+        use crate::flow_engine::dispatchers_impl::EmbeddingsDispatcherImpl;
+        use crate::project_studio::ingest::access_test_support::{
+            advertise_model, seed_passage, DelayedModel, ModelReply,
+        };
+        use crate::project_studio::{
+            models::MemberInput, project_db, repository as project_repository,
+        };
+
+        for change in ["expiry", "module"] {
+            let state = crate::dispatch::state::AppState::for_test();
+            let root = tempfile::tempdir().expect("tempdir");
+            let _ = crate::project_studio::db::init(&root.path().join("projects.db"));
+            let project_id = format!("tool-search-{}", uuid::Uuid::new_v4());
+            let actor = format!("actor-{project_id}");
+            let dir = root.path().join(&project_id);
+            std::fs::create_dir_all(&dir).expect("project directory");
+            project_repository::create_project(
+                &project_id,
+                "org-tool-search",
+                &project_id,
+                "",
+                "custom",
+                "[\"knowledge\"]",
+                "tool-owner",
+                &dir.to_string_lossy(),
+                &[MemberInput {
+                    user_id: actor.clone(),
+                    functions: vec!["developer".into()],
+                    project_admin: false,
+                    expires_at: None,
+                }],
+            )
+            .expect("project");
+            let pool = project_db::open(&project_id).expect("content");
+            project_repository::create_source(
+                &pool,
+                "access-source",
+                "document",
+                "Private specification",
+                "{}",
+                "tool-owner",
+            )
+            .expect("source");
+            let vectors = crate::services::vector_namespace_manager(&state.db);
+            seed_passage(
+                &vectors,
+                "org-tool-search",
+                &project_id,
+                "PRIVATE-TOOL-PASSAGE",
+            );
+            assert_eq!(
+                project_knowledge::search(
+                    &vectors,
+                    "org-tool-search",
+                    &project_id,
+                    &[0.1, 0.2, 0.3],
+                    &[],
+                    10
+                )
+                .expect("positive retrieval")
+                .len(),
+                1
+            );
+            let mut http =
+                DelayedModel::new(project_ingest::EMBEDDINGS_ALIAS, ModelReply::Embedding);
+            advertise_model(
+                &state,
+                "embeddings",
+                project_ingest::EMBEDDINGS_ALIAS,
+                &http.endpoint,
+            );
+            seed_agent(&state.db, "search-agent", r#"["core.project_search"]"#);
+            let slot = service(state.db.clone());
+            let mut ctx = stub_ctx();
+            ctx.user_id = Some(actor.clone());
+            ctx.org_id = Some("org-tool-search".into());
+            ctx.vectors = vectors.clone();
+            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone()));
+            let mut env = FlowEnvelope::empty();
+            env.meta.insert("agent_id".into(), json!("search-agent"));
+            env.context
+                .messages
+                .push(assistant_with_calls(vec![LlmToolCall {
+                    id: "delayed-search".into(),
+                    name: "core.project_search".into(),
+                    arguments:
+                        json!({"project_id":project_id,"query":"private project specification"})
+                            .to_string(),
+                }]));
+            let selected = node(json!({}));
+            let request = input(env);
+            let search = tokio::spawn(async move {
+                ToolExecNodeAdapter::new(slot)
+                    .execute(&selected, &[request], &ctx)
+                    .await
+            });
+            http.wait_request().await;
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                    "UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2",
+                    rusqlite::params![project_id, actor],
+                ).expect("expire during embedding");
+            } else {
+                project_repository::update_project_modules("org-tool-search", &project_id, "[]")
+                    .expect("disable knowledge during embedding");
+            }
+            http.release();
+            let result = search
+                .await
+                .expect("tool execution")
+                .expect("tool refusal is a real result");
+            let response = result
+                .context
+                .messages
+                .iter()
+                .find(|message| message.role == ChatRole::Tool)
+                .expect("tool result");
+            let ChatMessageContent::Text(content) = &response.content else {
+                panic!("tool result must contain text")
+            };
+            assert!(
+                content.contains("project not found or access denied"),
+                "{content}"
+            );
+            assert!(!content.contains("PRIVATE-TOOL-PASSAGE"));
+            http.finish();
+            std::mem::forget(root);
         }
     }
 }

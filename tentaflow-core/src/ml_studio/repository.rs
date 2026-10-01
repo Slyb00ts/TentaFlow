@@ -28,8 +28,17 @@ pub fn list_projects(user_id: &str) -> Result<Vec<ProjectSummary>> {
          ORDER BY p.updated_at DESC, p.name",
     )?;
     let rows = stmt.query_map(params![user_id], read_summary)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let summaries = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    drop(conn);
+    let mut visible = Vec::new();
+    for mut summary in summaries {
+        if let Some(role) = member_role(&summary.project.project_id, user_id)? {
+            summary.role = role;
+            visible.push(summary);
+        }
+    }
+    Ok(visible)
 }
 
 /// Creates a new project owned by the calling user inside their organization.
@@ -90,8 +99,9 @@ pub fn create_project(
 pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSummary>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
-    conn.query_row(
-        "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
+    let summary = conn
+        .query_row(
+            "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
                 (SELECT COUNT(*) FROM models m WHERE m.project_id = p.project_id), \
                 (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id), \
@@ -100,27 +110,33 @@ pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSumm
          FROM projects p \
          JOIN project_members pm ON pm.project_id = p.project_id \
          WHERE pm.user_id = ?1 AND pm.status = 'active' AND p.project_id = ?2",
-        params![user_id, project_id],
-        read_summary,
-    )
-    .optional()
-    .map_err(Into::into)
+            params![user_id, project_id],
+            read_summary,
+        )
+        .optional()?;
+    drop(conn);
+    let Some(mut summary) = summary else {
+        return Ok(None);
+    };
+    let Some(role) = member_role(project_id, user_id)? else {
+        return Ok(None);
+    };
+    summary.role = role;
+    Ok(Some(summary))
 }
 
-/// Returns the membership role slug of `user_id` in `project_id`, or `None` when
-/// the user has no membership row. Used as the authorization primitive for
-/// owner-only project actions. All membership rows are `active`, so a returned
-/// role always grants the access tied to that role.
+/// Returns the current role, revalidating grants mirrored by Project Studio.
+/// Manual memberships and the ML owner remain independent of linked projects.
 pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
-    conn.query_row(
-        "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+    let stored = conn.query_row(
+        "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2 AND status = 'active'",
         params![project_id, user_id],
         |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(Into::into)
+    ).optional()?;
+    drop(conn);
+    crate::project_studio::ml_link::current_member_role(project_id, user_id, stored)
 }
 
 /// Lists every member of a project, owner first then by creation time. No
@@ -319,16 +335,8 @@ fn require_owner(conn: &rusqlite::Connection, project_id: &str, user_id: &str) -
 /// Asserts `user_id` is an active member of `project_id`. Membership is the
 /// access boundary for dataset operations, mirroring `get_project`. A non-member
 /// cannot create, list or read datasets in a project they cannot see.
-fn require_member(conn: &rusqlite::Connection, project_id: &str, user_id: &str) -> Result<()> {
-    let role: Option<String> = conn
-        .query_row(
-            "SELECT role FROM project_members \
-             WHERE project_id = ?1 AND user_id = ?2 AND status = 'active'",
-            params![project_id, user_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if role.is_none() {
+fn require_member(project_id: &str, user_id: &str) -> Result<()> {
+    if member_role(project_id, user_id)?.is_none() {
         bail!("not a member of this project");
     }
     Ok(())
@@ -356,10 +364,10 @@ pub fn create_dataset(
         bail!("dataset name must be at most 256 characters");
     }
 
+    require_member(project_id, user_id)?;
     let dataset_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
-    require_member(&conn, project_id, user_id)?;
     conn.execute(
         "INSERT INTO datasets \
              (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
@@ -421,9 +429,9 @@ pub fn set_dataset_distill_status(dataset_id: &str, status: &str) -> Result<()> 
 
 /// Lists datasets of a project, newest first. Authorization by membership.
 pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
+    require_member(project_id, user_id)?;
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
-    require_member(&conn, project_id, user_id)?;
     let mut stmt = conn.prepare(
         "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
          FROM datasets WHERE project_id = ?1 ORDER BY created_at DESC, name",
@@ -447,10 +455,11 @@ pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
             read_dataset,
         )
         .optional()?;
+    drop(conn);
     let Some(dataset) = dataset else {
         return Ok(None);
     };
-    match require_member(&conn, &dataset.project_id, user_id) {
+    match require_member(&dataset.project_id, user_id) {
         Ok(()) => Ok(Some(dataset)),
         Err(_) => Ok(None),
     }
@@ -470,10 +479,11 @@ pub fn get_dataset_raw(user_id: &str, dataset_id: &str) -> Result<Vec<u8>> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    drop(conn);
     let Some((project_id, raw)) = row else {
         bail!("dataset not found");
     };
-    require_member(&conn, &project_id, user_id)?;
+    require_member(&project_id, user_id)?;
     match raw {
         Some(bytes) if !bytes.is_empty() => Ok(bytes),
         _ => bail!("dataset has no stored raw data (re-upload to enable training)"),
@@ -758,8 +768,16 @@ pub fn list_active_runs_for_user(user_id: &str) -> Result<Vec<ActiveRunRow>> {
             started_at: row.get(5)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let runs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    drop(conn);
+    let mut visible = Vec::new();
+    for run in runs {
+        if member_role(&run.project_id, user_id)?.is_some() {
+            visible.push(run);
+        }
+    }
+    Ok(visible)
 }
 
 /// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
@@ -1531,6 +1549,7 @@ mod lineage_tests {
     fn ensure_db() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _ = super::super::db::init(&tmp.path().join("ml_studio.db"));
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
         // Keep the directory alive for the rest of the test binary: `init`'s
         // `OnceLock` may keep this pool (WAL sidecar files included) alive
         // long after this function returns, across every other test that

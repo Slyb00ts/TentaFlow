@@ -13,10 +13,11 @@ use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, OptionalExtension};
 
 use super::models::{
-    ActivityRecord, ChatRecord, CreatorGrantRecord, IngestJobRecord, MemberRecord, ProjectKpis,
-    ProjectRecord, ProjectRole, SourceFileRecord, SourceListItem, SourceRecord, TagRecord,
+    ActivityRecord, ChatRecord, CreatorGrantRecord, IngestJobRecord, MemberInput, MemberRecord,
+    ProjectKpis, ProjectRecord, SourceFileRecord, SourceListItem, SourceRecord, TagRecord,
 };
 use crate::db::DbPool;
+use tentaflow_protocol::project_studio::access::{ProjectAccessWire, ProjectFunctionWire};
 
 fn read_err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("project_studio db read: {e}")
@@ -70,8 +71,13 @@ pub fn create_project(
     modules_json: &str,
     owner_user_id: &str,
     dir_path: &str,
-    members: &[(String, String)],
+    members: &[MemberInput],
 ) -> Result<()> {
+    let catalogue = super::models::default_project_functions();
+    let members = members
+        .iter()
+        .map(|member| super::models::validate_member_input(member, &catalogue, chrono::Utc::now()))
+        .collect::<Result<Vec<_>>>()?;
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
@@ -89,20 +95,23 @@ pub fn create_project(
             dir_path
         ],
     )?;
+    super::db::seed_project_functions(&tx, project_id)?;
     tx.execute(
-        "INSERT INTO project_members (project_id, user_id, role, invited_by) \
-         VALUES (?1, ?2, 'owner', ?2)",
+        "INSERT INTO project_members (project_id, user_id, project_admin, invited_by) \
+         VALUES (?1, ?2, 1, ?2)",
         params![project_id, owner_user_id],
     )?;
-    for (user_id, role) in members {
-        if user_id == owner_user_id {
+    for function in &catalogue {
+        tx.execute(
+            "INSERT INTO project_member_functions(project_id,user_id,function_id) VALUES (?1,?2,?3)",
+            params![project_id,owner_user_id,function.function_id],
+        )?;
+    }
+    for member in &members {
+        if member.user_id == owner_user_id {
             continue;
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO project_members (project_id, user_id, role, invited_by) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, user_id, role, owner_user_id],
-        )?;
+        insert_member(&tx, project_id, member, owner_user_id)?;
     }
     tx.commit()?;
     Ok(())
@@ -167,6 +176,10 @@ pub fn update_project_modules(org_id: &str, project_id: &str, modules_json: &str
          WHERE org_id = ?2 AND project_id = ?3",
         params![modules_json, org_id, project_id],
     )?;
+    drop(conn);
+    if n > 0 {
+        mirror_into_code_studio(project_id);
+    }
     Ok(n > 0)
 }
 
@@ -203,6 +216,10 @@ pub fn delete_project_rows(project_id: &str) -> Result<()> {
             params![project_id],
         )?;
         tx.execute(
+            "DELETE FROM project_functions WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
             "DELETE FROM projects WHERE project_id = ?1",
             params![project_id],
         )?;
@@ -228,6 +245,200 @@ pub fn touch_project(project_id: &str) -> Result<()> {
 // Central registry: members
 // =============================================================================
 
+fn list_functions_on(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+) -> Result<Vec<ProjectFunctionWire>> {
+    let mut stmt = conn.prepare(
+        "SELECT function_id,name,description,builtin,grants_json FROM project_functions \
+         WHERE project_id=?1 ORDER BY position,function_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        let grants_json: String = row.get(4)?;
+        let grants = serde_json::from_str(&grants_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok(ProjectFunctionWire {
+            function_id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            builtin: row.get(3)?,
+            grants,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn list_functions(project_id: &str) -> Result<Vec<ProjectFunctionWire>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(read_err)?;
+    list_functions_on(&conn, project_id)
+}
+
+fn validate_function(function: &ProjectFunctionWire) -> Result<()> {
+    let id = function.function_id.as_bytes();
+    if id.is_empty()
+        || id.len() > 64
+        || !id[0].is_ascii_lowercase() && !id[0].is_ascii_digit()
+        || !id.iter().all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'_' || *value == b'-'
+        })
+    {
+        bail!("invalid project function identifier");
+    }
+    if function.name.trim().is_empty() || function.name.chars().count() > 128 {
+        bail!("project function name must contain 1 to 128 characters");
+    }
+    if function.description.chars().count() > 2048 {
+        bail!("project function description exceeds 2048 characters");
+    }
+    let areas = function
+        .grants
+        .iter()
+        .map(|grant| grant.area)
+        .collect::<std::collections::HashSet<_>>();
+    if areas.len() != tentaflow_protocol::project_studio::access::ProjectArea::ALL.len()
+        || function.grants.len() != areas.len()
+    {
+        bail!("project function requires exactly one grant for every area");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_function_catalogue(functions: &[ProjectFunctionWire]) -> Result<()> {
+    let defaults = super::models::default_project_functions();
+    if functions.len() < defaults.len() || functions.len() > 64 {
+        bail!("invalid project function catalogue size");
+    }
+    let mut ids = std::collections::HashSet::new();
+    for function in functions {
+        validate_function(function)?;
+        if !ids.insert(&function.function_id) {
+            bail!("duplicate project function identifier");
+        }
+        let builtin = defaults
+            .iter()
+            .any(|entry| entry.function_id == function.function_id);
+        if builtin != function.builtin {
+            bail!("builtin project function identity cannot be changed");
+        }
+    }
+    if defaults
+        .iter()
+        .any(|entry| !ids.contains(&entry.function_id))
+    {
+        bail!("project function catalogue is missing a builtin function");
+    }
+    Ok(())
+}
+
+pub(super) fn restore_function_catalogue(
+    project_id: &str,
+    functions: &[ProjectFunctionWire],
+) -> Result<()> {
+    validate_function_catalogue(functions)?;
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    let tx = conn.unchecked_transaction()?;
+    let assignments = {
+        let mut stmt = tx.prepare(
+            "SELECT user_id,function_id FROM project_member_functions WHERE project_id=?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(
+        "DELETE FROM project_member_functions WHERE project_id=?1",
+        params![project_id],
+    )?;
+    tx.execute(
+        "DELETE FROM project_functions WHERE project_id=?1",
+        params![project_id],
+    )?;
+    for (position, function) in functions.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO project_functions(project_id,function_id,name,description,builtin,grants_json,position) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![project_id,function.function_id,function.name,function.description,function.builtin,serde_json::to_string(&function.grants)?,position as i64],
+        )?;
+    }
+    for (user_id, function_id) in assignments {
+        if functions
+            .iter()
+            .any(|function| function.function_id == function_id)
+        {
+            tx.execute("INSERT INTO project_member_functions(project_id,user_id,function_id) VALUES(?1,?2,?3)", params![project_id,user_id,function_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn save_function(project_id: &str, function: &ProjectFunctionWire) -> Result<bool> {
+    validate_function(function)?;
+    {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let catalogue = list_functions_on(&conn, project_id)?;
+        let existing = catalogue
+            .iter()
+            .find(|entry| entry.function_id == function.function_id);
+        if existing.is_none() && catalogue.len() >= 64 {
+            bail!("project function catalogue is limited to 64 entries");
+        }
+        if function.builtin != existing.is_some_and(|entry| entry.builtin) {
+            bail!("builtin project function identity cannot be changed");
+        }
+        conn.execute(
+            "INSERT INTO project_functions(project_id,function_id,name,description,builtin,grants_json,position) \
+             VALUES (?1,?2,?3,?4,0,?5,COALESCE((SELECT MAX(position)+1 FROM project_functions WHERE project_id=?1),0)) \
+             ON CONFLICT(project_id,function_id) DO UPDATE SET name=excluded.name, \
+                 description=excluded.description,grants_json=excluded.grants_json",
+            params![project_id,function.function_id,function.name.trim(),function.description.trim(),serde_json::to_string(&function.grants)?],
+        )?;
+    }
+    mirror_into_code_studio(project_id);
+    Ok(true)
+}
+
+pub fn delete_function(project_id: &str, function_id: &str) -> Result<bool> {
+    let removed = {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let builtin: Option<bool> = conn
+            .query_row(
+                "SELECT builtin FROM project_functions WHERE project_id=?1 AND function_id=?2",
+                params![project_id, function_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if builtin == Some(true) {
+            bail!("builtin project functions cannot be deleted");
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM project_member_functions WHERE project_id=?1 AND function_id=?2",
+            params![project_id, function_id],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM project_functions WHERE project_id=?1 AND function_id=?2",
+            params![project_id, function_id],
+        )?;
+        tx.commit()?;
+        removed > 0
+    };
+    if removed {
+        mirror_into_code_studio(project_id);
+    }
+    Ok(removed)
+}
+
 /// Fires the one-way project → Code Studio permission mirror: every Code Studio
 /// workspace linked to this project re-reads the project's member list and its
 /// own grants (`code_workspace_members.added_by = 'project:<id>'`) follow it.
@@ -249,13 +460,39 @@ fn mirror_into_code_studio(project_id: &str) {
     crate::code_studio::project_link::sync_project(&core_db, project_id);
 }
 
-pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
+const MEMBER_COLS: &str =
+    "m.project_id,m.user_id,m.project_admin,m.expires_at,m.invited_by,m.created_at, \
+    COALESCE((SELECT json_group_array(function_id) FROM ( \
+        SELECT a.function_id FROM project_member_functions a \
+        JOIN project_functions f ON f.project_id=a.project_id AND f.function_id=a.function_id \
+        WHERE a.project_id=m.project_id AND a.user_id=m.user_id ORDER BY f.position \
+    )), '[]')";
+
+fn read_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberRecord> {
+    let functions_json: String = row.get(6)?;
+    let functions = serde_json::from_str(&functions_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(MemberRecord {
+        project_id: row.get(0)?,
+        user_id: row.get(1)?,
+        project_admin: row.get(2)?,
+        expires_at: row.get(3)?,
+        invited_by: row.get(4)?,
+        created_at: row.get(5)?,
+        functions,
+    })
+}
+
+pub fn member_access(project_id: &str, user_id: &str) -> Result<Option<MemberRecord>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(read_err)?;
     conn.query_row(
-        "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        &format!(
+            "SELECT {MEMBER_COLS} FROM project_members m WHERE m.project_id=?1 AND m.user_id=?2"
+        ),
         params![project_id, user_id],
-        |row| row.get::<_, String>(0),
+        read_member,
     )
     .optional()
     .map_err(Into::into)
@@ -264,19 +501,11 @@ pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
 pub fn list_members(project_id: &str) -> Result<Vec<MemberRecord>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(read_err)?;
-    let mut stmt = conn.prepare(
-        "SELECT project_id, user_id, role, invited_by, created_at FROM project_members \
-         WHERE project_id = ?1 ORDER BY (role = 'owner') DESC, created_at, user_id",
-    )?;
-    let rows = stmt.query_map(params![project_id], |row| {
-        Ok(MemberRecord {
-            project_id: row.get(0)?,
-            user_id: row.get(1)?,
-            role: row.get(2)?,
-            invited_by: row.get(3)?,
-            created_at: row.get(4)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEMBER_COLS} FROM project_members m JOIN projects p ON p.project_id=m.project_id \
+         WHERE m.project_id=?1 ORDER BY (m.user_id=p.owner_user_id) DESC,m.created_at,m.user_id"
+    ))?;
+    let rows = stmt.query_map(params![project_id], read_member)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -293,42 +522,37 @@ pub fn member_count(project_id: &str) -> Result<u32> {
 }
 
 /// All memberships of one user, keyed by project id — used to compose the
-/// project list without one query per project.
-pub fn member_roles_for_user(user_id: &str) -> Result<HashMap<String, String>> {
+/// project list without one query per project. Expired access is excluded.
+pub fn member_accesses_for_user(user_id: &str) -> Result<HashMap<String, MemberRecord>> {
     let pool = super::db::pool()?;
     let conn = pool.read().map_err(read_err)?;
-    let mut stmt =
-        conn.prepare("SELECT project_id, role FROM project_members WHERE user_id = ?1")?;
-    let rows = stmt.query_map(params![user_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MEMBER_COLS} FROM project_members m WHERE m.user_id=?1"
+    ))?;
+    let rows = stmt.query_map(params![user_id], read_member)?;
     let mut out = HashMap::new();
     for row in rows {
-        let (project_id, role) = row?;
-        out.insert(project_id, role);
+        let member = row?;
+        if member.is_active() {
+            out.insert(member.project_id.clone(), member);
+        }
     }
     Ok(out)
 }
 
 /// Adds members, skipping users that already belong to the project. Returns
 /// the number of rows actually inserted.
-pub fn add_members(
-    project_id: &str,
-    members: &[(String, String)],
-    invited_by: &str,
-) -> Result<u32> {
+pub fn add_members(project_id: &str, members: &[MemberInput], invited_by: &str) -> Result<u32> {
     let added = {
         let pool = super::db::pool()?;
         let conn = pool.write().map_err(write_err)?;
         let tx = conn.unchecked_transaction()?;
+        let catalogue = list_functions_on(&tx, project_id)?;
         let mut added = 0u32;
-        for (user_id, role) in members {
-            let n = tx.execute(
-                "INSERT OR IGNORE INTO project_members (project_id, user_id, role, invited_by) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![project_id, user_id, role, invited_by],
-            )?;
-            added += n as u32;
+        for member in members {
+            let member =
+                super::models::validate_member_input(member, &catalogue, chrono::Utc::now())?;
+            added += insert_member(&tx, project_id, &member, invited_by)?;
         }
         tx.commit()?;
         added
@@ -339,14 +563,75 @@ pub fn add_members(
     Ok(added)
 }
 
-pub fn set_member_role(project_id: &str, user_id: &str, role: &str) -> Result<bool> {
+fn insert_member(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    member: &MemberInput,
+    invited_by: &str,
+) -> Result<u32> {
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO project_members(project_id,user_id,project_admin,expires_at,invited_by) \
+         VALUES (?1,?2,?3,?4,?5)",
+        params![project_id,member.user_id,member.project_admin,member.expires_at,invited_by],
+    )?;
+    if n > 0 {
+        for function_id in &member.functions {
+            conn.execute(
+                "INSERT INTO project_member_functions(project_id,user_id,function_id) VALUES (?1,?2,?3)",
+                params![project_id,member.user_id,function_id],
+            )?;
+        }
+    }
+    Ok(n as u32)
+}
+
+pub fn set_member_access(
+    project_id: &str,
+    user_id: &str,
+    functions: &[String],
+    project_admin: bool,
+    expires_at: Option<&str>,
+) -> Result<bool> {
     let changed = {
         let pool = super::db::pool()?;
         let conn = pool.write().map_err(write_err)?;
-        let n = conn.execute(
-            "UPDATE project_members SET role = ?1 WHERE project_id = ?2 AND user_id = ?3",
-            params![role, project_id, user_id],
+        let tx = conn.unchecked_transaction()?;
+        let owner: String = tx.query_row(
+            "SELECT owner_user_id FROM projects WHERE project_id=?1",
+            params![project_id],
+            |row| row.get(0),
         )?;
+        if owner == user_id && expires_at.is_some() {
+            bail!("project owner membership cannot expire");
+        }
+        let catalogue = list_functions_on(&tx, project_id)?;
+        let member = super::models::validate_member_input(
+            &MemberInput {
+                user_id: user_id.to_string(),
+                functions: functions.to_vec(),
+                project_admin,
+                expires_at: expires_at.map(str::to_string),
+            },
+            &catalogue,
+            chrono::Utc::now(),
+        )?;
+        let n = tx.execute(
+            "UPDATE project_members SET project_admin=?1,expires_at=?2 WHERE project_id=?3 AND user_id=?4",
+            params![member.project_admin,member.expires_at,project_id,user_id],
+        )?;
+        if n > 0 {
+            tx.execute(
+                "DELETE FROM project_member_functions WHERE project_id=?1 AND user_id=?2",
+                params![project_id, user_id],
+            )?;
+            for function_id in &member.functions {
+                tx.execute(
+                    "INSERT INTO project_member_functions(project_id,user_id,function_id) VALUES (?1,?2,?3)",
+                    params![project_id,user_id,function_id],
+                )?;
+            }
+        }
+        tx.commit()?;
         n > 0
     };
     if changed {
@@ -359,6 +644,16 @@ pub fn remove_member(project_id: &str, user_id: &str) -> Result<bool> {
     let removed = {
         let pool = super::db::pool()?;
         let conn = pool.write().map_err(write_err)?;
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_user_id FROM projects WHERE project_id=?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() == Some(user_id) {
+            bail!("project owner cannot be removed");
+        }
         let n = conn.execute(
             "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
             params![project_id, user_id],
@@ -371,28 +666,35 @@ pub fn remove_member(project_id: &str, user_id: &str) -> Result<bool> {
     Ok(removed)
 }
 
-/// Atomic ownership transfer: the old owner is demoted to manager, the new
-/// owner promoted, and `projects.owner_user_id` updated — one transaction, so
-/// the project can never have zero or two owners.
+/// Ownership is independent from function grants; a transfer activates the
+/// new owner's administrator membership without conferring confidential grants.
 pub fn transfer_ownership(project_id: &str, old_owner: &str, new_owner: &str) -> Result<()> {
     {
         let pool = super::db::pool()?;
         let conn = pool.write().map_err(write_err)?;
         let tx = conn.unchecked_transaction()?;
-        let demoted = tx.execute(
-            "UPDATE project_members SET role = 'manager' \
-             WHERE project_id = ?1 AND user_id = ?2 AND role = 'owner'",
-            params![project_id, old_owner],
+        let current_owner: String = tx.query_row(
+            "SELECT owner_user_id FROM projects WHERE project_id=?1",
+            params![project_id],
+            |row| row.get(0),
         )?;
-        if demoted == 0 {
-            bail!("current owner membership not found");
+        if current_owner != old_owner {
+            bail!("project ownership changed");
+        }
+        let new_member = tx.query_row(
+            &format!("SELECT {MEMBER_COLS} FROM project_members m WHERE m.project_id=?1 AND m.user_id=?2"),
+            params![project_id,new_owner],
+            read_member,
+        ).optional()?;
+        if !new_member.is_some_and(|member| member.is_active()) {
+            bail!("new owner is not an active project member");
         }
         let promoted = tx.execute(
-            "UPDATE project_members SET role = 'owner' WHERE project_id = ?1 AND user_id = ?2",
+            "UPDATE project_members SET project_admin=1,expires_at=NULL WHERE project_id=?1 AND user_id=?2",
             params![project_id, new_owner],
         )?;
         if promoted == 0 {
-            bail!("new owner is not a project member");
+            bail!("new owner membership not found");
         }
         tx.execute(
             "UPDATE projects SET owner_user_id = ?1, updated_at = datetime('now') \
@@ -1509,14 +1811,83 @@ pub fn read_source_counts(dir_path: &str) -> (u32, u32) {
 }
 
 // =============================================================================
-// Role gate helper shared by dispatcher + stream handler
+// Access evaluation shared by all request and background consumers
 // =============================================================================
 
-/// Effective role of `user_id` in the project, or `None` for a non-member.
-pub fn effective_role(project_id: &str, user_id: &str) -> Result<Option<ProjectRole>> {
-    Ok(member_role(project_id, user_id)?
-        .as_deref()
-        .and_then(ProjectRole::from_slug))
+pub fn project_access(
+    project: &ProjectRecord,
+    user_id: &str,
+    app_admin: bool,
+) -> Result<ProjectAccessWire> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(read_err)?;
+    let member = conn.query_row(
+        &format!("SELECT {MEMBER_COLS} FROM project_members m WHERE m.project_id=?1 AND m.user_id=?2"),
+        params![project.project_id,user_id],
+        read_member,
+    ).optional()?;
+    let catalogue = list_functions_on(&conn, &project.project_id)?;
+    Ok(super::models::evaluate_project_access(
+        project,
+        member.as_ref(),
+        &catalogue,
+        app_admin,
+        chrono::Utc::now(),
+    ))
+}
+
+pub fn replace_ml_grants(
+    project_id: &str,
+    link_id: &str,
+    ml_project_id: &str,
+    user_ids: &[String],
+) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM project_ml_grants WHERE project_id=?1 AND link_id=?2",
+        params![project_id, link_id],
+    )?;
+    for user_id in user_ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO project_ml_grants(ml_project_id,user_id,project_id,link_id) VALUES(?1,?2,?3,?4)",
+            params![ml_project_id,user_id,project_id,link_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn ml_grant_origins(ml_project_id: &str, user_id: &str) -> Result<Vec<(String, String)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn.prepare("SELECT project_id,link_id FROM project_ml_grants WHERE ml_project_id=?1 AND user_id=?2 ORDER BY project_id,link_id")?;
+    let rows = stmt.query_map(params![ml_project_id, user_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn remove_ml_grant(ml_project_id: &str, user_id: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "DELETE FROM project_ml_grants WHERE ml_project_id=?1 AND user_id=?2",
+        params![ml_project_id, user_id],
+    )?;
+    Ok(())
+}
+
+pub fn clear_ml_grants(project_id: &str, link_id: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "DELETE FROM project_ml_grants WHERE project_id=?1 AND link_id=?2",
+        params![project_id, link_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1695,7 +2066,7 @@ mod code_studio_mirror_tests {
             &format!("Projekt {project_id}"),
             "",
             "tests",
-            "[]",
+            "[\"knowledge\"]",
             owner,
             "/tmp/none",
             &[],
@@ -1703,7 +2074,132 @@ mod code_studio_mirror_tests {
         .expect("create project");
     }
 
-    /// Every membership mutation carries the project role into the linked
+    #[test]
+    fn function_catalogue_and_membership_mutations_change_real_access() {
+        use tentaflow_protocol::project_studio::access::{
+            ProjectArea, ProjectPermissionLevel as Level,
+        };
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        let _core = core_registry();
+        let project_id = format!("access-{}", uuid::Uuid::new_v4());
+        let owner = format!("owner-{}", uuid::Uuid::new_v4());
+        let user = format!("member-{}", uuid::Uuid::new_v4());
+        create_project(
+            &project_id,
+            ORG,
+            &project_id,
+            "",
+            "custom",
+            "[\"knowledge\",\"tests\",\"tasks\"]",
+            &owner,
+            "unused",
+            &[],
+        )
+        .expect("project");
+        let project = get_project(ORG, &project_id).expect("get").expect("row");
+        add_members(
+            &project_id,
+            &[MemberInput {
+                user_id: user.clone(),
+                functions: vec![],
+                project_admin: false,
+                expires_at: None,
+            }],
+            &owner,
+        )
+        .expect("member");
+        let initial = project_access(&project, &user, false).expect("access");
+        assert!(initial.has_access && initial.can_create_tasks);
+        assert!(!initial.allows(ProjectArea::Tests, Level::Read));
+        let mut custom = list_functions(&project_id)
+            .expect("catalogue")
+            .into_iter()
+            .find(|entry| entry.function_id == "tester")
+            .expect("tester");
+        custom.function_id = "reviewer".to_string();
+        custom.name = "Reviewer".to_string();
+        custom.builtin = false;
+        custom
+            .grants
+            .iter_mut()
+            .find(|entry| entry.area == ProjectArea::Tests)
+            .expect("tests")
+            .level = Level::Write;
+        save_function(&project_id, &custom).expect("function");
+        set_member_access(&project_id, &user, &["reviewer".to_string()], false, None)
+            .expect("assign");
+        assert!(project_access(&project, &user, false)
+            .expect("access")
+            .allows(ProjectArea::Tests, Level::Write));
+        assert!(
+            set_member_access(&project_id, &user, &["unknown".to_string()], false, None).is_err()
+        );
+        assert!(delete_function(&project_id, "tester").is_err());
+        custom
+            .grants
+            .iter_mut()
+            .find(|entry| entry.area == ProjectArea::Tests)
+            .expect("tests")
+            .level = Level::Read;
+        save_function(&project_id, &custom).expect("change matrix");
+        assert!(!project_access(&project, &user, false)
+            .expect("access")
+            .allows(ProjectArea::Tests, Level::Write));
+        delete_function(&project_id, "reviewer").expect("delete function");
+        assert!(member_access(&project_id, &user)
+            .expect("member")
+            .expect("row")
+            .functions
+            .is_empty());
+        set_member_access(&project_id, &owner, &["observer".to_string()], false, None)
+            .expect("ownership independent");
+        let owned = project_access(&project, &owner, false).expect("owner access");
+        assert!(owned.is_owner && !owned.project_admin);
+        assert!(remove_member(&project_id, &owner).is_err());
+        assert!(set_member_access(
+            &project_id,
+            &owner,
+            &[],
+            false,
+            Some("2099-01-01T00:00:00Z")
+        )
+        .is_err());
+        set_member_access(
+            &project_id,
+            &user,
+            &["tester".to_string()],
+            true,
+            Some("2099-01-01T00:00:00Z"),
+        )
+        .expect("temporary member");
+        {
+            let pool = super::super::db::pool().expect("registry");
+            let conn = pool.write().expect("write");
+            conn.execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2",params![project_id,user]).expect("expiration");
+        }
+        assert!(
+            !project_access(&project, &user, false)
+                .expect("expired access")
+                .has_access
+        );
+        assert!(!member_accesses_for_user(&user)
+            .expect("memberships")
+            .contains_key(&project_id));
+        assert!(transfer_ownership(&project_id, &owner, &user).is_err());
+        set_member_access(&project_id, &user, &["tester".to_string()], false, None)
+            .expect("reactivate");
+        transfer_ownership(&project_id, &owner, &user).expect("transfer");
+        let updated = get_project(ORG, &project_id).expect("get").expect("row");
+        assert_eq!(updated.owner_user_id, user);
+        let new_owner = member_access(&project_id, &user)
+            .expect("member")
+            .expect("row");
+        assert!(new_owner.project_admin);
+        assert_eq!(new_owner.functions, vec!["tester"]);
+        assert!(new_owner.expires_at.is_none());
+    }
+
+    /// Every membership mutation carries current repository access into the linked
     /// workspace: a new member is granted, a promotion is applied to the same
     /// row, and losing project membership loses workspace access.
     #[test]
@@ -1731,7 +2227,12 @@ mod code_studio_mirror_tests {
         assert_eq!(
             add_members(
                 &project_id,
-                &[(member.clone(), "viewer".to_string())],
+                &[MemberInput {
+                    user_id: member.clone(),
+                    functions: vec!["tester".to_string()],
+                    project_admin: false,
+                    expires_at: None
+                }],
                 &owner
             )
             .expect("add member"),
@@ -1748,11 +2249,18 @@ mod code_studio_mirror_tests {
             "the pass converges on the whole member list, not just the mutated user"
         );
 
-        assert!(set_member_role(&project_id, &member, "editor").expect("promote"));
+        assert!(set_member_access(
+            &project_id,
+            &member,
+            &["developer".to_string()],
+            false,
+            None
+        )
+        .expect("update functions"));
         assert_eq!(
             mirrored(&core, &workspace_id, &project_id, &member).as_deref(),
             Some("editor"),
-            "a role change did not reach the workspace"
+            "a function change did not reach the workspace"
         );
 
         assert!(remove_member(&project_id, &member).expect("remove"));
@@ -1801,7 +2309,12 @@ mod code_studio_mirror_tests {
         assert_eq!(
             add_members(
                 &project_id,
-                &[(by_hand.clone(), "viewer".to_string())],
+                &[MemberInput {
+                    user_id: by_hand.clone(),
+                    functions: vec!["tester".to_string()],
+                    project_admin: false,
+                    expires_at: None
+                }],
                 &owner
             )
             .expect("add member"),

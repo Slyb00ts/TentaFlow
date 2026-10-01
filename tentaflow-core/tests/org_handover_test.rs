@@ -392,7 +392,13 @@ fn project(w: &World, name: &str, owner: &str, members: &[(&str, &str)], holder:
         &path.to_string_lossy(),
         &members
             .iter()
-            .map(|(u, r)| (u.to_string(), r.to_string()))
+            .filter(|(user, _)| *user != owner)
+            .map(|(user, functions)| tentaflow_core::project_studio::models::MemberInput {
+                user_id: user.to_string(),
+                functions: if *functions == "administrator" { vec!["pm".to_string()] }
+                    else { functions.split(',').map(str::to_string).collect() },
+                project_admin: *functions == "administrator", expires_at: None,
+            })
             .collect::<Vec<_>>(),
     )
     .expect("create project");
@@ -485,9 +491,9 @@ async fn a_departure_lists_everything_the_person_holds_with_a_proposal_for_each(
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
-            (&w.deputy_head, "viewer"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
+            (&w.deputy_head, "observer"),
         ],
         &w.leaver,
     );
@@ -541,7 +547,7 @@ async fn a_departure_lists_everything_the_person_holds_with_a_proposal_for_each(
     let membership = &listing.items(Cat::Membership)[0];
     assert_eq!(
         (membership.role.as_str(), membership.action),
-        ("editor", OrgHandoverAction::End)
+        ("member", OrgHandoverAction::End)
     );
     let position = listing.titled(Cat::Position, "Programista");
     assert_eq!(position.action, OrgHandoverAction::TransferOrEnd);
@@ -561,8 +567,8 @@ async fn only_an_administrator_hands_over_a_departure_and_a_note_is_required() {
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -633,8 +639,8 @@ async fn a_departure_moves_the_work_the_seat_and_the_covers_and_leaves_an_audite
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
             (&w.deputy_head, "tester"),
         ],
         &w.leaver,
@@ -695,7 +701,7 @@ async fn a_departure_moves_the_work_the_seat_and_the_covers_and_leaves_an_audite
     assert_eq!(assignee_of(&p.id, &p.task_b), w.peer);
     assert_eq!(item_assignee(&p.id, &p.item), w.deputy_head);
     assert!(
-        repository::effective_role(&p.id, &w.leaver)
+        repository::member_access(&p.id, &w.leaver)
             .unwrap()
             .is_none(),
         "the membership ended with the work"
@@ -816,8 +822,8 @@ async fn a_taker_who_cannot_take_the_item_is_refused_before_anything_moves() {
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.deputy_head, "viewer"),
+            (&w.leaver, "developer,tester"),
+            (&w.deputy_head, "observer"),
         ],
         &w.leaver,
     );
@@ -889,8 +895,8 @@ async fn a_refused_seat_leaves_the_structure_and_everything_else_untouched() {
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -980,8 +986,8 @@ async fn a_failing_project_step_is_recorded_and_a_retry_finishes_it() {
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -1058,7 +1064,7 @@ async fn a_failing_project_step_is_recorded_and_a_retry_finishes_it() {
         retried.1
     );
     assert_eq!(assignee_of(&p.id, &p.task_b), w.peer);
-    assert!(repository::effective_role(&p.id, &w.leaver)
+    assert!(repository::member_access(&p.id, &w.leaver)
         .unwrap()
         .is_none());
     // Nothing to retry any more: a normal refusal, not a protocol error.
@@ -1104,8 +1110,8 @@ async fn a_membership_scheduled_for_the_departure_day_ends_on_that_day() {
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -1134,7 +1140,7 @@ async fn a_membership_scheduled_for_the_departure_day_ends_on_that_day() {
     assert!(answer.ok, "{:?}", answer.items);
     assert_eq!(answer.status_of("member:").0, "scheduled");
     assert!(
-        repository::effective_role(&p.id, &w.leaver)
+        repository::member_access(&p.id, &w.leaver)
             .unwrap()
             .is_some(),
         "still a member until the day"
@@ -1146,12 +1152,12 @@ async fn a_membership_scheduled_for_the_departure_day_ends_on_that_day() {
         handover::DueReport::default(),
         "not yet"
     );
-    assert!(repository::effective_role(&p.id, &w.leaver)
+    assert!(repository::member_access(&p.id, &w.leaver)
         .unwrap()
         .is_some());
     let report = due(leaving);
     assert_eq!(report.ended, 1, "{report:?}");
-    assert!(repository::effective_role(&p.id, &w.leaver)
+    assert!(repository::member_access(&p.id, &w.leaver)
         .unwrap()
         .is_none());
     // Running the day again finds nothing left to do.
@@ -1172,9 +1178,9 @@ async fn an_absence_handover_is_temporary_and_the_work_comes_back_unless_the_tak
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
-            (&w.deputy_head, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
+            (&w.deputy_head, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -1257,7 +1263,7 @@ async fn an_absence_handover_is_temporary_and_the_work_comes_back_unless_the_tak
     assert_eq!(assignee_of(&p.id, &p.task_a), w.peer);
     assert_eq!(item_assignee(&p.id, &p.item), w.peer);
     assert!(
-        repository::effective_role(&p.id, &w.leaver)
+        repository::member_access(&p.id, &w.leaver)
             .unwrap()
             .is_some(),
         "the person stays a member"
@@ -1342,8 +1348,8 @@ async fn a_project_removal_moves_only_that_projects_items_and_needs_its_manager(
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -1353,8 +1359,8 @@ async fn a_project_removal_moves_only_that_projects_items_and_needs_its_manager(
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );
@@ -1420,12 +1426,12 @@ async fn a_project_removal_moves_only_that_projects_items_and_needs_its_manager(
     .unwrap();
     assert!(answer.ok, "{:?}", answer.items);
     assert_eq!(assignee_of(&mine.id, &mine.task_a), w.peer);
-    assert!(repository::effective_role(&mine.id, &w.leaver)
+    assert!(repository::member_access(&mine.id, &w.leaver)
         .unwrap()
         .is_none());
     // The other project, the seat and everything else are as they were.
     assert_eq!(assignee_of(&other.id, &other.task_a), w.leaver);
-    assert!(repository::effective_role(&other.id, &w.leaver)
+    assert!(repository::member_access(&other.id, &w.leaver)
         .unwrap()
         .is_some());
     let snapshot =
@@ -1443,7 +1449,7 @@ async fn a_project_removal_moves_only_that_projects_items_and_needs_its_manager(
 }
 
 #[tokio::test]
-async fn only_the_owner_removes_a_manager_and_an_owner_hands_the_project_over_first() {
+async fn project_administrators_manage_non_owner_admins_and_owners_transfer_first() {
     let w = world();
     let p = project(
         &w,
@@ -1451,12 +1457,26 @@ async fn only_the_owner_removes_a_manager_and_an_owner_hands_the_project_over_fi
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "manager"),
-            (&w.peer, "manager"),
+            (&w.leaver, "administrator"),
+            (&w.peer, "administrator"),
+            (&w.deputy_head, "developer"),
         ],
         &w.leaver,
     );
-    // Another manager may not remove a manager.
+    assert!(
+        list(
+            &ctx(&w, &w.deputy_head, false),
+            &w.leaver,
+            Reason::ProjectRemoval,
+            Some(&p.id),
+            None
+        )
+        .await
+        .is_err(),
+        "an ordinary member cannot manage project administration"
+    );
+
+    // Project administrators manage non-owner administrators after handing over their work.
     let peer = ctx(&w, &w.peer, false);
     let listing = list(&peer, &w.leaver, Reason::ProjectRemoval, Some(&p.id), None)
         .await
@@ -1478,13 +1498,10 @@ async fn only_the_owner_removes_a_manager_and_an_owner_hands_the_project_over_fi
     )
     .await
     .unwrap();
-    assert_eq!(
-        answer.status_of("member:"),
-        ("failed", Some("only_owner_removes_manager"))
-    );
-    assert!(repository::effective_role(&p.id, &w.leaver)
+    assert_eq!(answer.status_of("member:"), ("done", None));
+    assert!(repository::member_access(&p.id, &w.leaver)
         .unwrap()
-        .is_some());
+        .is_none());
 
     // The owner leaving must name who takes the project.
     let admin = ctx(&w, &w.admin, true);
@@ -1528,17 +1545,15 @@ async fn only_the_owner_removes_a_manager_and_an_owner_hands_the_project_over_fi
     .await
     .unwrap();
     assert!(with.ok, "{:?}", with.items);
-    assert!(repository::effective_role(&p.id, &w.boss)
+    assert!(repository::member_access(&p.id, &w.boss).unwrap().is_none());
+    let project = repository::get_project(DEFAULT_ORG_ID, &p.id)
         .unwrap()
-        .is_none());
-    assert_eq!(
-        repository::effective_role(&p.id, &w.peer)
-            .unwrap()
-            .map(|r| r.slug()),
-        Some("owner")
-    );
+        .unwrap();
+    assert_eq!(project.owner_user_id, w.peer);
+    let new_owner = repository::member_access(&p.id, &w.peer).unwrap().unwrap();
+    assert!(new_owner.project_admin);
+    assert!(new_owner.expires_at.is_none());
 }
-
 // =============================================================================
 // After the assignment ended
 // =============================================================================
@@ -1552,8 +1567,8 @@ async fn people_whose_assignment_ended_and_who_still_hold_work_are_counted_for_t
         &w.boss,
         &[
             (&w.boss, "owner"),
-            (&w.leaver, "editor"),
-            (&w.peer, "editor"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
         ],
         &w.leaver,
     );

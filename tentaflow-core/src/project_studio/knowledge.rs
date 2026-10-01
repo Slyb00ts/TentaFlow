@@ -42,13 +42,15 @@ fn access_denied() -> anyhow::Error {
     anyhow!("project not found or access denied")
 }
 
-/// Loads the project and requires the acting user to be a member (any role —
-/// search is a read, matching the dashboard's Viewer gate). No admin override:
-/// a flow node / agent tool always acts strictly as the user.
+/// Tools act as the user and recheck the project's knowledge permission on every call.
 pub fn require_member(org_id: &str, project_id: &str, user_id: &str) -> Result<ProjectRecord> {
     project_db::validate_project_id(project_id).map_err(|_| access_denied())?;
     let record = repository::get_project(org_id, project_id)?.ok_or_else(access_denied)?;
-    if repository::effective_role(project_id, user_id)?.is_none() {
+    let access = repository::project_access(&record, user_id, false)?;
+    if !access.allows(
+        tentaflow_protocol::project_studio::access::ProjectArea::Knowledge,
+        tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+    ) {
         return Err(access_denied());
     }
     Ok(record)

@@ -12781,7 +12781,13 @@ fn decode_project_studio_payload(
         set(obj, "truncated", truncated.into());
         return;
     }
-    let value = match serde_json::to_value(&payload) {
+    let serialised = match &payload {
+        tentaflow_protocol::project_studio::ProjectStudioPayload::Access(access) => {
+            serde_json::to_value(access)
+        }
+        _ => serde_json::to_value(&payload),
+    };
+    let value = match serialised {
         Ok(v) => v,
         Err(_) => {
             set(obj, "variant", "ProjectStudioDecodeError".into());
@@ -20812,7 +20818,7 @@ pub fn encode_project_studio_projects_list_request(
 
 /// MessageBody::ProjectStudioBody(ProjectCreateRequest). `modules_json` is a
 /// JSON array of module names; `members_json` is a JSON array of
-/// MemberInputWire objects ({user_id, role}).
+/// MemberInputWire objects with functions, administrator flag and expiry.
 #[wasm_bindgen(js_name = encodeProjectStudioProjectCreateRequest)]
 pub fn encode_project_studio_project_create_request(
     name: String,
@@ -20920,7 +20926,7 @@ pub fn encode_project_studio_member_candidates_request(
 }
 
 /// MessageBody::ProjectStudioBody(MembersAddRequest). `members_json` is a JSON
-/// array of MemberInputWire objects ({user_id, role}).
+/// array of MemberInputWire objects with authoritative membership access.
 #[wasm_bindgen(js_name = encodeProjectStudioMembersAddRequest)]
 pub fn encode_project_studio_members_add_request(
     project_id: String,
@@ -20953,6 +20959,44 @@ pub fn encode_project_studio_member_role_set_request(
         },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioCatalogueGetRequest)]
+pub fn encode_project_studio_catalogue_get_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::project_studio::{access::ProjectAccessPayload, ProjectStudioPayload};
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        ProjectStudioPayload::Access(ProjectAccessPayload::CatalogueGetRequest { project_id }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioFunctionSaveRequest)]
+pub fn encode_project_studio_function_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("FunctionSaveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioFunctionDeleteRequest)]
+pub fn encode_project_studio_function_delete_request(
+    project_id: String,
+    function_id: String,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::project_studio::{access::ProjectAccessPayload, ProjectStudioPayload};
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        ProjectStudioPayload::Access(ProjectAccessPayload::FunctionDeleteRequest {
+            project_id,
+            function_id,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioMemberAccessSetRequest)]
+pub fn encode_project_studio_member_access_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MemberAccessSetRequest", &request_json)
 }
 
 /// MessageBody::ProjectStudioBody(MemberRemoveRequest).
@@ -21471,8 +21515,14 @@ fn encode_project_studio_json_request(
 ) -> Result<Vec<u8>, JsError> {
     let fields: serde_json::Value = serde_json::from_str(fields_json)
         .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let tagged = match variant {
+        "FunctionSaveRequest" | "MemberAccessSetRequest" => {
+            serde_json::json!({ "Access": { variant: fields } })
+        }
+        _ => serde_json::json!({ variant: fields }),
+    };
     let payload: tentaflow_protocol::project_studio::ProjectStudioPayload =
-        serde_json::from_value(serde_json::json!({ variant: fields }))
+        serde_json::from_value(tagged)
             .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
     encode_body_inner(&MessageBody::ProjectStudioBody(payload)).map_err(|e| JsError::new(&e))
 }
@@ -24009,6 +24059,54 @@ pub fn encode_provider_account_runtime_uninstall_request(
     request_json: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_provider_account_json_request("RuntimeUninstallRequest", &request_json)
+}
+
+#[cfg(test)]
+mod project_access_codec_tests {
+    use super::*;
+    use tentaflow_protocol::project_studio::{access::ProjectAccessPayload, ProjectStudioPayload};
+
+    #[test]
+    fn project_access_encoders_preserve_nested_variants_and_membership_fields() {
+        let bytes = encode_project_studio_member_access_set_request(
+            r#"{"project_id":"p1","user_id":"u1","functions":["developer","tester"],"project_admin":true,"expires_at":"2026-12-31T23:59:59Z"}"#.to_string(),
+        ).expect("encode access");
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).expect("body");
+        assert_eq!(
+            body,
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::Access(
+                ProjectAccessPayload::MemberAccessSetRequest {
+                    project_id: "p1".to_string(),
+                    user_id: "u1".to_string(),
+                    functions: vec!["developer".to_string(), "tester".to_string()],
+                    project_admin: true,
+                    expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+                }
+            ))
+        );
+        let bytes =
+            encode_project_studio_catalogue_get_request("p1".to_string()).expect("catalogue");
+        assert_eq!(
+            tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).expect("body"),
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::Access(
+                ProjectAccessPayload::CatalogueGetRequest {
+                    project_id: "p1".to_string()
+                }
+            ))
+        );
+        let bytes =
+            encode_project_studio_function_delete_request("p1".to_string(), "custom".to_string())
+                .expect("delete");
+        assert_eq!(
+            tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).expect("body"),
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::Access(
+                ProjectAccessPayload::FunctionDeleteRequest {
+                    project_id: "p1".to_string(),
+                    function_id: "custom".to_string()
+                }
+            ))
+        );
+    }
 }
 
 #[cfg(test)]

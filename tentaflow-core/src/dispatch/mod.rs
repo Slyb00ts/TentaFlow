@@ -2191,6 +2191,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Ps::ArchiveStreamRequest { .. } => "ProjectStudioArchiveStreamRequest",
                 Ps::ArchiveStreamChunk { .. } => "ProjectStudioArchiveStreamChunk",
                 Ps::ArchiveStreamEnd { .. } => "ProjectStudioArchiveStreamEnd",
+                Ps::Access(payload) => {
+                    use tentaflow_protocol::project_studio::access::ProjectAccessPayload as Access;
+                    match payload {
+                        Access::CatalogueGetRequest { .. } => "ProjectStudioCatalogueGetRequest",
+                        Access::CatalogueGetResponse { .. } => "ProjectStudioCatalogueGetResponse",
+                        Access::FunctionSaveRequest { .. } => "ProjectStudioFunctionSaveRequest",
+                        Access::FunctionSaveResult { .. } => "ProjectStudioFunctionSaveResult",
+                        Access::FunctionDeleteRequest { .. } => "ProjectStudioFunctionDeleteRequest",
+                        Access::FunctionDeleteResult { .. } => "ProjectStudioFunctionDeleteResult",
+                        Access::MemberAccessSetRequest { .. } => "ProjectStudioMemberAccessSetRequest",
+                        Access::MemberAccessSetResult { .. } => "ProjectStudioMemberAccessSetResult",
+                    }
+                }
+
             }
         }
         MessageBody::CodeStudioBody(p) => {

@@ -26,6 +26,7 @@ use tentaflow_protocol::code_studio::{
     WorkspaceInfo, WorkspaceMemberInfo, WorkspaceMemberInput, WorkspaceNodeInfo,
     WorkspaceUserCandidate, WorktreeInfo,
 };
+use tentaflow_protocol::project_studio::access::{ProjectArea, ProjectPermissionLevel};
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
@@ -1888,18 +1889,32 @@ async fn workspace_create_v1(
         )));
     }
     let local_path = if input.repo_kind == "local" {
-        if !matches!(&ctx.session, tentaflow_protocol::SessionAuth::UserSession { role: Some(role), .. } if role == "admin") {
-            return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, "only a node administrator can register a host directory"));
+        if !matches!(&ctx.session, tentaflow_protocol::SessionAuth::UserSession { role: Some(role), .. } if role == "admin")
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "only a node administrator can register a host directory",
+            ));
         }
         if exec_mode != ExecMode::ProcessSandbox {
-            return Err(ProtocolError::bad_request("existing directories require process_sandbox"));
+            return Err(ProtocolError::bad_request(
+                "existing directories require process_sandbox",
+            ));
         }
-        if input.repo_auth_kind.is_some_and(|kind| kind != "none") || input.secret_material.is_some() {
-            return Err(ProtocolError::bad_request("local directories do not accept repository credentials"));
+        if input.repo_auth_kind.is_some_and(|kind| kind != "none")
+            || input.secret_material.is_some()
+        {
+            return Err(ProtocolError::bad_request(
+                "local directories do not accept repository credentials",
+            ));
         }
-        Some(crate::code_studio::location::validate(input.repo_url.unwrap_or_default())
-            .map_err(|e| ProtocolError::bad_request(format!("{e:#}")))?)
-    } else { None };
+        Some(
+            crate::code_studio::location::validate(input.repo_url.unwrap_or_default())
+                .map_err(|e| ProtocolError::bad_request(format!("{e:#}")))?,
+        )
+    } else {
+        None
+    };
     let mut private_remote = false;
     if input.repo_kind == "git" {
         let url = input
@@ -2004,7 +2019,10 @@ async fn workspace_create_v1(
             container_image: input.container_image.map(str::to_string),
             egress_enforcement: enforcement,
             repo_kind: input.repo_kind.to_string(),
-            repo_url: local_path.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| input.repo_url.map(str::to_string)),
+            repo_url: local_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| input.repo_url.map(str::to_string)),
             repo_auth_kind: Some(auth_kind.to_string()),
             secret_ref,
             ssh_host_fingerprint: input.ssh_host_fingerprint.map(str::to_string),
@@ -2225,10 +2243,17 @@ fn workspace_archive_v1(
     let org = require_read(ctx)?;
     let (record, _) = require_workspace(ctx, org, workspace_id, Access::Lifecycle)?;
     require_local(ctx, &record)?;
-    if archived && paths::workspace_db_path(workspace_id).map_err(|e| db_error("workspace_db_path", e))?.exists() {
+    if archived
+        && paths::workspace_db_path(workspace_id)
+            .map_err(|e| db_error("workspace_db_path", e))?
+            .exists()
+    {
         let pool = open_workspace_pool(&record)?;
         if count_open_sessions(&pool)? > 0 {
-            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, "close all sessions before archiving the project"));
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                "close all sessions before archiving the project",
+            ));
         }
     }
     let target = if archived {
@@ -2273,7 +2298,10 @@ async fn workspace_delete_v1(
     let (record, _) = require_workspace(ctx, org, workspace_id, Access::Lifecycle)?;
     require_local(ctx, &record)?;
 
-    if paths::workspace_db_path(workspace_id).map_err(|e| db_error("workspace_db_path", e))?.exists() {
+    if paths::workspace_db_path(workspace_id)
+        .map_err(|e| db_error("workspace_db_path", e))?
+        .exists()
+    {
         let pool = open_workspace_pool(&record)?;
         let open = count_open_sessions(&pool)?;
         if open > 0 {
@@ -2958,16 +2986,20 @@ async fn session_close_v1(
     require_own_session(&pool, session_id, &org.user_id)?;
 
     crate::code_studio::cli_bridge::close_session_instances(&pool, session_id, None)
-        .await.map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+        .await
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
     let terminals = terminal_registry(&record)?;
     let runtime = workspace_runtime(&record)?;
     for handle in terminals.session_handles(session_id) {
         terminals.pty_close(&handle).map_err(terminal_error)?;
-        let lease = runtime.terminal_leases.lock()
+        let lease = runtime
+            .terminal_leases
+            .lock()
             .map_err(|_| ProtocolError::internal("terminal lease registry is poisoned"))?
             .remove(&handle.terminal_id);
         if let Some(lease) = lease {
-            sandbox_manager(ctx, &record)?.release(&pool, lease)
+            sandbox_manager(ctx, &record)?
+                .release(&pool, lease)
                 .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
         }
     }
@@ -3295,7 +3327,10 @@ fn session_scope(
     require_active(&record)?;
     let pool = open_workspace_pool(&record)?;
     let session = require_own_session(&pool, session_id, &org.user_id)?;
-    if matches!(session.status.as_str(), "closed" | "closing" | "failed" | "cancelled") {
+    if matches!(
+        session.status.as_str(),
+        "closed" | "closing" | "failed" | "cancelled"
+    ) {
         return Err(ProtocolError::new(
             ProtocolErrorCode::Conflict,
             "session is closed",
@@ -3396,7 +3431,10 @@ fn exec_mode_of(record: &WorkspaceRecord) -> Result<ExecMode, ProtocolError> {
         .ok_or_else(|| ProtocolError::internal("workspace has an unknown execution mode"))
 }
 
-fn sandbox_manager(ctx: &HandlerContext, record: &WorkspaceRecord) -> Result<SandboxManager, ProtocolError> {
+fn sandbox_manager(
+    ctx: &HandlerContext,
+    record: &WorkspaceRecord,
+) -> Result<SandboxManager, ProtocolError> {
     let exec_mode = exec_mode_of(record)?;
     let container = match exec_mode {
         ExecMode::Container => Some(ContainerConfig {
@@ -6857,27 +6895,27 @@ fn watch_session_run(
     tokio::spawn(async move {
         let (status, error, accounting, answer) =
             match manager.await_run(&run_id, RUN_WATCH_TIMEOUT).await {
-            Ok(run) => {
-                let error = run
-                    .exit_reason
-                    .filter(|reason| reason.starts_with("error:"));
-                // §17.3 — what the turn cost, taken from the run the manager
-                // settled. The harness is the only measurer of the native path,
-                // so a row that does not copy it here has no other source.
-                let accounting = (run.prompt_tokens, run.completion_tokens, run.model);
-                let answer = run
-                    .result
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|text| (text, run.agent_id));
-                (run.status, error, accounting, answer)
-            }
-            // The run outlived the watcher or vanished with its process. Either
-            // way the row cannot be closed on evidence, so it is left as it is.
-            Err(e) => {
-                tracing::warn!(run_id, error = %e, "code studio: run watcher gave up");
-                return;
-            }
-        };
+                Ok(run) => {
+                    let error = run
+                        .exit_reason
+                        .filter(|reason| reason.starts_with("error:"));
+                    // §17.3 — what the turn cost, taken from the run the manager
+                    // settled. The harness is the only measurer of the native path,
+                    // so a row that does not copy it here has no other source.
+                    let accounting = (run.prompt_tokens, run.completion_tokens, run.model);
+                    let answer = run
+                        .result
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| (text, run.agent_id));
+                    (run.status, error, accounting, answer)
+                }
+                // The run outlived the watcher or vanished with its process. Either
+                // way the row cannot be closed on evidence, so it is left as it is.
+                Err(e) => {
+                    tracing::warn!(run_id, error = %e, "code studio: run watcher gave up");
+                    return;
+                }
+            };
         {
             let Ok(conn) = pool.write() else {
                 return;
@@ -6998,8 +7036,8 @@ fn session_runs_v1(
     // what SHOULD resolve now, which is not the same claim: an operator may
     // rebind the agent after the run, and a chip that followed the binding would
     // relabel finished work.
-    let accounts = run_accounts(ctx, &conn, &scope.session.id)
-        .map_err(|e| db_error("run_accounts", e))?;
+    let accounts =
+        run_accounts(ctx, &conn, &scope.session.id).map_err(|e| db_error("run_accounts", e))?;
     let mut stmt = conn
         .prepare(
             "SELECT run_id, ordinal, kind, trigger, parent_run_id, agent_id, status, \
@@ -7196,7 +7234,10 @@ async fn session_cancel_v1(
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Editor)?;
     let runtime = workspace_runtime(&scope.record)?;
     let (selected, cancelled) = {
-        let conn = scope.pool.write().map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
+        let conn = scope
+            .pool
+            .write()
+            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
         let mut statement = conn.prepare(
             "WITH RECURSIVE selected(run_id) AS (
                SELECT run_id FROM session_runs WHERE session_id=?1 AND (?2 IS NULL OR run_id=?2)
@@ -7204,20 +7245,29 @@ async fn session_cancel_v1(
                  ON child.parent_run_id=parent.run_id WHERE child.session_id=?1
              ) SELECT run_id,status FROM session_runs WHERE run_id IN (SELECT run_id FROM selected)",
         ).map_err(|e| db_error("session_cancel", e.into()))?;
-        let rows = statement.query_map(rusqlite::params![scope.session.id, run_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_,String>(1)?)))
+        let rows = statement
+            .query_map(rusqlite::params![scope.session.id, run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| db_error("session_cancel", e.into()))?;
-        let rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| db_error("session_cancel", e.into()))?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("session_cancel", e.into()))?;
         drop(statement);
         let mut selected = Vec::new();
         let mut cancelled = Vec::new();
-        for (id,status) in rows {
+        for (id, status) in rows {
             if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
-                conn.execute("UPDATE session_runs SET status='cancelling' WHERE run_id=?1",[&id]).map_err(|e|db_error("session_cancel",e.into()))?;
+                conn.execute(
+                    "UPDATE session_runs SET status='cancelling' WHERE run_id=?1",
+                    [&id],
+                )
+                .map_err(|e| db_error("session_cancel", e.into()))?;
                 cancelled.push(id.clone());
             }
             selected.push(id);
         }
-        (selected,cancelled)
+        (selected, cancelled)
     };
 
     // Signal the flow before closing its processes so it cannot schedule the next node.
@@ -7226,23 +7276,41 @@ async fn session_cancel_v1(
             manager.cancel(id);
         }
     }
-    let pending = operations::list_by_status(&scope.pool, &scope.session.id, OperationStatus::Pending, None)
-        .map_err(|e| db_error("list_by_status", e))?;
+    let pending = operations::list_by_status(
+        &scope.pool,
+        &scope.session.id,
+        OperationStatus::Pending,
+        None,
+    )
+    .map_err(|e| db_error("list_by_status", e))?;
     for operation in &pending {
         if operation.op_kind == OpKind::Exec
-            && (run_id.is_none() || operation.run_id.as_ref().is_some_and(|id| selected.contains(id)))
+            && (run_id.is_none()
+                || operation
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|id| selected.contains(id)))
         {
-            runtime.executor.cancel_exec(&operation.op_id)
+            runtime
+                .executor
+                .cancel_exec(&operation.op_id)
                 .map_err(|e| db_error("cancel_exec", e.into()))?;
         }
     }
     crate::code_studio::cli_bridge::close_session_instances(
-        &scope.pool, session_id, run_id.map(|_| selected.as_slice()),
-    ).await.map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+        &scope.pool,
+        session_id,
+        run_id.map(|_| selected.as_slice()),
+    )
+    .await
+    .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
 
     for id in &cancelled {
         {
-            let conn = scope.pool.write().map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
+            let conn = scope
+                .pool
+                .write()
+                .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
             conn.execute(
                 "UPDATE session_runs SET status='cancelled',finished_at=datetime('now') WHERE run_id=?1",
                 [id],
@@ -7251,7 +7319,11 @@ async fn session_cancel_v1(
         append_event(
             &scope,
             format!("run:{id}:cancelled"),
-            EventPayload::RunFinished { run_id: id.clone(), status: "cancelled".to_string(), error: None },
+            EventPayload::RunFinished {
+                run_id: id.clone(),
+                status: "cancelled".to_string(),
+                error: None,
+            },
         )?;
     }
     Ok(cs(CodeStudioPayload::SessionCancelResponse {
@@ -8309,12 +8381,18 @@ fn project_link_set_v1(
     let project = crate::project_studio::repository::get_project(&org.org_id, project_id)
         .map_err(|e| db_error("get_project", e))?
         .ok_or_else(|| ProtocolError::not_found("project not found"))?;
-    let project_role = crate::project_studio::repository::member_role(project_id, &org.user_id)
-        .map_err(|e| db_error("project_member_role", e))?;
-    let may_administer = project.owner_user_id == org.user_id
-        || matches!(project_role.as_deref(), Some("owner") | Some("manager"));
-    if !may_administer {
+    let access = crate::project_studio::repository::project_access(&project, &org.user_id, false)
+        .map_err(|e| db_error("project_access", e))?;
+    if !access.has_access {
         return Err(ProtocolError::not_found("project not found"));
+    }
+    if !access.allows(ProjectArea::Settings, ProjectPermissionLevel::Write)
+        || !access.allows(ProjectArea::Repos, ProjectPermissionLevel::Write)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project integration write access required",
+        ));
     }
 
     if linked {
@@ -8388,9 +8466,17 @@ fn repo_tree_v1(
     let org = require_read(ctx)?;
     paths::validate_workspace_id(workspace_id)
         .map_err(|_| ProtocolError::bad_request("invalid workspace_id"))?;
-    crate::project_studio::repository::member_role(project_id, &org.user_id)
-        .map_err(|e| db_error("project_member_role", e))?
+    let project = crate::project_studio::repository::get_project(&org.org_id, project_id)
+        .map_err(|e| db_error("get_project", e))?
         .ok_or_else(not_found)?;
+    let access = crate::project_studio::repository::project_access(&project, &org.user_id, false)
+        .map_err(|e| db_error("project_access", e))?;
+    if !access.allows(
+        tentaflow_protocol::project_studio::access::ProjectArea::Repos,
+        tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+    ) {
+        return Err(not_found());
+    }
 
     let requested = limit.clamp(1, project_link::MAX_TREE_ENTRIES as u32) as usize;
     let entries = project_link::repo_tree(
@@ -9711,7 +9797,11 @@ mod tests {
         repository::grant_creator(&fx.ctx.state.db, "org-1", "u-owner", "u-admin").expect("grant");
 
         if crate::code_studio::process_sandbox::ProcessSandbox::check_available().is_err() {
-            assert!(workspace_create_v1(&fx.ctx, create_input("Domyslny", "", "normal", "any")).await.is_err());
+            assert!(
+                workspace_create_v1(&fx.ctx, create_input("Domyslny", "", "normal", "any"))
+                    .await
+                    .is_err()
+            );
             release();
             return;
         }
@@ -12485,5 +12575,84 @@ mod tests {
         assert_eq!(slugify("../../etc/passwd"), "etc-passwd");
         assert_eq!(slugify("   "), "workspace");
         assert!(!slugify("a..b").contains(".."));
+    }
+    #[tokio::test]
+    async fn devops_workspace_owner_can_link_with_integration_capabilities() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-devops-link", &[PERM_READ]);
+        seed_user(&fx.ctx, "u-devops-link");
+        seed_workspace(
+            &fx.ctx,
+            "ws-devops-link",
+            "u-devops-link",
+            ExecMode::TrustedNative,
+        );
+        activate(&fx.ctx, "ws-devops-link");
+        let _ = crate::project_studio::db::init(&fx._data.path().join("projects.db"));
+        let project_id = format!("devops-link-{}", uuid::Uuid::new_v4());
+        let dir = fx._data.path().join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project dir");
+        crate::project_studio::repository::create_project(
+            &project_id,
+            "org-1",
+            &project_id,
+            "",
+            "custom",
+            "[\"knowledge\"]",
+            "project-owner",
+            &dir.to_string_lossy(),
+            &[crate::project_studio::models::MemberInput {
+                user_id: "u-devops-link".into(),
+                functions: vec!["devops".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .expect("project");
+        let link = |linked| {
+            cs(CodeStudioPayload::ProjectLinkSetRequest {
+                workspace_id: "ws-devops-link".into(),
+                project_id: project_id.clone(),
+                linked,
+            })
+        };
+        assert!(code_studio_dispatch(&link(true), &fx.ctx).await.is_ok());
+        assert!(code_studio_dispatch(&link(false), &fx.ctx).await.is_ok());
+        crate::project_studio::repository::set_member_access(
+            &project_id,
+            "u-devops-link",
+            &["pm".into()],
+            false,
+            None,
+        )
+        .expect("PM function");
+        assert_eq!(
+            code_studio_dispatch(&link(true), &fx.ctx)
+                .await
+                .expect_err("settings write alone cannot manage integrations")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        crate::project_studio::repository::set_member_access(
+            &project_id,
+            "u-devops-link",
+            &["devops".into()],
+            false,
+            None,
+        )
+        .expect("DevOps function");
+        crate::project_studio::repository::update_project_modules("org-1", &project_id, "[]")
+            .expect("disable repositories");
+        assert_eq!(
+            code_studio_dispatch(&link(true), &fx.ctx)
+                .await
+                .expect_err("disabled module denies linking")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        crate::project_studio::project_db::close(&project_id);
+        crate::project_studio::repository::delete_project_rows(&project_id)
+            .expect("registry cleanup");
+        release();
     }
 }

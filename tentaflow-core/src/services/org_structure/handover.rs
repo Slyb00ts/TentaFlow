@@ -52,6 +52,7 @@ mod project_work;
 mod record;
 
 pub use due::{run_due, start, DueReport};
+pub(crate) use project_work::{remove_project_member, MemberRemoval};
 
 use advice::Advice;
 use org_items::{DeputyProvider, PositionProvider};
@@ -413,19 +414,23 @@ fn authorize(
                     id: project.to_string(),
                 });
             }
-            match crate::project_studio::repository::effective_role(project, actor.user_id)? {
-                Some(role) if role >= crate::project_studio::models::ProjectRole::Manager => {}
-                Some(_) => {
-                    return Err(E::NotPermitted(
-                        "only a project manager removes a member and hands over",
-                    ))
-                }
-                None => {
-                    return Err(E::NotFound {
-                        entity: "project",
-                        id: project.to_string(),
-                    })
-                }
+            let record = crate::project_studio::repository::get_project(org_id, project)?
+                .ok_or_else(|| E::NotFound {
+                    entity: "project",
+                    id: project.to_string(),
+                })?;
+            let access =
+                crate::project_studio::repository::project_access(&record, actor.user_id, false)?;
+            if !access.has_access {
+                return Err(E::NotFound {
+                    entity: "project",
+                    id: project.to_string(),
+                });
+            }
+            if !access.can_manage_members {
+                return Err(E::NotPermitted(
+                    "only a project administrator removes a member and hands over",
+                ));
             }
         }
         Reason::Absence => {

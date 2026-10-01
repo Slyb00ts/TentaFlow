@@ -12,6 +12,10 @@
 use std::collections::{HashMap, HashSet};
 
 use tentaflow_macros::{handler, observed, policy};
+use tentaflow_protocol::project_studio::access::{
+    ProjectAccessPayload, ProjectAccessWire, ProjectArea, ProjectFunctionWire,
+    ProjectPermissionLevel,
+};
 use tentaflow_protocol::project_studio::{
     ActivityEntry, ArchiveInventoryWire, ArtifactRef, AttachmentWire, BuildProfileWire,
     CaseVersionInfo, ChatInfo, ChatMessageWire, CreatorGrantInfo, CsvImportError, EnvApprovalItem,
@@ -27,9 +31,9 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
 use crate::project_studio::models::{
-    ActivityRecord, CaseListItem, EnvironmentRecord, GenerationRunRecord, IngestJobRecord,
-    ProjectRecord, ProjectRole, RunCounts, RunItemRecord, RunRecord, RunStepRecord, SourceListItem,
-    TaskCommentRecord, TaskRecord,
+    source_write_area, ActivityRecord, CaseListItem, EnvironmentRecord, GenerationRunRecord,
+    IngestJobRecord, MemberInput, ProjectRecord, RunCounts, RunItemRecord, RunRecord,
+    RunStepRecord, SourceListItem, TaskCommentRecord, TaskRecord,
 };
 use crate::project_studio::{
     activity, api_spec, archive, auto_runs, build_profiles, environments, generation, git_source,
@@ -44,8 +48,6 @@ const PERM_READ: &str = "project_studio.read";
 const PERM_ADMIN: &str = "project_studio.admin";
 
 use crate::project_studio::{VALID_MODULES, VALID_TEMPLATES};
-/// Roles grantable through the wire (owner exists only via create/transfer).
-const GRANTABLE_ROLES: &[&str] = &["manager", "editor", "tester", "viewer"];
 /// Agent functions accepted in settings (F1 UI exposes only 'chat').
 const AGENT_FUNCTIONS: &[&str] = &[
     "chat",
@@ -70,10 +72,7 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
 
 const PACKAGE_ID: &str = "projekty";
 
-// App-platform gate (P2.3): availability (installed + enabled instance) and
-// access come from the addon permission matrix — the org-RBAC role strings
-// with the same ids are inert. Per-project roles (owner/manager/editor/
-// tester/viewer) stay app-internal.
+// App availability and project membership are separate grants.
 pub(crate) fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
     super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
@@ -99,7 +98,7 @@ pub(crate) fn has_read(ctx: &HandlerContext) -> bool {
     super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ).is_ok()
 }
 
-fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+fn db_error(scope: &str, error: impl std::fmt::Display) -> ProtocolError {
     tracing::warn!(scope, error = %error, "project studio database error");
     ProtocolError::internal("project studio database error")
 }
@@ -118,52 +117,264 @@ fn not_found() -> ProtocolError {
     ProtocolError::not_found("project not found")
 }
 
-/// Loads the project (org-scoped) and enforces the role gate. Non-members get
-/// NotFound so a project's existence never leaks. `project_studio.admin`
-/// overrides ONLY the viewer tier (inspection outside membership) and the
-/// owner tier (archive/delete/orphan takeover) — content mutations
-/// (tester/editor/manager) always require real membership.
-///
-/// Returns the project record and the caller's membership role (`None` when
-/// the admin override applied).
-fn require_project(
+pub(crate) fn require_project_access(
     ctx: &HandlerContext,
     org: &OrgContext,
     project_id: &str,
-    min: ProjectRole,
-) -> Result<(ProjectRecord, Option<ProjectRole>), ProtocolError> {
+) -> Result<(ProjectRecord, ProjectAccessWire), ProtocolError> {
     project_db::validate_project_id(project_id)
         .map_err(|_| ProtocolError::bad_request("invalid project_id"))?;
     let record = repository::get_project(&org.org_id, project_id)
         .map_err(|e| db_error("get_project", e))?
         .ok_or_else(not_found)?;
-    let role = repository::effective_role(project_id, &org.user_id)
-        .map_err(|e| db_error("member_role", e))?;
-    match role {
-        Some(role) if role >= min => Ok((record, Some(role))),
-        Some(_) if matches!(min, ProjectRole::Owner) && is_admin(ctx) => Ok((record, role)),
-        Some(_) => Err(ProtocolError::new(
+    let access = repository::project_access(&record, &org.user_id, is_admin(ctx))
+        .map_err(|e| db_error("project_access", e))?;
+    if !access.has_access {
+        return Err(not_found());
+    }
+    Ok((record, access))
+}
+
+pub(crate) fn require_project(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    project_id: &str,
+    area: ProjectArea,
+    minimum: ProjectPermissionLevel,
+) -> Result<(ProjectRecord, ProjectAccessWire), ProtocolError> {
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    if !access.allows(area, minimum) {
+        return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            format!("requires project role '{}' or higher", min.slug()),
-        )),
-        None if is_admin(ctx) && matches!(min, ProjectRole::Viewer | ProjectRole::Owner) => {
-            Ok((record, None))
+            "project area access denied",
+        ));
+    }
+    Ok((record, access))
+}
+
+fn require_project_admin(access: &ProjectAccessWire) -> Result<(), ProtocolError> {
+    if !access.can_manage_members {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project administration required",
+        ));
+    }
+    Ok(())
+}
+
+fn task_access(access: &ProjectAccessWire, minimum: ProjectPermissionLevel) -> bool {
+    access.allows(ProjectArea::Tasks, minimum) || access.allows(ProjectArea::Board, minimum)
+}
+
+fn require_task_access(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    project_id: &str,
+    minimum: ProjectPermissionLevel,
+) -> Result<(ProjectRecord, ProjectAccessWire), ProtocolError> {
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    if !task_access(&access, minimum) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project task access denied",
+        ));
+    }
+    Ok((record, access))
+}
+
+fn require_owner(access: &ProjectAccessWire) -> Result<(), ProtocolError> {
+    if !access.is_owner && !access.app_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project ownership required",
+        ));
+    }
+    Ok(())
+}
+
+fn member_inputs(
+    org: &OrgContext,
+    members: &[MemberInputWire],
+    catalogue: &[ProjectFunctionWire],
+) -> Result<Vec<MemberInput>, ProtocolError> {
+    if members.len() > 200 {
+        return Err(ProtocolError::bad_request(
+            "members must contain at most 200 users",
+        ));
+    }
+    let mut seen = HashSet::new();
+    members
+        .iter()
+        .map(|member| {
+            if !member.role.is_empty() {
+                return Err(ProtocolError::bad_request("project roles are unsupported"));
+            }
+            if !seen.insert(&member.user_id) {
+                return Err(ProtocolError::bad_request("duplicate member user_id"));
+            }
+            if !repository::is_org_member(&org.org_id, &member.user_id)
+                .map_err(|e| db_error("is_org_member", e))?
+            {
+                return Err(ProtocolError::bad_request(
+                    "user is not a member of this organization",
+                ));
+            }
+            crate::project_studio::models::validate_member_input(
+                &MemberInput {
+                    user_id: member.user_id.clone(),
+                    functions: member.functions.clone(),
+                    project_admin: member.project_admin,
+                    expires_at: member.expires_at.clone(),
+                },
+                catalogue,
+                chrono::Utc::now(),
+            )
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))
+        })
+        .collect()
+}
+
+fn record_access_mutation(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    project_id: &str,
+    action: &str,
+    object_id: &str,
+    details: &str,
+) {
+    if let Ok(pool) = project_db::open(project_id) {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            action,
+            "member",
+            object_id,
+            details,
+        );
+    }
+    activity::record_org_security(
+        &ctx.state.db,
+        &ctx.state.local_node_id,
+        &org.user_id,
+        &format!("project_studio.{action}"),
+        project_id,
+        details,
+    );
+}
+
+fn access_dispatch(
+    ctx: &HandlerContext,
+    payload: &ProjectAccessPayload,
+) -> Result<MessageBody, ProtocolError> {
+    use ProjectAccessPayload as A;
+    match payload {
+        A::CatalogueGetRequest { project_id } => {
+            let org = require_read(ctx)?;
+            require_project_access(ctx, org, project_id)?;
+            let functions = repository::list_functions(project_id)
+                .map_err(|e| db_error("function_catalogue", e))?;
+            Ok(ps(ProjectStudioPayload::Access(A::CatalogueGetResponse {
+                functions,
+            })))
         }
-        None if is_admin(ctx) => Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "requires project membership",
+        A::FunctionSaveRequest {
+            project_id,
+            function,
+        } => function_save(ctx, project_id, function),
+        A::FunctionDeleteRequest {
+            project_id,
+            function_id,
+        } => function_delete(ctx, project_id, function_id),
+        A::MemberAccessSetRequest {
+            project_id,
+            user_id,
+            functions,
+            project_admin,
+            expires_at,
+        } => member_access_set(
+            ctx,
+            project_id,
+            user_id,
+            functions,
+            *project_admin,
+            expires_at.as_deref(),
+        ),
+        _ => Err(ProtocolError::bad_request(
+            "expected project access request",
         )),
-        None => Err(not_found()),
     }
 }
 
-fn parse_role(role: &str) -> Result<ProjectRole, ProtocolError> {
-    ProjectRole::from_slug(role)
-        .ok_or_else(|| ProtocolError::bad_request(format!("unknown role '{role}'")))
+fn function_save(
+    ctx: &HandlerContext,
+    project_id: &str,
+    function: &ProjectFunctionWire,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_project_admin(&access)?;
+    require_active(&record)?;
+    let catalogue =
+        repository::list_functions(project_id).map_err(|e| db_error("function_catalogue", e))?;
+    let ok = repository::save_function(project_id, function)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if ok {
+        let before = catalogue
+            .iter()
+            .find(|old| old.function_id == function.function_id);
+        let after = repository::list_functions(project_id)
+            .map_err(|e| db_error("function_catalogue", e))?
+            .into_iter()
+            .find(|saved| saved.function_id == function.function_id);
+        record_access_mutation(
+            ctx,
+            org,
+            project_id,
+            "function.saved",
+            &function.function_id,
+            &serde_json::json!({ "before": before, "after": after }).to_string(),
+        );
+        spawn_ml_permission_sync(project_id);
+    }
+    Ok(ps(ProjectStudioPayload::Access(
+        ProjectAccessPayload::FunctionSaveResult { ok },
+    )))
+}
+
+fn function_delete(
+    ctx: &HandlerContext,
+    project_id: &str,
+    function_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_project_admin(&access)?;
+    require_active(&record)?;
+    let before = repository::list_functions(project_id)
+        .map_err(|e| db_error("function_catalogue", e))?
+        .into_iter()
+        .find(|function| function.function_id == function_id);
+    let ok = repository::delete_function(project_id, function_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if ok {
+        record_access_mutation(
+            ctx,
+            org,
+            project_id,
+            "function.deleted",
+            function_id,
+            &serde_json::json!({ "before": before }).to_string(),
+        );
+        spawn_ml_permission_sync(project_id);
+    }
+    Ok(ps(ProjectStudioPayload::Access(
+        ProjectAccessPayload::FunctionDeleteResult { ok },
+    )))
 }
 
 /// Archived projects are read-only: every mutation handler short-circuits
-/// here right after the role gate. Only reads, unarchive (ProjectArchive)
+/// here right after the access gate. Only reads, unarchive (ProjectArchive)
 /// and ProjectDelete skip this check.
 fn require_active(record: &ProjectRecord) -> Result<(), ProtocolError> {
     if record.status == "archived" {
@@ -221,9 +432,6 @@ fn parse_modules_json(modules_json: &str) -> Vec<String> {
 }
 
 /// Validates a client-supplied module list into the canonical registry form.
-/// `knowledge` is re-added when the client omits it: every other module reads
-/// project knowledge (chat context, generation, agents), and the wizard also
-/// keeps it locked on, so a project without it would be unusable.
 fn normalize_modules(modules: &[String]) -> Result<Vec<String>, ProtocolError> {
     let mut out: Vec<String> = Vec::with_capacity(modules.len() + 1);
     for module in modules {
@@ -235,9 +443,6 @@ fn normalize_modules(modules: &[String]) -> Result<Vec<String>, ProtocolError> {
         if !out.iter().any(|m| m == module) {
             out.push(module.clone());
         }
-    }
-    if !out.iter().any(|m| m == "knowledge") {
-        out.insert(0, "knowledge".to_string());
     }
     Ok(out)
 }
@@ -312,12 +517,17 @@ fn activity_to_wire(
 /// Builds the full `ProjectInfo` for one record (list + detail views).
 fn project_info(
     record: &ProjectRecord,
-    my_role: Option<String>,
+    access: ProjectAccessWire,
     owner_names: &HashMap<String, (String, String)>,
 ) -> Result<ProjectInfo, ProtocolError> {
     let member_count =
         repository::member_count(&record.project_id).map_err(|e| db_error("member_count", e))?;
-    let (source_count, sources_ready) = repository::read_source_counts(&record.dir_path);
+    let (source_count, sources_ready) =
+        if access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read) {
+            repository::read_source_counts(&record.dir_path)
+        } else {
+            (0, 0)
+        };
     Ok(ProjectInfo {
         project_id: record.project_id.clone(),
         name: record.name.clone(),
@@ -333,7 +543,8 @@ fn project_info(
         member_count,
         source_count,
         sources_ready,
-        my_role,
+        my_role: None,
+        access,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
     })
@@ -357,6 +568,7 @@ pub async fn project_studio_dispatch(
 
     use ProjectStudioPayload as P;
     match payload {
+        P::Access(access) => access_dispatch(ctx, access),
         P::ProjectsListRequest { include_archived } => projects_list_v1(ctx, *include_archived),
         P::ProjectCreateRequest {
             name,
@@ -390,7 +602,12 @@ pub async fn project_studio_dispatch(
             project_id,
             user_id,
             role,
-        } => member_role_set_v1(ctx, project_id, user_id, role),
+        } => {
+            let _ = (project_id, user_id, role);
+            Err(ProtocolError::bad_request(
+                "project roles are unsupported; use member access",
+            ))
+        }
         P::MemberRemoveRequest {
             project_id,
             user_id,
@@ -1709,6 +1926,23 @@ register_project_studio_variant!(
     "tentaflow_ws_handler_ps_project_import_status"
 );
 
+register_project_studio_variant!(
+    "ProjectStudioCatalogueGetRequest",
+    "tentaflow_ws_handler_ps_catalogue_get"
+);
+register_project_studio_variant!(
+    "ProjectStudioFunctionSaveRequest",
+    "tentaflow_ws_handler_ps_function_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioFunctionDeleteRequest",
+    "tentaflow_ws_handler_ps_function_delete"
+);
+register_project_studio_variant!(
+    "ProjectStudioMemberAccessSetRequest",
+    "tentaflow_ws_handler_ps_member_access_set"
+);
+
 // =============================================================================
 // Registry: list / create / get / update / archive / delete
 // =============================================================================
@@ -1721,20 +1955,21 @@ fn projects_list_v1(
     let admin = is_admin(ctx);
     let records = repository::list_projects(&org.org_id, include_archived)
         .map_err(|e| db_error("projects_list", e))?;
-    let my_roles =
-        repository::member_roles_for_user(&org.user_id).map_err(|e| db_error("member_roles", e))?;
+    let memberships = repository::member_accesses_for_user(&org.user_id)
+        .map_err(|e| db_error("member_accesses", e))?;
 
     let visible: Vec<&ProjectRecord> = records
         .iter()
-        .filter(|r| admin || my_roles.contains_key(&r.project_id))
+        .filter(|r| admin || memberships.contains_key(&r.project_id))
         .collect();
     let owner_ids: Vec<String> = visible.iter().map(|r| r.owner_user_id.clone()).collect();
     let names = repository::resolve_user_refs(&owner_ids);
 
     let mut projects = Vec::with_capacity(visible.len());
     for record in visible {
-        let my_role = my_roles.get(&record.project_id).cloned();
-        projects.push(project_info(record, my_role, &names)?);
+        let access = repository::project_access(record, &org.user_id, admin)
+            .map_err(|e| db_error("project_access", e))?;
+        projects.push(project_info(record, access, &names)?);
     }
 
     let can_create = admin
@@ -1743,6 +1978,7 @@ fn projects_list_v1(
     Ok(ps(ProjectStudioPayload::ProjectsListResponse {
         projects,
         can_create,
+        can_administer: admin,
     }))
 }
 
@@ -1781,24 +2017,8 @@ fn project_create_v1(
             )));
         }
     }
-    let mut initial: Vec<(String, String)> = Vec::with_capacity(members.len());
-    for m in members {
-        if !GRANTABLE_ROLES.contains(&m.role.as_str()) {
-            return Err(ProtocolError::bad_request(format!(
-                "role '{}' cannot be granted",
-                m.role
-            )));
-        }
-        if !repository::is_org_member(&org.org_id, &m.user_id)
-            .map_err(|e| db_error("is_org_member", e))?
-        {
-            return Err(ProtocolError::bad_request(format!(
-                "user '{}' is not a member of this organization",
-                m.user_id
-            )));
-        }
-        initial.push((m.user_id.clone(), m.role.clone()));
-    }
+    let catalogue = crate::project_studio::models::default_project_functions();
+    let initial = member_inputs(org, members, &catalogue)?;
 
     let project_id = uuid::Uuid::new_v4().to_string();
     let dir = crate::project_studio::project_dir(&project_id);
@@ -1809,8 +2029,8 @@ fn project_create_v1(
         return Err(db_error("project_db.create", e));
     }
 
-    let modules_json =
-        serde_json::to_string(modules).unwrap_or_else(|_| "[\"knowledge\",\"chat\"]".to_string());
+    let modules_json = serde_json::to_string(&normalize_modules(modules)?)
+        .map_err(|e| ProtocolError::internal(format!("modules serialize: {e}")))?;
     if let Err(e) = repository::create_project(
         &project_id,
         &org.org_id,
@@ -1859,9 +2079,9 @@ fn project_create_v1(
 
 fn project_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, my_role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, my_access) = require_project_access(ctx, org, project_id)?;
     let names = repository::resolve_user_refs(std::slice::from_ref(&record.owner_user_id));
-    let project = project_info(&record, my_role.map(|r| r.slug().to_string()), &names)?;
+    let project = project_info(&record, my_access, &names)?;
     Ok(ps(ProjectStudioPayload::ProjectGetResponse { project }))
 }
 
@@ -1872,7 +2092,13 @@ fn project_update_v1(
     description: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 200 {
@@ -1909,7 +2135,8 @@ fn project_archive_v1(
     archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
+    let (_record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
     // Record while the pool may still be open; archiving closes it afterwards.
     if let Ok(pool) = project_db::open(project_id) {
         activity::record(
@@ -1939,22 +2166,53 @@ async fn project_delete_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
 
-    // 1. Stop running ingest jobs so nothing keeps writing into the files
-    //    that are about to disappear, and WAIT until each reaches a terminal
-    //    status — cancel is cooperative, deleting under a live job would race
-    //    its writes. A failed open means the directory is already gone
-    //    (retried delete) — nothing can be running then.
-    if let Ok(pool) = project_db::open(project_id) {
-        if let Ok(jobs) = repository::running_jobs(&pool) {
-            let ids: Vec<String> = jobs.into_iter().map(|(job_id, _)| job_id).collect();
-            for job_id in &ids {
-                ingest::signal_cancel(job_id);
-            }
-            wait_for_jobs_terminal(&pool, &ids).await?;
+    let content_pool = if std::path::Path::new(&record.dir_path)
+        .join("project.db")
+        .is_file()
+    {
+        Some(project_db::open(project_id).map_err(|e| db_error("project_storage", e))?)
+    } else {
+        let central =
+            crate::project_studio::db::pool().map_err(|e| db_error("project_registry", e))?;
+        let conn = central
+            .read()
+            .map_err(|e| db_error("project_registry", e))?;
+        let mirrored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_ml_grants WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| db_error("project_ml_grants", e))?;
+        if mirrored > 0 {
+            return Err(ProtocolError::internal(
+                "project storage missing; mirrored ML grants cannot be revoked",
+            ));
+        }
+        None
+    };
+    if let Some(pool) = content_pool.as_ref() {
+        let ids = repository::running_jobs(pool)
+            .map_err(|e| db_error("running_jobs", e))?
+            .into_iter()
+            .map(|(job_id, _)| job_id)
+            .collect::<Vec<_>>();
+        for job_id in &ids {
+            ingest::signal_cancel(job_id);
+        }
+        wait_for_jobs_terminal(pool, &ids).await?;
+    }
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
+    if let Some(pool) = content_pool.as_ref() {
+        for link in ml_link::list(pool).map_err(|e| db_error("ml_links", e))? {
+            ml_link::detach(pool, project_id, &link, true).map_err(|e| db_error("ml_revoke", e))?;
         }
     }
+    drop(content_pool);
     // 2. Drop the cached pool (checkpoint + release the SQLite handle).
     project_db::close(project_id);
     // 3. Drop every vector namespace of the `ps-<id>` scope (registry rows in
@@ -1999,32 +2257,41 @@ async fn project_delete_v1(
 
 fn members_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     let rows = repository::list_members(project_id).map_err(|e| db_error("members_list", e))?;
     let mut ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
     ids.extend(rows.iter().map(|m| m.invited_by.clone()));
     let names = repository::resolve_user_refs(&ids);
     let members = rows
         .into_iter()
-        .map(|m| MemberInfo {
-            display_name: names
-                .get(&m.user_id)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_else(|| m.user_id.clone()),
-            email: names
-                .get(&m.user_id)
-                .map(|(_, e)| e.clone())
-                .unwrap_or_default(),
-            invited_by_name: names
-                .get(&m.invited_by)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_else(|| m.invited_by.clone()),
-            user_id: m.user_id,
-            role: m.role,
-            invited_by: m.invited_by,
-            created_at: m.created_at,
+        .map(|m| -> Result<MemberInfo, ProtocolError> {
+            Ok(MemberInfo {
+                display_name: names
+                    .get(&m.user_id)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_else(|| m.user_id.clone()),
+                email: names
+                    .get(&m.user_id)
+                    .map(|(_, e)| e.clone())
+                    .unwrap_or_default(),
+                invited_by_name: names
+                    .get(&m.invited_by)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_else(|| m.invited_by.clone()),
+                access: repository::project_access(&record, &m.user_id, false)
+                    .map_err(|e| db_error("member_access", e))?,
+                is_owner: record.owner_user_id == m.user_id,
+                active: m.is_active(),
+                functions: m.functions,
+                project_admin: m.project_admin,
+                expires_at: m.expires_at,
+                user_id: m.user_id,
+                role: String::new(),
+                invited_by: m.invited_by,
+                created_at: m.created_at,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ps(ProjectStudioPayload::MembersListResponse { members }))
 }
 
@@ -2038,7 +2305,8 @@ fn member_candidates_v1(
     let exclude: HashSet<String> = match project_id {
         Some(project_id) => {
             // Invite modal — manager+ of the target project.
-            let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+            let (_record, access) = require_project_access(ctx, org, project_id)?;
+            require_project_admin(&access)?;
             repository::list_members(project_id)
                 .map_err(|e| db_error("members_list", e))?
                 .into_iter()
@@ -2084,124 +2352,78 @@ fn members_add_v1(
     members: &[MemberInputWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_project_admin(&access)?;
     require_active(&record)?;
-    let acting = role.expect("manager gate never yields admin override");
+    let catalogue =
+        repository::list_functions(project_id).map_err(|e| db_error("function_catalogue", e))?;
     if members.is_empty() {
         return Err(ProtocolError::bad_request("no members to add"));
     }
-    let mut to_add: Vec<(String, String)> = Vec::with_capacity(members.len());
-    for m in members {
-        if !GRANTABLE_ROLES.contains(&m.role.as_str()) {
-            return Err(ProtocolError::bad_request(format!(
-                "role '{}' cannot be granted",
-                m.role
-            )));
-        }
-        // A manager may only grant roles below manager; granting manager is
-        // reserved for the owner.
-        if m.role == "manager" && acting != ProjectRole::Owner {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PolicyDenied,
-                "only the owner may grant the manager role",
-            ));
-        }
-        if !repository::is_org_member(&org.org_id, &m.user_id)
-            .map_err(|e| db_error("is_org_member", e))?
-        {
-            return Err(ProtocolError::bad_request(format!(
-                "user '{}' is not a member of this organization",
-                m.user_id
-            )));
-        }
-        to_add.push((m.user_id.clone(), m.role.clone()));
-    }
+    let to_add = member_inputs(org, members, &catalogue)?;
     let added = repository::add_members(project_id, &to_add, &org.user_id)
         .map_err(|e| db_error("members_add", e))?;
     if added > 0 {
-        if let Ok(pool) = project_db::open(project_id) {
-            activity::record(
-                &pool,
-                &org.user_id,
-                "user",
-                "member.added",
-                "member",
-                "",
-                &serde_json::json!({ "count": added }).to_string(),
-            );
-        }
-        activity::record_org_security(
-            &ctx.state.db,
-            &ctx.state.local_node_id,
-            &org.user_id,
-            "project_studio.member.added",
+        record_access_mutation(
+            ctx,
+            org,
             project_id,
-            &format!("{added} member(s)"),
+            "member.added",
+            "",
+            &serde_json::json!({ "count": added }).to_string(),
         );
         spawn_ml_permission_sync(project_id);
     }
     Ok(ps(ProjectStudioPayload::MembersAddResponse { added }))
 }
 
-fn member_role_set_v1(
+fn member_access_set(
     ctx: &HandlerContext,
     project_id: &str,
     user_id: &str,
-    role: &str,
+    functions: &[String],
+    project_admin: bool,
+    expires_at: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, acting) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_project_admin(&access)?;
     require_active(&record)?;
-    let acting = acting.expect("manager gate never yields admin override");
-    let new_role = parse_role(role)?;
-    if new_role == ProjectRole::Owner {
-        return Err(ProtocolError::bad_request(
-            "owner role is assigned only via ownership transfer",
-        ));
-    }
-    let target = repository::effective_role(project_id, user_id)
-        .map_err(|e| db_error("member_role", e))?
+    let catalogue =
+        repository::list_functions(project_id).map_err(|e| db_error("function_catalogue", e))?;
+    let before = repository::member_access(project_id, user_id)
+        .map_err(|e| db_error("member_access", e))?
         .ok_or_else(|| ProtocolError::not_found("member not found"))?;
-    if target == ProjectRole::Owner {
-        return Err(ProtocolError::bad_request(
-            "transfer ownership before changing the owner's role",
-        ));
-    }
-    // A manager operates strictly below the manager tier: may neither touch
-    // another manager nor promote anyone to manager.
-    if acting != ProjectRole::Owner
-        && (target >= ProjectRole::Manager || new_role >= ProjectRole::Manager)
-    {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "only the owner may manage manager roles",
-        ));
-    }
-    let ok = repository::set_member_role(project_id, user_id, new_role.slug())
-        .map_err(|e| db_error("member_role_set", e))?;
+    let input = crate::project_studio::models::validate_member_input(
+        &MemberInput {
+            user_id: user_id.to_string(),
+            functions: functions.to_vec(),
+            project_admin,
+            expires_at: expires_at.map(str::to_string),
+        },
+        &catalogue,
+        chrono::Utc::now(),
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let ok = repository::set_member_access(
+        project_id,
+        user_id,
+        &input.functions,
+        input.project_admin,
+        input.expires_at.as_deref(),
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     if ok {
-        if let Ok(pool) = project_db::open(project_id) {
-            activity::record(
-                &pool,
-                &org.user_id,
-                "user",
-                "member.role_changed",
-                "member",
-                user_id,
-                &serde_json::json!({ "role": new_role.slug() }).to_string(),
-            );
-        }
-        activity::record_org_security(
-            &ctx.state.db,
-            &ctx.state.local_node_id,
-            &org.user_id,
-            "project_studio.member.role_changed",
-            project_id,
-            &format!("{user_id} -> {}", new_role.slug()),
-        );
+        record_access_mutation(ctx, org, project_id, "member.access_changed", user_id,
+            &serde_json::json!({
+                "before": { "functions": before.functions, "project_admin": before.project_admin, "expires_at": before.expires_at },
+                "after": { "functions": input.functions, "project_admin": input.project_admin, "expires_at": input.expires_at }
+            }).to_string());
         spawn_ml_permission_sync(project_id);
     }
-    Ok(ps(ProjectStudioPayload::MemberRoleSetResult { ok }))
+    Ok(ps(ProjectStudioPayload::Access(
+        ProjectAccessPayload::MemberAccessSetResult { ok },
+    )))
 }
 
 fn member_remove_v1(
@@ -2210,49 +2432,35 @@ fn member_remove_v1(
     user_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, acting) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_project_admin(&access)?;
     require_active(&record)?;
-    let acting = acting.expect("manager gate never yields admin override");
-    let target = repository::effective_role(project_id, user_id)
-        .map_err(|e| db_error("member_role", e))?
+    repository::member_access(project_id, user_id)
+        .map_err(|e| db_error("member_access", e))?
         .ok_or_else(|| ProtocolError::not_found("member not found"))?;
-    if target == ProjectRole::Owner {
-        return Err(ProtocolError::bad_request(
-            "the owner cannot be removed — transfer ownership first",
-        ));
-    }
-    if acting != ProjectRole::Owner && target >= ProjectRole::Manager {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "only the owner may remove a manager",
-        ));
-    }
-    let ok =
-        repository::remove_member(project_id, user_id).map_err(|e| db_error("member_remove", e))?;
-    if ok {
-        if let Ok(pool) = project_db::open(project_id) {
-            activity::record(
-                &pool,
+    use crate::services::org_structure::handover::{remove_project_member, MemberRemoval};
+    let outcome = remove_project_member(&org.org_id, project_id, user_id, &org.user_id, "{}")
+        .map_err(|e| ProtocolError::internal(e.to_string()))?;
+    match outcome {
+        MemberRemoval::Owner => Err(ProtocolError::bad_request(
+            "transfer ownership before removing the owner",
+        )),
+        MemberRemoval::HoldsWork => Err(ProtocolError::bad_request(
+            "member still holds work; use project removal handover",
+        )),
+        MemberRemoval::Missing => Ok(ps(ProjectStudioPayload::MemberRemoveResult { ok: false })),
+        MemberRemoval::Removed => {
+            activity::record_org_security(
+                &ctx.state.db,
+                &ctx.state.local_node_id,
                 &org.user_id,
-                "user",
-                "member.removed",
-                "member",
+                "project_studio.member.removed",
+                project_id,
                 user_id,
-                "{}",
             );
+            Ok(ps(ProjectStudioPayload::MemberRemoveResult { ok: true }))
         }
-        activity::record_org_security(
-            &ctx.state.db,
-            &ctx.state.local_node_id,
-            &org.user_id,
-            "project_studio.member.removed",
-            project_id,
-            user_id,
-        );
-        // Losing project membership revokes the mirrored ML access immediately.
-        spawn_ml_permission_sync(project_id);
     }
-    Ok(ps(ProjectStudioPayload::MemberRemoveResult { ok }))
 }
 
 fn ownership_transfer_v1(
@@ -2263,14 +2471,16 @@ fn ownership_transfer_v1(
     let org = require_read(ctx)?;
     // Owner tier: the owner themselves, or an org admin taking over an
     // orphaned project.
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
     require_active(&record)?;
     if new_owner_user_id == record.owner_user_id {
         return Err(ProtocolError::bad_request("user is already the owner"));
     }
-    repository::effective_role(project_id, new_owner_user_id)
-        .map_err(|e| db_error("member_role", e))?
-        .ok_or_else(|| ProtocolError::bad_request("new owner must be a project member"))?;
+    repository::member_access(project_id, new_owner_user_id)
+        .map_err(|e| db_error("member_access", e))?
+        .filter(|member| member.is_active())
+        .ok_or_else(|| ProtocolError::bad_request("new owner must be an active project member"))?;
     repository::transfer_ownership(project_id, &record.owner_user_id, new_owner_user_id)
         .map_err(|e| db_error("ownership_transfer", e))?;
     if let Ok(pool) = project_db::open(project_id) {
@@ -2362,7 +2572,13 @@ fn creator_grant_set_v1(
 
 fn sources_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let items = repository::list_sources(&pool).map_err(|e| db_error("sources_list", e))?;
     let ids: Vec<String> = items.iter().map(|i| i.record.created_by.clone()).collect();
@@ -2386,9 +2602,21 @@ async fn source_upload_chunk_v1(
     bytes: &[u8],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    // Tester tier (not editor): testers upload screenshots as run/step/task
-    // attachments through this same chunked endpoint (section C).
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    if !access.can_create_tasks
+        && ![
+            ProjectArea::Knowledge,
+            ProjectArea::Repos,
+            ProjectArea::Tests,
+        ]
+        .iter()
+        .any(|area| access.allows(*area, ProjectPermissionLevel::Write))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "attachment upload access denied",
+        ));
+    }
     require_active(&record)?;
 
     let org_id = org.org_id.clone();
@@ -2501,7 +2729,13 @@ async fn source_create_v1(
     file_refs: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(kind),
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     match kind {
         "document" | "url" => {}
@@ -2613,7 +2847,7 @@ fn source_update_v1(
     config_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 200 {
@@ -2626,6 +2860,13 @@ fn source_update_v1(
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
         .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
 
     // `config_json` is echoed back to every viewer by the source list, so a
     // credential must never land in it: for a git source the token is split off
@@ -2640,6 +2881,13 @@ fn source_update_v1(
         git_source::parse_config(&clean_config)
             .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
         if !token.is_empty() {
+            require_project(
+                ctx,
+                org,
+                project_id,
+                ProjectArea::Settings,
+                ProjectPermissionLevel::Write,
+            )?;
             let secret_enc = ctx
                 .state
                 .settings_cipher
@@ -2726,12 +2974,19 @@ async fn source_delete_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
         .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
 
     // Stop any running job of this source and wait for it to reach a
     // terminal status before ripping its data out — cancel is cooperative
@@ -2746,6 +3001,13 @@ async fn source_delete_v1(
         }
     }
     wait_for_jobs_terminal(&pool, &source_jobs).await?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
 
     let files = repository::files_for_ingest(&pool, source_id, None)
         .map_err(|e| db_error("files_for_ingest", e))?;
@@ -2813,12 +3075,19 @@ fn source_reingest_v1(
     file_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
         .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
     let job_id = spawn_ingest_job(
         ctx,
         org,
@@ -2847,7 +3116,7 @@ fn ingest_cancel_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     // Job must belong to THIS project's database — the registry is
@@ -2856,6 +3125,16 @@ fn ingest_cancel_v1(
     let job = repository::get_ingest_job(&pool, job_id)
         .map_err(|e| db_error("get_job", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
+    let source = repository::get_source(&pool, &job.source_id)
+        .map_err(|e| db_error("get_source", e))?
+        .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
     let ok = if job.finished_at.is_some() {
         false
     } else {
@@ -2870,7 +3149,13 @@ fn ingest_status_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let job = repository::get_ingest_job(&pool, job_id)
         .map_err(|e| db_error("get_job", e))?
@@ -2893,7 +3178,13 @@ fn source_files_list_v1(
     filter: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 500);
     let (rows, total) = repository::list_source_files(&pool, source_id, offset, limit, filter)
@@ -2928,12 +3219,22 @@ async fn source_file_delete_v1(
     file_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let file = repository::get_source_file(&pool, file_id)
         .map_err(|e| db_error("get_file", e))?
         .ok_or_else(|| ProtocolError::not_found("file not found"))?;
+    let source = repository::get_source(&pool, &file.source_id)
+        .map_err(|e| db_error("get_source", e))?
+        .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
 
     {
         let core_db = ctx.state.db.clone();
@@ -2980,7 +3281,13 @@ async fn source_file_preview_v1(
     max_bytes: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let file = repository::get_source_file(&pool, file_id)
         .map_err(|e| db_error("get_file", e))?
@@ -3045,7 +3352,13 @@ async fn kb_search_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let query = query.trim();
     if query.is_empty() {
         return Err(ProtocolError::bad_request("query is required"));
@@ -3055,6 +3368,13 @@ async fn kb_search_v1(
     let vectors = ingest::embed_texts(&ctx.state.router, vec![query.to_string()])
         .await
         .map_err(|e| ProtocolError::internal(format!("query embedding: {e}")))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let query_vec = vectors
         .into_iter()
         .next()
@@ -3158,9 +3478,27 @@ async fn kb_search_v1(
 // Overview + activity
 // =============================================================================
 
+fn activity_visible(entry: &ActivityRecord, access: &ProjectAccessWire, user_id: &str) -> bool {
+    let area = match entry.object_type.as_str() {
+        "chat" => {
+            return entry.actor_user_id == user_id
+                && access.allows(ProjectArea::Chat, ProjectPermissionLevel::Read)
+        }
+        "task" | "task_comment" => return task_access(access, ProjectPermissionLevel::Read),
+        "case" | "test_case" | "suite" | "run" | "run_item" | "run_step" | "generation"
+        | "schedule" => ProjectArea::Tests,
+        "environment" => ProjectArea::Environments,
+        "build_profile" => ProjectArea::Repos,
+        "source" | "file" | "ingest_job" | "ml_link" => ProjectArea::Knowledge,
+        "project" | "settings" | "member" | "tag" => ProjectArea::Settings,
+        _ => return false,
+    };
+    access.allows(area, ProjectPermissionLevel::Read)
+}
+
 fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, access) = require_project_access(ctx, org, project_id)?;
     let pool = open_project_pool(project_id)?;
     // Automated runs orphaned by a restart would otherwise be counted as open
     // forever — reconcile before reading the counters.
@@ -3174,33 +3512,50 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
         repository::member_count(project_id).map_err(|e| db_error("member_count", e))?;
     let my_chat_count =
         repository::count_chats(project_id, &org.user_id).map_err(|e| db_error("chat_count", e))?;
-    let (entries, _has_more) =
+    let (mut entries, _has_more) =
         repository::list_activity(&pool, None, 20).map_err(|e| db_error("activity", e))?;
+    entries.retain(|entry| activity_visible(entry, &access, &org.user_id));
+    let knowledge = access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read);
+    let tests = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Read);
+    let tasks = task_access(&access, ProjectPermissionLevel::Read);
+    let environments = access.allows(ProjectArea::Environments, ProjectPermissionLevel::Read);
     let ids: Vec<String> = entries.iter().map(|e| e.actor_user_id.clone()).collect();
     let names = repository::resolve_user_refs(&ids);
     Ok(ps(ProjectStudioPayload::OverviewResponse {
         kpis: OverviewKpis {
-            sources_total: kpis.sources_total,
-            sources_ready: kpis.sources_ready,
-            files_total: kpis.files_total,
-            chunks_total: kpis.chunks_total,
+            sources_total: if knowledge { kpis.sources_total } else { 0 },
+            sources_ready: if knowledge { kpis.sources_ready } else { 0 },
+            files_total: if knowledge { kpis.files_total } else { 0 },
+            chunks_total: if knowledge { kpis.chunks_total } else { 0 },
             member_count,
-            open_ingest_jobs: kpis.open_ingest_jobs,
-            my_chat_count,
-            cases_total: f2.cases_total,
-            cases_approved: f2.cases_approved,
-            suites_total: f2.suites_total,
-            runs_open: f2.runs_open,
-            my_run_items_pending: f2.my_run_items_pending,
-            tasks_open: f2.tasks_open,
-            defects_open: f2.defects_open,
-            generations_running: f2.generations_running,
-            environments_approved: f3.environments_approved,
-            environments_pending: f3.environments_pending,
-            auto_runs_open: f3.auto_runs_open,
-            schedules_enabled: f4.schedules_enabled,
-            schedules_blocked: f4.schedules_blocked,
-            ml_links: f4.ml_links,
+            open_ingest_jobs: if knowledge { kpis.open_ingest_jobs } else { 0 },
+            my_chat_count: if access.allows(ProjectArea::Chat, ProjectPermissionLevel::Read) {
+                my_chat_count
+            } else {
+                0
+            },
+            cases_total: if tests { f2.cases_total } else { 0 },
+            cases_approved: if tests { f2.cases_approved } else { 0 },
+            suites_total: if tests { f2.suites_total } else { 0 },
+            runs_open: if tests { f2.runs_open } else { 0 },
+            my_run_items_pending: if tests { f2.my_run_items_pending } else { 0 },
+            tasks_open: if tasks { f2.tasks_open } else { 0 },
+            defects_open: if tasks { f2.defects_open } else { 0 },
+            generations_running: if tests { f2.generations_running } else { 0 },
+            environments_approved: if environments {
+                f3.environments_approved
+            } else {
+                0
+            },
+            environments_pending: if environments {
+                f3.environments_pending
+            } else {
+                0
+            },
+            auto_runs_open: if tests { f3.auto_runs_open } else { 0 },
+            schedules_enabled: if tests { f4.schedules_enabled } else { 0 },
+            schedules_blocked: if tests { f4.schedules_blocked } else { 0 },
+            ml_links: if knowledge { f4.ml_links } else { 0 },
         },
         activity: activity_to_wire(entries, &names),
     }))
@@ -3213,11 +3568,12 @@ fn activity_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, access) = require_project_access(ctx, org, project_id)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
-    let (entries, has_more) = repository::list_activity(&pool, before_id, limit)
+    let (mut entries, has_more) = repository::list_activity(&pool, before_id, limit)
         .map_err(|e| db_error("activity_list", e))?;
+    entries.retain(|entry| activity_visible(entry, &access, &org.user_id));
     let ids: Vec<String> = entries.iter().map(|e| e.actor_user_id.clone()).collect();
     let names = repository::resolve_user_refs(&ids);
     Ok(ps(ProjectStudioPayload::ActivityListResponse {
@@ -3242,7 +3598,13 @@ fn chat_to_wire(chat: crate::project_studio::models::ChatRecord) -> ChatInfo {
 
 fn chats_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Read,
+    )?;
     let rows =
         repository::list_chats(project_id, &org.user_id).map_err(|e| db_error("chats_list", e))?;
     // Previews come from conversation_messages in the CORE db by session_id.
@@ -3277,16 +3639,14 @@ fn chat_create_v1(
     title: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    // Chats are personal rows keyed by the caller — an org admin inspecting a
-    // foreign project (role None) must not create content in it.
-    if role.is_none() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "requires project membership",
-        ));
-    }
     let title = title.trim();
     let title = if title.is_empty() { "Nowy czat" } else { title };
     let chat = repository::create_chat(project_id, &org.user_id, title)
@@ -3303,7 +3663,13 @@ fn chat_rename_v1(
     title: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let title = title.trim();
     if title.is_empty() {
@@ -3320,7 +3686,13 @@ fn chat_delete_v1(
     chat_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let ok = repository::delete_chat(project_id, chat_id, &org.user_id)
         .map_err(|e| db_error("chat_delete", e))?;
@@ -3335,7 +3707,13 @@ fn chat_history_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Chat,
+        ProjectPermissionLevel::Read,
+    )?;
     // Ownership check is part of the lookup: another user's chat_id yields
     // NotFound, never someone else's history.
     let chat = repository::get_chat(project_id, chat_id, &org.user_id)
@@ -3397,7 +3775,13 @@ fn chat_history_v1(
 
 fn settings_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
 
     let agents_map: HashMap<String, String> = repository::get_setting(&pool, "agents")
@@ -3452,7 +3836,13 @@ fn settings_save_v1(
     graph_extraction: Option<bool>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
 
@@ -3566,7 +3956,13 @@ fn tag_save_v1(
     name: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 100 {
@@ -3593,7 +3989,13 @@ fn tag_delete_v1(
     tag_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = repository::delete_tag(&pool, tag_id).map_err(|e| db_error("tag_delete", e))?;
@@ -3973,7 +4375,13 @@ fn cases_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     let filters = ps_tests::CaseFilters {
@@ -3999,7 +4407,13 @@ fn case_get_v1(
     include_versions: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let item = ps_tests::get_case(&pool, case_id)
         .map_err(|e| db_error("case_get", e))?
@@ -4098,7 +4512,13 @@ fn case_save_v1(
     change_note: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let language = case_language(kind, content_json);
     validate_case_fields(kind, &language, title, priority, content_json)?;
@@ -4174,7 +4594,7 @@ fn case_save_v1(
 /// disallowed for this case/caller (bulk skips, single errors).
 fn apply_status_transition(
     pool: &crate::db::DbPool,
-    role: ProjectRole,
+    access: &ProjectAccessWire,
     case_id: &str,
     target: &str,
     reason: &str,
@@ -4183,11 +4603,11 @@ fn apply_status_transition(
         return Ok(Err("case not found"));
     };
     let from = item.record.status.as_str();
-    let Some((min_role, needs_reason)) = ps_tests::transition_requirement(from, target) else {
+    let Some((minimum, needs_reason)) = ps_tests::transition_requirement(from, target) else {
         return Ok(Err("transition not allowed"));
     };
-    if role < min_role {
-        return Ok(Err("requires a higher project role"));
+    if !access.allows(ProjectArea::Tests, minimum) {
+        return Ok(Err("requires test administration"));
     }
     if needs_reason && reason.trim().is_empty() {
         return Ok(Err("a reason is required for this downgrade"));
@@ -4205,22 +4625,27 @@ fn case_status_set_v1(
     reason: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    let role = role.expect("editor gate never yields admin override");
     if !ps_tests::CASE_STATUSES.contains(&status) {
         return Err(ProtocolError::bad_request(format!(
             "unknown status '{status}'"
         )));
     }
     let pool = open_project_pool(project_id)?;
-    let ok = match apply_status_transition(&pool, role, case_id, status, reason)? {
+    let ok = match apply_status_transition(&pool, &access, case_id, status, reason)? {
         Ok(ok) => ok,
         Err("case not found") => return Err(ProtocolError::not_found("case not found")),
-        Err("requires a higher project role") => {
+        Err("requires test administration") => {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::PolicyDenied,
-                "this transition requires a higher project role",
+                "this transition requires test administration",
             ))
         }
         Err(message) => return Err(ProtocolError::bad_request(message)),
@@ -4247,9 +4672,14 @@ fn cases_bulk_status_v1(
     reason: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    let role = role.expect("editor gate never yields admin override");
     if !ps_tests::CASE_STATUSES.contains(&status) {
         return Err(ProtocolError::bad_request(format!(
             "unknown status '{status}'"
@@ -4265,7 +4695,7 @@ fn cases_bulk_status_v1(
     for case_id in case_ids {
         // Bulk semantics: cases the caller may not (or must not) transition
         // are skipped, the rest proceed — `updated` reports the real count.
-        if let Ok(true) = apply_status_transition(&pool, role, case_id, status, reason)? {
+        if let Ok(true) = apply_status_transition(&pool, &access, case_id, status, reason)? {
             updated += 1;
         }
     }
@@ -4291,7 +4721,13 @@ fn case_duplicate_v1(
     case_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let new_id = ps_tests::duplicate_case(&pool, case_id, &org.user_id)
@@ -4317,9 +4753,14 @@ fn case_delete_v1(
     case_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    let role = role.expect("editor gate never yields admin override");
     let pool = open_project_pool(project_id)?;
     let item = ps_tests::get_case(&pool, case_id)
         .map_err(|e| db_error("case_get", e))?
@@ -4338,8 +4779,8 @@ fn case_delete_v1(
             "case is referenced by test runs — deprecate instead",
         ));
     }
-    // Editor: own drafts only. Manager+: draft + review.
-    let allowed = if role >= ProjectRole::Manager {
+    // Test writers may delete their own drafts; administrators also remove reviews.
+    let allowed = if access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin) {
         matches!(item.record.status.as_str(), "draft" | "review")
     } else {
         item.record.status == "draft" && item.record.created_by == org.user_id
@@ -4347,7 +4788,7 @@ fn case_delete_v1(
     if !allowed {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "editors may delete only their own drafts",
+            "test writers may delete only their own drafts",
         ));
     }
     let ok = ps_tests::delete_case(&pool, case_id).map_err(|e| db_error("case_delete", e))?;
@@ -4372,7 +4813,13 @@ fn case_version_get_v1(
     version: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     // Visibility gate first: versions of a pending case are as hidden as the
     // case itself.
@@ -4399,7 +4846,13 @@ fn case_restore_version_v1(
     expected_version: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     match ps_tests::restore_version(&pool, case_id, version, expected_version, &org.user_id)
@@ -4437,7 +4890,13 @@ fn cases_import_csv_v1(
     dry_run: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     if csv_text.len() > ps_tests::CSV_MAX_BYTES {
         return Err(ProtocolError::bad_request("CSV exceeds the 2 MiB limit"));
@@ -4485,11 +4944,30 @@ fn attachment_get_v1(
     max_bytes: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
     if !is_sha256_hex(sha256) {
         return Err(ProtocolError::bad_request(
             "sha256 must be 64 lowercase hex characters",
         ));
+    }
+    let pool = open_project_pool(project_id)?;
+    let referenced = {
+        let conn = pool
+            .read()
+            .map_err(|e| db_error("attachment_reference", e))?;
+        let exists = |sql: &str| -> Result<bool, ProtocolError> {
+            conn.query_row(sql, [sha256], |row| row.get::<_, bool>(0))
+                .map_err(|e| db_error("attachment_reference", e))
+        };
+        (task_access(&access, ProjectPermissionLevel::Read)
+            && exists("SELECT EXISTS(SELECT 1 FROM tasks t, json_each(t.attachments_json) j WHERE json_extract(j.value, '$.sha256') = ?1)")?)
+        || (access.allows(ProjectArea::Tests, ProjectPermissionLevel::Read)
+            && exists("SELECT EXISTS(SELECT 1 FROM (SELECT attachments_json FROM test_cases UNION ALL SELECT attachments_json FROM test_run_items UNION ALL SELECT attachments_json FROM test_run_steps) t, json_each(t.attachments_json) j WHERE json_extract(j.value, '$.sha256') = ?1)")?)
+        || (access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read)
+            && exists("SELECT EXISTS(SELECT 1 FROM source_files WHERE sha256 = ?1)")?)
+    };
+    if !referenced {
+        return Err(ProtocolError::not_found("attachment not found"));
     }
     let cap = max_bytes.clamp(1, ATTACHMENT_MAX_BYTES) as usize;
     let blob = std::path::Path::new(&record.dir_path)
@@ -4500,7 +4978,6 @@ fn attachment_get_v1(
     let truncated = bytes.len() > cap;
     let mut bytes = bytes;
     bytes.truncate(cap);
-    let pool = open_project_pool(project_id)?;
     let mime = repository::attachment_mime(&pool, sha256)
         .map_err(|e| db_error("attachment_mime", e))?
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -4541,7 +5018,13 @@ fn suite_item_to_wire(
 
 fn suites_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let items = ps_tests::list_suites(&pool).map_err(|e| db_error("suites_list", e))?;
     let run_ids: Vec<String> = items
@@ -4562,7 +5045,13 @@ fn suite_get_v1(
     suite_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let item = ps_tests::get_suite(&pool, suite_id)
         .map_err(|e| db_error("suite_get", e))?
@@ -4600,7 +5089,13 @@ fn suite_save_v1(
     case_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
@@ -4645,7 +5140,13 @@ fn suite_delete_v1(
     suite_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = ps_tests::delete_suite(&pool, suite_id).map_err(|e| db_error("suite_delete", e))?;
@@ -4676,7 +5177,13 @@ fn runs_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     let (rows, total) = runs::list_runs(&pool, status, run_type, offset, limit)
@@ -4745,7 +5252,13 @@ fn run_create_v1(
     assignments: &[RunAssignmentWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
@@ -4819,11 +5332,11 @@ fn run_create_v1(
 
     // Assignment resolution + tester-membership validation.
     let require_tester_member = |user_id: &str| -> Result<(), ProtocolError> {
-        let target = repository::effective_role(project_id, user_id)
-            .map_err(|e| db_error("member_role", e))?;
-        if !matches!(target, Some(r) if r >= ProjectRole::Tester) {
+        let target = repository::project_access(&record, user_id, false)
+            .map_err(|e| db_error("project_access", e))?;
+        if !target.allows(ProjectArea::Tests, ProjectPermissionLevel::Write) {
             return Err(ProtocolError::bad_request(format!(
-                "user '{user_id}' is not a tester (or higher) of this project"
+                "user '{user_id}' does not have test write access"
             )));
         }
         Ok(())
@@ -4928,7 +5441,13 @@ fn run_get_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let (record, counts) = runs::get_run(&pool, run_id)
         .map_err(|e| db_error("run_get", e))?
@@ -4953,18 +5472,24 @@ fn run_close_v1(
     cancelled: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
         .map_err(|e| db_error("run_get", e))?
         .ok_or_else(|| ProtocolError::not_found("run not found"))?;
     // Manager+ OR the run's creator (section C).
-    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    let is_manager = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin);
     if !is_manager && run.created_by != org.user_id {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "closing a run requires the manager role or run ownership",
+            "closing a run requires test administration or run ownership",
         ));
     }
     let ok = runs::close_run(&pool, run_id, cancelled, &org.user_id)
@@ -5010,7 +5535,13 @@ fn run_delete_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Admin,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -5050,7 +5581,13 @@ fn run_item_claim_v1(
     item_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -5083,7 +5620,7 @@ fn run_item_claim_v1(
 /// Loads an item + its run and enforces "own item (tester) or manager".
 fn load_owned_item(
     org: &OrgContext,
-    role: Option<ProjectRole>,
+    access: &ProjectAccessWire,
     pool: &crate::db::DbPool,
     item_id: &str,
 ) -> Result<(RunItemRecord, RunRecord), ProtocolError> {
@@ -5093,7 +5630,7 @@ fn load_owned_item(
     let (run, _counts) = runs::get_run(pool, &item.run_id)
         .map_err(|e| db_error("run_get", e))?
         .ok_or_else(|| ProtocolError::not_found("run not found"))?;
-    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    let is_manager = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin);
     if !is_manager && item.assigned_to != org.user_id {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
@@ -5109,10 +5646,16 @@ fn run_item_release_v1(
     item_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
-    let (item, run) = load_owned_item(org, role, &pool, item_id)?;
+    let (item, run) = load_owned_item(org, &access, &pool, item_id)?;
     if item.status != "in_progress" {
         return Err(ProtocolError::bad_request("item is not in progress"));
     }
@@ -5139,7 +5682,13 @@ fn run_item_get_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     // Read view: any member may inspect (viewer read-only, section C).
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let item = runs::get_run_item(&pool, item_id)
         .map_err(|e| db_error("item_get", e))?
@@ -5171,7 +5720,13 @@ fn run_step_set_v1(
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     if !matches!(status, "" | "passed" | "failed" | "blocked" | "skipped") {
         return Err(ProtocolError::bad_request(format!(
@@ -5235,7 +5790,13 @@ fn run_item_finish_v1(
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let attachments_json = normalize_attachments(attachments_json)?;
     let pool = open_project_pool(project_id)?;
@@ -5303,24 +5864,18 @@ fn run_item_finish_v1(
 
 fn my_test_work_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let my_roles =
-        repository::member_roles_for_user(&org.user_id).map_err(|e| db_error("member_roles", e))?;
+    let memberships = repository::member_accesses_for_user(&org.user_id)
+        .map_err(|e| db_error("member_accesses", e))?;
     let mut entries: Vec<MyWorkEntry> = Vec::new();
-    for (project_id, role) in my_roles {
-        // Claiming needs tester+; viewers have no work queue.
-        if !matches!(ProjectRole::from_slug(&role), Some(r) if r >= ProjectRole::Tester) {
-            continue;
-        }
+    for (project_id, _member) in memberships {
         let Some(record) = repository::get_project(&org.org_id, &project_id)
             .map_err(|e| db_error("get_project", e))?
         else {
             continue;
         };
-        if record.status != "active"
-            || !parse_modules_json(&record.modules_json)
-                .iter()
-                .any(|m| m == "tests")
-        {
+        let access = repository::project_access(&record, &org.user_id, false)
+            .map_err(|e| db_error("project_access", e))?;
+        if !access.allows(ProjectArea::Tests, ProjectPermissionLevel::Write) {
             continue;
         }
         let Ok(pool) = project_db::open(&project_id) else {
@@ -5366,7 +5921,8 @@ fn tasks_list_v1(
     severity: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) =
+        require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     // "me" is a UI-level alias, not a stored user id — resolve it to the caller.
@@ -5403,7 +5959,8 @@ fn task_get_v1(
     task_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) =
+        require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
     let pool = open_project_pool(project_id)?;
     let record = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
@@ -5445,10 +6002,25 @@ fn task_save_v1(
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    // Tester tier: "Zgłoś usterkę" comes straight from the tester desk.
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = if task_id.is_some() {
+        require_project(
+            ctx,
+            org,
+            project_id,
+            ProjectArea::Tasks,
+            ProjectPermissionLevel::Write,
+        )?
+    } else {
+        let result = require_project_access(ctx, org, project_id)?;
+        if !result.1.can_create_tasks {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "task creation is disabled",
+            ));
+        }
+        result
+    };
     require_active(&record)?;
-    let role = role.expect("tester gate never yields admin override");
     if !tasks::TASK_TYPES.contains(&task_type) {
         return Err(ProtocolError::bad_request(format!(
             "unknown task_type '{task_type}'"
@@ -5483,12 +6055,13 @@ fn task_save_v1(
         ));
     }
     if !assigned_to.is_empty()
-        && repository::effective_role(project_id, assigned_to)
-            .map_err(|e| db_error("member_role", e))?
-            .is_none()
+        && repository::project_access(&record, assigned_to, false)
+            .map_err(|e| db_error("member_access", e))?
+            .allows(ProjectArea::Tasks, ProjectPermissionLevel::Write)
+            == false
     {
         return Err(ProtocolError::bad_request(
-            "assigned_to must be a project member",
+            "assigned_to must have task write access",
         ));
     }
     let links_json = normalize_links(links_json)?;
@@ -5525,16 +6098,6 @@ fn task_save_v1(
             let existing = tasks::get_task(&pool, id)
                 .map_err(|e| db_error("task_get", e))?
                 .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-            // Edit: the author, the assigned tester, or any editor+.
-            let allowed = existing.created_by == org.user_id
-                || existing.assigned_to == org.user_id
-                || role >= ProjectRole::Editor;
-            if !allowed {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::PolicyDenied,
-                    "only the author, the assignee or an editor may edit this task",
-                ));
-            }
             let changed = assigned_to != existing.assigned_to && !assigned_to.is_empty();
             if !tasks::update_task(&pool, id, &input).map_err(|e| db_error("task_update", e))? {
                 return Err(ProtocolError::not_found("task not found"));
@@ -5574,20 +6137,25 @@ fn task_delete_v1(
     task_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    let role = role.expect("tester gate never yields admin override");
     let pool = open_project_pool(project_id)?;
     let task = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    // Manager anytime; the author only while nobody commented.
-    let allowed =
-        role >= ProjectRole::Manager || (task.created_by == org.user_id && task.comment_count == 0);
+    // Authorship permits deletion only before a discussion needs preserving.
+    let allowed = access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Admin)
+        || (task.created_by == org.user_id && task.comment_count == 0);
     if !allowed {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "deleting requires the manager role (or authorship of an uncommented task)",
+            "deleting requires task administration or authorship of an uncommented task",
         ));
     }
     let ok = tasks::delete_task(&pool, task_id).map_err(|e| db_error("task_delete", e))?;
@@ -5612,7 +6180,13 @@ fn task_comment_add_v1(
     body_md: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
@@ -5648,7 +6222,13 @@ fn task_comment_edit_v1(
     body_md: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
@@ -5681,17 +6261,24 @@ fn task_comment_delete_v1(
     comment_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
-    let role = role.expect("tester gate never yields admin override");
     let pool = open_project_pool(project_id)?;
     let comment = tasks::get_comment(&pool, comment_id)
         .map_err(|e| db_error("comment_get", e))?
         .ok_or_else(|| ProtocolError::not_found("comment not found"))?;
-    if comment.author_user_id != org.user_id && role < ProjectRole::Manager {
+    if comment.author_user_id != org.user_id
+        && !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Admin)
+    {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "only the author or a manager may delete a comment",
+            "only the author or a task administrator may delete a comment",
         ));
     }
     let ok = tasks::delete_comment(&pool, comment_id).map_err(|e| db_error("comment_delete", e))?;
@@ -5723,8 +6310,21 @@ async fn generation_start_v1(
     agent_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     if !generation::GENERATION_KINDS.contains(&kind) {
         return Err(ProtocolError::bad_request(format!(
             "unknown generation kind '{kind}'"
@@ -5910,7 +6510,13 @@ fn generations_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
     let rows = generation::list_generations(&pool).map_err(|e| db_error("generations_list", e))?;
@@ -5931,7 +6537,13 @@ fn generation_get_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
     let record = generation::get_generation(&pool, gen_id)
@@ -5952,17 +6564,23 @@ fn generation_cancel_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let generation_record = generation::get_generation(&pool, gen_id)
         .map_err(|e| db_error("generation_get", e))?
         .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
-    let is_manager = matches!(role, Some(r) if r >= ProjectRole::Manager);
+    let is_manager = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin);
     if !is_manager && generation_record.started_by != org.user_id {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "cancelling requires the manager role or generation ownership",
+            "cancelling requires test administration or generation ownership",
         ));
     }
     if generation_record.status != "running" {
@@ -5999,7 +6617,13 @@ fn generation_review_v1(
     reject_case_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     if accept_case_ids.is_empty() && reject_case_ids.is_empty() {
         return Err(ProtocolError::bad_request("nothing to review"));
@@ -6039,7 +6663,13 @@ fn generation_delete_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Admin,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let generation_record = generation::get_generation(&pool, gen_id)
@@ -6070,6 +6700,31 @@ fn generation_delete_v1(
 // F2: notifications (G02) — central DB, always caller-scoped
 // =============================================================================
 
+fn notification_area(kind: &str) -> ProjectArea {
+    if kind.starts_with("task_") {
+        ProjectArea::Tasks
+    } else if kind.starts_with("environment_") || kind.starts_with("env_") {
+        ProjectArea::Environments
+    } else if kind.starts_with("run_")
+        || kind.starts_with("case_")
+        || kind.starts_with("generation_")
+        || kind.starts_with("schedule_")
+    {
+        ProjectArea::Tests
+    } else {
+        ProjectArea::Settings
+    }
+}
+
+fn notification_visible(access: &ProjectAccessWire, kind: &str) -> bool {
+    let area = notification_area(kind);
+    if area == ProjectArea::Tasks {
+        task_access(access, ProjectPermissionLevel::Read)
+    } else {
+        access.allows(area, ProjectPermissionLevel::Read)
+    }
+}
+
 fn notifications_list_v1(
     ctx: &HandlerContext,
     only_unread: bool,
@@ -6078,10 +6733,63 @@ fn notifications_list_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let limit = limit.clamp(1, 100);
-    let (rows, unread_count, has_more) =
+    let (rows, _unread_count, has_more) =
         notifications::list(&org.user_id, only_unread, before_id, limit)
             .map_err(|e| db_error("notifications_list", e))?;
-    let notifications_wire = rows
+    let mut access_by_project = HashMap::new();
+    let mut visible = Vec::new();
+    for row in rows {
+        if !access_by_project.contains_key(&row.project_id) {
+            let access = repository::get_project(&org.org_id, &row.project_id)
+                .map_err(|e| db_error("notification_project", e))?
+                .map(|record| repository::project_access(&record, &org.user_id, is_admin(ctx)))
+                .transpose()
+                .map_err(|e| db_error("notification_access", e))?;
+            access_by_project.insert(row.project_id.clone(), access);
+        }
+        if access_by_project
+            .get(&row.project_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|access| notification_visible(access, &row.kind))
+        {
+            visible.push(row);
+        }
+    }
+    let unread_groups: Vec<(String, String, u32)> = {
+        let registry =
+            crate::project_studio::db::pool().map_err(|e| db_error("notification_registry", e))?;
+        let conn = registry
+            .read()
+            .map_err(|e| db_error("notification_unread", e))?;
+        let mut stmt = conn.prepare("SELECT project_id, kind, COUNT(*) FROM notifications WHERE user_id = ?1 AND read_at IS NULL GROUP BY project_id, kind")
+            .map_err(|e| db_error("notification_unread", e))?;
+        let rows = stmt
+            .query_map([&org.user_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| db_error("notification_unread", e))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| db_error("notification_unread", e))?
+    };
+    let mut unread_count = 0u32;
+    for (project_id, kind, count) in unread_groups {
+        if !access_by_project.contains_key(&project_id) {
+            let access = repository::get_project(&org.org_id, &project_id)
+                .map_err(|e| db_error("notification_project", e))?
+                .map(|record| repository::project_access(&record, &org.user_id, is_admin(ctx)))
+                .transpose()
+                .map_err(|e| db_error("notification_access", e))?;
+            access_by_project.insert(project_id.clone(), access);
+        }
+        if access_by_project
+            .get(&project_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|access| notification_visible(access, &kind))
+        {
+            unread_count = unread_count.saturating_add(count);
+        }
+    }
+    let notifications_wire = visible
         .into_iter()
         .map(|n| NotificationWire {
             notification_id: n.notification_id,
@@ -6131,7 +6839,13 @@ fn report_query_v1(
     run_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     if !reports::REPORT_KINDS.contains(&report) {
         return Err(ProtocolError::bad_request(format!(
             "unknown report '{report}'"
@@ -6274,6 +6988,7 @@ async fn code_source_create(
     // Config persisted on the row + the encrypted token that never enters it.
     let mut stored_config = config_json.to_string();
     let mut secret_enc = String::new();
+    let mut spec_endpoints = None;
 
     // Materialise first, then persist. `prepared` is the file list that will
     // become `source_files` rows.
@@ -6285,6 +7000,13 @@ async fn code_source_create(
                 .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
             stored_config = clean_config;
             if !token.is_empty() {
+                require_project(
+                    ctx,
+                    org,
+                    &project_id,
+                    ProjectArea::Settings,
+                    ProjectPermissionLevel::Write,
+                )?;
                 secret_enc = ctx
                     .state
                     .settings_cipher
@@ -6292,6 +7014,22 @@ async fn code_source_create(
                     .map_err(|e| db_error("source_secret_encrypt", e))?;
             }
             deny_private_repo_url(ctx, org, &project_id, &config.repo_url).await?;
+            require_project(
+                ctx,
+                org,
+                &project_id,
+                ProjectArea::Repos,
+                ProjectPermissionLevel::Write,
+            )?;
+            if !secret_enc.is_empty() {
+                require_project(
+                    ctx,
+                    org,
+                    &project_id,
+                    ProjectArea::Settings,
+                    ProjectPermissionLevel::Write,
+                )?;
+            }
             let project = project_id.clone();
             let source = source_id.clone();
             let dir = dir_path.clone();
@@ -6350,40 +7088,66 @@ async fn code_source_create(
             let sha_owned = sha.clone();
             let mime = meta.mime.clone();
             let size = meta.size_bytes;
-            let source = source_id.clone();
-            let pool = open_project_pool(&project_id)?;
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ingest::CollectedFile>> {
-                let bytes = std::fs::read(&blob)?;
-                let spec = api_spec::parse_spec(&bytes)?;
-                let endpoints = serde_json::to_string(&spec.endpoints)?;
-                repository::set_setting(
-                    &pool,
-                    &api_spec::endpoints_setting_key(&source),
-                    &endpoints,
-                )?;
-                let digest = ingest::store_generated_text(
-                    &dir,
-                    "endpoints.md",
-                    &api_spec::endpoints_markdown(&spec),
-                )?;
-                Ok(vec![
-                    ingest::CollectedFile {
-                        rel_path: filename,
-                        sha256: sha_owned,
-                        size_bytes: size,
-                        mime,
-                    },
-                    digest,
-                ])
-            })
+            let (files, endpoints) = tokio::task::spawn_blocking(
+                move || -> anyhow::Result<(Vec<ingest::CollectedFile>, String)> {
+                    let bytes = std::fs::read(&blob)?;
+                    let spec = api_spec::parse_spec(&bytes)?;
+                    let endpoints = serde_json::to_string(&spec.endpoints)?;
+                    let digest = ingest::store_generated_text(
+                        &dir,
+                        "endpoints.md",
+                        &api_spec::endpoints_markdown(&spec),
+                    )?;
+                    Ok((
+                        vec![
+                            ingest::CollectedFile {
+                                rel_path: filename,
+                                sha256: sha_owned,
+                                size_bytes: size,
+                                mime,
+                            },
+                            digest,
+                        ],
+                        endpoints,
+                    ))
+                },
+            )
             .await
             .map_err(|_| ProtocolError::internal("api spec parse task panicked"))?
-            .map_err(|e| ProtocolError::bad_request(format!("spec rejected: {e}")))?
+            .map_err(|e| ProtocolError::bad_request(format!("spec rejected: {e}")))?;
+            spec_endpoints = Some(endpoints);
+            files
         }
         other => {
             return Err(ProtocolError::bad_request(format!(
                 "unknown kind '{other}'"
             )))
+        }
+    };
+    let authorized = require_project(
+        ctx,
+        org,
+        &project_id,
+        source_write_area(kind),
+        ProjectPermissionLevel::Write,
+    )
+    .and_then(|project| {
+        if !secret_enc.is_empty() {
+            require_project(
+                ctx,
+                org,
+                &project_id,
+                ProjectArea::Settings,
+                ProjectPermissionLevel::Write,
+            )?;
+        }
+        Ok(project)
+    });
+    let (current_record, _) = match authorized {
+        Ok(project) => project,
+        Err(error) => {
+            git_source::remove_source_dir(&project_id, &source_id);
+            return Err(error);
         }
     };
     if prepared.is_empty() {
@@ -6396,6 +7160,14 @@ async fn code_source_create(
     let pool = open_project_pool(&project_id)?;
     repository::create_source(&pool, &source_id, kind, name, &stored_config, &org.user_id)
         .map_err(|e| db_error("source_create", e))?;
+    if let Some(endpoints) = spec_endpoints {
+        repository::set_setting(
+            &pool,
+            &api_spec::endpoints_setting_key(&source_id),
+            &endpoints,
+        )
+        .map_err(|e| db_error("source_endpoints", e))?;
+    }
     if !secret_enc.is_empty() {
         repository::set_source_secret(&pool, &source_id, &secret_enc)
             .map_err(|e| db_error("source_secret_set", e))?;
@@ -6406,7 +7178,7 @@ async fn code_source_create(
     };
     let (file_ids, _removed) = repository::sync_tree_files(&pool, &source_id, &prepared, &delta)
         .map_err(|e| db_error("sync_tree_files", e))?;
-    let job_id = spawn_tree_ingest_job(ctx, org, record, &pool, &source_id, &file_ids)?;
+    let job_id = spawn_tree_ingest_job(ctx, org, &current_record, &pool, &source_id, &file_ids)?;
 
     // A fresh code source gets a proposed build recipe so the unit-test flow
     // starts from a filled form instead of an empty one.
@@ -6451,12 +7223,26 @@ async fn source_refresh_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
         .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
     if source.kind != "git" {
         return Err(ProtocolError::bad_request(
             "only git sources can be refreshed",
@@ -6480,6 +7266,20 @@ async fn source_refresh_v1(
         .map_err(|e| db_error("stored_hashes", e))?;
 
     deny_private_repo_url(ctx, org, project_id, &config.repo_url).await?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let project = project_id.to_string();
     let source_owned = source_id.to_string();
     let dir = std::path::PathBuf::from(&record.dir_path);
@@ -6498,6 +7298,20 @@ async fn source_refresh_v1(
             ))
         })?;
 
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let delta = ingest::diff_tree(&stored, &collected);
     let (file_ids, removed_ids) = repository::sync_tree_files(&pool, source_id, &collected, &delta)
         .map_err(|e| db_error("sync_tree_files", e))?;
@@ -6516,6 +7330,20 @@ async fn source_refresh_v1(
         .map_err(|_| ProtocolError::internal("knowledge cleanup task panicked"))?
         .map_err(|e| db_error("delete_knowledge", e))?;
     }
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     if file_ids.is_empty() {
         // Nothing changed: the source stays ready, no job is started. The
         // frontend treats an empty job_id as "up to date".
@@ -6556,7 +7384,13 @@ fn api_spec_endpoints_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
@@ -6580,12 +7414,26 @@ fn source_secret_set_v1(
     token: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
         .ok_or_else(|| ProtocolError::not_found("source not found"))?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        source_write_area(&source.kind),
+        ProjectPermissionLevel::Write,
+    )?;
     if source.kind != "git" {
         return Err(ProtocolError::bad_request(
             "only git sources carry an access token",
@@ -6665,7 +7513,13 @@ fn environments_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let records = environments::list(&pool).map_err(|e| db_error("environments_list", e))?;
     Ok(ps(ProjectStudioPayload::EnvironmentsListResponse {
@@ -6688,7 +7542,13 @@ async fn environment_save_v1(
     justification: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 120 {
@@ -6822,7 +7682,13 @@ fn environment_delete_v1(
     environment_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     environments::get(&pool, environment_id)
@@ -6961,7 +7827,13 @@ fn build_profile_get_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let profile = build_profiles::get(&pool, source_id)
         .map_err(|e| db_error("build_profile_get", e))?
@@ -6992,7 +7864,13 @@ fn build_profile_save_v1(
     workdir: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -7039,7 +7917,13 @@ async fn runners_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let core_db = ctx.state.db.clone();
     let discovered = tokio::task::spawn_blocking(move || auto_runs::list_runners(&core_db))
         .await
@@ -7157,8 +8041,21 @@ async fn run_start_auto_v1(
     perf_profile_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Read,
+    )?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
         return Err(ProtocolError::bad_request("run name is required"));
@@ -7266,6 +8163,8 @@ async fn run_start_auto_v1(
         submit_items,
         submit_env,
         meta.watchdog_deadline_ms,
+        project_id.to_string(),
+        org.org_id.clone(),
     )
     .await
     .map_err(|e| ProtocolError::bad_request(format!("the runner refused the run: {e}")))?;
@@ -7359,7 +8258,13 @@ fn run_auto_get_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     auto_runs::reconcile_running(&pool);
     let (record, counts) = runs::get_run(&pool, run_id)
@@ -7375,18 +8280,24 @@ fn run_auto_cancel_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
         .map_err(|e| db_error("run_get", e))?
         .ok_or_else(|| ProtocolError::not_found("run not found"))?;
     // Manager+ cancels any run; below that only the person who started it.
-    let is_manager = role.is_some_and(|r| r >= ProjectRole::Manager);
+    let is_manager = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Admin);
     if !is_manager && run.created_by != org.user_id {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
-            "only a manager or the run's creator can cancel it",
+            "only a test administrator or the run's creator can cancel it",
         ));
     }
     if run.status != "running" {
@@ -7420,7 +8331,20 @@ fn try_run_cancel_v1(
     try_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Environments,
+        ProjectPermissionLevel::Read,
+    )?;
     Ok(ps(ProjectStudioPayload::TryRunCancelResult {
         ok: auto_runs::cancel_try_run(try_id, &org.user_id),
     }))
@@ -7438,7 +8362,13 @@ fn run_artifact_get_v1(
     // sent, including its Authorization header. The stored bytes are scrubbed
     // of the environment secret, but everything else the target answered with
     // is still in there, so this stays with the people who execute the tests.
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let artifact = auto_runs::get_artifact(&pool, artifact_id)
         .map_err(|e| db_error("artifact_get", e))?
@@ -7583,7 +8513,13 @@ fn environment_index(pool: &crate::db::DbPool) -> HashMap<String, (String, Strin
 
 fn schedules_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let records = schedules::list(&pool).map_err(|e| db_error("schedules_list", e))?;
     let suite_ids: Vec<String> = records.iter().map(|r| r.suite_id.clone()).collect();
@@ -7714,15 +8650,30 @@ fn schedule_save_v1(
     wire: &ScheduleWire<'_>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Admin,
+    )?;
     require_active(&record)?;
+    if matches!(wire.run_type, "auto" | "perf") {
+        require_project(
+            ctx,
+            org,
+            project_id,
+            ProjectArea::Environments,
+            ProjectPermissionLevel::Read,
+        )?;
+    }
     let pool = open_project_pool(project_id)?;
     let (assignment_mode, case_ids_json, assignees_json) = validate_schedule(&pool, wire)?;
 
     for user_id in wire.assignees {
-        if repository::effective_role(project_id, user_id)
-            .map_err(|e| db_error("member_role", e))?
-            .is_none()
+        if !repository::project_access(&record, user_id, false)
+            .map_err(|e| db_error("member_access", e))?
+            .allows(ProjectArea::Tests, ProjectPermissionLevel::Write)
         {
             return Err(ProtocolError::bad_request(format!(
                 "user '{user_id}' is not a project member"
@@ -7830,7 +8781,13 @@ fn schedule_delete_v1(
     schedule_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Admin,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = schedules::delete(&pool, schedule_id).map_err(|e| db_error("schedule_delete", e))?;
@@ -7856,12 +8813,27 @@ fn schedule_set_enabled_v1(
     enabled: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Admin,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let schedule = schedules::get(&pool, schedule_id)
         .map_err(|e| db_error("schedule_get", e))?
         .ok_or_else(|| ProtocolError::not_found("schedule not found"))?;
+    if enabled && matches!(schedule.run_type.as_str(), "auto" | "perf") {
+        require_project(
+            ctx,
+            org,
+            project_id,
+            ProjectArea::Environments,
+            ProjectPermissionLevel::Read,
+        )?;
+    }
     let next = if enabled {
         schedules::compute_next_run(
             &schedule.schedule_kind,
@@ -7906,7 +8878,13 @@ async fn schedule_run_now_v1(
     schedule_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let schedule = schedules::get(&pool, schedule_id)
@@ -7943,7 +8921,13 @@ fn schedule_runs_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tests,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let limit = if limit == 0 { 50 } else { limit.clamp(1, 200) };
     let records = schedules::list_triggers(&pool, schedule_id, limit)
@@ -8018,7 +9002,13 @@ fn role_map_from_wire(entries: &[MlRoleMapEntry]) -> Vec<(String, String)> {
 
 fn ml_links_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
+    let (_record, access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let pool = open_project_pool(project_id)?;
     let records = ml_link::list(&pool).map_err(|e| db_error("ml_links_list", e))?;
     let creator_ids: Vec<String> = records.iter().map(|r| r.created_by.clone()).collect();
@@ -8050,7 +9040,8 @@ fn ml_links_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBod
         .collect();
     Ok(ps(ProjectStudioPayload::MlLinksListResponse {
         links,
-        can_manage: matches!(role, Some(r) if r >= ProjectRole::Manager),
+        can_manage: access.allows(ProjectArea::Settings, ProjectPermissionLevel::Write)
+            && access.allows(ProjectArea::Repos, ProjectPermissionLevel::Write),
     }))
 }
 
@@ -8064,14 +9055,23 @@ fn ml_project_create_from_project_v1(
     label: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
-    let map = if role_map.is_empty() {
-        ml_link::default_role_map()
-    } else {
-        role_map_from_wire(role_map)
-    };
+    let map = role_map_from_wire(role_map);
     let (link_id, ml_project_id, members_mapped, members_skipped) = ml_link::create_from_project(
         &pool,
         project_id,
@@ -8113,7 +9113,13 @@ fn ml_project_candidates_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (_record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     let candidates = ml_link::owned_candidates(&pool, &org.user_id)
         .map_err(|e| db_error("ml_candidates", e))?
@@ -8134,22 +9140,35 @@ fn ml_link_attach_v1(
     role_map: &[MlRoleMapEntry],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     // Attaching requires OWNERSHIP of the ML project: every membership write the
     // sync performs goes through owner-only repository calls, so a link created
     // by a non-owner could never apply anything.
-    if ml_link::ml_member_role(ml_project_id, &org.user_id).as_deref() != Some("owner") {
+    let ml_project = crate::ml_studio::repository::get_project(&org.user_id, ml_project_id)
+        .map_err(|e| db_error("ml_project", e))?
+        .filter(|summary| summary.project.org_id == org.org_id)
+        .ok_or_else(|| ProtocolError::not_found("ML project not found"))?;
+    if ml_project.role != "owner" {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "only the owner of the ML project may link it",
         ));
     }
-    let map = if role_map.is_empty() {
-        ml_link::default_role_map()
-    } else {
-        role_map_from_wire(role_map)
-    };
+    let map = role_map_from_wire(role_map);
     ml_link::validate_role_map(&map).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let pool = open_project_pool(project_id)?;
     if ml_link::count(&pool).map_err(|e| db_error("ml_links_count", e))?
@@ -8200,8 +9219,21 @@ fn ml_link_update_v1(
     role_map: &[MlRoleMapEntry],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     if ml_link::get(&pool, link_id)
         .map_err(|e| db_error("ml_link_get", e))?
@@ -8209,11 +9241,7 @@ fn ml_link_update_v1(
     {
         return Err(ProtocolError::not_found("link not found"));
     }
-    let map = if role_map.is_empty() {
-        ml_link::default_role_map()
-    } else {
-        role_map_from_wire(role_map)
-    };
+    let map = role_map_from_wire(role_map);
     ml_link::validate_role_map(&map).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let ok = ml_link::update(
         &pool,
@@ -8239,14 +9267,27 @@ fn ml_link_detach_v1(
     revoke_members: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     let link = ml_link::get(&pool, link_id)
         .map_err(|e| db_error("ml_link_get", e))?
         .ok_or_else(|| ProtocolError::not_found("link not found"))?;
-    let members_removed =
-        ml_link::detach(&pool, &link, revoke_members).map_err(|e| db_error("ml_link_detach", e))?;
+    let members_removed = ml_link::detach(&pool, project_id, &link, revoke_members)
+        .map_err(|e| db_error("ml_link_detach", e))?;
     activity::record(
         &pool,
         &org.user_id,
@@ -8272,8 +9313,21 @@ fn ml_link_sync_now_v1(
     link_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
     require_active(&record)?;
+    require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Write,
+    )?;
     let pool = open_project_pool(project_id)?;
     let link = ml_link::get(&pool, link_id)
         .map_err(|e| db_error("ml_link_get", e))?
@@ -8317,28 +9371,18 @@ fn task_status_set_v1(
     status: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
+    let (record, _access) =
+        require_task_access(ctx, org, project_id, ProjectPermissionLevel::Write)?;
     require_active(&record)?;
-    let role = role.expect("tester gate never yields admin override");
     if !tasks::TASK_STATUSES.contains(&status) {
         return Err(ProtocolError::bad_request(format!(
             "unknown status '{status}'"
         )));
     }
     let pool = open_project_pool(project_id)?;
-    let existing = tasks::get_task(&pool, task_id)
+    tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    // Same rule as TaskSave: the author, the assignee, or any editor+.
-    let allowed = existing.created_by == org.user_id
-        || existing.assigned_to == org.user_id
-        || role >= ProjectRole::Editor;
-    if !allowed {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "only the author, the assignee or an editor may move this task",
-        ));
-    }
     // Status-only write: TaskInfo (what the board renders) carries neither
     // `description_md` nor `attachments`, so routing a card move through
     // TaskSave would write both back empty.
@@ -8489,7 +9533,13 @@ fn project_export_start_v1(
     let org = require_read(ctx)?;
     // An ARCHIVED project may still be exported — that is often exactly why it
     // was archived — so `require_active` deliberately does not apply here.
-    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (record, _access) = require_project_access(ctx, org, project_id)?;
+    if !_access.project_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project export access denied",
+        ));
+    }
     archive::reap_export_archives();
     prune_export_refs();
 
@@ -8564,7 +9614,13 @@ fn project_export_status_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
+    let (_record, _access) = require_project_access(ctx, org, project_id)?;
+    if !_access.project_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "project export access denied",
+        ));
+    }
     // Authorize on the job's stored owner — never on the bare job id.
     let job = archive::job(job_id)
         .filter(|j| j.owner_user_id == org.user_id && j.project_id == project_id)
@@ -8848,53 +9904,49 @@ fn project_import_status_v1(
 mod tests {
     use super::*;
 
-    /// Owner-gate refuses a plain member, admits owner; non-member maps to
-    /// NotFound (existence must not leak) — exercised end-to-end against a
-    /// temp central DB in `require_project_role_hierarchy_and_not_found`.
-    #[test]
-    fn require_project_role_hierarchy_and_not_found() {
-        // Initialise the central registry in a tempdir (OnceLock — first test
-        // to run wins; unique ids keep tests independent).
+    #[tokio::test]
+    async fn project_area_dispatch_enforces_functions_expiry_modules_and_task_creation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
-
         let project_id = format!("gate-{}", uuid::Uuid::new_v4());
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(dir.join("files")).expect("project dir");
+        let member = |user: &str, functions: &[&str]| MemberInput {
+            user_id: user.to_string(),
+            functions: functions.iter().map(|id| id.to_string()).collect(),
+            project_admin: false,
+            expires_at: None,
+        };
         repository::create_project(
             &project_id,
-            "org-t",
-            &format!("Projekt {project_id}"),
+            "org-gate",
+            &format!("Access {project_id}"),
             "",
             "custom",
-            "[\"knowledge\"]",
-            "owner-1",
-            "/tmp/none",
+            "[\"knowledge\",\"tests\",\"tasks\",\"chat\"]",
+            "owner-gate",
+            &dir.to_string_lossy(),
             &[
-                ("manager-1".to_string(), "manager".to_string()),
-                ("editor-1".to_string(), "editor".to_string()),
-                ("tester-1".to_string(), "tester".to_string()),
-                ("viewer-1".to_string(), "viewer".to_string()),
+                member("developer-gate", &["developer"]),
+                member("tester-gate", &["tester"]),
+                member("multi-gate", &["developer", "tester"]),
+                member("empty-gate", &[]),
             ],
         )
         .expect("create project");
-
-        // The admin-override tier is decided by the permission matrix now, so
-        // the fixture is a real test AppState with an installed instance; a
-        // caller becomes "admin" through a matrix grant, not an org-RBAC bit.
+        std::mem::forget(tmp);
         let state = super::super::state::AppState::for_test();
-        let instance = super::super::app_gate::test_support::install_app(
-            &state,
-            PACKAGE_ID,
-            &[PERM_READ],
-        );
+        let instance =
+            super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
         super::super::app_gate::test_support::grant(
             &state,
             &instance,
-            "stranger-admin",
+            "app-admin-gate",
             PERM_ADMIN,
         );
         let ctx = |user: &str| HandlerContext {
             session: tentaflow_protocol::SessionAuth::UserSession {
-                user_id: [0x21u8; 16],
+                user_id: [0x21; 16],
                 role: None,
             },
             correlation_id: 1,
@@ -8904,47 +9956,376 @@ mod tests {
             origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: user.to_string(),
-                org_id: "org-t".to_string(),
+                org_id: "org-gate".to_string(),
                 role_id: "role-x".to_string(),
                 permissions: Default::default(),
             }),
         };
-        let check = |user: &str, min: ProjectRole| {
-            let c = ctx(user);
-            let org = c.org_context.clone().unwrap();
-            require_project(&c, &org, &project_id, min)
+        let get = || {
+            ps(ProjectStudioPayload::ProjectGetRequest {
+                project_id: project_id.clone(),
+            })
         };
-
-        // Hierarchy: editor passes editor gate, tester does not.
-        assert!(check("editor-1", ProjectRole::Editor).is_ok());
-        let denied = check("tester-1", ProjectRole::Editor).expect_err("tester below editor");
+        let case = || {
+            ps(ProjectStudioPayload::CaseSaveRequest {
+                project_id: project_id.clone(),
+                case_id: None,
+                kind: "manual".into(),
+                title: "Access case".into(),
+                priority: "medium".into(),
+                content_json: r#"{"steps":[{"action":"Open","expected":"Visible"}]}"#.into(),
+                tag_ids: vec![],
+                linked_source_ids: vec![],
+                attachments_json: "[]".into(),
+                expected_version: None,
+                change_note: String::new(),
+            })
+        };
+        let task = || {
+            ps(ProjectStudioPayload::TaskSaveRequest {
+                project_id: project_id.clone(),
+                task_id: None,
+                task_type: "task".into(),
+                title: "Access task".into(),
+                description_md: String::new(),
+                severity: String::new(),
+                priority: "medium".into(),
+                status: "todo".into(),
+                assigned_to: String::new(),
+                due_date: String::new(),
+                links_json: "[]".into(),
+                attachments_json: "[]".into(),
+            })
+        };
+        let denied = project_studio_dispatch(&case(), &ctx("developer-gate"))
+            .await
+            .expect_err("developer tests are read only");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
-        // Manager passes editor + manager, fails owner.
-        assert!(check("manager-1", ProjectRole::Manager).is_ok());
-        let denied = check("manager-1", ProjectRole::Owner).expect_err("manager is not owner");
+        assert!(project_studio_dispatch(&case(), &ctx("tester-gate"))
+            .await
+            .is_ok());
+        assert!(project_studio_dispatch(&case(), &ctx("multi-gate"))
+            .await
+            .is_ok());
+        let catalogue_request = ps(ProjectStudioPayload::Access(
+            ProjectAccessPayload::CatalogueGetRequest {
+                project_id: project_id.clone(),
+            },
+        ));
+        let owner_ctx = ctx("owner-gate");
+        super::super::seed_session_account(&owner_ctx);
+        let (catalogue_response, error) =
+            super::super::dispatch(&catalogue_request, &owner_ctx).await;
+        assert!(
+            !error,
+            "registered catalogue request failed: {catalogue_response:?}"
+        );
+        assert!(matches!(
+            catalogue_response,
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::Access(
+                ProjectAccessPayload::CatalogueGetResponse { .. }
+            ))
+        ));
+        let response = project_studio_dispatch(&get(), &ctx("multi-gate"))
+            .await
+            .expect("get union");
+        let MessageBody::ProjectStudioBody(ProjectStudioPayload::ProjectGetResponse { project }) =
+            response
+        else {
+            panic!("project response")
+        };
+        assert!(project
+            .access
+            .allows(ProjectArea::Tests, ProjectPermissionLevel::Write));
+        assert!(project
+            .access
+            .allows(ProjectArea::Repos, ProjectPermissionLevel::Write));
+        assert!(project.my_role.is_none());
+        assert!(
+            project_studio_dispatch(&task(), &ctx("empty-gate"))
+                .await
+                .is_ok(),
+            "any accessible member creates a task"
+        );
+        assert!(
+            project_studio_dispatch(&task(), &ctx("app-admin-gate"))
+                .await
+                .is_ok(),
+            "app inspection access also creates tasks"
+        );
+        let denied = project_studio_dispatch(&case(), &ctx("app-admin-gate"))
+            .await
+            .expect_err("app admin has no content write");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
-        // Owner passes everything.
-        assert!(check("owner-1", ProjectRole::Owner).is_ok());
-        // Viewer gate admits every member.
-        assert!(check("viewer-1", ProjectRole::Viewer).is_ok());
+        let outsider = project_studio_dispatch(&get(), &ctx("outsider-gate"))
+            .await
+            .expect_err("outsider hidden");
+        assert_eq!(outsider.code, ProtocolErrorCode::NotFound);
+        let mut foreign = ctx("owner-gate");
+        foreign.org_context.as_mut().unwrap().org_id = "foreign-gate".into();
+        assert_eq!(
+            project_studio_dispatch(&get(), &foreign)
+                .await
+                .expect_err("foreign hidden")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
 
-        // Non-member → NotFound (not PolicyDenied) so existence does not leak.
-        let err = check("stranger", ProjectRole::Viewer).expect_err("stranger");
-        assert_eq!(err.code, ProtocolErrorCode::NotFound);
-        // Matrix-admin override: viewer + owner tiers only; editor tier still
-        // denied (content mutations always require real membership).
-        assert!(check("stranger-admin", ProjectRole::Viewer).is_ok());
-        assert!(check("stranger-admin", ProjectRole::Owner).is_ok());
-        let err = check("stranger-admin", ProjectRole::Editor)
-            .expect_err("admin has no content-mutation override");
-        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
-        // Wrong org → NotFound even for a member.
-        let c = ctx("owner-1");
-        let mut foreign = c.org_context.clone().unwrap();
-        foreign.org_id = "org-other".to_string();
-        let err = require_project(&c, &foreign, &project_id, ProjectRole::Viewer)
-            .expect_err("foreign org");
-        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+        repository::set_member_access(&project_id, "owner-gate", &[], true, None)
+            .expect("project admin without confidential functions");
+        let function = ProjectFunctionWire {
+            function_id: "custom_security".into(),
+            name: "Explicit security".into(),
+            description: String::new(),
+            builtin: false,
+            grants: ProjectArea::ALL
+                .iter()
+                .map(
+                    |&area| tentaflow_protocol::project_studio::access::ProjectAreaGrantWire {
+                        area,
+                        level: if area == ProjectArea::SecurityConfidential {
+                            ProjectPermissionLevel::Read
+                        } else {
+                            ProjectPermissionLevel::None
+                        },
+                    },
+                )
+                .collect(),
+        };
+        let save = || {
+            ps(ProjectStudioPayload::Access(
+                ProjectAccessPayload::FunctionSaveRequest {
+                    project_id: project_id.clone(),
+                    function: function.clone(),
+                },
+            ))
+        };
+        assert_eq!(
+            project_studio_dispatch(&save(), &ctx("app-admin-gate"))
+                .await
+                .expect_err("real project admin required")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        assert!(
+            project_studio_dispatch(&save(), &ctx("owner-gate"))
+                .await
+                .is_ok(),
+            "project admin can explicitly grant confidentiality without a privilege ceiling"
+        );
+        let assign = ps(ProjectStudioPayload::Access(
+            ProjectAccessPayload::MemberAccessSetRequest {
+                project_id: project_id.clone(),
+                user_id: "empty-gate".into(),
+                functions: vec!["custom_security".into()],
+                project_admin: false,
+                expires_at: None,
+            },
+        ));
+        assert!(project_studio_dispatch(&assign, &ctx("owner-gate"))
+            .await
+            .is_ok());
+        let assigned = repository::member_access(&project_id, "empty-gate")
+            .expect("member")
+            .expect("assigned");
+        let catalogue = repository::list_functions(&project_id).expect("catalogue");
+        assert_eq!(
+            crate::project_studio::models::function_level(
+                &assigned.functions,
+                &catalogue,
+                ProjectArea::SecurityConfidential
+            ),
+            ProjectPermissionLevel::Read
+        );
+        let owner = repository::get_project("org-gate", &project_id)
+            .expect("project")
+            .expect("owner");
+        let owner_access =
+            repository::project_access(&owner, "owner-gate", false).expect("owner access");
+        assert_eq!(
+            owner_access.level(ProjectArea::SecurityConfidential),
+            ProjectPermissionLevel::None,
+            "future security module is disabled"
+        );
+
+        let legacy = ps(ProjectStudioPayload::MemberRoleSetRequest {
+            project_id: project_id.clone(),
+            user_id: "tester-gate".into(),
+            role: "manager".into(),
+        });
+        assert_eq!(
+            project_studio_dispatch(&legacy, &ctx("owner-gate"))
+                .await
+                .expect_err("legacy setter rejected")
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        crate::project_studio::db::pool().expect("registry").write().expect("write")
+            .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = 'tester-gate'", [&project_id]).expect("expire");
+        assert_eq!(
+            project_studio_dispatch(&get(), &ctx("tester-gate"))
+                .await
+                .expect_err("expired hidden")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert_eq!(
+            project_studio_dispatch(&case(), &ctx("tester-gate"))
+                .await
+                .expect_err("expired write hidden")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert!(
+            repository::member_access(&project_id, "tester-gate")
+                .expect("expired record")
+                .is_some(),
+            "administration retains expired member"
+        );
+        for (user, function, grants) in [
+            (
+                "board-gate",
+                "custom_board",
+                vec![
+                    (ProjectArea::Tasks, ProjectPermissionLevel::Read),
+                    (ProjectArea::Board, ProjectPermissionLevel::Write),
+                ],
+            ),
+            (
+                "tasks-gate",
+                "custom_tasks",
+                vec![(ProjectArea::Tasks, ProjectPermissionLevel::Write)],
+            ),
+            (
+                "board-read-gate",
+                "custom_board_read",
+                vec![(ProjectArea::Board, ProjectPermissionLevel::Read)],
+            ),
+        ] {
+            repository::save_function(
+                &project_id,
+                &ProjectFunctionWire {
+                    function_id: function.into(),
+                    name: function.into(),
+                    description: String::new(),
+                    builtin: false,
+                    grants: ProjectArea::ALL
+                        .iter()
+                        .map(|&area| {
+                            tentaflow_protocol::project_studio::access::ProjectAreaGrantWire {
+                                area,
+                                level: grants
+                                    .iter()
+                                    .find(|(cell, _)| *cell == area)
+                                    .map(|(_, level)| *level)
+                                    .unwrap_or(ProjectPermissionLevel::None),
+                            }
+                        })
+                        .collect(),
+                },
+            )
+            .expect("custom task/board matrix");
+            repository::add_members(
+                &project_id,
+                &[MemberInput {
+                    user_id: user.into(),
+                    functions: vec![function.into()],
+                    project_admin: false,
+                    expires_at: None,
+                }],
+                "owner-gate",
+            )
+            .expect("task/board member");
+        }
+        let created = project_studio_dispatch(&task(), &ctx("board-gate"))
+            .await
+            .expect("board user creates task");
+        let MessageBody::ProjectStudioBody(ProjectStudioPayload::TaskSaveResponse {
+            task_id, ..
+        }) = created
+        else {
+            panic!("task response");
+        };
+        let status_request = ps(ProjectStudioPayload::TaskStatusSetRequest {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            status: "in_progress".into(),
+        });
+        assert!(project_studio_dispatch(&status_request, &ctx("board-gate"))
+            .await
+            .is_ok());
+        assert!(project_studio_dispatch(&status_request, &ctx("tasks-gate"))
+            .await
+            .is_ok());
+        let mut edit_request = task();
+        if let MessageBody::ProjectStudioBody(ProjectStudioPayload::TaskSaveRequest {
+            task_id: id,
+            ..
+        }) = &mut edit_request
+        {
+            *id = Some(task_id.clone());
+        }
+        assert_eq!(
+            project_studio_dispatch(&edit_request, &ctx("board-gate"))
+                .await
+                .expect_err("board write cannot edit task fields")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        assert!(project_studio_dispatch(&edit_request, &ctx("tasks-gate"))
+            .await
+            .is_ok());
+        assert!(project_studio_dispatch(
+            &ps(ProjectStudioPayload::TaskGetRequest {
+                project_id: project_id.clone(),
+                task_id
+            }),
+            &ctx("board-read-gate")
+        )
+        .await
+        .is_ok());
+        let overview = project_studio_dispatch(
+            &ps(ProjectStudioPayload::OverviewRequest {
+                project_id: project_id.clone(),
+            }),
+            &ctx("board-read-gate"),
+        )
+        .await
+        .expect("board overview");
+        let MessageBody::ProjectStudioBody(ProjectStudioPayload::OverviewResponse {
+            kpis,
+            activity,
+            ..
+        }) = overview
+        else {
+            panic!("overview");
+        };
+        assert!(kpis.tasks_open > 0);
+        assert!(activity.iter().any(|entry| entry.object_type == "task"));
+        repository::update_project_modules(
+            "org-gate",
+            &project_id,
+            "[\"tasks\",\"knowledge\",\"chat\"]",
+        )
+        .expect("disable tests");
+        assert_eq!(
+            project_studio_dispatch(&case(), &ctx("owner-gate"))
+                .await
+                .expect_err("admin cannot bypass disabled tests")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        repository::set_project_archived("org-gate", &project_id, true).expect("archive");
+        assert!(project_studio_dispatch(&get(), &ctx("multi-gate"))
+            .await
+            .is_ok());
+        assert_eq!(
+            project_studio_dispatch(&task(), &ctx("owner-gate"))
+                .await
+                .expect_err("archive is read only")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
     }
 
     /// Archived projects are read-only: `require_active` (called by every
@@ -8956,6 +10337,9 @@ mod tests {
         let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
 
         let project_id = format!("arch-{}", uuid::Uuid::new_v4());
+        let dir = tmp.path().join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project directory");
+        project_db::open_pool_at(&dir).expect("real project storage");
         repository::create_project(
             &project_id,
             "org-a",
@@ -8964,7 +10348,7 @@ mod tests {
             "custom",
             "[\"knowledge\"]",
             "owner-a",
-            "/tmp/none",
+            &dir.to_string_lossy(),
             &[],
         )
         .expect("create project");
@@ -8982,6 +10366,7 @@ mod tests {
             .expect("get")
             .expect("record");
         assert!(require_active(&record).is_ok());
+        std::mem::forget(tmp);
     }
 
     fn f3_pool() -> crate::db::DbPool {
@@ -9153,7 +10538,12 @@ mod tests {
             "[\"knowledge\"]",
             "owner-s",
             &dir.to_string_lossy(),
-            &[("editor-s".to_string(), "editor".to_string())],
+            &[MemberInput {
+                user_id: "editor-s".to_string(),
+                functions: vec!["developer".to_string(), "devops".to_string()],
+                project_admin: false,
+                expires_at: None,
+            }],
         )
         .expect("create project");
         std::mem::forget(tmp);
@@ -9406,5 +10796,960 @@ mod tests {
             ..wire
         };
         assert!(schedule_save_v1(&ctx, &project_id, None, &bad_zone).is_err());
+        std::mem::forget(tmp);
+    }
+    #[tokio::test]
+    async fn archived_project_export_start_and_status_produce_a_real_archive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
+        let id = format!("export-archived-{}", uuid::Uuid::new_v4());
+        let dir = tmp.path().join(&id);
+        std::fs::create_dir_all(dir.join("files")).expect("project dir");
+        project_db::open_pool_at(&dir).expect("content db");
+        repository::create_project(
+            &id,
+            "org-export",
+            &id,
+            "",
+            "custom",
+            "[\"knowledge\"]",
+            "export-owner",
+            &dir.to_string_lossy(),
+            &[],
+        )
+        .expect("project");
+        repository::set_project_archived("org-export", &id, true).expect("archive");
+        let state = super::super::state::AppState::for_test();
+        let instance =
+            super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
+        let ctx = HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0x45; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: "export-owner".into(),
+                org_id: "org-export".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        super::super::app_gate::test_support::grant(
+            &ctx.state,
+            &instance,
+            "export-app-admin",
+            PERM_ADMIN,
+        );
+        let admin_ctx = HandlerContext {
+            session: ctx.session.clone(),
+            correlation_id: 2,
+            connection_id: 0,
+            resume_secret: None,
+            state: ctx.state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: "export-app-admin".into(),
+                org_id: "org-export".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        assert_eq!(
+            project_export_start_v1(&admin_ctx, &id, false, false, false)
+                .expect_err("app admin has no export entitlement")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        let response = project_studio_dispatch(
+            &ps(ProjectStudioPayload::ProjectExportStartRequest {
+                project_id: id.clone(),
+                include_runs: false,
+                include_vectors: false,
+                include_user_names: false,
+            }),
+            &ctx,
+        )
+        .await
+        .expect("archived export starts");
+        let MessageBody::ProjectStudioBody(ProjectStudioPayload::ProjectExportStartResponse {
+            job_id,
+        }) = response
+        else {
+            panic!("export response")
+        };
+        assert_eq!(
+            project_export_status_v1(&admin_ctx, &id, &job_id)
+                .expect_err("app admin cannot download archived export")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let export_ref = loop {
+            let response = project_studio_dispatch(
+                &ps(ProjectStudioPayload::ProjectExportStatusRequest {
+                    project_id: id.clone(),
+                    job_id: job_id.clone(),
+                }),
+                &ctx,
+            )
+            .await
+            .expect("archived export status");
+            let MessageBody::ProjectStudioBody(ProjectStudioPayload::ProjectExportStatusResponse {
+                status,
+                error,
+                export_ref,
+                archive_bytes,
+                ..
+            }) = response
+            else {
+                panic!("status response")
+            };
+            if status == "success" {
+                assert!(archive_bytes > 0);
+                break export_ref;
+            }
+            assert_ne!(status, "failed", "export failed: {error}");
+            assert!(tokio::time::Instant::now() < deadline, "export timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let path = crate::api::project_studio_export::export_archive_path(&export_ref);
+        let manifest = archive::read_manifest(&path).expect("real exported manifest");
+        assert_eq!(manifest.project.project_id, id);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.path == "db/project.db"));
+        std::fs::remove_file(path).expect("remove exported archive");
+        std::mem::forget(tmp);
+    }
+    #[tokio::test]
+    async fn ml_link_attach_enforces_the_existing_ml_project_organization() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&tmp.path().join("projects.db"));
+        let _ = crate::ml_studio::db::init(&tmp.path().join("ml.db"));
+        let id = format!("attach-org-{}", uuid::Uuid::new_v4());
+        let org_id = format!("org-{id}");
+        let owner = format!("owner-{id}");
+        let dir = tmp.path().join(&id);
+        std::fs::create_dir_all(dir.join("files")).expect("project dir");
+        project_db::open_pool_at(&dir).expect("content db");
+        repository::create_project(
+            &id,
+            &org_id,
+            &id,
+            "",
+            "custom",
+            "[\"knowledge\"]",
+            &owner,
+            &dir.to_string_lossy(),
+            &[],
+        )
+        .expect("project");
+        let foreign = crate::ml_studio::repository::create_project(
+            &owner,
+            "foreign-attach-org",
+            &format!("Foreign {id}"),
+            "",
+            "recognition",
+        )
+        .expect("foreign ML project");
+        let same_org = crate::ml_studio::repository::create_project(
+            &owner,
+            &org_id,
+            &format!("Local {id}"),
+            "",
+            "recognition",
+        )
+        .expect("same organization ML project");
+        let state = super::super::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
+        let ctx = HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0x64; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: owner,
+                org_id,
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        let request = |ml_project_id: &str| {
+            ps(ProjectStudioPayload::MlLinkAttachRequest {
+                project_id: id.clone(),
+                ml_project_id: ml_project_id.into(),
+                label: "ML integration".into(),
+                sync_permissions: false,
+                role_map: vec![],
+            })
+        };
+        assert_eq!(
+            project_studio_dispatch(&request(&foreign.project.project_id), &ctx)
+                .await
+                .expect_err("foreign organization must remain hidden")
+                .code,
+            ProtocolErrorCode::NotFound,
+        );
+        let pool = open_project_pool(&id).expect("content");
+        assert_eq!(ml_link::count(&pool).expect("links"), 0);
+        assert!(matches!(
+            project_studio_dispatch(&request(&same_org.project.project_id), &ctx)
+                .await
+                .expect("same organization owner attaches"),
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::MlLinkAttachResponse { .. }),
+        ));
+        assert_eq!(ml_link::count(&pool).expect("links"), 1);
+        std::mem::forget(tmp);
+    }
+    fn access_fixture(
+        modules: &str,
+        functions: &[&str],
+    ) -> (
+        HandlerContext,
+        crate::project_studio::models::ProjectRecord,
+        crate::db::DbPool,
+    ) {
+        use crate::project_studio::models::MemberInput;
+        use crate::services::rbac::middleware::OrgContext;
+        let state = crate::dispatch::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
+        let root = tempfile::tempdir().expect("tempdir");
+        let _ = crate::project_studio::db::init(&root.path().join("projects.db"));
+        let project_id = format!("async-access-{}", uuid::Uuid::new_v4());
+        let actor = format!("actor-{project_id}");
+        let owner = format!("owner-{project_id}");
+        let dir = root.path().join(&project_id);
+        std::fs::create_dir_all(dir.join("files")).expect("project directory");
+        repository::create_project(
+            &project_id,
+            "org-async-access",
+            &project_id,
+            "",
+            "custom",
+            modules,
+            &owner,
+            &dir.to_string_lossy(),
+            &[MemberInput {
+                user_id: actor.clone(),
+                functions: functions
+                    .iter()
+                    .map(|function| function.to_string())
+                    .collect(),
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .expect("project");
+        let pool = project_db::open(&project_id).expect("content");
+        let record = repository::get_project("org-async-access", &project_id)
+            .expect("project lookup")
+            .expect("row");
+        let ctx = HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0x7c; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: Some(OrgContext {
+                user_id: actor,
+                org_id: "org-async-access".into(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+        };
+        std::mem::forget(root);
+        (ctx, record, pool)
+    }
+
+    #[tokio::test]
+    async fn knowledge_dispatch_rechecks_access_after_a_real_delayed_embedding() {
+        use crate::project_studio::ingest::access_test_support::{
+            advertise_model, seed_passage, DelayedModel, ModelReply,
+        };
+        for change in ["expiry", "module"] {
+            let (ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer"]);
+            repository::create_source(
+                &pool,
+                "access-source",
+                "document",
+                "Private specification",
+                "{}",
+                &project.owner_user_id,
+            )
+            .expect("source");
+            let vectors = crate::services::vector_namespace_manager(&ctx.state.db);
+            seed_passage(
+                &vectors,
+                &project.org_id,
+                &project.project_id,
+                "PRIVATE-DISPATCH-PASSAGE",
+            );
+            assert_eq!(
+                crate::project_studio::knowledge::search(
+                    &vectors,
+                    &project.org_id,
+                    &project.project_id,
+                    &[0.1, 0.2, 0.3],
+                    &[],
+                    10
+                )
+                .expect("positive retrieval")
+                .len(),
+                1
+            );
+            let mut http = DelayedModel::new(ingest::EMBEDDINGS_ALIAS, ModelReply::Embedding);
+            advertise_model(
+                &ctx.state,
+                "embeddings",
+                ingest::EMBEDDINGS_ALIAS,
+                &http.endpoint,
+            );
+            let request = ps(ProjectStudioPayload::KbSearchRequest {
+                project_id: project.project_id.clone(),
+                query: "private specification".into(),
+                source_ids: vec![],
+                limit: 10,
+            });
+            let actor = ctx.org_context.as_ref().expect("org").user_id.clone();
+            let search = tokio::spawn(async move { project_studio_dispatch(&request, &ctx).await });
+            http.wait_request().await;
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute(
+                    "UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor],
+                ).expect("expire during embedding");
+            } else {
+                repository::update_project_modules(&project.org_id, &project.project_id, "[]")
+                    .expect("disable knowledge during embedding");
+            }
+            http.release();
+            let error = search
+                .await
+                .expect("dispatch")
+                .expect_err("current permission must prevent retrieval");
+            assert_eq!(
+                error.code,
+                if change == "expiry" {
+                    ProtocolErrorCode::NotFound
+                } else {
+                    ProtocolErrorCode::PolicyDenied
+                }
+            );
+            assert!(!error.message.contains("PRIVATE-DISPATCH-PASSAGE"));
+            http.finish();
+        }
+    }
+
+    #[tokio::test]
+    async fn automated_schedule_save_and_enable_require_current_environment_read() {
+        use tentaflow_protocol::project_studio::access::{
+            ProjectAreaGrantWire, ProjectFunctionWire,
+        };
+        let (ctx, project, pool) = access_fixture("[\"tests\"]", &["tester"]);
+        let actor = &ctx.org_context.as_ref().expect("org").user_id;
+        let mut function = ProjectFunctionWire {
+            function_id: "test-scheduler".into(),
+            name: "Test scheduler".into(),
+            description: String::new(),
+            builtin: false,
+            grants: ProjectArea::ALL
+                .iter()
+                .map(|&area| ProjectAreaGrantWire {
+                    area,
+                    level: if area == ProjectArea::Tests {
+                        ProjectPermissionLevel::Admin
+                    } else {
+                        ProjectPermissionLevel::None
+                    },
+                })
+                .collect(),
+        };
+        repository::save_function(&project.project_id, &function).expect("custom matrix");
+        repository::set_member_access(
+            &project.project_id,
+            actor,
+            &[function.function_id.clone()],
+            false,
+            None,
+        )
+        .expect("scheduler");
+        pool.write().expect("write").execute("INSERT INTO environments(environment_id,name,env_type,base_url,auth_type,approval_status,is_private_address,requested_by) \
+            VALUES('schedule-env','Schedule environment','api','http://127.0.0.1:8090','none','approved',1,?1)", [&project.owner_user_id]).expect("approved environment");
+        let request = |run_type: &str| {
+            ps(ProjectStudioPayload::ScheduleSaveRequest {
+                project_id: project.project_id.clone(),
+                schedule_id: None,
+                name: format!("{run_type} schedule"),
+                run_type: run_type.into(),
+                suite_id: String::new(),
+                case_ids: vec!["schedule-case".into()],
+                environment_id: if run_type == "manual" {
+                    String::new()
+                } else {
+                    "schedule-env".into()
+                },
+                runner_service_id: String::new(),
+                perf_profile_json: "{}".into(),
+                assignment_mode: "pool".into(),
+                assignees: vec![],
+                schedule_kind: "interval".into(),
+                schedule_expr: "1h".into(),
+                timezone: "UTC".into(),
+                enabled: false,
+            })
+        };
+        assert!(
+            project_studio_dispatch(&request("manual"), &ctx)
+                .await
+                .is_ok(),
+            "manual schedule does not read an environment"
+        );
+        for run_type in ["auto", "perf"] {
+            assert_eq!(
+                project_studio_dispatch(&request(run_type), &ctx)
+                    .await
+                    .expect_err("save reads environment even when disabled")
+                    .code,
+                ProtocolErrorCode::PolicyDenied
+            );
+            function
+                .grants
+                .iter_mut()
+                .find(|grant| grant.area == ProjectArea::Environments)
+                .expect("environment cell")
+                .level = ProjectPermissionLevel::Read;
+            repository::save_function(&project.project_id, &function)
+                .expect("environment read grant");
+            let response = project_studio_dispatch(&request(run_type), &ctx)
+                .await
+                .expect("explicit environment read permits save");
+            let MessageBody::ProjectStudioBody(ProjectStudioPayload::ScheduleSaveResponse {
+                schedule_id,
+                ..
+            }) = response
+            else {
+                panic!("schedule response")
+            };
+            function
+                .grants
+                .iter_mut()
+                .find(|grant| grant.area == ProjectArea::Environments)
+                .expect("environment cell")
+                .level = ProjectPermissionLevel::None;
+            repository::save_function(&project.project_id, &function)
+                .expect("revoke environment read");
+            let toggle = |enabled| {
+                ps(ProjectStudioPayload::ScheduleSetEnabledRequest {
+                    project_id: project.project_id.clone(),
+                    schedule_id: schedule_id.clone(),
+                    enabled,
+                })
+            };
+            assert_eq!(
+                project_studio_dispatch(&toggle(true), &ctx)
+                    .await
+                    .expect_err("enable reads environment")
+                    .code,
+                ProtocolErrorCode::PolicyDenied
+            );
+            assert!(
+                project_studio_dispatch(&toggle(false), &ctx).await.is_ok(),
+                "disabling remains available to test administrators"
+            );
+            function
+                .grants
+                .iter_mut()
+                .find(|grant| grant.area == ProjectArea::Environments)
+                .expect("environment cell")
+                .level = ProjectPermissionLevel::Read;
+            repository::save_function(&project.project_id, &function)
+                .expect("restore environment read");
+            assert!(project_studio_dispatch(&toggle(true), &ctx).await.is_ok());
+            function
+                .grants
+                .iter_mut()
+                .find(|grant| grant.area == ProjectArea::Environments)
+                .expect("environment cell")
+                .level = ProjectPermissionLevel::None;
+            repository::save_function(&project.project_id, &function)
+                .expect("next scenario without environment grant");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_creation_rechecks_after_delayed_spec_preparation_before_any_rows() {
+        use std::io::Write;
+        for change in ["expiry", "archive"] {
+            let (ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer"]);
+            let actor = ctx.org_context.as_ref().expect("org").user_id.clone();
+            let bytes = br#"{"openapi":"3.0.3","info":{"title":"Delayed API","version":"1.0"},"paths":{"/ping":{"get":{"responses":{"200":{"description":"OK"}}}}}}"#;
+            let uploaded = ingest::accept_upload_chunk(
+                &project.org_id,
+                &actor,
+                &project.project_id,
+                std::path::Path::new(&project.dir_path),
+                &uuid::Uuid::new_v4().to_string(),
+                "api.json",
+                "application/json",
+                0,
+                1,
+                bytes,
+            )
+            .expect("actual upload");
+            let ingest::UploadOutcome::Finalized { sha256, .. } = uploaded else {
+                panic!("completed upload")
+            };
+            let blob = std::path::Path::new(&project.dir_path)
+                .join("files")
+                .join(&sha256);
+            std::fs::remove_file(&blob).expect("prepare delayed blob read");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&blob)
+                .status()
+                .expect("fifo")
+                .success());
+            let (reading_tx, reading_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer_blob = blob.clone();
+            let writer = std::thread::spawn(move || {
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(writer_blob)
+                    .expect("wait for actual spec reader");
+                reading_tx.send(()).expect("reader started");
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("release spec bytes");
+                writer.write_all(bytes).expect("valid OpenAPI bytes");
+            });
+            let request = ps(ProjectStudioPayload::SourceCreateRequest {
+                project_id: project.project_id.clone(),
+                kind: "api_spec".into(),
+                name: "Delayed API".into(),
+                config_json: "{}".into(),
+                file_refs: vec![sha256],
+            });
+            let creation =
+                tokio::spawn(async move { project_studio_dispatch(&request, &ctx).await });
+            tokio::task::spawn_blocking(move || {
+                reading_rx.recv_timeout(std::time::Duration::from_secs(10))
+            })
+            .await
+            .expect("reader signal")
+            .expect("handler is preparing the real spec");
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire during preparation");
+            } else {
+                repository::set_project_archived(&project.org_id, &project.project_id, true)
+                    .expect("archive during preparation");
+            }
+            release_tx.send(()).expect("complete real preparation");
+            let error = creation
+                .await
+                .expect("source dispatch")
+                .expect_err("revoked creation must refuse persistence");
+            assert_eq!(
+                error.code,
+                if change == "expiry" {
+                    ProtocolErrorCode::NotFound
+                } else {
+                    ProtocolErrorCode::PolicyDenied
+                }
+            );
+            writer.join().expect("blob writer");
+            std::fs::remove_file(blob).expect("remove FIFO");
+            let conn = pool.read().expect("read");
+            for table in ["sources", "source_files", "build_profiles", "ingest_jobs"] {
+                let rows: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .expect("no unauthorized rows");
+                assert_eq!(rows, 0, "{change} must prevent {table} persistence");
+            }
+            let endpoints: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM settings WHERE key LIKE 'api_spec_endpoints:%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("endpoint metadata");
+            assert_eq!(
+                endpoints, 0,
+                "endpoint metadata is persisted only after current access"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_delete_rechecks_after_waiting_for_ingest_to_finish() {
+        for change in ["expiry", "archive"] {
+            let (ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer"]);
+            let actor = ctx.org_context.as_ref().expect("org").user_id.clone();
+            repository::create_source(
+                &pool,
+                "access-source",
+                "document",
+                "Private specification",
+                "{}",
+                &actor,
+            )
+            .expect("source");
+            let job_id = format!("delete-wait-{}", uuid::Uuid::new_v4());
+            repository::create_ingest_job(&pool, &job_id, "access-source", 1, &actor)
+                .expect("running ingest row");
+            let request = ps(ProjectStudioPayload::SourceDeleteRequest {
+                project_id: project.project_id.clone(),
+                source_id: "access-source".into(),
+            });
+            let mut deletion =
+                tokio::spawn(async move { project_studio_dispatch(&request, &ctx).await });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut deletion)
+                    .await
+                    .is_err(),
+                "running ingest holds the real deletion before its async boundary"
+            );
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire while deletion waits");
+            } else {
+                repository::set_project_archived(&project.org_id, &project.project_id, true)
+                    .expect("archive while deletion waits");
+            }
+            repository::finish_ingest_job(&pool, &job_id, "cancelled", "processing stopped")
+                .expect("finish actual job row");
+            let error = deletion
+                .await
+                .expect("delete dispatch")
+                .expect_err("current grant must prevent deletion");
+            assert_eq!(
+                error.code,
+                if change == "expiry" {
+                    ProtocolErrorCode::NotFound
+                } else {
+                    ProtocolErrorCode::PolicyDenied
+                }
+            );
+            assert!(repository::get_source(&pool, "access-source")
+                .expect("source")
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn project_delete_revokes_only_owned_ml_grants_and_preserves_provenance_on_failure() {
+        use tentaflow_protocol::{MlStudioPayload, MlStudioProjectDetailRequest};
+        let (member_ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer"]);
+        let actor = member_ctx
+            .org_context
+            .as_ref()
+            .expect("org")
+            .user_id
+            .clone();
+        let owner = project.owner_user_id.clone();
+        let core = crate::db::global_pool().expect("core directory");
+        core.write().expect("write").execute("INSERT OR IGNORE INTO user_accounts(id,username,password_hash,display_name,role,is_active) VALUES(?1,?1,'','ML owner','user',1)", [&owner]).expect("real owner identity");
+        let ml_path = std::path::Path::new(&project.dir_path)
+            .parent()
+            .expect("root")
+            .join("ml.db");
+        let _ = crate::ml_studio::db::init(&ml_path).expect("ML database");
+        let (link_id, ml_id, _, _) = ml_link::create_from_project(
+            &pool,
+            &project.project_id,
+            &project.org_id,
+            &owner,
+            &project.name,
+            "recognition",
+            "Owned ML integration",
+            true,
+            &ml_link::default_role_map(),
+        )
+        .expect("real mirrored ML project");
+        let manual = format!("manual-{}", uuid::Uuid::new_v4());
+        crate::ml_studio::repository::invite_member(&ml_id, &owner, &manual, "editor")
+            .expect("independent manual ML grant");
+        super::super::app_gate::test_support::install_app(
+            &member_ctx.state,
+            "ml-studio",
+            &["mlstudio.read"],
+        );
+        let request = MessageBody::MlStudioBody(MlStudioPayload::ProjectDetailRequest(
+            MlStudioProjectDetailRequest {
+                project_id: ml_id.clone(),
+            },
+        ));
+        assert!(
+            super::super::ml_studio::ml_studio_project_detail(&request, &member_ctx).is_ok(),
+            "mirrored member can read before project deletion"
+        );
+        let owner_ctx = HandlerContext {
+            org_context: Some(OrgContext {
+                user_id: owner.clone(),
+                org_id: project.org_id.clone(),
+                role_id: "role-test".into(),
+                permissions: Default::default(),
+            }),
+            session: member_ctx.session.clone(),
+            correlation_id: 2,
+            connection_id: 0,
+            resume_secret: None,
+            state: member_ctx.state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+        };
+        let deletion = ps(ProjectStudioPayload::ProjectDeleteRequest {
+            project_id: project.project_id.clone(),
+        });
+        let ml_db = crate::ml_studio::db::pool().expect("ML pool");
+        ml_db.write().expect("write").execute_batch(&format!("CREATE TRIGGER reject_owned_revoke BEFORE DELETE ON project_members WHEN OLD.project_id='{ml_id}' AND OLD.user_id='{actor}' BEGIN SELECT RAISE(ABORT,'owned revoke unavailable'); END;")).expect("inject actual external revoke failure");
+        let failure = project_studio_dispatch(&deletion, &owner_ctx)
+            .await
+            .expect_err("failed revoke must stop destructive project deletion");
+        assert_eq!(failure.code, ProtocolErrorCode::Internal);
+        assert_eq!(failure.message, "project studio database error");
+        assert!(std::path::Path::new(&project.dir_path)
+            .join("project.db")
+            .is_file());
+        assert!(
+            repository::get_project(&project.org_id, &project.project_id)
+                .expect("project")
+                .is_some()
+        );
+        assert!(ml_link::get(&pool, &link_id).expect("link").is_some());
+        assert_eq!(
+            repository::ml_grant_origins(&ml_id, &actor).expect("retained provenance"),
+            vec![(project.project_id.clone(), link_id)]
+        );
+        ml_db
+            .write()
+            .expect("write")
+            .execute_batch("DROP TRIGGER reject_owned_revoke;")
+            .expect("restore external revoke availability");
+        assert!(matches!(
+            project_studio_dispatch(&deletion, &owner_ctx)
+                .await
+                .expect("delete after actual revocation"),
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::ProjectDeleteResult { ok: true })
+        ));
+        assert!(!std::path::Path::new(&project.dir_path).exists());
+        assert!(
+            repository::get_project(&project.org_id, &project.project_id)
+                .expect("deleted project")
+                .is_none()
+        );
+        assert!(repository::ml_grant_origins(&ml_id, &actor)
+            .expect("revoked provenance")
+            .is_empty());
+        assert_eq!(
+            super::super::ml_studio::ml_studio_project_detail(&request, &member_ctx)
+                .expect_err("former mirror cannot read directly after deletion")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        ml_link::restore_grant_index().expect("real startup provenance restore after deletion");
+        assert_eq!(
+            super::super::ml_studio::ml_studio_project_detail(&request, &member_ctx)
+                .expect_err("restart cannot restore deleted project's access")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert_eq!(
+            crate::ml_studio::repository::member_role(&ml_id, &manual)
+                .expect("manual membership")
+                .as_deref(),
+            Some("editor")
+        );
+        assert_eq!(
+            crate::ml_studio::repository::member_role(&ml_id, &owner)
+                .expect("ML owner")
+                .as_deref(),
+            Some("owner")
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_refresh_rechecks_after_a_real_delayed_git_fetch_before_sync() {
+        use std::os::unix::fs::PermissionsExt;
+        let git = |directory: &std::path::Path, arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(arguments)
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        for change in ["expiry", "archive"] {
+            let (ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer", "devops"]);
+            let actor = ctx.org_context.as_ref().expect("org").user_id.clone();
+            let upstream = std::path::Path::new(&project.dir_path).join("upstream");
+            std::fs::create_dir_all(&upstream).expect("upstream");
+            git(&upstream, &["init", "--initial-branch=main"]);
+            git(&upstream, &["config", "user.name", "Project fixture"]);
+            git(
+                &upstream,
+                &["config", "user.email", "project-fixture@example.invalid"],
+            );
+            std::fs::write(
+                upstream.join("specification.py"),
+                "# Initial indexed specification
+",
+            )
+            .expect("initial file");
+            git(&upstream, &["add", "specification.py"]);
+            git(&upstream, &["commit", "-m", "Create initial specification"]);
+            let source_id = format!("refresh-{}", uuid::Uuid::new_v4());
+            let checkout =
+                git_source::source_dir(&project.project_id, &source_id).expect("checkout path");
+            std::fs::create_dir_all(checkout.parent().expect("sources root"))
+                .expect("sources root");
+            let cloned = std::process::Command::new("git")
+                .args(["clone", "--branch", "main"])
+                .arg(&upstream)
+                .arg(&checkout)
+                .output()
+                .expect("local clone");
+            assert!(
+                cloned.status.success(),
+                "{}",
+                String::from_utf8_lossy(&cloned.stderr)
+            );
+            let public_url = "https://1.1.1.1/project-access-fixture.git";
+            git(&checkout, &["remote", "set-url", "origin", public_url]);
+            let rewritten = format!("url.file://{}.insteadOf", upstream.to_string_lossy());
+            git(&checkout, &["config", &rewritten, public_url]);
+            repository::create_source(
+                &pool,
+                &source_id,
+                "git",
+                "Delayed repository",
+                &serde_json::json!({"repo_url":public_url,"branch":"main"}).to_string(),
+                &actor,
+            )
+            .expect("source");
+            let collected =
+                ingest::collect_tree_files(&checkout, std::path::Path::new(&project.dir_path))
+                    .expect("actual initial files");
+            let delta = ingest::TreeDelta {
+                added: collected.iter().map(|file| file.rel_path.clone()).collect(),
+                ..Default::default()
+            };
+            repository::sync_tree_files(&pool, &source_id, &collected, &delta)
+                .expect("initial stored files");
+            let initial =
+                repository::files_for_ingest(&pool, &source_id, None).expect("initial rows");
+            assert_eq!(initial.len(), 1);
+            let initial_sha = initial[0].sha256.clone();
+            std::fs::write(
+                upstream.join("specification.py"),
+                "# Changed repository content must not reach the revoked knowledge index
+",
+            )
+            .expect("updated file");
+            git(&upstream, &["add", "specification.py"]);
+            git(&upstream, &["commit", "-m", "Update specification"]);
+            // A fetched checkout can contain a newer revision than the ingested index.
+            git(
+                &checkout,
+                &[
+                    "pull",
+                    "--ff-only",
+                    upstream.to_str().expect("upstream path"),
+                    "main",
+                ],
+            );
+            let entered = std::path::Path::new(&project.dir_path).join("git-fetch-entered");
+            let release = std::path::Path::new(&project.dir_path).join("git-fetch-release");
+            let upload_pack =
+                std::path::Path::new(&project.dir_path).join("delayed-upload-pack.sh");
+            std::fs::write(&upload_pack, format!("#!/bin/sh\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.02; done\nexec git upload-pack \"$@\"\n", entered.display(), release.display())).expect("delayed real upload pack");
+            std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700))
+                .expect("upload pack permissions");
+            git(
+                &checkout,
+                &["config", &format!("remote.{public_url}.url"), public_url],
+            );
+            git(
+                &checkout,
+                &[
+                    "config",
+                    &format!("remote.{public_url}.uploadpack"),
+                    upload_pack.to_str().expect("script path"),
+                ],
+            );
+            let request = ps(ProjectStudioPayload::SourceRefreshRequest {
+                project_id: project.project_id.clone(),
+                source_id: source_id.clone(),
+            });
+            let refresh =
+                tokio::spawn(async move { project_studio_dispatch(&request, &ctx).await });
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !entered.is_file() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "real Git fetch did not enter the controlled upload-pack boundary"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if change == "expiry" {
+                crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire during real fetch");
+            } else {
+                repository::set_project_archived(&project.org_id, &project.project_id, true)
+                    .expect("archive during real fetch");
+            }
+            std::fs::write(&release, "complete actual upload-pack").expect("release actual fetch");
+            let error = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
+                .await
+                .expect("actual fetch completion")
+                .expect("refresh dispatch")
+                .expect_err("post-fetch grant must prevent persistent synchronization");
+            assert_eq!(
+                error.code,
+                if change == "expiry" {
+                    ProtocolErrorCode::NotFound
+                } else {
+                    ProtocolErrorCode::PolicyDenied
+                }
+            );
+            let after =
+                repository::files_for_ingest(&pool, &source_id, None).expect("stored files");
+            assert_eq!(after.len(), 1);
+            assert_eq!(
+                after[0].sha256, initial_sha,
+                "revoked fetch may not replace the indexed file version"
+            );
+            let jobs: i64 = pool
+                .read()
+                .expect("read")
+                .query_row("SELECT COUNT(*) FROM ingest_jobs", [], |row| row.get(0))
+                .expect("jobs");
+            assert_eq!(jobs, 0);
+            assert!(
+                std::fs::read_to_string(checkout.join("specification.py"))
+                    .expect("actual updated checkout")
+                    .starts_with("# Changed repository"),
+                "the fetched checkout differs from the index before the authorization refusal"
+            );
+            git_source::remove_source_dir(&project.project_id, &source_id);
+        }
     }
 }

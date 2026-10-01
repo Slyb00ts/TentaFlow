@@ -344,18 +344,22 @@ pub fn set_branches(
 // =============================================================================
 
 pub fn role_of(db: &DbPool, workspace_id: &str, user_id: &str) -> Result<Option<WorkspaceRole>> {
-    let conn = db.read().map_err(read_err)?;
-    let slug: Option<String> = conn
-        .query_row(
-            "SELECT role FROM code_workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
+    let member: Option<(String, String)> = {
+        let conn = db.read().map_err(read_err)?;
+        conn.query_row(
+            "SELECT role, added_by FROM code_workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
             params![workspace_id, user_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(read_err)?;
-    Ok(slug.as_deref().and_then(WorkspaceRole::from_slug))
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(read_err)?
+    };
+    let Some((role, added_by)) = member else {
+        return Ok(None);
+    };
+    let Some(role) = WorkspaceRole::from_slug(&role) else {
+        return Ok(None);
+    };
+    super::project_link::current_mirror_role(db, workspace_id, user_id, &added_by, role)
 }
-
 pub fn list_members(db: &DbPool, workspace_id: &str) -> Result<Vec<WorkspaceMemberRecord>> {
     let conn = db.read().map_err(read_err)?;
     let mut stmt = conn
@@ -390,7 +394,7 @@ pub fn upsert_member(
     tx.execute(
         "INSERT INTO code_workspace_members (workspace_id, user_id, role, added_by, added_at) \
          VALUES (?1, ?2, ?3, ?4, datetime('now')) \
-         ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role",
+         ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role, added_by = excluded.added_by",
         params![workspace_id, user_id, role.slug(), added_by],
     )
     .map_err(write_err)?;

@@ -9,7 +9,7 @@
 // Three rules, each of them a decision rather than a detail:
 //
 // **The permission mirror is one-way and only ever revokes its own grants.**
-// Project roles flow into workspace membership (`project_studio/ml_link.rs` is
+// Project repository grants flow into workspace membership (`project_studio/ml_link.rs` is
 // the precedent), and every row the mirror creates is stamped with
 // `added_by = 'project:<project_id>'`. That stamp IS the ledger: unlinking
 // removes exactly the rows carrying it, so a member an owner added by hand
@@ -32,6 +32,9 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, OptionalExtension};
+use tentaflow_protocol::project_studio::access::{
+    ProjectAccessWire, ProjectArea, ProjectPermissionLevel,
+};
 
 use super::git_broker::Broker;
 use super::models::{WorkspaceRecord, WorkspaceRole};
@@ -221,18 +224,43 @@ pub fn workspaces_for_project(
 // Permission mirror (project → workspace)
 // =============================================================================
 
-/// Workspace role a project role earns. Everyone who may change project content
-/// or run its tests becomes an editor; a viewer stays a viewer. `None` means the
-/// role grants no workspace access at all — the mirror never invents one.
+/// Repository access projects into workspace membership without granting ownership.
 ///
 /// The mirror never grants `owner`: ownership is a Code Studio decision, and a
 /// project must not be able to hand out the right to delete a workspace.
-pub fn workspace_role_for(project_role: &str) -> Option<WorkspaceRole> {
-    match project_role {
-        "owner" | "manager" | "editor" | "tester" => Some(WorkspaceRole::Editor),
-        "viewer" => Some(WorkspaceRole::Viewer),
-        _ => None,
+pub fn workspace_role_for(access: &ProjectAccessWire) -> Option<WorkspaceRole> {
+    if access.allows(ProjectArea::Repos, ProjectPermissionLevel::Write) {
+        Some(WorkspaceRole::Editor)
+    } else if access.allows(ProjectArea::Repos, ProjectPermissionLevel::Read) {
+        Some(WorkspaceRole::Viewer)
+    } else {
+        None
     }
+}
+
+pub(crate) fn current_mirror_role(
+    db: &DbPool,
+    workspace_id: &str,
+    user_id: &str,
+    added_by: &str,
+    stored: WorkspaceRole,
+) -> Result<Option<WorkspaceRole>> {
+    let Some(project_id) = added_by.strip_prefix(MIRROR_ORIGIN_PREFIX) else {
+        return Ok(Some(stored));
+    };
+    let Some(workspace) = repository::get_workspace(db, workspace_id)? else {
+        return Ok(None);
+    };
+    if !is_linked(db, workspace_id, project_id)? {
+        return Ok(None);
+    }
+    let Some(project) =
+        crate::project_studio::repository::get_project(&workspace.org_id, project_id)?
+    else {
+        return Ok(None);
+    };
+    let access = crate::project_studio::repository::project_access(&project, user_id, false)?;
+    Ok(workspace_role_for(&access).map(|current| current.min(stored)))
 }
 
 /// What one mirror pass changed.
@@ -255,14 +283,14 @@ pub fn apply_mirror(
     db: &DbPool,
     workspace_id: &str,
     project_id: &str,
-    members: &[(String, String)],
+    members: &[(String, ProjectAccessWire)],
 ) -> Result<MirrorOutcome> {
     let origin = mirror_origin(project_id);
     let mut outcome = MirrorOutcome::default();
 
     let mut desired: HashMap<&str, WorkspaceRole> = HashMap::new();
-    for (user_id, project_role) in members {
-        match workspace_role_for(project_role) {
+    for (user_id, access) in members {
+        match workspace_role_for(access) {
             Some(role) => {
                 // The same person can appear twice in one member list only
                 // through data drift; the role lattice decides, so the outcome
@@ -383,11 +411,27 @@ pub fn sync_link(db: &DbPool, workspace_id: &str, project_id: &str) -> Result<Mi
     if !is_linked(db, workspace_id, project_id)? {
         bail!("workspace is not linked to this project");
     }
-    let members: Vec<(String, String)> =
-        crate::project_studio::repository::list_members(project_id)?
-            .into_iter()
-            .map(|member| (member.user_id, member.role))
-            .collect();
+    let workspace = repository::get_workspace(db, workspace_id)?
+        .ok_or_else(|| anyhow!("workspace not found"))?;
+    let Some(project) =
+        crate::project_studio::repository::get_project(&workspace.org_id, project_id)?
+    else {
+        return Ok(MirrorOutcome {
+            revoked: revoke_mirror(db, workspace_id, project_id)?,
+            ..MirrorOutcome::default()
+        });
+    };
+    let members = crate::project_studio::repository::list_members(project_id)?
+        .into_iter()
+        .map(|member| {
+            let access = crate::project_studio::repository::project_access(
+                &project,
+                &member.user_id,
+                false,
+            )?;
+            Ok((member.user_id, access))
+        })
+        .collect::<Result<Vec<_>>>()?;
     apply_mirror(db, workspace_id, project_id, &members)
 }
 
@@ -607,15 +651,43 @@ mod tests {
         created
     }
 
-    fn members(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn members(pairs: &[(&str, &str)]) -> Vec<(String, ProjectAccessWire)> {
         pairs
             .iter()
-            .map(|(user, role)| (user.to_string(), role.to_string()))
+            .map(|(user, level)| {
+                let level = match *level {
+                    "write" => ProjectPermissionLevel::Write,
+                    "read" => ProjectPermissionLevel::Read,
+                    _ => ProjectPermissionLevel::None,
+                };
+                (
+                    user.to_string(),
+                    ProjectAccessWire {
+                        has_access: true,
+                        areas: vec![
+                            tentaflow_protocol::project_studio::access::ProjectAreaAccessWire {
+                                area: ProjectArea::Repos,
+                                level,
+                                enabled: true,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                )
+            })
             .collect()
     }
 
     fn role(db: &DbPool, workspace_id: &str, user_id: &str) -> Option<WorkspaceRole> {
-        repository::role_of(db, workspace_id, user_id).unwrap()
+        let conn = db.read().unwrap();
+        conn.query_row(
+            "SELECT role FROM code_workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
+            params![workspace_id, user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+        .and_then(|role| WorkspaceRole::from_slug(&role))
     }
 
     fn added_by(db: &DbPool, workspace_id: &str, user_id: &str) -> Option<String> {
@@ -637,11 +709,11 @@ mod tests {
             "ws-1",
             "p-1",
             &members(&[
-                ("u-a", "owner"),
-                ("u-b", "manager"),
-                ("u-c", "editor"),
-                ("u-d", "tester"),
-                ("u-e", "viewer"),
+                ("u-a", "write"),
+                ("u-b", "write"),
+                ("u-c", "write"),
+                ("u-d", "write"),
+                ("u-e", "read"),
                 ("u-f", "auditor"),
             ]),
         )
@@ -671,11 +743,11 @@ mod tests {
         workspace(&db, "ws-1", "app");
         link(&db, ORG, "ws-1", "p-1", "u-owner").unwrap();
 
-        apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "viewer")])).unwrap();
-        let again = apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "viewer")])).unwrap();
+        apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "read")])).unwrap();
+        let again = apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "read")])).unwrap();
         assert_eq!(again, MirrorOutcome::default(), "an idempotent pass wrote");
 
-        let promoted = apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "editor")])).unwrap();
+        let promoted = apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "write")])).unwrap();
         assert_eq!(promoted.updated, 1);
         assert_eq!(role(&db, "ws-1", "u-a"), Some(WorkspaceRole::Editor));
 
@@ -698,7 +770,7 @@ mod tests {
             &db,
             "ws-1",
             "p-1",
-            &members(&[("u-hand", "viewer"), ("u-mirror", "editor")]),
+            &members(&[("u-hand", "read"), ("u-mirror", "write")]),
         )
         .unwrap();
         assert_eq!(outcome.skipped_manual, 1);
@@ -730,8 +802,8 @@ mod tests {
         link(&db, ORG, "ws-1", "p-1", "u-owner").unwrap();
         link(&db, ORG, "ws-1", "p-2", "u-owner").unwrap();
 
-        apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "editor")])).unwrap();
-        let second = apply_mirror(&db, "ws-1", "p-2", &members(&[("u-b", "viewer")])).unwrap();
+        apply_mirror(&db, "ws-1", "p-1", &members(&[("u-a", "write")])).unwrap();
+        let second = apply_mirror(&db, "ws-1", "p-2", &members(&[("u-b", "read")])).unwrap();
         assert_eq!(second.revoked, 0, "one project revoked another's grant");
         assert_eq!(role(&db, "ws-1", "u-a"), Some(WorkspaceRole::Editor));
         assert_eq!(role(&db, "ws-1", "u-b"), Some(WorkspaceRole::Viewer));
@@ -850,5 +922,72 @@ mod tests {
         assert!(tree.is_empty(), "the initial commit is empty");
 
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+    #[test]
+    fn mirrored_workspace_roles_recheck_expiry_modules_and_preserve_manual_memberships() {
+        let (dir, db) = test_db();
+        let _ = crate::project_studio::db::init(&dir.path().join("projects.db"));
+        let project_id = format!("code-expiry-{}", uuid::Uuid::new_v4());
+        let project_dir = dir.path().join(&project_id);
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        crate::project_studio::repository::create_project(
+            &project_id,
+            ORG,
+            &project_id,
+            "",
+            "custom",
+            "[\"knowledge\"]",
+            "u-owner",
+            &project_dir.to_string_lossy(),
+            &[crate::project_studio::models::MemberInput {
+                user_id: "u-mirror".into(),
+                functions: vec!["developer".into()],
+                project_admin: false,
+                expires_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+            }],
+        )
+        .expect("project");
+        workspace(&db, "ws-expiry", "expiry");
+        link(&db, ORG, "ws-expiry", &project_id, "u-owner").expect("link");
+        sync_link(&db, "ws-expiry", &project_id).expect("mirror");
+        assert_eq!(
+            repository::role_of(&db, "ws-expiry", "u-mirror").expect("current role"),
+            Some(WorkspaceRole::Editor)
+        );
+        crate::project_studio::db::pool().expect("registry").write().expect("write")
+            .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = 'u-mirror'", [&project_id]).expect("expire");
+        assert_eq!(
+            role(&db, "ws-expiry", "u-mirror"),
+            Some(WorkspaceRole::Editor),
+            "cached mirror remains stored"
+        );
+        assert_eq!(
+            repository::role_of(&db, "ws-expiry", "u-mirror").expect("expired role"),
+            None
+        );
+        repository::upsert_member(
+            &db,
+            "ws-expiry",
+            "u-mirror",
+            WorkspaceRole::Editor,
+            "u-owner",
+        )
+        .expect("manual membership");
+        sync_link(&db, "ws-expiry", &project_id).expect("sync after manual grant");
+        assert_eq!(
+            repository::role_of(&db, "ws-expiry", "u-mirror").expect("manual role"),
+            Some(WorkspaceRole::Editor)
+        );
+        crate::project_studio::repository::update_project_modules(ORG, &project_id, "[]")
+            .expect("disable repositories");
+        assert_eq!(
+            repository::role_of(&db, "ws-expiry", "u-mirror").expect("manual independent"),
+            Some(WorkspaceRole::Editor)
+        );
+        assert_eq!(
+            repository::role_of(&db, "ws-expiry", "u-owner").expect("workspace owner independent"),
+            Some(WorkspaceRole::Owner)
+        );
+        std::mem::forget(dir);
     }
 }

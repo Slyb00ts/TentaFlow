@@ -202,6 +202,40 @@
   margin-bottom: 12px;
 }
 
+#ps-project-view > tf-detail-header .tf-detail-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+#ps-project-view > tf-detail-header .tf-detail-meta {
+  flex: 1 1 360px;
+}
+
+#ps-project-view > tf-detail-header .tf-detail-top-row {
+  flex-wrap: wrap;
+}
+
+#ps-project-view > tf-detail-header .tf-detail-title {
+  max-width: 100%;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+#ps-project-view > tf-detail-header .tf-detail-actions {
+  flex: 0 1 auto;
+  max-width: 100%;
+  margin-left: auto;
+}
+
+#ps-project-view > tf-detail-header .tf-detail-actions > span {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .ps-project-tabs {
   margin: 14px 0 16px;
 }
@@ -364,15 +398,22 @@
 }
 
 .ps-quick-action {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 12px;
+  display: block;
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: border-color 0.15s ease;
+}
+
+.ps-quick-action > .tf-btn {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  text-align: left;
 }
 
 .ps-quick-action:hover {
@@ -956,27 +997,43 @@
   margin-left: auto;
 }
 
-.ps-member-head,
-.ps-member-row {
-  display: grid;
-  grid-template-columns: 32px minmax(160px, 2fr) minmax(140px, 1fr) minmax(120px, 1fr) 150px 84px;
+.ps-access-heading {
+  display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 4px;
-  border-bottom: 1px solid var(--border);
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
 }
 
-.ps-member-head {
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  padding-bottom: 6px;
-}
+.ps-access-heading h2 { margin: 0 0 6px; }
 
-.ps-member-row:last-child {
-  border-bottom: 0;
+.ps-member-person { display: flex; gap: 10px; align-items: center; padding: 6px 0; }
+.ps-member-markers,
+.ps-member-function-chips,
+.ps-permission-key { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.ps-effective-access { display: flex; flex-wrap: wrap; gap: 4px; max-width: 400px; }
+.ps-effective-access tf-chip { font-size: 10px; }
+.ps-function-catalogue { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 10px; }
+.ps-function-row { display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.ps-function-row > div { flex: 1; }
+.ps-function-row b { font-size: 12px; }
+.ps-access-matrix { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
+.ps-access-matrix summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+.ps-access-matrix summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.ps-matrix-scroll { overflow-x: auto; margin-top: 12px; max-width: 100%; }
+.ps-access-form { display: flex; flex-direction: column; gap: 12px; }
+.ps-function-choices,
+.ps-function-grants { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
+.ps-function-grants { margin-top: 18px; }
+.ps-access-catalogue-fields { display: flex; flex-direction: column; gap: 12px; }
+.ps-wizard-access { padding: 14px; margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.ps-agent-bindings { display: flex; flex-wrap: wrap; gap: 12px; }
+.ps-agent-binding { display: flex; align-items: center; gap: 8px; }
+.ps-candidate-list > tf-button { display: block; width: 100%; }
+
+@media (max-width: 640px) {
+  .ps-access-heading { align-items: flex-start; flex-direction: column; }
+  .ps-function-choices, .ps-function-grants { grid-template-columns: 1fr; }
 }
 
 .ps-av-mini {
@@ -1013,44 +1070,6 @@
   margin-top: 1px;
 }
 
-.ps-member-invited {
-  font-size: 11px;
-  color: var(--text-3);
-  min-width: 0;
-}
-
-.ps-member-role {
-  min-width: 150px;
-}
-
-.ps-member-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.ps-role-legend {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 10px;
-}
-
-.ps-rl-item {
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 11px 13px;
-}
-
-.ps-rl-top {
-  margin-bottom: 6px;
-}
-
-.ps-rl-desc {
-  font-size: 11px;
-  color: var(--text-3);
-  line-height: 1.55;
-}
 
 .ps-candidate-list {
   border: 1px solid var(--border);

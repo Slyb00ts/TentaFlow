@@ -1594,6 +1594,13 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
         }
     };
 
+    if let Err(error) =
+        require_ingest_access(&project_pool, &payload.org_id, &payload.project_id, &job_id)
+    {
+        tracing::info!(job_id = %job_id, error = %error, "ingest access revoked");
+        cancel.store(true, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     if PANIC_AFTER_PROJECT_OPEN.swap(false, Ordering::SeqCst) {
         panic!("finalizer blew up");
@@ -1608,6 +1615,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
     // sprawdza flage przed kazdym plikiem.
     if cancel.load(Ordering::Relaxed) {
         let _ = repository::finish_ingest_job(&project_pool, &job_id, "cancelled", "");
+        let _ = repository::set_source_status(&project_pool, &payload.source_id, "cancelled", "");
     } else {
         if crate::services::ingest_gate::would_wait() {
             emit_line(
@@ -1619,6 +1627,8 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
                 0,
             );
         }
+        let org_id = payload.org_id.clone();
+        let project_id = payload.project_id.clone();
         let task = IngestTask {
             core_db: runtime_core_db(),
             router: runtime_router(),
@@ -1633,7 +1643,20 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
         let tx_run = tx.clone();
         let cancel_run = cancel.clone();
         run_guarded(&project_pool, &job_id, async move {
-            run_job(task, tx_run, cancel_run).await
+            let content = task.project_pool.clone();
+            let run_id = task.job_id.clone();
+            let pipeline = run_job(task, tx_run, cancel_run.clone());
+            tokio::pin!(pipeline);
+            loop {
+                tokio::select! {
+                    () = &mut pipeline => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        if require_ingest_access(&content, &org_id, &project_id, &run_id).is_err() {
+                            cancel_run.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         })
         .await;
     }
@@ -1797,6 +1820,28 @@ fn announce_queue_wait(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: 
     );
 }
 
+fn require_ingest_access(
+    pool: &DbPool,
+    org_id: &str,
+    project_id: &str,
+    job_id: &str,
+) -> Result<()> {
+    let project =
+        repository::get_project(org_id, project_id)?.ok_or_else(|| anyhow!("project not found"))?;
+    let job =
+        repository::get_ingest_job(pool, job_id)?.ok_or_else(|| anyhow!("ingest job not found"))?;
+    let source =
+        repository::get_source(pool, &job.source_id)?.ok_or_else(|| anyhow!("source not found"))?;
+    let access = repository::project_access(&project, &job.started_by, false)?;
+    if !access.allows(
+        super::models::source_write_area(&source.kind),
+        tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Write,
+    ) {
+        return Err(anyhow!("project source write access revoked"));
+    }
+    Ok(())
+}
+
 async fn run_job(
     task: IngestTask,
     tx: tokio::sync::broadcast::Sender<BusMessage>,
@@ -1814,7 +1859,11 @@ async fn run_job(
         files,
     } = task;
 
-    let _ = repository::set_source_status(&project_pool, &source_id, "indexing", "");
+    if require_ingest_access(&project_pool, &org_id, &project_id, &job_id).is_err() {
+        cancel.store(true, Ordering::Relaxed);
+    } else {
+        let _ = repository::set_source_status(&project_pool, &source_id, "indexing", "");
+    }
     emit_line(
         &tx,
         &job_id,
@@ -1856,6 +1905,9 @@ async fn run_job(
                 cancel.store(true, Ordering::Relaxed);
             }
         }
+        if require_ingest_access(&project_pool, &org_id, &project_id, &job_id).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if cancel.load(Ordering::Relaxed) {
             cancelled = true;
             break;
@@ -1873,6 +1925,8 @@ async fn run_job(
         let outcome = process_file(
             &core_db,
             &router,
+            &project_pool,
+            &job_id,
             &org_id,
             &project_id,
             &dir_path,
@@ -2072,6 +2126,8 @@ async fn clear_stale_file_graph(
 async fn ingest_file_via_flow(
     core_db: &DbPool,
     router: &Arc<Router>,
+    project_pool: &DbPool,
+    job_id: &str,
     org_id: &str,
     project_id: &str,
     dir_path: &Path,
@@ -2090,6 +2146,12 @@ async fn ingest_file_via_flow(
     // keep entities describing a version of the file that no longer exists.
     if let Err(e) = clear_stale_file_graph(core_db, org_id, project_id, &work.file_id).await {
         return FileResult::Error(e);
+    }
+    if cancel.load(Ordering::Relaxed)
+        || require_ingest_access(project_pool, org_id, project_id, job_id).is_err()
+    {
+        cancel.store(true, Ordering::Relaxed);
+        return FileResult::Cancelled;
     }
     let options = ingest_flow_options(&work.file_id, source_id, &work.path, graph_extraction);
 
@@ -2154,6 +2216,8 @@ async fn ingest_file_via_flow(
 async fn process_file(
     core_db: &DbPool,
     router: &Arc<Router>,
+    project_pool: &DbPool,
+    job_id: &str,
     org_id: &str,
     project_id: &str,
     dir_path: &Path,
@@ -2175,9 +2239,17 @@ async fn process_file(
             Ok(Err(e)) => return FileResult::Error(format!("blob read: {e}")),
             Err(_) => return FileResult::Error("blob read task panicked".to_string()),
         };
+        if cancel.load(Ordering::Relaxed)
+            || require_ingest_access(project_pool, org_id, project_id, job_id).is_err()
+        {
+            cancel.store(true, Ordering::Relaxed);
+            return FileResult::Cancelled;
+        }
         return ingest_file_via_flow(
             core_db,
             router,
+            project_pool,
+            job_id,
             org_id,
             project_id,
             dir_path,
@@ -2221,7 +2293,10 @@ async fn process_file(
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     for batch in chunks.chunks(EMBED_BATCH) {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed)
+            || require_ingest_access(project_pool, org_id, project_id, job_id).is_err()
+        {
+            cancel.store(true, Ordering::Relaxed);
             return FileResult::Cancelled;
         }
         let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
@@ -2233,6 +2308,9 @@ async fn process_file(
 
     let store_result = {
         let core_db = core_db.clone();
+        let project_pool = project_pool.clone();
+        let job_id = job_id.to_string();
+        let persist_cancel = cancel.clone();
         let org_id = org_id.to_string();
         let project_id = project_id.to_string();
         let dir = dir_path.to_path_buf();
@@ -2241,6 +2319,12 @@ async fn process_file(
         let path = work.path.clone();
         let chunk_count = chunks.len() as u32;
         match tokio::task::spawn_blocking(move || {
+            if persist_cancel.load(Ordering::Relaxed)
+                || require_ingest_access(&project_pool, &org_id, &project_id, &job_id).is_err()
+            {
+                persist_cancel.store(true, Ordering::Relaxed);
+                return Err(anyhow!("ingest cancelled before vector persistence"));
+            }
             store_chunks_blocking(
                 &core_db,
                 &org_id,
@@ -2262,7 +2346,280 @@ async fn process_file(
     };
     match store_result {
         Ok(count) => FileResult::Ready(count),
+        Err(_) if cancel.load(Ordering::Relaxed) => FileResult::Cancelled,
         Err(e) => FileResult::Error(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod access_test_support {
+    use crate::dispatch::state::AppState;
+    use crate::services::vector::backend::{Field, Metric, UpsertItem};
+    use std::io::{Read, Write};
+    use std::sync::{mpsc, Arc};
+    use tentaflow_sdk_spec::FieldValue;
+
+    pub enum ModelReply {
+        Embedding,
+        ChatToken,
+        IdleChat,
+    }
+
+    pub struct DelayedModel {
+        pub endpoint: String,
+        started: Option<mpsc::Receiver<serde_json::Value>>,
+        release: mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl DelayedModel {
+        pub fn new(model: &str, reply: ModelReply) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("model listener");
+            listener.set_nonblocking(true).expect("nonblocking accept");
+            let endpoint = format!("http://{}", listener.local_addr().expect("model address"));
+            let model = model.to_string();
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "model request never arrived"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("model accept: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).expect("request headers");
+                    assert!(count > 0, "request closed before headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(offset) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        break offset + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().expect("request length"))
+                    })
+                    .expect("content length");
+                while request.len() < header_end + length {
+                    let count = socket.read(&mut buffer).expect("request body");
+                    assert!(count > 0, "request closed before body");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + length])
+                        .expect("model body");
+                assert_eq!(body["model"], model);
+                if matches!(reply, ModelReply::Embedding) {
+                    assert!(headers.starts_with("POST /embeddings "));
+                } else {
+                    assert!(headers.starts_with("POST /chat/completions "));
+                    assert_eq!(body["stream"], true);
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").expect("stream headers");
+                    socket.flush().expect("flush stream headers");
+                }
+                started_tx
+                    .send(body)
+                    .expect("signal in-flight model request");
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("release model response");
+                match reply {
+                    ModelReply::Embedding => {
+                        let response = serde_json::json!({
+                            "object": "list", "model": model,
+                            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+                            "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                        }).to_string();
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).expect("embedding response");
+                    }
+                    ModelReply::ChatToken => {
+                        let delta = serde_json::json!({"id":"access-test", "object":"chat.completion.chunk", "created":0, "model":model,
+                            "choices":[{"index":0,"delta":{"content":"Generated project reply"},"finish_reason":null}]}).to_string();
+                        let final_delta = serde_json::json!({"id":"access-test", "object":"chat.completion.chunk", "created":0, "model":model,
+                            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}).to_string();
+                        write!(
+                            socket,
+                            "data: {delta}\n\ndata: {final_delta}\n\ndata: [DONE]\n\n"
+                        )
+                        .expect("chat tokens");
+                        socket.flush().expect("flush chat tokens");
+                    }
+                    ModelReply::IdleChat => {}
+                }
+            });
+            Self {
+                endpoint,
+                started: Some(started),
+                release,
+                thread,
+            }
+        }
+
+        pub async fn wait_request(&mut self) -> serde_json::Value {
+            let started = self.started.take().expect("one request receiver");
+            tokio::task::spawn_blocking(move || {
+                started.recv_timeout(std::time::Duration::from_secs(15))
+            })
+            .await
+            .expect("model signal task")
+            .expect("real model request is in flight")
+        }
+
+        pub fn release(&self) {
+            self.release
+                .send(())
+                .expect("complete delayed model response");
+        }
+
+        pub fn finish(self) {
+            self.thread.join().expect("model HTTP server");
+        }
+    }
+
+    pub fn advertise_model(state: &Arc<AppState>, category: &str, model: &str, endpoint: &str) {
+        use crate::config::{ConnectionType, ServiceBackend};
+        use crate::services::backend::client::BackendClient;
+        use crate::services::handles_cache::BackendHandle;
+        use crate::services::transport::Transport;
+        use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
+        let mut service = NewService::minimal(
+            "project-access-test",
+            DeployMethod::External,
+            Transport::HttpDirect,
+        );
+        service.category = category.into();
+        service.status = ServiceStatus::Running;
+        service.endpoint_url = Some(endpoint.to_string());
+        let service_id = {
+            let conn = state.db.write().expect("core write");
+            let service_id =
+                crate::services_repo::services::insert(&conn, &service).expect("model service");
+            crate::services_repo::models::insert(
+                &conn,
+                &crate::services_repo::models::NewModel {
+                    service_id,
+                    model_name: model.into(),
+                    display_name: None,
+                    capabilities: "[]".into(),
+                    context_length: None,
+                    quantization: None,
+                    is_default: false,
+                },
+            )
+            .expect("service model");
+            service_id
+        };
+        let node_id = state.local_node_id.to_string();
+        let registry = state.mesh_services_registry.clone();
+        registry.replace_local(
+            node_id.clone(),
+            crate::services::snapshot_builder::build_local_snapshot(&state.db, &node_id)
+                .expect("snapshot"),
+        );
+        state
+            .service_manager
+            .set_mesh_services_registry(registry.clone());
+        state
+            .router
+            .catalog_provider()
+            .rebuild(&registry, &state.db)
+            .expect("catalog");
+        let client = BackendClient::new(
+            ServiceBackend {
+                connection: ConnectionType::OpenAIApi {
+                    url: endpoint.into(),
+                    api_key: Some(String::new()),
+                    api_key_env: None,
+                    extra_headers: vec![],
+                    custom_endpoint: None,
+                    request_format: None,
+                    tts_config: None,
+                },
+                max_concurrent: 1,
+                timeout_ms: 15_000,
+                weight: 1,
+                model_name_override: None,
+                health_check_path: None,
+            },
+            None,
+        )
+        .expect("HTTP model client");
+        state
+            .live_handles
+            .insert(node_id, service_id, BackendHandle::Http(Arc::new(client)));
+    }
+
+    pub fn seed_passage(
+        vectors: &crate::services::vector::NamespaceManager,
+        org_id: &str,
+        project_id: &str,
+        text: &str,
+    ) {
+        let specs = super::passage_field_specs();
+        let fields = vec![
+            Field {
+                name: "doc_id".into(),
+                value: FieldValue::Str("access-file".into()),
+            },
+            Field {
+                name: "chunk_index".into(),
+                value: FieldValue::Int(0),
+            },
+            Field {
+                name: "text".into(),
+                value: FieldValue::Str(text.into()),
+            },
+            Field {
+                name: "source_id".into(),
+                value: FieldValue::Str("access-source".into()),
+            },
+            Field {
+                name: "path".into(),
+                value: FieldValue::Str("private.md".into()),
+            },
+            Field {
+                name: "location".into(),
+                value: FieldValue::Str(String::new()),
+            },
+        ];
+        let vector = [0.1_f32, 0.2, 0.3];
+        let items = [UpsertItem {
+            ref_id: 1,
+            vector: &vector,
+            fields: &fields,
+            sparse: None,
+        }];
+        vectors
+            .upsert_batch_with_quota(
+                org_id,
+                &super::vector_scope(project_id),
+                super::VECTOR_NAMESPACE,
+                3,
+                Metric::Cosine,
+                &specs,
+                false,
+                &items,
+                None,
+            )
+            .expect("real project passage");
     }
 }
 
@@ -3380,5 +3737,323 @@ mod tests {
             2,
             "curie's and bohr's relations survive, einstein's does not"
         );
+    }
+    #[tokio::test]
+    async fn worker_cancels_revoked_source_access_and_keeps_devops_git_ingest() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for scenario in [
+            "archived",
+            "disabled",
+            "expired",
+            "devops_document",
+            "devops_git",
+        ] {
+            let (project_id, dir, sha) = registered_project(tmp.path());
+            let job_id = format!("job-{}", uuid::Uuid::new_v4());
+            let task = queued_task(&state, &project_id, &dir, &sha, &job_id, "spec.rs");
+            if scenario.starts_with("devops") || scenario == "expired" {
+                repository::add_members(
+                    &project_id,
+                    &[super::super::models::MemberInput {
+                        user_id: "ingest-devops".into(),
+                        functions: vec!["devops".into()],
+                        project_admin: false,
+                        expires_at: None,
+                    }],
+                    "tester",
+                )
+                .expect("DevOps member");
+                task.project_pool
+                    .write()
+                    .expect("write")
+                    .execute(
+                        "UPDATE ingest_jobs SET started_by = 'ingest-devops' WHERE job_id = ?1",
+                        [&job_id],
+                    )
+                    .expect("job actor");
+                if scenario != "devops_document" {
+                    task.project_pool
+                        .write()
+                        .expect("write")
+                        .execute(
+                            "UPDATE sources SET kind = 'git' WHERE source_id = 'src-1'",
+                            [],
+                        )
+                        .expect("git source");
+                }
+            }
+            match scenario {
+                "archived" => {
+                    repository::set_project_archived("org-1", &project_id, true).expect("archive");
+                }
+                "disabled" => {
+                    repository::update_project_modules("org-1", &project_id, "[]")
+                        .expect("disable");
+                }
+                "expired" => {
+                    super::super::db::pool().expect("registry").write().expect("write")
+                    .execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = 'ingest-devops'", [&project_id]).expect("expire");
+                }
+                _ => {}
+            }
+            start_job(task);
+            let claimed = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+                .expect("claim")
+                .expect("job");
+            run_supervised(claimed).await;
+            let pool = super::super::project_db::open(&project_id).expect("content");
+            let row = repository::get_ingest_job(&pool, &job_id)
+                .expect("job")
+                .expect("row");
+            if scenario == "devops_git" {
+                assert_eq!(row.status, "success", "{}", row.error);
+                assert_eq!(row.files_done, 1);
+            } else {
+                assert_eq!(
+                    row.status, "cancelled",
+                    "scenario {scenario}: {}",
+                    row.error
+                );
+                assert_eq!(row.files_done, 0);
+            }
+            assert!(!ingest_jobs::is_pending(&queue, &job_id).expect("queue closed"));
+        }
+        std::mem::forget(tmp);
+    }
+    #[tokio::test]
+    async fn cancellation_during_the_final_embedding_prevents_vector_persistence() {
+        use crate::config::{ConnectionType, ServiceBackend};
+        use crate::services::backend::client::BackendClient;
+        use crate::services::handles_cache::BackendHandle;
+        use crate::services::transport::Transport;
+        use crate::services_repo::services::{DeployMethod, NewService, ServiceStatus};
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("embedding listener");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "embedding request never arrived"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let header_end = loop {
+                let count = socket.read(&mut buffer).expect("request headers");
+                assert!(count > 0, "request closed before headers");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(offset) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break offset + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /embeddings "));
+            let content_len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().expect("length"))
+                })
+                .expect("content length");
+            while request.len() < header_end + content_len {
+                let count = socket.read(&mut buffer).expect("request body");
+                assert!(count > 0, "request closed before body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_len])
+                    .expect("embedding body");
+            assert_eq!(request["model"], EMBEDDINGS_ALIAS);
+            started_tx
+                .send(())
+                .expect("signal in-flight final embedding");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release embedding");
+            let body = serde_json::json!({
+                "object": "list", "model": EMBEDDINGS_ALIAS,
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            })
+            .to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).expect("embedding response");
+        });
+        let state = crate::dispatch::state::AppState::for_test();
+        let mut service = NewService::minimal(
+            "ingest-test-embeddings",
+            DeployMethod::External,
+            Transport::HttpDirect,
+        );
+        service.category = "embeddings".into();
+        service.status = ServiceStatus::Running;
+        service.endpoint_url = Some(endpoint.clone());
+        let service_id = {
+            let conn = state.db.write().expect("core write");
+            let service_id =
+                crate::services_repo::services::insert(&conn, &service).expect("embedding service");
+            crate::services_repo::models::insert(
+                &conn,
+                &crate::services_repo::models::NewModel {
+                    service_id,
+                    model_name: EMBEDDINGS_ALIAS.into(),
+                    display_name: None,
+                    capabilities: "[]".into(),
+                    context_length: None,
+                    quantization: None,
+                    is_default: false,
+                },
+            )
+            .expect("embedding model");
+            service_id
+        };
+        let node_id = "ingest-embedding-node".to_string();
+        let registry = state.mesh_services_registry.clone();
+        registry.replace_local(
+            node_id.clone(),
+            crate::services::snapshot_builder::build_local_snapshot(&state.db, &node_id)
+                .expect("snapshot"),
+        );
+        state
+            .service_manager
+            .set_mesh_services_registry(registry.clone());
+        state
+            .router
+            .catalog_provider()
+            .rebuild(&registry, &state.db)
+            .expect("catalog");
+        let client = BackendClient::new(
+            ServiceBackend {
+                connection: ConnectionType::OpenAIApi {
+                    url: endpoint,
+                    api_key: Some(String::new()),
+                    api_key_env: None,
+                    extra_headers: vec![],
+                    custom_endpoint: None,
+                    request_format: None,
+                    tts_config: None,
+                },
+                max_concurrent: 1,
+                timeout_ms: 10_000,
+                weight: 1,
+                model_name_override: None,
+                health_check_path: None,
+            },
+            None,
+        )
+        .expect("embedding client");
+        state
+            .live_handles
+            .insert(node_id, service_id, BackendHandle::Http(Arc::new(client)));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, _) = registered_project(tmp.path());
+        let text = b"fn main() { println!(\"final embedding\"); }\n";
+        let sha = hex::encode(Sha256::digest(text));
+        std::fs::write(dir.join("files").join(&sha), text).expect("code blob");
+        let job_id = format!("embedding-job-{}", uuid::Uuid::new_v4());
+        let mut task = queued_task(&state, &project_id, &dir, &sha, &job_id, "main.rs");
+        let work = task.files.remove(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let processing_cancel = cancel.clone();
+        let processing = tokio::spawn(async move {
+            process_file(
+                &task.core_db,
+                &task.router,
+                &task.project_pool,
+                &task.job_id,
+                &task.org_id,
+                &task.project_id,
+                &task.dir_path,
+                &task.source_id,
+                &work,
+                false,
+                &processing_cancel,
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            started_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .expect("signal task")
+        .expect("real embedding is in flight");
+        cancel.store(true, Ordering::Relaxed);
+        release_tx.send(()).expect("complete final embedding");
+        let outcome = processing.await.expect("process file");
+        assert!(matches!(outcome, FileResult::Cancelled));
+        assert!(
+            !dir.join("vectors").exists(),
+            "cancelled embedding must not create or mutate the index"
+        );
+        server.join().expect("embedding server");
+        std::mem::forget(tmp);
+    }
+    #[tokio::test]
+    async fn cancelled_or_revoked_ingest_never_dispatches_after_graph_cleanup() {
+        for boundary in ["cancelled", "module"] {
+            let state = crate::dispatch::state::AppState::for_test();
+            let root = tempfile::tempdir().expect("tempdir");
+            let (project_id, dir, sha) = registered_project(root.path());
+            let job_id = format!("cleanup-boundary-{}", uuid::Uuid::new_v4());
+            let mut task = queued_task(&state, &project_id, &dir, &sha, &job_id, "spec.md");
+            let work = task.files.remove(0);
+            let cancel = Arc::new(AtomicBool::new(boundary == "cancelled"));
+            if boundary == "module" {
+                repository::update_project_modules("org-1", &project_id, "[]")
+                    .expect("knowledge disabled during cleanup boundary");
+            }
+            let before: i64 = state
+                .db
+                .read()
+                .expect("read")
+                .query_row("SELECT COUNT(*) FROM flow_executions", [], |row| row.get(0))
+                .expect("execution count");
+            let result = ingest_file_via_flow(
+                &task.core_db,
+                &task.router,
+                &task.project_pool,
+                &task.job_id,
+                &task.org_id,
+                &task.project_id,
+                &task.dir_path,
+                &task.source_id,
+                &work,
+                b"The cancelled project specification must never be dispatched.".to_vec(),
+                false,
+                &cancel,
+            )
+            .await;
+            assert!(matches!(result, FileResult::Cancelled));
+            assert!(cancel.load(Ordering::Relaxed));
+            let after: i64 = state
+                .db
+                .read()
+                .expect("read")
+                .query_row("SELECT COUNT(*) FROM flow_executions", [], |row| row.get(0))
+                .expect("execution count");
+            assert_eq!(
+                after, before,
+                "the completed graph cleanup must not launch a fresh uncancelled flow"
+            );
+            std::mem::forget(root);
+        }
     }
 }
