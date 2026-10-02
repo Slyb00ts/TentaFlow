@@ -1226,8 +1226,15 @@ mod tests {
         };
         assert_eq!(cancelled.timers[0].status, ProcessTimerStatus::Cancelled);
         assert_eq!(
-            crate::processes::timers::drain_due(&state.db, waiting.timers[0].due_at_ms.unwrap())
-                .unwrap(),
+            {
+                let drained = crate::processes::timers::drain_due(
+                    &state.db,
+                    waiting.timers[0].due_at_ms.unwrap(),
+                );
+                drained.completion.unwrap();
+                assert!(drained.cancelled_claims.is_empty());
+                drained.fired
+            },
             0
         );
         crate::services::org::repo::remove_membership(

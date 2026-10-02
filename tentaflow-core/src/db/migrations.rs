@@ -1111,6 +1111,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         (180, "org_handovers", MigrationStep::Sql(ORG_HANDOVERS)),
         (181, "bpmn_processes", MigrationStep::Sql(BPMN_PROCESSES)),
         (182, "bpmn_timers", MigrationStep::Sql(BPMN_TIMERS)),
+        (
+            183,
+            "bpmn_boundary_timers",
+            MigrationStep::RustSelfManaged(bpmn_boundary_timers),
+        ),
     ]
 }
 
@@ -1282,6 +1287,123 @@ WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
      ))
 BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
 "#;
+
+fn bpmn_boundary_timers(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        anyhow::ensure!(fk_disabled == 0, "boundary timer migration requires foreign keys disabled");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+CREATE TABLE bpmn_timers_183 (
+    timer_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('start','catch','boundary')),
+    instance_id TEXT REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    rule_json TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    anchor_at_ms INTEGER NOT NULL,
+    due_at_ms INTEGER,
+    occurrence INTEGER NOT NULL CHECK(typeof(occurrence) = 'integer' AND occurrence > 0),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('pending','fired','cancelled','archived','blocked','missed','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    CHECK((kind='start' AND instance_id IS NULL AND token_id IS NULL) OR
+          (kind IN ('catch','boundary') AND instance_id IS NOT NULL AND token_id IS NOT NULL)),
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version)
+);
+INSERT INTO bpmn_timers_183 SELECT * FROM bpmn_timers;
+DROP TRIGGER bpmn_instance_timer_pair_insert;
+DROP TRIGGER bpmn_instance_timer_pair_update;
+DROP TABLE bpmn_timers;
+ALTER TABLE bpmn_timers_183 RENAME TO bpmn_timers;
+CREATE UNIQUE INDEX uq_bpmn_timer_start ON bpmn_timers(definition_id,version,node_id) WHERE kind='start';
+CREATE UNIQUE INDEX uq_bpmn_timer_activation ON bpmn_timers(instance_id,token_id,node_id) WHERE kind IN ('catch','boundary');
+CREATE INDEX idx_bpmn_timers_due ON bpmn_timers(status,next_check_at_ms,due_at_ms,timer_id);
+CREATE INDEX idx_bpmn_timers_instance ON bpmn_timers(instance_id,status);
+ALTER TABLE bpmn_user_tasks ADD COLUMN token_id TEXT REFERENCES bpmn_tokens(token_id);
+CREATE TRIGGER bpmn_instance_timer_pair_insert BEFORE INSERT ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+CREATE TRIGGER bpmn_instance_timer_pair_update BEFORE UPDATE OF start_timer_id,start_occurrence ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+"#,
+        )?;
+
+        let mut statement = tx.prepare(
+            "SELECT user_task_id,instance_id,node_id,kind FROM bpmn_user_tasks WHERE status='open' ORDER BY user_task_id",
+        )?;
+        let open_tasks = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (task_id, instance_id, node_id, kind) in open_tasks {
+            let mut tokens = tx.prepare(
+                "SELECT token_id FROM bpmn_tokens WHERE instance_id=?1 AND node_id=?2 AND status='waiting' ORDER BY token_id",
+            )?;
+            let waiting = tokens
+                .query_map(rusqlite::params![instance_id, node_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                waiting.len() == 1,
+                "open process task {task_id} requires exactly one waiting activation, found {}",
+                waiting.len()
+            );
+            if kind == "verification" {
+                let mut jobs = tx.prepare(
+                    "SELECT DISTINCT token_id FROM bpmn_jobs WHERE instance_id=?1 AND node_id=?2 ORDER BY token_id",
+                )?;
+                let job_tokens = jobs
+                    .query_map(rusqlite::params![instance_id, node_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    job_tokens.len() == 1 && job_tokens[0] == waiting[0],
+                    "verification task {task_id} must match its single waiting job activation"
+                );
+            }
+            tx.execute(
+                "UPDATE bpmn_user_tasks SET token_id=?1 WHERE user_task_id=?2",
+                rusqlite::params![waiting[0], task_id],
+            )?;
+        }
+
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(
+            violations.is_empty(),
+            "boundary timer migration foreign key violations: {}",
+            violations.join("; ")
+        );
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "boundary timer migration integrity: {integrity}");
+        tx.execute(
+            "INSERT INTO _migrations (version,name) VALUES (?1,?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let fk_enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    anyhow::ensure!(fk_enabled == 1, "boundary timer migration could not restore foreign keys");
+    result
+}
 
 // v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
 //
@@ -14845,7 +14967,7 @@ mod tests {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 182);
+        assert_eq!(version, 183);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -14853,5 +14975,135 @@ mod tests {
         assert_eq!((model.as_str(), hash.as_str(), start_timer, start_occurrence, event.as_str()),
             (old_model_json.as_str(), old_hash.as_str(), None, None, "{\"source_key\":1}"));
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_timers", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, String) {
+        use tentaflow_protocol::processes::{
+            ActivityVerification, ProcessNode, ProcessNodeKind, ProcessSequenceFlow,
+        };
+
+        run_ladder_up_to(conn, 182);
+        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('boundary-owner','Boundary owner','x',1)", []).unwrap();
+        let mut model = crate::processes::model::starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.nodes.push(ProcessNode {
+            id: "Review_1".into(), name: "Review".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: Some("boundary-owner".into()),
+                output_mapping: Default::default(),
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Service_1".into(), name: "Service".into(),
+            kind: ProcessNodeKind::ServiceTask {
+                flow_id: "flow-pinned".into(), input_mapping: Default::default(),
+                output_mapping: Default::default(), verification: ActivityVerification::Human,
+                timeout_seconds: 60,
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Catch_1".into(), name: "Wait".into(),
+            kind: ProcessNodeKind::TimerCatch {
+                timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
+            },
+        });
+        model.sequence_flows[0].target_id = "Review_1".into();
+        for (id, source, target) in [
+            ("Flow_2", "Review_1", "Service_1"),
+            ("Flow_3", "Service_1", "Catch_1"),
+            ("Flow_4", "Catch_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: target.into(), condition: None,
+            });
+        }
+        crate::processes::model::validate_model(&model).unwrap();
+        let bytes = serde_json::to_string(&model).unwrap();
+        let hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('boundary-process','org-default','boundary-owner','Boundary','',1,?1,1,0,1,1)", [&bytes]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('boundary-process',1,?1,?2,'[]',1,'boundary-owner')", rusqlite::params![&bytes, &hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('boundary-instance','boundary-process',1,'org-default','boundary-owner',1,'running','{}',1,1)", []).unwrap();
+        for (id, node, status) in [
+            ("waiting-review", "Review_1", "waiting"),
+            ("waiting-service", "Service_1", "waiting"),
+            ("waiting-catch", "Catch_1", "waiting"),
+            ("historical-token", "Review_1", "consumed"),
+        ] {
+            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,node_id,fork_stack_json,status,created_at_ms) VALUES(?1,'boundary-instance',?2,'[]',?3,1)", rusqlite::params![id,node,status]).unwrap();
+        }
+        for (id, node, kind, status) in [
+            ("task-review", "Review_1", "work", "open"),
+            ("task-verification", "Service_1", "verification", "open"),
+            ("task-history", "Review_1", "work", "completed"),
+        ] {
+            conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms) VALUES(?1,'boundary-instance',?2,?2,'boundary-owner',?3,?4,'{}',1,1,1)", rusqlite::params![id,node,kind,status]).unwrap();
+        }
+        conn.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms) VALUES('job-verification','boundary-instance','Service_1','waiting-service','{}','completed',1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) VALUES('timer-catch','org-default','boundary-process',1,'Catch_1','catch','boundary-instance','waiting-catch','{\"Duration\":{\"seconds\":90}}','UTC',1,90001,1,1,'pending',90001,1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('boundary-event','boundary-instance',1,1,'instance_started',NULL,'boundary-owner','{\"business_key\":\"v_1\"}')", []).unwrap();
+        (bytes, hash)
+    }
+
+    #[test]
+    fn boundary_migration_backfills_exact_open_activation_and_preserves_old_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (bytes, hash) = bpmn_boundary_migration_fixture(&conn);
+        let timer_before: (String, String, String) = conn.query_row(
+            "SELECT rule_json,timezone,status FROM bpmn_timers WHERE timer_id='timer-catch'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        run(&conn).unwrap();
+        let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 183);
+        let stored: (String, String, String) = conn.query_row(
+            "SELECT model_json,model_sha256,(SELECT data_json FROM bpmn_events WHERE event_id='boundary-event') FROM bpmn_versions WHERE definition_id='boundary-process'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(stored, (bytes, hash, "{\"business_key\":\"v_1\"}".into()));
+        let timer_after: (String, String, String) = conn.query_row(
+            "SELECT rule_json,timezone,status FROM bpmn_timers WHERE timer_id='timer-catch'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(timer_after, timer_before);
+        let mut stmt = conn.prepare("SELECT user_task_id,token_id FROM bpmn_user_tasks ORDER BY user_task_id").unwrap();
+        let tasks: Vec<(String, Option<String>)> = stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(tasks, vec![
+            ("task-history".into(), None),
+            ("task-review".into(), Some("waiting-review".into())),
+            ("task-verification".into(), Some("waiting-service".into())),
+        ]);
+        for (timer_id, node_id) in [("boundary-a", "Boundary_A"), ("boundary-b", "Boundary_B")] {
+            conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) SELECT ?1,org_id,definition_id,version,?2,'boundary',instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms FROM bpmn_timers WHERE timer_id='timer-catch'", rusqlite::params![timer_id, node_id]).unwrap();
+        }
+        assert!(conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) SELECT 'duplicate-activation',org_id,definition_id,version,node_id,'boundary',instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms FROM bpmn_timers WHERE timer_id='timer-catch'", []).is_err());
+        assert!(conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence) VALUES('invalid-start','boundary-process',1,'org-default','boundary-owner',1,'running','{}',1,1,'timer-catch',1)", []).is_err());
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn boundary_migration_rejects_missing_ambiguous_and_mismatched_open_activations() {
+        for invalid in ["missing", "ambiguous", "verification_mismatch"] {
+            let conn = Connection::open_in_memory().unwrap();
+            bpmn_boundary_migration_fixture(&conn);
+            match invalid {
+                "missing" => {
+                    conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='waiting-review'", []).unwrap();
+                }
+                "ambiguous" => {
+                    conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,node_id,fork_stack_json,status,created_at_ms) VALUES('waiting-review-2','boundary-instance','Review_1','[]','waiting',1)", []).unwrap();
+                }
+                "verification_mismatch" => {
+                    conn.execute("UPDATE bpmn_jobs SET token_id='waiting-review' WHERE job_id='job-verification'", []).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(run(&conn).is_err(), "{invalid}");
+            let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+            assert_eq!(version, 182, "{invalid}");
+            assert!(!column_exists(&conn, "bpmn_user_tasks", "token_id").unwrap(), "{invalid}");
+            let fk_enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+            assert_eq!(fk_enabled, 1, "{invalid}");
+            assert!(foreign_key_check(&conn).unwrap().is_empty(), "{invalid}");
+        }
     }
 }

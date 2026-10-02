@@ -115,9 +115,10 @@ fn validate_timer_model(model: &ProcessModel) -> Result<()> {
                     .with_context(|| format!("timer start {}", node.id))?;
                 has_timer = true;
             }
-            ProcessNodeKind::TimerCatch { timer } => {
+            ProcessNodeKind::TimerCatch { timer }
+            | ProcessNodeKind::BoundaryTimer { timer, .. } => {
                 validate_timer_spec(timer, false)
-                    .with_context(|| format!("timer catch {}", node.id))?;
+                    .with_context(|| format!("timer event {}", node.id))?;
                 has_timer = true;
             }
             _ => {}
@@ -362,6 +363,19 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 in_count == 0 && out_count == 1,
                 "start event must have one outgoing flow and no incoming flow"
             ),
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => {
+                ensure!(
+                    in_count == 0 && out_count == 1,
+                    "boundary timer {} needs one outgoing flow and no incoming flow",
+                    node.id
+                );
+                ensure!(
+                    matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. })),
+                    "boundary timer {} must attach to a user or service task",
+                    node.id
+                );
+            }
             ProcessNodeKind::End => ensure!(
                 out_count == 0 && in_count >= 1,
                 "end event must have incoming flow and no outgoing flow"
@@ -407,15 +421,30 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             );
         }
     }
+    let pairs = and_pairs(model)?;
+    let joins: HashMap<&str, &str> = pairs
+        .iter()
+        .map(|(split, join)| (join.as_str(), split.as_str()))
+        .collect();
+    let mut graph_outgoing = outgoing.clone();
     let mut degree: HashMap<&str, usize> = nodes
         .keys()
         .map(|id| (*id, incoming.get(id).map_or(0, Vec::len)))
         .collect();
+    for node in &model.nodes {
+        if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &node.kind {
+            graph_outgoing
+                .entry(attached_to_id.as_str())
+                .or_default()
+                .push(node.id.as_str());
+            *degree.get_mut(node.id.as_str()).expect("boundary node validated") += 1;
+        }
+    }
     let mut queue = VecDeque::from([starts[0].id.as_str()]);
     let mut order = Vec::with_capacity(nodes.len());
     while let Some(node_id) = queue.pop_front() {
         order.push(node_id);
-        for target in outgoing.get(node_id).into_iter().flatten() {
+        for target in graph_outgoing.get(node_id).into_iter().flatten() {
             let remaining = degree.get_mut(target).expect("edge target validated");
             *remaining -= 1;
             if *remaining == 0 {
@@ -430,7 +459,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
     let mut can_end = HashSet::new();
     for node_id in order.iter().rev() {
         if matches!(nodes[node_id].kind, ProcessNodeKind::End)
-            || outgoing
+            || graph_outgoing
                 .get(node_id)
                 .into_iter()
                 .flatten()
@@ -443,8 +472,56 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         can_end.len() == nodes.len(),
         "process contains a dead-end path"
     );
+    let mut states: HashMap<&str, (String, Vec<String>)> = HashMap::new();
+    states.insert(starts[0].id.as_str(), ("main".into(), Vec::new()));
+    for node_id in &order {
+        let (region, mut stack) = states
+            .get(node_id)
+            .cloned()
+            .context("process node has no activation region")?;
+        let node = nodes[node_id];
+        if matches!(node.kind, ProcessNodeKind::ParallelGateway) {
+            if outgoing.get(node_id).is_some_and(|flows| flows.len() >= 2) {
+                stack.push((*node_id).to_string());
+            } else {
+                let split = joins.get(node_id).context("parallel join lacks its paired split")?;
+                ensure!(
+                    stack.pop().as_deref() == Some(*split),
+                    "parallel join {} has an invalid activation stack",
+                    node_id
+                );
+            }
+        }
+        if matches!(node.kind, ProcessNodeKind::End) {
+            ensure!(stack.is_empty(), "end event has an open parallel activation");
+        }
+        for target in outgoing.get(node_id).into_iter().flatten() {
+            if matches!(nodes[target].kind, ProcessNodeKind::End) {
+                ensure!(stack.is_empty(), "boundary or main path ends inside a parallel fork");
+                states.entry(*target).or_insert_with(|| (region.clone(), stack.clone()));
+            } else if let Some(existing) = states.get(target) {
+                ensure!(
+                    existing.0 == region && existing.1 == stack,
+                    "boundary path merges with another active region at {}",
+                    target
+                );
+            } else {
+                states.insert(*target, (region.clone(), stack.clone()));
+            }
+        }
+        for boundary in model.nodes.iter().filter(|candidate| {
+            matches!(&candidate.kind, ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                if attached_to_id.as_str() == *node_id)
+        }) {
+            ensure!(
+                stack.is_empty(),
+                "boundary timer {} attaches inside an active parallel fork",
+                boundary.id
+            );
+            states.insert(boundary.id.as_str(), (boundary.id.clone(), Vec::new()));
+        }
+    }
     validate_diagram(model, &nodes, &flow_ids)?;
-    and_pairs(model)?;
     Ok(())
 }
 
@@ -605,6 +682,128 @@ pub fn and_pairs(model: &ProcessModel) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boundary_model() -> ProcessModel {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessSequenceFlow};
+
+        let mut model = starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.nodes.push(ProcessNode {
+            id: "Review_1".into(),
+            name: "Review".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None,
+                output_mapping: Default::default(),
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Boundary_A".into(),
+            name: "Time limit".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Review_1".into(),
+                cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 90 },
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Boundary_B".into(),
+            name: "Reminder".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Review_1".into(),
+                cancel_activity: false,
+                timer: ProcessTimerSpec::Date {
+                    at: "2027-01-02T03:04:05Z".into(),
+                },
+            },
+        });
+        model.sequence_flows[0].target_id = "Review_1".into();
+        for (id, source_id) in [
+            ("Flow_2", "Review_1"),
+            ("Flow_3", "Boundary_A"),
+            ("Flow_4", "Boundary_B"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(),
+                source_id: source_id.into(),
+                target_id: "End_1".into(),
+                condition: None,
+            });
+        }
+        model
+    }
+
+    #[test]
+    fn boundary_siblings_are_real_implicit_branches_without_merging_activities() {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessSequenceFlow};
+
+        let mut model = boundary_model();
+        validate_model(&model).unwrap();
+        let boundary = model.nodes.iter_mut().find(|node| node.id == "Boundary_A").unwrap();
+        if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &mut boundary.kind {
+            *attached_to_id = "End_1".into();
+        }
+        assert!(validate_model(&model).is_err());
+        model = boundary_model();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_5".into(), source_id: "Review_1".into(),
+            target_id: "Boundary_A".into(), condition: None,
+        });
+        assert!(validate_model(&model).is_err());
+        model = boundary_model();
+        model.nodes.push(ProcessNode {
+            id: "Shared_1".into(), name: "Shared".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None, output_mapping: Default::default(),
+            },
+        });
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_2").unwrap().target_id = "Shared_1".into();
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_3").unwrap().target_id = "Shared_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_5".into(), source_id: "Shared_1".into(),
+            target_id: "End_1".into(), condition: None,
+        });
+        assert!(validate_model(&model).is_err());
+    }
+
+    #[test]
+    fn boundary_after_paired_join_and_own_closed_parallel_region_are_supported() {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessSequenceFlow};
+
+        let mut model = boundary_model();
+        for id in ["Split_1", "Join_1", "SideSplit_1", "SideJoin_1"] {
+            model.nodes.push(ProcessNode {
+                id: id.into(), name: id.into(), kind: ProcessNodeKind::ParallelGateway,
+            });
+        }
+        for id in ["Branch_A", "Branch_B", "Side_A", "Side_B"] {
+            model.nodes.push(ProcessNode {
+                id: id.into(), name: id.into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None, output_mapping: Default::default(),
+                },
+            });
+        }
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_1").unwrap().target_id = "Split_1".into();
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_3").unwrap().target_id = "SideSplit_1".into();
+        for (id, source, target) in [
+            ("F_A", "Split_1", "Branch_A"), ("F_B", "Split_1", "Branch_B"),
+            ("F_C", "Branch_A", "Join_1"), ("F_D", "Branch_B", "Join_1"),
+            ("F_E", "Join_1", "Review_1"),
+            ("F_F", "SideSplit_1", "Side_A"), ("F_G", "SideSplit_1", "Side_B"),
+            ("F_H", "Side_A", "SideJoin_1"), ("F_I", "Side_B", "SideJoin_1"),
+            ("F_J", "SideJoin_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: target.into(), condition: None,
+            });
+        }
+        validate_model(&model).unwrap();
+        let boundary = model.nodes.iter_mut().find(|node| node.id == "Boundary_A").unwrap();
+        if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &mut boundary.kind {
+            *attached_to_id = "Branch_A".into();
+        }
+        assert!(validate_model(&model).is_err());
+    }
 
     #[test]
     fn timer_profiles_require_explicit_zone_and_supported_start_catch_rules() {

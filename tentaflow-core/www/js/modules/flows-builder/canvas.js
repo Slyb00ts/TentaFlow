@@ -99,7 +99,7 @@ function markUnsupported(node, ports, side) {
 
 function portsForNode(node, template) {
   if (node.type.startsWith('bpmn_')) {
-    return { inputs: ['bpmn_start', 'bpmn_timer_start'].includes(node.type) ? [] : [{ name: 'in', type: 'any' }],
+    return { inputs: ['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(node.type) ? [] : [{ name: 'in', type: 'any' }],
       outputs: node.type === 'bpmn_end' ? [] : [{ name: 'full', type: 'any' }] };
   }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
@@ -430,8 +430,20 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       const errors = [];
       for (const node of this.nodes) {
-        if (!['bpmn_timer_start', 'bpmn_timer_catch'].includes(node.type)) continue;
+        if (!['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type)) continue;
         const [kind, timer] = Object.entries(node.config.timer)[0];
+        if (kind === 'Date' && (!timer.at || !timer.at.trim())) {
+          errors.push(I18n.t('bpmn.timer_date_required', { node: node.label || node.id }));
+        }
+        if (node.type === 'bpmn_boundary_timer') {
+          const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
+          if (!parent || !['bpmn_user_task', 'bpmn_service_task'].includes(parent.type)) {
+            errors.push(I18n.t('bpmn.boundary_required'));
+          }
+          if (!['Date', 'Duration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
+            errors.push(I18n.t('bpmn.boundary_timer_invalid', { node: node.label || node.id }));
+          }
+        }
         const fields = kind === 'Daily'
           ? [['hour', 'timer_hour', 0, 23], ['minute', 'timer_minute', 0, 59]]
           : ['Duration', 'Cycle'].includes(kind) ? [['seconds', 'timer_seconds', kind === 'Cycle' ? 300 : 1, 31536000]] : [];
@@ -694,9 +706,51 @@ export class FlowCanvas {
     }
     if (!changed) return;
     n.config = { ...n.config, ...patch };
+    if (this.mode === 'bpmn' && n.type === 'bpmn_boundary_timer' && Object.hasOwn(patch, 'attachedToId')) {
+      this._positionBoundary(n);
+    }
     this._pushHistory();
     this._renderSingleNode(n);
     this.onChange();
+  }
+
+  _positionBoundary(node) {
+    const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
+    if (!parent || !['bpmn_user_task', 'bpmn_service_task'].includes(parent.type)) return;
+    const centerX = node.x + node.width / 2;
+    const centerY = node.y + node.height / 2;
+    let x = Math.max(parent.x, Math.min(centerX, parent.x + parent.width));
+    let y = Math.max(parent.y, Math.min(centerY, parent.y + parent.height));
+    if (x === centerX && y === centerY) {
+      const sides = [
+        [centerX - parent.x, parent.x, centerY],
+        [parent.x + parent.width - centerX, parent.x + parent.width, centerY],
+        [centerY - parent.y, centerX, parent.y],
+        [parent.y + parent.height - centerY, centerX, parent.y + parent.height],
+      ];
+      sides.sort((left, right) => left[0] - right[0]);
+      [, x, y] = sides[0];
+    }
+    const occupied = this.nodes.filter((candidate) => candidate !== node && candidate.type === 'bpmn_boundary_timer'
+      && candidate.config.attachedToId === parent.id);
+    if (occupied.some((candidate) => Math.hypot(candidate.x + candidate.width / 2 - x, candidate.y + candidate.height / 2 - y) < node.width)) {
+      const positions = [];
+      for (let offset = 0; offset <= parent.width; offset += node.width) {
+        positions.push([parent.x + offset, parent.y], [parent.x + offset, parent.y + parent.height]);
+      }
+      positions.push([parent.x + parent.width, parent.y], [parent.x + parent.width, parent.y + parent.height]);
+      for (let offset = 0; offset <= parent.height; offset += node.height) {
+        positions.push([parent.x, parent.y + offset], [parent.x + parent.width, parent.y + offset]);
+      }
+      positions.sort((left, right) => Math.hypot(left[0] - x, left[1] - y) - Math.hypot(right[0] - x, right[1] - y));
+      const free = positions.find(([candidateX, candidateY]) => occupied.every((candidate) => Math.hypot(
+        candidate.x + candidate.width / 2 - candidateX,
+        candidate.y + candidate.height / 2 - candidateY,
+      ) >= node.width));
+      if (free) [x, y] = free;
+    }
+    node.x = x - node.width / 2;
+    node.y = y - node.height / 2;
   }
 
   updateNodeLabel(nodeId, label) {
@@ -727,6 +781,11 @@ export class FlowCanvas {
   removeNodes(ids) {
     if (this.readOnly) return;
     const idSet = new Set(ids);
+    if (this.mode === 'bpmn') {
+      for (const node of this.nodes) {
+        if (node.type === 'bpmn_boundary_timer' && idSet.has(node.config.attachedToId)) idSet.add(node.id);
+      }
+    }
     this.nodes = this.nodes.filter((n) => !idSet.has(n.id));
     this.edges = this.edges.filter((e) => !idSet.has(e.from_node) && !idSet.has(e.to_node));
     this._clearRemovedDefaults();
@@ -754,7 +813,14 @@ export class FlowCanvas {
       if (this.mode === 'bpmn' && clone.type === 'bpmn_exclusive_gateway') clone.config.defaultFlowId = null;
       clones.push(clone);
     }
+    if (this.mode === 'bpmn') {
+      for (const clone of clones) {
+        if (clone.type !== 'bpmn_boundary_timer') continue;
+        clone.config.attachedToId = idMap.get(clone.config.attachedToId) || clone.config.attachedToId;
+      }
+    }
     this.nodes.push(...clones);
+    if (this.mode === 'bpmn') clones.filter((clone) => clone.type === 'bpmn_boundary_timer').forEach((clone) => this._positionBoundary(clone));
     this.selectedIds = new Set(clones.map((c) => c.id));
     this._pushHistory();
     this.render();
@@ -895,7 +961,7 @@ export class FlowCanvas {
     const source = this.nodes.find((node) => node.id === sourceId);
     const target = this.nodes.find((node) => node.id === targetId);
     if (!source || !target) return false;
-    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || ['bpmn_start', 'bpmn_timer_start'].includes(target.type))) return false;
+    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || ['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(target.type))) return false;
     if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
     const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
     if (this.mode === 'bpmn') edge.condition = null;
@@ -934,6 +1000,7 @@ export class FlowCanvas {
   render() {
     this._renderRegions();
     this._renderNodes();
+    this._layoutProcessLabels();
     this._renderEdges();
     this._applyView();
     if (this.hintEl) this.hintEl.style.display = this.nodes.length === 0 ? 'flex' : 'none';
@@ -992,7 +1059,11 @@ export class FlowCanvas {
 
   _renderNodes() {
     this.nodesLayer.innerHTML = '';
-    for (const n of this.nodes) {
+    const ordered = this.mode === 'bpmn'
+      ? [...this.nodes.filter((node) => node.type !== 'bpmn_boundary_timer'),
+        ...this.nodes.filter((node) => node.type === 'bpmn_boundary_timer')]
+      : this.nodes;
+    for (const n of ordered) {
       this.nodesLayer.appendChild(this._buildNodeEl(n));
     }
     this._applySelectionClasses();
@@ -1003,6 +1074,7 @@ export class FlowCanvas {
     const fresh = this._buildNodeEl(n);
     if (old) old.replaceWith(fresh);
     else this.nodesLayer.appendChild(fresh);
+    this._layoutProcessLabels();
     this._applySelectionClasses();
     this._renderRegions();
     this._renderEdges();
@@ -1031,13 +1103,17 @@ export class FlowCanvas {
       div.style.width = `${n.width}px`;
       div.style.height = `${n.height}px`;
       const title = n.label || tmpl.label;
-      const event = ['bpmn_start', 'bpmn_end', 'bpmn_timer_start', 'bpmn_timer_catch'].includes(n.type);
+      const event = ['bpmn_start', 'bpmn_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(n.type);
+      if (n.type === 'bpmn_boundary_timer') {
+        div.classList.add(n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
+      }
       const gateway = n.type.endsWith('_gateway');
       div.innerHTML = `
         <div class="fb-process-symbol"><svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}</div>
-        ${event || gateway ? `<div class="fb-process-label">${escapeHtml(title)}</div>` : ''}
-        ${['bpmn_start', 'bpmn_timer_start'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
+        <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
+        <span class="fb-process-label-leader" aria-hidden="true"></span>
+        ${['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
         ${n.type === 'bpmn_end' ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
       div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
       div.setAttribute('aria-label', title);
@@ -1082,6 +1158,84 @@ export class FlowCanvas {
       ${outPortsHtml}
     `;
     return div;
+  }
+
+  _layoutProcessLabels() {
+    if (this.mode !== 'bpmn') return;
+    const nodeRects = this.nodes.map((node) => ({
+      left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
+    }));
+    const labels = [];
+    for (const node of this.nodes) {
+      const element = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+      const label = element?.querySelector('.fb-process-label');
+      if (!label) continue;
+      const title = element.querySelector('.fb-process-symbol > span');
+      element.classList.remove('fb-external-label');
+      const outside = !title || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
+      element.classList.toggle('fb-external-label', outside && !!title);
+      label.hidden = !outside;
+      const leader = element.querySelector('.fb-process-label-leader');
+      leader.hidden = !outside;
+      if (outside) labels.push({ node, element, label, leader });
+    }
+    labels.sort((left, right) => {
+      const priority = ({ node }) => node.type === 'bpmn_boundary_timer' ? 1
+        : ['bpmn_user_task', 'bpmn_service_task'].includes(node.type) ? 0 : 2;
+      return priority(left) - priority(right) || left.node.id.localeCompare(right.node.id);
+    });
+    const occupied = [];
+    const gap = 12;
+    const overlaps = (left, right) => left.left < right.right + gap && left.right + gap > right.left
+      && left.top < right.bottom + gap && left.bottom + gap > right.top;
+    for (const { node, element, label, leader } of labels) {
+      const width = label.offsetWidth;
+      const height = label.offsetHeight;
+      if (!width || !height) continue;
+      const centerX = node.x + node.width / 2;
+      const centerY = node.y + node.height / 2;
+      const parent = node.type === 'bpmn_boundary_timer'
+        ? this.nodes.find((candidate) => candidate.id === node.config.attachedToId) : null;
+      const side = parent && Math.abs(centerX - (parent.x + parent.width)) <= 1 ? 'right'
+        : parent && Math.abs(centerX - parent.x) <= 1 ? 'left'
+          : parent && Math.abs(centerY - parent.y) <= 1 ? 'top'
+            : parent && Math.abs(centerY - (parent.y + parent.height)) <= 1 ? 'bottom'
+              : null;
+      const sides = side ? [side, ...['top', 'bottom', 'right', 'left'].filter((candidate) => candidate !== side)]
+        : element.classList.contains('fb-external-label') ? ['top', 'bottom', 'left', 'right']
+          : ['bottom', 'top', 'right', 'left'];
+      let selected;
+      for (let slot = 0; slot <= this.nodes.length + labels.length + 4 && !selected; slot += 1) {
+        const shift = slot === 0 ? 0 : (slot % 2 ? 1 : -1) * Math.ceil(slot / 2);
+        for (const direction of sides) {
+          const x = direction === 'left' ? node.x - width - gap
+            : direction === 'right' ? node.x + node.width + gap
+              : centerX - width / 2 + shift * (width + gap);
+          const y = direction === 'top' ? node.y - height - gap
+            : direction === 'bottom' ? node.y + node.height + gap
+              : centerY - height / 2 + shift * (height + gap);
+          const rect = { left: x, top: y, right: x + width, bottom: y + height };
+          if (!nodeRects.some((other) => overlaps(rect, other)) && !occupied.some((other) => overlaps(rect, other))) {
+            selected = rect;
+            break;
+          }
+        }
+      }
+      if (!selected) continue;
+      label.style.left = `${selected.left - node.x}px`;
+      label.style.top = `${selected.top - node.y}px`;
+      const targetX = Math.max(selected.left, Math.min(centerX, selected.right));
+      const targetY = Math.max(selected.top, Math.min(centerY, selected.bottom));
+      const sourceX = Math.max(node.x, Math.min(targetX, node.x + node.width));
+      const sourceY = Math.max(node.y, Math.min(targetY, node.y + node.height));
+      const distance = Math.hypot(targetX - sourceX, targetY - sourceY);
+      leader.style.left = `${sourceX - node.x}px`;
+      leader.style.top = `${sourceY - node.y}px`;
+      leader.style.width = `${distance}px`;
+      leader.style.transform = `rotate(${Math.atan2(targetY - sourceY, targetX - sourceX)}rad)`;
+      leader.hidden = distance === 0;
+      occupied.push(selected);
+    }
   }
 
   _renderMissingRows(missing) {
@@ -1322,11 +1476,13 @@ export class FlowCanvas {
       maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height : NODE_H_APPROX));
       if (this.mode === 'bpmn') {
         const label = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(n.id)}"] .fb-process-label`);
-        if (label) {
-          const left = n.x + label.offsetLeft - label.offsetWidth / 2;
+        if (label && !label.hidden && label.offsetWidth && label.offsetHeight) {
+          const left = n.x + Number.parseFloat(label.style.left);
+          const top = n.y + Number.parseFloat(label.style.top);
           minX = Math.min(minX, left);
+          minY = Math.min(minY, top);
           maxX = Math.max(maxX, left + label.offsetWidth);
-          maxY = Math.max(maxY, n.y + label.offsetTop + label.offsetHeight);
+          maxY = Math.max(maxY, top + label.offsetHeight);
         }
       }
     }
@@ -1396,6 +1552,7 @@ export class FlowCanvas {
    * wprost o całość.
    */
   fitToContent(minZoom = 0) {
+    this._layoutProcessLabels();
     const bounds = this._contentBounds();
     if (!bounds) { this.resetZoom(); return; }
     const { minX, minY, maxX, maxY } = bounds;
@@ -1493,17 +1650,33 @@ export class FlowCanvas {
       const additive = ev.shiftKey;
       if (!this.selectedIds.has(id)) this.selectNode(id, { additive });
       this._bringToFront(nodeEl);
+      if (this.mode === 'bpmn') {
+        for (const boundary of this.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_timer' && candidate.config.attachedToId === id)) {
+          const boundaryEl = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(boundary.id)}"]`);
+          if (boundaryEl) this._bringToFront(boundaryEl);
+        }
+      }
       if (this.readOnly) return;
       const origs = new Map();
       for (const sid of this.selectedIds) {
         const nd = this.nodes.find((n) => n.id === sid);
         if (nd) origs.set(sid, { x: nd.x, y: nd.y });
       }
+      const dependents = new Map();
+      if (this.mode === 'bpmn') {
+        for (const boundary of this.nodes) {
+          if (boundary.type !== 'bpmn_boundary_timer' || this.selectedIds.has(boundary.id)) continue;
+          if (origs.has(boundary.config.attachedToId)) {
+            dependents.set(boundary.id, { x: boundary.x, y: boundary.y, parentId: boundary.config.attachedToId });
+          }
+        }
+      }
       this._draggingNode = {
         ids: [...this.selectedIds],
         startClientX: ev.clientX,
         startClientY: ev.clientY,
         origs,
+        dependents,
         moved: false,
         pointerId: ev.pointerId,
       };
@@ -1562,10 +1735,27 @@ export class FlowCanvas {
         if (!n || !orig) continue;
         n.x = Math.round((orig.x + dx) / GRID) * GRID;
         n.y = Math.round((orig.y + dy) / GRID) * GRID;
+        if (this.mode === 'bpmn' && n.type === 'bpmn_boundary_timer' && !this._draggingNode.origs.has(n.config.attachedToId)) {
+          this._positionBoundary(n);
+        }
         const el = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(id)}"]`);
         if (el) {
           el.style.left = `${n.x}px`;
           el.style.top = `${n.y}px`;
+          el.classList.add('dragging');
+        }
+      }
+      for (const [id, original] of this._draggingNode.dependents) {
+        const parent = this.nodes.find((node) => node.id === original.parentId);
+        const parentOriginal = this._draggingNode.origs.get(original.parentId);
+        const boundary = this.nodes.find((node) => node.id === id);
+        if (!parent || !parentOriginal || !boundary) continue;
+        boundary.x = original.x + parent.x - parentOriginal.x;
+        boundary.y = original.y + parent.y - parentOriginal.y;
+        const el = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(id)}"]`);
+        if (el) {
+          el.style.left = `${boundary.x}px`;
+          el.style.top = `${boundary.y}px`;
           el.classList.add('dragging');
         }
       }
@@ -1615,6 +1805,7 @@ export class FlowCanvas {
     if (this._draggingNode && this._draggingNode.pointerId === ev.pointerId) {
       this.nodesLayer.querySelectorAll('.fb-node.dragging').forEach((el) => el.classList.remove('dragging'));
       if (this._draggingNode.moved) {
+        this._layoutProcessLabels();
         this._pushHistory();
         this.onChange();
         this._suppressNextClick = true;

@@ -96,6 +96,31 @@ function inspector(graph, readOnly = false) {
     onLabelChange: (id, value) => graph.updateNodeLabel(id, value), onDelete: (id) => graph.removeNodes([id]), onDuplicate: (id) => graph.duplicateNodes([id]) });
 }
 function userNode(graph) { graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), 250, 300); return graph.nodes.at(-1); }
+function boundaryModel() {
+  const model = emptyProcessModel();
+  model.timerTimezone = 'Europe/Warsaw';
+  model.variables = { business_key: { inner_value: 'R&D Łódź' } };
+  model.nodes.splice(1, 0,
+    { id: 'Review', name: 'Review contract', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } },
+    { id: 'Timer_A', name: 'Deadline', kind: { BoundaryTimer: { attachedToId: 'Review', cancelActivity: true, timer: { Duration: { seconds: 90 } } } } },
+    { id: 'Timer_B', name: 'Reminder', kind: { BoundaryTimer: { attachedToId: 'Review', cancelActivity: false, timer: { Date: { at: '2027-01-02T03:04:05+01:00' } } } } });
+  model.sequenceFlows = [
+    { id: 'Flow_1', sourceId: 'Start', targetId: 'Review', condition: null },
+    { id: 'Flow_2', sourceId: 'Review', targetId: 'End', condition: null },
+    { id: 'Flow_3', sourceId: 'Timer_A', targetId: 'End', condition: null },
+    { id: 'Flow_4', sourceId: 'Timer_B', targetId: 'End', condition: null },
+  ];
+  model.diagram.shapes = [
+    { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
+    { elementId: 'Review', x: 200, y: 160, width: 240, height: 96 },
+    { elementId: 'Timer_A', x: 412, y: 228, width: 56, height: 56 },
+    { elementId: 'Timer_B', x: 172, y: 228, width: 56, height: 56 },
+    { elementId: 'End', x: 550, y: 160, width: 56, height: 56 },
+  ];
+  model.diagram.edges = model.sequenceFlows.map((edge) => ({ sequenceFlowId: edge.id,
+    waypoints: [{ x: 100, y: 180 }, { x: 300, y: 180 }] }));
+  return model;
+}
 function poll() { return [...intervals.values()].find((row) => row.delay === 3000)?.callback(); }
 async function monitor(current, additions = {}) {
   fixtures({ processInstanceGetRequest: { instance: current }, processHistoryRequest: { events: [], nextSeq: 0, hasMore: false }, ...additions });
@@ -124,6 +149,109 @@ test('model round trip preserves stable sequence IDs, DI, default path and opaqu
   assert.match(graph.nodesLayer.textContent, /<Choice>/);
   assert.equal(graph.nodesLayer.querySelector('choice'), null, 'names remain text');
   graph.destroy();
+});
+
+test('boundary siblings retain stable attachment, modes, DI and reject incoming sequence flow', () => {
+  const model = boundaryModel();
+  const graph = canvas(model);
+  assert.deepEqual(graph.getData(), model);
+  assert.equal(graph.nodesLayer.querySelectorAll('.bpmn_boundary_timer').length, 2);
+  assert.equal(graph.nodesLayer.querySelector('.bpmn_boundary_timer.fb-boundary-interrupting').dataset.nodeId, 'Timer_A');
+  assert.equal(graph.nodesLayer.querySelector('.bpmn_boundary_timer.fb-boundary-noninterrupting').dataset.nodeId, 'Timer_B');
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="Timer_A"] .fb-port-in'), null);
+  assert.equal(graph.connectNodes('Start', 'Timer_A'), false);
+  assert.deepEqual(graph.getData(), model);
+  graph.destroy();
+});
+
+test('boundary inspector uses stable activity selection and an actual checked toggle', async () => {
+  const graph = canvas(boundaryModel());
+  const boundary = graph.nodes.find((node) => node.id === 'Timer_A');
+  const panel = inspector(graph); panel.show(boundary, graph.templates.get(boundary.type));
+  await flush(2);
+  const attach = panel.root.querySelector('[data-process="attachedToId"]');
+  assert.equal(attach.value, 'Review');
+  assert.match(panel.root.querySelector('[data-boundary-target]').textContent, /Review contract/);
+  assert.deepEqual([...panel.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration']);
+  const toggle = panel.root.querySelector('[data-process="cancelActivity"]');
+  toggle.checked = false;
+  toggle.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { checked: false } }));
+  assert.equal(boundary.config.cancelActivity, false);
+  assert.ok(graph.nodesLayer.querySelector('[data-node-id="Timer_A"]').classList.contains('fb-boundary-noninterrupting'));
+  change(attach, '');
+  assert.equal(boundary.config.attachedToId, null);
+  assert.ok(graph.validate().length > 0);
+  change(attach, 'Review');
+  assert.equal(boundary.config.attachedToId, 'Review');
+  change(panel.root.querySelector('[data-process="timerType"]'), 'Date');
+  await flush(2);
+  assert.ok(graph.validate().length > 0, 'an empty date is not a valid saved rule');
+  change(panel.root.querySelector('[data-process="timerAt"]'), '2027-01-02T03:04:05+01:00');
+  assert.deepEqual(boundary.config.timer, { Date: { at: '2027-01-02T03:04:05+01:00' } });
+  assert.deepEqual(graph.validate(), []);
+  const readonly = inspector(graph, true); readonly.show(boundary, graph.templates.get(boundary.type));
+  assert.ok(readonly.root.querySelector('[data-process="attachedToId"]').hasAttribute('disabled'));
+  assert.ok(readonly.root.querySelector('[data-process="cancelActivity"]').hasAttribute('disabled'));
+  readonly.root.querySelector('[data-process="cancelActivity"]').dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+  assert.equal(boundary.config.cancelActivity, false);
+  graph.destroy(); panel.destroy(); readonly.destroy();
+});
+
+test('boundary moves with its activity once, cascades on delete and remaps cloned parent', () => {
+  const graph = canvas(boundaryModel());
+  graph.view.zoom = 1;
+  const review = graph.nodes.find((node) => node.id === 'Review');
+  const first = graph.nodes.find((node) => node.id === 'Timer_A');
+  const original = graph.getData();
+  const before = { parentX: review.x, childX: first.x };
+  const element = graph.nodesLayer.querySelector('[data-node-id="Review"]');
+  element.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 33, button: 0, clientX: 200, clientY: 200 }));
+  graph._flushPointerMove(250, 200);
+  window.dispatchEvent(new window.PointerEvent('pointerup', { pointerId: 33, button: 0 }));
+  assert.equal(review.x - before.parentX, first.x - before.childX);
+  graph.undo(); assert.deepEqual(graph.getData(), original);
+  graph.redo();
+  assert.equal(graph.nodes.find((node) => node.id === 'Review').x - before.parentX,
+    graph.nodes.find((node) => node.id === 'Timer_A').x - before.childX);
+  graph.duplicateNodes(['Review', 'Timer_A']);
+  const clones = graph.nodes.filter((node) => graph.selectedIds.has(node.id));
+  const cloneParent = clones.find((node) => node.type === 'bpmn_user_task');
+  const cloneBoundary = clones.find((node) => node.type === 'bpmn_boundary_timer');
+  assert.equal(cloneBoundary.config.attachedToId, cloneParent.id);
+  graph.duplicateNodes(['Timer_B']);
+  const reminderClone = graph.nodes.find((node) => graph.selectedIds.has(node.id));
+  assert.equal(reminderClone.config.attachedToId, 'Review');
+  assert.notEqual(reminderClone.id, 'Timer_B');
+  assert.notDeepEqual({ x: reminderClone.x, y: reminderClone.y }, { x: graph.nodes.find((node) => node.id === 'Timer_B').x, y: graph.nodes.find((node) => node.id === 'Timer_B').y });
+  graph.removeNodes(['Review']);
+  assert.ok(!graph.nodes.some((node) => ['Review', 'Timer_A', 'Timer_B', reminderClone.id].includes(node.id)));
+  assert.ok(graph.nodes.some((node) => node.id === 'End'));
+  graph.undo(); assert.ok(graph.nodes.some((node) => node.id === 'Review'));
+  graph.destroy();
+});
+
+test('incomplete boundary attachment or date blocks the real save and publication requests', async () => {
+  const original = definition('boundary-save', { model: boundaryModel() });
+  const state = await mount(original, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...original, model: payload.model, draftRevision: 5 } }),
+    processDefinitionPublishRequest: () => ({ definition: { ...original, publishedVersion: 1 }, version: { version: 1, model: state.canvas.getData() } }),
+  });
+  state.canvas.selectNode('Timer_A'); await flush(2);
+  change(state.config.root.querySelector('[data-process="attachedToId"]'), '');
+  assert.equal(await builder._save(), false);
+  await builder._publish();
+  assert.equal(calls.some((call) => call.kind === 'processDefinitionSaveRequest' || call.kind === 'processDefinitionPublishRequest'), false);
+  change(state.config.root.querySelector('[data-process="attachedToId"]'), 'Review');
+  change(state.config.root.querySelector('[data-process="timerType"]'), 'Date');
+  await flush(2);
+  assert.equal(await builder._save(), false);
+  assert.equal(calls.some((call) => call.kind === 'processDefinitionSaveRequest'), false);
+  change(state.config.root.querySelector('[data-process="timerAt"]'), '2027-01-02T03:04:05+01:00');
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest');
+  assert.deepEqual(saved.payload.model.nodes.find((node) => node.id === 'Timer_A').kind.BoundaryTimer, {
+    attachedToId: 'Review', cancelActivity: true, timer: { Date: { at: '2027-01-02T03:04:05+01:00' } },
+  });
 });
 
 test('canvas connection and undo preserve identity and deletion clears an XOR default', () => {
@@ -174,10 +302,10 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
-test('palette offers only the eight supported elements and cancels drag/filter work when disposed', async () => {
+test('palette offers only the nine supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 8);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 9);
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -332,6 +460,22 @@ test('human completion fetches full authorized work and sends instance revision 
   assert.equal(win.querySelector('[data-complete]'), null);
 });
 
+test('instance window keeps its localized title while the full long definition name remains visible in the summary', async () => {
+  const name = `Quarterly approval <source> & Łódź ${'long process title '.repeat(12)}`;
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const win = await monitor(instance(`long-title-${language}`, { definitionName: name }));
+      assert.equal(win.shadowRoot.querySelector('.tf-window-title-text').textContent, I18n.t('bpmn.instance'));
+      assert.equal(win.querySelector('[data-summary] h2').textContent, name);
+      assert.equal(win.querySelector('[data-summary] h2').querySelector('source'), null);
+      assert.ok(win.querySelector('[data-summary]').textContent.includes(I18n.t('bpmn.version_number', { version: 2 })));
+      assert.ok(win.querySelector('[data-variables] tf-code-editor').value.includes('Purchase_ID'));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('human verification reads the persisted ActivityResult and submits only the decision', async () => {
   const task = { userTaskId: 'verify', nodeId: 'Check', name: 'Check contract', assigneeUserId: 'anna', kind: 'Verification', status: 'Open', revision: 1, canComplete: true };
   const current = instance('verify-run', { userTasks: [task] }); const result = { outcome: 'Completed', summary: 'Contract validated', code: null, outputs: { Approved_ID: true }, evidence: ['Actual source evidence'] };
@@ -413,7 +557,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 8);
+    assert.equal(processTemplates().length, 9);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
@@ -568,6 +712,27 @@ test('process timezone requires an explicit value and actual undo/redo preserves
   assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false);
 });
 
+test('boundary-only processes expose the editable timezone while timerless processes hide it', async () => {
+  const boundary = boundaryModel(); delete boundary.timerTimezone;
+  const current = definition('boundary-timezone', { model: boundary });
+  const state = await mount(current, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...current, model: payload.model, draftRevision: 5 } }),
+  });
+  const field = state.root.querySelector('[data-role="timer-timezone"]');
+  assert.equal(field.hidden, false);
+  assert.equal(field.hasAttribute('disabled'), false);
+  assert.equal(field.value, '');
+  assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false, 'the editor does not invent a timezone');
+  change(field, 'Europe/Warsaw');
+  assert.equal(state.canvas.getData().timerTimezone, 'Europe/Warsaw');
+  assert.equal(await builder._save(), true);
+  assert.equal(calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model.timerTimezone, 'Europe/Warsaw');
+  const catchState = await mount(definition('catch-timezone', { model: timedModel('TimerCatch') }));
+  assert.equal(catchState.root.querySelector('[data-role="timer-timezone"]').hidden, false);
+  const plainState = await mount(definition('plain-timezone'));
+  assert.equal(plainState.root.querySelector('[data-role="timer-timezone"]').hidden, true);
+});
+
 test('timer publication requires a real arming confirmation and refreshes the authoritative schedule', async () => {
   const current = definition('timer-publish', { model: timedModel('TimerStart', 'Cycle', { seconds: 300, totalFirings: 3 }) });
   let published = false; let confirmations = 0;
@@ -628,18 +793,85 @@ test('BPMN fit includes the rendered event label without altering stored DI', ()
   const node = graph.nodes[0];
   const label = graph.nodesLayer.querySelector('[data-node-id="Start"] .fb-process-label');
   Object.defineProperties(label, {
-    offsetLeft: { value: node.width / 2 }, offsetTop: { value: node.height + 10 },
     offsetWidth: { value: 200 }, offsetHeight: { value: 400 },
   });
   graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 500, height: 400 });
   const original = graph.getData();
+  graph._layoutProcessLabels();
   const bounds = graph._contentBounds();
-  assert.equal(bounds.minX, node.x + node.width / 2 - 100);
-  assert.equal(bounds.maxY, node.y + node.height + 410);
+  assert.equal(bounds.minX, Math.min(...graph.nodes.map((row) => row.x), node.x + parseFloat(label.style.left)));
+  assert.equal(bounds.maxY, Math.max(...graph.nodes.map((row) => row.y + row.height), node.y + parseFloat(label.style.top) + 400));
   graph.fitToContent();
   assert.ok(graph.view.y + bounds.maxY * graph.view.zoom <= 400);
   assert.ok(graph.view.y + bounds.minY * graph.view.zoom >= 0);
   assert.deepEqual(graph.getData(), original);
+  graph.destroy();
+});
+
+test('BPMN full task and sibling boundary names occupy separate measured regions before and after Fit', () => {
+  const model = boundaryModel();
+  const taskName = `Task A ${'A'.repeat(214)}`;
+  const firstName = `Boundary B ${'B'.repeat(204)}`;
+  const secondName = `Boundary C ${'C'.repeat(204)}`;
+  model.nodes.find((node) => node.id === 'Review').name = taskName;
+  model.nodes.find((node) => node.id === 'Timer_A').name = firstName;
+  model.nodes.find((node) => node.id === 'Timer_B').name = secondName;
+  const parent = model.diagram.shapes.find((shape) => shape.elementId === 'Review');
+  for (const [id, centerY] of [['Timer_A', 175], ['Timer_B', 245]]) {
+    const shape = model.diagram.shapes.find((row) => row.elementId === id);
+    shape.x = parent.x + parent.width - shape.width / 2;
+    shape.y = centerY - shape.height / 2;
+  }
+  const graph = canvas(model);
+  const original = graph.getData();
+  const taskElement = graph.nodesLayer.querySelector('[data-node-id="Review"]');
+  const taskText = taskElement.querySelector('.fb-process-symbol > span');
+  Object.defineProperties(taskText, {
+    clientHeight: { get: () => taskElement.classList.contains('fb-external-label') ? 0 : 68 },
+    scrollHeight: { get: () => taskElement.classList.contains('fb-external-label') ? 0 : 180 },
+    clientWidth: { value: 180 }, scrollWidth: { value: 180 },
+  });
+  for (const [id, height] of [['Review', 180], ['Timer_A', 190], ['Timer_B', 190]]) {
+    const label = graph.nodesLayer.querySelector(`[data-node-id="${id}"] .fb-process-label`);
+    Object.defineProperties(label, { offsetWidth: { value: 200 }, offsetHeight: { value: height } });
+  }
+  graph._layoutProcessLabels();
+  assert.equal(taskElement.classList.contains('fb-external-label'), true);
+  const named = [['Review', taskName], ['Timer_A', firstName], ['Timer_B', secondName]];
+  const rects = named.map(([id, name]) => {
+    const node = graph.nodes.find((row) => row.id === id);
+    const element = graph.nodesLayer.querySelector(`[data-node-id="${id}"]`);
+    const label = element.querySelector('.fb-process-label');
+    assert.equal(label.hidden, false);
+    assert.equal(label.textContent, name);
+    assert.equal(element.querySelector('.fb-process-label-leader').hidden, false);
+    const left = node.x + parseFloat(label.style.left);
+    const top = node.y + parseFloat(label.style.top);
+    return { left, top, right: left + label.offsetWidth, bottom: top + label.offsetHeight };
+  });
+  const crosses = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  for (const label of rects) {
+    for (const node of graph.nodes) {
+      assert.equal(crosses(label, { left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height }), false);
+    }
+  }
+  for (let i = 0; i < rects.length; i += 1) {
+    for (let j = i + 1; j < rects.length; j += 1) assert.equal(crosses(rects[i], rects[j]), false);
+  }
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 900, height: 600 });
+  graph.fitToContent();
+  assert.equal(taskElement.classList.contains('fb-external-label'), true);
+  const bounds = graph._contentBounds();
+  for (const label of rects) {
+    assert.ok(bounds.minX <= label.left && bounds.maxX >= label.right);
+    assert.ok(bounds.minY <= label.top && bounds.maxY >= label.bottom);
+  }
+  assert.deepEqual(graph.getData(), original);
+  graph.updateNodeLabel('Review', 'Review contract');
+  const shortTask = graph.nodesLayer.querySelector('[data-node-id="Review"]');
+  assert.equal(shortTask.classList.contains('fb-external-label'), false);
+  assert.equal(shortTask.querySelector('.fb-process-label').hidden, true);
+  assert.equal(shortTask.querySelector('.fb-process-symbol > span').textContent.trim(), 'Review contract');
   graph.destroy();
 });
 
@@ -789,6 +1021,75 @@ test('all five locales describe actual timer states and events without raw IDs o
     for (const event of events) assert.doesNotMatch(processEventText({ ...event, nodeName: 'Saved deadline' }), /bpmn\.|private-id|instance_cancelled|\{node\}|\{message\}|\{retry\}|\{due\}|\{actual\}|\{count\}/);
   }
   await I18n.setLanguage('en');
+});
+
+test('all five locales render boundary cancellation truth and preserve arbitrary reasons', async () => {
+  const arbitrary = '<untrusted>' + 'reason_'.repeat(4600);
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const reason of ['activity_completed', 'sibling_interrupted']) {
+        const label = processTimerReasonText(reason);
+        assert.equal(label, I18n.t(`bpmn.timer_reason_${reason}`));
+        assert.doesNotMatch(label, /bpmn\.|activity_completed|sibling_interrupted/);
+        const event = processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline', data: { kind: 'Boundary', reason, timer_id: 'private-id' } });
+        assert.ok(event.includes(label));
+        assert.doesNotMatch(event, /private-id|\{reason\}|\{node\}/);
+      }
+      const noninterrupting = processEventText({ kind: 'timer_fired', nodeName: 'Reminder', data: {
+        kind: 'Boundary', cancel_activity: false, planned_due_at_ms: 1000, fired_at_ms: 2000,
+      } });
+      assert.ok(noninterrupting.includes(I18n.t('bpmn.boundary_noninterrupting')));
+      const interrupting = processEventText({ kind: 'timer_fired', nodeName: 'Deadline', data: {
+        kind: 'Boundary', cancel_activity: true, planned_due_at_ms: 1000, fired_at_ms: 2000,
+      } });
+      assert.ok(interrupting.includes(I18n.t('bpmn.boundary_interrupting')));
+      assert.equal(processTimerReasonText(arbitrary), arbitrary);
+      assert.ok(processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline', data: { reason: arbitrary } }).includes(arbitrary));
+    }
+  } finally { await I18n.setLanguage('en'); }
+  const current = instance('boundary-empty-name', { timers: [{ ...savedTimer({ kind: 'Boundary', nodeName: '' }), attachedToId: 'Review' }] });
+  const win = await monitor(current);
+  assert.ok(win.querySelector('[data-timers]').textContent.includes(I18n.t('bpmn.node_boundary_timer')));
+  assert.ok(win.querySelector('[data-timers]').textContent.includes('Review'));
+  assert.equal(win.querySelector('[data-timers] script'), null);
+});
+
+test('boundary timer shows its actual escaped element ID and ordinal occurrence in five locales', async () => {
+  const captions = {
+    en: ['Attached activity', 'Attached activity (element ID)'],
+    pl: ['Przypięta czynność', 'Przypięta czynność (ID elementu)'],
+    de: ['Angehängte Aktivität', 'Angehängte Aktivität (Element-ID)'],
+    es: ['Actividad adjunta', 'Actividad adjunta (ID del elemento)'],
+    fr: ['Activité attachée', 'Activité attachée (ID de l’élément)'],
+  };
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const graph = canvas(boundaryModel());
+      const boundary = graph.nodes.find((node) => node.id === 'Timer_A');
+      const panel = inspector(graph);
+      panel.show(boundary, graph.templates.get(boundary.type));
+      assert.equal(panel.root.querySelector('[data-process="attachedToId"]').getAttribute('label'), captions[language][0]);
+      const timer = savedTimer({ kind: 'Boundary', nodeName: 'Deadline', attachedToId: 'Review_1' });
+      const win = await monitor(instance(`boundary-id-${language}`, { timers: [timer] }));
+      const terms = [...win.querySelectorAll('[data-timers] dt')].map((term) => term.textContent);
+      const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
+      assert.deepEqual(terms, [I18n.t('bpmn.timer_occurrence'), captions[language][1]]);
+      assert.deepEqual(values, [I18n.t('bpmn.timer_slot', { occurrence: 3, total: 7 }), 'Review_1']);
+      assert.doesNotMatch(terms.join(' '), /bpmn\.|\{occurrence\}|\{total\}/);
+      assert.notEqual(terms[0], terms[1]);
+      win.remove();
+      graph.destroy();
+    }
+    await I18n.setLanguage('en');
+    const untrusted = '<img src=x onerror=alert(1)>';
+    const timer = savedTimer({ kind: 'Boundary', attachedToId: untrusted, totalFirings: null });
+    const win = await monitor(instance('boundary-escaped-id', { timers: [timer] }));
+    const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
+    assert.deepEqual(values, ['3', untrusted]);
+    assert.equal(win.querySelector('[data-timers] img'), null);
+  } finally { await I18n.setLanguage('en'); }
 });
 
 test('terminal timer Error displays its full reason and real incident without offering a service retry', async () => {

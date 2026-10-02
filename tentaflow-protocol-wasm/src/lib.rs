@@ -25904,5 +25904,31 @@ mod process_wire_tests {
         assert_eq!(model.nodes[0].kind, tentaflow_protocol::processes::ProcessNodeKind::TimerStart {
             timer: tentaflow_protocol::processes::ProcessTimerSpec::Daily { hour:9, minute:15, total_firings:Some(3) }
         });
+
+        let boundary = serde_json::json!({
+            "command_id":"7c865aaa-febd-4621-9ae6-35977200a0fd",
+            "definition_id":null,"expected_revision":0,"name":"Boundary","description":"",
+            "model":{"schema_version":1,"process_id":"P_1","timer_timezone":"Europe/Warsaw",
+                "nodes":[
+                    {"id":"Start_1","name":"Start","kind":"Start"},
+                    {"id":"Review_1","name":"Review","kind":{"UserTask":{"assignee_user_id":null,"output_mapping":{}}}},
+                    {"id":"Boundary_1","name":"Deadline","kind":{"BoundaryTimer":{
+                        "attached_to_id":"Review_1","cancel_activity":false,
+                        "timer":{"Duration":{"seconds":90}}}}},
+                    {"id":"End_1","name":"End","kind":"End"}
+                ],
+                "sequence_flows":[],"variables":{"business_key":{"inner_value":"Łódź"}},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), boundary.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed boundary process save request expected");
+        };
+        assert_eq!(model.variables["business_key"]["inner_value"], "Łódź");
+        assert_eq!(model.nodes[2].kind, tentaflow_protocol::processes::ProcessNodeKind::BoundaryTimer {
+            attached_to_id: "Review_1".into(), cancel_activity: false,
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
+        });
     }
 }

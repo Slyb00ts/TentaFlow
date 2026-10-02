@@ -325,7 +325,18 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
-    } else if (kind === 'TimerStart' || kind === 'TimerCatch') {
+    } else if (kind === 'TimerStart' || kind === 'TimerCatch' || kind === 'BoundaryTimer') {
+      if (kind === 'BoundaryTimer') {
+        const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task'].includes(candidate.type));
+        const target = activities.find((candidate) => candidate.id === config.attachedToId);
+        fields += `<tf-select data-process="attachedToId" label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}>
+          <option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>
+          ${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))}</option>`).join('')}
+          ${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable'))}</option>` : ''}
+        </tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>
+        <tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.boundary_mode_hint'))}</p>`;
+      }
       const timerKind = Object.keys(config.timer)[0];
       const timer = config.timer[timerKind];
       const types = kind === 'TimerStart' ? ['Date', 'Duration', 'Cycle', 'Daily'] : ['Date', 'Duration'];
@@ -334,7 +345,7 @@ export class FlowConfig {
       else if (timerKind === 'Duration' || timerKind === 'Cycle') fields += input('timerSeconds', 'timer_seconds', timer.seconds, `type="number" min="${timerKind === 'Cycle' ? 300 : 1}" max="31536000" step="1"`) + `<p class="fb-field-hint">${escapeHtml(I18n.t(timerKind === 'Cycle' ? 'bpmn.timer_cycle_hint' : 'bpmn.timer_duration_hint'))}</p>`;
       else if (timerKind === 'Daily') fields += `<div class="fb-timer-clock">${input('timerHour', 'timer_hour', timer.hour, 'type="number" min="0" max="23" step="1"')}${input('timerMinute', 'timer_minute', timer.minute, 'type="number" min="0" max="59" step="1"')}</div><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_daily_hint'))}</p>`;
       if (timerKind === 'Cycle' || timerKind === 'Daily') fields += input('timerTotal', 'timer_total', timer.totalFirings, 'type="number" min="1" max="4294967295" step="1"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_total_hint'))}</p>`;
-      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : 'bpmn.timer_catch_hint'))}</p>`;
+      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : kind === 'BoundaryTimer' ? 'bpmn.boundary_timer_hint' : 'bpmn.timer_catch_hint'))}</p>`;
     } else if (kind === 'ExclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
@@ -353,7 +364,7 @@ export class FlowConfig {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start'].includes(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
     fields += input('elementId', 'element_id', node.id, 'readonly');
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
@@ -376,7 +387,14 @@ export class FlowConfig {
       if (key === 'editSequence') { canvas.selectEdge(control.value); return; }
       if (this.readOnly) return;
       if (key === 'name') this.opts.onLabelChange(node.id, control.value);
-      else if (key === 'verification') {
+      else if (key === 'cancelActivity') {
+        this.opts.onConfigChange(node.id, { cancelActivity: event.detail?.checked ?? control.checked });
+      } else if (key === 'attachedToId') {
+        this.opts.onConfigChange(node.id, { attachedToId: control.value || null });
+        const selected = canvas.nodes.find((candidate) => candidate.id === control.value);
+        this.root.querySelector('[data-boundary-target]').textContent = selected
+          ? (selected.label || getNodeName(selected.type)) : I18n.t('bpmn.boundary_required');
+      } else if (key === 'verification') {
         this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
         this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';
       } else if (key === 'timerType') {

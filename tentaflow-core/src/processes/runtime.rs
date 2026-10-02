@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use super::model::{and_pairs, validate_variables, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
-    AndReceipt, ForkFrame, PlannedEvent, ProcessActor, ProcessJob, ProcessTimer, ProcessToken,
-    RuntimePlan, RuntimeSnapshot,
+    AndReceipt, BoundaryTimerIncident, CancelledJobClaim, ForkFrame, PlannedEvent, ProcessActor,
+    ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
 };
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -114,7 +114,9 @@ struct Transition<'a> {
     jobs: Vec<ProcessJob>,
     tasks: Vec<ProcessUserTask>,
     receipts: Vec<AndReceipt>,
-    existing_incidents: bool,
+    incidents: Vec<ProcessIncident>,
+    timers: Vec<ProcessTimer>,
+    boundary_incidents: Vec<BoundaryTimerIncident>,
     plan: RuntimePlan,
 }
 
@@ -143,7 +145,9 @@ impl<'a> Transition<'a> {
             jobs: Vec::new(),
             tasks: Vec::new(),
             receipts: Vec::new(),
-            existing_incidents: false,
+            incidents: Vec::new(),
+            timers: Vec::new(),
+            boundary_incidents: Vec::new(),
             plan: RuntimePlan::initial(variables),
         })
     }
@@ -163,7 +167,9 @@ impl<'a> Transition<'a> {
         transition.jobs = snapshot.jobs.clone();
         transition.tasks = snapshot.user_tasks.clone();
         transition.receipts = snapshot.receipts.clone();
-        transition.existing_incidents = !snapshot.instance.incidents.is_empty();
+        transition.incidents = snapshot.instance.incidents.clone();
+        transition.timers = snapshot.timers.clone();
+        transition.boundary_incidents = snapshot.boundary_incidents.clone();
         Ok(transition)
     }
 
@@ -271,6 +277,7 @@ impl<'a> Transition<'a> {
         kind: ProcessUserTaskKind,
         assignee: String,
         outputs: Value,
+        token_id: &str,
     ) {
         let task = ProcessUserTask {
             user_task_id: Uuid::new_v4().to_string(),
@@ -282,10 +289,222 @@ impl<'a> Transition<'a> {
             outputs,
             revision: 1,
             can_complete: false,
+            token_id: Some(token_id.to_owned()),
         };
         self.event("user_task_opened", Some(node.id.clone()), json!({"user_task_id": task.user_task_id, "assignee_user_id": assignee, "kind": task.kind}));
         self.tasks.push(task.clone());
         self.plan.create_user_tasks.push(task);
+    }
+
+    fn arm_timer(
+        &mut self,
+        node: &ProcessNode,
+        token_id: &str,
+        kind: ProcessTimerKind,
+        rule: &tentaflow_protocol::processes::ProcessTimerSpec,
+    ) -> Result<()> {
+        let zone = self
+            .model
+            .timer_timezone
+            .as_deref()
+            .context("process timer timezone is missing")?
+            .to_owned();
+        let due = super::timers::resolve_timer_due(rule, &zone, kind.clone(), self.now_ms);
+        let (due_at_ms, status, last_reason, error_reason) = match due {
+            Ok(due) => (Some(due), ProcessTimerStatus::Pending, None, None),
+            Err(error) if kind == ProcessTimerKind::Boundary => {
+                let reason = format!("{error:#}");
+                (
+                    None,
+                    ProcessTimerStatus::Error,
+                    Some(super::repository::timer_reason(&reason)?),
+                    Some(super::repository::bounded_failure_message(&reason)),
+                )
+            }
+            Err(error) => {
+                self.incident(&node.id, None, "TIMER_ERROR", error.to_string());
+                return Ok(());
+            }
+        };
+        let timer = ProcessTimer {
+            timer_id: Uuid::new_v4().to_string(),
+            org_id: self.org_id.to_owned(),
+            definition_id: self.definition_id.to_owned(),
+            version: self.version,
+            node_id: node.id.clone(),
+            kind: kind.clone(),
+            instance_id: Some(self.instance_id.to_owned()),
+            token_id: Some(token_id.to_owned()),
+            rule: rule.clone(),
+            timezone: zone.to_owned(),
+            anchor_at_ms: self.now_ms,
+            due_at_ms,
+            occurrence: 1,
+            total_firings: Some(1),
+            revision: 1,
+            status: status.clone(),
+            last_reason: last_reason.clone(),
+            next_check_at_ms: due_at_ms.unwrap_or(self.now_ms),
+            created_at_ms: self.now_ms,
+            updated_at_ms: self.now_ms,
+        };
+        let attached_to_id = match &node.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.as_str()),
+            _ => None,
+        };
+        if status == ProcessTimerStatus::Error {
+            let reason = error_reason.context("failed boundary timer has no reason")?;
+            self.incident(&node.id, None, "TIMER_ERROR", reason.clone());
+            let incident_id = self
+                .plan
+                .add_incidents
+                .last()
+                .context("boundary timer failure incident was not created")?
+                .incident_id
+                .clone();
+            self.event("timer_error", Some(node.id.clone()), json!({"kind":kind,"timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":token_id,"incident_id":incident_id,"reason":reason,"due_at_ms":due_at_ms}));
+        } else {
+            self.event("timer_armed", Some(node.id.clone()), json!({"kind":kind,"timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":if kind == ProcessTimerKind::Boundary {Some(token_id)} else {None},"due_at_ms":due_at_ms,"timezone":zone,"occurrence":1}));
+        }
+        self.timers.push(timer.clone());
+        self.plan.create_timers.push(timer);
+        Ok(())
+    }
+
+    fn arm_boundaries(&mut self, activity: &ProcessNode, token_id: &str) -> Result<()> {
+        let boundaries = self.model.nodes.iter().filter(|node| matches!(&node.kind, ProcessNodeKind::BoundaryTimer { attached_to_id, .. } if attached_to_id == &activity.id)).cloned().collect::<Vec<_>>();
+        for node in boundaries {
+            let ProcessNodeKind::BoundaryTimer { timer, .. } = &node.kind else {
+                anyhow::bail!("boundary catalogue contains another node kind");
+            };
+            self.arm_timer(&node, token_id, ProcessTimerKind::Boundary, timer)?;
+        }
+        Ok(())
+    }
+
+    fn disarm_boundaries(
+        &mut self,
+        token_id: &str,
+        reason: &str,
+        winning_timer_id: Option<&str>,
+    ) -> Result<()> {
+        let timers = self
+            .timers
+            .iter()
+            .filter(|timer| {
+                timer.kind == ProcessTimerKind::Boundary
+                    && timer.token_id.as_deref() == Some(token_id)
+                    && matches!(
+                        timer.status,
+                        ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
+                    )
+                    && Some(timer.timer_id.as_str()) != winning_timer_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for timer in timers {
+            let node = self.node(&timer.node_id)?.clone();
+            let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &node.kind else {
+                anyhow::bail!("boundary timer references a different node kind");
+            };
+            self.plan
+                .timer_updates
+                .push(super::repository::TimerUpdate {
+                    timer_id: timer.timer_id.clone(),
+                    expected_revision: timer.revision,
+                    fired_occurrence: None,
+                    occurrence: timer.occurrence,
+                    due_at_ms: None,
+                    status: ProcessTimerStatus::Cancelled,
+                    last_reason: Some(reason.to_owned()),
+                    next_check_at_ms: self.now_ms,
+                });
+            self.event("timer_cancelled",Some(node.id.clone()),json!({"kind":"Boundary","timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":token_id,"reason":reason,"winning_timer_id":winning_timer_id}));
+        }
+        Ok(())
+    }
+
+    fn resolve_boundary_incidents(&mut self, token_id: &str) {
+        let ids = self
+            .boundary_incidents
+            .iter()
+            .filter(|link| link.token_id == token_id)
+            .map(|link| link.incident_id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.resolve_incident(&id);
+        }
+    }
+
+    fn resolve_incident(&mut self, id: &str) {
+        self.incidents.retain(|incident| incident.incident_id != id);
+        if !self
+            .plan
+            .resolve_incident_ids
+            .iter()
+            .any(|existing| existing == id)
+        {
+            self.plan.resolve_incident_ids.push(id.to_owned());
+        }
+    }
+
+    fn interrupt_activity(&mut self, token: &ProcessToken, winning_timer_id: &str) -> Result<()> {
+        ensure!(
+            token.fork_stack.is_empty(),
+            "boundary interruption requires an empty parallel activation stack"
+        );
+        let job_ids = self
+            .jobs
+            .iter()
+            .filter(|job| job.token_id == token.token_id)
+            .map(|job| job.job_id.clone())
+            .collect::<Vec<_>>();
+        self.plan.cancel_job_ids = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.token_id == token.token_id
+                    && matches!(job.status.as_str(), "queued" | "running" | "error")
+            })
+            .map(|job| job.job_id.clone())
+            .collect();
+        self.jobs
+            .retain(|job| !self.plan.cancel_job_ids.contains(&job.job_id));
+        self.plan.cancel_user_task_ids = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.token_id.as_deref() == Some(token.token_id.as_str())
+                    && task.status == ProcessUserTaskStatus::Open
+            })
+            .map(|task| task.user_task_id.clone())
+            .collect();
+        self.tasks
+            .retain(|task| !self.plan.cancel_user_task_ids.contains(&task.user_task_id));
+        self.tokens
+            .retain(|existing| existing.token_id != token.token_id);
+        self.plan.cancel_token_ids.push(token.token_id.clone());
+        self.disarm_boundaries(
+            &token.token_id,
+            "sibling_interrupted",
+            Some(winning_timer_id),
+        )?;
+        self.resolve_boundary_incidents(&token.token_id);
+        let incidents = self
+            .incidents
+            .iter()
+            .filter(|incident| {
+                incident
+                    .job_id
+                    .as_ref()
+                    .is_some_and(|job_id| job_ids.contains(job_id))
+            })
+            .map(|incident| incident.incident_id.clone())
+            .collect::<Vec<_>>();
+        for id in incidents {
+            self.resolve_incident(&id);
+        }
+        Ok(())
     }
 
     fn join(&mut self, token: &ProcessToken) -> Result<()> {
@@ -389,67 +608,22 @@ impl<'a> Transition<'a> {
                 ProcessNodeKind::UserTask {
                     assignee_user_id, ..
                 } => {
-                    self.wait(&token, "waiting");
+                    let token_id = self.wait(&token, "waiting");
                     self.user_task(
                         &node,
                         ProcessUserTaskKind::Work,
                         assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
                         Value::Null,
+                        &token_id,
                     );
+                    self.arm_boundaries(&node, &token_id)?;
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
                     let token_id = self.wait(&token, "waiting");
-                    let due = self
-                        .model
-                        .timer_timezone
-                        .as_deref()
-                        .context("process timer timezone is missing")
-                        .and_then(|timezone| {
-                            super::timers::resolve_timer_due(
-                                &timer,
-                                timezone,
-                                ProcessTimerKind::Catch,
-                                self.now_ms,
-                            )
-                        });
-                    match due {
-                        Ok(due_at_ms) => {
-                            let timer = ProcessTimer {
-                                timer_id: Uuid::new_v4().to_string(),
-                                org_id: self.org_id.to_owned(),
-                                definition_id: self.definition_id.to_owned(),
-                                version: self.version,
-                                node_id: node.id.clone(),
-                                kind: ProcessTimerKind::Catch,
-                                instance_id: Some(self.instance_id.to_owned()),
-                                token_id: Some(token_id),
-                                rule: timer,
-                                timezone: self
-                                    .model
-                                    .timer_timezone
-                                    .clone()
-                                    .context("process timer timezone is missing")?,
-                                anchor_at_ms: self.now_ms,
-                                due_at_ms: Some(due_at_ms),
-                                occurrence: 1,
-                                total_firings: Some(1),
-                                revision: 1,
-                                status: ProcessTimerStatus::Pending,
-                                last_reason: None,
-                                next_check_at_ms: due_at_ms,
-                                created_at_ms: self.now_ms,
-                                updated_at_ms: self.now_ms,
-                            };
-                            self.event("timer_armed", Some(node.id), json!({
-                                "timer_id":timer.timer_id,"kind":timer.kind,"due_at_ms":due_at_ms,
-                                "timezone":timer.timezone,"occurrence":1
-                            }));
-                            self.plan.create_timers.push(timer);
-                        }
-                        Err(error) => {
-                            self.incident(&node.id, None, "TIMER_ERROR", error.to_string())
-                        }
-                    }
+                    self.arm_timer(&node, &token_id, ProcessTimerKind::Catch, &timer)?;
+                }
+                ProcessNodeKind::BoundaryTimer { .. } => {
+                    anyhow::bail!("boundary events are entered only by their attached timer")
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
                     match prepare_service_input(&input_mapping, &self.plan.variables) {
@@ -459,7 +633,7 @@ impl<'a> Transition<'a> {
                                 job_id: Uuid::new_v4().to_string(),
                                 instance_id: self.instance_id.to_owned(),
                                 node_id: node.id.clone(),
-                                token_id,
+                                token_id: token_id.clone(),
                                 input,
                                 status: "queued".into(),
                                 attempt: 0,
@@ -470,14 +644,16 @@ impl<'a> Transition<'a> {
                             };
                             self.event(
                                 "service_queued",
-                                Some(node.id),
+                                Some(node.id.clone()),
                                 json!({"job_id": job.job_id}),
                             );
                             self.jobs.push(job.clone());
                             self.plan.create_jobs.push(job);
+                            self.arm_boundaries(&node, &token_id)?;
                         }
                         Err(error) => {
-                            self.wait(&token, "waiting");
+                            let token_id = self.wait(&token, "waiting");
+                            self.arm_boundaries(&node, &token_id)?;
                             self.incident(&node.id, None, "EXPRESSION_ERROR", error.to_string());
                             break;
                         }
@@ -568,7 +744,7 @@ impl<'a> Transition<'a> {
     }
 
     fn finish(mut self) -> RuntimePlan {
-        self.plan.status = if self.existing_incidents || !self.plan.add_incidents.is_empty() {
+        self.plan.status = if !self.incidents.is_empty() || !self.plan.add_incidents.is_empty() {
             ProcessInstanceStatus::Incident
         } else if self.tokens.is_empty() {
             self.event("instance_completed", None, Value::Null);
@@ -681,7 +857,11 @@ pub fn plan_user_completion(
     let token = transition
         .tokens
         .iter()
-        .find(|token| token.node_id == node.id && token.status == "waiting")
+        .find(|token| {
+            task.token_id.as_deref() == Some(token.token_id.as_str())
+                && token.node_id == node.id
+                && token.status == "waiting"
+        })
         .context("user task waiting token missing")?
         .clone();
     let effective_outputs = match task.kind {
@@ -735,6 +915,8 @@ pub fn plan_user_completion(
         .complete_user_task_ids
         .push(task_id.to_owned());
     transition.tasks.retain(|task| task.user_task_id != task_id);
+    transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+    transition.resolve_boundary_incidents(&token.token_id);
     transition.consume(&token.token_id);
     transition.event(
         if task.kind == ProcessUserTaskKind::Work {
@@ -803,6 +985,7 @@ pub fn plan_job_result(
                 ProcessUserTaskKind::Verification,
                 transition.initiator.to_owned(),
                 serde_json::to_value(result)?,
+                &token.token_id,
             );
         }
         ActivityVerification::Condition { expression } => {
@@ -814,6 +997,12 @@ pub fn plan_job_result(
                 ) {
                     Ok(variables) => {
                         transition.plan.variables = variables;
+                        transition.disarm_boundaries(
+                            &token.token_id,
+                            "activity_completed",
+                            None,
+                        )?;
+                        transition.resolve_boundary_incidents(&token.token_id);
                         transition.consume(&token.token_id);
                         transition.event(
                             "verification_passed",
@@ -890,8 +1079,62 @@ pub(super) fn plan_timer_catch(
     Ok(transition.finish())
 }
 
+pub(super) fn plan_timer_boundary(
+    snapshot: &RuntimeSnapshot,
+    timer: &ProcessTimer,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    ensure!(
+        timer.kind == ProcessTimerKind::Boundary
+            && timer.instance_id.as_deref() == Some(snapshot.instance.instance_id.as_str())
+            && timer.definition_id == snapshot.instance.definition_id
+            && timer.org_id == snapshot.org_id
+            && timer.version == snapshot.instance.version,
+        "boundary timer does not match its pinned instance"
+    );
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let node = transition.node(&timer.node_id)?.clone();
+    let ProcessNodeKind::BoundaryTimer {
+        attached_to_id,
+        cancel_activity,
+        timer: rule,
+    } = &node.kind
+    else {
+        anyhow::bail!("timer does not reference a boundary node");
+    };
+    ensure!(
+        rule == &timer.rule,
+        "boundary timer rule differs from pinned model"
+    );
+    let token = transition
+        .tokens
+        .iter()
+        .find(|token| {
+            timer.token_id.as_deref() == Some(token.token_id.as_str())
+                && token.node_id == *attached_to_id
+                && token.status == "waiting"
+        })
+        .context("boundary attached waiting activation is missing")?
+        .clone();
+    ensure!(
+        token.fork_stack.is_empty(),
+        "boundary attachment has an active parallel fork frame"
+    );
+    if *cancel_activity {
+        transition.interrupt_activity(&token, &timer.timer_id)?;
+    }
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    Ok(transition.finish())
+}
+
 struct RunningJob {
     instance_id: String,
+    attempt: u32,
+    fence: u64,
+    worker_id: String,
     cancel: CancellationToken,
 }
 
@@ -962,17 +1205,40 @@ pub async fn stop(dispatcher: &FlowDispatcher) -> Result<()> {
 }
 
 impl ProcessRuntime {
+    fn signal_cancelled_claims(&self, claims: &[CancelledJobClaim]) {
+        for claim in claims {
+            if let Some(job) = self.running.get(&claim.job_id) {
+                if job.attempt == claim.attempt
+                    && job.fence == claim.fence
+                    && job.worker_id == claim.worker_id
+                {
+                    job.cancel.cancel();
+                }
+            }
+        }
+    }
+
+    fn remove_running_claim(&self, job_id: &str, attempt: u32, fence: u64, worker_id: &str) {
+        self.running.remove_if(job_id, |_, job| {
+            job.attempt == attempt && job.fence == fence && job.worker_id == worker_id
+        });
+    }
+
+    fn handle_timer_drain(&self, drained: super::timers::TimerDrainOutcome) {
+        self.signal_cancelled_claims(&drained.cancelled_claims);
+        if let Err(error) = drained.completion {
+            tracing::error!(error = %error, "process timer drain failed");
+        }
+    }
+
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut jobs = tokio::task::JoinSet::new();
         loop {
             if self.stop.is_cancelled() {
                 break;
             }
-            if let Err(error) =
-                super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis())
-            {
-                tracing::error!(error = %error, "process timer drain failed");
-            }
+            let drained = super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis());
+            self.handle_timer_drain(drained);
             while jobs.len() < 4 && !self.stop.is_cancelled() {
                 let Some(dispatcher) = self.dispatcher.upgrade() else {
                     self.stop.cancel();
@@ -996,6 +1262,9 @@ impl ProcessRuntime {
                     job_id.clone(),
                     RunningJob {
                         instance_id: claimed.job.instance_id.clone(),
+                        attempt: claimed.job.attempt,
+                        fence: claimed.job.fence,
+                        worker_id: self.worker_id.clone(),
                         cancel: cancel.clone(),
                     },
                 );
@@ -1012,7 +1281,7 @@ impl ProcessRuntime {
                         claimed,
                         cancel,
                     )).catch_unwind().await;
-                    worker.running.remove(&job_id);
+                    worker.remove_running_claim(&job_id, attempt, fence, &worker.worker_id);
                     let failure = match result {
                         Ok(Ok(())) => None,
                         Ok(Err(error)) => Some(error.to_string()),
@@ -1193,6 +1462,31 @@ pub(crate) mod test_support {
             edge("ToService", "Start_1", "Service"),
             edge("ToEnd", "Service", "End_1"),
         ];
+        model
+    }
+
+    pub fn with_boundaries(
+        mut model: ProcessModel,
+        activity: &str,
+        boundaries: &[(&str, bool, u32)],
+    ) -> ProcessModel {
+        model.timer_timezone = Some("UTC".into());
+        for (id, interrupt, seconds) in boundaries {
+            model.nodes.push(ProcessNode {
+                id: (*id).into(),
+                name: format!("Boundary {id}"),
+                kind: ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: activity.into(),
+                    cancel_activity: *interrupt,
+                    timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration {
+                        seconds: *seconds,
+                    },
+                },
+            });
+            model
+                .sequence_flows
+                .push(edge(&format!("From_{id}"), id, "End_1"));
+        }
         model
     }
 
@@ -1728,5 +2022,386 @@ mod tests {
         let other_worker = start(&other.db, other.dispatcher()).unwrap();
         assert!(!Arc::ptr_eq(&worker, &other_worker));
         other_worker.shutdown().await.unwrap();
+    }
+
+    fn registry_runtime(fixture: &Fixture, worker_id: &str) -> ProcessRuntime {
+        ProcessRuntime {
+            db: fixture.db.clone(),
+            dispatcher: Arc::downgrade(fixture.dispatcher()),
+            worker_id: worker_id.into(),
+            stop: CancellationToken::new(),
+            wake: tokio::sync::Notify::new(),
+            running: dashmap::DashMap::new(),
+            handle: parking_lot::Mutex::new(None),
+        }
+    }
+
+    fn register_claim(
+        runtime: &ProcessRuntime,
+        claim: &super::super::repository::ClaimedProcessJob,
+        cancel: &CancellationToken,
+    ) {
+        runtime.running.insert(
+            claim.job.job_id.clone(),
+            RunningJob {
+                instance_id: claim.job.instance_id.clone(),
+                attempt: claim.job.attempt,
+                fence: claim.job.fence,
+                worker_id: claim.job.worker_id.clone().unwrap(),
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_claim_registration_race_never_enters_the_real_flow_executor() {
+        let fixture = Fixture::new();
+        let flow_id = flow(
+            &fixture.db,
+            &fixture.owner,
+            &graph("must not execute", None),
+        );
+        let model = with_boundaries(
+            service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            ),
+            "Service",
+            &[("Limit", true, 1)],
+        );
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(
+            &fixture.db,
+            "registration-window",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
+        let due = claim.snapshot.timers[0].due_at_ms.unwrap();
+        let runtime = registry_runtime(&fixture, "registration-window");
+        let cancel = CancellationToken::new();
+        let before_registration = tokio::sync::Barrier::new(2);
+        let committed = tokio::sync::Barrier::new(2);
+        let firing = async {
+            before_registration.wait().await;
+            assert!(runtime.running.is_empty());
+            let drained = super::super::timers::drain_due(&fixture.db, due);
+            assert_eq!(drained.fired, 1);
+            assert!(drained.completion.is_ok());
+            assert_eq!(drained.cancelled_claims.len(), 1);
+            runtime.handle_timer_drain(drained);
+            committed.wait().await;
+        };
+        let registering = async {
+            before_registration.wait().await;
+            committed.wait().await;
+            register_claim(&runtime, &claim, &cancel);
+            assert!(!cancel.is_cancelled());
+            super::super::jobs::execute_claimed(
+                &fixture.db,
+                fixture.dispatcher(),
+                "registration-window",
+                claim.clone(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            runtime.remove_running_claim(
+                &claim.job.job_id,
+                claim.job.attempt,
+                claim.job.fence,
+                "registration-window",
+            );
+        };
+        tokio::join!(firing, registering);
+        assert!(runtime.running.is_empty());
+        let actual_effect_count =
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .len();
+        assert_eq!(actual_effect_count, 0);
+        let snapshot =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(snapshot.jobs[0].status, "cancelled");
+        assert_eq!(snapshot.jobs[0].fence, claim.job.fence + 1);
+        assert!(snapshot.jobs[0].result.is_none());
+        assert!(!snapshot.instance.can_retry);
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_signal_and_old_cleanup_cannot_touch_an_actual_retried_claim() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("new generation", None));
+        let started = start_model(
+            &fixture,
+            &service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            ),
+        );
+        let old = repository::claim_job(
+            &fixture.db,
+            "old-worker",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(repository::fail_job(
+            &fixture.db,
+            &old.job.job_id,
+            old.job.attempt,
+            old.job.fence,
+            "old-worker",
+            "INTERRUPTED",
+            "controlled worker interruption",
+            chrono::Utc::now().timestamp_millis()
+        )
+        .unwrap());
+        let incident =
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        repository::retry_job(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("retry real generation"),
+            &started.instance_id,
+            &old.job.job_id,
+            incident.revision,
+        )
+        .unwrap();
+        let new = repository::claim_job(
+            &fixture.db,
+            "new-worker",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(old.job.job_id, new.job.job_id);
+        assert!(new.job.attempt > old.job.attempt && new.job.fence > old.job.fence);
+        let runtime = registry_runtime(&fixture, "new-worker");
+        let cancel = CancellationToken::new();
+        register_claim(&runtime, &new, &cancel);
+        runtime.signal_cancelled_claims(&[CancelledJobClaim {
+            job_id: old.job.job_id.clone(),
+            attempt: old.job.attempt,
+            fence: old.job.fence,
+            worker_id: "old-worker".into(),
+        }]);
+        assert!(!cancel.is_cancelled());
+        runtime.remove_running_claim(
+            &old.job.job_id,
+            old.job.attempt,
+            old.job.fence,
+            "old-worker",
+        );
+        assert_eq!(runtime.running.len(), 1);
+        super::super::jobs::execute_claimed(
+            &fixture.db,
+            fixture.dispatcher(),
+            "new-worker",
+            new.clone(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap()
+                .status,
+            ProcessInstanceStatus::Completed
+        );
+        runtime.remove_running_claim(
+            &new.job.job_id,
+            new.job.attempt,
+            new.job.fence,
+            "new-worker",
+        );
+        assert!(runtime.running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn midbatch_sqlite_failure_keeps_prior_committed_cancellation_and_signals_exact_worker() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("queued effects", None));
+        let mut instances = Vec::new();
+        for seconds in [1, 2] {
+            let model = with_boundaries(
+                service_model(
+                    &flow_id,
+                    ActivityVerification::Condition {
+                        expression: "true".into(),
+                    },
+                ),
+                "Service",
+                &[("Limit", true, seconds)],
+            );
+            instances.push(start_model(&fixture, &model));
+        }
+        let runtime = registry_runtime(&fixture, "batch-worker");
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            let claim = repository::claim_job(
+                &fixture.db,
+                "batch-worker",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+            let cancel = CancellationToken::new();
+            register_claim(&runtime, &claim, &cancel);
+            claims.push((claim, cancel));
+        }
+        let first = claims
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == instances[0].instance_id)
+            .unwrap();
+        let second = claims
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == instances[1].instance_id)
+            .unwrap();
+        let fault_id = second.0.snapshot.timers[0].timer_id.clone();
+        fixture.db.write().unwrap().execute_batch(&format!("CREATE TRIGGER fail_later_timer BEFORE UPDATE ON bpmn_timers WHEN OLD.timer_id='{}' AND NEW.status IN ('fired','error') BEGIN SELECT RAISE(ABORT,'controlled midbatch SQLite failure'); END;",fault_id)).unwrap();
+        let due = second.0.snapshot.timers[0].due_at_ms.unwrap();
+        let drained = super::super::timers::drain_due(&fixture.db, due);
+        assert_eq!(drained.fired, 1);
+        assert_eq!(drained.cancelled_claims.len(), 1);
+        assert!(drained
+            .completion
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("controlled midbatch SQLite failure"));
+        assert_eq!(
+            drained.cancelled_claims[0],
+            CancelledJobClaim {
+                job_id: first.0.job.job_id.clone(),
+                attempt: first.0.job.attempt,
+                fence: first.0.job.fence,
+                worker_id: "batch-worker".into()
+            }
+        );
+        runtime.handle_timer_drain(drained);
+        assert!(first.1.is_cancelled());
+        assert!(!second.1.is_cancelled());
+        let committed =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &first.0.job.instance_id)
+                .unwrap();
+        let rolled_back =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &second.0.job.instance_id)
+                .unwrap();
+        assert_eq!(committed.jobs[0].status, "cancelled");
+        assert_eq!(committed.jobs[0].fence, first.0.job.fence + 1);
+        assert_eq!(rolled_back.jobs[0].status, "running");
+        assert_eq!(rolled_back.jobs[0].fence, second.0.job.fence);
+        assert_eq!(
+            rolled_back.timers[0].status,
+            tentaflow_protocol::processes::ProcessTimerStatus::Pending
+        );
+        assert!(rolled_back.instance.incidents.is_empty());
+        assert!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        fixture
+            .db
+            .write()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_later_timer")
+            .unwrap();
+        let retried = super::super::timers::drain_due(&fixture.db, due);
+        assert_eq!(retried.fired, 1);
+        assert!(retried.completion.is_ok());
+        runtime.handle_timer_drain(retried);
+        assert!(second.1.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn boundary_running_executor_receives_only_its_committed_generation_signal() {
+        let fixture = Fixture::new();
+        let flow_id = flow(
+            &fixture.db,
+            &fixture.owner,
+            &graph("late effect result", Some(2_000)),
+        );
+        let model = with_boundaries(
+            service_model(&flow_id, ActivityVerification::Human),
+            "Service",
+            &[("Limit", true, 1)],
+        );
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(
+            &fixture.db,
+            "live-generation",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
+        let runtime = registry_runtime(&fixture, "live-generation");
+        let cancel = CancellationToken::new();
+        register_claim(&runtime, &claim, &cancel);
+        let execution = super::super::jobs::execute_claimed(
+            &fixture.db,
+            fixture.dispatcher(),
+            "live-generation",
+            claim.clone(),
+            cancel.clone(),
+        );
+        let interrupted = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !crate::db::repository::list_flow_executions_for_flow(
+                        &fixture.db,
+                        &flow_id,
+                        10,
+                    )
+                    .unwrap()
+                    .is_empty()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the real pinned flow executor started");
+            let drained = super::super::timers::drain_due(
+                &fixture.db,
+                claim.snapshot.timers[0].due_at_ms.unwrap(),
+            );
+            assert_eq!(drained.fired, 1);
+            assert!(drained.completion.is_ok());
+            assert_eq!(drained.cancelled_claims.len(), 1);
+            runtime.handle_timer_drain(drained);
+            assert!(cancel.is_cancelled());
+        };
+        let (result, ()) = tokio::join!(execution, interrupted);
+        result.unwrap();
+        let snapshot =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(snapshot.jobs[0].status, "cancelled");
+        assert!(snapshot.jobs[0].result.is_none());
+        assert!(snapshot.user_tasks.is_empty() && snapshot.instance.incidents.is_empty());
+        assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Completed);
+        assert!(!repository::renew_job_lease(
+            &fixture.db,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "live-generation",
+            chrono::Utc::now().timestamp_millis()
+        )
+        .unwrap());
     }
 }

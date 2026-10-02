@@ -405,7 +405,7 @@ const FlowBuilderScreen = {
     schedule.hidden = !state.publishedTimerStart;
     schedule.toggleAttribute('disabled', !!state.operationBusy);
     const timezone = state.root.querySelector('[data-role="timer-timezone"]');
-    timezone.hidden = !state.canvas.nodes.some((node) => ['bpmn_timer_start', 'bpmn_timer_catch'].includes(node.type));
+    timezone.hidden = !state.canvas.nodes.some((node) => ['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type));
     timezone.value = state.canvas.processModel.timerTimezone || '';
     timezone.toggleAttribute('disabled', readOnly);
     const timerSummary = state.root.querySelector('[data-role="timer-summary"]');

@@ -346,6 +346,18 @@ function processModel(model) {
     } else if (tag === 'TimerStart' || tag === 'TimerCatch') {
       if (Object.keys(body).some((key) => key !== 'timer')) throw new TypeError(`unsupported ${tag} field`);
       fields = { timer: processTimerSpec(body.timer) };
+    } else if (tag === 'BoundaryTimer') {
+      if (Object.keys(body).some((key) => !['attachedToId', 'cancelActivity', 'timer'].includes(key))) {
+        throw new TypeError('unsupported BoundaryTimer field');
+      }
+      if (typeof body.attachedToId !== 'string' || typeof body.cancelActivity !== 'boolean') {
+        throw new TypeError('boundary timer requires an attachment and cancellation choice');
+      }
+      const timer = processTimerSpec(body.timer);
+      if (!('Date' in timer) && !('Duration' in timer)) {
+        throw new TypeError('boundary timer supports Date or Duration only');
+      }
+      fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity, timer };
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }

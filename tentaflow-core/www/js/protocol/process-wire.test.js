@@ -100,6 +100,73 @@ test('timer model wire preserves each typed rule and opaque variables', { skip }
   }), /unsupported timer rule/);
 });
 
+test('boundary timer wire keeps attachment, cancellation and opaque business keys', { skip }, () => {
+  const model = {
+    schemaVersion: 1, processId: 'Boundary_1', timerTimezone: 'Europe/Warsaw',
+    nodes: [
+      { id: 'Start_1', name: 'Start', kind: 'Start' },
+      { id: 'Review_1', name: 'Review', kind: { UserTask: { assigneeUserId: null, outputMapping: { business_key: 'outputs.value' } } } },
+      { id: 'Timer_1', name: 'Reminder', kind: { BoundaryTimer: {
+        attachedToId: 'Review_1', cancelActivity: false, timer: { Duration: { seconds: 90 } },
+      } } },
+      { id: 'End_1', name: 'End', kind: 'End' },
+    ],
+    sequenceFlows: [
+      { id: 'Flow_1', sourceId: 'Start_1', targetId: 'Review_1', condition: null },
+      { id: 'Flow_2', sourceId: 'Review_1', targetId: 'End_1', condition: null },
+      { id: 'Flow_3', sourceId: 'Timer_1', targetId: 'End_1', condition: null },
+    ],
+    variables: { attached_to_id: { user_key: 'Łódź' } }, diagram: { shapes: [], edges: [] },
+  };
+  const payload = { commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
+    expectedRevision: 0, name: 'Boundary', description: '', model };
+  const body = request('processDefinitionSaveRequest', payload);
+  assert.equal(body.model.nodes[2].kind.BoundaryTimer.attachedToId, 'Review_1');
+  assert.equal(body.model.nodes[2].kind.BoundaryTimer.cancelActivity, false);
+  assert.deepEqual(body.model.nodes[2].kind.BoundaryTimer.timer, { Duration: { seconds: 90 } });
+  assert.deepEqual(body.model.variables, model.variables);
+  assert.deepEqual(body.model.nodes[1].kind.UserTask.outputMapping, { business_key: 'outputs.value' });
+
+  for (const bad of [
+    { attachedToId: 'Review_1', timer: { Duration: { seconds: 90 } } },
+    { attachedToId: 'Review_1', cancelActivity: true, timer: { Cycle: { seconds: 300, totalFirings: 2 } } },
+    { attachedToId: 'Review_1', cancelActivity: false, timer: { Duration: { seconds: 90 } }, extra: 1 },
+  ]) {
+    const invalid = structuredClone(payload);
+    invalid.model.nodes[2].kind.BoundaryTimer = bad;
+    assert.throws(() => codec.encode.processDefinitionSaveRequest(17, invalid), TypeError);
+  }
+});
+
+test('boundary timer and full task identity decode without changing older nullable fields', { skip }, () => {
+  const timerFields = {
+    timer_id: 't1', node_id: 'Timer_1', node_name: 'Reminder', kind: 'Boundary',
+    status: 'Pending', due_at_ms: 42, timezone: 'UTC', occurrence: 1,
+    total_firings: null, last_reason: null, attached_to_id: 'Review_1',
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    UserTaskGetResponse: { task: {
+      user_task_id: 'u1', node_id: 'Review_1', name: 'Review', assignee_user_id: 'person',
+      kind: 'Work', status: 'Open', outputs: { business_key: 'kept' },
+      revision: 1, can_complete: true, token_id: 'waiting-activation',
+    } },
+  } })));
+  assert.equal(decoded.task.tokenId, 'waiting-activation');
+  assert.deepEqual(decoded.task.outputs, { business_key: 'kept' });
+  const timer = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance: {
+      instance_id: 'i1', definition_id: 'd1', definition_name: 'Boundary',
+      initiator_user_id: 'person', version: 1, revision: 1, status: 'Running',
+      variables: { attached_to_id: 'business' }, active_node_ids: ['Review_1'],
+      user_tasks: [], incidents: [], created_at_ms: 1, updated_at_ms: 1,
+      can_cancel: true, can_retry: false, timers: [timerFields],
+    } },
+  } })));
+  assert.equal(timer.instance.timers[0].attachedToId, 'Review_1');
+  assert.equal(timer.instance.timers[0].kind, 'Boundary');
+  assert.deepEqual(timer.instance.variables, { attached_to_id: 'business' });
+});
+
 test('timer status Error and schedule fields decode to canonical camel keys', { skip }, () => {
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     DefinitionGetResponse: { definition: {

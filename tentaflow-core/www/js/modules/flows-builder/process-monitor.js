@@ -65,7 +65,17 @@ function validateJson(section, object = false) {
 export function processEventText(event) {
   const node = event.nodeName || text('element_unavailable');
   if (event.kind === 'timer_armed') return text('event_timer_armed', { node, due: date(event.data.due_at_ms), timezone: event.data.timezone });
-  if (event.kind === 'timer_fired') return text('event_timer_fired', { node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms), count: event.data.skipped_count });
+  if (event.kind === 'timer_fired') {
+    if (event.data.kind === 'Boundary') return text('event_boundary_fired', {
+      node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms),
+      mode: text(event.data.cancel_activity ? 'boundary_interrupting' : 'boundary_noninterrupting'),
+    });
+    return text('event_timer_fired', { node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms), count: event.data.skipped_count });
+  }
+  if (event.kind === 'timer_cancelled') {
+    if (event.data.reason === 'instance_cancelled') return text('event_timer_cancelled', { node });
+    return text('event_timer_cancelled_reason', { node, reason: processTimerReasonText(event.data.reason) });
+  }
   if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
   if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
@@ -81,6 +91,8 @@ export function processTimerText(timer) {
 export function processTimerReasonText(reason) {
   switch (reason) {
     case 'instance_cancelled': return text('event_cancelled');
+    case 'activity_completed': return text('timer_reason_activity_completed');
+    case 'sibling_interrupted': return text('timer_reason_sibling_interrupted');
     case 'definition_archived': return text('timer_reason_definition_archived');
     case 'missed_during_archive': return text('timer_reason_missed_during_archive');
     case 'finite_schedule_exhausted_during_archive': return text('timer_reason_finite_schedule_exhausted_during_archive');
@@ -95,8 +107,9 @@ function renderTimers(host, timers) {
     const row = document.createElement('div');
     row.className = 'fb-process-work fb-process-timer';
     row.dataset.timerId = timer.timerId;
-    row.innerHTML = `<div><strong>${escapeHtml(timer.nodeName || text(timer.kind === 'Start' ? 'node_timer_start' : 'node_timer_catch'))}</strong>
+    row.innerHTML = `<div><strong>${escapeHtml(timer.nodeName || text(timer.kind === 'Start' ? 'node_timer_start' : timer.kind === 'Boundary' ? 'node_boundary_timer' : 'node_timer_catch'))}</strong>
       <p>${escapeHtml(processTimerText(timer))}</p><dl><dt>${escapeHtml(text('timer_occurrence'))}</dt><dd>${escapeHtml(timer.totalFirings == null ? String(timer.occurrence) : text('timer_slot', { occurrence: timer.occurrence, total: timer.totalFirings }))}</dd>
+      ${timer.kind === 'Boundary' ? `<dt>${escapeHtml(text('boundary_attached_element_id'))}</dt><dd>${escapeHtml(timer.attachedToId)}</dd>` : ''}
       ${timer.lastReason ? `<dt>${escapeHtml(text('timer_reason'))}</dt><dd>${escapeHtml(processTimerReasonText(timer.lastReason))}</dd>` : ''}</dl></div>`;
     host.append(row);
   }
@@ -298,7 +311,6 @@ export async function openProcessInstance(instanceId, initial = null) {
   function render() {
     if (!win.isConnected) return;
     renderedSnapshot = JSON.stringify(instance);
-    win.setAttribute('title', instance.definitionName);
     host.querySelector('[data-summary]').innerHTML = `<div class="fb-process-summary"><h2>${escapeHtml(instance.definitionName)}</h2>
       <tf-chip status="${tone(instance.status)}">${escapeHtml(processStatusLabel(instance.status))}</tf-chip>
       <span>${escapeHtml(text('version_number', { version: instance.version }))}</span>

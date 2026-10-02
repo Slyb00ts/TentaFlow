@@ -26,6 +26,7 @@ pub struct ProcessNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProcessNodeKind {
     Start,
     End,
@@ -50,6 +51,11 @@ pub enum ProcessNodeKind {
     TimerCatch {
         timer: ProcessTimerSpec,
     },
+    BoundaryTimer {
+        attached_to_id: String,
+        cancel_activity: bool,
+        timer: ProcessTimerSpec,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +78,7 @@ pub enum ProcessTimerSpec {
 pub enum ProcessTimerKind {
     Start,
     Catch,
+    Boundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +104,8 @@ pub struct ProcessTimerSummary {
     pub occurrence: u64,
     pub total_firings: Option<u32>,
     pub last_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -253,6 +262,8 @@ pub struct ProcessUserTask {
     pub outputs: Value,
     pub revision: u64,
     pub can_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -655,6 +666,7 @@ mod tests {
             outputs: serde_json::json!({"business_key": {"inner_value": 3}}),
             revision: 1,
             can_complete: true,
+            token_id: None,
         };
         let summary = ProcessUserTaskSummary::from(&task);
         let summary_json = serde_json::to_value(&summary).unwrap();
@@ -668,5 +680,54 @@ mod tests {
             detail["UserTaskGetResponse"]["task"]["outputs"]["business_key"]["inner_value"],
             3
         );
+    }
+
+    #[test]
+    fn boundary_identity_round_trips_without_changing_older_timer_and_task_json() {
+        assert_eq!(
+            serde_json::to_string(&ProcessNodeKind::TimerCatch {
+                timer: ProcessTimerSpec::Duration { seconds: 90 },
+            }).unwrap(),
+            "{\"TimerCatch\":{\"timer\":{\"Duration\":{\"seconds\":90}}}}"
+        );
+        let boundary = ProcessNodeKind::BoundaryTimer {
+            attached_to_id: "Review_1".into(),
+            cancel_activity: false,
+            timer: ProcessTimerSpec::Duration { seconds: 90 },
+        };
+        let encoded = crate::cbor::encode(&boundary).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&encoded).unwrap(), boundary);
+        assert_eq!(serde_json::to_value(&boundary).unwrap(), serde_json::json!({
+            "BoundaryTimer":{"attached_to_id":"Review_1","cancel_activity":false,
+                "timer":{"Duration":{"seconds":90}}}
+        }));
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "BoundaryTimer": {"attached_to_id":"Review_1","cancel_activity":false,
+                "timer":{"Duration":{"seconds":90}},"unsupported":true}
+        })).is_err());
+        let timer = ProcessTimerSummary {
+            timer_id: "timer-1".into(), node_id: "Boundary_1".into(),
+            node_name: "Timeout".into(), kind: ProcessTimerKind::Boundary,
+            status: ProcessTimerStatus::Pending, due_at_ms: Some(1_000),
+            timezone: "UTC".into(), occurrence: 1, total_firings: None,
+            last_reason: None, attached_to_id: Some("Review_1".into()),
+        };
+        assert_eq!(crate::cbor::decode::<ProcessTimerSummary>(&crate::cbor::encode(&timer).unwrap()).unwrap(), timer);
+        assert_eq!(serde_json::to_value(&timer).unwrap()["attached_to_id"], "Review_1");
+        let mut earlier = timer;
+        earlier.kind = ProcessTimerKind::Catch;
+        earlier.attached_to_id = None;
+        assert!(serde_json::to_value(&earlier).unwrap().get("attached_to_id").is_none());
+        let older_task = ProcessUserTask {
+            user_task_id: "task-1".into(), node_id: "Review_1".into(),
+            name: "Review".into(), assignee_user_id: "user-1".into(),
+            kind: ProcessUserTaskKind::Work, status: ProcessUserTaskStatus::Completed,
+            outputs: Value::Null, revision: 2, can_complete: false, token_id: None,
+        };
+        assert!(serde_json::to_value(&older_task).unwrap().get("token_id").is_none());
+        let mut active = older_task;
+        active.status = ProcessUserTaskStatus::Open;
+        active.token_id = Some("waiting-1".into());
+        assert_eq!(serde_json::to_value(&active).unwrap()["token_id"], "waiting-1");
     }
 }

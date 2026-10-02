@@ -1049,4 +1049,131 @@ mod tests {
             .contains("sha256="));
         assert!(history.iter().all(|event| event.kind != "service_result"));
     }
+
+    #[tokio::test]
+    async fn boundary_queued_claimed_and_observed_jobs_cannot_reappear_through_retry_or_late_result(
+    ) {
+        for stage in ["queued", "claimed", "observed"] {
+            let fixture = Fixture::new();
+            let flow_id = flow(
+                &fixture.db,
+                &fixture.owner,
+                &graph("factual external effect", None),
+            );
+            let model = with_boundaries(
+                service_model(&flow_id, ActivityVerification::Human),
+                "Service",
+                &[("Limit", true, 1)],
+            );
+            let started = start_model(&fixture, &model);
+            let initial =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let claim = if stage == "queued" {
+                None
+            } else {
+                repository::claim_job(&fixture.db, "late-worker", now_ms()).unwrap()
+            };
+            let observed = if stage == "observed" {
+                Some(observe_effect(&fixture, claim.as_ref().unwrap()).await)
+            } else {
+                None
+            };
+            let late_plan = observed.as_ref().map(|result| {
+                plan_job_result(
+                    &claim.as_ref().unwrap().snapshot,
+                    &claim.as_ref().unwrap().job,
+                    result,
+                    now_ms(),
+                )
+                .unwrap()
+            });
+            let drained =
+                super::super::timers::drain_due(&fixture.db, initial.timers[0].due_at_ms.unwrap());
+            drained.completion.unwrap();
+            assert_eq!(drained.fired, 1);
+            assert_eq!(
+                drained.cancelled_claims.len(),
+                usize::from(stage != "queued")
+            );
+            let current =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            assert_eq!(current.jobs[0].status, "cancelled");
+            assert!(current.jobs[0].result.is_none());
+            assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+            assert!(!current.instance.can_retry);
+            assert!(repository::retry_job(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("retry interrupted activation"),
+                &started.instance_id,
+                &current.jobs[0].job_id,
+                current.instance.revision
+            )
+            .is_err());
+            if let Some(claim) = &claim {
+                assert!(!repository::renew_job_lease(
+                    &fixture.db,
+                    &claim.job.job_id,
+                    claim.job.attempt,
+                    claim.job.fence,
+                    "late-worker",
+                    now_ms()
+                )
+                .unwrap());
+                assert!(!repository::fail_job(
+                    &fixture.db,
+                    &claim.job.job_id,
+                    claim.job.attempt,
+                    claim.job.fence,
+                    "late-worker",
+                    "LATE_ERROR",
+                    "must not revive interrupted activation",
+                    now_ms()
+                )
+                .unwrap());
+                if let Some(result) = &observed {
+                    assert!(repository::accept_job_result(
+                        &fixture.db,
+                        &fixture.owner,
+                        &claim.job.job_id,
+                        claim.job.attempt,
+                        claim.job.fence,
+                        "late-worker",
+                        result,
+                        claim.snapshot.instance.revision,
+                        late_plan.as_ref().unwrap(),
+                        now_ms()
+                    )
+                    .is_err());
+                } else {
+                    execute_claimed(
+                        &fixture.db,
+                        fixture.dispatcher(),
+                        "late-worker",
+                        claim.clone(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            assert!(repository::claim_job(&fixture.db, "replacement", now_ms())
+                .unwrap()
+                .is_none());
+            let actual_effect_count =
+                crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                    .unwrap()
+                    .len();
+            assert_eq!(actual_effect_count, usize::from(stage == "observed"));
+            let history =
+                repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                    .unwrap()
+                    .0;
+            assert!(history
+                .iter()
+                .all(|event| event.kind != "service_result" && event.kind != "job_failed"));
+        }
+    }
 }

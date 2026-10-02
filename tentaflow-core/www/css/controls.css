@@ -2103,6 +2103,7 @@ tf-menu[open] .tf-menu-item.disabled {
 .tf-window-title .tf-window-title-text {
   font-size: 13px;
   font-weight: 700;
+  line-height: 1.5;
   color: var(--tf-text);
   white-space: nowrap;
   overflow: hidden;

@@ -7,6 +7,7 @@ const ELEMENTS = [
   ['End', 'end', 'stop', 'events', 56, 56],
   ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
   ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
+  ['BoundaryTimer', 'boundary_timer', 'clock', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
@@ -17,7 +18,7 @@ export function processTemplates() {
   return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: ['Start', 'TimerStart'].includes(kind) ? [] : ['in'],
+    input_ports: ['Start', 'TimerStart', 'BoundaryTimer'].includes(kind) ? [] : ['in'],
     output_ports: kind === 'End' ? [] : ['full'],
     width, height,
   }));
@@ -34,6 +35,7 @@ export function processNodeConfig(kind) {
   if (kind === 'ServiceTask') return { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60 };
   if (kind === 'ExclusiveGateway') return { defaultFlowId: null };
   if (kind === 'TimerStart' || kind === 'TimerCatch') return { timer: { Duration: { seconds: 60 } } };
+  if (kind === 'BoundaryTimer') return { attachedToId: null, cancelActivity: true, timer: { Duration: { seconds: 60 } } };
   return {};
 }
 
@@ -68,6 +70,17 @@ export function processToCanvas(model) {
       width: shape?.width ?? element[4], height: shape?.height ?? element[5] };
   });
   const byId = new Map(nodes.map((node) => [node.id, node]));
+  for (const node of nodes) {
+    if (node.type !== 'bpmn_boundary_timer' || shapes.has(node.id)) continue;
+    const parent = byId.get(node.config.attachedToId);
+    if (!parent) continue;
+    const siblings = nodes.filter((candidate) => candidate.type === 'bpmn_boundary_timer' && candidate.config.attachedToId === parent.id);
+    const angle = Math.PI / 4 + siblings.indexOf(node) * 2 * Math.PI / siblings.length;
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+    const scale = 1 / Math.max(Math.abs(dx) / (parent.width / 2), Math.abs(dy) / (parent.height / 2));
+    node.x = parent.x + parent.width / 2 + dx * scale - node.width / 2;
+    node.y = parent.y + parent.height / 2 + dy * scale - node.height / 2;
+  }
   const edges = model.sequenceFlows.map((edge) => ({ id: edge.id,
     from_node: edge.sourceId, to_node: edge.targetId, from_port: 'full', to_port: 'in',
     condition: edge.condition, waypoints: structuredClone(routes.get(edge.id) || []),

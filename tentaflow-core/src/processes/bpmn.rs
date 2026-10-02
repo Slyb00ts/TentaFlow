@@ -390,6 +390,24 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
             element.children_only(&[(BPMN, "timerEventDefinition")])?;
             ProcessNodeKind::TimerCatch { timer: parsed_timer()? }
         }
+        "boundaryEvent" => {
+            element.attrs_only(&["id", "name", "attachedToRef", "cancelActivity"])?;
+            element.children_only(&[(BPMN, "timerEventDefinition")])?;
+            let cancel_activity = match element.attr("cancelActivity") {
+                None | Some("true" | "1") => true,
+                Some("false" | "0") => false,
+                Some(other) => return Err(XmlElementError {
+                    message: format!("invalid boundary cancelActivity {other} at byte {}", element.offset),
+                    element_id: Some(id.clone()),
+                    offset: element.offset,
+                }.into()),
+            };
+            ProcessNodeKind::BoundaryTimer {
+                attached_to_id: element.required("attachedToRef")?,
+                cancel_activity,
+                timer: parsed_timer()?,
+            }
+        }
         "endEvent" => {
             element.attrs_only(&["id", "name"])?;
             element.children_only(&[])?;
@@ -500,7 +518,9 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
         other => bail!("unsupported BPMN node {other} at byte {}", element.offset),
     };
     match &kind {
-        ProcessNodeKind::TimerStart { timer } | ProcessNodeKind::TimerCatch { timer } => {
+        ProcessNodeKind::TimerStart { timer }
+        | ProcessNodeKind::TimerCatch { timer }
+        | ProcessNodeKind::BoundaryTimer { timer, .. } => {
             validate_timer_spec(timer, matches!(&kind, ProcessNodeKind::TimerStart { .. }))
                 .map_err(|error| XmlElementError {
                     message: format!("invalid timer rule at byte {}: {error}", element.offset),
@@ -593,6 +613,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         (BPMN, "extensionElements"),
         (BPMN, "startEvent"),
         (BPMN, "intermediateCatchEvent"),
+        (BPMN, "boundaryEvent"),
         (BPMN, "endEvent"),
         (BPMN, "userTask"),
         (BPMN, "serviceTask"),
@@ -644,7 +665,9 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
     }
     if timer_timezone.is_none() {
         if let Some(node) = nodes.iter().find(|node| matches!(&node.kind,
-            ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::TimerCatch { .. })) {
+            ProcessNodeKind::TimerStart { .. }
+            | ProcessNodeKind::TimerCatch { .. }
+            | ProcessNodeKind::BoundaryTimer { .. })) {
             let offset = process.children.iter().find(|child| child.attr("id") == Some(node.id.as_str()))
                 .map_or(process.offset, |child| child.offset);
             return Err(XmlElementError {
@@ -673,7 +696,11 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         diagram,
         timer_timezone,
     };
-    validate_model(&model)?;
+    validate_model(&model).map_err(|error| XmlElementError {
+        message: error.to_string(),
+        element_id: Some(model.process_id.clone()),
+        offset: process.offset,
+    })?;
     Ok(model)
 }
 
@@ -716,6 +743,11 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
             ProcessNodeKind::Start => ("startEvent", String::new()),
             ProcessNodeKind::TimerStart { .. } => ("startEvent", String::new()),
             ProcessNodeKind::TimerCatch { .. } => ("intermediateCatchEvent", String::new()),
+            ProcessNodeKind::BoundaryTimer { attached_to_id, cancel_activity, .. } => (
+                "boundaryEvent",
+                format!(" attachedToRef=\"{}\" cancelActivity=\"{}\"",
+                    escaped(attached_to_id), cancel_activity),
+            ),
             ProcessNodeKind::End => ("endEvent", String::new()),
             ProcessNodeKind::ParallelGateway => ("parallelGateway", String::new()),
             ProcessNodeKind::ExclusiveGateway { default_flow_id } => (
@@ -734,7 +766,9 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
             escaped(&node.name)
         ));
         match &node.kind {
-            ProcessNodeKind::TimerStart { timer } | ProcessNodeKind::TimerCatch { timer } => {
+            ProcessNodeKind::TimerStart { timer }
+            | ProcessNodeKind::TimerCatch { timer }
+            | ProcessNodeKind::BoundaryTimer { timer, .. } => {
                 let rule = match timer {
                     ProcessTimerSpec::Date { at } => format!("<bpmn:timeDate>{}</bpmn:timeDate>", escaped(at)),
                     ProcessTimerSpec::Duration { seconds } => format!("<bpmn:timeDuration>PT{seconds}S</bpmn:timeDuration>"),
@@ -854,6 +888,71 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_xml_round_trip_preserves_siblings_attachment_cancellation_and_di() {
+        let mut model = super::super::model::starter_model();
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        model.variables.insert("business_key".into(), serde_json::json!({"label": "R&D Łódź"}));
+        model.nodes.push(ProcessNode {
+            id: "Review_1".into(), name: "Review & approve".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None, output_mapping: BTreeMap::new(),
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Boundary_A".into(), name: "Deadline".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Review_1".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Date { at: "2027-01-02T03:04:05+01:00".into() },
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Boundary_B".into(), name: "Reminder".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Review_1".into(), cancel_activity: false,
+                timer: ProcessTimerSpec::Duration { seconds: 90 },
+            },
+        });
+        model.sequence_flows[0].target_id = "Review_1".into();
+        for (id, source) in [
+            ("Flow_2", "Review_1"), ("Flow_3", "Boundary_A"), ("Flow_4", "Boundary_B"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: "End_1".into(), condition: None,
+            });
+        }
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "Boundary_A".into(), x: 125.0, y: 86.0, width: 36.0, height: 36.0,
+        });
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "Boundary_B".into(), x: 170.0, y: 86.0, width: 36.0, height: 36.0,
+        });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("attachedToRef=\"Review_1\" cancelActivity=\"true\""));
+        assert!(xml.contains("attachedToRef=\"Review_1\" cancelActivity=\"false\""));
+        let (parsed, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(parsed, Some(model.clone()));
+
+        let defaulted = xml.replacen(" cancelActivity=\"true\"", "", 1);
+        let (parsed_default, diagnostics) = import_xml(&defaulted);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(parsed_default, Some(model));
+        let (invalid_boolean, diagnostics) = import_xml(&xml.replace("cancelActivity=\"true\"", "cancelActivity=\"sometimes\""));
+        assert!(invalid_boolean.is_none());
+        assert_eq!(diagnostics[0].element_id.as_deref(), Some("Boundary_A"));
+        assert!(diagnostics[0].offset.is_some_and(|offset| offset < xml.len()));
+        for malformed in [
+            xml.replace("cancelActivity=\"true\"", "cancelActivity=\"sometimes\""),
+            xml.replace("attachedToRef=\"Review_1\"", "attachedToRef=\"Missing_1\""),
+            xml.replacen("</bpmn:timerEventDefinition>", "<bpmn:timeDuration>PT5S</bpmn:timeDuration></bpmn:timerEventDefinition>", 1),
+        ] {
+            let (parsed, diagnostics) = import_xml(&malformed);
+            assert!(parsed.is_none());
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal && diagnostic.offset.is_some()), "{diagnostics:?}");
+        }
+    }
 
     #[test]
     fn timer_xml_round_trip_preserves_rules_timezone_and_di() {
