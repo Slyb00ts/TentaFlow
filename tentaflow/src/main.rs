@@ -1223,6 +1223,10 @@ async fn run_server(args: Args) -> Result<()> {
         .await;
     }
 
+    if let Some(dispatcher) = router.flow_dispatcher() {
+        tentaflow_core::processes::runtime::start(&db, dispatcher)?;
+    }
+
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
     tentaflow_core::api::unified_server::start_unified_server(
         &config,
@@ -1275,6 +1279,9 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    if let Some(dispatcher) = router.flow_dispatcher() {
+        tentaflow_core::processes::runtime::stop(dispatcher).await?;
+    }
     // Stop the vision worker fleet first: each worker gets a link Shutdown
     // (drain + clean exit), then a bounded group kill — GPU memory must be
     // released before anything else races the teardown.

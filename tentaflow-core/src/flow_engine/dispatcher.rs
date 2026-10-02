@@ -400,6 +400,14 @@ pub struct FlowRef {
     pub version_id: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PinnedFlowSnapshot {
+    pub flow_id: String,
+    pub source_version: u32,
+    pub graph_json: String,
+    pub graph_sha256: String,
+}
+
 impl FlowRef {
     /// The flow's current graph.
     pub fn live(flow_id: impl Into<String>) -> Self {
@@ -548,6 +556,8 @@ pub struct FlowDispatcher {
     /// so per-frame frames never hit disk and a frame delete can never touch a
     /// durable blob. See [`crate::flow_engine::blob_store::CompositeBlobStore`].
     frame_blobs: Arc<dyn BlobStore>,
+    pub(crate) process_runtime:
+        parking_lot::Mutex<Option<Arc<crate::processes::runtime::ProcessRuntime>>>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -757,6 +767,7 @@ impl FlowDispatcher {
             agent_service,
             subflow_runner,
             frame_blobs,
+            process_runtime: parking_lot::Mutex::new(None),
         }
     }
 
@@ -769,6 +780,10 @@ impl FlowDispatcher {
 
     pub fn registry(&self) -> &Arc<AdapterRegistry> {
         &self.registry
+    }
+
+    pub(crate) fn process_database(&self) -> &DbPool {
+        &self.db
     }
 
     /// Save-time validation entry point (plan-app-platform §3.3), called
@@ -1034,6 +1049,147 @@ impl FlowDispatcher {
         )
         .await
         .map_err(DispatchError::from)
+    }
+
+    pub fn authorize_process_flow(
+        &self,
+        flow_id: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<FlowRequestMeta, DispatchError> {
+        let denied = || DispatchError::Denied {
+            flow_id: flow_id.to_owned(),
+        };
+        let account = repository::get_user_account_by_id(&self.db, user_id)
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .filter(|user| user.is_active)
+            .ok_or_else(denied)?;
+        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id))
+            .map_err(|_| denied())?;
+        let flow = repository::get_flow(&self.db, flow_id)
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .filter(|flow| flow.status == "active")
+            .ok_or_else(denied)?;
+        if !acl::check_access(&self.db, "flow", &flow.id, user_id, &account.role)
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+        {
+            return Err(denied());
+        }
+        let mut meta = FlowRequestMeta::new(
+            uuid::Uuid::new_v4().to_string(),
+            FlowOrigin::Dashboard,
+            FlowActor::user(user_id),
+        );
+        meta.user_id = Some(account.id);
+        meta.user_role = Some(account.role);
+        meta.org_id = Some(org_id.to_owned());
+        Ok(meta)
+    }
+
+    pub fn snapshot_flow(
+        &self,
+        flow_id: &str,
+        meta: &FlowRequestMeta,
+    ) -> std::result::Result<PinnedFlowSnapshot, DispatchError> {
+        use sha2::{Digest, Sha256};
+
+        let (Some(user_id), Some(org_id)) = (&meta.user_id, &meta.org_id) else {
+            return Err(DispatchError::Denied {
+                flow_id: flow_id.to_owned(),
+            });
+        };
+        self.authorize_process_flow(flow_id, user_id, org_id)?;
+        let flow = repository::get_flow(&self.db, flow_id)
+            .map_err(|e| DispatchError::Internal(e.to_string()))?
+            .filter(|flow| flow.status == "active")
+            .ok_or_else(|| DispatchError::Denied {
+                flow_id: flow_id.to_owned(),
+            })?;
+        self.validate_process_snapshot(flow_id, &flow.flow_json)?;
+        CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry).map_err(|e| {
+            DispatchError::CompileFailed {
+                flow_id: flow_id.to_owned(),
+                msg: e.to_string(),
+            }
+        })?;
+        Ok(PinnedFlowSnapshot {
+            flow_id: flow.id,
+            source_version: u32::try_from(flow.version)
+                .map_err(|e| DispatchError::Internal(e.to_string()))?,
+            graph_sha256: hex::encode(Sha256::digest(flow.flow_json.as_bytes())),
+            graph_json: flow.flow_json,
+        })
+    }
+
+    fn validate_process_snapshot(
+        &self,
+        flow_id: &str,
+        graph_json: &str,
+    ) -> std::result::Result<(), DispatchError> {
+        let definition: FlowDefinition =
+            serde_json::from_str(graph_json).map_err(|error| DispatchError::CompileFailed {
+                flow_id: flow_id.to_owned(),
+                msg: error.to_string(),
+            })?;
+        for node in &definition.nodes {
+            if matches!(
+                node.node_type.as_str(),
+                "subflow" | "map" | "agent" | "agent_router" | "spawn" | "await_subagents"
+            ) {
+                return Err(DispatchError::CompileFailed {
+                    flow_id: flow_id.to_owned(),
+                    msg: format!(
+                        "B1 cannot pin the mutable flow dependency of node '{}' ({})",
+                        node.id, node.node_type
+                    ),
+                });
+            }
+        }
+        self.validate_flow(&definition)
+            .map_err(|error| DispatchError::CompileFailed {
+                flow_id: flow_id.to_owned(),
+                msg: error.to_string(),
+            })
+    }
+
+    pub async fn dispatch_pinned_flow(
+        &self,
+        snapshot: &PinnedFlowSnapshot,
+        initial: FlowEnvelope,
+        mut meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        use sha2::{Digest, Sha256};
+
+        let (Some(user_id), Some(org_id)) = (&meta.user_id, &meta.org_id) else {
+            return Err(DispatchError::Denied {
+                flow_id: snapshot.flow_id.clone(),
+            });
+        };
+        let user_id = user_id.clone();
+        let org_id = org_id.clone();
+        let current = self.authorize_process_flow(&snapshot.flow_id, &user_id, &org_id)?;
+        if meta.actor_user_id.as_deref() != Some(user_id.as_str())
+            || hex::encode(Sha256::digest(snapshot.graph_json.as_bytes())) != snapshot.graph_sha256
+        {
+            return Err(DispatchError::Denied {
+                flow_id: snapshot.flow_id.clone(),
+            });
+        }
+        meta.user_role = current.user_role;
+        self.validate_process_snapshot(&snapshot.flow_id, &snapshot.graph_json)?;
+        let compiled = Arc::new(
+            CompiledFlow::from_json(&snapshot.flow_id, &snapshot.graph_json, &self.registry)
+                .map_err(|e| DispatchError::CompileFailed {
+                    flow_id: snapshot.flow_id.clone(),
+                    msg: e.to_string(),
+                })?,
+        );
+        let outcome = self
+            .run_blocking(compiled, initial, meta, RunDescriptor::default())
+            .await
+            .map_err(DispatchError::from)?;
+        self.authorize_process_flow(&snapshot.flow_id, &user_id, &org_id)?;
+        Ok(outcome)
     }
 
     /// Background-run variant (Harness §3.6/§3.7): runs the agent harness flow

@@ -54,7 +54,8 @@
 
 .fb-shell {
   display: grid;
-  grid-template-rows: 56px 1fr 44px;
+  grid-template-areas: 'toolbar' 'notice' 'error' 'body' 'footer';
+  grid-template-rows: auto auto auto minmax(0, 1fr) 44px;
   height: 100%;
   width: 100%;
   background: var(--tf-bg, #050818);
@@ -62,6 +63,12 @@
   font-size: 13px;
   overflow: hidden;
 }
+.fb-shell [hidden] { display: none !important; }
+.fb-topbar { grid-area: toolbar; }
+.fb-process-notice { grid-area: notice; }
+.fb-shell > [data-role='error'] { grid-area: error; }
+.fb-body { grid-area: body; }
+.fb-bottombar { grid-area: footer; }
 
 /* ============================================================================
    Topbar
@@ -90,19 +97,19 @@
 .fb-flow-name {
   flex: 0 1 360px;
   min-width: 160px;
-  font-size: 15px;
-  font-weight: 600;
-  padding: 8px 12px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--tf-radius, 10px);
-  color: var(--tf-text, #f5f6ff);
-  font-family: inherit;
-  outline: none;
-  transition: all 0.15s;
+  max-width: 360px;
 }
-.fb-flow-name:hover { background: var(--tf-bg-input, #0b0e22); border-color: var(--tf-border, #1f2548); }
-.fb-flow-name:focus { background: var(--tf-bg-input, #0b0e22); border-color: var(--tf-accent-1, #6366f1); }
+.fb-flow-name .tf-input { font-size: 15px; font-weight: 600; }
+
+@media (min-width: 768px) {
+  .fb-shell:not(.fb-process-shell) .fb-topbar {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    padding-block: 8px;
+  }
+  .fb-shell:not(.fb-process-shell) .fb-flow-name,
+  .fb-shell:not(.fb-process-shell) .fb-topbar > tf-button { flex-shrink: 0; }
+}
 
 /* The shared tf-select is a full-width form control; in the toolbar row it has
    to shrink to its own label, so only the box metrics are overridden — colours,
@@ -219,18 +226,7 @@
   font-weight: 700;
 }
 .fb-palette-search { padding: 0 14px 12px; }
-.fb-palette-search input {
-  width: 100%;
-  padding: 8px 12px 8px 34px;
-  background: var(--tf-bg-input, #0b0e22) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%236a7196' stroke-width='2'><circle cx='11' cy='11' r='7'/><line x1='21' y1='21' x2='16.65' y2='16.65'/></svg>") no-repeat 12px center;
-  border: 1px solid var(--tf-border, #1f2548);
-  border-radius: var(--tf-radius, 10px);
-  color: var(--tf-text, #f5f6ff);
-  font-size: 13px;
-  outline: none;
-  min-height: 36px;
-}
-.fb-palette-search input:focus { border-color: var(--tf-accent-1, #6366f1); background-color: var(--tf-bg-card, #141836); }
+.fb-palette-search tf-searchbox { display: block; width: 100%; }
 
 .fb-palette-list {
   flex: 1;
@@ -257,6 +253,9 @@
   border-radius: var(--tf-radius-sm, 6px);
   transition: background 0.12s;
 }
+.fb-palette-cat-header > .tf-btn { width: 100%; }
+.fb-palette-cat-header > .tf-btn > span { display: flex; flex: 1; gap: 8px; text-align: left; }
+.fb-palette-cat-header > .tf-btn > span > span:first-child { flex: 1; }
 .fb-palette-cat-header:hover { background: var(--tf-bg-3, #131736); color: var(--tf-text-2, #c1c5e0); }
 /* Nagłówek grupy: etykieta, licznik, strzałka — licznik odpycha strzałkę na
    prawo, więc rozkład zostaje ten sam co przed dodaniem liczby. */
@@ -290,6 +289,8 @@
   min-height: 48px;
   touch-action: none;
 }
+.fb-node-item > .tf-btn { width: 100%; padding: 0; min-width: 0; }
+.fb-node-item > .tf-btn > span { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; text-align: left; }
 .fb-node-item:hover { background: var(--tf-bg-card, #141836); border-color: var(--tf-border, #1f2548); transform: translateX(2px); }
 .fb-node-item:active, .fb-node-item.dragging { cursor: grabbing; opacity: 0.7; }
 .fb-node-icon {
@@ -328,11 +329,11 @@
 .fb-node-desc {
   font-size: 11px;
   color: var(--tf-text-3, #6a7196);
-  line-height: 1.3;
+  line-height: 1.4;
   margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
 }
 .fb-palette-empty {
   text-align: center;
@@ -891,28 +892,6 @@
   border-bottom: 1px solid var(--tf-border, #1f2548);
   padding: 0 8px;
 }
-.fb-config-tab {
-  padding: 10px 12px 12px;
-  max-width: 100%;
-  background: transparent;
-  border: 0;
-  color: var(--tf-text-3, #6a7196);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  position: relative;
-  font-family: inherit;
-}
-.fb-config-tab:hover { color: var(--tf-text, #f5f6ff); }
-.fb-config-tab.active { color: var(--tf-text, #f5f6ff); }
-.fb-config-tab.active::after {
-  content: '';
-  position: absolute;
-  left: 8px; right: 8px; bottom: -1px;
-  height: 2px;
-  background: var(--tf-gradient-accent, linear-gradient(135deg, #6366f1, #a78bfa));
-  border-radius: 2px 2px 0 0;
-}
 .fb-config-body {
   flex: 1;
   overflow-y: auto;
@@ -1165,7 +1144,7 @@
      żadnej wskazówki, że tam jest. Zamiast tego pasek się zawija, a wiersz
      shella rośnie razem z nim. */
   .fb-shell {
-    grid-template-rows: auto 1fr 52px;
+    grid-template-rows: auto auto auto minmax(0, 1fr) 52px;
   }
   .fb-topbar {
     flex-wrap: wrap;
@@ -1191,7 +1170,6 @@
   .fb-autosave { order: 6; }
   .fb-zoom-controls { order: 7; }
   .fb-topbar > [data-role="variables"] { order: 8; }
-  .fb-topbar > [data-role="test"] { order: 9; }
   .fb-topbar > [data-role="history"] { order: 10; }
   /* Sam znacznik wystarczy — pełne "Zapisano" zjadało cały rząd. */
   .fb-autosave [data-role="autosave-text"] { display: none; }
@@ -1204,32 +1182,6 @@
     width: 100%;
     height: 100%;
   }
-  .fb-mobile-tab {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    background: transparent;
-    border: 0;
-    color: var(--tf-text-3, #6a7196);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    cursor: pointer;
-    font-family: inherit;
-    position: relative;
-  }
-  .fb-mobile-tab svg { width: 18px; height: 18px; }
-  .fb-mobile-tab.active { color: var(--tf-accent-2, #818cf8); }
-  .fb-mobile-tab.active::after {
-    content: '';
-    position: absolute;
-    top: 0; left: 25%; right: 25%;
-    height: 2px;
-    background: var(--tf-gradient-accent, linear-gradient(135deg, #6366f1, #a78bfa));
-  }
 }
 
 .fb-mobile-tabs { display: none; }
@@ -1241,20 +1193,7 @@
 /* ============================================================================
    Lista flow (flows.js) — ikon-only akcje + status chip
    ============================================================================ */
-.flows-status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-.flows-status-chip.active { background: rgba(34,197,94,0.15); color: var(--tf-success, #22c55e); }
-.flows-status-chip.draft { background: var(--tf-accent-glow, rgba(99,102,241,0.18)); color: var(--tf-accent-2, #818cf8); }
-.flows-status-chip.archived { background: rgba(148,163,184,0.15); color: #94a3b8; }
+.flows-row-actions { display: flex; align-items: center; gap: 6px; }
 
 /* ============================================================================
    Edytor zmiennych flow (variables.js) — tabela {name, type, default, desc}
@@ -1370,3 +1309,38 @@
   cursor: default;
   opacity: 0.6;
 }
+
+/* Process notation shares the editor shell and retains the model's DI bounds. */
+.fb-process-shell .fb-topbar { flex-wrap: wrap; padding-block: 8px; overflow-x: visible; gap: 8px; }
+.fb-process-shell .fb-topbar > tf-button { flex-shrink: 0; }
+.fb-process-shell .fb-topbar-separator { display: none; }
+.fb-process-shell .fb-topbar-spacer { flex-basis: 20px; }
+.fb-process-notice { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 16px; border-bottom: 1px solid var(--tf-border); color: var(--tf-text-2); }
+.fb-process-notice > span { flex: 1; min-width: 220px; line-height: 1.5; }
+.fb-process-node { border: 2px solid var(--tf-accent-2); border-radius: 12px; background: var(--tf-bg-card); }
+.fb-process-symbol { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 100%; padding: 12px; box-sizing: border-box; overflow-wrap: anywhere; }
+.fb-process-symbol > span { min-width: 0; line-height: 1.4; font-weight: 600; max-height: 100%; overflow-y: auto; }
+.fb-process-symbol svg { width: 24px; height: 24px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; }
+.fb-process-node.bpmn_start, .fb-process-node.bpmn_end { border-radius: 50%; }
+.fb-process-node.bpmn_end { border-width: 4px; }
+.fb-process-node.bpmn_exclusive_gateway, .fb-process-node.bpmn_parallel_gateway { background: transparent; border: none; box-shadow: none; }
+.fb-process-node.bpmn_exclusive_gateway::before, .fb-process-node.bpmn_parallel_gateway::before { content: ''; position: absolute; inset: 15%; transform: rotate(45deg); background: var(--tf-bg-card); border: 2px solid var(--tf-warning); box-sizing: border-box; }
+.fb-process-node .fb-process-symbol { position: relative; }
+.fb-process-node:focus-visible { outline: 3px solid var(--tf-accent-1); outline-offset: 5px; }
+.fb-process-label { position: absolute; top: calc(100% + 10px); left: 50%; transform: translateX(-50%); width: max-content; max-width: 200px; line-height: 1.4; text-align: center; overflow-wrap: anywhere; }
+.fb-process-edge-label { fill: var(--tf-text-2); font-size: 12px; paint-order: stroke; stroke: var(--tf-bg); stroke-width: 4px; stroke-linejoin: round; pointer-events: none; }
+.fb-process-shell .fb-edge-hit:focus-visible { stroke: var(--tf-accent-1); stroke-opacity: 0.4; }
+.fb-process-fields, .fb-process-connect, .fb-process-content { min-width: 0; }
+.fb-process-connect { display: flex; flex-direction: column; gap: 8px; }
+.fb-process-window .fb-process-content { display: flex; flex-direction: column; gap: 16px; }
+.fb-process-summary, .fb-process-work { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.fb-process-summary h2 { flex: 1; min-width: 200px; margin: 0; overflow-wrap: anywhere; }
+.fb-process-work { border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 12px; margin-block: 8px; }
+.fb-process-work > div { flex: 1; min-width: 200px; overflow-wrap: anywhere; }
+.fb-process-work p { color: var(--tf-text-2); margin-bottom: 0; line-height: 1.5; }
+.fb-process-json { min-width: 0; }
+.fb-process-json tf-code-editor { display: block; height: 200px; max-width: 100%; border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
+.fb-process-import tf-code-editor { display: block; height: 320px; }
+.fb-process-history ol { list-style: none; padding: 0; }
+.fb-process-history li { border-left: 2px solid var(--tf-border); padding: 4px 0 16px 16px; line-height: 1.5; overflow-wrap: anywhere; }
+.fb-process-history time { display: block; font-size: 12px; color: var(--tf-text-3); }

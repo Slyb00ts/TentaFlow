@@ -8662,6 +8662,7 @@ pub enum MessageBody {
     // Appended at the END of the enum (ciborium tags by variant NAME).
     AddonRequirementInstallRequestBody(AddonRequirementInstallRequest),
     AddonRequirementInstallResponseBody(AddonRequirementInstallResponse),
+    ProcessBody(crate::processes::ProcessPayload),
 }
 
 // =============================================================================

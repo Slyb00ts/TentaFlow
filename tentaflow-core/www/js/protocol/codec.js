@@ -299,7 +299,156 @@ function orgFileBytes(payload) {
  *
  * Zwracaja Uint8Array gotowy do `ws.send(bytes)`.
  */
+function processField(value, camel) {
+  return value?.[camel];
+}
+
+function processModel(model) {
+  if (!model || typeof model !== 'object') throw new TypeError('process model is required');
+  const nodes = (model.nodes ?? []).map((node) => {
+    const kind = node.kind;
+    if (typeof kind === 'string') return { id: String(node.id), name: String(node.name ?? ''), kind };
+    if (!kind || typeof kind !== 'object') throw new TypeError('process node kind is required');
+    const [tag, body] = Object.entries(kind)[0] ?? [];
+    if (!tag || !body) throw new TypeError('process node kind is invalid');
+    let fields;
+    if (tag === 'UserTask') {
+      fields = { assignee_user_id: processField(body, 'assigneeUserId') ?? null,
+        output_mapping: processField(body, 'outputMapping') ?? {} };
+    } else if (tag === 'ServiceTask') {
+      const verification = body.verification;
+      const verified = typeof verification === 'object' && verification !== null && verification.Condition
+        ? { Condition: { expression: String(verification.Condition.expression ?? '') } }
+        : verification;
+      fields = { flow_id: String(processField(body, 'flowId') ?? ''),
+        input_mapping: processField(body, 'inputMapping') ?? {},
+        output_mapping: processField(body, 'outputMapping') ?? {},
+        verification: verified ?? 'Human',
+        timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60) };
+    } else if (tag === 'ExclusiveGateway') {
+      fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };
+    } else {
+      throw new TypeError(`unsupported process node kind ${tag}`);
+    }
+    return { id: String(node.id), name: String(node.name ?? ''), kind: { [tag]: fields } };
+  });
+  const diagram = model.diagram ?? {};
+  return {
+    schema_version: Number(processField(model, 'schemaVersion') ?? 1),
+    process_id: String(processField(model, 'processId') ?? ''),
+    nodes,
+    sequence_flows: (processField(model, 'sequenceFlows') ?? []).map((flow) => ({
+      id: String(flow.id), source_id: String(processField(flow, 'sourceId') ?? ''),
+      target_id: String(processField(flow, 'targetId') ?? ''),
+      condition: flow.condition ?? null,
+    })),
+    variables: model.variables ?? {},
+    diagram: {
+      shapes: (diagram.shapes ?? []).map((shape) => ({
+        element_id: String(processField(shape, 'elementId') ?? ''),
+        x: Number(shape.x), y: Number(shape.y), width: Number(shape.width), height: Number(shape.height),
+      })),
+      edges: (diagram.edges ?? []).map((edge) => ({
+        sequence_flow_id: String(processField(edge, 'sequenceFlowId') ?? ''),
+        waypoints: (edge.waypoints ?? []).map((point) => ({ x: Number(point.x), y: Number(point.y) })),
+      })),
+    },
+  };
+}
+
+function processRequestBody(variant, payload) {
+  const fields = {};
+  const fieldNames = {
+    OptionsRequest: [],
+    DefinitionListRequest: ['offset', 'limit'], DefinitionGetRequest: ['definitionId'],
+    DefinitionSaveRequest: ['commandId', 'definitionId', 'expectedRevision', 'name', 'description', 'model'],
+    DefinitionPublishRequest: ['commandId', 'definitionId', 'expectedRevision'],
+    DefinitionArchiveRequest: ['commandId', 'definitionId', 'expectedRevision', 'archived'],
+    VersionListRequest: ['definitionId', 'offset', 'limit'], VersionGetRequest: ['definitionId', 'version'],
+    XmlImportRequest: ['xml'], XmlExportRequest: ['definitionId', 'version'],
+    InstanceStartRequest: ['commandId', 'definitionId', 'version', 'variables'],
+    InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId'],
+    UserTaskGetRequest: ['instanceId', 'userTaskId'],
+    UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
+    InstanceCancelRequest: ['commandId', 'instanceId', 'expectedRevision'],
+    JobRetryRequest: ['commandId', 'instanceId', 'jobId', 'expectedRevision'],
+    HistoryRequest: ['instanceId', 'afterSeq', 'limit'],
+  }[variant];
+  if (!fieldNames) throw new TypeError(`unknown process request ${variant}`);
+  for (const name of fieldNames) {
+    const key = name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    const value = processField(payload, name);
+    if (value === undefined && !['definitionId', 'version', 'approved'].includes(name)) {
+      throw new TypeError(`process request ${variant} requires ${name}`);
+    }
+    fields[key] = name === 'model' ? processModel(value) : (value ?? null);
+  }
+  return _wasm.encodeProcessRequest(variant, JSON.stringify(fields));
+}
+
+function processFrame(correlationId, sequence, variant, payload) {
+  assertReady();
+  const body = processRequestBody(variant, payload);
+  return _wasm.encodeEnvelopeDirect(
+    BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
+  );
+}
+
 export const encode = {
+  processOptionsRequest(correlationId, payload = {}, sequence = 1) {
+    return processFrame(correlationId, sequence, 'OptionsRequest', payload);
+  },
+  processDefinitionListRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'DefinitionListRequest', payload);
+  },
+  processDefinitionGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'DefinitionGetRequest', payload);
+  },
+  processDefinitionSaveRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'DefinitionSaveRequest', payload);
+  },
+  processDefinitionPublishRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'DefinitionPublishRequest', payload);
+  },
+  processDefinitionArchiveRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'DefinitionArchiveRequest', payload);
+  },
+  processVersionListRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'VersionListRequest', payload);
+  },
+  processVersionGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'VersionGetRequest', payload);
+  },
+  processXmlImportRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'XmlImportRequest', payload);
+  },
+  processXmlExportRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'XmlExportRequest', payload);
+  },
+  processInstanceStartRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceStartRequest', payload);
+  },
+  processInstanceListRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceListRequest', payload);
+  },
+  processInstanceGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceGetRequest', payload);
+  },
+  processUserTaskGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'UserTaskGetRequest', payload);
+  },
+  processUserTaskCompleteRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'UserTaskCompleteRequest', payload);
+  },
+  processInstanceCancelRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceCancelRequest', payload);
+  },
+  processJobRetryRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'JobRetryRequest', payload);
+  },
+  processHistoryRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'HistoryRequest', payload);
+  },
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {
     assertReady();

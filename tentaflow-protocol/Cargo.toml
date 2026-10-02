@@ -11,9 +11,9 @@ description = "Wspólne typy protokołu QUIC+CBOR dla TentaFlow"
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 ciborium = { workspace = true }
+serde_json = { workspace = true, default-features = true }
 
 [dev-dependencies]
-serde_json = { workspace = true, default-features = true }
 criterion = { workspace = true, features = ["html_reports"] }
 
 [[bench]]

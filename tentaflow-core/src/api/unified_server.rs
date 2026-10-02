@@ -292,6 +292,10 @@ pub fn start_unified_server_with_permissions(
         );
     crate::project_studio::task_transfer::recover_transfers(&owner_state)?;
     crate::project_studio::media::start_workers(owner_state.clone())?;
+    let process_runtime = match router.flow_dispatcher() {
+        Some(dispatcher) => Some(crate::processes::runtime::start(&db, dispatcher)?),
+        None => None,
+    };
     let installed = crate::code_studio::remote_proxy::install_owner_context(owner_state);
     info!("Code Studio owner context installed: {installed}");
 
@@ -420,6 +424,9 @@ pub fn start_unified_server_with_permissions(
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
                             info!("Unified server: shutdown — zamykam listener");
+                            if let Some(runtime) = process_runtime.as_ref() {
+                                if let Err(error) = runtime.shutdown().await { error!(error = %error, "process worker shutdown failed"); }
+                            }
                             return;
                         }
                         continue;

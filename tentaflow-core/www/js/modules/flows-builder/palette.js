@@ -10,6 +10,9 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeName, getNodeDescription } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
+import { processTemplates } from './bpmn.js';
+import '/js/components/tf-searchbox.js';
+import '/js/components/tf-button.js';
 
 const CATEGORY_ORDER = ['trigger', 'service', 'memory', 'transform', 'logic', 'filter', 'output', 'other'];
 
@@ -19,6 +22,7 @@ function categoryLabel(cat) {
 
 function catFor(tpl) {
   const c = (tpl.category || '').toLowerCase();
+  if (tpl.node_type.startsWith('bpmn_')) return c;
   if (CATEGORY_ORDER.includes(c)) return c;
   // Sensible fallback: typ noda -> kategoria
   const t = tpl.node_type;
@@ -42,6 +46,7 @@ export class FlowPalette {
   constructor(rootEl, opts = {}) {
     this.root = rootEl;
     this.opts = opts;
+    this.mode = opts.mode || 'flow';
     this.templates = [];
     // node_type występujące w kilku wariantach (presety agentów). Dla nich
     // nazwa z i18n jest wspólna, więc paleta musi pokazać etykietę szablonu —
@@ -54,6 +59,8 @@ export class FlowPalette {
     this.collapsedCats = new Set();
     this._ghost = null;
     this._dragging = null;
+    this._filterTimer = null;
+    this._disposed = false;
     this._pointerMoveHandler = this._onPointerMove.bind(this);
     this._pointerUpHandler = this._onPointerUp.bind(this);
   }
@@ -66,19 +73,20 @@ export class FlowPalette {
         <span class="fb-palette-count" data-role="count">0</span>
       </div>
       <div class="fb-palette-search">
-        <input type="search" placeholder="${escapeAttr(I18n.t('flows_palette.search_placeholder'))}" aria-label="${escapeAttr(I18n.t('flows_palette.search_label'))}">
+        <tf-searchbox placeholder="${escapeAttr(I18n.t('flows_palette.search_placeholder'))}" aria-label="${escapeAttr(I18n.t('flows_palette.search_label'))}"></tf-searchbox>
       </div>
       <div class="fb-palette-list" data-role="list"></div>
     `;
     this.listEl = this.root.querySelector('[data-role="list"]');
     this.countEl = this.root.querySelector('[data-role="count"]');
-    this.searchEl = this.root.querySelector('input[type="search"]');
+    this.searchEl = this.root.querySelector('tf-searchbox');
 
-    let debounce = null;
-    this.searchEl.addEventListener('input', (e) => {
-      clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        this.filter = (e.target.value || '').toLowerCase();
+    this.searchEl.addEventListener('search', (e) => {
+      if (e.target !== this.searchEl) return;
+      clearTimeout(this._filterTimer);
+      this._filterTimer = setTimeout(() => {
+        if (this._disposed || !this.root.isConnected) return;
+        this.filter = (e.detail.value || '').toLowerCase();
         this._render();
       }, 120);
     });
@@ -86,15 +94,17 @@ export class FlowPalette {
     // Alongside the palette: which model can take what. Fire-and-forget — a
     // canvas that renders before the catalog lands simply dims nothing, and the
     // next render (any edit) picks it up.
-    ModelModalities.load();
+    if (this.mode !== 'bpmn') ModelModalities.load();
 
     try {
-      this.templates = await ApiBinary.list('flowNodeTemplatesListRequest', { arrayKey: 'templates' });
+      this.templates = this.mode === 'bpmn' ? processTemplates() : await ApiBinary.list('flowNodeTemplatesListRequest', { arrayKey: 'templates' });
     } catch (err) {
+      if (this._disposed || !this.root.isConnected) return;
       this.templates = [];
       this.listEl.innerHTML = `<div class="fb-palette-empty">${escapeHtml(I18n.t('flows_palette.load_error', { error: err.message }))}</div>`;
       return;
     }
+    if (this._disposed || !this.root.isConnected) return;
     const perType = new Map();
     for (const tpl of this.templates) perType.set(tpl.node_type, (perType.get(tpl.node_type) ?? 0) + 1);
     this.presetTypes = new Set([...perType.entries()].filter(([, n]) => n > 1).map(([t]) => t));
@@ -155,17 +165,17 @@ export class FlowPalette {
     }
 
     let html = '';
-    for (const cat of CATEGORY_ORDER) {
+    for (const cat of this.mode === 'bpmn' ? ['events', 'tasks', 'gateways'] : CATEGORY_ORDER) {
       const items = groups[cat];
       if (!items || items.length === 0) continue;
       const collapsed = this.collapsedCats.has(cat);
       html += `
         <div class="fb-palette-category ${collapsed ? 'collapsed' : ''}" data-cat="${escapeAttr(cat)}">
-          <div class="fb-palette-cat-header" data-role="cat-header">
-            <span>${escapeHtml(categoryLabel(cat))}</span>
+          <tf-button variant="ghost" class="fb-palette-cat-header" data-role="cat-header" aria-expanded="${!collapsed}">
+            <span>${escapeHtml(this.mode === 'bpmn' ? I18n.t(`bpmn.category_${cat}`) : categoryLabel(cat))}</span>
             <span class="fb-palette-cat-count">${items.length}</span>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-          </div>
+          </tf-button>
           <div class="fb-palette-items">
             ${items.map((it) => this._renderItem(it.tpl, it.index)).join('')}
           </div>
@@ -179,11 +189,15 @@ export class FlowPalette {
         if (this.collapsedCats.has(cat)) this.collapsedCats.delete(cat);
         else this.collapsedCats.add(cat);
         h.closest('.fb-palette-category').classList.toggle('collapsed');
+        h.setAttribute('aria-expanded', String(!this.collapsedCats.has(cat)));
       });
     });
 
     this.listEl.querySelectorAll('.fb-node-item').forEach((el) => {
       el.addEventListener('pointerdown', (ev) => this._onPointerDown(ev, el));
+      el.addEventListener('click', (ev) => {
+        if (!this.readOnly && ev.detail === 0) this.opts.onAdd?.(this.templates[Number(el.dataset.index)]);
+      });
     });
   }
 
@@ -194,13 +208,13 @@ export class FlowPalette {
     const name = this._nameOf(tpl);
     const desc = this._descOf(tpl);
     return `
-      <div class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc || name)}" style="--node-color: var(${varName})">
+      <tf-button variant="ghost" wrap class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc || name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
           <div class="fb-node-name">${escapeHtml(name)}</div>
           ${desc ? `<div class="fb-node-desc">${escapeHtml(desc)}</div>` : ''}
         </div>
-      </div>`;
+      </tf-button>`;
   }
 
   _onPointerDown(ev, el) {
@@ -256,6 +270,7 @@ export class FlowPalette {
     if (this._ghost) { this._ghost.remove(); this._ghost = null; }
     if (d.el) d.el.classList.remove('dragging');
     document.querySelectorAll('.fb-canvas.drop-target').forEach((c) => c.classList.remove('drop-target'));
+    if (ev.type === 'pointercancel') { this._dragging = null; return; }
     if (d.moved && this.opts.onDrop) {
       const canvas = document.querySelector('.fb-canvas');
       if (canvas) {
@@ -264,11 +279,15 @@ export class FlowPalette {
           this.opts.onDrop(d.tpl, ev.clientX, ev.clientY);
         }
       }
+    } else if (!d.moved) {
+      this.opts.onAdd?.(d.tpl);
     }
     this._dragging = null;
   }
 
   destroy() {
+    this._disposed = true;
+    clearTimeout(this._filterTimer);
     window.removeEventListener('pointermove', this._pointerMoveHandler);
     window.removeEventListener('pointerup', this._pointerUpHandler);
     window.removeEventListener('pointercancel', this._pointerUpHandler);

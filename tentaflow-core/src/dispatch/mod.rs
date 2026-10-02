@@ -49,6 +49,7 @@ pub mod ml_studio;
 pub mod ml_studio_remote_import;
 pub mod model_conversion;
 pub mod model_metrics;
+pub mod processes;
 pub mod project_studio;
 pub mod provider_account;
 pub mod maps;
@@ -2811,6 +2812,47 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Pa::RuntimeUninstallRequest { .. } => "ProviderAccountRuntimeUninstallRequest",
                 Pa::RuntimeStatusResponse { .. } => "ProviderAccountRuntimeStatusResponse",
                 Pa::AccountOpAck { .. } => "ProviderAccountAccountOpAck",
+            }
+        }
+        MessageBody::ProcessBody(p) => {
+            use tentaflow_protocol::processes::ProcessPayload as P;
+            match p {
+                P::OptionsRequest { .. } => "ProcessOptionsRequest",
+                P::OptionsResponse { .. } => "ProcessOptionsResponse",
+                P::DefinitionListRequest { .. } => "ProcessDefinitionListRequest",
+                P::DefinitionListResponse { .. } => "ProcessDefinitionListResponse",
+                P::DefinitionGetRequest { .. } => "ProcessDefinitionGetRequest",
+                P::DefinitionGetResponse { .. } => "ProcessDefinitionGetResponse",
+                P::DefinitionSaveRequest { .. } => "ProcessDefinitionSaveRequest",
+                P::DefinitionSaveResponse { .. } => "ProcessDefinitionSaveResponse",
+                P::DefinitionPublishRequest { .. } => "ProcessDefinitionPublishRequest",
+                P::DefinitionPublishResponse { .. } => "ProcessDefinitionPublishResponse",
+                P::DefinitionArchiveRequest { .. } => "ProcessDefinitionArchiveRequest",
+                P::DefinitionArchiveResponse { .. } => "ProcessDefinitionArchiveResponse",
+                P::VersionListRequest { .. } => "ProcessVersionListRequest",
+                P::VersionListResponse { .. } => "ProcessVersionListResponse",
+                P::VersionGetRequest { .. } => "ProcessVersionGetRequest",
+                P::VersionGetResponse { .. } => "ProcessVersionGetResponse",
+                P::XmlImportRequest { .. } => "ProcessXmlImportRequest",
+                P::XmlImportResponse { .. } => "ProcessXmlImportResponse",
+                P::XmlExportRequest { .. } => "ProcessXmlExportRequest",
+                P::XmlExportResponse { .. } => "ProcessXmlExportResponse",
+                P::InstanceStartRequest { .. } => "ProcessInstanceStartRequest",
+                P::InstanceStartResponse { .. } => "ProcessInstanceStartResponse",
+                P::InstanceListRequest { .. } => "ProcessInstanceListRequest",
+                P::InstanceListResponse { .. } => "ProcessInstanceListResponse",
+                P::InstanceGetRequest { .. } => "ProcessInstanceGetRequest",
+                P::InstanceGetResponse { .. } => "ProcessInstanceGetResponse",
+                P::UserTaskGetRequest { .. } => "ProcessUserTaskGetRequest",
+                P::UserTaskGetResponse { .. } => "ProcessUserTaskGetResponse",
+                P::UserTaskCompleteRequest { .. } => "ProcessUserTaskCompleteRequest",
+                P::UserTaskCompleteResponse { .. } => "ProcessUserTaskCompleteResponse",
+                P::InstanceCancelRequest { .. } => "ProcessInstanceCancelRequest",
+                P::InstanceCancelResponse { .. } => "ProcessInstanceCancelResponse",
+                P::JobRetryRequest { .. } => "ProcessJobRetryRequest",
+                P::JobRetryResponse { .. } => "ProcessJobRetryResponse",
+                P::HistoryRequest { .. } => "ProcessHistoryRequest",
+                P::HistoryResponse { .. } => "ProcessHistoryResponse",
             }
         }
         MessageBody::MapBody(p) => {

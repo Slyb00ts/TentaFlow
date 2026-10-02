@@ -52,8 +52,9 @@ pub fn check_access(
     user_id: &str,
     user_role: &str,
 ) -> Result<bool> {
+    let conn = db.read()?;
     crate::db::repository::resource_permissions::check_default_allow(
-        db,
+        &conn,
         resource_type,
         resource_id,
         user_id,

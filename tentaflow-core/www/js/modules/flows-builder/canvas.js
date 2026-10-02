@@ -10,6 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
+import { processToCanvas, canvasToProcess, processNodeKind, processNodeConfig } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -97,6 +98,10 @@ function markUnsupported(node, ports, side) {
 }
 
 function portsForNode(node, template) {
+  if (node.type.startsWith('bpmn_')) {
+    return { inputs: node.type === 'bpmn_start' ? [] : [{ name: 'in', type: 'any' }],
+      outputs: node.type === 'bpmn_end' ? [] : [{ name: 'full', type: 'any' }] };
+  }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
   // so it needs the literal fallback; every other entry-style node — trigger,
   // `bus_consume`, `on_subagent_complete`, and any future one — is tagged
@@ -184,6 +189,7 @@ export class FlowCanvas {
   constructor(rootEl, opts = {}) {
     this.root = rootEl;
     this.opts = opts;
+    this.mode = opts.mode || 'flow';
     this.nodes = [];
     this.edges = [];
     this.selectedIds = new Set();
@@ -282,6 +288,7 @@ export class FlowCanvas {
   // Menu kontekstowe canvas: akcje regionu petli (zgrupuj / rozgrupuj) na
   // biezacym zaznaczeniu. Otwierane prawym przyciskiem nad wezlem.
   _onContextMenu(ev) {
+    if (this.mode === 'bpmn') return;
     const nodeEl = ev.target.closest('.fb-node');
     if (!nodeEl || this.readOnly) { this._closeContextMenu(); return; }
     ev.preventDefault();
@@ -327,6 +334,12 @@ export class FlowCanvas {
   // Dane
   // -------------------------------------------------------------------------
   setData(nodes, edges, { reset = true } = {}) {
+    if (this.mode === 'bpmn') {
+      this.processModel = structuredClone(nodes);
+      const data = processToCanvas(nodes);
+      nodes = data.nodes;
+      edges = data.edges;
+    }
     // Seed/backend pisze pozycje jako `{position: {x, y}}` (zagniezdzone),
     // canvas renderuje przez flat `n.x`/`n.y`. Bez tej normalizacji wszystkie
     // nodes lecialy na (0,0) — w GUI wygladalo to jak pojedynczy node.
@@ -366,6 +379,9 @@ export class FlowCanvas {
   }
 
   getData() {
+    if (this.mode === 'bpmn') {
+      return canvasToProcess(this.processModel, this.nodes, this.edges, (edge) => this._processEdgePoints(edge));
+    }
     this._normalizeEdgePorts();
     // Przy serializacji pomijamy porty rowne domyslnym ("full"/"in"), zeby
     // nie zasmiecac flow_json pusta metadata — backend rozumie brak pol
@@ -411,6 +427,7 @@ export class FlowCanvas {
   // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
   // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
   validate() {
+    if (this.mode === 'bpmn') return [];
     this._normalizeEdgePorts();
     const errors = [];
     const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
@@ -483,6 +500,7 @@ export class FlowCanvas {
   }
 
   _normalizeEdgePorts() {
+    if (this.mode === 'bpmn') return;
     if (!Array.isArray(this.edges) || this.edges.length === 0) return;
     const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
     for (const edge of this.edges) {
@@ -538,6 +556,32 @@ export class FlowCanvas {
     }
   }
 
+  _clearRemovedDefaults() {
+    if (this.mode !== 'bpmn') return;
+    const ids = new Set(this.edges.map((edge) => edge.id));
+    for (const node of this.nodes) {
+      if (node.type === 'bpmn_exclusive_gateway' && !ids.has(node.config.defaultFlowId)) node.config.defaultFlowId = null;
+    }
+  }
+
+  updateEdge(edgeId, patch) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    const edge = this.edges.find((value) => value.id === edgeId);
+    if (!edge || Object.entries(patch).every(([key, value]) => edge[key] === value)) return;
+    Object.assign(edge, patch);
+    this._pushHistory();
+    this._renderEdges();
+    this.onChange();
+  }
+
+  _processEdgePoints(edge) {
+    const from = this.nodes.find((node) => node.id === edge.from_node);
+    const to = this.nodes.find((node) => node.id === edge.to_node);
+    const endpoints = [from?.x, from?.y, to?.x, to?.y];
+    if (edge.waypoints?.length >= 2 && edge.originalEndpoints?.every((value, index) => value === endpoints[index])) return structuredClone(edge.waypoints);
+    return [this._getPortWorldPos(edge.from_node, 'full', 'out'), this._getPortWorldPos(edge.to_node, 'in', 'in')];
+  }
+
   _pushHistory() {
     // Odcinamy redo-branche po nowej operacji. structuredClone zamiast
     // JSON round-trip — szybszy binary copy + zachowuje typy Date/Map jesli
@@ -588,6 +632,13 @@ export class FlowCanvas {
       y: Math.round((pt.y - NODE_H_APPROX / 2) / GRID) * GRID,
       config: defaultConfig,
     };
+    if (this.mode === 'bpmn') {
+      node.config = processNodeConfig(processNodeKind(node.type));
+      node.width = tpl.width;
+      node.height = tpl.height;
+      node.x = Math.round((pt.x - node.width / 2) / GRID) * GRID;
+      node.y = Math.round((pt.y - node.height / 2) / GRID) * GRID;
+    }
     this.nodes.push(node);
     this._pushHistory();
     this.render();
@@ -627,6 +678,7 @@ export class FlowCanvas {
   }
 
   _normalizeNodeLabels() {
+    if (this.mode === 'bpmn') return;
     if (!Array.isArray(this.nodes) || this.nodes.length === 0) return;
     for (const node of this.nodes) {
       // Preset dzieli node_type z innymi presetami, więc jego etykieta jest
@@ -644,6 +696,7 @@ export class FlowCanvas {
     const idSet = new Set(ids);
     this.nodes = this.nodes.filter((n) => !idSet.has(n.id));
     this.edges = this.edges.filter((e) => !idSet.has(e.from_node) && !idSet.has(e.to_node));
+    this._clearRemovedDefaults();
     this.selectedIds.clear();
     this._pushHistory();
     this.render();
@@ -662,9 +715,10 @@ export class FlowCanvas {
         id: 'n_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
         x: n.x + 30,
         y: n.y + 30,
-        config: { ...n.config },
+        config: structuredClone(n.config),
       };
       idMap.set(n.id, clone.id);
+      if (this.mode === 'bpmn' && clone.type === 'bpmn_exclusive_gateway') clone.config.defaultFlowId = null;
       clones.push(clone);
     }
     this.nodes.push(...clones);
@@ -773,6 +827,7 @@ export class FlowCanvas {
     }
     if (this.selectedEdgeId) {
       this.edges = this.edges.filter((e) => e.id !== this.selectedEdgeId);
+      this._clearRemovedDefaults();
       this.selectedEdgeId = null;
       this._pushHistory();
       this.render();
@@ -792,6 +847,31 @@ export class FlowCanvas {
       ? this.nodes.find((n) => n.id === [...this.selectedIds][0])
       : null;
     this.onSelect(node);
+  }
+
+  selectEdge(id) {
+    this.selectedIds.clear();
+    this.selectedEdgeId = id;
+    this._applySelectionClasses();
+    this._renderEdges();
+    this.onSelect(null, this.edges.find((edge) => edge.id === id));
+  }
+
+  connectNodes(sourceId, targetId, fromPort = 'full', toPort = 'in') {
+    if (this.readOnly || sourceId === targetId) return false;
+    const source = this.nodes.find((node) => node.id === sourceId);
+    const target = this.nodes.find((node) => node.id === targetId);
+    if (!source || !target) return false;
+    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || target.type === 'bpmn_start')) return false;
+    if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
+    const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
+    if (this.mode === 'bpmn') edge.condition = null;
+    if (source.region && source.region === target.region && this._wouldFormCycle(sourceId, targetId)) edge.kind = 'loop_back';
+    this.edges.push(edge);
+    this._pushHistory();
+    this._renderEdges();
+    this.onChange();
+    return true;
   }
 
   clearSelection() {
@@ -904,6 +984,32 @@ export class FlowCanvas {
     div.style.top = `${n.y}px`;
     div.style.width = `${NODE_WIDTH}px`;
     div.style.setProperty('--node-color', `var(${nodeColorVar(n.type, tmpl?.category)})`);
+
+    if (this.mode === 'bpmn') {
+      div.tabIndex = 0;
+      div.setAttribute('role', 'button');
+      div.setAttribute('aria-label', n.label || tmpl.label);
+      div.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        this.selectNode(n.id);
+      });
+      div.classList.add('fb-process-node', n.type);
+      div.style.width = `${n.width}px`;
+      div.style.height = `${n.height}px`;
+      const title = n.label || tmpl.label;
+      const event = n.type === 'bpmn_start' || n.type === 'bpmn_end';
+      const gateway = n.type.endsWith('_gateway');
+      div.innerHTML = `
+        <div class="fb-process-symbol"><svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>
+          ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}</div>
+        ${event || gateway ? `<div class="fb-process-label">${escapeHtml(title)}</div>` : ''}
+        ${n.type === 'bpmn_start' ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
+        ${n.type === 'bpmn_end' ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
+      div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
+      div.setAttribute('aria-label', title);
+      return div;
+    }
 
     const missing = this._missingRequired(n);
     if (missing.length) div.classList.add('error');
@@ -1023,6 +1129,7 @@ export class FlowCanvas {
   _getPortWorldPos(nodeId, portName, side) {
     const node = this.nodes.find((n) => n.id === nodeId);
     if (!node) return { x: 0, y: 0 };
+    if (this.mode === 'bpmn') return { x: side === 'in' ? node.x : node.x + node.width, y: node.y + node.height / 2 };
     const tmpl = this.templates.get(node.type);
     const { inputs, outputs } = portsForNode(node, tmpl);
     const list = side === 'in' ? inputs : outputs;
@@ -1044,12 +1151,23 @@ export class FlowCanvas {
       if (!from || !to) continue;
       const fp = this._getPortWorldPos(e.from_node, e.from_port || 'full', 'out');
       const tp = this._getPortWorldPos(e.to_node, e.to_port || 'in', 'in');
-      const d = this._bezierPath(fp.x, fp.y, tp.x, tp.y);
+      const points = this.mode === 'bpmn' ? this._processEdgePoints(e) : null;
+      const d = points ? points.map((point, index) => `${index ? 'L' : 'M'} ${point.x} ${point.y}`).join(' ') : this._bezierPath(fp.x, fp.y, tp.x, tp.y);
       // Hit area
       const hit = document.createElementNS(svgNs, 'path');
       hit.setAttribute('class', 'fb-edge-hit');
       hit.setAttribute('d', d);
       hit.dataset.edgeId = e.id;
+      if (this.mode === 'bpmn') {
+        hit.setAttribute('tabindex', '0');
+        hit.setAttribute('role', 'button');
+        hit.setAttribute('aria-label', `${getNodeDisplayTitle(from, this.templates.get(from.type))} → ${getNodeDisplayTitle(to, this.templates.get(to.type))}`);
+        hit.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          this.selectEdge(e.id);
+        });
+      }
       this.svg.appendChild(hit);
       // Visible path. Loop-back edges (region cykl) rysowane przerywana linia
       // (klasa `loop-back`) + znacznik "loop" na srodku, zeby odroznic je od
@@ -1062,6 +1180,15 @@ export class FlowCanvas {
       const isSelected = this.selectedEdgeId === e.id;
       if (isSelected) p.classList.add('selected');
       this.svg.appendChild(p);
+      if (this.mode === 'bpmn') {
+        const text = document.createElementNS(svgNs, 'text');
+        const middle = points[Math.floor(points.length / 2)];
+        text.setAttribute('x', String((fp.x + middle.x) / 2));
+        text.setAttribute('y', String((fp.y + middle.y) / 2 - 12));
+        text.setAttribute('class', 'fb-process-edge-label');
+        text.textContent = from.config.defaultFlowId === e.id ? I18n.t('bpmn.default_path') : (e.condition || '');
+        this.svg.appendChild(text);
+      }
       if (isLoopBack) {
         const mid = this._bezierMidpoint(fp.x, fp.y, tp.x, tp.y);
         const badge = document.createElementNS(svgNs, 'g');
@@ -1092,7 +1219,7 @@ export class FlowCanvas {
       // krawedz ma takze hover-interaktywny target przez .fb-edge-hit:hover
       // w CSS, ale realny przycisk jest renderowany dopiero po selekcji
       // (po pierwszym kliku w edge). Klik w X usuwa krawedz.
-      if (isSelected) {
+      if (isSelected && this.mode !== 'bpmn') {
         const mid = this._bezierMidpoint(fp.x, fp.y, tp.x, tp.y);
         const g = document.createElementNS(svgNs, 'g');
         g.setAttribute('class', 'fb-edge-delete');
@@ -1158,8 +1285,8 @@ export class FlowCanvas {
     for (const n of this.nodes) {
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
-      maxX = Math.max(maxX, n.x + NODE_WIDTH);
-      maxY = Math.max(maxY, n.y + NODE_H_APPROX);
+      maxX = Math.max(maxX, n.x + (this.mode === 'bpmn' ? n.width : NODE_WIDTH));
+      maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height + 64 : NODE_H_APPROX));
     }
     return { minX, minY, maxX, maxY };
   }
@@ -1495,32 +1622,7 @@ export class FlowCanvas {
           if (rejectMsg) {
             this.opts.onInvalidConnection?.(rejectMsg);
           } else {
-            const exists = this.edges.some((e) =>
-              e.from_node === fromNode.id
-              && e.to_node === toNodeId
-              && e.from_port === fromPort
-              && e.to_port === toPort);
-            if (!exists) {
-              const edge = {
-                id: 'e_' + Date.now().toString(36),
-                from_node: fromNode.id,
-                to_node: toNodeId,
-                from_port: fromPort,
-                to_port: toPort,
-              };
-              // Back-edge detection: if both endpoints live in the SAME loop
-              // region and this edge closes a cycle (target is reachable as an
-              // ancestor of source through forward edges), mark it `loop_back`.
-              // The backend (cache.rs) excludes loop_back edges from in-degree,
-              // so this is the only legal way to draw a cycle on the canvas.
-              if (fromNode.region && fromNode.region === toNode?.region
-                && this._wouldFormCycle(fromNode.id, toNodeId)) {
-                edge.kind = 'loop_back';
-              }
-              this.edges.push(edge);
-              this._pushHistory();
-              this.onChange();
-            }
+            this.connectNodes(fromNode.id, toNodeId, fromPort, toPort);
           }
         }
       }
@@ -1558,11 +1660,7 @@ export class FlowCanvas {
     }
     const hit = hitTarget.closest('.fb-edge-hit');
     if (hit) {
-      this.selectedIds.clear();
-      this.selectedEdgeId = hit.dataset.edgeId;
-      this._applySelectionClasses();
-      this._renderEdges();
-      this.onSelect(null);
+      this.selectEdge(hit.dataset.edgeId);
       return;
     }
     const nodeEl = hitTarget.closest('.fb-node');

@@ -36,6 +36,7 @@ pub mod org_structure_cover;
 pub mod org_structure_handover;
 pub mod pii;
 pub mod profiling;
+pub mod processes;
 pub mod project_studio;
 pub mod provider_account;
 pub mod map;

@@ -15,6 +15,9 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
+import '/js/components/tf-person-picker.js';
+import '/js/components/tf-tabs.js';
+import { processNodeKind } from './bpmn.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -244,6 +247,7 @@ export class FlowConfig {
     this.template = null;
     this.activeTab = 'config';
     this.readOnly = !!opts.readOnly;
+    this.mode = opts.mode || 'flow';
     this.root.classList.add('fb-config');
     this.renderEmpty();
   }
@@ -255,7 +259,132 @@ export class FlowConfig {
     this.template = template;
     this.activeTab = 'config';
     if (!node) { this.renderEmpty(); return; }
-    this._render();
+    if (this.mode === 'bpmn') this._renderProcess();
+    else this._render();
+  }
+
+  showEdge(edge) {
+    this.node = null;
+    this.edge = edge;
+    if (!edge) { this.renderEmpty(); return; }
+    const canvas = this.opts.getCanvas();
+    const source = canvas.nodes.find((node) => node.id === edge.from_node);
+    const target = canvas.nodes.find((node) => node.id === edge.to_node);
+    const name = (node) => node?.label || getNodeName(node?.type);
+    const exclusive = source?.type === 'bpmn_exclusive_gateway';
+    this.root.innerHTML = `
+      <div class="fb-config-header"><div class="fb-config-title-wrap">
+        <div class="fb-config-title">${escapeHtml(I18n.t('bpmn.sequence_flow'))}</div>
+        <div class="fb-config-subtitle">${escapeHtml(name(source))} → ${escapeHtml(name(target))}</div>
+      </div></div>
+      <div class="fb-config-body">
+        <tf-input data-process="condition" label="${escapeAttr(I18n.t('bpmn.condition'))}" hint="${escapeAttr(I18n.t('bpmn.condition_hint'))}" value="${escapeAttr(edge.condition || '')}" ${this.readOnly ? 'disabled' : ''}></tf-input>
+        ${exclusive ? `<tf-toggle data-process="default" label="${escapeAttr(I18n.t('bpmn.default_path'))}" ${source.config.defaultFlowId === edge.id ? 'checked' : ''} ${this.readOnly ? 'disabled' : ''}></tf-toggle>` : ''}
+        <tf-input readonly label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(edge.id)}"></tf-input>
+      </div>
+      ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
+    this.root.querySelector('[data-process="condition"]').addEventListener('change', (event) => {
+      if (event.target.tagName !== 'TF-INPUT' || this.readOnly) return;
+      this.opts.onEdgeChange(edge.id, { condition: event.target.value.trim() || null });
+    });
+    this.root.querySelector('[data-process="default"]')?.addEventListener('change', (event) => {
+      if (event.target.tagName !== 'TF-TOGGLE' || this.readOnly) return;
+      this.opts.onConfigChange(source.id, { defaultFlowId: event.detail.checked ? edge.id : null });
+    });
+    this.root.querySelector('[data-process="delete"]')?.addEventListener('click', () => {
+      canvas.selectedEdgeId = edge.id;
+      canvas.deleteSelected();
+      this.renderEmpty();
+    });
+  }
+
+  _renderProcess() {
+    const node = this.node;
+    const kind = processNodeKind(node.type);
+    const config = node.config;
+    const disabled = this.readOnly ? 'disabled' : '';
+    const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
+    const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
+    let fields = input('name', 'element_name', node.label);
+    if (kind === 'UserTask') {
+      const available = !config.assigneeUserId || this.opts.processOptions.assignees.some((user) => user.userId === config.assigneeUserId);
+      fields += `<tf-person-picker data-process="assigneeUserId" label="${escapeAttr(I18n.t('bpmn.assignee'))}" ${this.readOnly ? 'inert' : ''}></tf-person-picker>
+        ${available ? '' : `<tf-alert tone="warning" message="${escapeAttr(I18n.t('bpmn.assignee_unavailable'))}"></tf-alert>`}
+        ${this.readOnly ? '' : `<tf-button variant="secondary" data-initiator>${escapeHtml(I18n.t('bpmn.use_initiator'))}</tf-button>`}
+        <p class="fb-field-hint" data-assignee-hint>${escapeHtml(I18n.t(config.assigneeUserId ? 'bpmn.assignee_hint' : 'bpmn.initiator'))}</p>${mapping('outputMapping', 'output_mapping')}`;
+    } else if (kind === 'ServiceTask') {
+      const flows = this.opts.processOptions.serviceFlows;
+      const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
+      const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
+      fields += `<tf-select data-process="flowId" label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>
+        ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
+        <tf-select data-process="verification" label="${escapeAttr(I18n.t('bpmn.verification'))}" value="${typeof config.verification === 'string' ? 'Human' : 'Condition'}" ${disabled}>
+          <option value="Human">${escapeHtml(I18n.t('bpmn.verification_human'))}</option>
+          <option value="Condition">${escapeHtml(I18n.t('bpmn.verification_condition'))}</option>
+        </tf-select>
+        <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
+        ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
+    } else if (kind === 'ExclusiveGateway') {
+      const canvas = this.opts.getCanvas();
+      const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
+      fields += `<tf-select data-process="defaultFlowId" label="${escapeAttr(I18n.t('bpmn.default_path'))}" value="${escapeAttr(config.defaultFlowId || '')}" ${disabled}>
+        <option value="">${escapeHtml(I18n.t('bpmn.no_default'))}</option>
+        ${outgoing.map((edge) => {
+          const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
+          return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target?.label || getNodeName(target?.type))}${edge.condition ? ` — ${escapeHtml(edge.condition)}` : ''}</option>`;
+        }).join('')}</tf-select><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.xor_hint'))}</p>`;
+    } else {
+      fields += `<p class="fb-field-hint">${escapeHtml(getNodeName(node.type))}: ${escapeHtml(I18n.t(`bpmn.node_${node.type.slice(5)}_hint`))}</p>`;
+    }
+    const canvas = this.opts.getCanvas();
+    const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
+    if (outgoing.length) fields += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => {
+      const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
+      return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
+    }).join('')}</tf-select>`;
+    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && target.type !== 'bpmn_start').map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    fields += input('elementId', 'element_id', node.id, 'readonly');
+    this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
+      <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
+      ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="secondary" icon="copy" data-process="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
+    this.root.querySelectorAll('tf-keyvalue-editor').forEach((editor) => { editor.value = config[editor.dataset.process]; });
+    const picker = this.root.querySelector('tf-person-picker');
+    if (picker) {
+      picker.items = this.opts.processOptions.assignees.map((user) => ({ id: user.userId, name: user.displayName }));
+      picker.value = config.assigneeUserId || '';
+      this.root.querySelector('[data-initiator]')?.addEventListener('click', () => {
+        this.opts.onConfigChange(node.id, { assigneeUserId: null });
+        picker.value = null;
+        this.root.querySelector('[data-assignee-hint]').textContent = I18n.t('bpmn.initiator');
+      });
+    }
+    this.root.querySelector('.fb-process-fields').addEventListener('change', (event) => {
+      const control = event.target.closest('[data-process]');
+      if (!control || control !== event.target || !this.root.contains(control)) return;
+      const key = control.dataset.process;
+      if (key === 'editSequence') { canvas.selectEdge(control.value); return; }
+      if (this.readOnly) return;
+      if (key === 'name') this.opts.onLabelChange(node.id, control.value);
+      else if (key === 'verification') {
+        this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
+        this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';
+      } else if (key === 'expression') this.opts.onConfigChange(node.id, { verification: { Condition: { expression: control.value } } });
+      else if (key !== 'elementId') this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
+      if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator');
+    });
+    const connect = this.root.querySelector('[data-connect]');
+    const add = this.root.querySelector('[data-connect-add]');
+    connect?.addEventListener('change', (event) => {
+      if (event.target !== connect) return;
+      add.toggleAttribute('disabled', !connect.value);
+    });
+    add?.addEventListener('click', () => {
+      if (!canvas.connectNodes(node.id, connect.value)) return;
+      this._renderProcess();
+    });
+    this.root.querySelector('[data-process="delete"]')?.addEventListener('click', () => { this.opts.onDelete(node.id); this.renderEmpty(); });
+    this.root.querySelector('[data-process="duplicate"]')?.addEventListener('click', () => this.opts.onDuplicate(node.id));
   }
 
   renderEmpty() {
@@ -301,12 +430,12 @@ export class FlowConfig {
           <div class="fb-config-subtitle">${escapeHtml(subtitle)}</div>
         </div>
       </div>
-      <nav class="fb-config-tabs" role="tablist">
-        <button class="fb-config-tab ${this.activeTab === 'config' ? 'active' : ''}" data-tab="config">${escapeHtml(I18n.t('flows_config.tab_config'))}</button>
-        <button class="fb-config-tab ${this.activeTab === 'mapping' ? 'active' : ''}" data-tab="mapping">${escapeHtml(I18n.t('flows_config.tab_mapping'))}</button>
-        <button class="fb-config-tab ${this.activeTab === 'ports' ? 'active' : ''}" data-tab="ports">${escapeHtml(I18n.t('flows_config.tab_ports'))}</button>
-        <button class="fb-config-tab ${this.activeTab === 'advanced' ? 'active' : ''}" data-tab="advanced">${escapeHtml(I18n.t('flows_config.tab_advanced'))}</button>
-      </nav>
+      <tf-tabs class="fb-config-tabs" value="${this.activeTab}" variant="underline">
+        <tf-tab id="config" label="${escapeAttr(I18n.t('flows_config.tab_config'))}"></tf-tab>
+        <tf-tab id="mapping" label="${escapeAttr(I18n.t('flows_config.tab_mapping'))}"></tf-tab>
+        <tf-tab id="ports" label="${escapeAttr(I18n.t('flows_config.tab_ports'))}"></tf-tab>
+        <tf-tab id="advanced" label="${escapeAttr(I18n.t('flows_config.tab_advanced'))}"></tf-tab>
+      </tf-tabs>
       <div class="fb-config-body" data-role="body"></div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer">
         <tf-button variant="secondary" size="sm" icon="copy" data-action="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button>
@@ -314,12 +443,10 @@ export class FlowConfig {
       </footer>`}
     `;
 
-    this.root.querySelectorAll('.fb-config-tab').forEach((t) => {
-      t.addEventListener('click', () => {
-        this.activeTab = t.dataset.tab;
-        this._renderBody();
-        this.root.querySelectorAll('.fb-config-tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === this.activeTab));
-      });
+    this.root.querySelector('tf-tabs').addEventListener('change', (event) => {
+      if (event.target.tagName !== 'TF-TABS') return;
+      this.activeTab = event.detail.value;
+      this._renderBody();
     });
 
     this.root.querySelectorAll('[data-action]').forEach((btn) => {
@@ -965,7 +1092,7 @@ export class FlowConfig {
       const name = typeof c === 'string' ? c : (c.name || `case_${i + 1}`);
       return `
         <div class="fb-field-row" data-case-idx="${i}">
-          <input class="fb-input" data-bind-case="${i}" value="${escapeAttr(name)}">
+          <tf-input data-bind-case="${i}" value="${escapeAttr(name)}"></tf-input>
           <tf-button variant="ghost" size="sm" icon="trash" data-action="remove-case" data-idx="${i}"></tf-button>
         </div>`;
     }).join('');
@@ -984,18 +1111,18 @@ export class FlowConfig {
     return `
       <div class="fb-field">
         <label class="fb-label">${escapeHtml(I18n.t('flows_config.advanced_node_id'))}</label>
-        <input class="fb-input" value="${escapeAttr(n.id)}" readonly>
+        <tf-input value="${escapeAttr(n.id)}" readonly></tf-input>
       </div>
       <div class="fb-field">
         <label class="fb-label">${escapeHtml(I18n.t('flows_config.advanced_position'))}</label>
         <div style="display:flex; gap:8px;">
-          <input class="fb-input" type="number" data-bind-pos="x" value="${n.x}">
-          <input class="fb-input" type="number" data-bind-pos="y" value="${n.y}">
+          <tf-input type="number" data-bind-pos="x" value="${n.x}"></tf-input>
+          <tf-input type="number" data-bind-pos="y" value="${n.y}"></tf-input>
         </div>
       </div>
       <div class="fb-field">
         <label class="fb-label">${escapeHtml(I18n.t('flows_config.advanced_raw'))}</label>
-        <textarea class="fb-textarea" data-bind-raw="config" rows="6">${escapeHtml(JSON.stringify(n.config || {}, null, 2))}</textarea>
+        <tf-textarea data-bind-raw="config" rows="6" value="${escapeAttr(JSON.stringify(n.config || {}, null, 2))}"></tf-textarea>
         <div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.advanced_raw_hint'))}</div>
       </div>
     `;

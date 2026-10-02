@@ -7,12 +7,14 @@
 import { I18n } from '/js/i18n.js';
 
 export function getNodeName(nodeType, fallbackLabel = '') {
+  if (nodeType.startsWith('bpmn_')) return I18n.t(`bpmn.node_${nodeType.slice(5)}`);
   const key = `flows.node_names.${nodeType}`;
   const translated = I18n.t(key);
   return translated !== key ? translated : (fallbackLabel || nodeType);
 }
 
 export function getNodeDescription(nodeType, fallbackDescription = '') {
+  if (nodeType.startsWith('bpmn_')) return I18n.t(`bpmn.node_${nodeType.slice(5)}_hint`);
   const key = `flows.node_descriptions.${nodeType}`;
   const translated = I18n.t(key);
   return translated !== key ? translated : (fallbackDescription || '');

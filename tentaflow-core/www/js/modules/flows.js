@@ -11,8 +11,17 @@ import {
 import { TfWindow } from '/js/components/tf-window.js';
 import { openFlowBuilder } from '/js/modules/flows-builder.js';
 import { I18n } from '/js/i18n.js';
+import { emptyProcessModel, processCommand } from './flows-builder/bpmn.js';
+import { openProcessInstances } from './flows-builder/process-monitor.js';
+import { openFormWindow } from '/js/lib/actions/form-window.js';
+import '/js/components/tf-tabs.js';
+import '/js/components/tf-table.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
 
 let flows = [];
+let mode = 'flow';
+let mounted = null;
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -22,7 +31,7 @@ function statusChip(status) {
   const s = (status || '').toLowerCase();
   const cls = s === 'active' ? 'active' : (s === 'archived' ? 'archived' : 'draft');
   const label = I18n.t(`flows.status_${cls}`);
-  return `<span class="flows-status-chip ${cls}">${escapeHtml(label)}</span>`;
+  return `<tf-chip status="${cls === 'active' ? 'ok' : cls === 'archived' ? 'neutral' : 'warn'}">${escapeHtml(label)}</tf-chip>`;
 }
 
 const FlowsScreen = {
@@ -32,65 +41,98 @@ const FlowsScreen = {
       <div class="page-header">
         <div>
           <h1>${sprite('flow')} ${escapeHtml(I18n.t('flows.list_title'))}</h1>
-          <div class="sub">${escapeHtml(I18n.t('flows.subtitle'))}</div>
+          <div class="sub" id="flows-subtitle">${escapeHtml(I18n.t(mode === 'bpmn' ? 'bpmn.list_description' : 'flows.subtitle'))}</div>
         </div>
         <div class="actions">
+          <tf-button variant="secondary" icon="clock" id="btn-process-instances">${escapeHtml(I18n.t('bpmn.my_work'))}</tf-button>
           <tf-button variant="primary" icon="plus" id="btn-new-flow">${escapeHtml(I18n.t('flows.new_flow_btn'))}</tf-button>
         </div>
       </div>
+      <tf-tabs id="flows-mode" value="${mode}" variant="underline"><tf-tab id="flow" label="${escapeAttr(I18n.t('flows.list_title'))}"></tf-tab><tf-tab id="bpmn" label="${escapeAttr(I18n.t('bpmn.processes'))}"></tf-tab></tf-tabs>
       <div id="flows-host"></div>
       <div id="execs-host"></div>`;
   },
   async mount() {
-    byId('btn-new-flow').addEventListener('click', () => newFlow());
+    const state = { host: byId('flows-host'), generation: 0, offset: 0, canCreateFlow: false };
+    mounted = state;
+    byId('btn-new-flow').addEventListener('click', () => mode === 'bpmn' ? newProcess() : newFlow());
+    byId('btn-process-instances').addEventListener('click', () => openProcessInstances());
+    byId('flows-mode').addEventListener('change', (event) => {
+      if (event.target.id !== 'flows-mode') return;
+      mode = event.detail.value;
+      state.offset = 0;
+      byId('execs-host').replaceChildren();
+      load();
+    });
+    try {
+      const me = await ApiBinary.one('authMeRequest');
+      if (mounted !== state || !state.host.isConnected) return;
+      state.canCreateFlow = ['admin', 'power_user'].includes(me.role);
+      if (!state.canCreateFlow) { mode = 'bpmn'; byId('flows-mode').value = mode; }
+    } catch (error) {
+      if (mounted !== state || !state.host.isConnected) return;
+      toast(I18n.t('bpmn.request_error', { error: error.message }), 'error');
+    }
     await load();
   },
-  unmount() { flows = []; },
+  unmount() { mounted = null; flows = []; },
 };
 
 async function load() {
+  const state = mounted;
+  if (!state || !state.host.isConnected) return;
+  const generation = ++state.generation;
+  const selectedMode = mode;
+  byId('flows-subtitle').textContent = I18n.t(selectedMode === 'bpmn' ? 'bpmn.list_description' : 'flows.subtitle');
+  state.host.replaceChildren();
+  const button = byId('btn-new-flow');
+  button.textContent = I18n.t(mode === 'bpmn' ? 'bpmn.new_process' : 'flows.new_flow_btn');
+  button.hidden = mode === 'flow' && !state.canCreateFlow;
   try {
-    flows = await ApiBinary.list('flowListRequest');
-    renderTable();
+    const response = selectedMode === 'bpmn'
+      ? await ApiBinary.one('processDefinitionListRequest', { offset: state.offset, limit: 25 })
+      : await ApiBinary.list('flowListRequest');
+    if (mounted !== state || generation !== state.generation || !state.host.isConnected) return;
+    flows = selectedMode === 'bpmn' ? response.definitions : response;
+    renderTable(selectedMode === 'bpmn' ? response.total : flows.length);
   } catch (err) {
+    if (mounted !== state || generation !== state.generation || !state.host.isConnected) return;
     toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
   }
 }
 
-function renderTable() {
+function renderTable(total) {
   const host = byId('flows-host');
   if (!host) return;
-  if (flows.length === 0) {
+  if (total === 0) {
     host.innerHTML = `
       <div class="empty-big">
         ${sprite('flow')}
-        <h3>${escapeHtml(I18n.t('flows.empty_title'))}</h3>
-        <p>${escapeHtml(I18n.t('flows.empty_desc'))}</p>
-        <tf-button variant="primary" icon="plus" id="empty-new-flow">${escapeHtml(I18n.t('flows.new_flow_btn'))}</tf-button>
+        <h3>${escapeHtml(I18n.t(mode === 'bpmn' ? 'bpmn.processes_empty' : 'flows.empty_title'))}</h3>
+        <p>${escapeHtml(I18n.t(mode === 'bpmn' ? 'bpmn.private_hint' : 'flows.empty_desc'))}</p>
+        ${mode === 'bpmn' || mounted.canCreateFlow ? `<tf-button variant="primary" icon="plus" id="empty-new-flow">${escapeHtml(I18n.t(mode === 'bpmn' ? 'bpmn.new_process' : 'flows.new_flow_btn'))}</tf-button>` : ''}
       </div>`;
     const btn = byId('empty-new-flow');
-    if (btn) btn.addEventListener('click', () => newFlow());
+    if (btn) btn.addEventListener('click', () => mode === 'bpmn' ? newProcess() : newFlow());
     return;
   }
-  host.innerHTML = `
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>${escapeHtml(I18n.t('flows.col_name'))}</th>
-          <th>${escapeHtml(I18n.t('flows.col_desc'))}</th>
-          <th>${escapeHtml(I18n.t('flows.col_status'))}</th>
-          <th>${escapeHtml(I18n.t('flows.col_updated'))}</th>
-          <th style="text-align:right;">${escapeHtml(I18n.t('flows.col_actions'))}</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${flows.map(renderRow).join('')}
-      </tbody>
-    </table>`;
+  host.innerHTML = `<tf-table id="flows-table" ${mode === 'bpmn' ? `page-size="25" total="${total}" page="${mounted.offset / 25 + 1}"` : ''}>
+    <tf-column key="nameHtml" renderer="html" label="${escapeAttr(I18n.t('flows.col_name'))}"></tf-column>
+    <tf-column key="description" label="${escapeAttr(I18n.t('flows.col_desc'))}"></tf-column>
+    <tf-column key="statusHtml" renderer="html" label="${escapeAttr(I18n.t('flows.col_status'))}"></tf-column>
+    <tf-column key="versionLabel" label="${escapeAttr(I18n.t(mode === 'bpmn' ? 'bpmn.published_version' : 'flows.col_updated'))}"></tf-column></tf-table>`;
+  const table = host.querySelector('tf-table');
+  table.rowKey = mode === 'bpmn' ? 'definitionId' : 'id';
+  table.rows = flows.map(renderRow);
   bindRowActions();
+  const state = mounted;
+  table.addEventListener('page-change', (event) => { if (mounted !== state || !state.host.contains(table)) return; state.offset = (event.detail.page - 1) * 25; load(); });
 }
 
 function renderRow(f) {
+  if (mode === 'bpmn') return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>`,
+    statusHtml: `<tf-chip status="${f.archived ? 'neutral' : 'info'}">${escapeHtml(I18n.t(f.archived ? 'bpmn.archived' : 'bpmn.draft'))}</tf-chip>`,
+    versionLabel: f.publishedVersion === null ? I18n.t('bpmn.not_published') : I18n.t('bpmn.version_number', { version: f.publishedVersion }) };
   const status = f.status || (f.enabled ? 'active' : 'draft');
   const updated = f.updatedAtEpoch || f.updated_at_epoch || f.updated_at;
   // The server rejects edit/delete/status changes on a system flow, so the row
@@ -99,43 +141,48 @@ function renderRow(f) {
   const systemChip = isSystem
     ? ` <tf-chip status="info" data-flow-system="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.system_chip'))}</tf-chip>`
     : '';
-  const editIcon = isSystem ? 'eye' : 'settings';
-  const editTitle = I18n.t(isSystem ? 'flows.preview' : 'flows.edit_title');
   // A factory flow is editable but never deletable; instead of delete it gets
   // "restore factory version" (the server refuses delete for it anyway).
   const isFactory = !!f.isFactory;
   const factoryChip = isFactory
     ? ` <tf-chip status="neutral" data-flow-factory="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.factory_chip'))}</tf-chip>`
     : '';
-  const factoryBtn = isFactory ? `
-        <tf-button variant="ghost" size="sm" icon="refresh" data-flow-factory-restore="${escapeAttr(f.id)}" data-flow-name="${escapeAttr(f.name)}" title="${escapeAttr(I18n.t('flows.factory_restore'))}"></tf-button>` : '';
-  const deleteBtn = (isSystem || isFactory) ? '' : `
-        <tf-button variant="danger" size="sm" icon="trash" data-flow-delete="${escapeAttr(f.id)}" data-flow-name="${escapeAttr(f.name)}" title="${escapeAttr(I18n.t('flows.delete_title'))}"></tf-button>`;
-  return `
-    <tr data-key="flow-${escapeAttr(f.id)}">
-      <td data-label="${escapeAttr(I18n.t('flows.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}</td>
-      <td data-label="${escapeAttr(I18n.t('flows.col_desc'))}">${f.description ? escapeHtml(f.description) : '<span style="color:var(--text-3);">—</span>'}</td>
-      <td data-label="${escapeAttr(I18n.t('flows.col_status'))}">${statusChip(status)}</td>
-      <td data-label="${escapeAttr(I18n.t('flows.col_updated'))}" style="font-size:12px;color:var(--text-3);">${formatDate(updated)}</td>
-      <td data-label="${escapeAttr(I18n.t('flows.col_actions'))}" style="text-align:right;">
-        <tf-button variant="ghost" size="sm" icon="${editIcon}" data-flow-edit="${escapeAttr(f.id)}" title="${escapeAttr(editTitle)}"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="clock" data-flow-execs="${escapeAttr(f.id)}" title="${escapeAttr(I18n.t('flows.history_title_short'))}"></tf-button>${factoryBtn}${deleteBtn}
-      </td>
-    </tr>`;
+  return { ...f, nameHtml: `<strong>${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}`, statusHtml: statusChip(status), versionLabel: formatDate(updated) };
 }
 
 function bindRowActions() {
-  document.querySelectorAll('[data-flow-edit]').forEach((b) => {
-    b.onclick = () => openFlowBuilder(b.dataset.flowEdit);
-  });
-  document.querySelectorAll('[data-flow-execs]').forEach((b) => {
-    b.onclick = () => showExecs(b.dataset.flowExecs);
-  });
-  document.querySelectorAll('[data-flow-delete]').forEach((b) => {
-    b.onclick = () => deleteFlow(b.dataset.flowDelete, b.dataset.flowName);
-  });
-  document.querySelectorAll('[data-flow-factory-restore]').forEach((b) => {
-    b.onclick = () => restoreFactoryFlow(b.dataset.flowFactoryRestore, b.dataset.flowName);
+  const process = mode === 'bpmn';
+  byId('flows-table').rowActions = (row, _index, current) => {
+    const group = document.createElement('div');
+    group.className = 'flows-row-actions';
+    const add = (icon, label, action, variant = 'ghost') => {
+      const button = document.createElement('tf-button');
+      button.setAttribute('icon', icon); button.setAttribute('variant', variant); button.setAttribute('size', 'sm');
+      button.setAttribute('title', label);
+      button.addEventListener('click', () => action(current()));
+      group.append(button);
+    };
+    add(row.isSystem ? 'eye' : 'settings', I18n.t(row.isSystem ? 'flows.preview' : 'flows.edit_title'), (selected) => openFlowBuilder(process ? selected.definitionId : selected.id, { mode: process ? 'bpmn' : 'flow' }));
+    add('clock', I18n.t('flows.history_title_short'), (selected) => process ? openProcessInstances(selected.definitionId) : showExecs(selected.id));
+    if (!process && row.isFactory) add('refresh', I18n.t('flows.factory_restore'), (selected) => restoreFactoryFlow(selected.id, selected.name));
+    if (!process && !row.isSystem && !row.isFactory) add('trash', I18n.t('flows.delete_title'), (selected) => deleteFlow(selected.id, selected.name), 'danger');
+    return group;
+  };
+}
+
+function newProcess() {
+  const state = mounted;
+  const section = document.createElement('div');
+  section.innerHTML = `<tf-input data-name required label="${escapeAttr(I18n.t('bpmn.process_name'))}"></tf-input><tf-textarea data-description label="${escapeAttr(I18n.t('flows.col_desc'))}"></tf-textarea>`;
+  const model = emptyProcessModel();
+  const command = processCommand();
+  return openFormWindow({ title: I18n.t('bpmn.new_process'), icon: 'flow', note: { text: I18n.t('bpmn.private_hint') }, sections: [section], submitLabel: I18n.t('bpmn.create'),
+    canSubmit: () => mounted === state && state.host.isConnected && !!section.querySelector('[data-name]').value.trim(),
+    collect: () => ({ definitionId: null, expectedRevision: 0, name: section.querySelector('[data-name]').value.trim(), description: section.querySelector('[data-description]').value, model }),
+    onSubmit: async (payload) => {
+      const response = await ApiBinary.one('processDefinitionSaveRequest', command(payload));
+      if (mounted === state && state.host.isConnected) openFlowBuilder(response.definition.definitionId, { mode: 'bpmn' });
+    },
   });
 }
 

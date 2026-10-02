@@ -11125,6 +11125,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
+        MessageBody::ProcessBody(payload) => decode_process_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
         MessageBody::BusBody(payload) => decode_bus_payload(&obj, payload),
         MessageBody::MeshNodeProfileSetRequestBody(r) => {
@@ -12946,6 +12947,66 @@ fn decode_json_family_payload(
             }
         }
         _ => set(obj, "variant", format!("{family}DecodeError").into()),
+    }
+}
+
+fn process_json_to_js(value: &serde_json::Value, opaque: bool) -> JsValue {
+    match value {
+        serde_json::Value::Null => JsValue::NULL,
+        serde_json::Value::Bool(value) => (*value).into(),
+        serde_json::Value::Number(value) => value.as_f64().unwrap_or(0.0).into(),
+        serde_json::Value::String(value) => value.clone().into(),
+        serde_json::Value::Array(values) => {
+            let output = js_sys::Array::new();
+            for value in values {
+                output.push(&process_json_to_js(value, opaque));
+            }
+            output.into()
+        }
+        serde_json::Value::Object(values) => {
+            let output = js_sys::Object::new();
+            for (key, value) in values {
+                let dynamic = matches!(
+                    key.as_str(),
+                    "variables" | "outputs" | "data" | "input_mapping" | "output_mapping"
+                );
+                let out_key = if opaque {
+                    key.clone()
+                } else {
+                    snake_key_to_camel(key)
+                };
+                set(
+                    &output,
+                    &out_key,
+                    process_json_to_js(value, opaque || dynamic),
+                );
+            }
+            output.into()
+        }
+    }
+}
+
+fn decode_process_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::processes::ProcessPayload,
+) {
+    match serde_json::to_value(payload) {
+        Ok(serde_json::Value::Object(map)) => {
+            if let Some((name, serde_json::Value::Object(fields))) = map.into_iter().next() {
+                set(obj, "variant", format!("Process{name}").into());
+                for (key, value) in fields {
+                    let dynamic = matches!(key.as_str(), "variables" | "outputs" | "data");
+                    set(
+                        obj,
+                        &snake_key_to_camel(&key),
+                        process_json_to_js(&value, dynamic),
+                    );
+                }
+            } else {
+                set(obj, "variant", "ProcessDecodeError".into());
+            }
+        }
+        _ => set(obj, "variant", "ProcessDecodeError".into()),
     }
 }
 
@@ -21552,6 +21613,16 @@ fn encode_project_studio_json_request(
     encode_body_inner(&MessageBody::ProjectStudioBody(payload)).map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeProcessRequest)]
+pub fn encode_process_request(variant: String, fields_json: String) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(&fields_json)
+        .map_err(|error| JsError::new(&format!("invalid process request: {error}")))?;
+    let payload: tentaflow_protocol::processes::ProcessPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|error| JsError::new(&format!("invalid process request fields: {error}")))?;
+    encode_body_inner(&MessageBody::ProcessBody(payload)).map_err(|error| JsError::new(&error))
+}
+
 /// MessageBody::ProjectStudioBody(CasesListRequest) — filtered + paged manual
 /// test cases; empty filter strings mean "all".
 #[wasm_bindgen(js_name = encodeProjectStudioCasesListRequest)]
@@ -25795,4 +25866,21 @@ pub fn encode_tentanas_target_open_request(request_json: String) -> Result<Vec<u
 #[wasm_bindgen(js_name = encodeTentaNasTrimScheduleSetRequest)]
 pub fn encode_tentanas_trim_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TrimScheduleSetRequest", &request_json)
+}
+
+#[cfg(test)]
+mod process_wire_tests {
+    use super::*;
+
+    #[test]
+    fn process_request_encoder_uses_typed_body_and_pagination() {
+        let bytes = encode_process_request(
+            "DefinitionListRequest".into(),
+            r#"{"offset":10,"limit":25}"#.into(),
+        ).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        assert_eq!(body, MessageBody::ProcessBody(
+            tentaflow_protocol::processes::ProcessPayload::DefinitionListRequest { offset: 10, limit: 25 }
+        ));
+    }
 }

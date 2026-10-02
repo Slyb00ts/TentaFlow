@@ -22654,7 +22654,7 @@ pub mod resource_permissions {
     /// 5. Any group-level allow → allow.
     /// 6. DEFAULT = `default_allow`.
     fn check_inner(
-        pool: &DbPool,
+        conn: &rusqlite::Connection,
         resource_type: &str,
         resource_id: &str,
         user_id: &str,
@@ -22665,10 +22665,6 @@ pub mod resource_permissions {
         if user_role == "admin" {
             return Ok(true);
         }
-
-        let conn = pool
-            .read()
-            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
         // 2. + 3. User-level override. Only "no matching row" collapses to
         // None; any real DB error must propagate to the caller instead of
@@ -22717,13 +22713,13 @@ pub mod resource_permissions {
     /// Sprawdza dostep uzytkownika — wariant Tier1 z default ALLOW
     /// (public by default) i admin-bypass.
     pub fn check_default_allow(
-        pool: &DbPool,
+        conn: &rusqlite::Connection,
         resource_type: &str,
         resource_id: &str,
         user_id: &str,
         user_role: &str,
     ) -> Result<bool> {
-        check_inner(pool, resource_type, resource_id, user_id, user_role, true)
+        check_inner(conn, resource_type, resource_id, user_id, user_role, true)
     }
 
     /// Sprawdza dostep podmiotu — wariant /v1 (Tier 2) z default DENY.
@@ -28371,7 +28367,7 @@ mod api_key_access_v2_tests {
     fn check_default_allow_no_rules_allows() {
         let db = fresh_db();
         assert!(
-            resource_permissions::check_default_allow(&db, "model", "gpt-4o", "u1", "user")
+            resource_permissions::check_default_allow(&db.read().unwrap(), "model", "gpt-4o", "u1", "user")
                 .unwrap(),
             "Tier1 default must be ALLOW with no rules"
         );
@@ -28383,7 +28379,7 @@ mod api_key_access_v2_tests {
         seed_user(&db, "u1", "user");
         resource_permissions::set(&db, "model", "gpt-4o", "user", "u1", "deny").unwrap();
         assert!(
-            !resource_permissions::check_default_allow(&db, "model", "gpt-4o", "u1", "user")
+            !resource_permissions::check_default_allow(&db.read().unwrap(), "model", "gpt-4o", "u1", "user")
                 .unwrap()
         );
     }

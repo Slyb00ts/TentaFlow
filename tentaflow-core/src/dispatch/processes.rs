@@ -1,0 +1,984 @@
+// ============ File: processes.rs — private BPMN authoring and current-participant process commands ============
+
+use tentaflow_macros::{handler, observed, policy};
+use tentaflow_protocol::processes::{
+    PinnedFlowInfo, ProcessNodeKind, ProcessOptionFlow, ProcessOptionUser, ProcessPayload as P,
+};
+use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
+
+use super::HandlerContext;
+use crate::flow_engine::dispatcher::FlowDispatcher;
+use crate::processes::{bpmn, repository, runtime};
+use repository::{CommandStamp, PinnedServiceSnapshot, ProcessActor};
+
+fn error(error: anyhow::Error) -> ProtocolError {
+    let message = error.to_string();
+    if message.contains("not found") || message.contains("Query returned no rows") {
+        return ProtocolError::not_found("process resource not found");
+    }
+    if message.contains("not active")
+        || message.contains("not the initiator")
+        || message.contains("only process")
+        || message.contains("not currently completable")
+        || message.contains("access denied")
+    {
+        return ProtocolError::new(ProtocolErrorCode::PolicyDenied, message);
+    }
+    if error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<crate::db::DbError>().is_some()
+    {
+        tracing::error!(error = %error, "process database operation failed");
+        return ProtocolError::internal("process database operation failed");
+    }
+    ProtocolError::bad_request(message)
+}
+
+fn actor(ctx: &HandlerContext) -> Result<ProcessActor, ProtocolError> {
+    let SessionAuth::UserSession { user_id, .. } = &ctx.session else {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "a user session is required",
+        ));
+    };
+    let user_id = uuid::Uuid::from_bytes(*user_id).to_string();
+    let scope = ctx
+        .org_context
+        .as_ref()
+        .filter(|scope| scope.user_id == user_id)
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::AuthRequired,
+                "a current organization is required",
+            )
+        })?;
+    let current = crate::db::repository::get_user_account_by_id(&ctx.state.db, &user_id)
+        .map_err(error)?
+        .filter(|user| user.is_active)
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::PolicyDenied, "the account is not active")
+        })?;
+    crate::services::rbac::resolve_org_context(&ctx.state.db, &current.id, Some(&scope.org_id))
+        .map_err(|_| {
+            ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "the account is not a current organization member",
+            )
+        })?;
+    let org = crate::services::org::repo::get_organization(&ctx.state.db, &scope.org_id)
+        .map_err(|error| ProtocolError::internal(error.to_string()))?
+        .filter(|org| org.status == "active")
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "the organization is not active",
+            )
+        })?;
+    Ok(ProcessActor {
+        org_id: org.org_id,
+        user_id,
+    })
+}
+
+fn dispatcher(ctx: &HandlerContext) -> Result<&std::sync::Arc<FlowDispatcher>, ProtocolError> {
+    ctx.state
+        .router
+        .flow_dispatcher()
+        .ok_or_else(|| ProtocolError::internal("the flow executor is unavailable"))
+}
+
+fn stamp(payload: &P, command_id: &str) -> Result<CommandStamp, ProtocolError> {
+    uuid::Uuid::parse_str(command_id)
+        .map_err(|_| ProtocolError::bad_request("command_id must be a UUID"))?;
+    Ok(CommandStamp {
+        command_id: command_id.to_owned(),
+        request_hash: repository::request_hash(payload).map_err(error)?,
+    })
+}
+
+fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolError> {
+    let members =
+        crate::services::org::repo::list_memberships_for_org(&ctx.state.db, &actor.org_id)
+            .map_err(|error| ProtocolError::internal(error.to_string()))?;
+    if members.len() > 1000 {
+        return Err(ProtocolError::bad_request(
+            "the process assignee catalogue exceeds 1000 entries",
+        ));
+    }
+    let mut assignees = Vec::new();
+    for (id, _) in members {
+        if let Some(user) = crate::db::repository::get_user_account_by_id(&ctx.state.db, &id)
+            .map_err(error)?
+            .filter(|user| user.is_active)
+        {
+            assignees.push(ProcessOptionUser {
+                user_id: user.id,
+                display_name: user.display_name,
+            });
+        }
+    }
+    let executor = dispatcher(ctx)?;
+    let mut service_flows = Vec::new();
+    for flow in crate::db::repository::list_flows(&ctx.state.db, 0, 1001).map_err(error)? {
+        if flow.status != "active" {
+            continue;
+        }
+        let Ok(meta) = executor.authorize_process_flow(&flow.id, &actor.user_id, &actor.org_id)
+        else {
+            continue;
+        };
+        if executor.snapshot_flow(&flow.id, &meta).is_ok() {
+            service_flows.push(ProcessOptionFlow {
+                flow_id: flow.id,
+                name: flow.name,
+            });
+        }
+    }
+    if service_flows.len() > 1000 {
+        return Err(ProtocolError::bad_request(
+            "the process service catalogue exceeds 1000 entries",
+        ));
+    }
+    Ok(P::OptionsResponse {
+        assignees,
+        service_flows,
+    })
+}
+
+#[handler(variant = "ProcessBody", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn process_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let MessageBody::ProcessBody(payload) = req else {
+        return Err(ProtocolError::bad_request("expected a process request"));
+    };
+    if tentaflow_protocol::cbor::encode(req)
+        .map_err(|error| ProtocolError::bad_request(error.to_string()))?
+        .len()
+        > 960 * 1024
+    {
+        return Err(ProtocolError::bad_request(
+            "the process request exceeds its binary frame budget",
+        ));
+    }
+    let actor = actor(ctx)?;
+    let pool = &ctx.state.db;
+    let response = match payload {
+        P::OptionsRequest {} => options(ctx, &actor)?,
+        P::DefinitionListRequest { offset, limit } => {
+            let (definitions, total, has_more) =
+                repository::list_definitions(pool, &actor, *offset, *limit).map_err(error)?;
+            P::DefinitionListResponse {
+                definitions,
+                total,
+                has_more,
+            }
+        }
+        P::DefinitionGetRequest { definition_id } => P::DefinitionGetResponse {
+            definition: repository::get_definition(pool, &actor, definition_id).map_err(error)?,
+        },
+        P::DefinitionSaveRequest {
+            command_id,
+            definition_id,
+            expected_revision,
+            name,
+            description,
+            model,
+        } => P::DefinitionSaveResponse {
+            definition: repository::save_definition(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                definition_id.as_deref(),
+                *expected_revision,
+                name,
+                description,
+                model,
+            )
+            .map_err(error)?,
+        },
+        P::DefinitionPublishRequest {
+            command_id,
+            definition_id,
+            expected_revision,
+        } => {
+            let stamp = stamp(payload, command_id)?;
+            if let Some((definition, version)) =
+                repository::replay_definition_publication(pool, &actor, &stamp, definition_id)
+                    .map_err(error)?
+            {
+                return Ok(MessageBody::ProcessBody(P::DefinitionPublishResponse {
+                    definition: (&definition).into(),
+                    version,
+                }));
+            }
+            let definition =
+                repository::get_definition(pool, &actor, definition_id).map_err(error)?;
+            crate::processes::model::validate_model(&definition.model).map_err(error)?;
+            let mut snapshots = Vec::new();
+            for node in &definition.model.nodes {
+                if let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind {
+                    let executor = dispatcher(ctx)?;
+                    let meta = executor
+                        .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
+                        .map_err(|error| {
+                            ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                        })?;
+                    let pinned = executor
+                        .snapshot_flow(flow_id, &meta)
+                        .map_err(|error| ProtocolError::bad_request(error.to_string()))?;
+                    snapshots.push(PinnedServiceSnapshot {
+                        info: PinnedFlowInfo {
+                            node_id: node.id.clone(),
+                            flow_id: pinned.flow_id,
+                            source_version: pinned.source_version,
+                            graph_sha256: pinned.graph_sha256,
+                        },
+                        graph_json: pinned.graph_json,
+                    });
+                }
+            }
+            let (definition, version) = repository::publish_definition(
+                pool,
+                &actor,
+                &stamp,
+                definition_id,
+                *expected_revision,
+                &snapshots,
+            )
+            .map_err(error)?;
+            P::DefinitionPublishResponse {
+                definition: (&definition).into(),
+                version,
+            }
+        }
+        P::DefinitionArchiveRequest {
+            command_id,
+            definition_id,
+            expected_revision,
+            archived,
+        } => P::DefinitionArchiveResponse {
+            definition: repository::archive_definition(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                definition_id,
+                *expected_revision,
+                *archived,
+            )
+            .map_err(error)?,
+        },
+        P::VersionListRequest {
+            definition_id,
+            offset,
+            limit,
+        } => {
+            let (versions, total, has_more) =
+                repository::list_versions(pool, &actor, definition_id, *offset, *limit)
+                    .map_err(error)?;
+            P::VersionListResponse {
+                versions,
+                total,
+                has_more,
+            }
+        }
+        P::VersionGetRequest {
+            definition_id,
+            version,
+        } => P::VersionGetResponse {
+            version: repository::get_version(pool, &actor, definition_id, *version)
+                .map_err(error)?,
+        },
+        P::XmlImportRequest { xml } => {
+            let (model, diagnostics) = bpmn::import_xml(xml);
+            P::XmlImportResponse { model, diagnostics }
+        }
+        P::XmlExportRequest {
+            definition_id,
+            version,
+        } => {
+            let model = match version {
+                Some(version) => {
+                    repository::get_version(pool, &actor, definition_id, *version)
+                        .map_err(error)?
+                        .model
+                }
+                None => {
+                    repository::get_definition(pool, &actor, definition_id)
+                        .map_err(error)?
+                        .model
+                }
+            };
+            P::XmlExportResponse {
+                xml: bpmn::export_xml(&model).map_err(error)?,
+            }
+        }
+        P::InstanceStartRequest {
+            command_id,
+            definition_id,
+            version,
+            variables,
+        } => {
+            let stamp = stamp(payload, command_id)?;
+            let instance = if let Some(prior) =
+                repository::replay_instance_command(pool, &actor, &stamp, None).map_err(error)?
+            {
+                prior
+            } else {
+                let published = repository::get_version(pool, &actor, definition_id, *version)
+                    .map_err(error)?;
+                crate::processes::model::validate_variables(variables).map_err(error)?;
+                let mut merged = serde_json::to_value(&published.model.variables)
+                    .map_err(|error| ProtocolError::internal(error.to_string()))?;
+                let object = merged.as_object_mut().ok_or_else(|| {
+                    ProtocolError::bad_request("process variables must be an object")
+                })?;
+                for (key, value) in variables.as_object().ok_or_else(|| {
+                    ProtocolError::bad_request("process variables must be an object")
+                })? {
+                    object.insert(key.clone(), value.clone());
+                }
+                let instance_id = uuid::Uuid::new_v4().to_string();
+                let plan =
+                    runtime::plan_start(&published.model, &instance_id, &actor.user_id, merged)
+                        .map_err(error)?;
+                repository::start_instance(
+                    pool,
+                    &actor,
+                    &stamp,
+                    &instance_id,
+                    definition_id,
+                    *version,
+                    variables,
+                    &plan,
+                )
+                .map_err(error)?
+            };
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::InstanceStartResponse { instance }
+        }
+        P::InstanceListRequest {
+            definition_id,
+            offset,
+            limit,
+        } => {
+            let (instances, total, has_more) =
+                repository::list_instances(pool, &actor, definition_id.as_deref(), *offset, *limit)
+                    .map_err(error)?;
+            P::InstanceListResponse {
+                instances,
+                total,
+                has_more,
+            }
+        }
+        P::InstanceGetRequest { instance_id } => P::InstanceGetResponse {
+            instance: repository::get_instance(pool, &actor, instance_id).map_err(error)?,
+        },
+        P::UserTaskGetRequest {
+            instance_id,
+            user_task_id,
+        } => P::UserTaskGetResponse {
+            task: repository::get_user_task(pool, &actor, instance_id, user_task_id)
+                .map_err(error)?,
+        },
+        P::UserTaskCompleteRequest {
+            command_id,
+            instance_id,
+            user_task_id,
+            expected_revision,
+            outputs,
+            approved,
+        } => {
+            let stamp = stamp(payload, command_id)?;
+            let instance = if let Some(prior) =
+                repository::replay_instance_command(pool, &actor, &stamp, Some(instance_id))
+                    .map_err(error)?
+            {
+                prior
+            } else {
+                let snapshot =
+                    repository::runtime_snapshot(pool, &actor, instance_id).map_err(error)?;
+                let plan =
+                    runtime::plan_user_completion(&snapshot, user_task_id, outputs, *approved)
+                        .map_err(error)?;
+                repository::complete_user_task(
+                    pool,
+                    &actor,
+                    &stamp,
+                    instance_id,
+                    user_task_id,
+                    *expected_revision,
+                    outputs,
+                    *approved,
+                    &plan,
+                )
+                .map_err(error)?
+            };
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::UserTaskCompleteResponse { instance }
+        }
+        P::InstanceCancelRequest {
+            command_id,
+            instance_id,
+            expected_revision,
+        } => {
+            let instance = repository::cancel_instance(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                instance_id,
+                *expected_revision,
+            )
+            .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::cancel_instance(executor, instance_id);
+            }
+            P::InstanceCancelResponse { instance }
+        }
+        P::JobRetryRequest {
+            command_id,
+            instance_id,
+            job_id,
+            expected_revision,
+        } => {
+            let instance = repository::retry_job(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                instance_id,
+                job_id,
+                *expected_revision,
+            )
+            .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::JobRetryResponse { instance }
+        }
+        P::HistoryRequest {
+            instance_id,
+            after_seq,
+            limit,
+        } => {
+            let (events, next_seq, has_more) =
+                repository::list_events(pool, &actor, instance_id, *after_seq, *limit)
+                    .map_err(error)?;
+            P::HistoryResponse {
+                events,
+                next_seq,
+                has_more,
+            }
+        }
+        P::OptionsResponse { .. }
+        | P::DefinitionListResponse { .. }
+        | P::DefinitionGetResponse { .. }
+        | P::DefinitionSaveResponse { .. }
+        | P::DefinitionPublishResponse { .. }
+        | P::DefinitionArchiveResponse { .. }
+        | P::VersionListResponse { .. }
+        | P::VersionGetResponse { .. }
+        | P::XmlImportResponse { .. }
+        | P::XmlExportResponse { .. }
+        | P::InstanceStartResponse { .. }
+        | P::InstanceListResponse { .. }
+        | P::InstanceGetResponse { .. }
+        | P::UserTaskGetResponse { .. }
+        | P::UserTaskCompleteResponse { .. }
+        | P::InstanceCancelResponse { .. }
+        | P::JobRetryResponse { .. }
+        | P::HistoryResponse { .. } => {
+            return Err(ProtocolError::bad_request(
+                "process responses are not accepted as requests",
+            ))
+        }
+    };
+    Ok(MessageBody::ProcessBody(response))
+}
+
+macro_rules! register_request {
+    ($variant:literal) => {
+        inventory::submit! {
+            super::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: __tentaflow_policy_process_dispatch,
+                metric_name: concat!("tentaflow_ws_handler_", $variant),
+                dispatch_fn: __tentaflow_dispatch_process_dispatch,
+            }
+        }
+    };
+}
+
+register_request!("ProcessOptionsRequest");
+register_request!("ProcessDefinitionListRequest");
+register_request!("ProcessDefinitionGetRequest");
+register_request!("ProcessDefinitionSaveRequest");
+register_request!("ProcessDefinitionPublishRequest");
+register_request!("ProcessDefinitionArchiveRequest");
+register_request!("ProcessVersionListRequest");
+register_request!("ProcessVersionGetRequest");
+register_request!("ProcessXmlImportRequest");
+register_request!("ProcessXmlExportRequest");
+register_request!("ProcessInstanceStartRequest");
+register_request!("ProcessInstanceListRequest");
+register_request!("ProcessInstanceGetRequest");
+register_request!("ProcessUserTaskGetRequest");
+register_request!("ProcessUserTaskCompleteRequest");
+register_request!("ProcessInstanceCancelRequest");
+register_request!("ProcessJobRetryRequest");
+register_request!("ProcessHistoryRequest");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::{AppState, RequestOrigin};
+    use crate::processes::runtime::test_support;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tentaflow_protocol::processes::{
+        ActivityVerification, ProcessDefinition, ProcessInstanceStatus,
+    };
+
+    fn context(state: &Arc<AppState>, actor: &ProcessActor) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: *uuid::Uuid::parse_str(&actor.user_id).unwrap().as_bytes(),
+                role: Some("user".into()),
+            },
+            correlation_id: 1,
+            connection_id: 1,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: Some(
+                crate::services::rbac::resolve_org_context(
+                    &state.db,
+                    &actor.user_id,
+                    Some(&actor.org_id),
+                )
+                .unwrap(),
+            ),
+            origin: RequestOrigin::Local,
+        }
+    }
+
+    async fn request(ctx: &HandlerContext, payload: P) -> P {
+        let response = super::super::dispatch(&MessageBody::ProcessBody(payload), ctx).await;
+        assert!(
+            !response.1,
+            "actual process dispatch failed: {:?}",
+            response.0
+        );
+        let MessageBody::ProcessBody(payload) = response.0 else {
+            panic!("typed process response expected")
+        };
+        payload
+    }
+
+    async fn refused(ctx: &HandlerContext, payload: P) -> ProtocolError {
+        let response = super::super::dispatch(&MessageBody::ProcessBody(payload), ctx).await;
+        assert!(response.1, "actual process dispatch unexpectedly succeeded");
+        let MessageBody::Error(error) = response.0 else {
+            panic!("protocol error expected")
+        };
+        error
+    }
+
+    async fn save(
+        ctx: &HandlerContext,
+        model: tentaflow_protocol::processes::ProcessModel,
+    ) -> ProcessDefinition {
+        let P::DefinitionSaveResponse { definition } = request(
+            ctx,
+            P::DefinitionSaveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: None,
+                expected_revision: 0,
+                name: "My evidence process".into(),
+                description: "".into(),
+                model,
+            },
+        )
+        .await
+        else {
+            panic!("saved definition expected")
+        };
+        definition
+    }
+
+    #[tokio::test]
+    async fn ordinary_authors_have_private_definitions_and_current_assignees_complete_their_tasks()
+    {
+        let state = AppState::for_test();
+        let first = test_support::actor(&state.db, "first-author");
+        let second = test_support::actor(&state.db, "second-author");
+        let outsider = test_support::actor(&state.db, "unassigned-reader");
+        let first_ctx = context(&state, &first);
+        let second_ctx = context(&state, &second);
+        let outsider_ctx = context(&state, &outsider);
+        let definition = save(&first_ctx, test_support::user_model(Some(&second.user_id))).await;
+        let other = save(&second_ctx, crate::processes::model::starter_model()).await;
+        let P::DefinitionListResponse {
+            definitions,
+            total,
+            has_more,
+        } = request(
+            &first_ctx,
+            P::DefinitionListRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("list expected")
+        };
+        assert_eq!(total, 1);
+        assert!(!has_more);
+        assert_eq!(definitions[0].definition_id, definition.definition_id);
+        assert_ne!(other.definition_id, definition.definition_id);
+        assert_eq!(
+            refused(
+                &second_ctx,
+                P::DefinitionGetRequest {
+                    definition_id: definition.definition_id.clone()
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+        request(
+            &first_ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+            },
+        )
+        .await;
+        let P::InstanceStartResponse { instance } = request(
+            &first_ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                version: 1,
+                variables: json!({}),
+            },
+        )
+        .await
+        else {
+            panic!("started instance expected")
+        };
+        assert_eq!(instance.status, ProcessInstanceStatus::Waiting);
+        assert_eq!(
+            refused(
+                &outsider_ctx,
+                P::InstanceGetRequest {
+                    instance_id: instance.instance_id.clone()
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+        let task_id = instance.user_tasks[0].user_task_id.clone();
+        assert_eq!(
+            refused(
+                &outsider_ctx,
+                P::UserTaskGetRequest {
+                    instance_id: instance.instance_id.clone(),
+                    user_task_id: task_id.clone()
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+        let P::InstanceGetResponse {
+            instance: participant,
+        } = request(
+            &second_ctx,
+            P::InstanceGetRequest {
+                instance_id: instance.instance_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("participant detail expected")
+        };
+        assert!(participant.user_tasks[0].can_complete);
+        assert!(!participant.can_cancel);
+        let completion = P::UserTaskCompleteRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.instance_id.clone(),
+            user_task_id: task_id.clone(),
+            expected_revision: instance.revision,
+            outputs: json!({"answer":"verified"}),
+            approved: None,
+        };
+        let P::UserTaskCompleteResponse {
+            instance: completed,
+        } = request(&second_ctx, completion.clone()).await
+        else {
+            panic!("completed instance expected")
+        };
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        assert_eq!(completed.variables["answer"], "verified");
+        let replay = request(&second_ctx, completion).await;
+        let P::UserTaskCompleteResponse { instance: replayed } = replay else {
+            panic!("completion replay expected")
+        };
+        assert_eq!(replayed.revision, completed.revision);
+        let P::HistoryResponse {
+            events, has_more, ..
+        } = request(
+            &second_ctx,
+            P::HistoryRequest {
+                instance_id: instance.instance_id.clone(),
+                after_seq: 0,
+                limit: 200,
+            },
+        )
+        .await
+        else {
+            panic!("history expected")
+        };
+        assert!(!has_more);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "user_task_completed")
+                .count(),
+            1
+        );
+        crate::db::repository::update_user_account(
+            &state.db,
+            &second.user_id,
+            "second-author",
+            "second@example.test",
+            false,
+        )
+        .unwrap();
+        assert!(
+            super::super::dispatch(
+                &MessageBody::ProcessBody(P::InstanceGetRequest {
+                    instance_id: instance.instance_id.clone()
+                }),
+                &second_ctx
+            )
+            .await
+            .1
+        );
+        crate::db::repository::update_user_account(
+            &state.db,
+            &second.user_id,
+            "second-author",
+            "second@example.test",
+            true,
+        )
+        .unwrap();
+        crate::services::org::repo::remove_membership(&state.db, &second.org_id, &second.user_id)
+            .unwrap();
+        assert_eq!(
+            refused(
+                &second_ctx,
+                P::InstanceGetRequest {
+                    instance_id: instance.instance_id
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_replay_preserves_graph_and_mutable_subflow_publication_is_rejected() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "pinned-author");
+        let ctx = context(&state, &actor);
+        let flow_id = test_support::flow(&state.db, &actor, &test_support::graph("before", None));
+        let definition = save(
+            &ctx,
+            test_support::service_model(&flow_id, ActivityVerification::Human),
+        )
+        .await;
+        let publication = P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: definition.definition_id.clone(),
+            expected_revision: definition.draft_revision,
+        };
+        let P::DefinitionPublishResponse { version, .. } = request(&ctx, publication.clone()).await
+        else {
+            panic!("published version expected")
+        };
+        test_support::update_flow(
+            &state.db,
+            &actor,
+            &flow_id,
+            &test_support::graph("after", None),
+        );
+        let P::DefinitionPublishResponse {
+            version: replayed, ..
+        } = request(&ctx, publication).await
+        else {
+            panic!("publication replay expected")
+        };
+        assert_eq!(replayed, version);
+        let P::VersionListResponse { total, .. } = request(
+            &ctx,
+            P::VersionListRequest {
+                definition_id: definition.definition_id,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("version list expected")
+        };
+        assert_eq!(total, 1);
+        let nested=json!({"nodes":[{"id":"t","type":"trigger","config":{}},{"id":"sub","type":"subflow","config":{"flow_id":flow_id}},{"id":"o","type":"output","config":{}}],"edges":[{"from":"t","to":"sub","from_port":"text","to_port":"in"},{"from":"sub","to":"o","from_port":"full","to_port":"text"}]}).to_string();
+        let nested_id = test_support::flow(&state.db, &actor, &nested);
+        let definition = save(
+            &ctx,
+            test_support::service_model(&nested_id, ActivityVerification::Human),
+        )
+        .await;
+        let denied = refused(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::BadRequest);
+        assert!(denied.message.contains("cannot pin"));
+        let P::VersionListResponse { total, .. } = request(
+            &ctx,
+            P::VersionListRequest {
+                definition_id: definition.definition_id,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("version list expected")
+        };
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn typed_options_use_current_accounts_and_flow_acl_and_reject_response_direction() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "option-author");
+        let other = test_support::actor(&state.db, "inactive-option");
+        let ctx = context(&state, &actor);
+        crate::db::repository::update_user_account(
+            &state.db,
+            &other.user_id,
+            "inactive-option",
+            "inactive@example.test",
+            false,
+        )
+        .unwrap();
+        let allowed = test_support::flow(&state.db, &actor, &test_support::graph("allowed", None));
+        let denied = test_support::flow(&state.db, &actor, &test_support::graph("denied", None));
+        crate::db::repository::resource_permissions::set(
+            &state.db,
+            "flow",
+            &denied,
+            "user",
+            &actor.user_id,
+            "deny",
+        )
+        .unwrap();
+        let P::OptionsResponse {
+            assignees,
+            service_flows,
+        } = request(&ctx, P::OptionsRequest {}).await
+        else {
+            panic!("typed options expected")
+        };
+        assert!(assignees.iter().any(|user| user.user_id == actor.user_id));
+        assert!(assignees.iter().all(|user| user.user_id != other.user_id));
+        assert!(service_flows.iter().any(|flow| flow.flow_id == allowed));
+        assert!(service_flows.iter().all(|flow| flow.flow_id != denied));
+        let mut anonymous = ctx.clone();
+        anonymous.session = SessionAuth::Anonymous;
+        assert!(
+            super::super::dispatch(&MessageBody::ProcessBody(P::OptionsRequest {}), &anonymous)
+                .await
+                .1
+        );
+        assert!(
+            super::super::dispatch(
+                &MessageBody::ProcessBody(P::OptionsResponse {
+                    assignees: vec![],
+                    service_flows: vec![]
+                }),
+                &ctx
+            )
+            .await
+            .1
+        );
+        for name in [
+            "ProcessDefinitionSaveRequest",
+            "ProcessUserTaskGetRequest",
+            "ProcessUserTaskCompleteRequest",
+            "ProcessHistoryRequest",
+            "ProcessJobRetryRequest",
+        ] {
+            assert!(
+                super::super::find(name).is_some(),
+                "nested typed handler {name} must be registered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_binary_request_is_rejected_before_any_definition_mutation() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "bounded-author");
+        let ctx = context(&state, &actor);
+        let error = refused(
+            &ctx,
+            P::DefinitionSaveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: None,
+                expected_revision: 0,
+                name: "Bounded process".into(),
+                description: "x".repeat(1024 * 1024),
+                model: crate::processes::model::starter_model(),
+            },
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(error.message.contains("binary frame budget"));
+        let P::DefinitionListResponse {
+            definitions, total, ..
+        } = request(
+            &ctx,
+            P::DefinitionListRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("list expected")
+        };
+        assert_eq!(total, 0);
+        assert!(definitions.is_empty());
+    }
+}

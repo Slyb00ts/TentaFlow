@@ -1109,8 +1109,130 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         (178, "org_structure", MigrationStep::Sql(ORG_STRUCTURE)),
         (179, "org_deputies_absences", MigrationStep::Sql(ORG_DEPUTIES_ABSENCES)),
         (180, "org_handovers", MigrationStep::Sql(ORG_HANDOVERS)),
+        (181, "bpmn_processes", MigrationStep::Sql(BPMN_PROCESSES)),
     ]
 }
+
+const BPMN_PROCESSES: &str = r#"
+CREATE TABLE bpmn_definitions (
+    definition_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    owner_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    draft_revision INTEGER NOT NULL CHECK(typeof(draft_revision) = 'integer' AND draft_revision > 0),
+    model_json TEXT NOT NULL,
+    published_version INTEGER CHECK(published_version IS NULL OR (typeof(published_version) = 'integer' AND published_version > 0)),
+    archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_bpmn_definitions_owner ON bpmn_definitions(org_id, owner_user_id, updated_at_ms DESC);
+CREATE TABLE bpmn_versions (
+    definition_id TEXT NOT NULL REFERENCES bpmn_definitions(definition_id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    model_json TEXT NOT NULL,
+    model_sha256 TEXT NOT NULL,
+    service_snapshots_json TEXT NOT NULL,
+    published_at_ms INTEGER NOT NULL,
+    published_by TEXT NOT NULL REFERENCES user_accounts(id),
+    PRIMARY KEY(definition_id, version)
+);
+CREATE TABLE bpmn_instances (
+    instance_id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    initiator_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','incident','cancelled')),
+    variables_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(definition_id, version) REFERENCES bpmn_versions(definition_id, version)
+);
+CREATE INDEX idx_bpmn_instances_initiator ON bpmn_instances(org_id, initiator_user_id, updated_at_ms DESC);
+CREATE TABLE bpmn_tokens (
+    token_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    arrival_edge_id TEXT,
+    fork_stack_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ready','waiting','joining','consumed','cancelled')),
+    created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_bpmn_tokens_instance ON bpmn_tokens(instance_id, status);
+CREATE TABLE bpmn_and_receipts (
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    join_node_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL,
+    branch_edge_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(instance_id, join_node_id, activation_id, branch_edge_id)
+);
+CREATE TABLE bpmn_user_tasks (
+    user_task_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    assignee_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    kind TEXT NOT NULL CHECK(kind IN ('work','verification')),
+    status TEXT NOT NULL CHECK(status IN ('open','completed','cancelled')),
+    outputs_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_bpmn_user_tasks_assignee ON bpmn_user_tasks(assignee_user_id, status, updated_at_ms DESC);
+CREATE TABLE bpmn_jobs (
+    job_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    input_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','error','cancelled')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempt) = 'integer' AND attempt >= 0 AND attempt <= 4294967295),
+    fence INTEGER NOT NULL DEFAULT 0 CHECK(typeof(fence) = 'integer' AND fence >= 0),
+    worker_id TEXT,
+    lease_until_ms INTEGER,
+    result_json TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_bpmn_jobs_claim ON bpmn_jobs(status, lease_until_ms, created_at_ms);
+CREATE TABLE bpmn_incidents (
+    incident_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    node_id TEXT,
+    job_id TEXT,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    at_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER
+);
+CREATE INDEX idx_bpmn_incidents_instance ON bpmn_incidents(instance_id, resolved_at_ms);
+CREATE TABLE bpmn_events (
+    event_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq > 0),
+    at_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    node_id TEXT,
+    actor_user_id TEXT,
+    data_json TEXT NOT NULL,
+    UNIQUE(instance_id, seq)
+);
+CREATE TABLE bpmn_commands (
+    org_id TEXT NOT NULL,
+    actor_user_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(org_id, actor_user_id, command_id)
+);
+"#;
 
 // v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
 //
@@ -14643,5 +14765,25 @@ mod tests {
             rejected.is_err(),
             "the CHECK constraint must still reject a subject_type outside the allow-list"
         );
+    }
+
+    #[test]
+    fn bpmn_migration_adds_durable_tables_without_changing_existing_flows() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 180);
+        conn.execute(
+            "INSERT INTO flows(id,name,flow_json,status) VALUES('flow-retained','Existing','{}','active')",
+            [],
+        ).unwrap();
+        run(&conn).unwrap();
+        let retained: String = conn.query_row(
+            "SELECT name FROM flows WHERE id='flow-retained'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(retained, "Existing");
+        for table in ["bpmn_definitions", "bpmn_versions", "bpmn_instances", "bpmn_tokens", "bpmn_and_receipts", "bpmn_user_tasks", "bpmn_jobs", "bpmn_events", "bpmn_commands"] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+        let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 181);
     }
 }

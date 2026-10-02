@@ -235,6 +235,11 @@ impl DashboardServer {
             mesh_relay_health.clone(),port_allocator.clone(),mesh_services_registry.clone());
         crate::project_studio::task_transfer::recover_transfers(&project_state)?;
         crate::project_studio::media::start_workers(project_state.clone())?;
+        let process_runtime = match router.flow_dispatcher() {
+            Some(dispatcher) => Some(crate::processes::runtime::start(&db, dispatcher)?),
+            None => None,
+        };
+
 
         crate::scheduler::start(db.clone(), addon_manager.clone());
 
@@ -331,8 +336,19 @@ impl DashboardServer {
             }
         }
 
+        let mut shutdown_rx = service_manager.shutdown_rx.clone();
         loop {
-            let (stream, remote_addr) = match listener.accept().await {
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        if let Some(runtime) = process_runtime.as_ref() { runtime.shutdown().await?; }
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            let (stream, remote_addr) = match accepted {
                 Ok(conn) => conn,
                 Err(e) => {
                     error!("Blad akceptowania polaczenia (dashboard): {}", e);

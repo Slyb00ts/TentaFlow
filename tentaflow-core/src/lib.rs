@@ -75,6 +75,7 @@ pub mod license;
 pub mod lifecycle_signal;
 pub mod meeting;
 pub mod paths;
+pub mod processes;
 pub mod profiling;
 pub mod tentanas;
 pub mod tentavm;

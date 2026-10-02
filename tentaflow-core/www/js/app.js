@@ -120,7 +120,7 @@ const ADMIN_NAV = [
     headingKey: 'nav.section_workflows',
     icon: 'flow',
     items: [
-      { id: 'flows', labelKey: 'nav.flows', icon: 'flow' },
+      { id: 'flows', labelKey: 'nav.flows', icon: 'flow', userVisible: true },
       { id: 'scheduler', labelKey: 'nav.scheduler', icon: 'clock' },
       { id: 'rules', labelKey: 'nav.rules', icon: 'rules' },
     ],

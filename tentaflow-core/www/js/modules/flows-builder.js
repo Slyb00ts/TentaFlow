@@ -5,7 +5,7 @@
 //       (breadcrumb, undo/redo, mobile tabs), autosave co 10s, historia wersji.
 // =============================================================================
 
-import { escapeHtml, escapeAttr, formatRelative, toast, byId } from '/js/utils.js';
+import { escapeHtml, escapeAttr, formatRelative, toast } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { Router } from '/js/router.js';
 import { FlowCanvas } from '/js/modules/flows-builder/canvas.js';
@@ -16,29 +16,31 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
+import { checkProcessDocument, processCommand, processEditorLabels } from '/js/modules/flows-builder/bpmn.js';
+import { openProcessInstances, openProcessRun, openProcessVariables } from '/js/modules/flows-builder/process-monitor.js';
+import { openFormWindow } from '/js/lib/actions/form-window.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-tabs.js';
+import '/js/components/tf-file-input.js';
+import '/js/components/tf-table.js';
 
-// Stan aktualnie otwartego buildera (przechowywany poza klasa dla param route'a).
-let pendingFlowId = null;
-let pendingMe = null;
-
-export function openFlowBuilder(flowId, me) {
-  pendingFlowId = flowId;
-  pendingMe = me || null;
-  Router.navigate('flow-builder');
+export function openFlowBuilder(flowId, { mode = 'flow' } = {}) {
+  return Router.navigate('flow-builder', { flowId, mode });
 }
 
 const FlowBuilderScreen = {
   title: 'Flow Builder',
   _state: null,
 
-  render() {
+  render({ mode = 'flow' } = {}) {
+    const process = mode === 'bpmn';
     return `
-      <div class="fb-shell" data-role="shell">
+      <div class="fb-shell ${process ? 'fb-process-shell' : ''}" data-role="shell">
         <header class="fb-topbar">
           <tf-button variant="ghost" size="sm" data-role="back" title="${escapeAttr(I18n.t('flows_builder.back_title'))}"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('flows_builder.back'))}</tf-button>
           <div class="fb-topbar-separator"></div>
-          <input class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}">
-          <tf-select class="fb-status-select" data-role="status" aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
+          <tf-input class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}"></tf-input>
+          <tf-select class="fb-status-select" data-role="status" ${process ? 'hidden' : ''} aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
             <option value="draft">${escapeHtml(I18n.t('flows_builder.status_draft'))}</option>
             <option value="active">${escapeHtml(I18n.t('flows_builder.status_active'))}</option>
             <option value="archived">${escapeHtml(I18n.t('flows_builder.status_archived'))}</option>
@@ -57,10 +59,16 @@ const FlowBuilderScreen = {
           </div>
           <div class="fb-topbar-separator"></div>
           <tf-button variant="ghost" size="sm" icon="code" data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="play" data-role="test" title="${escapeAttr(I18n.t('flows_builder.test_title'))}">${escapeHtml(I18n.t('flows_builder.test'))}</tf-button>
+          ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
+          <tf-button variant="secondary" size="sm" icon="check" data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="play" data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="clock" data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
         </header>
+        ${process ? `<div class="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><span>${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button></div>` : ''}
+        <tf-alert data-role="error" tone="danger" hidden></tf-alert>
 
         <div class="fb-body" data-role="body">
           <aside class="fb-palette" data-role="palette"></aside>
@@ -87,18 +95,17 @@ const FlowBuilderScreen = {
           </div>
           <div class="fb-bottombar-spacer"></div>
           <span class="fb-stats" data-role="stats">${escapeHtml(I18n.t('flows_builder.stats', { nodes: 0, edges: 0 }))}</span>
-          <div class="fb-mobile-tabs">
-            <button class="fb-mobile-tab" data-mobile-tab="palette"><svg><use href="#i-plus"/></svg>${escapeHtml(I18n.t('flows_builder.tab_palette'))}</button>
-            <button class="fb-mobile-tab active" data-mobile-tab="canvas"><svg><use href="#i-flow"/></svg>${escapeHtml(I18n.t('flows_builder.tab_canvas'))}</button>
-            <button class="fb-mobile-tab" data-mobile-tab="config"><svg><use href="#i-settings"/></svg>${escapeHtml(I18n.t('flows_builder.tab_config'))}</button>
-          </div>
+          <tf-tabs class="fb-mobile-tabs" value="canvas" variant="pill">
+            <tf-tab id="palette" icon="plus" label="${escapeAttr(I18n.t('flows_builder.tab_palette'))}"></tf-tab>
+            <tf-tab id="canvas" icon="flow" label="${escapeAttr(I18n.t('flows_builder.tab_canvas'))}"></tf-tab>
+            <tf-tab id="config" icon="settings" label="${escapeAttr(I18n.t('flows_builder.tab_config'))}"></tf-tab>
+          </tf-tabs>
         </footer>
       </div>
     `;
   },
 
-  async mount() {
-    const flowId = pendingFlowId;
+  async mount({ flowId, mode = 'flow' } = {}) {
     if (!flowId) {
       // No flow selected (e.g. the builder route was hit directly) — the flow
       // list is the real entry point, so just go there. Not a warning.
@@ -109,7 +116,7 @@ const FlowBuilderScreen = {
     const root = document.querySelector('[data-role="shell"]');
     const state = {
       flowId,
-      me: pendingMe,
+      mode,
       flow: null,
       root,
       canvas: null,
@@ -121,6 +128,12 @@ const FlowBuilderScreen = {
       readOnly: false,
       autosaveTimer: null,
       saving: false,
+      editRevision: 0,
+      previewVersion: null,
+      processOptions: null,
+      saveCommand: processCommand(),
+      publishCommand: processCommand(),
+      archiveCommand: processCommand(),
       templatesMap: new Map(),
       // Deklaracje zmiennych flow (§3.12 / R10). Wczytane z flow_json i
       // dopisywane z powrotem przy zapisie — bez tego save gubilby sekcje.
@@ -131,23 +144,34 @@ const FlowBuilderScreen = {
 
     // Załaduj flow
     try {
-      const detail = await ApiBinary.one('flowDetailRequest', { flowId: String(flowId) });
-      state.flow = {
-        id: detail.id,
-        name: detail.name,
-        description: detail.description ?? null,
-        flow_json: detail.graphJson ?? '{"nodes":[],"edges":[]}',
-        status: detail.status ?? (detail.enabled ? 'active' : 'draft'),
-      };
-      state.readOnly = !!detail.isSystem;
+      if (state.mode === 'bpmn') {
+        const [response, options] = await Promise.all([
+          ApiBinary.one('processDefinitionGetRequest', { definitionId: flowId }),
+          ApiBinary.one('processOptionsRequest', {}),
+        ]);
+        if (!this._current(state)) return;
+        state.definition = response.definition;
+        state.processOptions = options;
+        state.flow = { id: flowId, name: response.definition.name, description: response.definition.description };
+        state.readOnly = response.definition.archived;
+      } else {
+        const detail = await ApiBinary.one('flowDetailRequest', { flowId: String(flowId) });
+        if (!this._current(state)) return;
+        state.flow = { id: detail.id, name: detail.name, description: detail.description ?? null,
+          flow_json: detail.graphJson ?? '{"nodes":[],"edges":[]}', status: detail.status ?? (detail.enabled ? 'active' : 'draft') };
+        state.readOnly = !!detail.isSystem;
+      }
     } catch (err) {
+      if (!this._current(state)) return;
       toast(I18n.t('flows_builder.load_error', { error: err.message }), 'error');
-      Router.navigate('flows');
+      if (this._current(state)) Router.navigate('flows');
       return;
     }
 
     let parsed = { nodes: [], edges: [] };
     try {
+      if (state.mode === 'bpmn') parsed = state.definition.model;
+      else
       parsed = JSON.parse(state.flow.flow_json || state.flow.flowJson || '{"nodes":[],"edges":[]}');
     } catch (_) { parsed = { nodes: [], edges: [] }; }
     state.flowVariables = Array.isArray(parsed.variables) ? parsed.variables : [];
@@ -155,6 +179,7 @@ const FlowBuilderScreen = {
     // Paleta
     state.palette = new FlowPalette(root.querySelector('[data-role="palette"]'), {
       readOnly: state.readOnly,
+      mode: state.mode,
       onTemplatesLoaded: (list) => {
         for (const t of list) state.templatesMap.set(t.node_type, t);
         state.canvas?.setTemplates(list);
@@ -163,21 +188,28 @@ const FlowBuilderScreen = {
         state.canvas.addNodeFromTemplate(tpl, clientX, clientY);
         this._markDirty();
       },
+      onAdd: (tpl) => {
+        const rect = root.querySelector('[data-role="canvas"]').getBoundingClientRect();
+        state.canvas.addNodeFromTemplate(tpl, rect.left + rect.width / 2, rect.top + rect.height / 2);
+      },
     });
     await state.palette.init();
+    if (!this._current(state)) return;
 
     // Canvas
     const canvasRoot = root.querySelector('[data-role="canvas"]');
     state.canvas = new FlowCanvas(canvasRoot, {
       readOnly: state.readOnly,
+      mode: state.mode,
       onChange: () => {
         this._markDirty();
         this._updateStats();
         this._renderMinimap();
       },
-      onSelect: (node) => {
+      onSelect: (node, edge) => {
         const tpl = node ? state.templatesMap.get(node.type) : null;
-        state.config.show(node, tpl);
+        if (edge) state.config?.showEdge(edge);
+        else state.config?.show(node, tpl);
         const crumb = root.querySelector('[data-role="crumb-name"]');
         if (crumb) crumb.textContent = node ? getNodeDisplayTitle(node, tpl) : (state.flow?.name || I18n.t('flows_builder.crumb_empty'));
       },
@@ -191,11 +223,14 @@ const FlowBuilderScreen = {
       },
     });
     state.canvas.setTemplates(state.palette.getTemplates());
-    state.canvas.setData(parsed.nodes || [], parsed.edges || []);
+    if (state.mode === 'bpmn') state.canvas.setData(parsed);
+    else state.canvas.setData(parsed.nodes || [], parsed.edges || []);
 
     // Config
     state.config = new FlowConfig(root.querySelector('[data-role="config"]'), {
       readOnly: state.readOnly,
+      mode: state.mode,
+      processOptions: state.processOptions,
       // Declared flow variables (flow_json.variables) feed the per-node
       // io-mapping editor (§3.12): output_mapping targets must be declared (R10).
       getFlowVariables: () => state.flowVariables || [],
@@ -203,6 +238,7 @@ const FlowBuilderScreen = {
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
+      onEdgeChange: (id, patch) => state.canvas.updateEdge(id, patch),
       onLabelChange: (id, label) => { state.canvas.updateNodeLabel(id, label); },
       onPositionChange: (id, patch) => {
         const n = state.canvas.nodes.find((x) => x.id === id);
@@ -231,9 +267,9 @@ const FlowBuilderScreen = {
     statusEl.value = state.flow.status || 'draft';
     crumbName.textContent = state.flow.name || I18n.t('flows_builder.crumb_empty');
 
-    if (state.readOnly) {
+    if (state.readOnly && state.mode !== 'bpmn') {
       root.classList.add('fb-readonly');
-      nameEl.disabled = true;
+      nameEl.setAttribute('disabled', '');
       statusEl.setAttribute('disabled', '');
       for (const role of ['save', 'variables', 'test', 'undo', 'redo', 'autosave']) {
         root.querySelector(`[data-role="${role}"]`)?.setAttribute('hidden', '');
@@ -241,11 +277,11 @@ const FlowBuilderScreen = {
       const banner = document.createElement('tf-alert');
       banner.setAttribute('tone', 'info');
       banner.setAttribute('data-role', 'system-readonly');
-      banner.setAttribute('message', I18n.t('flows_builder.system_readonly'));
+      banner.setAttribute('message', I18n.t(state.mode === 'bpmn' ? 'bpmn.archived_hint' : 'flows_builder.system_readonly'));
       root.insertBefore(banner, root.querySelector('[data-role="body"]'));
     }
 
-    nameEl.addEventListener('input', () => { this._markDirty(); crumbName.textContent = nameEl.value || I18n.t('flows_builder.crumb_empty'); });
+    nameEl.addEventListener('input', (event) => { if (event.target !== nameEl) return; this._markDirty(); crumbName.textContent = nameEl.value || I18n.t('flows_builder.crumb_empty'); });
     statusEl.addEventListener('change', () => this._markDirty());
 
     root.querySelector('[data-role="back"]').addEventListener('click', async () => {
@@ -256,7 +292,7 @@ const FlowBuilderScreen = {
           confirmLabel: I18n.t('flows_builder.unsaved_confirm'),
           cancelLabel: I18n.t('flows_builder.unsaved_cancel'),
         });
-        if (ok) await this._save();
+        if (ok && !await this._save()) return;
       }
       Router.navigate('flows');
     });
@@ -266,25 +302,31 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="zoom-fit"]').addEventListener('click', () => state.canvas.fitToContent());
     root.querySelector('[data-role="save"]').addEventListener('click', () => this._save());
     root.querySelector('[data-role="variables"]').addEventListener('click', () => this._openVariables());
-    root.querySelector('[data-role="test"]').addEventListener('click', () => {
-      toast(I18n.t('flows_builder.test_soon'), 'info');
-    });
     root.querySelector('[data-role="history"]').addEventListener('click', () => this._openHistory());
 
     root.querySelector('[data-role="undo"]').addEventListener('click', () => state.canvas.undo());
     root.querySelector('[data-role="redo"]').addEventListener('click', () => state.canvas.redo());
 
     // Mobile tabs
-    root.querySelectorAll('[data-mobile-tab]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const tab = btn.dataset.mobileTab;
-        root.querySelectorAll('[data-mobile-tab]').forEach((x) => x.classList.toggle('active', x === btn));
+    root.querySelector('.fb-mobile-tabs').addEventListener('change', (event) => {
+        if (event.target.tagName !== 'TF-TABS') return;
+        const tab = event.detail.value;
         const body = root.querySelector('[data-role="body"]');
         body.querySelector('[data-role="palette"]').classList.toggle('open', tab === 'palette');
         body.querySelector('[data-role="config"]').classList.toggle('open', tab === 'config');
         body.classList.toggle('overlay-backdrop', tab !== 'canvas');
-      });
     });
+
+    if (state.mode === 'bpmn') {
+      root.querySelector('[data-role="publish"]').addEventListener('click', () => this._publish());
+      root.querySelector('[data-role="run"]').addEventListener('click', () => this._runProcess());
+      root.querySelector('[data-role="instances"]').addEventListener('click', () => openProcessInstances(state.flowId));
+      root.querySelector('[data-role="import"]').addEventListener('click', () => this._importProcess());
+      root.querySelector('[data-role="export"]').addEventListener('click', () => this._exportProcess());
+      root.querySelector('[data-role="archive"]').addEventListener('click', () => this._archiveProcess());
+      root.querySelector('[data-role="draft"]').addEventListener('click', () => this._loadDraft());
+      this._syncProcessControls();
+    }
 
     // Swipe z lewej krawędzi → paleta; z prawej → config (tablet)
     this._setupEdgeSwipes(root);
@@ -295,9 +337,9 @@ const FlowBuilderScreen = {
     state.cleanupFns.push(() => document.removeEventListener('keydown', onKey));
 
     // Autosave co 10s gdy dirty
-    if (!state.readOnly) {
+    if (!state.readOnly || state.mode === 'bpmn') {
       state.autosaveTimer = setInterval(() => {
-        if (state.dirty && !state.saving) this._save({ silent: true });
+        if (this._current(state) && state.dirty && !state.readOnly && !state.saving) this._save({ silent: true });
       }, 10000);
     }
 
@@ -315,13 +357,251 @@ const FlowBuilderScreen = {
     s.canvas?.destroy();
     s.config?.destroy();
     this._state = null;
-    pendingFlowId = null;
+  },
+
+  async canUnmount() {
+    const state = this._state;
+    if (!state?.dirty) return true;
+    if (state.saving || state.operationBusy) return false;
+    const save = await TfWindow.confirm({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
+      confirmLabel: I18n.t('flows_builder.unsaved_confirm'), cancelLabel: I18n.t('flows_builder.unsaved_cancel') });
+    return save ? this._save() : true;
+  },
+
+  _current(state) { return this._state === state && state.root.isConnected; },
+
+  _syncProcessControls() {
+    const state = this._state;
+    if (!state || state.mode !== 'bpmn' || !this._current(state)) return;
+    const readOnly = state.definition.archived || state.previewVersion !== null || !!state.operationBusy;
+    state.readOnly = readOnly;
+    state.canvas.readOnly = readOnly;
+    if (state.config.readOnly !== readOnly) {
+      state.config.readOnly = readOnly;
+      const selected = state.canvas.nodes.find((node) => state.canvas.selectedIds.has(node.id));
+      if (selected) state.config.show(selected, state.templatesMap.get(selected.type));
+      else if (state.canvas.selectedEdgeId) state.config.showEdge(state.canvas.edges.find((edge) => edge.id === state.canvas.selectedEdgeId));
+      else state.config.renderEmpty();
+    }
+    if (state.palette.readOnly !== readOnly) { state.palette.readOnly = readOnly; state.palette._render(); }
+    state.root.querySelector('[data-role="name"]').toggleAttribute('disabled', readOnly);
+    for (const role of ['save', 'variables', 'publish', 'import', 'undo', 'redo']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
+    state.root.querySelector('[data-role="run"]').toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived || !!state.operationBusy);
+    state.root.querySelector('[data-role="draft"]').hidden = state.previewVersion === null;
+    state.root.querySelector('[data-role="archive"]').textContent = I18n.t(state.definition.archived ? 'bpmn.unarchive' : 'bpmn.archive');
+    state.root.querySelector('[data-role="archive"]').toggleAttribute('disabled', !!state.operationBusy || state.previewVersion !== null);
+    state.root.querySelector('.fb-process-notice > span').textContent = I18n.t(state.definition.archived ? 'bpmn.archived_hint' : 'bpmn.supported_hint');
+    state.root.querySelector('[data-role="publication"]').textContent = state.previewVersion !== null
+      ? I18n.t('bpmn.preview_version', { version: state.previewVersion })
+      : state.definition.archived ? I18n.t('bpmn.archived')
+      : state.definition.publishedVersion ? I18n.t('bpmn.draft_published', { version: state.definition.publishedVersion }) : I18n.t('bpmn.draft');
+  },
+
+  async _processOperation(action) {
+    const state = this._state;
+    if (!state || !this._current(state) || state.operationBusy) return;
+    state.operationBusy = true;
+    state.root.querySelector('[data-role="error"]').hidden = true;
+    this._syncProcessControls();
+    try { await action(state); }
+    catch (error) {
+      if (!this._current(state)) return;
+      const alert = state.root.querySelector('[data-role="error"]');
+      alert.hidden = false;
+      alert.setAttribute('message', I18n.t('bpmn.request_error', { error: error.message }));
+    } finally {
+      state.operationBusy = false;
+      if (this._current(state)) this._syncProcessControls();
+    }
+  },
+
+  async _publish() {
+    const state = this._state;
+    if (!state || state.readOnly || state.saving) return;
+    if (state.dirty && !await this._save()) return;
+    if (!this._current(state) || state.dirty) return;
+    await this._processOperation(async (current) => {
+      const response = await ApiBinary.one('processDefinitionPublishRequest', current.publishCommand({ definitionId: current.flowId, expectedRevision: current.definition.draftRevision }));
+      if (!this._current(current)) return;
+      current.definition = { ...response.definition, model: response.version.model };
+      toast(I18n.t('bpmn.published', { version: response.version.version }), 'success');
+    });
+  },
+
+  async _runProcess() {
+    const state = this._state;
+    if (!state || state.definition.archived || !state.definition.publishedVersion) return;
+    const version = state.previewVersion ?? state.definition.publishedVersion;
+    await this._processOperation(async (current) => {
+      const response = await ApiBinary.one('processVersionGetRequest', { definitionId: current.flowId, version });
+      if (!this._current(current)) return;
+      openProcessRun({ ...current.definition, model: response.version.model }, [response.version]);
+    });
+  },
+
+  async _archiveProcess() {
+    const state = this._state;
+    if (!state || state.operationBusy || state.previewVersion !== null) return;
+    if (state.dirty && !await this._save()) return;
+    const archived = !state.definition.archived;
+    const approved = await TfWindow.confirm({ title: I18n.t(archived ? 'bpmn.archive' : 'bpmn.unarchive'), message: I18n.t(archived ? 'bpmn.archive_hint' : 'bpmn.unarchive_hint') });
+    if (!approved || !this._current(state)) return;
+    await this._processOperation(async (current) => {
+      const response = await ApiBinary.one('processDefinitionArchiveRequest', current.archiveCommand({ definitionId: current.flowId, expectedRevision: current.definition.draftRevision, archived }));
+      if (!this._current(current)) return;
+      current.definition = response.definition;
+      current.root.querySelector('[data-role="system-readonly"]')?.remove();
+      current.root.classList.remove('fb-readonly');
+    });
+  },
+
+  async _loadDraft() {
+    await this._processOperation(async (state) => {
+      const response = await ApiBinary.one('processDefinitionGetRequest', { definitionId: state.flowId });
+      if (!this._current(state)) return;
+      state.definition = response.definition;
+      state.previewVersion = null;
+      state.canvas.setData(response.definition.model);
+      state.root.querySelector('[data-role="name"]').value = response.definition.name;
+      state.dirty = false;
+      this._setAutosave('ok');
+    });
+  },
+
+  _importProcess() {
+    const state = this._state;
+    if (!state || state.readOnly) return;
+    const section = document.createElement('div');
+    section.className = 'fb-process-import';
+    section.innerHTML = `<tf-file-input accept=".bpmn,.xml" label="${escapeAttr(I18n.t('bpmn.xml_file'))}"></tf-file-input>
+      <tf-code-editor language="html" aria-label="${escapeAttr(I18n.t('bpmn.xml_document'))}"></tf-code-editor>
+      <tf-alert data-file-error tone="danger" hidden></tf-alert>`;
+    section.querySelector('tf-code-editor').labels = processEditorLabels();
+    let fileGeneration = 0;
+    let fileBusy = false;
+    const win = openFormWindow({ title: I18n.t('bpmn.import_xml'), icon: 'arrow-up', subject: state.definition.name,
+      note: { text: I18n.t('bpmn.import_hint') }, sections: [section], submitLabel: I18n.t('bpmn.import_apply'),
+      canSubmit: () => !fileBusy && !!section.querySelector('tf-code-editor').value.trim() && this._current(state) && !state.readOnly,
+      collect: () => section.querySelector('tf-code-editor').value,
+      onSubmit: async (xml) => {
+        checkProcessDocument(xml);
+        const response = await ApiBinary.one('processXmlImportRequest', { xml });
+        if (!this._current(state) || !win.isConnected || state.readOnly) throw new Error(I18n.t('bpmn.editor_changed'));
+        const fatal = response.diagnostics.filter((diagnostic) => diagnostic.fatal);
+        if (fatal.length) throw new Error(I18n.t('bpmn.import_rejected', { error: fatal.map((diagnostic) => diagnostic.message).join('\n') }));
+        state.canvas.setData(response.model);
+        this._markDirty();
+        this._updateStats();
+        this._renderMinimap();
+        return { message: I18n.t('bpmn.imported_draft') };
+      },
+    });
+    section.querySelector('tf-file-input').addEventListener('change', async (event) => {
+      if (event.target.tagName !== 'TF-FILE-INPUT') return;
+      const generation = ++fileGeneration;
+      const file = event.detail.files[0];
+      if (!file) return;
+      const error = section.querySelector('[data-file-error]');
+      error.hidden = true;
+      fileBusy = true;
+      try {
+        if (file.size > 512 * 1024) throw new Error(I18n.t('bpmn.document_too_large'));
+        const xml = await file.text();
+        if (generation !== fileGeneration || !win.isConnected) return;
+        checkProcessDocument(xml);
+        section.querySelector('tf-code-editor').value = xml;
+      } catch (failure) {
+        if (generation !== fileGeneration || !win.isConnected) return;
+        error.hidden = false;
+        error.setAttribute('message', failure.message);
+      } finally {
+        if (generation === fileGeneration) { fileBusy = false; section.dispatchEvent(new CustomEvent('change', { bubbles: true })); }
+      }
+    });
+  },
+
+  async _exportProcess() {
+    const state = this._state;
+    if (!state || state.operationBusy) return;
+    if (state.previewVersion === null && state.dirty && !await this._save()) return;
+    await this._processOperation(async (current) => {
+      const response = await ApiBinary.one('processXmlExportRequest', { definitionId: current.flowId, version: current.previewVersion });
+      if (!this._current(current)) return;
+      const url = URL.createObjectURL(new Blob([response.xml], { type: 'application/xml;charset=utf-8' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${current.definition.name.replace(/[^\p{L}\p{N}_-]/gu, '_')}.bpmn`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  },
+
+  async _openProcessVersions() {
+    const state = this._state;
+    if (!state || !this._current(state)) return;
+    const win = document.createElement('tf-window');
+    win.setAttribute('title', I18n.t('bpmn.versions'));
+    win.setAttribute('modal', '');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('width', '800');
+    win.setAttribute('initial-x', 'center');
+    win.setAttribute('initial-y', 'center');
+    win.innerHTML = `<div slot="body" class="fb-process-content"><tf-alert tone="danger" data-error hidden></tf-alert><tf-table page-size="25" page="1" empty-message="${escapeAttr(I18n.t('bpmn.versions_empty'))}"><tf-column key="label" label="${escapeAttr(I18n.t('bpmn.version'))}"></tf-column><tf-column key="at" label="${escapeAttr(I18n.t('bpmn.published_at'))}"></tf-column></tf-table></div>`;
+    document.body.appendChild(win);
+    const table = win.querySelector('tf-table');
+    let offset = 0;
+    let generation = 0;
+    let previewGeneration = 0;
+    const current = () => this._current(state) && win.isConnected;
+    const error = (failure) => {
+      if (!current()) return;
+      const alert = win.querySelector('[data-error]');
+      alert.hidden = false;
+      alert.setAttribute('message', I18n.t('bpmn.request_error', { error: failure.message }));
+    };
+    table.rowKey = 'version';
+    table.rowActionsKey = (row) => row.version;
+    table.rowActions = (_row, _index, selected) => {
+      const button = document.createElement('tf-button');
+      button.setAttribute('variant', 'secondary');
+      button.textContent = I18n.t('bpmn.preview');
+      button.addEventListener('click', async () => {
+        const request = ++previewGeneration;
+        const version = selected().version;
+        if (state.dirty && !await this._save()) return;
+        if (!current() || request !== previewGeneration || state.dirty) return;
+        try {
+          const response = await ApiBinary.one('processVersionGetRequest', { definitionId: state.flowId, version });
+          if (!current() || request !== previewGeneration) return;
+          state.previewVersion = response.version.version;
+          state.canvas.setData(response.version.model);
+          this._syncProcessControls();
+          this._updateStats();
+          this._renderMinimap();
+          win.close();
+        } catch (failure) { if (request === previewGeneration) error(failure); }
+      });
+      return button;
+    };
+    const load = async () => {
+      const request = ++generation;
+      try {
+        const response = await ApiBinary.one('processVersionListRequest', { definitionId: state.flowId, offset, limit: 25 });
+        if (!current() || request !== generation) return;
+        table.setAttribute('page', String(offset / 25 + 1));
+        table.setAttribute('total', String(response.total));
+        table.rows = response.versions.map((version) => ({ ...version, label: I18n.t('bpmn.version_number', { version: version.version }), at: new Date(version.publishedAtMs).toLocaleString(I18n.getLanguage()) }));
+      } catch (failure) { if (request === generation) error(failure); }
+    };
+    table.addEventListener('page-change', (event) => { offset = (event.detail.page - 1) * 25; load(); });
+    await load();
   },
 
   _markDirty() {
     const s = this._state;
     if (!s || s.readOnly) return;
     s.dirty = true;
+    s.editRevision += 1;
     this._setAutosave('pending');
     this._updateStats();
   },
@@ -357,7 +637,7 @@ const FlowBuilderScreen = {
 
   async _save({ silent = false } = {}) {
     const s = this._state;
-    if (!s || s.saving || s.readOnly) return;
+    if (!s || s.saving || s.readOnly) return false;
     // Walidacja klient-side przed wyslaniem do backendu — porty, wiszace
     // krawedzie, cykle. Backend ma swoj validate_flow_json_str, wiec to jest
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
@@ -365,15 +645,31 @@ const FlowBuilderScreen = {
     if (errors.length > 0) {
       this._setAutosave('error');
       if (!silent) toast(errors[0], 'error');
-      return;
+      return false;
     }
     s.saving = true;
+    const editRevision = s.editRevision;
     try {
       const nameEl = s.root.querySelector('[data-role="name"]');
       const statusEl = s.root.querySelector('[data-role="status"]');
       const name = (nameEl.value || '').trim() || I18n.t('flows_builder.default_name');
       const status = statusEl.value || 'draft';
       const data = s.canvas.getData();
+      if (s.mode === 'bpmn') {
+        checkProcessDocument(JSON.stringify(data));
+        const response = await ApiBinary.one('processDefinitionSaveRequest', s.saveCommand({
+          definitionId: s.flowId, expectedRevision: s.definition.draftRevision,
+          name, description: s.definition.description, model: data,
+        }));
+        if (!this._current(s)) return false;
+        s.definition = response.definition;
+        s.flow.name = response.definition.name;
+        s.dirty = s.editRevision !== editRevision;
+        this._syncProcessControls();
+        this._setAutosave(s.dirty ? 'pending' : 'ok');
+        if (!silent) toast(I18n.t('flows_builder.save_success'), 'success');
+        return true;
+      }
       // `variables` dopisujemy tylko gdy niepuste — pusty flow round-trippuje
       // byte-identycznie z legacy flow_json (serde skip_serializing_if).
       const graph = { nodes: data.nodes, edges: data.edges };
@@ -394,12 +690,16 @@ const FlowBuilderScreen = {
         status,
         flow_json: graphJson,
       };
-      s.dirty = false;
+      if (!this._current(s)) return false;
+      s.dirty = s.editRevision !== editRevision;
       this._setAutosave('ok');
       if (!silent) toast(I18n.t('flows_builder.save_success'), 'success');
+      return true;
     } catch (err) {
+      if (!this._current(s)) return false;
       this._setAutosave('error');
       toast(I18n.t('flows_builder.save_error', { error: err.message }), 'error');
+      return false;
     } finally {
       s.saving = false;
     }
@@ -409,8 +709,16 @@ const FlowBuilderScreen = {
     const s = this._state;
     if (!s) return;
     if (s.readOnly) return;
+    if (s.mode === 'bpmn') {
+      openProcessVariables(s.canvas.processModel.variables, (values) => {
+        if (!this._current(s) || s.readOnly) return;
+        s.canvas.processModel.variables = values;
+        this._markDirty();
+      });
+      return;
+    }
     const result = await openVariablesEditor(s.flowVariables || []);
-    if (result === null) return; // anulowano — bez zmian
+    if (result === null || !this._current(s)) return;
     s.flowVariables = result;
     this._markDirty();
     toast(I18n.t('flows_vars.saved', { count: result.length }), 'success');
@@ -419,6 +727,7 @@ const FlowBuilderScreen = {
   _onKey(ev) {
     const s = this._state;
     if (!s) return;
+    if (ev.composedPath().some((element) => element.tagName?.startsWith('TF-') || element.isContentEditable)) return;
     const tag = (ev.target.tagName || '').toUpperCase();
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (s.readOnly) return;
@@ -492,7 +801,7 @@ const FlowBuilderScreen = {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of nodes) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
-      maxX = Math.max(maxX, n.x + 220); maxY = Math.max(maxY, n.y + 96);
+      maxX = Math.max(maxX, n.x + (s.mode === 'bpmn' ? n.width : 220)); maxY = Math.max(maxY, n.y + (s.mode === 'bpmn' ? n.height : 96));
     }
     const w = Math.max(1, maxX - minX);
     const h = Math.max(1, maxY - minY);
@@ -506,8 +815,8 @@ const FlowBuilderScreen = {
       dot.style.setProperty('--node-color', `var(${nodeColorVar(n.type, s.templatesMap.get(n.type)?.category)})`);
       dot.style.left = `${offX + (n.x - minX) * scale}px`;
       dot.style.top = `${offY + (n.y - minY) * scale}px`;
-      dot.style.width = `${Math.max(8, 220 * scale)}px`;
-      dot.style.height = `${Math.max(4, 40 * scale)}px`;
+      dot.style.width = `${Math.max(8, (s.mode === 'bpmn' ? n.width : 220) * scale)}px`;
+      dot.style.height = `${Math.max(4, (s.mode === 'bpmn' ? n.height : 40) * scale)}px`;
       mini.appendChild(dot);
     }
     // Viewport
@@ -526,6 +835,7 @@ const FlowBuilderScreen = {
   async _openHistory() {
     const s = this._state;
     if (!s) return;
+    if (s.mode === 'bpmn') return this._openProcessVersions();
     let versions = [];
     try {
       const resp = await ApiBinary.one('flowVersionListRequest', { flowId: String(s.flowId) });
@@ -608,9 +918,7 @@ const FlowBuilderScreen = {
         toast(I18n.t('flows_builder.restore_success'), 'success');
         cleanup();
         // Reload builder
-        const id = s.flowId;
-        pendingFlowId = id;
-        Router.navigate('flow-builder');
+        openFlowBuilder(s.flowId);
       } catch (err) {
         toast(I18n.t('flows_builder.restore_error', { error: err.message }), 'error');
       }
