@@ -70,6 +70,7 @@ if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver
 }
 const { TfSelect } = await import('./tf-select.js');
 const { TfButton } = await import('./tf-button.js');
+const { TfTextarea } = await import('./tf-textarea.js');
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -78,6 +79,39 @@ function mount(el, attrs = {}) {
   document.body.appendChild(el);
   return el;
 }
+
+test('tf-textarea: the focused control tracks its explicit or visible accessible name', () => {
+  const textarea = mount(new TfTextarea(), { label: 'Element name', value: 'Full process name', autogrow: '', rows: '1' });
+  const input = textarea.querySelector('textarea');
+  assert.equal(input.getAttribute('aria-label'), 'Element name');
+  assert.equal(input.value, 'Full process name');
+  textarea.setAttribute('aria-label', 'Process name');
+  assert.equal(input.getAttribute('aria-label'), 'Process name');
+  textarea.setAttribute('label', 'Updated element name');
+  assert.equal(input.getAttribute('aria-label'), 'Process name');
+  textarea.removeAttribute('aria-label');
+  assert.equal(input.getAttribute('aria-label'), 'Updated element name');
+  textarea.removeAttribute('label');
+  assert.equal(input.hasAttribute('aria-label'), false);
+  textarea.remove();
+});
+
+test('tf-textarea: autogrow includes measured borders in a border-box height', () => {
+  const textarea = mount(new TfTextarea(), { value: 'Wrapped full name', autogrow: '', rows: '1' });
+  const input = textarea.querySelector('textarea');
+  Object.defineProperties(input, {
+    scrollHeight: { value: 146 },
+    clientHeight: { value: 144 },
+    offsetHeight: { value: 146 },
+  });
+  input.style.boxSizing = 'border-box';
+  textarea.value = 'A renamed full name';
+  assert.equal(input.style.height, '148px');
+  input.style.boxSizing = 'content-box';
+  textarea.value = 'Another full name';
+  assert.equal(input.style.height, '146px');
+  textarea.remove();
+});
 
 // ---------------------------------------------------------------------------
 // 1. tf-tree — node.badge

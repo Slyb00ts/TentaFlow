@@ -3,9 +3,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, ensure, Context, Result};
-use tentaflow_protocol::processes::{ProcessModel, ProcessNodeKind};
+use tentaflow_protocol::processes::{ProcessModel, ProcessNodeKind, ProcessTimerSpec};
 
 use crate::flow_engine::expr;
+use crate::project_studio::schedules::parse_timezone;
 
 pub const MAX_MODEL_BYTES: usize = 512 * 1024;
 pub const MAX_NODES: usize = 128;
@@ -39,6 +40,7 @@ pub fn starter_model() -> ProcessModel {
         }],
         variables: Default::default(),
         diagram: ProcessDiagram::default(),
+        timer_timezone: None,
     }
 }
 
@@ -49,6 +51,95 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+pub fn validate_timer_spec(spec: &ProcessTimerSpec, is_start: bool) -> Result<()> {
+    match spec {
+        ProcessTimerSpec::Date { at } => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(at)
+                .with_context(|| format!("timer date must be RFC3339 with an offset: {at}"))?;
+            let fractional_digits = at
+                .split_once('.')
+                .map(|(_, fraction)| {
+                    fraction
+                        .chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .count()
+                })
+                .unwrap_or(0);
+            ensure!(
+                fractional_digits <= 3 && parsed.timestamp_subsec_nanos() % 1_000_000 == 0,
+                "timer date precision must be milliseconds or coarser"
+            );
+        }
+        ProcessTimerSpec::Duration { seconds } => ensure!(
+            (1..=31_536_000).contains(seconds),
+            "timer duration must be 1..=31536000 seconds"
+        ),
+        ProcessTimerSpec::Cycle {
+            seconds,
+            total_firings,
+        } => {
+            ensure!(is_start, "repeating timer is only supported as a start event");
+            ensure!(
+                (300..=31_536_000).contains(seconds),
+                "timer cycle must be 300..=31536000 seconds"
+            );
+            ensure!(
+                total_firings.is_none_or(|count| count > 0),
+                "timer firing count must be positive"
+            );
+        }
+        ProcessTimerSpec::Daily {
+            hour,
+            minute,
+            total_firings,
+        } => {
+            ensure!(is_start, "repeating timer is only supported as a start event");
+            ensure!(*hour < 24 && *minute < 60, "invalid timer daily clock time");
+            ensure!(
+                total_firings.is_none_or(|count| count > 0),
+                "timer firing count must be positive"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_timer_model(model: &ProcessModel) -> Result<()> {
+    let mut has_timer = false;
+    for node in &model.nodes {
+        match &node.kind {
+            ProcessNodeKind::TimerStart { timer } => {
+                validate_timer_spec(timer, true)
+                    .with_context(|| format!("timer start {}", node.id))?;
+                has_timer = true;
+            }
+            ProcessNodeKind::TimerCatch { timer } => {
+                validate_timer_spec(timer, false)
+                    .with_context(|| format!("timer catch {}", node.id))?;
+                has_timer = true;
+            }
+            _ => {}
+        }
+    }
+    if has_timer {
+        let timezone = model
+            .timer_timezone
+            .as_deref()
+            .context("timed process requires an explicit IANA timezone")?;
+        ensure!(
+            !timezone.is_empty() && timezone.trim() == timezone,
+            "timer timezone must be a nonempty IANA name"
+        );
+        parse_timezone(timezone)?;
+    } else {
+        ensure!(
+            model.timer_timezone.is_none(),
+            "timerless process cannot declare a timer timezone"
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_variables(value: &serde_json::Value) -> Result<()> {
@@ -84,6 +175,7 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
         "process draft exceeds 512 KiB"
     );
     validate_variables(&serde_json::to_value(&model.variables)?)?;
+    validate_timer_model(model)?;
     let mut node_ids = HashSet::new();
     for node in &model.nodes {
         ensure!(
@@ -156,6 +248,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         "process model exceeds 512 KiB"
     );
     validate_variables(&serde_json::to_value(&model.variables)?)?;
+    validate_timer_model(model)?;
 
     let mut nodes = HashMap::new();
     for node in &model.nodes {
@@ -248,7 +341,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
     let starts: Vec<_> = model
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, ProcessNodeKind::Start))
+        .filter(|node| matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }))
         .collect();
     ensure!(
         starts.len() == 1,
@@ -265,7 +358,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         let in_count = incoming.get(node.id.as_str()).map_or(0, Vec::len);
         let out_count = outgoing.get(node.id.as_str()).map_or(0, Vec::len);
         match &node.kind {
-            ProcessNodeKind::Start => ensure!(
+            ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } => ensure!(
                 in_count == 0 && out_count == 1,
                 "start event must have one outgoing flow and no incoming flow"
             ),
@@ -512,6 +605,32 @@ pub fn and_pairs(model: &ProcessModel) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_profiles_require_explicit_zone_and_supported_start_catch_rules() {
+        let mut model = starter_model();
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(3) } };
+        assert!(validate_model(&model).is_err());
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        validate_model(&model).unwrap();
+        model.timer_timezone = Some("Mars/Olympus".into());
+        assert!(validate_model(&model).is_err());
+        model.timer_timezone = Some("UTC".into());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Cycle { seconds: 299, total_firings: Some(3) } };
+        assert!(validate_model(&model).is_err());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Daily { hour: 24, minute: 0, total_firings: None } };
+        assert!(validate_model(&model).is_err());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Date { at: "2027-01-02T03:04:05.1234Z".into() } };
+        assert!(validate_model(&model).is_err());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Date { at: "2027-01-02T03:04:05.123Z".into() } };
+        validate_model(&model).unwrap();
+        model.nodes.insert(1, tentaflow_protocol::processes::ProcessNode { id: "Wait_1".into(), name: "Wait".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: None } } });
+        model.sequence_flows[0].target_id = "Wait_1".into();
+        model.sequence_flows.push(tentaflow_protocol::processes::ProcessSequenceFlow { id: "Flow_2".into(), source_id: "Wait_1".into(), target_id: "End_1".into(), condition: None });
+        assert!(validate_model(&model).is_err());
+        model.nodes[1].kind = ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 90 } };
+        validate_model(&model).unwrap();
+    }
 
     #[test]
     fn starter_publishes_and_cycle_is_rejected() {

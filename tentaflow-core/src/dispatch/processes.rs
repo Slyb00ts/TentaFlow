@@ -176,9 +176,14 @@ pub fn process_dispatch(
                 has_more,
             }
         }
-        P::DefinitionGetRequest { definition_id } => P::DefinitionGetResponse {
-            definition: repository::get_definition(pool, &actor, definition_id).map_err(error)?,
-        },
+        P::DefinitionGetRequest { definition_id } => {
+            let (definition, timer_start) =
+                repository::get_definition(pool, &actor, definition_id).map_err(error)?;
+            P::DefinitionGetResponse {
+                definition,
+                timer_start,
+            }
+        }
         P::DefinitionSaveRequest {
             command_id,
             definition_id,
@@ -214,7 +219,7 @@ pub fn process_dispatch(
                     version,
                 }));
             }
-            let definition =
+            let (definition, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
             let mut snapshots = Vec::new();
@@ -249,6 +254,9 @@ pub fn process_dispatch(
                 &snapshots,
             )
             .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
             P::DefinitionPublishResponse {
                 definition: (&definition).into(),
                 version,
@@ -259,8 +267,8 @@ pub fn process_dispatch(
             definition_id,
             expected_revision,
             archived,
-        } => P::DefinitionArchiveResponse {
-            definition: repository::archive_definition(
+        } => {
+            let definition = repository::archive_definition(
                 pool,
                 &actor,
                 &stamp(payload, command_id)?,
@@ -268,8 +276,12 @@ pub fn process_dispatch(
                 *expected_revision,
                 *archived,
             )
-            .map_err(error)?,
-        },
+            .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::DefinitionArchiveResponse { definition }
+        }
         P::VersionListRequest {
             definition_id,
             offset,
@@ -308,6 +320,7 @@ pub fn process_dispatch(
                 None => {
                     repository::get_definition(pool, &actor, definition_id)
                         .map_err(error)?
+                        .0
                         .model
                 }
             };
@@ -341,9 +354,18 @@ pub fn process_dispatch(
                     object.insert(key.clone(), value.clone());
                 }
                 let instance_id = uuid::Uuid::new_v4().to_string();
-                let plan =
-                    runtime::plan_start(&published.model, &instance_id, &actor.user_id, merged)
-                        .map_err(error)?;
+                let at_ms = chrono::Utc::now().timestamp_millis();
+                let plan = runtime::plan_start(
+                    &published.model,
+                    &instance_id,
+                    &actor,
+                    definition_id,
+                    *version,
+                    merged,
+                    runtime::StartCause::Manual,
+                    at_ms,
+                )
+                .map_err(error)?;
                 repository::start_instance(
                     pool,
                     &actor,
@@ -353,6 +375,7 @@ pub fn process_dispatch(
                     *version,
                     variables,
                     &plan,
+                    at_ms,
                 )
                 .map_err(error)?
             };
@@ -402,9 +425,15 @@ pub fn process_dispatch(
             } else {
                 let snapshot =
                     repository::runtime_snapshot(pool, &actor, instance_id).map_err(error)?;
-                let plan =
-                    runtime::plan_user_completion(&snapshot, user_task_id, outputs, *approved)
-                        .map_err(error)?;
+                let at_ms = chrono::Utc::now().timestamp_millis();
+                let plan = runtime::plan_user_completion(
+                    &snapshot,
+                    user_task_id,
+                    outputs,
+                    *approved,
+                    at_ms,
+                )
+                .map_err(error)?;
                 repository::complete_user_task(
                     pool,
                     &actor,
@@ -415,6 +444,7 @@ pub fn process_dispatch(
                     outputs,
                     *approved,
                     &plan,
+                    at_ms,
                 )
                 .map_err(error)?
             };
@@ -543,7 +573,8 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tentaflow_protocol::processes::{
-        ActivityVerification, ProcessDefinition, ProcessInstanceStatus,
+        ActivityVerification, ProcessDefinition, ProcessInstanceStatus, ProcessNode,
+        ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus,
     };
 
     fn context(state: &Arc<AppState>, actor: &ProcessActor) -> HandlerContext {
@@ -980,5 +1011,241 @@ mod tests {
         };
         assert_eq!(total, 0);
         assert!(definitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn published_timer_summary_is_private_and_manual_start_or_replay_cannot_rearm_it() {
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "timed-author");
+        let outsider = test_support::actor(&state.db, "timed-outsider");
+        let ctx = context(&state, &owner);
+        let outside = context(&state, &outsider);
+        let mut model = crate::processes::model::starter_model();
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart {
+            timer: ProcessTimerSpec::Duration { seconds: 60 },
+        };
+        let definition = save(&ctx, model).await;
+        let publish = P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: definition.definition_id.clone(),
+            expected_revision: definition.draft_revision,
+        };
+        let P::DefinitionPublishResponse { version, .. } = request(&ctx, publish.clone()).await
+        else {
+            panic!("actual publication expected")
+        };
+        let P::DefinitionGetResponse {
+            definition,
+            timer_start: Some(summary),
+        } = request(
+            &ctx,
+            P::DefinitionGetRequest {
+                definition_id: definition.definition_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("actual persisted schedule expected")
+        };
+        assert_eq!(summary.kind, ProcessTimerKind::Start);
+        assert_eq!(summary.status, ProcessTimerStatus::Pending);
+        assert_eq!(summary.timezone, "Europe/Warsaw");
+        assert_eq!(summary.due_at_ms, Some(version.published_at_ms + 60_000));
+        assert_eq!(
+            refused(
+                &outside,
+                P::DefinitionGetRequest {
+                    definition_id: definition.definition_id.clone()
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+        let denial = refused(
+            &ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                version: version.version,
+                variables: json!({}),
+            },
+        )
+        .await;
+        assert_eq!(denial.code, ProtocolErrorCode::BadRequest);
+        assert!(denial.message.contains("cannot be started manually"));
+        request(&ctx, publish).await;
+        let P::DefinitionGetResponse {
+            timer_start: Some(replayed),
+            ..
+        } = request(
+            &ctx,
+            P::DefinitionGetRequest {
+                definition_id: definition.definition_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("replayed schedule expected")
+        };
+        assert_eq!(replayed, summary);
+        let P::InstanceListResponse {
+            total, instances, ..
+        } = request(
+            &ctx,
+            P::InstanceListRequest {
+                definition_id: Some(definition.definition_id),
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("actual empty instance list expected")
+        };
+        assert_eq!(total, 0);
+        assert!(instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn participant_completion_arms_one_catch_with_commit_time_and_cancelled_summary() {
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "catch-author");
+        let participant = test_support::actor(&state.db, "catch-reviewer");
+        let ctx = context(&state, &owner);
+        let reviewer = context(&state, &participant);
+        let mut model = test_support::user_model(Some(&participant.user_id));
+        model.timer_timezone = Some("UTC".into());
+        model.nodes.push(ProcessNode {
+            id: "Wait".into(),
+            name: "Wait after human work".into(),
+            kind: ProcessNodeKind::TimerCatch {
+                timer: ProcessTimerSpec::Duration { seconds: 60 },
+            },
+        });
+        model.sequence_flows = vec![
+            test_support::edge("ToWork", "Start_1", "Work"),
+            test_support::edge("ToWait", "Work", "Wait"),
+            test_support::edge("ToEnd", "Wait", "End_1"),
+        ];
+        let definition = save(&ctx, model).await;
+        request(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+            },
+        )
+        .await;
+        let P::InstanceStartResponse { instance } = request(
+            &ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                version: 1,
+                variables: json!({}),
+            },
+        )
+        .await
+        else {
+            panic!("human wait expected")
+        };
+        let complete = P::UserTaskCompleteRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.instance_id.clone(),
+            user_task_id: instance.user_tasks[0].user_task_id.clone(),
+            expected_revision: instance.revision,
+            outputs: json!({"answer":"checked"}),
+            approved: None,
+        };
+        let P::UserTaskCompleteResponse { instance: waiting } =
+            request(&reviewer, complete.clone()).await
+        else {
+            panic!("timer wait expected")
+        };
+        assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
+        assert_eq!(waiting.timers.len(), 1);
+        assert_eq!(
+            waiting.timers[0].due_at_ms,
+            Some(waiting.updated_at_ms + 60_000)
+        );
+        let snapshot =
+            repository::runtime_snapshot(&state.db, &owner, &instance.instance_id).unwrap();
+        assert_eq!(snapshot.timers[0].anchor_at_ms, waiting.updated_at_ms);
+        assert_eq!(snapshot.timers[0].org_id, owner.org_id);
+        assert_eq!(snapshot.timers[0].definition_id, definition.definition_id);
+        assert_eq!(snapshot.timers[0].version, 1);
+        let P::HistoryResponse { events: before, .. } = request(
+            &reviewer,
+            P::HistoryRequest {
+                instance_id: instance.instance_id.clone(),
+                after_seq: 0,
+                limit: 200,
+            },
+        )
+        .await
+        else {
+            panic!("participant history expected")
+        };
+        request(&reviewer, complete).await;
+        let P::HistoryResponse { events: after, .. } = request(
+            &reviewer,
+            P::HistoryRequest {
+                instance_id: instance.instance_id.clone(),
+                after_seq: 0,
+                limit: 200,
+            },
+        )
+        .await
+        else {
+            panic!("idempotent participant history expected")
+        };
+        assert_eq!(before, after);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|event| event.kind == "timer_armed")
+                .count(),
+            1
+        );
+        let P::InstanceCancelResponse {
+            instance: cancelled,
+        } = request(
+            &ctx,
+            P::InstanceCancelRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                instance_id: instance.instance_id.clone(),
+                expected_revision: waiting.revision,
+            },
+        )
+        .await
+        else {
+            panic!("actual cancelled timer expected")
+        };
+        assert_eq!(cancelled.timers[0].status, ProcessTimerStatus::Cancelled);
+        assert_eq!(
+            crate::processes::timers::drain_due(&state.db, waiting.timers[0].due_at_ms.unwrap())
+                .unwrap(),
+            0
+        );
+        crate::services::org::repo::remove_membership(
+            &state.db,
+            &participant.org_id,
+            &participant.user_id,
+        )
+        .unwrap();
+        assert_eq!(
+            refused(
+                &reviewer,
+                P::InstanceGetRequest {
+                    instance_id: instance.instance_id
+                }
+            )
+            .await
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
     }
 }

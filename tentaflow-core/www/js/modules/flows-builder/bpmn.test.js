@@ -28,7 +28,7 @@ const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
 const { processTemplates } = await import('./bpmn.js');
-const { openProcessInstance, openProcessInstances, openProcessRun, processEventText } = await import('./process-monitor.js');
+const { openProcessInstance, openProcessInstances, openProcessRun, openProcessSchedule, processEventText, processTimerReasonText, processTimerText } = await import('./process-monitor.js');
 const { default: builder } = await import('../flows-builder.js');
 const { default: flows } = await import('../flows.js');
 localStorage.setItem('tentaflow_lang', 'en');
@@ -174,10 +174,11 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
-test('palette offers only the six supported elements and cancels drag/filter work when disposed', async () => {
+test('palette offers only the eight supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 6);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 8);
+  assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
   window.dispatchEvent(new window.PointerEvent('pointercancel', { pointerId: 1 }));
@@ -412,7 +413,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 6);
+    assert.equal(processTemplates().length, 8);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
@@ -477,4 +478,391 @@ test('poll refusal disables cached mutation controls and a delayed error after c
   const last = deferred(); responder = () => last.promise; const delayed = poll(); win.remove(); await flush();
   last.reject(new Error('Late refusal')); await delayed;
   assert.equal(document.querySelector('.fb-process-window'), null);
+});
+
+function timedModel(kind = 'TimerStart', type = 'Duration', spec = { seconds: 60 }) {
+  const model = emptyProcessModel();
+  model.timerTimezone = 'Europe/Warsaw';
+  model.variables = { Request_ID: { Preserve_Me: true } };
+  if (kind === 'TimerStart') {
+    model.nodes[0].kind = { TimerStart: { timer: { [type]: spec } } };
+  } else {
+    model.nodes.splice(1, 0, { id: 'Wait', name: 'Saved deadline', kind: { TimerCatch: { timer: { [type]: spec } } } });
+    model.sequenceFlows = [{ id: 'e_before_wait', sourceId: 'Start', targetId: 'Wait', condition: null }, { id: 'e_after_wait', sourceId: 'Wait', targetId: 'End', condition: null }];
+    model.diagram.shapes.splice(1, 0, { elementId: 'Wait', x: 240, y: 160, width: 56, height: 56 });
+    model.diagram.edges = [{ sequenceFlowId: 'e_before_wait', waypoints: [{ x: 136, y: 188 }, { x: 240, y: 188 }] }, { sequenceFlowId: 'e_after_wait', waypoints: [{ x: 296, y: 188 }, { x: 400, y: 188 }] }];
+  }
+  return model;
+}
+function savedTimer(overrides = {}) {
+  return { timerId: 'private-timer-id', nodeId: 'Start', nodeName: 'Daily approval', kind: 'Start', status: 'Pending', dueAtMs: Date.UTC(2026, 9, 3, 7), timezone: 'Europe/Warsaw', occurrence: 3, totalFirings: 7, lastReason: null, ...overrides };
+}
+
+test('all supported timer literals preserve IANA, variables, stable IDs and DI through the actual canvas', () => {
+  const cases = [['TimerStart', 'Date', { at: '2026-10-03T09:00:00.123+02:00' }], ['TimerStart', 'Duration', { seconds: 86400 }], ['TimerStart', 'Cycle', { seconds: 300, totalFirings: 3 }], ['TimerStart', 'Daily', { hour: 9, minute: 30, totalFirings: null }], ['TimerCatch', 'Date', { at: '2026-10-02T12:00:00Z' }], ['TimerCatch', 'Duration', { seconds: 1 }]];
+  for (const [kind, type, spec] of cases) {
+    const model = timedModel(kind, type, spec);
+    const graph = canvas(model);
+    assert.deepEqual(graph.getData(), model);
+    const event = graph.nodesLayer.querySelector(kind === 'TimerStart' ? '.bpmn_timer_start' : '.bpmn_timer_catch');
+    assert.ok(event);
+    assert.match(event.querySelector('use').getAttribute('href'), /clock$/);
+    assert.equal(event.querySelectorAll('.fb-port').length, kind === 'TimerStart' ? 1 : 2);
+    if (kind === 'TimerStart') assert.equal(graph.connectNodes('End', 'Start'), false);
+    graph.destroy();
+  }
+  const legacy = emptyProcessModel();
+  assert.equal(Object.hasOwn(canvasToProcess(legacy, processToCanvas(legacy).nodes, processToCanvas(legacy).edges, (edge) => edge.waypoints), 'timerTimezone'), false);
+});
+
+test('timer inspector edits Date, elapsed Duration, finite Cycle and Daily without permitting repeating catch', async () => {
+  const graph = canvas(timedModel()); const config = inspector(graph);
+  const node = graph.nodes[0]; config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="timerSeconds"]'), '86400');
+  assert.deepEqual(node.config.timer, { Duration: { seconds: 86400 } });
+  change(config.root.querySelector('[data-process="timerType"]'), 'Date');
+  await flush(2);
+  change(config.root.querySelector('[data-process="timerAt"]'), '2026-10-03T09:00:00.123+02:00');
+  assert.equal(config.root.querySelector('[data-timer-literal]').textContent, '2026-10-03T09:00:00.123+02:00');
+  assert.deepEqual(node.config.timer, { Date: { at: '2026-10-03T09:00:00.123+02:00' } });
+  change(config.root.querySelector('[data-process="timerType"]'), 'Cycle');
+  await flush(2);
+  assert.equal(config.root.querySelector('[data-process="timerSeconds"]').getAttribute('min'), '300');
+  change(config.root.querySelector('[data-process="timerSeconds"]'), '600');
+  change(config.root.querySelector('[data-process="timerTotal"]'), '3');
+  assert.deepEqual(node.config.timer, { Cycle: { seconds: 600, totalFirings: 3 } });
+  change(config.root.querySelector('[data-process="timerTotal"]'), '');
+  assert.equal(node.config.timer.Cycle.totalFirings, null);
+  change(config.root.querySelector('[data-process="timerType"]'), 'Daily');
+  await flush(2);
+  change(config.root.querySelector('[data-process="timerHour"]'), '14');
+  change(config.root.querySelector('[data-process="timerMinute"]'), '32');
+  assert.deepEqual(node.config.timer, { Daily: { hour: 14, minute: 32, totalFirings: null } });
+  const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
+  assert.ok(readonly.root.querySelector('[data-process="timerType"]').hasAttribute('disabled'));
+  change(readonly.root.querySelector('[data-process="timerHour"]'), '3');
+  assert.equal(node.config.timer.Daily.hour, 14);
+  const catchGraph = canvas(timedModel('TimerCatch')); const catchConfig = inspector(catchGraph);
+  catchConfig.show(catchGraph.nodes[1], catchGraph.templates.get('bpmn_timer_catch'));
+  assert.deepEqual([...catchConfig.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration']);
+  assert.equal(catchConfig.root.querySelector('[data-process="timerTotal"]'), null);
+  graph.destroy(); config.destroy(); readonly.destroy(); catchGraph.destroy(); catchConfig.destroy();
+});
+
+test('process timezone requires an explicit value and actual undo/redo preserves it through save', async () => {
+  const model = timedModel(); delete model.timerTimezone;
+  const state = await mount(definition('timezone', { model }), { processDefinitionSaveRequest: (payload) => ({ definition: definition('timezone', { model: payload.model, draftRevision: 5 }) }) });
+  const field = state.root.querySelector('[data-role="timer-timezone"]');
+  assert.equal(field.hidden, false); assert.equal(field.value, '');
+  assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false, 'no UTC default is fabricated');
+  change(field, 'Europe/Warsaw');
+  assert.equal(state.canvas.getData().timerTimezone, 'Europe/Warsaw');
+  state.canvas.processModel.variables.Current_Key = 'preserved';
+  state.canvas.undo(); assert.equal(field.value, '');
+  assert.equal(state.canvas.getData().variables.Current_Key, 'preserved', 'timezone undo does not revert independently edited variables');
+  state.canvas.redo(); assert.equal(field.value, 'Europe/Warsaw');
+  await builder._save();
+  assert.equal(calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model.timerTimezone, 'Europe/Warsaw');
+  state.canvas.updateProcessTimezone('');
+  assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false);
+});
+
+test('timer publication requires a real arming confirmation and refreshes the authoritative schedule', async () => {
+  const current = definition('timer-publish', { model: timedModel('TimerStart', 'Cycle', { seconds: 300, totalFirings: 3 }) });
+  let published = false; let confirmations = 0;
+  const previousConfirm = TfWindow.confirm;
+  try {
+    const state = await mount(current, {
+      processDefinitionGetRequest: () => ({ definition: { ...current, publishedVersion: published ? 1 : null }, timerStart: published ? savedTimer() : null }),
+      processDefinitionPublishRequest: () => { published = true; return { definition: { ...current, publishedVersion: 1 }, version: { version: 1, model: current.model } }; },
+    });
+    TfWindow.confirm = async (options) => { confirmations += 1; assert.match(options.message, /Europe\/Warsaw/); assert.match(options.message, /arms|automatic/); return false; };
+    await builder._publish();
+    assert.equal(calls.some((call) => call.kind === 'processDefinitionPublishRequest'), false);
+    TfWindow.confirm = async () => true;
+    await builder._publish();
+    assert.equal(confirmations, 1);
+    assert.equal(calls.filter((call) => call.kind === 'processDefinitionPublishRequest').length, 1);
+    assert.equal(calls.filter((call) => call.kind === 'processDefinitionGetRequest').length, 2);
+    assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
+    assert.equal(state.root.querySelector('[data-role="schedule"]').hidden, false);
+    assert.match(state.root.querySelector('[data-role="timer-summary"]').textContent, /Scheduled.*Europe\/Warsaw/);
+    assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
+  } finally { TfWindow.confirm = previousConfirm; }
+});
+
+test('BPMN names retain their full text when saved and in immutable inspection', async () => {
+  const name = `Long process name ${'Process'.repeat(28)}`;
+  const nodeName = `Long timer name ${'Timer'.repeat(40)}`;
+  const current = definition('long-names', { name, model: timedModel() });
+  current.model.nodes[0].name = nodeName;
+  let state = await mount(current, { processDefinitionSaveRequest: { definition: { ...current, draftRevision: 5 } } });
+  const control = state.root.querySelector('[data-role="name"]');
+  assert.equal(control.tagName, 'TF-TEXTAREA');
+  assert.equal(control.querySelector('textarea').value, name);
+  assert.equal(control.querySelector('textarea').getAttribute('aria-label'), I18n.t('flows_builder.name_label'));
+  state.canvas.selectNode('Start');
+  assert.equal(state.root.querySelector('[data-process="name"] textarea').value, nodeName);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest');
+  assert.equal(saved.payload.name, name);
+  assert.equal(saved.payload.model.nodes[0].name, nodeName);
+  state = await mount({ ...current, publishedVersion: 1 }, {
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: { version: { version: 1, model: current.model } },
+  });
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush();
+  state.canvas.selectNode('Start');
+  const immutable = state.root.querySelector('[data-process="name"]');
+  assert.equal(immutable.querySelector('textarea').value, nodeName);
+  assert.equal(immutable.querySelector('textarea').disabled, true);
+  change(immutable, 'Unauthorized rename');
+  assert.equal(state.canvas.getData().nodes[0].name, nodeName);
+});
+
+test('BPMN fit includes the rendered event label without altering stored DI', () => {
+  const graph = canvas(timedModel());
+  const node = graph.nodes[0];
+  const label = graph.nodesLayer.querySelector('[data-node-id="Start"] .fb-process-label');
+  Object.defineProperties(label, {
+    offsetLeft: { value: node.width / 2 }, offsetTop: { value: node.height + 10 },
+    offsetWidth: { value: 200 }, offsetHeight: { value: 400 },
+  });
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 500, height: 400 });
+  const original = graph.getData();
+  const bounds = graph._contentBounds();
+  assert.equal(bounds.minX, node.x + node.width / 2 - 100);
+  assert.equal(bounds.maxY, node.y + node.height + 410);
+  graph.fitToContent();
+  assert.ok(graph.view.y + bounds.maxY * graph.view.zoom <= 400);
+  assert.ok(graph.view.y + bounds.minY * graph.view.zoom >= 0);
+  assert.deepEqual(graph.getData(), original);
+  graph.destroy();
+});
+
+test('BPMN minimap confines its real viewport to the measured map area', async () => {
+  const state = await mount(definition('measured-minimap', { model: timedModel() }));
+  const mini = state.root.querySelector('[data-role="minimap"]');
+  Object.defineProperties(mini, { clientWidth: { value: 118 }, clientHeight: { value: 78 } });
+  state.canvas.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 1500, height: 1200 });
+  state.canvas.view = { x: 0, y: 0, zoom: 1 };
+  builder._renderMinimap();
+  const viewport = mini.querySelector('[data-role="minimap-viewport"]');
+  assert.equal(viewport.hidden, false);
+  assert.ok(parseFloat(viewport.style.left) >= 0);
+  assert.ok(parseFloat(viewport.style.top) >= 18);
+  assert.ok(parseFloat(viewport.style.left) + parseFloat(viewport.style.width) <= 118);
+  assert.ok(parseFloat(viewport.style.top) + parseFloat(viewport.style.height) <= 78);
+});
+
+test('published timer start cannot submit a manual run even with a direct helper call', async () => {
+  const current = definition('timed', { model: timedModel(), publishedVersion: 2 });
+  const state = await mount(current, { processDefinitionGetRequest: { definition: current, timerStart: savedTimer() }, processVersionGetRequest: { version: { version: 2, model: current.model } } });
+  assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
+  await builder._runProcess();
+  assert.equal(document.querySelector('.tf-act-window'), null);
+  assert.match(document.querySelector('[data-timers]').textContent, /Daily approval/);
+  const form = openProcessRun(current, [{ version: 2, model: current.model }]);
+  assert.ok(form.querySelector('[data-act="submit"]').hasAttribute('disabled'));
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
+});
+
+test('schedule reads persisted Pending, Blocked and Missed states and scopes delayed reads to its window', async () => {
+  let actual = savedTimer();
+  fixtures({ processDefinitionGetRequest: () => ({ definition: definition('schedule', { publishedVersion: 2 }), timerStart: actual }) });
+  const win = await openProcessSchedule('schedule');
+  assert.match(win.querySelector('[data-timers]').textContent, /Scheduled.*Europe\/Warsaw/);
+  assert.doesNotMatch(win.textContent, /private-timer-id/);
+  actual = savedTimer({ status: 'Blocked', lastReason: 'Current source access was revoked' }); await poll();
+  assert.match(win.querySelector('[data-timers]').textContent, /Blocked.*Europe\/Warsaw/);
+  assert.match(win.querySelector('[data-timers]').textContent, /Current source access was revoked/);
+  actual = savedTimer({ status: 'Missed', dueAtMs: null }); await poll();
+  assert.match(win.querySelector('[data-timers]').textContent, /Missed.*publish.*No next deadline/);
+  const pending = deferred(); responder = () => pending.promise; const loading = poll();
+  win.remove(); await flush();
+  fixtures({ processDefinitionGetRequest: { definition: definition('other'), timerStart: savedTimer({ nodeName: 'Current other' }) } });
+  const other = await openProcessSchedule('other');
+  pending.resolve({ definition: definition('late'), timerStart: savedTimer({ nodeName: 'Late private data' }) }); await loading;
+  assert.match(other.querySelector('[data-timers]').textContent, /Current other/);
+  assert.doesNotMatch(other.textContent, /Late private data/);
+});
+
+test('schedule renders a long unbroken definition name and untrusted markup as text', async () => {
+  const name = `${'Approval'.repeat(24)}X<img src=x onerror=alert(1)>`;
+  assert.equal(name.length, 221);
+  fixtures({ processDefinitionGetRequest: { definition: definition('long-schedule', { name, publishedVersion: 1 }), timerStart: savedTimer() } });
+  const win = await openProcessSchedule('long-schedule');
+  const summary = win.querySelector('[data-schedule-summary]');
+  assert.ok(summary.textContent.startsWith(name));
+  assert.equal(summary.querySelector('img'), null);
+  assert.equal(win.querySelector('[data-timers]').textContent.includes('Daily approval'), true);
+});
+
+test('schedule and current start localize known timer reasons in five languages without changing arbitrary errors', async () => {
+  const reasons = [
+    ['instance_cancelled', 'event_cancelled'],
+    ['definition_archived', 'timer_reason_definition_archived'],
+    ['missed_during_archive', 'timer_reason_missed_during_archive'],
+    ['finite_schedule_exhausted_during_archive', 'timer_reason_finite_schedule_exhausted_during_archive'],
+    ['superseded_by_publication', 'timer_reason_superseded_by_publication'],
+  ];
+  const markup = '<script>kept as text</script>';
+  const arbitrary = `${'x'.repeat(32768 - markup.length)}${markup}`;
+  assert.equal(new TextEncoder().encode(arbitrary).length, 32768);
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const current = definition(`reason-${language}`, { model: timedModel(), publishedVersion: 1 });
+      const timer = savedTimer({ lastReason: reasons[0][0] });
+      const state = await mount(current, { processDefinitionGetRequest: () => ({ definition: current, timerStart: timer }) });
+      const win = await openProcessSchedule(current.definitionId);
+      for (const [reason, key] of reasons) {
+        timer.lastReason = reason;
+        state.timerStart = timer;
+        builder._syncProcessControls();
+        await poll();
+        const translated = I18n.t(`bpmn.${key}`);
+        assert.notEqual(translated, `bpmn.${key}`);
+        assert.equal(processTimerReasonText(reason), translated);
+        assert.equal(win.querySelector('[data-timers] dd:last-child').textContent, translated);
+        assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(translated));
+        assert.doesNotMatch(win.querySelector('[data-timers]').textContent, new RegExp(reason));
+      }
+      timer.lastReason = arbitrary;
+      state.timerStart = timer;
+      builder._syncProcessControls();
+      await poll();
+      assert.equal(win.querySelector('[data-timers] dd:last-child').textContent, arbitrary);
+      assert.equal(win.querySelector('[data-timers] script'), null);
+      assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(arbitrary));
+      assert.equal(processTimerReasonText(arbitrary), arbitrary);
+      win.dispatchEvent(new Event('closed'));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('instance monitor renders actual Catch deadlines and later cancellation without a client fire control', async () => {
+  const timer = savedTimer({ kind: 'Catch', nodeId: 'Wait', nodeName: '<Saved wait>', totalFirings: null, occurrence: 1 });
+  let current = instance('catch', { activeNodeIds: ['Wait'], timers: [timer] });
+  const win = await monitor(current, { processInstanceGetRequest: () => ({ instance: current }) });
+  assert.equal(win.querySelector('[data-timer-section]').hidden, false);
+  assert.match(win.querySelector('[data-timers]').textContent, /<Saved wait>[\s\S]*Scheduled/);
+  assert.equal(win.querySelector('[data-timers] saved'), null);
+  assert.equal(win.querySelector('[data-fire-timer]'), null);
+  current = { ...current, revision: 12, status: 'Cancelled', timers: [{ ...timer, status: 'Cancelled' }] }; await poll();
+  assert.match(win.querySelector('[data-timers]').textContent, /Cancelled/);
+  assert.equal(calls.some((call) => /Timer(Fire|Complete)/.test(call.kind)), false);
+});
+
+test('timer XML response retains server literals, IANA and business keys when imported and saved', async () => {
+  const imported = timedModel('TimerStart', 'Daily', { hour: 9, minute: 30, totalFirings: 3 });
+  const state = await mount(definition('timer-import'), { processXmlImportRequest: { model: imported, diagnostics: [] }, processDefinitionSaveRequest: (payload) => ({ definition: definition('timer-import', { model: payload.model, draftRevision: 5 }) }) });
+  builder._importProcess(); await flush();
+  const form = document.querySelector('.tf-act-window');
+  form.querySelector('tf-code-editor').value = '<bpmn:definitions/>';
+  form.querySelector('tf-code-editor').dispatchEvent(new Event('input', { bubbles: true }));
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  assert.deepEqual(state.canvas.getData(), imported);
+  assert.equal(state.root.querySelector('[data-role="timer-timezone"]').hidden, false);
+  await builder._save();
+  assert.deepEqual(calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model, imported);
+});
+
+test('all five locales describe actual timer states and events without raw IDs or unexpanded parameters', async () => {
+  const events = [
+    { kind: 'timer_armed', data: { timer_id: 'private-id', due_at_ms: 1000, timezone: 'Europe/Warsaw' } },
+    { kind: 'timer_fired', data: { timer_id: 'private-id', planned_due_at_ms: 1000, fired_at_ms: 2000, skipped_count: 2 } },
+    { kind: 'timer_blocked', data: { timer_id: 'private-id', reason: 'Permission changed', due_at_ms: 1000, next_check_at_ms: 62000 } },
+    { kind: 'timer_cancelled', data: { timer_id: 'private-id', reason: 'instance_cancelled' } },
+    { kind: 'timer_error', data: { timer_id: 'private-id', reason: 'Next deadline exceeds the supported range', due_at_ms: 1000 } },
+  ];
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    for (const status of ['Pending', 'Fired', 'Cancelled', 'Archived', 'Blocked', 'Missed', 'Error']) {
+      assert.doesNotMatch(processTimerText(savedTimer({ status })), /bpmn\.|\{status\}|\{due\}|\{timezone\}/);
+    }
+    for (const event of events) assert.doesNotMatch(processEventText({ ...event, nodeName: 'Saved deadline' }), /bpmn\.|private-id|instance_cancelled|\{node\}|\{message\}|\{retry\}|\{due\}|\{actual\}|\{count\}/);
+  }
+  await I18n.setLanguage('en');
+});
+
+test('terminal timer Error displays its full reason and real incident without offering a service retry', async () => {
+  const reason = 'Daily time has no supported UTC instant in the selected time zone; publication must use a supported time.';
+  const timer = savedTimer({ kind: 'Catch', status: 'Error', nodeName: 'Waiting step', dueAtMs: null, lastReason: reason });
+  const current = instance('timer-error', { status: 'Incident', timers: [timer], incidents: [{ incidentId: 'incident', nodeId: 'Wait', nodeName: 'Waiting step', code: 'TIMER_ERROR', message: reason, jobId: null, canRetry: false }] });
+  const win = await monitor(current);
+  assert.match(win.querySelector('[data-timers]').textContent, /Timer error.*No next deadline/);
+  assert.ok(win.querySelector('[data-timers]').textContent.includes(reason));
+  assert.ok(win.querySelector('[data-incidents]').textContent.includes(reason));
+  assert.equal(win.querySelector('[data-retry]'), null);
+  const actual = definition('start-error', { model: timedModel(), publishedVersion: 4 });
+  const state = await mount(actual, { processDefinitionGetRequest: { definition: actual, timerStart: { ...timer, kind: 'Start' } } });
+  assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(reason));
+  assert.match(state.root.querySelector('[data-role="timer-summary"]').textContent, /Current start.*4.*Timer error/);
+  assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
+});
+
+test('current schedule access denial clears persisted private details and disables its run-list action', async () => {
+  let revoked = false;
+  fixtures({ processDefinitionGetRequest: () => { if (revoked) throw new Error('Current access was revoked'); return { definition: definition('private-schedule'), timerStart: savedTimer() }; } });
+  const win = await openProcessSchedule('private-schedule');
+  assert.equal(win.querySelectorAll('[data-timer-id]').length, 1);
+  revoked = true; await poll();
+  assert.equal(win.querySelectorAll('[data-timer-id]').length, 0);
+  assert.ok(win.querySelector('[data-schedule-instances]').hasAttribute('disabled'));
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /revoked/);
+  revoked = false; await poll();
+  assert.equal(win.querySelectorAll('[data-timer-id]').length, 1);
+  assert.equal(win.querySelector('[data-schedule-instances]').hasAttribute('disabled'), false);
+  assert.equal(win.querySelector('[data-error]').hidden, true);
+});
+
+test('blank required timer numbers block draft save and publication instead of silently scheduling zero', async () => {
+  for (const [type, spec, controlKey, field, valid, invalid] of [
+    ['Daily', { hour: 14, minute: 32, totalFirings: null }, 'timerHour', 'hour', '0', '24'],
+    ['Daily', { hour: 14, minute: 32, totalFirings: null }, 'timerMinute', 'minute', '0', '60'],
+    ['Duration', { seconds: 60 }, 'timerSeconds', 'seconds', '1', '0'],
+    ['Cycle', { seconds: 300, totalFirings: null }, 'timerSeconds', 'seconds', '300', '299'],
+  ]) {
+    const id = `required-${type}-${field}`;
+    const original = definition(id, { model: timedModel('TimerStart', type, spec) });
+    const state = await mount(original, {
+      processDefinitionSaveRequest: (payload) => ({ definition: { ...original, model: payload.model, draftRevision: 5 } }),
+      processDefinitionPublishRequest: () => ({ definition: { ...original, publishedVersion: 1 }, version: { version: 1, model: state.canvas.getData() } }),
+    });
+    state.canvas.selectNode('Start'); await flush(2);
+    const control = state.config.root.querySelector(`[data-process="${controlKey}"]`);
+    change(control, '');
+    const serialized = state.canvas.getData();
+    assert.equal(await builder._save(), false, `A blank ${field} must not save ${JSON.stringify(serialized.nodes[0].kind.TimerStart.timer)}`);
+    assert.equal(serialized.nodes[0].kind.TimerStart.timer[type][field], null);
+    assert.equal(control.value, '');
+    assert.ok(state.canvas.validate().length > 0);
+    await builder._publish();
+    assert.equal(calls.some((call) => call.kind === 'processDefinitionSaveRequest' && call.payload.definitionId === id), false);
+    assert.equal(calls.some((call) => call.kind === 'processDefinitionPublishRequest' && call.payload.definitionId === id), false);
+    for (const value of [invalid, '1.5']) {
+      change(control, value);
+      assert.equal(await builder._save(), false);
+    }
+    change(control, valid);
+    assert.equal(state.canvas.validate().length, 0);
+    const total = state.config.root.querySelector('[data-process="timerTotal"]');
+    if (total) {
+      for (const value of ['0', '4294967296', '1.5']) {
+        change(total, value);
+        assert.equal(await builder._save(), false);
+      }
+      change(total, '');
+      assert.equal(state.canvas.getData().nodes[0].kind.TimerStart.timer[type].totalFirings, null);
+      assert.equal(state.canvas.validate().length, 0);
+    }
+    assert.equal(await builder._save(), true);
+    assert.equal(calls.find((call) => call.kind === 'processDefinitionSaveRequest' && call.payload.definitionId === id).payload.model.nodes[0].kind.TimerStart.timer[type][field], Number(valid));
+  }
 });

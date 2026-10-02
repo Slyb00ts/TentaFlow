@@ -1,4 +1,4 @@
-// ============ File: runtime.rs — durable B1 token transition planning and worker lifetime ============
+// ============ File: runtime.rs — durable process token transitions and worker lifetime ============
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
@@ -8,15 +8,16 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ActivityVerification, ProcessIncident, ProcessInstanceStatus,
-    ProcessModel, ProcessNode, ProcessNodeKind, ProcessUserTask, ProcessUserTaskKind,
-    ProcessUserTaskStatus,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessTimerKind, ProcessTimerStatus,
+    ProcessUserTask, ProcessUserTaskKind, ProcessUserTaskStatus,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::model::{and_pairs, validate_variables, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
-    AndReceipt, ForkFrame, PlannedEvent, ProcessJob, ProcessToken, RuntimePlan, RuntimeSnapshot,
+    AndReceipt, ForkFrame, PlannedEvent, ProcessActor, ProcessJob, ProcessTimer, ProcessToken,
+    RuntimePlan, RuntimeSnapshot,
 };
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -103,7 +104,11 @@ fn patch_variables(
 struct Transition<'a> {
     model: &'a ProcessModel,
     instance_id: &'a str,
+    org_id: &'a str,
     initiator: &'a str,
+    definition_id: &'a str,
+    version: u32,
+    now_ms: i64,
     pairs: HashMap<String, String>,
     tokens: Vec<ProcessToken>,
     jobs: Vec<ProcessJob>,
@@ -117,14 +122,22 @@ impl<'a> Transition<'a> {
     fn new(
         model: &'a ProcessModel,
         instance_id: &'a str,
+        org_id: &'a str,
         initiator: &'a str,
+        definition_id: &'a str,
+        version: u32,
         variables: Value,
+        now_ms: i64,
     ) -> Result<Self> {
         validate_variables(&variables)?;
         Ok(Self {
             model,
             instance_id,
+            org_id,
             initiator,
+            definition_id,
+            version,
+            now_ms,
             pairs: and_pairs(model)?,
             tokens: Vec::new(),
             jobs: Vec::new(),
@@ -135,12 +148,16 @@ impl<'a> Transition<'a> {
         })
     }
 
-    fn from_snapshot(snapshot: &'a RuntimeSnapshot) -> Result<Self> {
+    fn from_snapshot(snapshot: &'a RuntimeSnapshot, now_ms: i64) -> Result<Self> {
         let mut transition = Self::new(
             &snapshot.model,
             &snapshot.instance.instance_id,
+            &snapshot.org_id,
             &snapshot.instance.initiator_user_id,
+            &snapshot.instance.definition_id,
+            snapshot.instance.version,
             snapshot.instance.variables.clone(),
+            now_ms,
         )?;
         transition.tokens = snapshot.tokens.clone();
         transition.jobs = snapshot.jobs.clone();
@@ -238,7 +255,7 @@ impl<'a> Transition<'a> {
             job_id,
             code: code.into(),
             message: message.clone(),
-            at_ms: chrono::Utc::now().timestamp_millis(),
+            at_ms: self.now_ms,
             can_retry: false,
         });
         self.event(
@@ -358,7 +375,7 @@ impl<'a> Transition<'a> {
             let node = self.node(&token.node_id)?.clone();
             let outgoing = self.outgoing(&node.id);
             match node.kind.clone() {
-                ProcessNodeKind::Start => {
+                ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } => {
                     self.consume(&id);
                     self.event("node_completed", Some(node.id.clone()), Value::Null);
                     for edge in outgoing {
@@ -379,6 +396,60 @@ impl<'a> Transition<'a> {
                         assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
                         Value::Null,
                     );
+                }
+                ProcessNodeKind::TimerCatch { timer } => {
+                    let token_id = self.wait(&token, "waiting");
+                    let due = self
+                        .model
+                        .timer_timezone
+                        .as_deref()
+                        .context("process timer timezone is missing")
+                        .and_then(|timezone| {
+                            super::timers::resolve_timer_due(
+                                &timer,
+                                timezone,
+                                ProcessTimerKind::Catch,
+                                self.now_ms,
+                            )
+                        });
+                    match due {
+                        Ok(due_at_ms) => {
+                            let timer = ProcessTimer {
+                                timer_id: Uuid::new_v4().to_string(),
+                                org_id: self.org_id.to_owned(),
+                                definition_id: self.definition_id.to_owned(),
+                                version: self.version,
+                                node_id: node.id.clone(),
+                                kind: ProcessTimerKind::Catch,
+                                instance_id: Some(self.instance_id.to_owned()),
+                                token_id: Some(token_id),
+                                rule: timer,
+                                timezone: self
+                                    .model
+                                    .timer_timezone
+                                    .clone()
+                                    .context("process timer timezone is missing")?,
+                                anchor_at_ms: self.now_ms,
+                                due_at_ms: Some(due_at_ms),
+                                occurrence: 1,
+                                total_firings: Some(1),
+                                revision: 1,
+                                status: ProcessTimerStatus::Pending,
+                                last_reason: None,
+                                next_check_at_ms: due_at_ms,
+                                created_at_ms: self.now_ms,
+                                updated_at_ms: self.now_ms,
+                            };
+                            self.event("timer_armed", Some(node.id), json!({
+                                "timer_id":timer.timer_id,"kind":timer.kind,"due_at_ms":due_at_ms,
+                                "timezone":timer.timezone,"occurrence":1
+                            }));
+                            self.plan.create_timers.push(timer);
+                        }
+                        Err(error) => {
+                            self.incident(&node.id, None, "TIMER_ERROR", error.to_string())
+                        }
+                    }
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
                     match prepare_service_input(&input_mapping, &self.plan.variables) {
@@ -516,18 +587,64 @@ impl<'a> Transition<'a> {
     }
 }
 
+pub enum StartCause {
+    Manual,
+    Timer { timer_id: String, occurrence: u64 },
+}
+
 pub fn plan_start(
     model: &ProcessModel,
     instance_id: &str,
-    initiator: &str,
+    actor: &ProcessActor,
+    definition_id: &str,
+    version: u32,
     variables: Value,
+    cause: StartCause,
+    now_ms: i64,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::new(model, instance_id, initiator, variables)?;
+    let mut transition = Transition::new(
+        model,
+        instance_id,
+        &actor.org_id,
+        &actor.user_id,
+        definition_id,
+        version,
+        variables,
+        now_ms,
+    )?;
     let start = model
         .nodes
         .iter()
-        .find(|node| matches!(node.kind, ProcessNodeKind::Start))
+        .find(|node| {
+            matches!(
+                node.kind,
+                ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+            )
+        })
         .context("process start event missing")?;
+    let facts = match (&start.kind, cause) {
+        (ProcessNodeKind::Start, StartCause::Manual) => json!({"initiator_user_id":actor.user_id}),
+        (
+            ProcessNodeKind::TimerStart { .. },
+            StartCause::Timer {
+                timer_id,
+                occurrence,
+            },
+        ) => {
+            ensure!(
+                Uuid::parse_str(&timer_id).is_ok()
+                    && occurrence > 0
+                    && occurrence <= i64::MAX as u64,
+                "scheduled process start identity is invalid"
+            );
+            json!({"initiator_user_id":actor.user_id,"start_timer_id":timer_id,"start_occurrence":occurrence})
+        }
+        (ProcessNodeKind::TimerStart { .. }, StartCause::Manual) => {
+            anyhow::bail!("a timer-start process cannot be started manually")
+        }
+        _ => anyhow::bail!("timer firing does not match the process start event"),
+    };
+    transition.plan.start_instance_id = Some(instance_id.to_owned());
     transition.create_token(ProcessToken {
         token_id: String::new(),
         node_id: start.id.clone(),
@@ -535,17 +652,13 @@ pub fn plan_start(
         fork_stack: Vec::new(),
         status: "ready".into(),
     });
-    transition.event(
-        "instance_started",
-        None,
-        json!({"initiator_user_id": initiator}),
-    );
+    transition.event("instance_started", None, facts);
     transition.advance()?;
     Ok(transition.finish())
 }
 
-pub fn plan_advance(snapshot: &RuntimeSnapshot) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot)?;
+pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
     transition.advance()?;
     Ok(transition.finish())
 }
@@ -555,9 +668,10 @@ pub fn plan_user_completion(
     task_id: &str,
     outputs: &Value,
     approved: Option<bool>,
+    now_ms: i64,
 ) -> Result<RuntimePlan> {
     validate_output(outputs)?;
-    let mut transition = Transition::from_snapshot(snapshot)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
     let task = snapshot
         .user_tasks
         .iter()
@@ -642,9 +756,10 @@ pub fn plan_job_result(
     snapshot: &RuntimeSnapshot,
     job: &ProcessJob,
     result: &ActivityResult,
+    now_ms: i64,
 ) -> Result<RuntimePlan> {
     validate_output(&result.outputs)?;
-    let mut transition = Transition::from_snapshot(snapshot)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
     let node = transition.node(&job.node_id)?.clone();
     let token = transition
         .tokens
@@ -735,6 +850,46 @@ pub fn plan_job_result(
     Ok(transition.finish())
 }
 
+pub(super) fn plan_timer_catch(
+    snapshot: &RuntimeSnapshot,
+    timer: &ProcessTimer,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    ensure!(
+        timer.kind == ProcessTimerKind::Catch
+            && timer.instance_id.as_deref() == Some(snapshot.instance.instance_id.as_str())
+            && timer.definition_id == snapshot.instance.definition_id
+            && timer.org_id == snapshot.org_id
+            && timer.version == snapshot.instance.version,
+        "catch timer does not match its pinned instance"
+    );
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let token_id = timer
+        .token_id
+        .as_deref()
+        .context("catch timer has no waiting token")?;
+    let token = transition
+        .tokens
+        .iter()
+        .find(|token| {
+            token.token_id == token_id
+                && token.node_id == timer.node_id
+                && token.status == "waiting"
+        })
+        .context("catch timer waiting token is missing")?
+        .clone();
+    ensure!(
+        matches!(&transition.node(&timer.node_id)?.kind, ProcessNodeKind::TimerCatch { timer: rule } if *rule == timer.rule),
+        "catch timer rule does not match its pinned node"
+    );
+    transition.consume(token_id);
+    for edge in transition.outgoing(&timer.node_id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    Ok(transition.finish())
+}
+
 struct RunningJob {
     instance_id: String,
     cancel: CancellationToken,
@@ -812,6 +967,11 @@ impl ProcessRuntime {
         loop {
             if self.stop.is_cancelled() {
                 break;
+            }
+            if let Err(error) =
+                super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis())
+            {
+                tracing::error!(error = %error, "process timer drain failed");
             }
             while jobs.len() < 4 && !self.stop.is_cancelled() {
                 let Some(dispatcher) = self.dispatcher.upgrade() else {
@@ -914,7 +1074,9 @@ pub(crate) mod test_support {
     use crate::config::RouterConfig;
     use crate::db::{self, models::FlowParams};
     use crate::routing::Router;
-    use tentaflow_protocol::processes::{PinnedFlowInfo, ProcessInstance, ProcessSequenceFlow};
+    use tentaflow_protocol::processes::{
+        PinnedFlowInfo, ProcessInstance, ProcessSequenceFlow, ProcessVersion,
+    };
 
     pub struct Fixture {
         pub directory: tempfile::TempDir,
@@ -1103,7 +1265,7 @@ pub(crate) mod test_support {
         .expect("edit actual service graph");
     }
 
-    pub fn start_model(fixture: &Fixture, model: &ProcessModel) -> ProcessInstance {
+    pub fn publish_model(fixture: &Fixture, model: &ProcessModel) -> ProcessVersion {
         let actor = &fixture.owner;
         let definition = super::super::repository::save_definition(
             &fixture.db,
@@ -1145,20 +1307,37 @@ pub(crate) mod test_support {
             definition.draft_revision,
             &snapshots,
         )
-        .expect("publish immutable process");
+        .expect("publish immutable process")
+        .1
+    }
+
+    pub fn start_model(fixture: &Fixture, model: &ProcessModel) -> ProcessInstance {
+        let version = publish_model(fixture, model);
+        let actor = &fixture.owner;
         let id = Uuid::new_v4().to_string();
         let variables = serde_json::to_value(&model.variables).unwrap();
-        let plan = super::plan_start(model, &id, &actor.user_id, variables.clone())
-            .expect("plan actual start");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let plan = super::plan_start(
+            model,
+            &id,
+            actor,
+            &version.definition_id,
+            version.version,
+            variables.clone(),
+            StartCause::Manual,
+            at_ms,
+        )
+        .expect("plan actual start");
         super::super::repository::start_instance(
             &fixture.db,
             actor,
             &stamp("start"),
             &id,
-            &definition.definition_id,
-            1,
+            &version.definition_id,
+            version.version,
             &variables,
             &plan,
+            at_ms,
         )
         .expect("commit process start")
     }
@@ -1192,6 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_wait_survives_reopen_and_completion_is_idempotent() {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let waiting = start_model(&fixture, &user_model(Some(&fixture.participant.user_id)));
         assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
@@ -1219,7 +1399,7 @@ mod tests {
         assert!(snapshot.instance.user_tasks[0].can_complete);
         assert!(!snapshot.instance.can_cancel);
         let output = json!({"answer":"reviewed"});
-        let plan = plan_user_completion(&snapshot, &task_id, &output, None).unwrap();
+        let plan = plan_user_completion(&snapshot, &task_id, &output, None, at_ms).unwrap();
         let completion = stamp("complete evidence");
         let completed = repository::complete_user_task(
             &reopened,
@@ -1231,6 +1411,7 @@ mod tests {
             &output,
             None,
             &plan,
+            at_ms,
         )
         .unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -1248,6 +1429,7 @@ mod tests {
             &output,
             None,
             &plan,
+            at_ms,
         )
         .unwrap();
         assert_eq!(replay.instance_id, completed.instance_id);
@@ -1270,7 +1452,8 @@ mod tests {
             waiting.revision,
             &output,
             None,
-            &plan
+            &plan,
+            at_ms
         )
         .is_err());
         assert_eq!(
@@ -1286,6 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_join_retains_activation_across_reopen_and_advances_once() {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let mut model = super::super::model::starter_model();
         model.nodes.splice(
@@ -1337,7 +1521,8 @@ mod tests {
         let snapshot =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id)
                 .unwrap();
-        let plan = plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None).unwrap();
+        let plan =
+            plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None, at_ms).unwrap();
         let partial = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
@@ -1348,6 +1533,7 @@ mod tests {
             &Value::Null,
             None,
             &plan,
+            at_ms,
         )
         .unwrap();
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
@@ -1373,8 +1559,14 @@ mod tests {
             .iter()
             .find(|task| task.node_id == "Right" && task.status == ProcessUserTaskStatus::Open)
             .unwrap();
-        let plan = plan_user_completion(&snapshot, &right.user_task_id, &json!(["checked"]), None)
-            .unwrap();
+        let plan = plan_user_completion(
+            &snapshot,
+            &right.user_task_id,
+            &json!(["checked"]),
+            None,
+            at_ms,
+        )
+        .unwrap();
         let completion = stamp("right done");
         let completed = repository::complete_user_task(
             &reopened,
@@ -1386,6 +1578,7 @@ mod tests {
             &json!(["checked"]),
             None,
             &plan,
+            at_ms,
         )
         .unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -1399,6 +1592,7 @@ mod tests {
             &json!(["checked"]),
             None,
             &plan,
+            at_ms,
         )
         .unwrap();
         let snapshot =

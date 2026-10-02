@@ -67,6 +67,65 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
   assert.equal(Object.hasOwn(body.model.nodes[1].kind.ServiceTask, 'timeout_seconds'), false);
 });
 
+test('timer model wire preserves each typed rule and opaque variables', { skip }, () => {
+  for (const timer of [
+    { Date: { at: '2027-01-02T03:04:05+01:00' } },
+    { Duration: { seconds: 90061 } },
+    { Cycle: { seconds: 300, totalFirings: 3 } },
+    { Daily: { hour: 9, minute: 15, totalFirings: null } },
+  ]) {
+    const model = {
+      schemaVersion: 1, processId: 'Timed_1', timerTimezone: 'Europe/Warsaw',
+      nodes: [
+        { id: 'Start_1', name: 'Start', kind: { TimerStart: { timer } } },
+        { id: 'End_1', name: 'End', kind: 'End' },
+      ],
+      sequenceFlows: [{ id: 'Flow_1', sourceId: 'Start_1', targetId: 'End_1', condition: null }],
+      variables: { threshold_value: { nested_key: 'Łódź & <ok>' } },
+      diagram: { shapes: [], edges: [] },
+    };
+    const body = request('processDefinitionSaveRequest', {
+      commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
+      expectedRevision: 0, name: 'Timed', description: '', model,
+    });
+    assert.equal(body.model.timerTimezone, 'Europe/Warsaw');
+    assert.deepEqual(body.model.variables, model.variables);
+    assert.deepEqual(body.model.nodes[0].kind.TimerStart.timer, timer);
+  }
+  assert.throws(() => codec.encode.processDefinitionSaveRequest(17, {
+    commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
+    expectedRevision: 0, name: 'Bad', description: '',
+    model: { schemaVersion: 1, processId: 'P_1', nodes: [{ id: 'Start_1', name: '', kind: { TimerStart: { timer: { Daily: { hour: 9, minute: 0, extra: true } } } } }],
+      sequenceFlows: [], variables: {}, diagram: { shapes: [], edges: [] }, timerTimezone: 'UTC' },
+  }), /unsupported timer rule/);
+});
+
+test('timer status Error and schedule fields decode to canonical camel keys', { skip }, () => {
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    DefinitionGetResponse: { definition: {
+      definition_id: 'd1', name: 'Morning', description: '', owner_user_id: 'u1',
+      draft_revision: 1, published_version: 1, archived: false,
+      model: { schema_version: 1, process_id: 'P_1', timer_timezone: 'Europe/Warsaw',
+        nodes: [
+          { id: 'Start_1', name: 'Morning', kind: { TimerStart: { timer: { Duration: { seconds: 1 } } } } },
+          { id: 'End_1', name: 'End', kind: 'End' },
+        ],
+        sequence_flows: [{ id: 'Flow_1', source_id: 'Start_1', target_id: 'End_1', condition: null }],
+        variables: {}, diagram: { shapes: [], edges: [] },
+      },
+    }, timer_start: {
+      timer_id: 't1', node_id: 'Start_1', node_name: 'Morning', kind: 'Start',
+      status: 'Error', due_at_ms: 1, timezone: 'Europe/Warsaw', occurrence: 3,
+      total_firings: 3, last_reason: 'calendar horizon exceeded',
+    } },
+  } })));
+  assert.equal(decoded.variant, 'ProcessDefinitionGetResponse');
+  assert.equal(decoded.timerStart.status, 'Error');
+  assert.equal(decoded.timerStart.totalFirings, 3);
+  assert.equal(decoded.timerStart.lastReason, 'calendar horizon exceeded');
+  assert.equal(Object.hasOwn(decoded.timerStart, 'total_firings'), false);
+});
+
 test('paged list request and response use canonical camel keys only', { skip }, () => {
   const requestBody = request('processDefinitionListRequest', { offset: 10, limit: 25 });
   assert.equal(requestBody.variant, 'ProcessDefinitionListRequest');

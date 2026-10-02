@@ -99,7 +99,7 @@ function markUnsupported(node, ports, side) {
 
 function portsForNode(node, template) {
   if (node.type.startsWith('bpmn_')) {
-    return { inputs: node.type === 'bpmn_start' ? [] : [{ name: 'in', type: 'any' }],
+    return { inputs: ['bpmn_start', 'bpmn_timer_start'].includes(node.type) ? [] : [{ name: 'in', type: 'any' }],
       outputs: node.type === 'bpmn_end' ? [] : [{ name: 'full', type: 'any' }] };
   }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
@@ -427,7 +427,23 @@ export class FlowCanvas {
   // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
   // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
   validate() {
-    if (this.mode === 'bpmn') return [];
+    if (this.mode === 'bpmn') {
+      const errors = [];
+      for (const node of this.nodes) {
+        if (!['bpmn_timer_start', 'bpmn_timer_catch'].includes(node.type)) continue;
+        const [kind, timer] = Object.entries(node.config.timer)[0];
+        const fields = kind === 'Daily'
+          ? [['hour', 'timer_hour', 0, 23], ['minute', 'timer_minute', 0, 59]]
+          : ['Duration', 'Cycle'].includes(kind) ? [['seconds', 'timer_seconds', kind === 'Cycle' ? 300 : 1, 31536000]] : [];
+        if (['Cycle', 'Daily'].includes(kind) && timer.totalFirings != null) fields.push(['totalFirings', 'timer_total', 1, 4294967295]);
+        for (const [field, label, min, max] of fields) {
+          if (!Number.isInteger(timer[field]) || timer[field] < min || timer[field] > max) {
+            errors.push(I18n.t('bpmn.timer_number_invalid', { node: node.label || node.id, field: I18n.t(`bpmn.${label}`), min, max }));
+          }
+        }
+      }
+      return errors;
+    }
     this._normalizeEdgePorts();
     const errors = [];
     const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
@@ -587,7 +603,8 @@ export class FlowCanvas {
     // JSON round-trip — szybszy binary copy + zachowuje typy Date/Map jesli
     // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
     this.history = this.history.slice(0, this.historyIndex + 1);
-    this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges }));
+    this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
+      ...(this.mode === 'bpmn' ? { timerTimezone: this.processModel.timerTimezone ?? null } : {}) }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -599,6 +616,10 @@ export class FlowCanvas {
     const snap = structuredClone(this.history[this.historyIndex]);
     this.nodes = snap.nodes;
     this.edges = snap.edges;
+    if (this.mode === 'bpmn') {
+      if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
+      else this.processModel.timerTimezone = snap.timerTimezone;
+    }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
     this.render();
@@ -612,6 +633,10 @@ export class FlowCanvas {
     const snap = structuredClone(this.history[this.historyIndex]);
     this.nodes = snap.nodes;
     this.edges = snap.edges;
+    if (this.mode === 'bpmn') {
+      if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
+      else this.processModel.timerTimezone = snap.timerTimezone;
+    }
     this.render();
     this.onChange();
   }
@@ -619,6 +644,14 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   // CRUD nody / krawędzie
   // -------------------------------------------------------------------------
+  updateProcessTimezone(value) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    if (value === '') delete this.processModel.timerTimezone;
+    else this.processModel.timerTimezone = value;
+    this._pushHistory();
+    this.onChange();
+  }
+
   addNodeFromTemplate(tpl, clientX, clientY) {
     if (this.readOnly) return;
     const pt = this._clientToWorld(clientX, clientY);
@@ -862,7 +895,7 @@ export class FlowCanvas {
     const source = this.nodes.find((node) => node.id === sourceId);
     const target = this.nodes.find((node) => node.id === targetId);
     if (!source || !target) return false;
-    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || target.type === 'bpmn_start')) return false;
+    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || ['bpmn_start', 'bpmn_timer_start'].includes(target.type))) return false;
     if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
     const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
     if (this.mode === 'bpmn') edge.condition = null;
@@ -998,13 +1031,13 @@ export class FlowCanvas {
       div.style.width = `${n.width}px`;
       div.style.height = `${n.height}px`;
       const title = n.label || tmpl.label;
-      const event = n.type === 'bpmn_start' || n.type === 'bpmn_end';
+      const event = ['bpmn_start', 'bpmn_end', 'bpmn_timer_start', 'bpmn_timer_catch'].includes(n.type);
       const gateway = n.type.endsWith('_gateway');
       div.innerHTML = `
         <div class="fb-process-symbol"><svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}</div>
         ${event || gateway ? `<div class="fb-process-label">${escapeHtml(title)}</div>` : ''}
-        ${n.type === 'bpmn_start' ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
+        ${['bpmn_start', 'bpmn_timer_start'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
         ${n.type === 'bpmn_end' ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
       div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
       div.setAttribute('aria-label', title);
@@ -1286,7 +1319,16 @@ export class FlowCanvas {
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x + (this.mode === 'bpmn' ? n.width : NODE_WIDTH));
-      maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height + 64 : NODE_H_APPROX));
+      maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height : NODE_H_APPROX));
+      if (this.mode === 'bpmn') {
+        const label = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(n.id)}"] .fb-process-label`);
+        if (label) {
+          const left = n.x + label.offsetLeft - label.offsetWidth / 2;
+          minX = Math.min(minX, left);
+          maxX = Math.max(maxX, left + label.offsetWidth);
+          maxY = Math.max(maxY, n.y + label.offsetTop + label.offsetHeight);
+        }
+      }
     }
     return { minX, minY, maxX, maxY };
   }

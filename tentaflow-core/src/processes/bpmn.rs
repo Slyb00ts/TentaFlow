@@ -9,9 +9,10 @@ use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
     ProcessNode, ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape,
+    ProcessTimerSpec,
 };
 
-use super::model::{validate_model, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
+use super::model::{validate_model, validate_timer_spec, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
 
 const BPMN: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
 const BPMNDI: &str = "http://www.omg.org/spec/BPMN/20100524/DI";
@@ -247,15 +248,22 @@ fn mapping(parent: &Element, name: &str) -> Result<BTreeMap<String, String>> {
     }
 }
 
-fn process_variables(
+fn process_configuration(
     process: &Element,
     process_id: &str,
-) -> Result<BTreeMap<String, serde_json::Value>> {
+) -> Result<(BTreeMap<String, serde_json::Value>, Option<String>)> {
     let Some(extension) = process.child(BPMN, "extensionElements")? else {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), None));
     };
     extension.attrs_only(&[])?;
-    extension.children_only(&[(TF, "variables")])?;
+    extension.children_only(&[(TF, "variables"), (TF, "timerTimezone")])?;
+    let timer_timezone = extension.child(TF, "timerTimezone")?
+        .map(|element| {
+            element.attrs_only(&[])?;
+            ensure!(element.children.is_empty(), "timerTimezone must be text at byte {}", element.offset);
+            ensure!(!element.text.is_empty(), "timerTimezone is empty at byte {}", element.offset);
+            Ok(element.text.clone())
+        }).transpose()?;
     let variables = extension
         .child(TF, "variables")?
         .context("process extension requires TentaFlow variables")?;
@@ -279,17 +287,108 @@ fn process_variables(
     let value: serde_json::Value =
         serde_json::from_str(variables.text.trim()).map_err(|error| invalid(error.to_string()))?;
     validate_variables(&value).map_err(|error| invalid(error.to_string()))?;
-    serde_json::from_value(value).map_err(|error| invalid(error.to_string()).into())
+    let variables = serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
+    Ok((variables, timer_timezone))
+}
+
+fn timer_spec(element: &Element, node_id: &str) -> Result<ProcessTimerSpec> {
+    let timer = element.child(BPMN, "timerEventDefinition")?
+        .context("timer event requires timerEventDefinition")?;
+    timer.attrs_only(&[])?;
+    timer.children_only(&[(BPMN, "timeDate"), (BPMN, "timeDuration"), (BPMN, "timeCycle"), (BPMN, "extensionElements")])?;
+    ensure!(timer.children.len() == 1, "timer event {node_id} requires exactly one timer rule at byte {}", timer.offset);
+    let rule = &timer.children[0];
+    let invalid = |reason: String| XmlElementError {
+        message: format!("invalid timer rule at byte {}: {reason}", rule.offset),
+        element_id: Some(node_id.to_string()), offset: rule.offset,
+    };
+    if rule.is(BPMN, "extensionElements") {
+        rule.attrs_only(&[])?;
+        rule.children_only(&[(TF, "dailyTimer")])?;
+        ensure!(rule.children.len() == 1, "timer extension requires one dailyTimer at byte {}", rule.offset);
+        let daily = rule.child(TF, "dailyTimer")?.context("dailyTimer is required")?;
+        daily.attrs_only(&["hour", "minute", "totalFirings"])?;
+        ensure!(daily.children.is_empty() && daily.text.trim().is_empty(), "dailyTimer must have only attributes at byte {}", daily.offset);
+        return Ok(ProcessTimerSpec::Daily {
+            hour: daily.required("hour")?.parse().map_err(|error| invalid(format!("invalid hour: {error}")))?,
+            minute: daily.required("minute")?.parse().map_err(|error| invalid(format!("invalid minute: {error}")))?,
+            total_firings: daily.attr("totalFirings").map(|count| count.parse().map_err(|error| invalid(format!("invalid count: {error}")))).transpose()?,
+        });
+    }
+    rule.attrs_only(&[])?;
+    ensure!(rule.children.is_empty(), "timer rule must be text at byte {}", rule.offset);
+    let value = rule.text.trim();
+    if rule.is(BPMN, "timeDate") {
+        return Ok(ProcessTimerSpec::Date { at: value.to_string() });
+    }
+    let parse_seconds = |value: &str| -> Result<u32> {
+        let profile = value.strip_prefix('P').ok_or_else(|| invalid("duration must begin with P".into()))?;
+        let (days, time) = if let Some((days, time)) = profile.split_once('T') { (days, Some(time)) } else { (profile, None) };
+        let mut seconds = 0_u64;
+        let mut found = false;
+        if !days.is_empty() {
+            let day = days.strip_suffix('D').ok_or_else(|| invalid("unsupported duration day component".into()))?;
+            ensure!(!day.is_empty() && day.bytes().all(|byte| byte.is_ascii_digit()), "duration days must be an integer");
+            seconds = day.parse::<u64>()?.checked_mul(86_400).context("duration exceeds supported range")?;
+            found = true;
+        }
+        if let Some(mut rest) = time {
+            ensure!(!rest.is_empty(), "duration T must have time components");
+            for (suffix, multiplier) in [('H', 3600_u64), ('M', 60), ('S', 1)] {
+                if let Some(index) = rest.find(suffix) {
+                    let amount = &rest[..index];
+                    ensure!(!amount.is_empty() && amount.bytes().all(|byte| byte.is_ascii_digit()), "duration components must be integers in D/H/M/S order");
+                    seconds = seconds.checked_add(amount.parse::<u64>()?.checked_mul(multiplier).context("duration exceeds supported range")?).context("duration exceeds supported range")?;
+                    rest = &rest[index + 1..];
+                    found = true;
+                }
+            }
+            ensure!(rest.is_empty(), "unsupported duration component");
+        }
+        ensure!(found, "duration must contain a D/H/M/S component");
+        u32::try_from(seconds).map_err(|error| invalid(format!("duration exceeds supported range: {error}")).into())
+    };
+    if rule.is(BPMN, "timeDuration") {
+        return Ok(ProcessTimerSpec::Duration { seconds: parse_seconds(value)? });
+    }
+    let (repetition, duration) = value.split_once('/').ok_or_else(|| invalid("supported cycle profile is R[n]/PT{seconds}S".into()))?;
+    ensure!(repetition.starts_with('R'), "timer cycle must start with R at byte {}", rule.offset);
+    let count = &repetition[1..];
+    let total_firings = if count.is_empty() { None } else {
+        ensure!(count.bytes().all(|byte| byte.is_ascii_digit()), "timer cycle count must be an integer");
+        Some(count.parse().map_err(|error| invalid(format!("invalid count: {error}")))?)
+    };
+    let seconds = duration.strip_prefix("PT").and_then(|value| value.strip_suffix('S'))
+        .ok_or_else(|| invalid("supported cycle profile is R[n]/PT{seconds}S".into()))?;
+    ensure!(!seconds.is_empty() && seconds.bytes().all(|byte| byte.is_ascii_digit()),
+        "timer cycle requires integer seconds at byte {}", rule.offset);
+    Ok(ProcessTimerSpec::Cycle {
+        seconds: seconds.parse().map_err(|error| invalid(format!("invalid cycle seconds: {error}")))?,
+        total_firings,
+    })
 }
 
 fn node_from_xml(element: &Element) -> Result<ProcessNode> {
     let id = element.required("id")?;
     let name = element.attr("name").unwrap_or_default().to_string();
+    let parsed_timer = || timer_spec(element, &id).map_err(|error| {
+        if error.downcast_ref::<XmlElementError>().is_some() { error }
+        else { XmlElementError {
+            message: format!("invalid timer rule at byte {}: {error}", element.offset),
+            element_id: Some(id.clone()), offset: element.offset,
+        }.into() }
+    });
     let kind = match element.local.as_str() {
         "startEvent" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[])?;
-            ProcessNodeKind::Start
+            element.children_only(&[(BPMN, "timerEventDefinition")])?;
+            if element.children.is_empty() { ProcessNodeKind::Start }
+            else { ProcessNodeKind::TimerStart { timer: parsed_timer()? } }
+        }
+        "intermediateCatchEvent" => {
+            element.attrs_only(&["id", "name"])?;
+            element.children_only(&[(BPMN, "timerEventDefinition")])?;
+            ProcessNodeKind::TimerCatch { timer: parsed_timer()? }
         }
         "endEvent" => {
             element.attrs_only(&["id", "name"])?;
@@ -400,6 +499,16 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
         }
         other => bail!("unsupported BPMN node {other} at byte {}", element.offset),
     };
+    match &kind {
+        ProcessNodeKind::TimerStart { timer } | ProcessNodeKind::TimerCatch { timer } => {
+            validate_timer_spec(timer, matches!(&kind, ProcessNodeKind::TimerStart { .. }))
+                .map_err(|error| XmlElementError {
+                    message: format!("invalid timer rule at byte {}: {error}", element.offset),
+                    element_id: Some(id.clone()), offset: element.offset,
+                })?;
+        }
+        _ => {}
+    }
     Ok(ProcessNode { id, name, kind })
 }
 
@@ -483,6 +592,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
     process.children_only(&[
         (BPMN, "extensionElements"),
         (BPMN, "startEvent"),
+        (BPMN, "intermediateCatchEvent"),
         (BPMN, "endEvent"),
         (BPMN, "userTask"),
         (BPMN, "serviceTask"),
@@ -491,7 +601,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         (BPMN, "sequenceFlow"),
     ])?;
     let process_id = process.required("id")?;
-    let variables = process_variables(process, &process_id)?;
+    let (variables, timer_timezone) = process_configuration(process, &process_id)?;
     let mut nodes = Vec::new();
     let mut sequence_flows = Vec::new();
     for child in &process.children {
@@ -532,6 +642,17 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
             nodes.push(node_from_xml(child)?);
         }
     }
+    if timer_timezone.is_none() {
+        if let Some(node) = nodes.iter().find(|node| matches!(&node.kind,
+            ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::TimerCatch { .. })) {
+            let offset = process.children.iter().find(|child| child.attr("id") == Some(node.id.as_str()))
+                .map_or(process.offset, |child| child.offset);
+            return Err(XmlElementError {
+                message: format!("timed process requires timerTimezone at byte {offset}"),
+                element_id: Some(node.id.clone()), offset,
+            }.into());
+        }
+    }
     let diagrams: Vec<_> = root
         .children
         .iter()
@@ -550,6 +671,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         sequence_flows,
         variables,
         diagram,
+        timer_timezone,
     };
     validate_model(&model)?;
     Ok(model)
@@ -582,12 +704,18 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     validate_model(model)?;
     let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\" targetNamespace=\"{TF}\"><bpmn:process id=\"{}\" isExecutable=\"true\">",escaped(&model.process_id));
     xml.push_str(&format!(
-        "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables></bpmn:extensionElements>",
+        "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables>",
         escaped(&serde_json::to_string(&model.variables)?)
     ));
+    if let Some(timezone) = &model.timer_timezone {
+        xml.push_str(&format!("<tentaflow:timerTimezone>{}</tentaflow:timerTimezone>", escaped(timezone)));
+    }
+    xml.push_str("</bpmn:extensionElements>");
     for node in &model.nodes {
         let (tag, extra) = match &node.kind {
             ProcessNodeKind::Start => ("startEvent", String::new()),
+            ProcessNodeKind::TimerStart { .. } => ("startEvent", String::new()),
+            ProcessNodeKind::TimerCatch { .. } => ("intermediateCatchEvent", String::new()),
             ProcessNodeKind::End => ("endEvent", String::new()),
             ProcessNodeKind::ParallelGateway => ("parallelGateway", String::new()),
             ProcessNodeKind::ExclusiveGateway { default_flow_id } => (
@@ -606,6 +734,21 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
             escaped(&node.name)
         ));
         match &node.kind {
+            ProcessNodeKind::TimerStart { timer } | ProcessNodeKind::TimerCatch { timer } => {
+                let rule = match timer {
+                    ProcessTimerSpec::Date { at } => format!("<bpmn:timeDate>{}</bpmn:timeDate>", escaped(at)),
+                    ProcessTimerSpec::Duration { seconds } => format!("<bpmn:timeDuration>PT{seconds}S</bpmn:timeDuration>"),
+                    ProcessTimerSpec::Cycle { seconds, total_firings } => format!(
+                        "<bpmn:timeCycle>R{}/PT{seconds}S</bpmn:timeCycle>",
+                        total_firings.map(|count| count.to_string()).unwrap_or_default()
+                    ),
+                    ProcessTimerSpec::Daily { hour, minute, total_firings } => format!(
+                        "<bpmn:extensionElements><tentaflow:dailyTimer hour=\"{hour}\" minute=\"{minute}\"{} /></bpmn:extensionElements>",
+                        total_firings.map(|count| format!(" totalFirings=\"{count}\"")).unwrap_or_default()
+                    ),
+                };
+                xml.push_str(&format!("><bpmn:timerEventDefinition>{rule}</bpmn:timerEventDefinition></bpmn:{tag}>"));
+            }
             ProcessNodeKind::UserTask {
                 assignee_user_id,
                 output_mapping,
@@ -711,6 +854,59 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_xml_round_trip_preserves_rules_timezone_and_di() {
+        let cases = [
+            ProcessTimerSpec::Date { at: "2027-01-02T03:04:05+01:00".into() },
+            ProcessTimerSpec::Duration { seconds: 90_061 },
+            ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(3) },
+            ProcessTimerSpec::Daily { hour: 9, minute: 15, total_firings: None },
+        ];
+        for (index, rule) in cases.into_iter().enumerate() {
+            let mut model = super::super::model::starter_model();
+            model.timer_timezone = Some("Europe/Warsaw".into());
+            model.variables.insert("threshold_value".into(), serde_json::json!({"nested_key": "Łódź & <ok>"}));
+            model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: rule.clone() };
+            model.diagram.shapes.push(ProcessShape { element_id: "Start_1".into(), x: 12.0, y: 18.0, width: 36.0, height: 36.0 });
+            if index < 2 {
+                model.nodes.push(ProcessNode { id: "Wait_1".into(), name: "Wait & resume".into(), kind: ProcessNodeKind::TimerCatch { timer: rule } });
+                model.sequence_flows[0].target_id = "Wait_1".into();
+                model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(), source_id: "Wait_1".into(), target_id: "End_1".into(), condition: None });
+            }
+            let xml = export_xml(&model).unwrap();
+            let (parsed, diagnostics) = import_xml(&xml);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(parsed, Some(model));
+            if index == 1 {
+                let expanded = xml.replace("PT90061S", "P1DT1H1M1S");
+                let (expanded_model, diagnostics) = import_xml(&expanded);
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert_eq!(export_xml(&expanded_model.unwrap()).unwrap(), xml);
+            }
+        }
+    }
+
+    #[test]
+    fn timer_xml_rejects_unsupported_profiles_duplicates_and_missing_timezone() {
+        let mut model = super::super::model::starter_model();
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(3) } };
+        let xml = export_xml(&model).unwrap();
+        for invalid in [
+            xml.replace("R3/PT300S", "R3/P1M"),
+            xml.replace("R3/PT300S", "R3/P1D"),
+            xml.replace("R3/PT300S", "R3/PT5M"),
+            xml.replace("R3/PT300S", "R3/PT0.5S"),
+            xml.replace("</bpmn:timerEventDefinition>", "<bpmn:timeDate>2027-01-01T00:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition>"),
+            xml.replace("</tentaflow:timerTimezone>", "</tentaflow:timerTimezone><tentaflow:timerTimezone>UTC</tentaflow:timerTimezone>"),
+            xml.replace("<tentaflow:timerTimezone>Europe/Warsaw</tentaflow:timerTimezone>", ""),
+        ] {
+            let (parsed, diagnostics) = import_xml(&invalid);
+            assert!(parsed.is_none());
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal && diagnostic.offset.is_some()), "{diagnostics:?}");
+        }
+    }
 
     #[test]
     fn supported_xml_round_trip_preserves_ids_and_di() {

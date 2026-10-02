@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessModel {
     pub schema_version: u32,
     pub process_id: String,
@@ -13,6 +14,8 @@ pub struct ProcessModel {
     pub sequence_flows: Vec<ProcessSequenceFlow>,
     pub variables: BTreeMap<String, Value>,
     pub diagram: ProcessDiagram,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +44,59 @@ pub enum ProcessNodeKind {
         default_flow_id: Option<String>,
     },
     ParallelGateway,
+    TimerStart {
+        timer: ProcessTimerSpec,
+    },
+    TimerCatch {
+        timer: ProcessTimerSpec,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessTimerSpec {
+    Date { at: String },
+    Duration { seconds: u32 },
+    Cycle {
+        seconds: u32,
+        total_firings: Option<u32>,
+    },
+    Daily {
+        hour: u8,
+        minute: u8,
+        total_firings: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessTimerKind {
+    Start,
+    Catch,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessTimerStatus {
+    Pending,
+    Fired,
+    Cancelled,
+    Archived,
+    Blocked,
+    Missed,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessTimerSummary {
+    pub timer_id: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub kind: ProcessTimerKind,
+    pub status: ProcessTimerStatus,
+    pub due_at_ms: Option<i64>,
+    pub timezone: String,
+    pub occurrence: u64,
+    pub total_firings: Option<u32>,
+    pub last_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -255,6 +311,8 @@ pub struct ProcessInstance {
     pub updated_at_ms: i64,
     pub can_cancel: bool,
     pub can_retry: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timers: Vec<ProcessTimerSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -361,6 +419,8 @@ pub enum ProcessPayload {
     },
     DefinitionGetResponse {
         definition: ProcessDefinition,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_start: Option<ProcessTimerSummary>,
     },
     DefinitionSaveRequest {
         command_id: String,
@@ -499,6 +559,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timer_rules_round_trip_and_timerless_model_omits_new_fields() {
+        let timerless = ProcessModel {
+            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
+            sequence_flows: Vec::new(), variables: BTreeMap::new(),
+            diagram: ProcessDiagram::default(), timer_timezone: None,
+        };
+        let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
+        assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
+        assert_eq!(serde_json::to_string(&timerless).unwrap(),
+            "{\"schema_version\":1,\"process_id\":\"P_1\",\"nodes\":[],\"sequence_flows\":[],\"variables\":{},\"diagram\":{\"shapes\":[],\"edges\":[]}}");
+        for (kind, timer) in [
+            ("TimerStart", ProcessTimerSpec::Date { at: "2027-01-02T03:04:05+01:00".into() }),
+            ("TimerCatch", ProcessTimerSpec::Duration { seconds: 90_061 }),
+            ("TimerStart", ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(3) }),
+            ("TimerStart", ProcessTimerSpec::Daily { hour: 9, minute: 15, total_firings: None }),
+        ] {
+            let node_kind = if kind == "TimerCatch" { ProcessNodeKind::TimerCatch { timer } } else { ProcessNodeKind::TimerStart { timer } };
+            let mut model = timerless.clone();
+            model.timer_timezone = Some("Europe/Warsaw".into());
+            model.nodes.push(ProcessNode { id: "Start_1".into(), name: "Start".into(), kind: node_kind });
+            let bytes = crate::cbor::encode(&model).unwrap();
+            let decoded: ProcessModel = crate::cbor::decode(&bytes).unwrap();
+            assert_eq!(decoded, model);
+        }
+        assert!(serde_json::from_value::<ProcessTimerSpec>(serde_json::json!({"Cycle":{"seconds":300,"total_firings":3,"unknown":true}})).is_err());
+        assert!(serde_json::from_value::<ProcessModel>(serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]},"timer_timezone":null,"unknown":true})).is_err());
+    }
+
+    #[test]
     fn process_payload_round_trip_preserves_nested_model_and_tag() {
         let payload = ProcessPayload::DefinitionSaveRequest {
             command_id: "77b1c94f-6f69-4b71-a344-97caa34cb2c0".into(),
@@ -517,6 +606,7 @@ mod tests {
                 sequence_flows: Vec::new(),
                 variables: BTreeMap::new(),
                 diagram: ProcessDiagram::default(),
+                timer_timezone: None,
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();

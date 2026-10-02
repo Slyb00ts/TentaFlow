@@ -16,10 +16,11 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processCommand, processEditorLabels } from '/js/modules/flows-builder/bpmn.js';
-import { openProcessInstances, openProcessRun, openProcessVariables } from '/js/modules/flows-builder/process-monitor.js';
+import { checkProcessDocument, processCommand, processEditorLabels, processHasTimerStart } from '/js/modules/flows-builder/bpmn.js';
+import { openProcessInstances, openProcessRun, openProcessSchedule, openProcessVariables, processTimerReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
@@ -39,7 +40,7 @@ const FlowBuilderScreen = {
         <header class="fb-topbar">
           <tf-button variant="ghost" size="sm" data-role="back" title="${escapeAttr(I18n.t('flows_builder.back_title'))}"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('flows_builder.back'))}</tf-button>
           <div class="fb-topbar-separator"></div>
-          <tf-input class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}"></tf-input>
+          <${process ? 'tf-textarea autogrow rows="1"' : 'tf-input'} class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}"></${process ? 'tf-textarea' : 'tf-input'}>
           <tf-select class="fb-status-select" data-role="status" ${process ? 'hidden' : ''} aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
             <option value="draft">${escapeHtml(I18n.t('flows_builder.status_draft'))}</option>
             <option value="active">${escapeHtml(I18n.t('flows_builder.status_active'))}</option>
@@ -63,11 +64,12 @@ const FlowBuilderScreen = {
           <tf-button variant="ghost" size="sm" icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
           <tf-button variant="secondary" size="sm" icon="check" data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="play" data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="clock" data-role="schedule" hidden>${escapeHtml(I18n.t('bpmn.timer_schedule'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
         </header>
-        ${process ? `<div class="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><span>${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button></div>` : ''}
+        ${process ? `<div class="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="Europe/Warsaw" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" hidden></tf-alert>
 
         <div class="fb-body" data-role="body">
@@ -151,6 +153,8 @@ const FlowBuilderScreen = {
         ]);
         if (!this._current(state)) return;
         state.definition = response.definition;
+        state.timerStart = response.timerStart ?? null;
+        state.publishedTimerStart = !!response.timerStart;
         state.processOptions = options;
         state.flow = { id: flowId, name: response.definition.name, description: response.definition.description };
         state.readOnly = response.definition.archived;
@@ -205,6 +209,7 @@ const FlowBuilderScreen = {
         this._markDirty();
         this._updateStats();
         this._renderMinimap();
+        if (state.mode === 'bpmn' && state.config) this._syncProcessControls();
       },
       onSelect: (node, edge) => {
         const tpl = node ? state.templatesMap.get(node.type) : null;
@@ -320,6 +325,12 @@ const FlowBuilderScreen = {
     if (state.mode === 'bpmn') {
       root.querySelector('[data-role="publish"]').addEventListener('click', () => this._publish());
       root.querySelector('[data-role="run"]').addEventListener('click', () => this._runProcess());
+      root.querySelector('[data-role="schedule"]').addEventListener('click', () => openProcessSchedule(state.flowId));
+      const timezone = root.querySelector('[data-role="timer-timezone"]');
+      timezone.addEventListener('change', (event) => {
+        if (event.target !== timezone || !this._current(state) || state.readOnly) return;
+        state.canvas.updateProcessTimezone(timezone.value);
+      });
       root.querySelector('[data-role="instances"]').addEventListener('click', () => openProcessInstances(state.flowId));
       root.querySelector('[data-role="import"]').addEventListener('click', () => this._importProcess());
       root.querySelector('[data-role="export"]').addEventListener('click', () => this._exportProcess());
@@ -386,11 +397,24 @@ const FlowBuilderScreen = {
     if (state.palette.readOnly !== readOnly) { state.palette.readOnly = readOnly; state.palette._render(); }
     state.root.querySelector('[data-role="name"]').toggleAttribute('disabled', readOnly);
     for (const role of ['save', 'variables', 'publish', 'import', 'undo', 'redo']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
-    state.root.querySelector('[data-role="run"]').toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived || !!state.operationBusy);
+    const timedVersion = state.previewVersion === null ? state.publishedTimerStart : processHasTimerStart(state.canvas.getData());
+    const run = state.root.querySelector('[data-role="run"]');
+    run.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived || !!state.operationBusy || timedVersion);
+    run.setAttribute('title', I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : 'bpmn.run_hint'));
+    const schedule = state.root.querySelector('[data-role="schedule"]');
+    schedule.hidden = !state.publishedTimerStart;
+    schedule.toggleAttribute('disabled', !!state.operationBusy);
+    const timezone = state.root.querySelector('[data-role="timer-timezone"]');
+    timezone.hidden = !state.canvas.nodes.some((node) => ['bpmn_timer_start', 'bpmn_timer_catch'].includes(node.type));
+    timezone.value = state.canvas.processModel.timerTimezone || '';
+    timezone.toggleAttribute('disabled', readOnly);
+    const timerSummary = state.root.querySelector('[data-role="timer-summary"]');
+    timerSummary.hidden = !state.timerStart;
+    timerSummary.textContent = state.timerStart ? I18n.t('bpmn.timer_latest_summary', { version: state.definition.publishedVersion, summary: processTimerText(state.timerStart) }) + (state.timerStart.lastReason ? ` · ${I18n.t('bpmn.timer_reason')}: ${processTimerReasonText(state.timerStart.lastReason)}` : '') : '';
     state.root.querySelector('[data-role="draft"]').hidden = state.previewVersion === null;
     state.root.querySelector('[data-role="archive"]').textContent = I18n.t(state.definition.archived ? 'bpmn.unarchive' : 'bpmn.archive');
     state.root.querySelector('[data-role="archive"]').toggleAttribute('disabled', !!state.operationBusy || state.previewVersion !== null);
-    state.root.querySelector('.fb-process-notice > span').textContent = I18n.t(state.definition.archived ? 'bpmn.archived_hint' : 'bpmn.supported_hint');
+    state.root.querySelector('[data-role="process-hint"]').textContent = I18n.t(state.definition.archived ? 'bpmn.archived_hint' : 'bpmn.supported_hint');
     state.root.querySelector('[data-role="publication"]').textContent = state.previewVersion !== null
       ? I18n.t('bpmn.preview_version', { version: state.previewVersion })
       : state.definition.archived ? I18n.t('bpmn.archived')
@@ -421,10 +445,22 @@ const FlowBuilderScreen = {
     if (state.dirty && !await this._save()) return;
     if (!this._current(state) || state.dirty) return;
     await this._processOperation(async (current) => {
+      if (processHasTimerStart(current.canvas.getData())) {
+        const approved = await TfWindow.confirm({ title: I18n.t('bpmn.timer_publish_title'), message: I18n.t('bpmn.timer_publish_hint', { timezone: current.canvas.processModel.timerTimezone || I18n.t('bpmn.timer_timezone_required') }), confirmLabel: I18n.t('bpmn.publish') });
+        if (!approved || !this._current(current)) return;
+      }
       const response = await ApiBinary.one('processDefinitionPublishRequest', current.publishCommand({ definitionId: current.flowId, expectedRevision: current.definition.draftRevision }));
       if (!this._current(current)) return;
+      const previouslyTimed = current.publishedTimerStart;
       current.definition = { ...response.definition, model: response.version.model };
+      current.publishedTimerStart = processHasTimerStart(response.version.model);
+      current.timerStart = null;
       toast(I18n.t('bpmn.published', { version: response.version.version }), 'success');
+      if (current.publishedTimerStart || previouslyTimed) {
+        const actual = await ApiBinary.one('processDefinitionGetRequest', { definitionId: current.flowId });
+        if (!this._current(current)) return;
+        current.timerStart = actual.timerStart ?? null;
+      }
     });
   },
 
@@ -435,6 +471,11 @@ const FlowBuilderScreen = {
     await this._processOperation(async (current) => {
       const response = await ApiBinary.one('processVersionGetRequest', { definitionId: current.flowId, version });
       if (!this._current(current)) return;
+      if (processHasTimerStart(response.version.model)) {
+        if (version === current.definition.publishedVersion) current.publishedTimerStart = true;
+        await openProcessSchedule(current.flowId);
+        return;
+      }
       openProcessRun({ ...current.definition, model: response.version.model }, [response.version]);
     });
   },
@@ -450,6 +491,11 @@ const FlowBuilderScreen = {
       const response = await ApiBinary.one('processDefinitionArchiveRequest', current.archiveCommand({ definitionId: current.flowId, expectedRevision: current.definition.draftRevision, archived }));
       if (!this._current(current)) return;
       current.definition = response.definition;
+      if (current.publishedTimerStart) {
+        const actual = await ApiBinary.one('processDefinitionGetRequest', { definitionId: current.flowId });
+        if (!this._current(current)) return;
+        current.timerStart = actual.timerStart ?? null;
+      }
       current.root.querySelector('[data-role="system-readonly"]')?.remove();
       current.root.classList.remove('fb-readonly');
     });
@@ -460,6 +506,8 @@ const FlowBuilderScreen = {
       const response = await ApiBinary.one('processDefinitionGetRequest', { definitionId: state.flowId });
       if (!this._current(state)) return;
       state.definition = response.definition;
+      state.timerStart = response.timerStart ?? null;
+      state.publishedTimerStart = !!response.timerStart;
       state.previewVersion = null;
       state.canvas.setData(response.definition.model);
       state.root.querySelector('[data-role="name"]').value = response.definition.name;
@@ -493,6 +541,7 @@ const FlowBuilderScreen = {
         this._markDirty();
         this._updateStats();
         this._renderMinimap();
+        this._syncProcessControls();
         return { message: I18n.t('bpmn.imported_draft') };
       },
     });
@@ -805,10 +854,13 @@ const FlowBuilderScreen = {
     }
     const w = Math.max(1, maxX - minX);
     const h = Math.max(1, maxY - minY);
-    const miniW = 180, miniH = 120;
+    const captionHeight = s.mode === 'bpmn' ? 18 : 0;
+    const miniW = s.mode === 'bpmn' ? mini.clientWidth : 180;
+    const miniH = s.mode === 'bpmn' ? mini.clientHeight - captionHeight : 120;
+    if (miniW <= 0 || miniH <= 0) return;
     const scale = Math.min(miniW / w, miniH / h) * 0.85;
     const offX = (miniW - w * scale) / 2;
-    const offY = (miniH - h * scale) / 2;
+    const offY = captionHeight + (miniH - h * scale) / 2;
     for (const n of nodes) {
       const dot = document.createElement('div');
       dot.className = 'fb-minimap-node';
@@ -826,10 +878,26 @@ const FlowBuilderScreen = {
     const vWorldH = rect.height / canvas.view.zoom;
     const vWorldX = -canvas.view.x / canvas.view.zoom;
     const vWorldY = -canvas.view.y / canvas.view.zoom;
-    vp.style.left = `${offX + (vWorldX - minX) * scale}px`;
-    vp.style.top = `${offY + (vWorldY - minY) * scale}px`;
-    vp.style.width = `${Math.max(8, vWorldW * scale)}px`;
-    vp.style.height = `${Math.max(8, vWorldH * scale)}px`;
+    const left = offX + (vWorldX - minX) * scale;
+    const top = offY + (vWorldY - minY) * scale;
+    const width = Math.max(8, vWorldW * scale);
+    const height = Math.max(8, vWorldH * scale);
+    if (s.mode === 'bpmn') {
+      const x = Math.max(0, Math.min(miniW, left));
+      const y = Math.max(captionHeight, Math.min(mini.clientHeight, top));
+      const right = Math.max(x, Math.min(miniW, left + width));
+      const bottom = Math.max(y, Math.min(mini.clientHeight, top + height));
+      vp.hidden = right === x || bottom === y;
+      vp.style.left = `${x}px`;
+      vp.style.top = `${y}px`;
+      vp.style.width = `${right - x}px`;
+      vp.style.height = `${bottom - y}px`;
+    } else {
+      vp.style.left = `${left}px`;
+      vp.style.top = `${top}px`;
+      vp.style.width = `${width}px`;
+      vp.style.height = `${height}px`;
+    }
   },
 
   async _openHistory() {

@@ -305,7 +305,7 @@ export class FlowConfig {
     const disabled = this.readOnly ? 'disabled' : '';
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
-    let fields = input('name', 'element_name', node.label);
+    let fields = `<tf-textarea data-process="name" label="${escapeAttr(I18n.t('bpmn.element_name'))}" value="${escapeAttr(node.label || '')}" autogrow rows="1" ${disabled}></tf-textarea>`;
     if (kind === 'UserTask') {
       const available = !config.assigneeUserId || this.opts.processOptions.assignees.some((user) => user.userId === config.assigneeUserId);
       fields += `<tf-person-picker data-process="assigneeUserId" label="${escapeAttr(I18n.t('bpmn.assignee'))}" ${this.readOnly ? 'inert' : ''}></tf-person-picker>
@@ -325,6 +325,16 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
+    } else if (kind === 'TimerStart' || kind === 'TimerCatch') {
+      const timerKind = Object.keys(config.timer)[0];
+      const timer = config.timer[timerKind];
+      const types = kind === 'TimerStart' ? ['Date', 'Duration', 'Cycle', 'Daily'] : ['Date', 'Duration'];
+      fields += `<tf-select data-process="timerType" label="${escapeAttr(I18n.t('bpmn.timer_type'))}" value="${escapeAttr(timerKind)}" ${disabled}>${types.map((type) => `<option value="${type}">${escapeHtml(I18n.t(`bpmn.timer_type_${type.toLowerCase()}`))}</option>`).join('')}</tf-select>`;
+      if (timerKind === 'Date') fields += input('timerAt', 'timer_at', timer.at, 'placeholder="2026-10-02T15:30:00+02:00"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_date_hint'))}</p><p class="fb-timer-literal" data-timer-literal>${escapeHtml(timer.at)}</p>`;
+      else if (timerKind === 'Duration' || timerKind === 'Cycle') fields += input('timerSeconds', 'timer_seconds', timer.seconds, `type="number" min="${timerKind === 'Cycle' ? 300 : 1}" max="31536000" step="1"`) + `<p class="fb-field-hint">${escapeHtml(I18n.t(timerKind === 'Cycle' ? 'bpmn.timer_cycle_hint' : 'bpmn.timer_duration_hint'))}</p>`;
+      else if (timerKind === 'Daily') fields += `<div class="fb-timer-clock">${input('timerHour', 'timer_hour', timer.hour, 'type="number" min="0" max="23" step="1"')}${input('timerMinute', 'timer_minute', timer.minute, 'type="number" min="0" max="59" step="1"')}</div><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_daily_hint'))}</p>`;
+      if (timerKind === 'Cycle' || timerKind === 'Daily') fields += input('timerTotal', 'timer_total', timer.totalFirings, 'type="number" min="1" max="4294967295" step="1"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_total_hint'))}</p>`;
+      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : 'bpmn.timer_catch_hint'))}</p>`;
     } else if (kind === 'ExclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
@@ -343,7 +353,7 @@ export class FlowConfig {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && target.type !== 'bpmn_start').map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start'].includes(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
     fields += input('elementId', 'element_id', node.id, 'readonly');
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
@@ -369,6 +379,17 @@ export class FlowConfig {
       else if (key === 'verification') {
         this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
         this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';
+      } else if (key === 'timerType') {
+        const values = { Date: { at: '' }, Duration: { seconds: 60 }, Cycle: { seconds: 300, totalFirings: null }, Daily: { hour: 9, minute: 0, totalFirings: null } };
+        this.opts.onConfigChange(node.id, { timer: { [control.value]: values[control.value] } });
+        this._renderProcess();
+        this.root.querySelector('[data-process="timerType"]').focus();
+      } else if (key.startsWith('timer')) {
+        const timerKind = Object.keys(node.config.timer)[0];
+        const field = { timerAt: 'at', timerSeconds: 'seconds', timerHour: 'hour', timerMinute: 'minute', timerTotal: 'totalFirings' }[key];
+        const value = key === 'timerAt' ? control.value : (control.value.trim() === '' ? null : Number(control.value));
+        this.opts.onConfigChange(node.id, { timer: { [timerKind]: { ...node.config.timer[timerKind], [field]: value } } });
+        if (key === 'timerAt') this.root.querySelector('[data-timer-literal]').textContent = control.value;
       } else if (key === 'expression') this.opts.onConfigChange(node.id, { verification: { Condition: { expression: control.value } } });
       else if (key !== 'elementId') this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
       if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator');

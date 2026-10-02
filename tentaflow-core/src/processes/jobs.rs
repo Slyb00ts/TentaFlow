@@ -275,7 +275,8 @@ pub async fn execute_claimed(
         ) {
             return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error);
         }
-        let plan = match plan_job_result(&current, job, &result) {
+        let at_ms = now_ms();
+        let plan = match plan_job_result(&current, job, &result, at_ms) {
             Ok(plan) => plan,
             Err(error) => return fail_claim(pool, worker_id, &claimed, "TRANSITION_ERROR", error),
         };
@@ -289,6 +290,7 @@ pub async fn execute_claimed(
             &result,
             current.instance.revision,
             &plan,
+            at_ms,
         ) {
             Ok(_) => return Ok(()),
             Err(error) if error.to_string().contains("revision conflict") => continue,
@@ -358,6 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn published_service_executes_pinned_graph_after_live_source_edit() {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("published", None));
         let started = start_model(
@@ -408,7 +411,7 @@ mod tests {
             1
         );
         let result = job.result.as_ref().unwrap();
-        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, result).unwrap();
+        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, result, at_ms).unwrap();
         repository::accept_job_result(
             &fixture.db,
             &fixture.owner,
@@ -419,6 +422,7 @@ mod tests {
             result,
             claim.snapshot.instance.revision,
             &plan,
+            at_ms,
         )
         .unwrap();
         assert_eq!(
@@ -431,6 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_verification_uses_persisted_result_and_explicit_retry_after_rejection() {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("evidence", None));
         let started = start_model(
@@ -456,15 +461,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detail.outputs["outputs"]["variables"]["marker"], "evidence");
-        assert!(
-            runtime::plan_user_completion(&waiting, &task.user_task_id, &Value::Null, None)
-                .is_err()
-        );
+        assert!(runtime::plan_user_completion(
+            &waiting,
+            &task.user_task_id,
+            &Value::Null,
+            None,
+            at_ms
+        )
+        .is_err());
         let rejection = runtime::plan_user_completion(
             &waiting,
             &task.user_task_id,
             &json!("insufficient"),
             Some(false),
+            at_ms,
         )
         .unwrap();
         let rejected = repository::complete_user_task(
@@ -477,6 +487,7 @@ mod tests {
             &json!("insufficient"),
             Some(false),
             &rejection,
+            at_ms,
         )
         .unwrap();
         assert_eq!(rejected.status, ProcessInstanceStatus::Incident);
@@ -510,6 +521,7 @@ mod tests {
             &task.user_task_id,
             &json!({"answer":"client cannot replace service output"}),
             Some(true),
+            at_ms,
         )
         .unwrap();
         let completed = repository::complete_user_task(
@@ -522,6 +534,7 @@ mod tests {
             &json!({"answer":"client cannot replace service output"}),
             Some(true),
             &approval,
+            at_ms,
         )
         .unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -539,6 +552,7 @@ mod tests {
     #[tokio::test]
     async fn observed_effect_before_crash_is_not_reexecuted_without_retry_and_old_fence_is_rejected(
     ) {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("observed", None));
         let started = start_model(
@@ -554,7 +568,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let observed = observe_effect(&fixture, &claim).await;
-        let late_plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed).unwrap();
+        let late_plan =
+            runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at_ms).unwrap();
         let path = fixture.directory.path().join("processes.db");
         let actor = fixture.owner.clone();
         let Fixture {
@@ -590,7 +605,8 @@ mod tests {
             "lost-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &late_plan
+            &late_plan,
+            at_ms
         )
         .is_err());
         repository::retry_job(
@@ -630,6 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_revocation_and_cancelled_claim_never_publish_a_late_result() {
+        let at_ms = chrono::Utc::now().timestamp_millis();
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("authorized", None));
         let started = start_model(
@@ -687,7 +704,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let observed = observe_effect(&fixture, &claim).await;
-        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed).unwrap();
+        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at_ms).unwrap();
         let current =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
         repository::cancel_instance(
@@ -720,7 +737,8 @@ mod tests {
             "cancelled-worker",
             &observed,
             current.revision,
-            &plan
+            &plan,
+            at_ms
         )
         .is_err());
         assert!(!repository::fail_job(
@@ -983,11 +1001,14 @@ mod tests {
                 },
             ),
         );
-        let claim = repository::claim_job(&fixture.db, "overdue-worker", now_ms() - 31_000)
+        let at_ms = now_ms() - 31_000;
+        let claim = repository::claim_job(&fixture.db, "overdue-worker", at_ms)
             .unwrap()
             .unwrap();
+        assert!(at_ms < claim.job.lease_until_ms.unwrap());
+        assert!(claim.job.lease_until_ms.unwrap() < now_ms());
         let observed = observe_effect(&fixture, &claim).await;
-        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed).unwrap();
+        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at_ms).unwrap();
         assert!(repository::accept_job_result(
             &fixture.db,
             &fixture.owner,
@@ -997,7 +1018,8 @@ mod tests {
             "overdue-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &plan
+            &plan,
+            at_ms
         )
         .is_err());
         let reason = "A real service failure with Unicode detail: 🧪".repeat(1200);

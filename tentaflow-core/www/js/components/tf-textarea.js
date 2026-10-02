@@ -1,13 +1,13 @@
 // =============================================================================
 // File: tf-textarea.js — <tf-textarea> multi-line input, light DOM, auto-grow.
-// Supports: label, placeholder, value, hint, error, rows, disabled, autogrow.
+// Supports: label, aria-label, placeholder, value, hint, error, rows, disabled, autogrow.
 // Reflects .value to attribute and emits "input"/"change".
 // Example: <tf-textarea placeholder="Zapytaj o cokolwiek..." autogrow rows="2">
 // =============================================================================
 
 class TfTextarea extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'rows', 'disabled', 'autogrow', 'maxlength'];
+    return ['label', 'aria-label', 'placeholder', 'value', 'hint', 'error', 'rows', 'disabled', 'autogrow', 'maxlength'];
   }
 
   constructor() {
@@ -119,6 +119,9 @@ class TfTextarea extends HTMLElement {
     if (document.activeElement !== this._textarea) this._textarea.value = value;
     this._textarea.rows = parseInt(rows, 10) || 2;
     this._textarea.disabled = disabled;
+    const accessibleName = this.getAttribute('aria-label') || labelText;
+    if (accessibleName) this._textarea.setAttribute('aria-label', accessibleName);
+    else this._textarea.removeAttribute('aria-label');
     if (maxlen !== null) this._textarea.setAttribute('maxlength', maxlen);
     else this._textarea.removeAttribute('maxlength');
 
@@ -136,7 +139,9 @@ class TfTextarea extends HTMLElement {
     if (!this.hasAttribute('autogrow') || !this._textarea) return;
     // Auto-size to content up to CSS max-height; min via rows attr.
     this._textarea.style.height = 'auto';
-    this._textarea.style.height = `${this._textarea.scrollHeight}px`;
+    const border = window.getComputedStyle(this._textarea).boxSizing === 'border-box'
+      ? this._textarea.offsetHeight - this._textarea.clientHeight : 0;
+    this._textarea.style.height = `${this._textarea.scrollHeight + border}px`;
   }
 
   _onInput(e) {

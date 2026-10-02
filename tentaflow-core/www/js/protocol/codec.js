@@ -303,6 +303,22 @@ function processField(value, camel) {
   return value?.[camel];
 }
 
+function processTimerSpec(timer) {
+  if (!timer || typeof timer !== 'object' || Array.isArray(timer)) throw new TypeError('timer rule is required');
+  const entries = Object.entries(timer);
+  if (entries.length !== 1) throw new TypeError('timer rule requires one kind');
+  const [tag, body] = entries[0];
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('timer rule body is required');
+  const allowed = {
+    Date: ['at'], Duration: ['seconds'], Cycle: ['seconds', 'totalFirings'], Daily: ['hour', 'minute', 'totalFirings'],
+  }[tag];
+  if (!allowed || Object.keys(body).some((key) => !allowed.includes(key))) throw new TypeError(`unsupported timer rule ${tag}`);
+  if (tag === 'Date') return { Date: { at: String(body.at ?? '') } };
+  if (tag === 'Duration') return { Duration: { seconds: Number(body.seconds) } };
+  if (tag === 'Cycle') return { Cycle: { seconds: Number(body.seconds), total_firings: body.totalFirings == null ? null : Number(body.totalFirings) } };
+  return { Daily: { hour: Number(body.hour), minute: Number(body.minute), total_firings: body.totalFirings == null ? null : Number(body.totalFirings) } };
+}
+
 function processModel(model) {
   if (!model || typeof model !== 'object') throw new TypeError('process model is required');
   const nodes = (model.nodes ?? []).map((node) => {
@@ -327,6 +343,9 @@ function processModel(model) {
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60) };
     } else if (tag === 'ExclusiveGateway') {
       fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };
+    } else if (tag === 'TimerStart' || tag === 'TimerCatch') {
+      if (Object.keys(body).some((key) => key !== 'timer')) throw new TypeError(`unsupported ${tag} field`);
+      fields = { timer: processTimerSpec(body.timer) };
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }
@@ -343,6 +362,7 @@ function processModel(model) {
       condition: flow.condition ?? null,
     })),
     variables: model.variables ?? {},
+    timer_timezone: processField(model, 'timerTimezone') ?? null,
     diagram: {
       shapes: (diagram.shapes ?? []).map((shape) => ({
         element_id: String(processField(shape, 'elementId') ?? ''),

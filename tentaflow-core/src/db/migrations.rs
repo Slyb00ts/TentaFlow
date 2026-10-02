@@ -1110,6 +1110,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         (179, "org_deputies_absences", MigrationStep::Sql(ORG_DEPUTIES_ABSENCES)),
         (180, "org_handovers", MigrationStep::Sql(ORG_HANDOVERS)),
         (181, "bpmn_processes", MigrationStep::Sql(BPMN_PROCESSES)),
+        (182, "bpmn_timers", MigrationStep::Sql(BPMN_TIMERS)),
     ]
 }
 
@@ -1232,6 +1233,54 @@ CREATE TABLE bpmn_commands (
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY(org_id, actor_user_id, command_id)
 );
+"#;
+
+const BPMN_TIMERS: &str = r#"
+CREATE TABLE bpmn_timers (
+    timer_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('start','catch')),
+    instance_id TEXT REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    rule_json TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    anchor_at_ms INTEGER NOT NULL,
+    due_at_ms INTEGER,
+    occurrence INTEGER NOT NULL CHECK(typeof(occurrence) = 'integer' AND occurrence > 0),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('pending','fired','cancelled','archived','blocked','missed','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    CHECK((kind='start' AND instance_id IS NULL AND token_id IS NULL) OR
+          (kind='catch' AND instance_id IS NOT NULL AND token_id IS NOT NULL)),
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version)
+);
+CREATE UNIQUE INDEX uq_bpmn_timer_start ON bpmn_timers(definition_id,version,node_id) WHERE kind='start';
+CREATE UNIQUE INDEX uq_bpmn_timer_catch ON bpmn_timers(instance_id,token_id,node_id) WHERE kind='catch';
+CREATE INDEX idx_bpmn_timers_due ON bpmn_timers(status,next_check_at_ms,due_at_ms,timer_id);
+CREATE INDEX idx_bpmn_timers_instance ON bpmn_timers(instance_id,status);
+ALTER TABLE bpmn_instances ADD COLUMN start_timer_id TEXT REFERENCES bpmn_timers(timer_id);
+ALTER TABLE bpmn_instances ADD COLUMN start_occurrence INTEGER CHECK(start_occurrence IS NULL OR (typeof(start_occurrence) = 'integer' AND start_occurrence > 0));
+CREATE UNIQUE INDEX uq_bpmn_timer_start_slot ON bpmn_instances(start_timer_id,start_occurrence) WHERE start_timer_id IS NOT NULL;
+CREATE TRIGGER bpmn_instance_timer_pair_insert BEFORE INSERT ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+CREATE TRIGGER bpmn_instance_timer_pair_update BEFORE UPDATE OF start_timer_id,start_occurrence ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
 "#;
 
 // v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
@@ -14770,20 +14819,39 @@ mod tests {
     #[test]
     fn bpmn_migration_adds_durable_tables_without_changing_existing_flows() {
         let conn = Connection::open_in_memory().unwrap();
-        run_ladder_up_to(&conn, 180);
+        run_ladder_up_to(&conn, 181);
         conn.execute(
             "INSERT INTO flows(id,name,flow_json,status) VALUES('flow-retained','Existing','{}','active')",
             [],
         ).unwrap();
+        let b1_version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(b1_version, 181);
+        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('bpmn-owner','Bpmn owner','x',1)", []).unwrap();
+        let old_model = crate::processes::model::starter_model();
+        crate::processes::model::validate_model(&old_model).unwrap();
+        let old_model_json = serde_json::to_string(&old_model).unwrap();
+        let old_hash = crate::processes::repository::request_hash(&old_model).unwrap();
+        assert!(!old_model_json.contains("timer_timezone"));
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('bpmn-old','org-default','bpmn-owner','Old','',1,?1,1,0,1,1)", [&old_model_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('bpmn-old',1,?1,?2,'[]',1,'bpmn-owner')", rusqlite::params![&old_model_json, &old_hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('bpmn-old-instance','bpmn-old',1,'org-default','bpmn-owner',1,'completed','{}',1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('bpmn-old-event','bpmn-old-instance',1,1,'instance_started',NULL,'bpmn-owner','{\"source_key\":1}')", []).unwrap();
         run(&conn).unwrap();
         let retained: String = conn.query_row(
             "SELECT name FROM flows WHERE id='flow-retained'", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(retained, "Existing");
-        for table in ["bpmn_definitions", "bpmn_versions", "bpmn_instances", "bpmn_tokens", "bpmn_and_receipts", "bpmn_user_tasks", "bpmn_jobs", "bpmn_events", "bpmn_commands"] {
+        for table in ["bpmn_definitions", "bpmn_versions", "bpmn_instances", "bpmn_tokens", "bpmn_and_receipts", "bpmn_user_tasks", "bpmn_jobs", "bpmn_events", "bpmn_commands", "bpmn_timers"] {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 181);
+        assert_eq!(version, 182);
+        let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        assert_eq!((model.as_str(), hash.as_str(), start_timer, start_occurrence, event.as_str()),
+            (old_model_json.as_str(), old_hash.as_str(), None, None, "{\"source_key\":1}"));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_timers", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 }

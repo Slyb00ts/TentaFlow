@@ -25883,4 +25883,26 @@ mod process_wire_tests {
             tentaflow_protocol::processes::ProcessPayload::DefinitionListRequest { offset: 10, limit: 25 }
         ));
     }
+
+    #[test]
+    fn process_request_encoder_keeps_timer_rules_and_timezone() {
+        let fields = serde_json::json!({
+            "command_id":"7c865aaa-febd-4621-9ae6-35977200a0fd",
+            "definition_id":null,"expected_revision":0,"name":"Timed","description":"",
+            "model":{"schema_version":1,"process_id":"P_1","timer_timezone":"Europe/Warsaw",
+                "nodes":[{"id":"Start_1","name":"Start","kind":{"TimerStart":{"timer":{"Daily":{"hour":9,"minute":15,"total_firings":3}}}}}],
+                "sequence_flows":[],"variables":{"threshold_value":{"nested_key":"Łódź"}},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.timer_timezone.as_deref(), Some("Europe/Warsaw"));
+        assert_eq!(model.variables["threshold_value"]["nested_key"], "Łódź");
+        assert_eq!(model.nodes[0].kind, tentaflow_protocol::processes::ProcessNodeKind::TimerStart {
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Daily { hour:9, minute:15, total_firings:Some(3) }
+        });
+    }
 }

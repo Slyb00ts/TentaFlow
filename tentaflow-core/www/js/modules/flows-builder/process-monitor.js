@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processCommand, processEditorLabels, processJson, processStatusLabel } from './bpmn.js';
+import { checkProcessValue, processCommand, processEditorLabels, processHasTimerStart, processJson, processStatusLabel } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
@@ -64,12 +64,81 @@ function validateJson(section, object = false) {
 
 export function processEventText(event) {
   const node = event.nodeName || text('element_unavailable');
+  if (event.kind === 'timer_armed') return text('event_timer_armed', { node, due: date(event.data.due_at_ms), timezone: event.data.timezone });
+  if (event.kind === 'timer_fired') return text('event_timer_fired', { node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms), count: event.data.skipped_count });
+  if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
+  if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
   if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
   return text(`event_${event.kind}`, { node });
 }
 
+export function processTimerText(timer) {
+  const due = timer.dueAtMs == null ? text('timer_no_due') : new Date(timer.dueAtMs).toLocaleString(I18n.getLanguage(), { timeZone: timer.timezone, timeZoneName: 'short' });
+  return text('timer_brief', { status: text(`timer_status_${timer.status.toLowerCase()}`), due, timezone: timer.timezone });
+}
+
+export function processTimerReasonText(reason) {
+  switch (reason) {
+    case 'instance_cancelled': return text('event_cancelled');
+    case 'definition_archived': return text('timer_reason_definition_archived');
+    case 'missed_during_archive': return text('timer_reason_missed_during_archive');
+    case 'finite_schedule_exhausted_during_archive': return text('timer_reason_finite_schedule_exhausted_during_archive');
+    case 'superseded_by_publication': return text('timer_reason_superseded_by_publication');
+    default: return reason;
+  }
+}
+
+function renderTimers(host, timers) {
+  host.replaceChildren();
+  for (const timer of timers) {
+    const row = document.createElement('div');
+    row.className = 'fb-process-work fb-process-timer';
+    row.dataset.timerId = timer.timerId;
+    row.innerHTML = `<div><strong>${escapeHtml(timer.nodeName || text(timer.kind === 'Start' ? 'node_timer_start' : 'node_timer_catch'))}</strong>
+      <p>${escapeHtml(processTimerText(timer))}</p><dl><dt>${escapeHtml(text('timer_occurrence'))}</dt><dd>${escapeHtml(timer.totalFirings == null ? String(timer.occurrence) : text('timer_slot', { occurrence: timer.occurrence, total: timer.totalFirings }))}</dd>
+      ${timer.lastReason ? `<dt>${escapeHtml(text('timer_reason'))}</dt><dd>${escapeHtml(processTimerReasonText(timer.lastReason))}</dd>` : ''}</dl></div>`;
+    host.append(row);
+  }
+}
+
+export async function openProcessSchedule(definitionId) {
+  const win = readWindow(text('timer_schedule'), 'clock');
+  const host = win.querySelector('[data-content]');
+  host.innerHTML = `<div data-schedule-summary></div><p>${escapeHtml(text('timer_schedule_hint'))}</p><section data-timers></section>
+    <tf-button variant="secondary" icon="clock" data-schedule-instances>${escapeHtml(text('instances'))}</tf-button>`;
+  let refreshing = false;
+  let generation = 0;
+  async function refresh() {
+    if (refreshing || !win.isConnected) return;
+    refreshing = true;
+    const current = ++generation;
+    try {
+      const response = await ApiBinary.one('processDefinitionGetRequest', { definitionId });
+      if (!win.isConnected || current !== generation) return;
+      host.querySelector('[data-schedule-summary]').textContent = `${response.definition.name} · ${response.definition.publishedVersion ? text('version_number', { version: response.definition.publishedVersion }) : text('draft')}`;
+      const timers = host.querySelector('[data-timers]');
+      if (response.timerStart) renderTimers(timers, [response.timerStart]);
+      else timers.textContent = text('timer_schedule_empty');
+      host.querySelector('[data-schedule-instances]').removeAttribute('disabled');
+      win.querySelector('[data-error]').hidden = true;
+    } catch (error) {
+      if (!win.isConnected || current !== generation) return;
+      host.querySelector('[data-timers]').replaceChildren();
+      host.querySelector('[data-schedule-instances]').setAttribute('disabled', '');
+      showError(win, error);
+    } finally { refreshing = false; }
+  }
+  host.querySelector('[data-schedule-instances]').addEventListener('click', () => openProcessInstances(definitionId));
+  await refresh();
+  if (!win.isConnected) return win;
+  const timer = setInterval(refresh, 3000);
+  win.addEventListener('closed', () => { clearInterval(timer); generation += 1; }, { once: true });
+  return win;
+}
+
 function processIncidentText(incident) {
+  if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
@@ -115,7 +184,7 @@ export async function openProcessInstances(definitionId = null) {
 export async function openProcessInstance(instanceId, initial = null) {
   const win = readWindow(text('instance'), 'play', 940);
   const host = win.querySelector('[data-content]');
-  host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section>
+  host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section hidden><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
     <div data-variables></div><section class="fb-process-history"><h3>${escapeHtml(text('history'))}</h3><ol data-events></ol>
       <tf-button variant="secondary" data-more>${escapeHtml(text('more_history'))}</tf-button></section>`;
   let instance = initial;
@@ -262,6 +331,8 @@ export async function openProcessInstance(instanceId, initial = null) {
       incidents.appendChild(row);
     }
     host.querySelector('[data-variables]').replaceChildren(jsonSection(text('current_variables'), instance.variables, false));
+    host.querySelector('[data-timer-section]').hidden = !instance.timers?.length;
+    renderTimers(host.querySelector('[data-timers]'), instance.timers || []);
   }
 
   async function refresh() {
@@ -303,9 +374,9 @@ export function openProcessRun(definition, versions) {
   const variables = jsonSection(text('initial_variables'), definition.model.variables);
   const command = processCommand();
   return openFormWindow({ title: text('run'), icon: 'play', subject: definition.name,
-    note: { text: text('run_hint') }, sections: [selection, variables], submitLabel: text('run'),
+    note: { text: text(processHasTimerStart(definition.model) ? 'timer_start_manual_hint' : 'run_hint') }, sections: [selection, variables], submitLabel: text('run'),
     validate: () => validateJson(variables, true),
-    canSubmit: () => versions.length > 0 && !definition.archived,
+    canSubmit: () => versions.length > 0 && !definition.archived && !processHasTimerStart(definition.model),
     collect: () => ({ definitionId: definition.definitionId, version: Number(selection.querySelector('tf-select').value), variables: variables.jsonValue }),
     onSubmit: async (payload) => {
       const response = await ApiBinary.one('processInstanceStartRequest', command(payload));

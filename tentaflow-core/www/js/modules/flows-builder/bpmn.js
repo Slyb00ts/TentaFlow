@@ -5,6 +5,8 @@ import { I18n } from '/js/i18n.js';
 const ELEMENTS = [
   ['Start', 'start', 'play', 'events', 56, 56],
   ['End', 'end', 'stop', 'events', 56, 56],
+  ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
+  ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
@@ -15,7 +17,7 @@ export function processTemplates() {
   return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: kind === 'Start' ? [] : ['in'],
+    input_ports: ['Start', 'TimerStart'].includes(kind) ? [] : ['in'],
     output_ports: kind === 'End' ? [] : ['full'],
     width, height,
   }));
@@ -31,7 +33,12 @@ export function processNodeConfig(kind) {
   if (kind === 'UserTask') return { assigneeUserId: null, outputMapping: {} };
   if (kind === 'ServiceTask') return { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60 };
   if (kind === 'ExclusiveGateway') return { defaultFlowId: null };
+  if (kind === 'TimerStart' || kind === 'TimerCatch') return { timer: { Duration: { seconds: 60 } } };
   return {};
+}
+
+export function processHasTimerStart(model) {
+  return model.nodes.some((node) => typeof node.kind === 'object' && 'TimerStart' in node.kind);
 }
 
 export function emptyProcessModel() {
@@ -72,6 +79,7 @@ export function processToCanvas(model) {
 export function canvasToProcess(model, nodes, edges, edgePoints) {
   return { schemaVersion: model.schemaVersion, processId: model.processId,
     variables: structuredClone(model.variables),
+    ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
