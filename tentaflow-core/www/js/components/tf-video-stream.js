@@ -1,14 +1,14 @@
 // =============================================================================
-// Plik: tf-video-stream.js
-// Opis: Komponent <tf-video-stream stream-id="camera:cam_xxx" [label] [height-px] [fit]>
-//       — kafelek live video oparty na MediaSource Extensions. Subskrybuje
-//       strumien w StreamHub przez binary WS (Chunk B protocol), karmi fMP4
-//       chunki do SourceBuffer dolaczonego do <video>. Cleanup w
-//       disconnectedCallback wysyla StreamCloseRequest i zwalnia blob URL.
-// Przyklad: <tf-video-stream stream-id="camera:cam_550e8400-e29b-41d4-a716-446655440000"
-//             label="Wejscie · online" height-px="320"></tf-video-stream>
-//       `fit="contain"` pokazuje cala klatke (pasy po bokach lub gora/dol),
-//       domyslnie `cover` wypelnia kafelek kosztem przyciecia krawedzi.
+// File: tf-video-stream.js
+// Purpose: <tf-video-stream stream-id="camera:cam_xxx" [label] [height-px] [fit]>
+//          — a live video tile on Media Source Extensions. It subscribes to the
+//          stream in StreamHub over the binary WS (Chunk B protocol) and feeds
+//          fMP4 chunks into a SourceBuffer attached to <video>. On
+//          disconnectedCallback it sends StreamCloseRequest and frees the blob URL.
+// Example: <tf-video-stream stream-id="camera:cam_550e8400-e29b-41d4-a716-446655440000"
+//            label="Wejscie · online" height-px="320"></tf-video-stream>
+//          `fit="contain"` shows the whole frame (bars at the sides or top and
+//          bottom); the default `cover` fills the tile at the cost of cropped edges.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';

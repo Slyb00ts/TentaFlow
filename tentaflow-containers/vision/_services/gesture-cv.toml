@@ -1,16 +1,18 @@
 # =============================================================================
-# Plik: gesture-cv.toml
-# Opis: Modele rozpoznawania gestów na kamerach robotów — poza ciała (MoveNet
-#       single-pose lightning) wskazuje dłonie, detektor dłoni MediaPipe znajduje
-#       je w wycinku wokół nadgarstka, a model punktów dłoni MediaPipe czyta 21
-#       punktów palców. Embedded: tract (CPU), ładowane leniwie przez silnik
-#       gestów; deploy jedynie pobiera trzy pliki do vision_models_dir().
-#       Wszystkie pochodzą z wydań autorów przypiętych do commita i sumy sha256
-#       w `vision/camera_cv_models.rs` (bundle `gesture-cv`).
+# File: gesture-cv.toml
+# Purpose: gesture recognition models for robot cameras — the body pose
+#          (MoveNet single-pose lightning) points at the hands, the MediaPipe
+#          palm detector finds them in a crop around the wrist, and the
+#          MediaPipe hand landmark model reads 21 finger keypoints. Embedded:
+#          ONNX Runtime (CUDA) under `vision-ort`, tract (CPU) otherwise,
+#          loaded lazily by the gesture engine; deploy only downloads the
+#          three files into vision_models_dir(). All come from the authors'
+#          releases, pinned to a commit and a sha256 in
+#          `vision/camera_cv_models.rs` (bundle `gesture-cv`).
 #
-#       Licencje: MoveNet — Apache-2.0 (Google, eksport ONNX Xenova);
-#       palm_detection_mediapipe i handpose_estimation_mediapipe — Apache-2.0
-#       (OpenCV zoo).
+#          Licenses: MoveNet — Apache-2.0 (Google, Xenova ONNX export);
+#          palm_detection_mediapipe and handpose_estimation_mediapipe —
+#          Apache-2.0 (OpenCV zoo).
 # =============================================================================
 
 [engine]

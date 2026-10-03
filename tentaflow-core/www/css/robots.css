@@ -300,8 +300,8 @@
   gap: 14px;
 }
 
-/* Przegląd: kamera, widok 3D i kolumna telemetrii/sterowania obok siebie na
-   całą wysokość panelu; kolumna przewija się sama, gdy jest dłuższa. */
+/* Overview tab: camera, 3D view and the telemetry/control column side by side
+   at the panel's full height; the column scrolls on its own when it is longer. */
 .robots-overview {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(260px, 320px);
