@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -190,6 +190,7 @@ export class FlowCanvas {
     this.root = rootEl;
     this.opts = opts;
     this.mode = opts.mode || 'flow';
+    this.processPath = [];
     this.nodes = [];
     this.edges = [];
     this.selectedIds = new Set();
@@ -335,8 +336,9 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   setData(nodes, edges, { reset = true } = {}) {
     if (this.mode === 'bpmn') {
+      this.processPath = [];
       this.processModel = structuredClone(nodes);
-      const data = processToCanvas(nodes);
+      const data = processToCanvas(nodes, this.processPath);
       nodes = data.nodes;
       edges = data.edges;
     }
@@ -380,7 +382,9 @@ export class FlowCanvas {
 
   getData() {
     if (this.mode === 'bpmn') {
-      return canvasToProcess(this.processModel, this.nodes, this.edges, (edge) => this._processEdgePoints(edge));
+      this.processModel = canvasToProcess(this.processModel, this.nodes, this.edges,
+        (edge) => this._processEdgePoints(edge), this.processPath);
+      return structuredClone(this.processModel);
     }
     this._normalizeEdgePorts();
     // Przy serializacji pomijamy porty rowne domyslnym ("full"/"in"), zeby
@@ -421,6 +425,23 @@ export class FlowCanvas {
         return out;
       }),
     };
+  }
+
+  navigateProcessBody(path) {
+    if (this.mode !== 'bpmn') return;
+    const complete = this.getData();
+    processBody(complete, path);
+    this.processPath = [...path];
+    const graph = processToCanvas(complete, path);
+    this.nodes = graph.nodes;
+    this.edges = graph.edges;
+    this._normalizeNodeLabels();
+    this._normalizeEdgePorts();
+    this.selectedIds.clear();
+    this.selectedEdgeId = null;
+    this.onSelect(null);
+    this.render();
+    this.fitToContent(READABLE_MIN_ZOOM);
   }
 
   // Waliduje klient-side przed zapisem: kazdy edge musi wskazywac istniejace
@@ -622,11 +643,7 @@ export class FlowCanvas {
     // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
-      ...(this.mode === 'bpmn' ? { timerTimezone: this.processModel.timerTimezone ?? null,
-        workCalendar: this.processModel.workCalendar ?? null,
-        calendarPin: this.processModel.calendarPin ?? null,
-        messages: this.processModel.messages ?? [], errors: this.processModel.errors ?? [],
-        targetNamespace: this.processModel.targetNamespace ?? null } : {}) }));
+      ...(this.mode === 'bpmn' ? { processModel: this.getData(), processPath: this.processPath } : {}) }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -639,16 +656,8 @@ export class FlowCanvas {
     this.nodes = snap.nodes;
     this.edges = snap.edges;
     if (this.mode === 'bpmn') {
-      if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
-      else this.processModel.timerTimezone = snap.timerTimezone;
-      if (snap.workCalendar === null) delete this.processModel.workCalendar;
-      else this.processModel.workCalendar = snap.workCalendar;
-      if (snap.calendarPin === null) delete this.processModel.calendarPin;
-      else this.processModel.calendarPin = snap.calendarPin;
-      this.processModel.messages = snap.messages;
-      this.processModel.errors = snap.errors;
-      if (snap.targetNamespace === null) delete this.processModel.targetNamespace;
-      else this.processModel.targetNamespace = snap.targetNamespace;
+      this.processModel = snap.processModel;
+      this.processPath = snap.processPath;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -664,16 +673,8 @@ export class FlowCanvas {
     this.nodes = snap.nodes;
     this.edges = snap.edges;
     if (this.mode === 'bpmn') {
-      if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
-      else this.processModel.timerTimezone = snap.timerTimezone;
-      if (snap.workCalendar === null) delete this.processModel.workCalendar;
-      else this.processModel.workCalendar = snap.workCalendar;
-      if (snap.calendarPin === null) delete this.processModel.calendarPin;
-      else this.processModel.calendarPin = snap.calendarPin;
-      this.processModel.messages = snap.messages;
-      this.processModel.errors = snap.errors;
-      if (snap.targetNamespace === null) delete this.processModel.targetNamespace;
-      else this.processModel.targetNamespace = snap.targetNamespace;
+      this.processModel = snap.processModel;
+      this.processPath = snap.processPath;
     }
     this.render();
     this.onChange();
@@ -686,6 +687,14 @@ export class FlowCanvas {
     if (this.readOnly || this.mode !== 'bpmn') return;
     if (value === '') delete this.processModel.timerTimezone;
     else this.processModel.timerTimezone = value;
+    this._pushHistory();
+    this.onChange();
+  }
+
+  updateProcessVariables(values) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    this.getData();
+    processBody(this.processModel, this.processPath).variables = structuredClone(values);
     this._pushHistory();
     this.onChange();
   }
@@ -716,16 +725,18 @@ export class FlowCanvas {
     if (this.mode !== 'bpmn') return;
     this.processModel = structuredClone(model);
     for (const snapshot of this.history) {
-      snapshot.calendarPin = snapshot.workCalendar === null ? null : structuredClone(model.calendarPin ?? null);
+      if (snapshot.processModel.workCalendar) snapshot.processModel.calendarPin = structuredClone(model.calendarPin ?? null);
     }
     if (this.historyIndex >= 0) {
-      this.history[this.historyIndex].timerTimezone = model.timerTimezone ?? null;
-      this.history[this.historyIndex].workCalendar = structuredClone(model.workCalendar ?? null);
+      this.history[this.historyIndex].processModel = structuredClone(model);
     }
   }
 
   addNodeFromTemplate(tpl, clientX, clientY) {
     if (this.readOnly) return;
+    if (this.mode === 'bpmn' && this.processPath.length > 0
+      && ['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)) return;
+    if (this.mode === 'bpmn' && this.processPath.length >= 3 && tpl.node_type === 'bpmn_sub_process') return;
     const pt = this._clientToWorld(clientX, clientY);
     let defaultConfig = {};
     try { defaultConfig = JSON.parse(tpl.default_config || '{}'); } catch (_) {}
@@ -776,7 +787,7 @@ export class FlowCanvas {
 
   _positionBoundary(node) {
     const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
-    if (!parent || !['bpmn_user_task', 'bpmn_service_task'].includes(parent.type)) return;
+    if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process'].includes(parent.type)) return;
     const centerX = node.x + node.width / 2;
     const centerY = node.y + node.height / 2;
     let x = Math.max(parent.x, Math.min(centerX, parent.x + parent.width));
@@ -871,6 +882,7 @@ export class FlowCanvas {
       };
       idMap.set(n.id, clone.id);
       if (this.mode === 'bpmn' && clone.type === 'bpmn_exclusive_gateway') clone.config.defaultFlowId = null;
+      if (this.mode === 'bpmn' && clone.type === 'bpmn_sub_process') clone.config.body = cloneProcessBody(clone.config.body);
       clones.push(clone);
     }
     if (this.mode === 'bpmn') {

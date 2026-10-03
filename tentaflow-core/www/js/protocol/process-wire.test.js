@@ -67,6 +67,32 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
   assert.equal(Object.hasOwn(body.model.nodes[1].kind.ServiceTask, 'timeout_seconds'), false);
 });
 
+test('embedded subprocess wire preserves nested graph and opaque local variable keys', { skip }, () => {
+  const body = { nodes: [
+    { id: 'Child_Start', name: 'Enter', kind: 'Start' },
+    { id: 'Child_End', name: 'Leave', kind: 'End' },
+  ], sequenceFlows: [{ id: 'Child_Flow', sourceId: 'Child_Start', targetId: 'Child_End', condition: null }],
+  variables: { customer_ID: { original_key: 7 } }, diagram: { shapes: [], edges: [] } };
+  const model = { schemaVersion: 1, processId: 'P_1', nodes: [
+    { id: 'Start_1', name: 'Start', kind: 'Start' },
+    { id: 'Sub_1', name: 'Review', kind: { SubProcess: { body,
+      inputMapping: { local_ID: 'vars.customer_ID' }, outputMapping: { returned_ID: 'outputs.customer_ID' } } } },
+    { id: 'End_1', name: 'End', kind: 'End' },
+  ], sequenceFlows: [], variables: { customer_ID: { original_key: 3 } }, diagram: { shapes: [], edges: [] } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Review', description: '', model });
+  const nested = saved.model.nodes[1].kind.SubProcess;
+  assert.deepEqual(nested.body.variables, body.variables);
+  assert.equal(nested.body.sequenceFlows[0].targetId, 'Child_End');
+  assert.deepEqual(nested.inputMapping, { local_ID: 'vars.customer_ID' });
+  assert.deepEqual(nested.outputMapping, { returned_ID: 'outputs.customer_ID' });
+  assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Review', description: '', model: { ...model, nodes: [
+      model.nodes[0], { ...model.nodes[1], kind: { SubProcess: { ...model.nodes[1].kind.SubProcess,
+        body: { ...body, timerTimezone: 'UTC' } } } }, model.nodes[2],
+    ] } }), /unsupported subprocess body field/);
+});
+
 test('message model and send wire keep typed structure and opaque business keys', { skip }, () => {
   const model = { schemaVersion: 1, processId: 'P_1', targetNamespace: 'urn:example:orders',
     messages: [{ messageId: 'Message_1', name: 'order.received' }],
@@ -109,12 +135,17 @@ test('message model and send wire keep typed structure and opaque business keys'
 test('instance pages encode exact selectors and message detail preserves null availability', { skip }, () => {
   const body = request('processInstanceGetRequest', { instanceId: 'instance', pages: {
     userTasks: { offset: 20, limit: 20 }, subscriptions: { offset: 0, limit: 2 },
+    scopes: { offset: 0, limit: 20 },
     selectedUserTaskId: 'task-1', selectedIncidentId: 'incident-1',
   } });
   assert.equal(body.pages.userTasks.offset, 20);
   assert.equal(body.pages.subscriptions.limit, 2);
+  assert.equal(body.pages.scopes.limit, 20);
   assert.equal(body.pages.selectedUserTaskId, 'task-1');
   assert.equal(body.pages.selectedIncidentId, 'incident-1');
+  const scope = request('processScopeGetRequest', { instanceId: 'instance', scopeId: 'child-scope' });
+  assert.equal(scope.instanceId, 'instance');
+  assert.equal(scope.scopeId, 'child-scope');
   const message = { message_id: 'msg', sender_user_id: 'user', origin: 'Api',
     target: { Start: { definition_id: 'def' } }, message_name: 'order.received', correlation_key: 'key',
     revision: 1, status: 'Delivered', received_at_ms: 1, expires_at_ms: 2, updated_at_ms: 2,
@@ -151,10 +182,11 @@ test('instance response decodes required empty and populated message collections
   const populated = decode({ ...base,
     subscriptions: [{ subscription_id: 's1', node_id: 'Wait_1', node_name: 'Wait', token_id: 't1',
       kind: 'MessageCatch', status: 'Open', revision: 1, message_name: 'order.received',
-      correlation_key: 'case-1', error_code: null, attached_to_id: null, race_id: 'r1', last_reason: null }],
+      correlation_key: 'case-1', error_code: null, attached_to_id: null, race_id: 'r1', last_reason: null,
+      scope_id: 'child-scope' }],
     event_races: [{ race_id: 'r1', gateway_node_id: 'Race_1', gateway_name: 'First arrival',
       status: 'Open', revision: 1, winner_node_id: null,
-      branch_subscription_ids: ['s1'], branch_timer_ids: [] }],
+      branch_subscription_ids: ['s1'], branch_timer_ids: [], scope_id: 'child-scope' }],
     outgoing_messages: [{ message_id: 'm1', sender_user_id: 'u1', origin: 'Api',
       target: { Start: { definition_id: 'd2' } }, message_name: 'order.received',
       correlation_key: 'case-1', revision: 1, status: 'Pending', received_at_ms: 1,
@@ -163,14 +195,18 @@ test('instance response decodes required empty and populated message collections
       source_node_id: 'Throw_1', last_reason: null, payload_sha256: 'sha', payload_bytes: 4,
       payload_available: false, can_resolve: false, can_cancel: false }],
     message_names: ['order.received'],
+    scopes: [{ scope_id: 'child-scope', parent_scope_id: 'i1', subprocess_node_id: 'Sub_1',
+      subprocess_node_name: 'Review', parent_token_id: 'wait-1', revision: 1, status: 'Running',
+      depth: 1, created_at_ms: 1, updated_at_ms: 1 }],
   });
   assert.equal(populated.instance.subscriptions[0].subscriptionId, 's1');
   assert.deepEqual(populated.instance.eventRaces[0].branchSubscriptionIds, ['s1']);
   assert.equal(populated.instance.outgoingMessages[0].messageId, 'm1');
   assert.deepEqual(populated.instance.messageNames, ['order.received']);
+  assert.equal(populated.instance.scopes[0].subprocessNodeName, 'Review');
   assert.deepEqual(populated.instance.variables, { business_key: 'kept' });
-  const empty = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [], message_names: [] });
-  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames']) {
+  const empty = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [], message_names: [], scopes: [] });
+  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames', 'scopes']) {
     assert.deepEqual(empty.instance[field], [], `${field} remains an array on an empty page`);
   }
   assert.equal(empty.instance.canSendMessage, true);
@@ -277,7 +313,7 @@ test('boundary timer wire keeps attachment, cancellation and opaque business key
   }
 });
 
-test('boundary timer and full task identity decode without changing older nullable fields', { skip }, () => {
+test('boundary timer and full task scope identity decode with nullable timer fields', { skip }, () => {
   const timerFields = {
     timer_id: 't1', node_id: 'Timer_1', node_name: 'Reminder', kind: 'Boundary',
     status: 'Pending', due_at_ms: 42, timezone: 'UTC', occurrence: 1,
@@ -287,10 +323,11 @@ test('boundary timer and full task identity decode without changing older nullab
     UserTaskGetResponse: { task: {
       user_task_id: 'u1', node_id: 'Review_1', name: 'Review', assignee_user_id: 'person',
       kind: 'Work', status: 'Open', outputs: { business_key: 'kept' },
-      revision: 1, can_complete: true, token_id: 'waiting-activation',
+      revision: 1, can_complete: true, token_id: 'waiting-activation', scope_id: 'i1',
     } },
   } })));
   assert.equal(decoded.task.tokenId, 'waiting-activation');
+  assert.equal(decoded.task.scopeId, 'i1');
   assert.deepEqual(decoded.task.outputs, { business_key: 'kept' });
   const timer = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance: {
@@ -360,11 +397,12 @@ test('user task detail response preserves opaque output keys', { skip }, () => {
     UserTaskGetResponse: { task: {
       user_task_id: 't1', node_id: 'Review_1', name: 'Review', assignee_user_id: 'u1',
       kind: 'Work', status: 'Open', outputs: { business_key: { inner_value: 3 } },
-      revision: 1, can_complete: true,
+      revision: 1, can_complete: true, scope_id: 'i1',
     } },
   } })));
   assert.equal(decoded.variant, 'ProcessUserTaskGetResponse');
   assert.equal(decoded.task.userTaskId, 't1');
+  assert.equal(decoded.task.scopeId, 'i1');
   assert.deepEqual(decoded.task.outputs, { business_key: { inner_value: 3 } });
   assert.equal(Object.hasOwn(decoded.task, 'user_task_id'), false);
 });

@@ -1117,6 +1117,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             MigrationStep::RustSelfManaged(bpmn_boundary_timers),
         ),
         (184, "bpmn_messages_and_event_races", MigrationStep::Sql(BPMN_MESSAGES_AND_EVENT_RACES)),
+        (185, "bpmn_scopes", MigrationStep::RustSelfManaged(bpmn_scopes)),
     ]
 }
 
@@ -1507,6 +1508,436 @@ BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
     let fk_enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     anyhow::ensure!(fk_enabled == 1, "boundary timer migration could not restore foreign keys");
     result
+}
+
+const BPMN_SCOPES: &str = r#"
+-- File: bpmn-b2c-schema-185.sql — exact scoped table rebuild inside one RustSelfManaged transaction.
+
+-- Caller disables foreign_keys before BEGIN and restores it after success/failure.
+
+-- Caller runs ownership/root-bijection checks, foreign_key_check and integrity_check before schema-version commit.
+
+DROP TRIGGER bpmn_instance_timer_pair_insert;
+
+DROP TRIGGER bpmn_instance_timer_pair_update;
+
+DROP TRIGGER bpmn_message_envelope_immutable;
+
+CREATE TABLE bpmn_scopes (
+    scope_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    parent_scope_id TEXT,
+    subprocess_node_id TEXT,
+    parent_token_id TEXT,
+    revision INTEGER,
+    status TEXT,
+    local_variables_json TEXT,
+    created_at_ms INTEGER,
+    updated_at_ms INTEGER,
+    UNIQUE(instance_id,scope_id),
+    UNIQUE(instance_id,parent_token_id),
+    FOREIGN KEY(instance_id,parent_scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,parent_scope_id,parent_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK((scope_id=instance_id AND parent_scope_id IS NULL AND subprocess_node_id IS NULL AND parent_token_id IS NULL AND revision IS NULL AND status IS NULL AND local_variables_json IS NULL AND created_at_ms IS NULL AND updated_at_ms IS NULL) OR
+          (scope_id<>instance_id AND parent_scope_id IS NOT NULL AND subprocess_node_id IS NOT NULL AND parent_token_id IS NOT NULL AND revision IS NOT NULL AND typeof(revision)='integer' AND revision>0 AND status IS NOT NULL AND status IN ('running','waiting','completed','incident','cancelled') AND local_variables_json IS NOT NULL AND json_valid(local_variables_json) AND json_type(local_variables_json)='object' AND length(CAST(local_variables_json AS BLOB))<=262144 AND created_at_ms IS NOT NULL AND typeof(created_at_ms)='integer' AND updated_at_ms IS NOT NULL AND typeof(updated_at_ms)='integer'))
+);
+CREATE UNIQUE INDEX uq_bpmn_scope_root ON bpmn_scopes(instance_id) WHERE parent_scope_id IS NULL;
+CREATE INDEX idx_bpmn_scopes_instance ON bpmn_scopes(instance_id,status,scope_id);
+CREATE INDEX idx_bpmn_scopes_parent ON bpmn_scopes(instance_id,parent_scope_id,scope_id);
+INSERT INTO bpmn_scopes(scope_id,instance_id) SELECT instance_id,instance_id FROM bpmn_instances;
+
+
+CREATE TABLE bpmn_tokens_185 (
+    token_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    arrival_edge_id TEXT,
+    fork_stack_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ready','waiting','joining','consumed','cancelled')),
+    created_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,token_id)
+);
+
+INSERT INTO bpmn_tokens_185(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms)
+SELECT token_id,instance_id,instance_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms FROM bpmn_tokens;
+
+CREATE TABLE bpmn_and_receipts_185 (
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    join_node_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL,
+    branch_edge_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(instance_id,scope_id,join_node_id,activation_id,branch_edge_id),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_and_receipts_185(instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms)
+SELECT instance_id,instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms FROM bpmn_and_receipts;
+
+CREATE TABLE bpmn_user_tasks_185 (
+    user_task_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    assignee_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    kind TEXT NOT NULL CHECK(kind IN ('work','verification')),
+    status TEXT NOT NULL CHECK(status IN ('open','completed','cancelled')),
+    outputs_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(status<>'open' OR token_id IS NOT NULL)
+);
+
+INSERT INTO bpmn_user_tasks_185(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id)
+SELECT user_task_id,instance_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id FROM bpmn_user_tasks;
+
+CREATE TABLE bpmn_jobs_185 (
+    job_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    input_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','error','cancelled')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK(typeof(attempt) = 'integer' AND attempt >= 0 AND attempt <= 4294967295),
+    fence INTEGER NOT NULL DEFAULT 0 CHECK(typeof(fence) = 'integer' AND fence >= 0),
+    worker_id TEXT,
+    lease_until_ms INTEGER,
+    result_json TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    result_origin TEXT CHECK(result_origin IS NULL OR result_origin IN ('envelope','contract','platform')),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,job_id)
+);
+
+INSERT INTO bpmn_jobs_185(job_id,instance_id,scope_id,node_id,token_id,input_json,status,attempt,fence,worker_id,lease_until_ms,result_json,created_at_ms,updated_at_ms,result_origin)
+SELECT job_id,instance_id,instance_id,node_id,token_id,input_json,status,attempt,fence,worker_id,lease_until_ms,result_json,created_at_ms,updated_at_ms,result_origin FROM bpmn_jobs;
+
+CREATE TABLE bpmn_incidents_185 (
+    incident_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    node_id TEXT,
+    job_id TEXT,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    at_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER,
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,job_id) REFERENCES bpmn_jobs(instance_id,scope_id,job_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_incidents_185(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms)
+SELECT incident_id,instance_id,instance_id,node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents;
+
+CREATE TABLE bpmn_events_185 (
+    event_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    seq INTEGER NOT NULL CHECK(typeof(seq) = 'integer' AND seq > 0),
+    at_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    node_id TEXT,
+    actor_user_id TEXT,
+    data_json TEXT NOT NULL,
+    UNIQUE(instance_id, seq),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,event_id)
+);
+
+INSERT INTO bpmn_events_185(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json)
+SELECT event_id,instance_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json FROM bpmn_events;
+
+CREATE TABLE bpmn_timers_185 (
+    timer_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('start','catch','boundary')),
+    instance_id TEXT REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    rule_json TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    anchor_at_ms INTEGER NOT NULL,
+    due_at_ms INTEGER,
+    occurrence INTEGER NOT NULL CHECK(typeof(occurrence) = 'integer' AND occurrence > 0),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('pending','fired','cancelled','archived','blocked','missed','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    CHECK((kind='start' AND instance_id IS NULL AND scope_id IS NULL AND token_id IS NULL) OR
+          (kind IN ('catch','boundary') AND instance_id IS NOT NULL AND scope_id IS NOT NULL AND token_id IS NOT NULL)),
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,timer_id),
+    FOREIGN KEY(instance_id,scope_id,race_id) REFERENCES bpmn_event_races(instance_id,scope_id,race_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_timers_185(timer_id,org_id,definition_id,version,node_id,kind,instance_id,scope_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id)
+SELECT timer_id,org_id,definition_id,version,node_id,kind,instance_id,CASE WHEN kind='start' THEN NULL ELSE instance_id END,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id FROM bpmn_timers;
+
+CREATE TABLE bpmn_event_races_185 (
+    race_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    gateway_node_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','won','cancelled')),
+    winner_node_id TEXT,
+    winner_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    winner_timer_id TEXT REFERENCES bpmn_timers(timer_id),
+    won_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE(instance_id,gateway_node_id,activation_id),
+    CHECK((status='won' AND winner_node_id IS NOT NULL AND won_at_ms IS NOT NULL AND ((winner_subscription_id IS NOT NULL AND winner_timer_id IS NULL) OR (winner_subscription_id IS NULL AND winner_timer_id IS NOT NULL))) OR (status IN ('open','cancelled') AND winner_node_id IS NULL AND winner_subscription_id IS NULL AND winner_timer_id IS NULL AND won_at_ms IS NULL)),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,race_id),
+    FOREIGN KEY(instance_id,scope_id,winner_subscription_id) REFERENCES bpmn_event_subscriptions(instance_id,scope_id,subscription_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,winner_timer_id) REFERENCES bpmn_timers(instance_id,scope_id,timer_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_event_races_185(race_id,instance_id,scope_id,gateway_node_id,activation_id,revision,status,winner_node_id,winner_subscription_id,winner_timer_id,won_at_ms,created_at_ms,updated_at_ms)
+SELECT race_id,instance_id,instance_id,gateway_node_id,activation_id,revision,status,winner_node_id,winner_subscription_id,winner_timer_id,won_at_ms,created_at_ms,updated_at_ms FROM bpmn_event_races;
+
+CREATE TABLE bpmn_event_subscriptions_185 (
+    subscription_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    kind TEXT NOT NULL CHECK(kind IN ('message_catch','boundary_message','boundary_error')),
+    message_name TEXT,
+    correlation_key TEXT,
+    error_code TEXT,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','consumed','cancelled','error')),
+    last_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    UNIQUE(instance_id,node_id,token_id),
+    CHECK((kind='boundary_error' AND message_name IS NULL AND correlation_key IS NULL AND race_id IS NULL) OR (kind IN ('message_catch','boundary_message') AND error_code IS NULL AND ((status='error' AND correlation_key IS NULL) OR (message_name IS NOT NULL AND length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256 AND correlation_key IS NOT NULL AND length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256)))),
+    CHECK(kind='message_catch' OR race_id IS NULL),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,subscription_id),
+    FOREIGN KEY(instance_id,scope_id,race_id) REFERENCES bpmn_event_races(instance_id,scope_id,race_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_event_subscriptions_185(subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms)
+SELECT subscription_id,instance_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions;
+
+CREATE TABLE bpmn_messages_185 (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    sender_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    message_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK(origin IN ('api','process')),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('start','catch')),
+    definition_id TEXT NOT NULL REFERENCES bpmn_definitions(definition_id),
+    target_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    target_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    message_name TEXT NOT NULL CHECK(length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256),
+    correlation_key TEXT NOT NULL CHECK(length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256),
+    payload_json TEXT,
+    payload_sha256 TEXT NOT NULL,
+    payload_bytes INTEGER NOT NULL CHECK(typeof(payload_bytes)='integer' AND payload_bytes BETWEEN 1 AND 262144),
+    ttl_seconds INTEGER NOT NULL CHECK(typeof(ttl_seconds)='integer' AND ttl_seconds BETWEEN 1 AND 604800),
+    received_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>received_at_ms),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('pending','blocked','ambiguous','delivered','expired','cancelled','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    payload_pruned_at_ms INTEGER,
+    resolved_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    resolved_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    resolved_token_id TEXT REFERENCES bpmn_tokens(token_id),
+    matched_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    matched_version INTEGER CHECK(matched_version IS NULL OR (typeof(matched_version)='integer' AND matched_version>0)),
+    matched_node_id TEXT,
+    matched_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    delivered_at_ms INTEGER,
+    source_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    source_scope_id TEXT,
+    source_definition_id TEXT,
+    source_version INTEGER,
+    source_node_id TEXT,
+    source_activation_id TEXT,
+    source_event_id TEXT REFERENCES bpmn_events(event_id),
+    PRIMARY KEY(org_id,sender_user_id,message_id),
+    UNIQUE(source_instance_id,source_activation_id,source_node_id),
+    CHECK((origin='api' AND source_scope_id IS NULL AND source_instance_id IS NULL AND source_definition_id IS NULL AND source_version IS NULL AND source_node_id IS NULL AND source_activation_id IS NULL AND source_event_id IS NULL) OR (origin='process' AND source_scope_id IS NOT NULL AND source_instance_id IS NOT NULL AND source_definition_id IS NOT NULL AND source_version IS NOT NULL AND source_node_id IS NOT NULL AND source_activation_id IS NOT NULL AND source_event_id IS NOT NULL)),
+    CHECK((target_kind='start' AND target_instance_id IS NULL AND target_subscription_id IS NULL) OR (target_kind='catch' AND (target_subscription_id IS NULL OR target_instance_id IS NOT NULL))),
+    CHECK((resolved_instance_id IS NULL AND resolved_subscription_id IS NULL AND resolved_token_id IS NULL) OR (target_kind='catch' AND resolved_instance_id IS NOT NULL AND resolved_subscription_id IS NOT NULL AND resolved_token_id IS NOT NULL)),
+    CHECK((status='delivered' AND matched_instance_id IS NOT NULL AND matched_version IS NOT NULL AND matched_node_id IS NOT NULL AND delivered_at_ms IS NOT NULL) OR (status<>'delivered' AND matched_instance_id IS NULL AND matched_version IS NULL AND matched_node_id IS NULL AND matched_subscription_id IS NULL AND delivered_at_ms IS NULL)),
+    CHECK((payload_json IS NOT NULL AND payload_pruned_at_ms IS NULL) OR (payload_json IS NULL AND payload_pruned_at_ms IS NOT NULL AND status IN ('delivered','expired','cancelled','error'))),
+    FOREIGN KEY(source_instance_id,source_scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(source_instance_id,source_scope_id,source_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_messages_185(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,payload_pruned_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,source_scope_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id)
+SELECT org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,payload_pruned_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,CASE WHEN origin='process' THEN source_instance_id ELSE NULL END,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id FROM bpmn_messages;
+
+DROP TABLE bpmn_messages;
+
+DROP TABLE bpmn_event_subscriptions;
+
+DROP TABLE bpmn_event_races;
+
+DROP TABLE bpmn_timers;
+
+DROP TABLE bpmn_events;
+
+DROP TABLE bpmn_incidents;
+
+DROP TABLE bpmn_jobs;
+
+DROP TABLE bpmn_user_tasks;
+
+DROP TABLE bpmn_and_receipts;
+
+DROP TABLE bpmn_tokens;
+
+ALTER TABLE bpmn_tokens_185 RENAME TO bpmn_tokens;
+
+ALTER TABLE bpmn_and_receipts_185 RENAME TO bpmn_and_receipts;
+
+ALTER TABLE bpmn_user_tasks_185 RENAME TO bpmn_user_tasks;
+
+ALTER TABLE bpmn_jobs_185 RENAME TO bpmn_jobs;
+
+ALTER TABLE bpmn_incidents_185 RENAME TO bpmn_incidents;
+
+ALTER TABLE bpmn_events_185 RENAME TO bpmn_events;
+
+ALTER TABLE bpmn_timers_185 RENAME TO bpmn_timers;
+
+ALTER TABLE bpmn_event_races_185 RENAME TO bpmn_event_races;
+
+ALTER TABLE bpmn_event_subscriptions_185 RENAME TO bpmn_event_subscriptions;
+
+ALTER TABLE bpmn_messages_185 RENAME TO bpmn_messages;
+
+CREATE INDEX idx_bpmn_tokens_instance ON bpmn_tokens(instance_id,scope_id,status);
+
+CREATE INDEX idx_bpmn_user_tasks_assignee ON bpmn_user_tasks(assignee_user_id, status, updated_at_ms DESC);
+
+CREATE INDEX idx_bpmn_jobs_claim ON bpmn_jobs(status, lease_until_ms, created_at_ms);
+
+CREATE INDEX idx_bpmn_incidents_instance ON bpmn_incidents(instance_id, resolved_at_ms);
+
+CREATE INDEX idx_bpmn_event_races_instance ON bpmn_event_races(instance_id,status,created_at_ms,race_id);
+
+CREATE INDEX idx_bpmn_subscriptions_match ON bpmn_event_subscriptions(org_id,definition_id,message_name,correlation_key,status,instance_id,subscription_id);
+
+CREATE INDEX idx_bpmn_subscriptions_instance ON bpmn_event_subscriptions(instance_id,status,created_at_ms,subscription_id);
+
+CREATE INDEX idx_bpmn_subscriptions_race ON bpmn_event_subscriptions(race_id);
+
+CREATE INDEX idx_bpmn_timers_race ON bpmn_timers(race_id);
+
+CREATE INDEX idx_bpmn_messages_due ON bpmn_messages(status,next_check_at_ms,received_at_ms,sender_user_id,message_id);
+
+CREATE INDEX idx_bpmn_messages_target ON bpmn_messages(org_id,definition_id,message_name,correlation_key,target_instance_id,status);
+
+CREATE INDEX idx_bpmn_messages_source ON bpmn_messages(source_instance_id,source_scope_id,status,received_at_ms);
+
+CREATE INDEX idx_bpmn_messages_sender ON bpmn_messages(org_id,sender_user_id,received_at_ms,message_id);
+
+CREATE INDEX idx_bpmn_messages_prune ON bpmn_messages(status,payload_pruned_at_ms,updated_at_ms);
+
+CREATE UNIQUE INDEX uq_bpmn_timer_start ON bpmn_timers(definition_id,version,node_id) WHERE kind='start';
+
+CREATE INDEX idx_bpmn_timers_due ON bpmn_timers(status,next_check_at_ms,due_at_ms,timer_id);
+
+CREATE INDEX idx_bpmn_timers_instance ON bpmn_timers(instance_id,status);
+
+CREATE UNIQUE INDEX uq_bpmn_timer_activation ON bpmn_timers(instance_id,token_id,node_id) WHERE kind IN ('catch','boundary');
+
+CREATE TRIGGER bpmn_instance_timer_pair_insert BEFORE INSERT ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+
+CREATE TRIGGER bpmn_instance_timer_pair_update BEFORE UPDATE OF start_timer_id,start_occurrence ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+
+CREATE TRIGGER bpmn_message_envelope_immutable BEFORE UPDATE ON bpmn_messages
+WHEN NEW.org_id IS NOT OLD.org_id OR NEW.sender_user_id IS NOT OLD.sender_user_id OR NEW.message_id IS NOT OLD.message_id OR NEW.request_hash IS NOT OLD.request_hash OR NEW.origin IS NOT OLD.origin OR NEW.target_kind IS NOT OLD.target_kind OR NEW.definition_id IS NOT OLD.definition_id OR NEW.target_instance_id IS NOT OLD.target_instance_id OR NEW.target_subscription_id IS NOT OLD.target_subscription_id OR NEW.message_name IS NOT OLD.message_name OR NEW.correlation_key IS NOT OLD.correlation_key OR NEW.payload_sha256 IS NOT OLD.payload_sha256 OR NEW.payload_bytes IS NOT OLD.payload_bytes OR NEW.ttl_seconds IS NOT OLD.ttl_seconds OR NEW.received_at_ms IS NOT OLD.received_at_ms OR NEW.expires_at_ms IS NOT OLD.expires_at_ms OR NEW.source_instance_id IS NOT OLD.source_instance_id OR NEW.source_scope_id IS NOT OLD.source_scope_id OR NEW.source_definition_id IS NOT OLD.source_definition_id OR NEW.source_version IS NOT OLD.source_version OR NEW.source_node_id IS NOT OLD.source_node_id OR NEW.source_activation_id IS NOT OLD.source_activation_id OR NEW.source_event_id IS NOT OLD.source_event_id OR (NEW.payload_json IS NOT OLD.payload_json AND NOT (OLD.payload_json IS NOT NULL AND NEW.payload_json IS NULL AND NEW.payload_pruned_at_ms IS NOT NULL AND NEW.status IN ('delivered','expired','cancelled','error')))
+BEGIN SELECT RAISE(ABORT,'BPMN message envelope is immutable'); END;
+"#;
+
+fn bpmn_scopes(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        anyhow::ensure!(fk_disabled == 0, "scope migration requires foreign keys disabled");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(BPMN_SCOPES)?;
+        let missing_roots: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_instances i WHERE NOT EXISTS (SELECT 1 FROM bpmn_scopes s WHERE s.instance_id=i.instance_id AND s.scope_id=i.instance_id AND s.parent_scope_id IS NULL)",
+            [], |row| row.get(0),
+        )?;
+        let orphan_roots: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_scopes s WHERE s.parent_scope_id IS NULL AND NOT EXISTS (SELECT 1 FROM bpmn_instances i WHERE i.instance_id=s.instance_id AND i.instance_id=s.scope_id)",
+            [], |row| row.get(0),
+        )?;
+        anyhow::ensure!(missing_roots == 0 && orphan_roots == 0,
+            "scope migration root identity mismatch: {missing_roots} missing, {orphan_roots} orphaned");
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(violations.is_empty(),
+            "scope migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "scope migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations (version,name) VALUES (?1,?2)", rusqlite::params![version,name])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.execute_batch("PRAGMA foreign_keys = ON;").and_then(|()| {
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+    });
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            let enabled = restored?;
+            anyhow::ensure!(enabled == 1, "scope migration could not restore foreign keys");
+            Ok(())
+        }
+    }
 }
 
 // v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
@@ -10959,9 +11390,15 @@ mod tests {
             );",
         )
         .unwrap();
+        let current_version: i64 = conn
+            .query_row("SELECT COALESCE(MAX(version), 0) FROM _migrations", [], |row| row.get(0))
+            .unwrap();
         for (rung, name, step) in get_migrations() {
             if rung > version {
                 break;
+            }
+            if rung <= current_version {
+                continue;
             }
             apply_migration(conn, rung, name, &step)
                 .unwrap_or_else(|error| panic!("the ladder must reach {version}: {error}"));
@@ -15071,7 +15508,7 @@ mod tests {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 184);
+        assert_eq!(version, 185);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -15096,7 +15533,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('message-event','message-instance',1,1,'instance_started',NULL,'message-owner','{\"customer_ID\":\"kept\"}')", []).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 184);
+        assert_eq!(version, 185);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -15185,7 +15622,7 @@ mod tests {
             "SELECT rule_json,timezone,status FROM bpmn_timers WHERE timer_id='timer-catch'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
         ).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 184);
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
         assert_eq!(version, 184);
         let stored: (String, String, String) = conn.query_row(
@@ -15239,4 +15676,68 @@ mod tests {
             assert!(foreign_key_check(&conn).unwrap().is_empty(), "{invalid}");
         }
     }
+    #[test]
+    fn scope_migration_preserves_real_legacy_messages_and_root_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bpmn-v184.db");
+        let conn = Connection::open(&path).unwrap();
+        let (bytes, hash) = bpmn_boundary_migration_fixture(&conn);
+        run_ladder_up_to(&conn, 184);
+        let payload = r#"{"customer_ID":"é"}"#;
+        let payload_bytes = i64::try_from(payload.len()).expect("fixture payload fits SQLite INTEGER");
+        let payload_hash = crate::processes::repository::request_hash(&serde_json::json!({"customer_ID":"é"})).unwrap();
+        for (id, origin, status, content, pruned, source, activation) in [
+            ("api-message", "api", "pending", Some(payload), None, None, None),
+            ("api-pruned-message", "api", "expired", None, Some(10), None, None),
+            ("process-message", "process", "pending", Some(payload), None, Some("boundary-instance"), Some("activation-1")),
+            ("process-pruned-message", "process", "cancelled", None, Some(10), Some("boundary-instance"), Some("activation-2")),
+        ] {
+            conn.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,payload_pruned_at_ms,source_instance_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id) VALUES('org-default','boundary-owner',?1,?1,?2,'start','boundary-process','signal','customer_ID',?3,?4,?5,60,1,60001,1,?6,1,1,?7,?8,CASE WHEN ?2='process' THEN 'boundary-process' ELSE NULL END,CASE WHEN ?2='process' THEN 1 ELSE NULL END,CASE WHEN ?2='process' THEN 'Service_1' ELSE NULL END,?9,CASE WHEN ?2='process' THEN 'boundary-event' ELSE NULL END)",
+                rusqlite::params![id, origin, content, &payload_hash, payload_bytes, status, pruned, source, activation]).unwrap();
+        }
+        let before: Vec<(String, String, Option<String>, String, i64, String, Option<String>, Option<String>)> = {
+            let mut query = conn.prepare("SELECT message_id,request_hash,payload_json,payload_sha256,payload_bytes,status,source_activation_id,source_event_id FROM bpmn_messages ORDER BY message_id").unwrap();
+            query.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        conn.execute("INSERT INTO bpmn_commands(org_id,actor_user_id,command_id,request_hash,result_json,created_at_ms) VALUES('org-default','boundary-owner','old-command','old-hash','{\"instance_id\":\"boundary-instance\",\"opaque_ID\":true}',1)", []).unwrap();
+        run(&conn).unwrap();
+        let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 185);
+        let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(roots, (1, 0));
+        let after: Vec<(String, String, Option<String>, String, i64, String, Option<String>, Option<String>)> = {
+            let mut query = conn.prepare("SELECT message_id,request_hash,payload_json,payload_sha256,payload_bytes,status,source_activation_id,source_event_id FROM bpmn_messages ORDER BY message_id").unwrap();
+            query.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))
+                .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 4);
+        let provenance: (Option<String>, Option<String>) = conn.query_row("SELECT source_instance_id,source_scope_id FROM bpmn_messages WHERE message_id='process-message'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(provenance, (Some("boundary-instance".into()), Some("boundary-instance".into())));
+        let retained: (String, String, String, String) = conn.query_row("SELECT v.model_json,v.model_sha256,e.data_json,c.result_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='boundary-instance' JOIN bpmn_commands c ON c.command_id='old-command' WHERE v.definition_id='boundary-process'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(retained, (bytes, hash, "{\"business_key\":\"v_1\"}".into(), "{\"instance_id\":\"boundary-instance\",\"opaque_ID\":true}".into()));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scope_migration_rolls_back_malformed_legacy_reference_and_restores_fk_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("malformed-v184.db")).unwrap();
+        bpmn_boundary_migration_fixture(&conn);
+        run_ladder_up_to(&conn, 184);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE bpmn_jobs SET token_id='missing-token' WHERE job_id='job-verification'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let original: String = conn.query_row("SELECT token_id FROM bpmn_jobs WHERE job_id='job-verification'", [], |row| row.get(0)).unwrap();
+        assert!(run(&conn).is_err());
+        let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 184);
+        assert!(!table_exists(&conn, "bpmn_scopes").unwrap());
+        assert_eq!(conn.query_row("SELECT token_id FROM bpmn_jobs WHERE job_id='job-verification'", [], |row| row.get::<_, String>(0)).unwrap(), original);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let trigger: String = conn.query_row("SELECT name FROM sqlite_master WHERE type='trigger' AND name='bpmn_message_envelope_immutable'", [], |row| row.get(0)).unwrap();
+        assert_eq!(trigger, "bpmn_message_envelope_immutable");
+    }
+
 }

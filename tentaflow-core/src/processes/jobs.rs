@@ -149,6 +149,7 @@ fn fail_claim(
     claimed: &ClaimedProcessJob,
     code: &str,
     error: impl std::fmt::Display,
+    observed: Option<&ObservedActivityResult>,
 ) -> Result<()> {
     let message = error.to_string();
     tracing::error!(job_id = %claimed.job.job_id, code, reason = %message, "process service claim failed");
@@ -161,6 +162,7 @@ fn fail_claim(
         code,
         &message,
         now_ms(),
+        observed,
     )?;
     Ok(())
 }
@@ -172,13 +174,20 @@ pub async fn execute_claimed(
     claimed: ClaimedProcessJob,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let node = claimed
-        .snapshot
-        .model
-        .nodes
-        .iter()
-        .find(|node| node.id == claimed.job.node_id)
-        .context("claimed job node missing")?;
+    let node = repository::scope_node(
+        &claimed.snapshot.model,
+        &claimed.snapshot.scopes,
+        &claimed.job.instance_id,
+        &claimed.job.scope_id,
+        &claimed.job.node_id,
+    )?;
+    let effective = repository::effective_scope_variables(
+        &claimed.snapshot.scopes,
+        &claimed.snapshot.scope_variables,
+        &claimed.job.instance_id,
+        &claimed.snapshot.instance.variables,
+        &claimed.job.scope_id,
+    )?;
     let ProcessNodeKind::ServiceTask {
         flow_id,
         timeout_seconds,
@@ -192,6 +201,7 @@ pub async fn execute_claimed(
             &claimed,
             "INVALID_SERVICE_JOB",
             "job node is not a service task",
+            None,
         );
     };
     let snapshot = claimed
@@ -212,7 +222,16 @@ pub async fn execute_claimed(
         &claimed.actor.org_id,
     ) {
         Ok(meta) => meta,
-        Err(error) => return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error),
+        Err(error) => {
+            return fail_claim(
+                pool,
+                worker_id,
+                &claimed,
+                "SOURCE_ACCESS_REVOKED",
+                error,
+                None,
+            )
+        }
     };
     meta.request_id = format!(
         "{}:{}:{}",
@@ -249,6 +268,7 @@ pub async fn execute_claimed(
             &claimed,
             "INTERRUPTED",
             "the worker was cancelled before executing the service task",
+            None,
         );
     }
     match repository::renew_job_lease(
@@ -268,11 +288,19 @@ pub async fn execute_claimed(
                 &claimed,
                 "LEASE_LOST",
                 "service job no longer owns its execution lease",
+                None,
             );
         }
         Err(error) => {
             cancel.cancel();
-            return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error);
+            return fail_claim(
+                pool,
+                worker_id,
+                &claimed,
+                "SOURCE_ACCESS_REVOKED",
+                error,
+                None,
+            );
         }
     }
 
@@ -287,22 +315,22 @@ pub async fn execute_claimed(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return fail_claim(pool, worker_id, &claimed, "INTERRUPTED", "the worker was cancelled before its external effect was confirmed");
+                return fail_claim(pool, worker_id, &claimed, "INTERRUPTED", "the worker was cancelled before its external effect was confirmed", None);
             }
             _ = renewal.tick() => {
                 if let Err(error) = dispatcher.authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id) {
                     cancel.cancel();
-                    return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error);
+                    return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error, None);
                 }
                 match repository::renew_job_lease(pool, &claimed.job.job_id, claimed.job.attempt, claimed.job.fence, worker_id, now_ms()) {
                     Ok(true) => {},
                     Ok(false) => {
                         cancel.cancel();
-                        return fail_claim(pool, worker_id, &claimed, "LEASE_LOST", "service job no longer owns its execution lease");
+                        return fail_claim(pool, worker_id, &claimed, "LEASE_LOST", "service job no longer owns its execution lease", None);
                     }
                     Err(error) => {
                         cancel.cancel();
-                        return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error);
+                        return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error, None);
                     }
                 }
             }
@@ -312,7 +340,7 @@ pub async fn execute_claimed(
             }
             outcome = &mut execution => {
                 break match outcome {
-                    Ok(outcome) => observed_result(outcome,result_expression.as_deref(),&claimed.snapshot.instance.variables),
+                    Ok(outcome) => observed_result(outcome,result_expression.as_deref(),&effective),
                     Err(error) => ObservedActivityResult{result:failure("FLOW_ERROR", error.to_string()),origin:ActivityResultOrigin::Platform},
                 };
             }
@@ -326,7 +354,14 @@ pub async fn execute_claimed(
             match repository::runtime_snapshot(pool, &claimed.actor, &claimed.job.instance_id) {
                 Ok(current) => current,
                 Err(error) => {
-                    return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error)
+                    return fail_claim(
+                        pool,
+                        worker_id,
+                        &claimed,
+                        "SOURCE_ACCESS_REVOKED",
+                        error,
+                        Some(&result),
+                    )
                 }
             };
         let Some(job) = current
@@ -347,12 +382,28 @@ pub async fn execute_claimed(
             &claimed.actor.user_id,
             &claimed.actor.org_id,
         ) {
-            return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error);
+            return fail_claim(
+                pool,
+                worker_id,
+                &claimed,
+                "SOURCE_ACCESS_REVOKED",
+                error,
+                Some(&result),
+            );
         }
         let at_ms = now_ms();
         let plan = match plan_job_result(&current, job, &result, at_ms) {
             Ok(plan) => plan,
-            Err(error) => return fail_claim(pool, worker_id, &claimed, "TRANSITION_ERROR", error),
+            Err(error) => {
+                return fail_claim(
+                    pool,
+                    worker_id,
+                    &claimed,
+                    "TRANSITION_ERROR",
+                    error,
+                    Some(&result),
+                )
+            }
         };
         match repository::accept_job_result(
             pool,
@@ -366,9 +417,21 @@ pub async fn execute_claimed(
             &plan,
             at_ms,
         ) {
-            Ok(_) => return Ok(()),
+            Ok(committed) => {
+                super::runtime::signal_cancelled_claims(dispatcher, &committed.cancelled_claims);
+                return Ok(());
+            }
             Err(error) if error.to_string().contains("revision conflict") => continue,
-            Err(error) => return fail_claim(pool, worker_id, &claimed, "RESULT_REJECTED", error),
+            Err(error) => {
+                return fail_claim(
+                    pool,
+                    worker_id,
+                    &claimed,
+                    "RESULT_REJECTED",
+                    error,
+                    Some(&result),
+                )
+            }
         }
     }
     fail_claim(
@@ -377,6 +440,7 @@ pub async fn execute_claimed(
         &claimed,
         "REVISION_CONFLICT",
         "concurrent process transitions prevented result publication",
+        Some(&result),
     )
 }
 
@@ -510,7 +574,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(
             repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
                 .unwrap()
@@ -575,7 +640,8 @@ mod tests {
             &rejection,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(rejected.status, ProcessInstanceStatus::Incident);
         assert_eq!(rejected.incidents[0].code, "HUMAN_REJECTED");
         assert_eq!(
@@ -622,7 +688,8 @@ mod tests {
             &approval,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(completed.variables["answer"], "evidence");
         let executions =
@@ -823,7 +890,8 @@ mod tests {
             &started.instance_id,
             current.revision,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         let events =
             repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
                 .unwrap()
@@ -861,7 +929,8 @@ mod tests {
             "cancelled-worker",
             "INTERRUPTED",
             "late worker",
-            now_ms()
+            now_ms(),
+            None
         )
         .unwrap());
         assert_eq!(
@@ -913,7 +982,8 @@ mod tests {
                     &started.instance_id,
                     claim.snapshot.instance.revision,
                 )
-                .unwrap();
+                .unwrap()
+                .instance;
                 assert!(!cancel.is_cancelled());
             } else if scenario == "worker_stopped" {
                 cancel.cancel();
@@ -977,6 +1047,7 @@ mod tests {
         let claim = repository::claim_job(&fixture.db, "running-worker", now_ms())
             .unwrap()
             .unwrap();
+        let claimed_job = claim.job.clone();
         let db = fixture.db.clone();
         let dispatcher = fixture.dispatcher().clone();
         let task = tokio::spawn(async move {
@@ -1021,14 +1092,89 @@ mod tests {
                 .unwrap();
         assert_eq!(current.status, ProcessInstanceStatus::Incident);
         assert_eq!(current.incidents[0].code, "SOURCE_ACCESS_REVOKED");
+        assert_eq!(
+            current.incidents[0].job_id.as_deref(),
+            Some(claimed_job.job_id.as_str())
+        );
         assert!(current.variables.get("answer").is_none());
-        assert!(
+        assert_eq!(current.variables, started.variables);
+        let snapshot =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        let retained_job = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.job_id == claimed_job.job_id)
+            .unwrap();
+        assert_eq!(retained_job.status, "error");
+        assert_eq!(retained_job.attempt, claimed_job.attempt);
+        assert_eq!(retained_job.fence, claimed_job.fence + 1);
+        assert!(retained_job.worker_id.is_none() && retained_job.lease_until_ms.is_none());
+        assert_eq!(
+            retained_job.result_origin,
+            Some(ActivityResultOrigin::Platform)
+        );
+        let denied_reason = fixture
+            .dispatcher()
+            .authorize_process_flow(&flow_id, &fixture.owner.user_id, &fixture.owner.org_id)
+            .err()
+            .expect("actual source grant remains denied")
+            .to_string();
+        let result = retained_job.result.as_ref().unwrap();
+        assert_eq!(result.outcome, ActivityOutcome::Error);
+        assert_eq!(result.code.as_deref(), Some("FLOW_ERROR"));
+        assert_eq!(
+            result.summary,
+            repository::bounded_failure_message(&denied_reason)
+        );
+        assert_eq!(result.outputs, Value::Null);
+        assert!(result.evidence.is_empty());
+        assert!(snapshot
+            .tokens
+            .iter()
+            .any(|token| { token.token_id == claimed_job.token_id && token.status == "waiting" }));
+        assert!(snapshot.user_tasks.is_empty());
+        let executions =
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].status.as_deref(), Some("completed"));
+        assert!(executions[0].total_latency_ms.unwrap() >= 0);
+        let history =
             repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
                 .unwrap()
-                .0
-                .iter()
-                .all(|event| event.kind != "service_result")
+                .0;
+        let observed = history
+            .iter()
+            .filter(|event| event.kind == "service_result")
+            .collect::<Vec<_>>();
+        assert_eq!(observed.len(), 1);
+        let mut expected = serde_json::to_value(result).unwrap();
+        expected["result_origin"] = json!("platform");
+        assert_eq!(observed[0].data, expected);
+        assert_eq!(observed[0].scope_id, started.instance_id);
+        let failed = history
+            .iter()
+            .filter(|event| event.kind == "job_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].data["job_id"], claimed_job.job_id);
+        assert_eq!(failed[0].data["code"], "SOURCE_ACCESS_REVOKED");
+        assert_eq!(
+            failed[0].data["message"],
+            repository::bounded_failure_message(&denied_reason)
         );
+        assert!(history.iter().all(|event| !matches!(
+            event.kind.as_str(),
+            "verification_passed"
+                | "verification_created"
+                | "verification_approved"
+                | "job_success"
+                | "scope_completed"
+                | "end_reached"
+                | "instance_completed"
+                | "business_error_caught"
+        )));
     }
 
     #[tokio::test]
@@ -1153,7 +1299,18 @@ mod tests {
         let result = failure("LARGE_REASON", reason.clone());
         assert!(result.summary.contains("original bytes="));
         assert!(result.summary.contains("sha256="));
-        fail_claim(&fixture.db, "overdue-worker", &claim, "LEASE_LOST", &reason).unwrap();
+        fail_claim(
+            &fixture.db,
+            "overdue-worker",
+            &claim,
+            "LEASE_LOST",
+            &reason,
+            Some(&ObservedActivityResult {
+                result: observed.clone(),
+                origin: ActivityResultOrigin::Envelope,
+            }),
+        )
+        .unwrap();
         let current =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
                 .unwrap();
@@ -1175,7 +1332,13 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("sha256="));
-        assert!(history.iter().all(|event| event.kind != "service_result"));
+        let retained = history
+            .iter()
+            .filter(|event| event.kind == "service_result")
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].data["outputs"], observed.outputs);
+        assert_eq!(retained[0].data["result_origin"], "envelope");
     }
 
     #[tokio::test]
@@ -1261,7 +1424,8 @@ mod tests {
                     "late-worker",
                     "LATE_ERROR",
                     "must not revive interrupted activation",
-                    now_ms()
+                    now_ms(),
+                    None
                 )
                 .unwrap());
                 if let Some(result) = &observed {
@@ -1567,7 +1731,11 @@ mod tests {
             *result_expression = Some("outputs.variables.actual_result".into());
             *output_mapping = BTreeMap::from([("answer".into(), "outputs.answer".into())]);
         }
-        let model = boundary_messages(model, "Service", &[("Notify", false, "EvidenceReady")]);
+        let mut model = embedded_model(model, "Scope");
+        if let ProcessNodeKind::SubProcess { output_mapping, .. } = &mut model.nodes[1].kind {
+            output_mapping.insert("answer".into(), "outputs.answer".into());
+        }
+        let model = boundary_messages(model, "Scope", &[("Notify", false, "EvidenceReady")]);
         let version = published(&fixture, &model);
         let started = start_version(&fixture, &version);
         execute(&fixture, "human-contract").await;
@@ -1617,11 +1785,21 @@ mod tests {
             &plan,
             at,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         let final_state =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
                 .unwrap();
         assert_eq!(final_state.variables["answer"], 17);
+        assert_eq!(
+            final_state
+                .scopes
+                .iter()
+                .find(|scope| scope.parent_scope_id.is_some())
+                .unwrap()
+                .status,
+            ProcessInstanceStatus::Completed
+        );
         assert_eq!(
             final_state.subscriptions[0].status,
             tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed
@@ -1675,7 +1853,8 @@ mod tests {
                 &plan,
                 at,
             )
-            .unwrap();
+            .unwrap()
+            .instance;
             first_incident.get_or_insert_with(|| rejected.incidents[0].incident_id.clone());
             if index < 20 {
                 repository::retry_job(
@@ -1713,6 +1892,7 @@ mod tests {
             subscriptions: None,
             event_races: None,
             outgoing_messages: None,
+            scopes: None,
             selected_user_task_id: first_task.clone(),
             selected_incident_id: first_incident.clone(),
         };
@@ -1760,6 +1940,125 @@ mod tests {
                 .unwrap()
                 .len(),
             21
+        );
+    }
+    #[tokio::test]
+    async fn rejected_scoped_result_budget_preserves_observed_effect_without_parent_return_or_rerun(
+    ) {
+        let fixture = Fixture::new();
+        let source=flow(&fixture.db,&fixture.owner,&json!({"nodes":[
+            {"id":"trigger","type":"trigger","config":{}},{"id":"output","type":"output","config":{}}
+        ],"edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}]}).to_string());
+        let mut body = service_model(
+            &source,
+            ActivityVerification::Condition {
+                expression: "true".into(),
+            },
+        );
+        if let ProcessNodeKind::ServiceTask {
+            input_mapping,
+            output_mapping,
+            ..
+        } = &mut body.nodes[1].kind
+        {
+            *input_mapping = BTreeMap::from([("payload".into(), "vars.large_parent".into())]);
+            *output_mapping = BTreeMap::from([("child_copy".into(), "outputs.payload".into())]);
+        }
+        let mut model = embedded_model(body, "Scope");
+        model
+            .variables
+            .insert("large_parent".into(), json!("x".repeat(180 * 1024)));
+        if let ProcessNodeKind::SubProcess { output_mapping, .. } = &mut model.nodes[1].kind {
+            *output_mapping =
+                BTreeMap::from([("returned_copy".into(), "outputs.child_copy".into())]);
+        }
+        let started = start_model(&fixture, &model);
+        let scope = started
+            .scopes
+            .iter()
+            .find(|scope| scope.parent_scope_id.is_some())
+            .unwrap()
+            .clone();
+        let claimed = execute(&fixture, "scope-budget-worker").await;
+        let actual =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(actual.instance.status, ProcessInstanceStatus::Incident);
+        assert_eq!(actual.instance.variables, started.variables);
+        let retained = actual
+            .jobs
+            .iter()
+            .find(|job| job.job_id == claimed.job.job_id)
+            .unwrap();
+        assert_eq!(retained.status, "error");
+        assert_eq!(retained.result_origin, Some(ActivityResultOrigin::Envelope));
+        assert_eq!(
+            retained.result.as_ref().unwrap().outputs["payload"],
+            started.variables["large_parent"]
+        );
+        assert_eq!(actual.scope_variables[&scope.scope_id], json!({}));
+        assert!(actual
+            .tokens
+            .iter()
+            .any(
+                |token| Some(token.token_id.as_str()) == scope.parent_token_id.as_deref()
+                    && token.status == "waiting"
+            ));
+        assert!(actual
+            .tokens
+            .iter()
+            .any(|token| token.token_id == claimed.job.token_id
+                && token.scope_id == scope.scope_id
+                && token.status == "waiting"));
+        assert!(actual
+            .instance
+            .incidents
+            .iter()
+            .any(|incident| incident.scope_id == scope.scope_id
+                && incident.code == "RESULT_REJECTED"));
+        let events =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        let observed = events
+            .iter()
+            .filter(|event| event.kind == "service_result")
+            .collect::<Vec<_>>();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].scope_id, scope.scope_id);
+        assert_eq!(
+            observed[0].data["outputs"],
+            retained.result.as_ref().unwrap().outputs
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.kind != "scope_completed" && event.kind != "business_error_caught"));
+        assert_eq!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &source, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        execute_claimed(
+            &fixture.db,
+            fixture.dispatcher(),
+            "scope-budget-worker",
+            claimed,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &source, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0,
+            events
         );
     }
 }

@@ -15,6 +15,7 @@ const ELEMENTS = [
   ['BoundaryError', 'boundary_error', 'alert-triangle', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
+  ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
   ['ParallelGateway', 'parallel_gateway', 'plus', 'gateways', 72, 72],
   ['EventBasedGateway', 'event_based_gateway', 'branch', 'gateways', 72, 72],
@@ -49,6 +50,15 @@ export function processNodeConfig(kind) {
   if (kind === 'BoundaryMessage') return { attachedToId: '', cancelActivity: true,
     messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'BoundaryError') return { attachedToId: '', errorRef: null, outputMapping: {} };
+  if (kind === 'SubProcess') {
+    const suffix = crypto.randomUUID().replaceAll('-', '_');
+    const start = `LocalStart_${suffix}`, end = `LocalEnd_${suffix}`;
+    return { body: {
+      nodes: [{ id: start, name: '', kind: 'Start' }, { id: end, name: '', kind: 'End' }],
+      sequenceFlows: [{ id: `LocalFlow_${suffix}`, sourceId: start, targetId: end, condition: null }],
+      variables: {}, diagram: { shapes: [], edges: [] },
+    }, inputMapping: {}, outputMapping: {} };
+  }
   return {};
 }
 
@@ -58,6 +68,15 @@ export function processHasTimerStart(model) {
 
 export function processHasMessageStart(model) {
   return model.nodes.some((node) => typeof node.kind === 'object' && 'MessageStart' in node.kind);
+}
+
+export function processHasTimer(model) {
+  return model.nodes.some((node) => {
+    if (typeof node.kind !== 'object') return false;
+    const kind = Object.keys(node.kind)[0];
+    return ['TimerStart', 'TimerCatch', 'BoundaryTimer'].includes(kind)
+      || (kind === 'SubProcess' && processHasTimer(node.kind.SubProcess.body));
+  });
 }
 
 export function processBoundaryKind(type) {
@@ -77,10 +96,45 @@ export function emptyProcessModel() {
   };
 }
 
-export function processToCanvas(model) {
-  const shapes = new Map(model.diagram.shapes.map((shape) => [shape.elementId, shape]));
-  const routes = new Map(model.diagram.edges.map((edge) => [edge.sequenceFlowId, edge.waypoints]));
-  const nodes = model.nodes.map((node, index) => {
+export function processBody(model, path = []) {
+  let body = model;
+  for (const nodeId of path) {
+    const node = body.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node || typeof node.kind !== 'object' || !node.kind.SubProcess) throw new Error(I18n.t('bpmn.unsupported_element'));
+    body = node.kind.SubProcess.body;
+  }
+  return body;
+}
+
+export function cloneProcessBody(body) {
+  const copy = structuredClone(body);
+  const ids = new Map();
+  for (const node of copy.nodes) ids.set(node.id, `Node_${crypto.randomUUID().replaceAll('-', '_')}`);
+  const flows = new Map();
+  for (const flow of copy.sequenceFlows) flows.set(flow.id, `Flow_${crypto.randomUUID().replaceAll('-', '_')}`);
+  for (const node of copy.nodes) {
+    node.id = ids.get(node.id);
+    if (typeof node.kind !== 'object') continue;
+    const [kind, config] = Object.entries(node.kind)[0];
+    if (kind === 'SubProcess') config.body = cloneProcessBody(config.body);
+    if (kind === 'ExclusiveGateway' && config.defaultFlowId) config.defaultFlowId = flows.get(config.defaultFlowId);
+    if (['BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind)) config.attachedToId = ids.get(config.attachedToId);
+  }
+  for (const flow of copy.sequenceFlows) {
+    flow.id = flows.get(flow.id);
+    flow.sourceId = ids.get(flow.sourceId);
+    flow.targetId = ids.get(flow.targetId);
+  }
+  for (const shape of copy.diagram.shapes) shape.elementId = ids.get(shape.elementId);
+  for (const edge of copy.diagram.edges) edge.sequenceFlowId = flows.get(edge.sequenceFlowId);
+  return copy;
+}
+
+export function processToCanvas(model, path = []) {
+  const body = processBody(model, path);
+  const shapes = new Map(body.diagram.shapes.map((shape) => [shape.elementId, shape]));
+  const routes = new Map(body.diagram.edges.map((edge) => [edge.sequenceFlowId, edge.waypoints]));
+  const nodes = body.nodes.map((node, index) => {
     const kind = typeof node.kind === 'string' ? node.kind : Object.keys(node.kind)[0];
     const element = ELEMENTS.find(([value]) => value === kind);
     if (!element) throw new Error(I18n.t('bpmn.unsupported_element'));
@@ -102,7 +156,7 @@ export function processToCanvas(model) {
     node.x = parent.x + parent.width / 2 + dx * scale - node.width / 2;
     node.y = parent.y + parent.height / 2 + dy * scale - node.height / 2;
   }
-  const edges = model.sequenceFlows.map((edge) => ({ id: edge.id,
+  const edges = body.sequenceFlows.map((edge) => ({ id: edge.id,
     from_node: edge.sourceId, to_node: edge.targetId, from_port: 'full', to_port: 'in',
     condition: edge.condition, waypoints: structuredClone(routes.get(edge.id) || []),
     originalEndpoints: [byId.get(edge.sourceId)?.x, byId.get(edge.sourceId)?.y,
@@ -110,15 +164,8 @@ export function processToCanvas(model) {
   return { nodes, edges };
 }
 
-export function canvasToProcess(model, nodes, edges, edgePoints) {
-  return { schemaVersion: model.schemaVersion, processId: model.processId,
-    variables: structuredClone(model.variables),
-    ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
-    ...(model.workCalendar == null ? {} : { workCalendar: structuredClone(model.workCalendar) }),
-    ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
-    ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
-    ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
-    ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
+export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
+  const graph = {
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
@@ -127,6 +174,21 @@ export function canvasToProcess(model, nodes, edges, edgePoints) {
     sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null })),
     diagram: { shapes: nodes.map((node) => ({ elementId: node.id, x: node.x, y: node.y, width: node.width, height: node.height })),
       edges: edges.map((edge) => ({ sequenceFlowId: edge.id, waypoints: edgePoints(edge) })) },
+  };
+  if (path.length) {
+    const full = structuredClone(model);
+    Object.assign(processBody(full, path), graph);
+    return full;
+  }
+  return { schemaVersion: model.schemaVersion, processId: model.processId,
+    variables: structuredClone(model.variables),
+    ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
+    ...(model.workCalendar == null ? {} : { workCalendar: structuredClone(model.workCalendar) }),
+    ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
+    ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
+    ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
+    ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
+    ...graph,
   };
 }
 

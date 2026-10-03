@@ -225,7 +225,7 @@ pub fn process_dispatch(
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
             let mut snapshots = Vec::new();
-            for node in &definition.model.nodes {
+            for node in crate::processes::model::all_nodes(&definition.model) {
                 if let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind {
                     let executor = dispatcher(ctx)?;
                     let meta = executor
@@ -405,6 +405,18 @@ pub fn process_dispatch(
             instance: repository::get_instance(pool, &actor, instance_id, pages.as_ref())
                 .map_err(error)?,
         },
+        P::ScopeGetRequest {
+            instance_id,
+            scope_id,
+        } => {
+            let (scope, variables, active_node_ids) =
+                repository::get_scope(pool, &actor, instance_id, scope_id).map_err(error)?;
+            P::ScopeGetResponse {
+                scope,
+                variables,
+                active_node_ids,
+            }
+        }
         P::UserTaskGetRequest {
             instance_id,
             user_task_id,
@@ -438,7 +450,7 @@ pub fn process_dispatch(
                     at_ms,
                 )
                 .map_err(error)?;
-                repository::complete_user_task(
+                let outcome = repository::complete_user_task(
                     pool,
                     &actor,
                     &stamp,
@@ -450,7 +462,11 @@ pub fn process_dispatch(
                     &plan,
                     at_ms,
                 )
-                .map_err(error)?
+                .map_err(error)?;
+                if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                    runtime::signal_cancelled_claims(executor, &outcome.cancelled_claims);
+                }
+                outcome.instance
             };
             if let Some(executor) = ctx.state.router.flow_dispatcher() {
                 runtime::wake(executor);
@@ -462,7 +478,7 @@ pub fn process_dispatch(
             instance_id,
             expected_revision,
         } => {
-            let instance = repository::cancel_instance(
+            let outcome = repository::cancel_instance(
                 pool,
                 &actor,
                 &stamp(payload, command_id)?,
@@ -471,9 +487,11 @@ pub fn process_dispatch(
             )
             .map_err(error)?;
             if let Some(executor) = ctx.state.router.flow_dispatcher() {
-                runtime::cancel_instance(executor, instance_id);
+                runtime::signal_cancelled_claims(executor, &outcome.cancelled_claims);
             }
-            P::InstanceCancelResponse { instance }
+            P::InstanceCancelResponse {
+                instance: outcome.instance,
+            }
         }
         P::JobRetryRequest {
             command_id,
@@ -623,6 +641,7 @@ pub fn process_dispatch(
         | P::InstanceStartResponse { .. }
         | P::InstanceListResponse { .. }
         | P::InstanceGetResponse { .. }
+        | P::ScopeGetResponse { .. }
         | P::UserTaskGetResponse { .. }
         | P::UserTaskCompleteResponse { .. }
         | P::InstanceCancelResponse { .. }
@@ -664,6 +683,7 @@ register_request!("ProcessXmlExportRequest");
 register_request!("ProcessInstanceStartRequest");
 register_request!("ProcessInstanceListRequest");
 register_request!("ProcessInstanceGetRequest");
+register_request!("ProcessScopeGetRequest");
 register_request!("ProcessUserTaskGetRequest");
 register_request!("ProcessUserTaskCompleteRequest");
 register_request!("ProcessInstanceCancelRequest");
@@ -1583,6 +1603,38 @@ mod tests {
         else {
             panic!("instance expected")
         };
+        let scope_response = request(
+            &participant_ctx,
+            P::ScopeGetRequest {
+                instance_id: instance.instance_id.clone(),
+                scope_id: instance.instance_id.clone(),
+            },
+        )
+        .await;
+        let P::ScopeGetResponse {
+            scope,
+            variables,
+            active_node_ids,
+        } = &scope_response
+        else {
+            panic!("actual participant scope detail expected")
+        };
+        assert_eq!(scope.scope_id, instance.instance_id);
+        assert!(scope.parent_scope_id.is_none());
+        assert_eq!(variables, &instance.variables);
+        assert_eq!(
+            active_node_ids,
+            &vec![instance.user_tasks[0].node_id.clone()]
+        );
+        refused(&participant_ctx, scope_response).await;
+        refused(
+            &outsider_ctx,
+            P::ScopeGetRequest {
+                instance_id: instance.instance_id.clone(),
+                scope_id: instance.instance_id.clone(),
+            },
+        )
+        .await;
         let message_id = uuid::Uuid::new_v4().to_string();
         let send = P::MessageSendRequest {
             command_id: uuid::Uuid::new_v4().to_string(),
@@ -1717,6 +1769,7 @@ mod tests {
             subscriptions: None,
             event_races: None,
             outgoing_messages: None,
+            scopes: None,
             selected_user_task_id: Some(task_id.clone()),
             selected_incident_id: None,
         };

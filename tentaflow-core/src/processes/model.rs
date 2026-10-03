@@ -1,10 +1,11 @@
 // ============ File: model.rs — B1 process graph validation and structured parallel joins ============
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, ensure, Context, Result};
 use tentaflow_protocol::processes::{
-    ProcessMessageTargetSpec, ProcessModel, ProcessNodeKind, ProcessTimerSpec,
+    ProcessDiagram, ProcessMessageTargetSpec, ProcessModel, ProcessNode, ProcessNodeKind,
+    ProcessSequenceFlow, ProcessTimerSpec,
 };
 
 use crate::flow_engine::expr;
@@ -16,6 +17,40 @@ pub const MAX_SEQUENCE_FLOWS: usize = 256;
 pub const MAX_VARIABLE_BYTES: usize = 256 * 1024;
 pub const MAX_VARIABLE_KEYS: usize = 128;
 const MAX_DI_COORDINATE: f64 = 1_000_000.0;
+
+pub fn scope_body<'a>(
+    model: &'a ProcessModel,
+    subprocess_node_ids: &[String],
+) -> Result<(&'a [ProcessNode], &'a [ProcessSequenceFlow], &'a BTreeMap<String, serde_json::Value>)> {
+    let mut nodes = model.nodes.as_slice();
+    let mut flows = model.sequence_flows.as_slice();
+    let mut variables = &model.variables;
+    for node_id in subprocess_node_ids {
+        let node = nodes.iter().find(|node| node.id == *node_id)
+            .with_context(|| format!("subprocess {node_id} is outside its parent body"))?;
+        let ProcessNodeKind::SubProcess { body, .. } = &node.kind else {
+            bail!("scope path node {node_id} is not a subprocess");
+        };
+        nodes = &body.nodes;
+        flows = &body.sequence_flows;
+        variables = &body.variables;
+    }
+    Ok((nodes, flows, variables))
+}
+
+pub fn all_nodes(model: &ProcessModel) -> Vec<&ProcessNode> {
+    fn visit<'a>(nodes: &'a [ProcessNode], result: &mut Vec<&'a ProcessNode>) {
+        for node in nodes {
+            result.push(node);
+            if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+                visit(&body.nodes, result);
+            }
+        }
+    }
+    let mut nodes = Vec::new();
+    visit(&model.nodes, &mut nodes);
+    nodes
+}
 
 pub fn starter_model() -> ProcessModel {
     use tentaflow_protocol::processes::{ProcessDiagram, ProcessNode, ProcessSequenceFlow};
@@ -216,29 +251,7 @@ pub fn validate_timer_spec(spec: &ProcessTimerSpec, is_start: bool) -> Result<()
 }
 
 fn validate_timer_model(model: &ProcessModel) -> Result<()> {
-    let mut has_timer = false;
-    for node in &model.nodes {
-        match &node.kind {
-            ProcessNodeKind::TimerStart { timer } => {
-                validate_timer_spec(timer, true)
-                    .with_context(|| format!("timer start {}", node.id))?;
-                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
-                    ensure!(model.work_calendar.is_some(), "working timer requires a configured calendar");
-                }
-                has_timer = true;
-            }
-            ProcessNodeKind::TimerCatch { timer }
-            | ProcessNodeKind::BoundaryTimer { timer, .. } => {
-                validate_timer_spec(timer, false)
-                    .with_context(|| format!("timer event {}", node.id))?;
-                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
-                    ensure!(model.work_calendar.is_some(), "working timer requires a configured calendar");
-                }
-                has_timer = true;
-            }
-            _ => {}
-        }
-    }
+    let has_timer = validate_timer_nodes(&model.nodes, model.work_calendar.is_some())?;
     if let Some(calendar) = &model.work_calendar {
         super::calendar::validate_work_calendar(calendar)?;
         let bytes = serde_json::to_vec(&serde_json::json!({
@@ -267,6 +280,36 @@ fn validate_timer_model(model: &ProcessModel) -> Result<()> {
     Ok(())
 }
 
+fn validate_timer_nodes(nodes: &[ProcessNode], has_calendar: bool) -> Result<bool> {
+    let mut has_timer = false;
+    for node in nodes {
+        match &node.kind {
+            ProcessNodeKind::TimerStart { timer } => {
+                validate_timer_spec(timer, true)
+                    .with_context(|| format!("timer start {}", node.id))?;
+                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
+                    ensure!(has_calendar, "working timer requires a configured calendar");
+                }
+                has_timer = true;
+            }
+            ProcessNodeKind::TimerCatch { timer }
+            | ProcessNodeKind::BoundaryTimer { timer, .. } => {
+                validate_timer_spec(timer, false)
+                    .with_context(|| format!("timer event {}", node.id))?;
+                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
+                    ensure!(has_calendar, "working timer requires a configured calendar");
+                }
+                has_timer = true;
+            }
+            ProcessNodeKind::SubProcess { body, .. } => {
+                has_timer |= validate_timer_nodes(&body.nodes, has_calendar)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(has_timer)
+}
+
 pub fn validate_variables(value: &serde_json::Value) -> Result<()> {
     let object = value
         .as_object()
@@ -292,131 +335,128 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
         "invalid process model identity"
     );
     ensure!(
-        model.nodes.len() <= MAX_NODES && model.sequence_flows.len() <= MAX_SEQUENCE_FLOWS,
-        "process draft exceeds B1 graph limits"
-    );
-    ensure!(
         serde_json::to_vec(model)?.len() <= MAX_MODEL_BYTES,
         "process draft exceeds 512 KiB"
     );
-    validate_variables(&serde_json::to_value(&model.variables)?)?;
     validate_timer_model(model)?;
     let mut all_ids = HashSet::from([model.process_id.as_str()]);
     validate_declarations(model, &mut all_ids)?;
-    for node in &model.nodes {
-        ensure!(
-            valid_id(&node.id) && all_ids.insert(node.id.as_str()),
-            "invalid or duplicate BPMN ID: {}",
-            node.id
-        );
-        ensure!(
-            node.name.len() <= 256 && !node.name.chars().any(char::is_control),
-            "invalid node name"
-        );
+    let mut node_count = 0;
+    let mut flow_count = 0;
+    validate_draft_body(
+        &model.nodes, &model.sequence_flows, &model.variables, &model.diagram,
+        0, &mut all_ids, &mut node_count, &mut flow_count,
+    )
+}
+
+fn validate_draft_body<'a>(
+    nodes: &'a [ProcessNode],
+    flows: &'a [ProcessSequenceFlow],
+    variables: &BTreeMap<String, serde_json::Value>,
+    diagram: &ProcessDiagram,
+    depth: usize,
+    all_ids: &mut HashSet<&'a str>,
+    node_count: &mut usize,
+    flow_count: &mut usize,
+) -> Result<()> {
+    ensure!(depth <= 3, "embedded subprocess depth exceeds three levels");
+    *node_count += nodes.len();
+    *flow_count += flows.len();
+    ensure!(*node_count <= MAX_NODES && *flow_count <= MAX_SEQUENCE_FLOWS,
+        "process draft exceeds whole-tree graph limits");
+    validate_variables(&serde_json::to_value(variables)?)?;
+    for node in nodes {
+        ensure!(valid_id(&node.id) && all_ids.insert(node.id.as_str()),
+            "invalid or duplicate BPMN ID: {}", node.id);
+        ensure!(node.name.len() <= 256 && !node.name.chars().any(char::is_control),
+            "invalid node name");
         match &node.kind {
-            ProcessNodeKind::ServiceTask {
-                input_mapping,
-                output_mapping,
-                verification,
-                timeout_seconds,
-                result_expression,
-                ..
-            } => {
-                ensure!(
-                    (1..=600).contains(timeout_seconds),
-                    "service timeout outside 1..=600 seconds"
-                );
+            ProcessNodeKind::ServiceTask { input_mapping, output_mapping, verification,
+                timeout_seconds, result_expression, .. } => {
+                ensure!((1..=600).contains(timeout_seconds),
+                    "service timeout outside 1..=600 seconds");
                 validate_mapping(input_mapping)?;
                 validate_mapping(output_mapping)?;
-                if let tentaflow_protocol::processes::ActivityVerification::Condition {
-                    expression,
-                } = verification
-                {
+                if let tentaflow_protocol::processes::ActivityVerification::Condition { expression } = verification {
                     expr::validate_syntax(expression, None)?;
                 }
                 if let Some(expression) = result_expression {
                     validate_expression(expression, "service result expression", false)?;
                 }
             }
-            ProcessNodeKind::UserTask { output_mapping, .. } => validate_mapping(output_mapping)?,
-            ProcessNodeKind::MessageStart { output_mapping, .. }
+            ProcessNodeKind::UserTask { output_mapping, .. }
+            | ProcessNodeKind::MessageStart { output_mapping, .. }
             | ProcessNodeKind::BoundaryError { output_mapping, .. } => validate_mapping(output_mapping)?,
-            ProcessNodeKind::MessageCatch {
-                correlation_expression,
-                output_mapping,
-                ..
-            }
-            | ProcessNodeKind::BoundaryMessage {
-                correlation_expression,
-                output_mapping,
-                ..
-            } => {
+            ProcessNodeKind::MessageCatch { correlation_expression, output_mapping, .. }
+            | ProcessNodeKind::BoundaryMessage { correlation_expression, output_mapping, .. } => {
                 validate_expression(correlation_expression, "message correlation expression", false)?;
                 validate_mapping(output_mapping)?;
             }
-            ProcessNodeKind::MessageThrow {
-                target,
-                correlation_expression,
-                payload_expression,
-                ttl_seconds,
-                ..
-            } => {
+            ProcessNodeKind::MessageThrow { target, correlation_expression, payload_expression,
+                ttl_seconds, .. } => {
                 validate_message_target(target, false)?;
                 validate_expression(correlation_expression, "message correlation expression", false)?;
                 validate_expression(payload_expression, "message payload expression", false)?;
-                ensure!((1..=604_800).contains(ttl_seconds), "message TTL outside 1..=604800 seconds");
+                ensure!((1..=604_800).contains(ttl_seconds),
+                    "message TTL outside 1..=604800 seconds");
+            }
+            ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
+                validate_mapping(input_mapping)?;
+                validate_mapping(output_mapping)?;
+                validate_draft_body(&body.nodes, &body.sequence_flows, &body.variables,
+                    &body.diagram, depth + 1, all_ids, node_count, flow_count)?;
             }
             _ => {}
         }
-    }
-    let mut flow_ids = HashSet::new();
-    for flow in &model.sequence_flows {
-        ensure!(
-            valid_id(&flow.id) && flow_ids.insert(flow.id.as_str()) && all_ids.insert(flow.id.as_str()),
-            "invalid or duplicate BPMN ID: {}",
-            flow.id
-        );
-        if let Some(expression) = &flow.condition {
-            expr::validate_syntax(expression, None)?;
+        if depth > 0 {
+            ensure!(!matches!(node.kind, ProcessNodeKind::TimerStart { .. }
+                | ProcessNodeKind::MessageStart { .. }),
+                "timer and message starts are root-only: {}", node.id);
         }
     }
-    let nodes = model
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect();
-    validate_diagram(model, &nodes, &flow_ids)
+    let mut flow_ids = HashSet::new();
+    for flow in flows {
+        ensure!(valid_id(&flow.id) && flow_ids.insert(flow.id.as_str())
+            && all_ids.insert(flow.id.as_str()),
+            "invalid or duplicate BPMN ID: {}", flow.id);
+        if let Some(expression) = &flow.condition {
+            validate_expression(expression, "sequence flow condition", true)?;
+        }
+    }
+    let node_map = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    validate_diagram(diagram, nodes, flows, &node_map, &flow_ids)
 }
 
 pub fn validate_model(model: &ProcessModel) -> Result<()> {
     validate_draft(model)?;
-    ensure!(
-        model.schema_version == 1,
-        "unsupported process model schema version"
-    );
-    ensure!(valid_id(&model.process_id), "invalid process ID");
-    ensure!(
-        !model.nodes.is_empty() && model.nodes.len() <= MAX_NODES,
-        "process node count exceeds B1 limit"
-    );
-    ensure!(
-        !model.sequence_flows.is_empty() && model.sequence_flows.len() <= MAX_SEQUENCE_FLOWS,
-        "process sequence flow count exceeds B1 limit"
-    );
-    ensure!(
-        serde_json::to_vec(model)?.len() <= MAX_MODEL_BYTES,
-        "process model exceeds 512 KiB"
-    );
-    validate_variables(&serde_json::to_value(&model.variables)?)?;
-    validate_timer_model(model)?;
-
-    let mut nodes = HashMap::new();
     let message_ids: HashSet<_> = model.messages.iter().map(|message| message.message_id.as_str()).collect();
     let error_ids: HashSet<_> = model.errors.iter().map(|error| error.error_id.as_str()).collect();
     let mut used_messages = HashSet::new();
     let mut used_errors = HashSet::new();
+    validate_body(
+        &model.nodes, &model.sequence_flows, &model.diagram, 0,
+        &message_ids, &error_ids, &mut used_messages, &mut used_errors,
+    )?;
+    ensure!(message_ids == used_messages, "unreferenced message declaration");
+    ensure!(error_ids == used_errors, "unreferenced error declaration");
+    Ok(())
+}
+
+fn validate_body<'a>(
+    graph_nodes: &'a [ProcessNode],
+    graph_flows: &'a [ProcessSequenceFlow],
+    diagram: &ProcessDiagram,
+    depth: usize,
+    message_ids: &HashSet<&str>,
+    error_ids: &HashSet<&str>,
+    used_messages: &mut HashSet<&'a str>,
+    used_errors: &mut HashSet<&'a str>,
+) -> Result<()> {
+    ensure!(!graph_nodes.is_empty() && !graph_flows.is_empty(),
+        "process body requires nodes and sequence flows");
+    let mut nodes = HashMap::new();
     let mut boundary_error_handlers = HashSet::new();
-    for node in &model.nodes {
+    for node in graph_nodes {
         ensure!(valid_id(&node.id), "invalid node ID: {}", node.id);
         ensure!(
             node.name.len() <= 256 && !node.name.chars().any(char::is_control),
@@ -497,15 +537,21 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 ensure!(boundary_error_handlers.insert((attached_to_id.as_str(), error_ref.as_deref())), "duplicate boundary error handler on {}", attached_to_id);
                 validate_mapping(output_mapping)?;
             }
+            ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
+                ensure!(depth < 3, "embedded subprocess depth exceeds three levels");
+                validate_mapping(input_mapping)?;
+                validate_mapping(output_mapping)?;
+                validate_body(&body.nodes, &body.sequence_flows, &body.diagram,
+                    depth + 1, message_ids, error_ids, used_messages, used_errors)
+                    .with_context(|| format!("embedded subprocess {}", node.id))?;
+            }
             _ => {}
         }
     }
-    ensure!(message_ids == used_messages, "unreferenced message declaration");
-    ensure!(error_ids == used_errors, "unreferenced error declaration");
     let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut flow_ids = HashSet::new();
-    for flow in &model.sequence_flows {
+    for flow in graph_flows {
         ensure!(valid_id(&flow.id), "invalid sequence flow ID: {}", flow.id);
         ensure!(
             flow_ids.insert(flow.id.as_str()),
@@ -537,23 +583,23 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             .push(&flow.source_id);
     }
 
-    let starts: Vec<_> = model
-        .nodes
-        .iter()
+    let starts: Vec<_> = graph_nodes.iter()
         .filter(|node| matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::MessageStart { .. }))
         .collect();
+    if depth > 0 {
+        ensure!(starts.iter().all(|node| matches!(node.kind, ProcessNodeKind::Start)),
+            "timer and message starts are root-only");
+    }
     ensure!(
         starts.len() == 1,
         "process requires exactly one start event"
     );
     ensure!(
-        model
-            .nodes
-            .iter()
+        graph_nodes.iter()
             .any(|node| matches!(node.kind, ProcessNodeKind::End)),
         "process requires an end event"
     );
-    for node in &model.nodes {
+    for node in graph_nodes {
         let in_count = incoming.get(node.id.as_str()).map_or(0, Vec::len);
         let out_count = outgoing.get(node.id.as_str()).map_or(0, Vec::len);
         match &node.kind {
@@ -571,7 +617,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 );
                 ensure!(
                     matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                        Some(ProcessNodeKind::ServiceTask { .. }))
+                        Some(ProcessNodeKind::ServiceTask { .. } | ProcessNodeKind::SubProcess { .. }))
                         || (!matches!(node.kind, ProcessNodeKind::BoundaryError { .. })
                             && matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                                 Some(ProcessNodeKind::UserTask { .. }))),
@@ -581,7 +627,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             }
             ProcessNodeKind::EventBasedGateway => {
                 ensure!(in_count == 1 && (2..=8).contains(&out_count), "event gateway {} needs one incoming and 2..=8 outgoing flows", node.id);
-                for flow in model.sequence_flows.iter().filter(|flow| flow.source_id == node.id) {
+                for flow in graph_flows.iter().filter(|flow| flow.source_id == node.id) {
                     ensure!(flow.condition.is_none(), "event gateway {} cannot have conditions", node.id);
                     let branch = nodes[flow.target_id.as_str()];
                     ensure!(
@@ -614,9 +660,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 );
                 if let Some(default_id) = default_flow_id {
                     ensure!(
-                        model
-                            .sequence_flows
-                            .iter()
+                        graph_flows.iter()
                             .any(|flow| flow.id == *default_id
                                 && flow.source_id == node.id
                                 && flow.condition.is_none()),
@@ -633,16 +677,14 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         }
         if !matches!(node.kind, ProcessNodeKind::ExclusiveGateway { .. }) {
             ensure!(
-                model
-                    .sequence_flows
-                    .iter()
+                graph_flows.iter()
                     .filter(|flow| flow.source_id == node.id)
                     .all(|flow| flow.condition.is_none()),
                 "conditions require an exclusive gateway"
             );
         }
     }
-    let pairs = and_pairs(model)?;
+    let pairs = and_pairs(graph_nodes, graph_flows)?;
     let joins: HashMap<&str, &str> = pairs
         .iter()
         .map(|(split, join)| (join.as_str(), split.as_str()))
@@ -652,7 +694,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         .keys()
         .map(|id| (*id, incoming.get(id).map_or(0, Vec::len)))
         .collect();
-    for node in &model.nodes {
+    for node in graph_nodes {
         if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
         | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
         | ProcessNodeKind::BoundaryError { attached_to_id, .. } = &node.kind {
@@ -676,7 +718,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         }
     }
     ensure!(
-        order.len() == model.nodes.len(),
+        order.len() == graph_nodes.len(),
         "process contains a cycle or unreachable node (unsupported in B1)"
     );
     let mut can_end = HashSet::new();
@@ -732,7 +774,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 states.insert(*target, (region.clone(), stack.clone()));
             }
         }
-        for boundary in model.nodes.iter().filter(|candidate| {
+        for boundary in graph_nodes.iter().filter(|candidate| {
             matches!(&candidate.kind,
                 ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
                 | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
@@ -747,18 +789,19 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             states.insert(boundary.id.as_str(), (boundary.id.clone(), Vec::new()));
         }
     }
-    validate_event_gateway_regions(model, &nodes, &outgoing, &order)?;
-    validate_diagram(model, &nodes, &flow_ids)?;
+    validate_event_gateway_regions(graph_nodes, graph_flows, &nodes, &outgoing, &order)?;
+    validate_diagram(diagram, graph_nodes, graph_flows, &nodes, &flow_ids)?;
     Ok(())
 }
 
 fn validate_event_gateway_regions<'a>(
-    model: &'a ProcessModel,
+    graph_nodes: &'a [ProcessNode],
+    graph_flows: &[ProcessSequenceFlow],
     nodes: &HashMap<&'a str, &'a tentaflow_protocol::processes::ProcessNode>,
     outgoing: &HashMap<&'a str, Vec<&'a str>>,
     order: &[&'a str],
 ) -> Result<()> {
-    for gateway in model.nodes.iter().filter(|node| matches!(node.kind, ProcessNodeKind::EventBasedGateway)) {
+    for gateway in graph_nodes.iter().filter(|node| matches!(node.kind, ProcessNodeKind::EventBasedGateway)) {
         let branches = outgoing.get(gateway.id.as_str()).context("event gateway lacks branches")?;
         let mut branch_reach = Vec::with_capacity(branches.len());
         for branch in branches {
@@ -778,7 +821,7 @@ fn validate_event_gateway_regions<'a>(
             matches!(nodes[common].kind, ProcessNodeKind::End)
                 || matches!(&nodes[common].kind, ProcessNodeKind::ExclusiveGateway { default_flow_id: None }
                     if outgoing.get(common).map_or(0, Vec::len) == 1
-                        && model.sequence_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
+                        && graph_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
             "event gateway {} branches merge at unsupported node {}",
             gateway.id,
             common
@@ -817,17 +860,19 @@ fn validate_mapping(mapping: &std::collections::BTreeMap<String, String>) -> Res
 }
 
 fn validate_diagram(
-    model: &ProcessModel,
-    nodes: &HashMap<&str, &tentaflow_protocol::processes::ProcessNode>,
+    diagram: &ProcessDiagram,
+    graph_nodes: &[ProcessNode],
+    graph_flows: &[ProcessSequenceFlow],
+    nodes: &HashMap<&str, &ProcessNode>,
     flow_ids: &HashSet<&str>,
 ) -> Result<()> {
     ensure!(
-        model.diagram.shapes.len() <= model.nodes.len()
-            && model.diagram.edges.len() <= model.sequence_flows.len(),
+        diagram.shapes.len() <= graph_nodes.len()
+            && diagram.edges.len() <= graph_flows.len(),
         "process diagram exceeds graph element count"
     );
     let mut shape_ids = HashSet::new();
-    for shape in &model.diagram.shapes {
+    for shape in &diagram.shapes {
         ensure!(
             nodes.contains_key(shape.element_id.as_str())
                 && shape_ids.insert(shape.element_id.as_str()),
@@ -843,7 +888,7 @@ fn validate_diagram(
         );
     }
     let mut edge_ids = HashSet::new();
-    for edge in &model.diagram.edges {
+    for edge in &diagram.edges {
         ensure!(
             flow_ids.contains(edge.sequence_flow_id.as_str())
                 && edge_ids.insert(edge.sequence_flow_id.as_str()),
@@ -865,31 +910,27 @@ fn validate_diagram(
 }
 
 /// Maps each parallel split to the one join reached by every branch.
-pub fn and_pairs(model: &ProcessModel) -> Result<HashMap<String, String>> {
+pub fn and_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<HashMap<String, String>> {
     let outgoing = |id: &str| {
-        model
-            .sequence_flows
+        flows
             .iter()
             .filter(|flow| flow.source_id == id)
             .map(|flow| flow.target_id.as_str())
             .collect::<Vec<_>>()
     };
     let incoming = |id: &str| {
-        model
-            .sequence_flows
+        flows
             .iter()
             .filter(|flow| flow.target_id == id)
             .count()
     };
-    let joins: Vec<_> = model
-        .nodes
+    let joins: Vec<_> = nodes
         .iter()
         .filter(|node| {
             matches!(node.kind, ProcessNodeKind::ParallelGateway) && incoming(&node.id) >= 2
         })
         .collect();
-    let splits: Vec<_> = model
-        .nodes
+    let splits: Vec<_> = nodes
         .iter()
         .filter(|node| {
             matches!(node.kind, ProcessNodeKind::ParallelGateway) && outgoing(&node.id).len() >= 2
@@ -1222,6 +1263,61 @@ mod tests {
         assert!(validate_model(&model).is_err());
         model.diagram.shapes[0].x = 25.0;
         model.diagram.edges[0].waypoints[1].y = -1e300;
+        assert!(validate_model(&model).is_err());
+    }
+
+    fn embedded_model() -> ProcessModel {
+        use tentaflow_protocol::processes::ProcessSubProcess;
+        let mut model = starter_model();
+        model.nodes.insert(1, ProcessNode {
+            id: "Sub_1".into(), name: "Review scope".into(),
+            kind: ProcessNodeKind::SubProcess {
+                body: ProcessSubProcess {
+                    nodes: vec![
+                        ProcessNode { id: "LocalStart".into(), name: "Start".into(), kind: ProcessNodeKind::Start },
+                        ProcessNode { id: "LocalTask".into(), name: "Approve".into(),
+                            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                        ProcessNode { id: "LocalEnd".into(), name: "End".into(), kind: ProcessNodeKind::End },
+                    ],
+                    sequence_flows: vec![
+                        ProcessSequenceFlow { id: "LocalFlow1".into(), source_id: "LocalStart".into(), target_id: "LocalTask".into(), condition: None },
+                        ProcessSequenceFlow { id: "LocalFlow2".into(), source_id: "LocalTask".into(), target_id: "LocalEnd".into(), condition: None },
+                    ],
+                    variables: BTreeMap::from([("local_ID".into(), serde_json::json!("value"))]),
+                    diagram: ProcessDiagram::default(),
+                },
+                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+            },
+        });
+        model.sequence_flows[0].target_id = "Sub_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_2".into(), source_id: "Sub_1".into(), target_id: "End_1".into(), condition: None,
+        });
+        model
+    }
+
+    #[test]
+    fn embedded_scope_has_local_graph_and_global_identity() {
+        let mut model = embedded_model();
+        validate_model(&model).unwrap();
+        assert_eq!(scope_body(&model, &["Sub_1".into()]).unwrap().0.len(), 3);
+        assert_eq!(all_nodes(&model).len(), 6);
+        assert!(scope_body(&model, &["LocalTask".into()]).is_err());
+
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes[1].kind {
+            body.nodes[1].id = "End_1".into();
+        }
+        assert!(validate_model(&model).is_err());
+        let mut model = embedded_model();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes[1].kind {
+            body.sequence_flows[0].target_id = "End_1".into();
+        }
+        assert!(validate_model(&model).is_err());
+        let mut model = embedded_model();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes[1].kind {
+            body.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Duration { seconds: 60 } };
+        }
+        model.timer_timezone = Some("UTC".into());
         assert!(validate_model(&model).is_err());
     }
 }

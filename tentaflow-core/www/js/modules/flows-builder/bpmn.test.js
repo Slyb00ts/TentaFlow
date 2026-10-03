@@ -69,9 +69,9 @@ function definition(id = 'definition-one', overrides = {}) {
 function instance(id = 'instance-one', overrides = {}) {
   const value = { instanceId: id, definitionId: 'definition-one', definitionName: 'Document approval', initiatorUserId: 'owner', version: 2, revision: 11,
     status: 'Waiting', variables: { Purchase_ID: 'PO-7' }, activeNodeIds: ['Review'], userTasks: [], incidents: [], timers: [],
-    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], canSendMessage: false,
+    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], scopes: [], canSendMessage: false,
     createdAtMs: 1000, updatedAtMs: 2000, canCancel: false, canRetry: false, ...overrides };
-  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages'].map((name) =>
+  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes'].map((name) =>
     [name, { offset: 0, total: value[name].length, nextOffset: null, hasMore: false }]));
   return value;
 }
@@ -126,6 +126,45 @@ function boundaryModel() {
     waypoints: [{ x: 100, y: 180 }, { x: 300, y: 180 }] }));
   return model;
 }
+function embeddedModel() {
+  const model = emptyProcessModel();
+  const body = {
+    nodes: [
+      { id: 'Local_Start', name: 'Start work', kind: 'Start' },
+      { id: 'Local_Review', name: 'Review inside scope', kind: { UserTask: { assigneeUserId: 'anna', outputMapping: {} } } },
+      { id: 'Local_End', name: 'Complete work', kind: 'End' },
+    ],
+    sequenceFlows: [
+      { id: 'Local_Flow_1', sourceId: 'Local_Start', targetId: 'Local_Review', condition: null },
+      { id: 'Local_Flow_2', sourceId: 'Local_Review', targetId: 'Local_End', condition: null },
+    ],
+    variables: { local_ID: { business_key: 'kept' } },
+    diagram: {
+      shapes: [
+        { elementId: 'Local_Start', x: 40, y: 160, width: 56, height: 56 },
+        { elementId: 'Local_Review', x: 180, y: 140, width: 240, height: 96 },
+        { elementId: 'Local_End', x: 500, y: 160, width: 56, height: 56 },
+      ],
+      edges: [
+        { sequenceFlowId: 'Local_Flow_1', waypoints: [{ x: 96, y: 188 }, { x: 180, y: 188 }] },
+        { sequenceFlowId: 'Local_Flow_2', waypoints: [{ x: 420, y: 188 }, { x: 500, y: 188 }] },
+      ],
+    },
+  };
+  model.nodes.splice(1, 0, { id: 'Scope_Review', name: 'Review department', kind: { SubProcess: {
+    body, inputMapping: { local_ID: 'vars.source_ID' }, outputMapping: { accepted_ID: 'outputs.local_ID' },
+  } } });
+  model.sequenceFlows = [
+    { id: 'Root_Flow_1', sourceId: 'Start', targetId: 'Scope_Review', condition: null },
+    { id: 'Root_Flow_2', sourceId: 'Scope_Review', targetId: 'End', condition: null },
+  ];
+  model.diagram.shapes.splice(1, 0, { elementId: 'Scope_Review', x: 190, y: 140, width: 240, height: 96 });
+  model.diagram.edges = [
+    { sequenceFlowId: 'Root_Flow_1', waypoints: [{ x: 136, y: 188 }, { x: 190, y: 188 }] },
+    { sequenceFlowId: 'Root_Flow_2', waypoints: [{ x: 430, y: 188 }, { x: 400, y: 188 }] },
+  ];
+  return model;
+}
 function poll() { return [...intervals.values()].find((row) => row.delay === 3000)?.callback(); }
 async function monitor(current, additions = {}) {
   fixtures({ processInstanceGetRequest: { instance: current }, processHistoryRequest: { events: [], nextSeq: 0, hasMore: false }, ...additions });
@@ -153,6 +192,123 @@ test('model round trip preserves stable sequence IDs, DI, default path and opaqu
   assert.deepEqual(graph.getData(), model);
   assert.match(graph.nodesLayer.textContent, /<Choice>/);
   assert.equal(graph.nodesLayer.querySelector('choice'), null, 'names remain text');
+  graph.destroy();
+});
+
+test('embedded body edits preserve offscreen root graph, local variables and undo context', () => {
+  const model = embeddedModel();
+  const graph = canvas(model);
+  assert.deepEqual(graph.getData(), model);
+  graph.navigateProcessBody(['Scope_Review']);
+  assert.deepEqual(graph.processPath, ['Scope_Review']);
+  assert.deepEqual(graph.nodes.map((node) => node.id), ['Local_Start', 'Local_Review', 'Local_End']);
+  graph.updateNodeLabel('Local_Review', 'Review request');
+  graph.updateProcessVariables({ local_ID: { business_key: 'updated' } });
+  assert.equal(graph.getData().nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'updated');
+  graph.undo();
+  assert.deepEqual(graph.processPath, ['Scope_Review']);
+  assert.equal(graph.getData().nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'kept');
+  assert.equal(graph.nodes.find((node) => node.id === 'Local_Review').label, 'Review request');
+  graph.redo();
+  assert.equal(graph.getData().nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'updated');
+  graph.navigateProcessBody([]);
+  const saved = graph.getData();
+  assert.deepEqual(saved.nodes.map((node) => node.id), ['Start', 'Scope_Review', 'End']);
+  assert.deepEqual(saved.sequenceFlows.map((flow) => flow.id), ['Root_Flow_1', 'Root_Flow_2']);
+  assert.equal(saved.nodes[1].kind.SubProcess.body.nodes[1].name, 'Review request');
+  assert.equal(saved.nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'updated');
+  assert.deepEqual(saved.nodes[1].kind.SubProcess.inputMapping, { local_ID: 'vars.source_ID' });
+  graph.destroy();
+});
+
+test('editor enters a real subprocess and saves its complete root model after returning', async () => {
+  const current = definition('embedded-definition', { model: embeddedModel() });
+  const state = await mount(current, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...current, model: payload.model, draftRevision: 5 } }),
+  });
+  state.canvas.selectNode('Scope_Review');
+  await flush(2);
+  click(state.config.root.querySelector('[data-process-enter]'));
+  assert.deepEqual(state.canvas.processPath, ['Scope_Review']);
+  assert.equal(state.root.querySelector('[data-role="scope-up"]').hidden, false);
+  assert.match(state.root.querySelector('[data-role="scope-path"]').textContent, /Review department/);
+  state.canvas.updateNodeLabel('Local_Review', 'Reviewed inside scope');
+  click(state.root.querySelector('[data-role="scope-up"]'));
+  assert.deepEqual(state.canvas.processPath, []);
+  assert.equal(state.root.querySelector('[data-role="scope-up"]').hidden, true);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model;
+  assert.deepEqual(saved.nodes.map((node) => node.id), ['Start', 'Scope_Review', 'End']);
+  assert.equal(saved.nodes[1].kind.SubProcess.body.nodes[1].name, 'Reviewed inside scope');
+  assert.equal(saved.nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'kept');
+});
+
+test('participant inspects a scoped run through authorized ScopeGet without definition access', async () => {
+  const scope = { scopeId: 'scope-child-1', parentScopeId: 'instance-scoped', subprocessNodeId: 'Scope_Review',
+    subprocessNodeName: 'Review department', parentTokenId: 'waiting-parent', revision: 2,
+    status: 'Running', depth: 1, createdAtMs: 10, updatedAtMs: 20 };
+  const current = instance('instance-scoped', { scopes: [scope], activeNodeIds: ['Local_Review'] });
+  const win = await monitor(current, { processScopeGetRequest: (request) => {
+    assert.deepEqual(request, { instanceId: 'instance-scoped', scopeId: 'scope-child-1' });
+    return { scope, variables: { local_ID: { business_key: '<kept>' } }, activeNodeIds: ['Local_Review'] };
+  } });
+  const row = win.querySelector('[data-scope-id="scope-child-1"]');
+  assert.ok(row);
+  assert.match(row.textContent, /Review department/);
+  click(row.querySelector('[data-scope-inspect]'));
+  await flush(2);
+  const detail = win.querySelector('[data-scope-detail]');
+  assert.match(detail.textContent, /Local_Review/);
+  assert.match(detail.querySelector('tf-code-editor').value, /<kept>/);
+  assert.equal(detail.querySelector('kept'), null, 'business values remain text');
+  assert.equal(calls.some((call) => call.kind === 'processVersionGetRequest'), false);
+});
+
+test('all five locales render persisted subprocess history and interruption reasons', async () => {
+  const events = [
+    { kind: 'scope_entered', nodeName: null, data: { subprocess_node_id: 'Scope_Review' } },
+    { kind: 'scope_completed', nodeName: null, data: { subprocess_node_id: 'Scope_Review' } },
+    { kind: 'scope_cancelled', nodeName: null, data: { subprocess_node_id: 'Scope_Review', reason: 'scope_cancelled' } },
+    { kind: 'scope_entry_failed', nodeName: '<Review>', data: { subprocess_node_id: 'Scope_Review', reason: 'scope_limit', code: 'SCOPE_LIMIT' } },
+    { kind: 'scope_error_propagated', nodeName: '<Handler>', data: { code: 'BUSINESS_409' } },
+    { kind: 'incident', nodeName: 'Scope_Review', data: { code: 'SCOPE_LIMIT', message: 'process instance reached its 129-scope lifetime limit' } },
+  ];
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    for (const event of events) {
+      const rendered = processEventText(event);
+      assert.doesNotMatch(rendered, /bpmn\.|scope_(?:entered|completed|cancelled|entry_failed|error_propagated|limit)|SCOPE_LIMIT/);
+    }
+    assert.match(processEventText(events[0]), /Scope_Review/, 'the stable element ID is labeled by the localized event');
+    assert.match(processEventText(events[4]), /BUSINESS_409/, 'the actual business error code remains visible');
+    assert.notEqual(processLifecycleReasonText('scope_cancelled'), 'scope_cancelled');
+    assert.equal(processLifecycleReasonText('<private>&'), '<private>&', 'arbitrary diagnostics remain intact');
+  }
+  await I18n.setLanguage('en');
+  const history = events.map((event, index) => ({ ...event, seq: index + 1, atMs: 1000 + index }));
+  const win = await monitor(instance('scope-history'), {
+    processHistoryRequest: { events: history, nextSeq: history.length, hasMore: false },
+  });
+  assert.match(win.textContent, /Scope_Review/);
+  assert.match(win.textContent, /<Review>/);
+  assert.equal(win.querySelector('review'), null, 'node names remain escaped text in history');
+});
+
+test('duplicating a subprocess rekeys its complete local graph without rewriting the original', () => {
+  const graph = canvas(embeddedModel());
+  graph.duplicateNodes(['Scope_Review']);
+  const model = graph.getData();
+  const original = model.nodes.find((node) => node.id === 'Scope_Review').kind.SubProcess.body;
+  const duplicate = model.nodes.find((node) => node.id !== 'Scope_Review' && node.kind?.SubProcess)?.kind.SubProcess.body;
+  assert.ok(duplicate);
+  assert.deepEqual(original.nodes.map((node) => node.id), ['Local_Start', 'Local_Review', 'Local_End']);
+  assert.deepEqual(duplicate.nodes.map((node) => node.name), original.nodes.map((node) => node.name));
+  assert.deepEqual(duplicate.variables, original.variables);
+  assert.equal(new Set([...original.nodes, ...duplicate.nodes].map((node) => node.id)).size, 6);
+  assert.equal(new Set([...original.sequenceFlows, ...duplicate.sequenceFlows].map((flow) => flow.id)).size, 4);
+  assert.ok(duplicate.sequenceFlows.every((flow) => duplicate.nodes.some((node) => node.id === flow.sourceId)
+    && duplicate.nodes.some((node) => node.id === flow.targetId)));
+  assert.deepEqual(duplicate.diagram.shapes.map((shape) => shape.elementId), duplicate.nodes.map((node) => node.id));
   graph.destroy();
 });
 
@@ -458,7 +614,7 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 15);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 16);
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1023,7 +1179,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 15);
+    assert.equal(processTemplates().length, 16);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
@@ -1166,9 +1322,9 @@ test('process timezone requires an explicit value and actual undo/redo preserves
   const field = state.root.querySelector('[data-role="timer-timezone"]');
   assert.equal(field.hidden, false); assert.equal(field.value, '');
   assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false, 'no UTC default is fabricated');
+  state.canvas.updateProcessVariables({ ...state.canvas.getData().variables, Current_Key: 'preserved' });
   change(field, 'Europe/Warsaw');
   assert.equal(state.canvas.getData().timerTimezone, 'Europe/Warsaw');
-  state.canvas.processModel.variables.Current_Key = 'preserved';
   state.canvas.undo(); assert.equal(field.value, '');
   assert.equal(state.canvas.getData().variables.Current_Key, 'preserved', 'timezone undo does not revert independently edited variables');
   state.canvas.redo(); assert.equal(field.value, 'Europe/Warsaw');

@@ -47,6 +47,7 @@ export class FlowPalette {
     this.root = rootEl;
     this.opts = opts;
     this.mode = opts.mode || 'flow';
+    this.processDepth = 0;
     this.templates = [];
     // node_type występujące w kilku wariantach (presety agentów). Dla nich
     // nazwa z i18n jest wspólna, więc paleta musi pokazać etykietę szablonu —
@@ -114,6 +115,11 @@ export class FlowPalette {
 
   getTemplates() { return this.templates; }
 
+  setProcessDepth(depth) {
+    this.processDepth = depth;
+    if (this.listEl) this._render();
+  }
+
   /** Nazwa wpisu palety — preset mówi własną etykietą, reszta tłumaczeniem typu. */
   _nameOf(tpl) {
     if (this.presetTypes.has(tpl.node_type) && tpl.label) return tpl.label;
@@ -127,10 +133,14 @@ export class FlowPalette {
 
   _render() {
     const groups = {};
-    const total = this.templates.length;
+    const available = this.templates.filter((tpl) => this.processDepth === 0
+      || (!['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)
+        && (this.processDepth < 3 || tpl.node_type !== 'bpmn_sub_process')));
+    const total = available.length;
     let shown = 0;
     for (let i = 0; i < this.templates.length; i += 1) {
       const tpl = this.templates[i];
+      if (!available.includes(tpl)) continue;
       const c = catFor(tpl);
       const label = this._nameOf(tpl).toLowerCase();
       const desc = this._descOf(tpl).toLowerCase();

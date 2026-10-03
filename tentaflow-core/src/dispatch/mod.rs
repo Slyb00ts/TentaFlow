@@ -2863,6 +2863,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::MessageResolveResponse { .. } => "ProcessMessageResolveResponse",
                 P::MessageCancelRequest { .. } => "ProcessMessageCancelRequest",
                 P::MessageCancelResponse { .. } => "ProcessMessageCancelResponse",
+                P::ScopeGetRequest { .. } => "ProcessScopeGetRequest",
+                P::ScopeGetResponse { .. } => "ProcessScopeGetResponse",
 
             }
         }

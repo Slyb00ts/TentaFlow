@@ -10,7 +10,7 @@ use tentaflow_protocol::processes::{
     ActivityVerification, ProcessCalendarPin, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
     ProcessErrorDeclaration, ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessNode,
     ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessTimerSpec,
-    ProcessWorkCalendar,
+    ProcessSubProcess, ProcessWorkCalendar,
 };
 
 use super::model::{validate_model, validate_timer_spec, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
@@ -21,6 +21,14 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
+const GRAPH_ELEMENTS: [(&str, &str); 13] = [
+    (BPMN, "extensionElements"), (BPMN, "startEvent"),
+    (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
+    (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
+    (BPMN, "serviceTask"), (BPMN, "subProcess"),
+    (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
+    (BPMN, "parallelGateway"), (BPMN, "sequenceFlow"),
+];
 
 #[derive(Debug)]
 struct Element {
@@ -723,6 +731,37 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 result_expression,
             }
         }
+        "subProcess" => {
+            element.attrs_only(&["id", "name", "triggeredByEvent"])?;
+            ensure!(element.attr("triggeredByEvent").is_none_or(|value| value == "false"),
+                "event subprocess {} is unsupported at byte {}", id, element.offset);
+            element.children_only(&GRAPH_ELEMENTS)?;
+            let extension = element.child(BPMN, "extensionElements")?
+                .context("embedded subprocess requires TentaFlow extension")?;
+            extension.attrs_only(&[])?;
+            extension.children_only(&[(TF, "subProcess")])?;
+            ensure!(extension.children.len() == 1, "embedded subprocess requires one TentaFlow extension");
+            let config = extension.child(TF, "subProcess")?.expect("validated subprocess extension");
+            config.attrs_only(&[])?;
+            config.children_only(&[(TF, "variables"), (TF, "inputMapping"), (TF, "outputMapping")])?;
+            let variables = config.child(TF, "variables")?
+                .context("subprocess requires local variables")?;
+            variables.attrs_only(&[])?;
+            ensure!(variables.children.is_empty() && variables.text.len() <= MAX_VARIABLE_BYTES,
+                "invalid subprocess variables at byte {}", variables.offset);
+            let variables: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(variables.text.trim()).map_err(|error| XmlElementError {
+                    message: format!("invalid subprocess variables at byte {}: {error}", variables.offset),
+                    element_id: Some(id.clone()), offset: variables.offset,
+                })?;
+            validate_variables(&serde_json::to_value(&variables)?)?;
+            let (nodes, sequence_flows) = graph_from_xml(element, target_namespace)?;
+            ProcessNodeKind::SubProcess {
+                body: ProcessSubProcess { nodes, sequence_flows, variables, diagram: ProcessDiagram::default() },
+                input_mapping: mapping(config, "inputMapping")?,
+                output_mapping: mapping(config, "outputMapping")?,
+            }
+        }
         other => bail!("unsupported BPMN node {other} at byte {}", element.offset),
     };
     match &kind {
@@ -758,8 +797,16 @@ fn diagram_from_xml(element: &Element, process_id: &str) -> Result<ProcessDiagra
     plane.children_only(&[(BPMNDI, "BPMNShape"), (BPMNDI, "BPMNEdge")])?;
     let mut diagram = ProcessDiagram::default();
     for child in &plane.children {
-        child.attrs_only(&["id", "bpmnElement"])?;
         if child.is(BPMNDI, "BPMNShape") {
+            child.attrs_only(&["id", "bpmnElement", "isExpanded"])?;
+            if let Some(expanded) = child.attr("isExpanded") {
+                if expanded != "false" && expanded != "0" {
+                    return Err(XmlElementError {
+                        message: format!("expanded subprocess diagram is unsupported at byte {}", child.offset),
+                        element_id: Some(child.required("bpmnElement")?), offset: child.offset,
+                    }.into());
+                }
+            }
             child.children_only(&[(DC, "Bounds")])?;
             ensure!(child.children.len() == 1, "BPMNShape requires Bounds");
             let bounds = child.child(DC, "Bounds")?.expect("validated Bounds");
@@ -773,6 +820,7 @@ fn diagram_from_xml(element: &Element, process_id: &str) -> Result<ProcessDiagra
                 height: bounds.required("height")?.parse()?,
             });
         } else {
+            child.attrs_only(&["id", "bpmnElement"])?;
             child.children_only(&[(DI, "waypoint")])?;
             let mut waypoints = Vec::new();
             for point in &child.children {
@@ -793,6 +841,58 @@ fn diagram_from_xml(element: &Element, process_id: &str) -> Result<ProcessDiagra
         }
     }
     Ok(diagram)
+}
+
+fn partition_body_diagram(body: &mut ProcessSubProcess, diagram: &mut ProcessDiagram) {
+    for node in &mut body.nodes {
+        if let ProcessNodeKind::SubProcess { body: child, .. } = &mut node.kind {
+            partition_body_diagram(child, diagram);
+        }
+    }
+    let node_ids: HashSet<&str> = body.nodes.iter().map(|node| node.id.as_str()).collect();
+    let flow_ids: HashSet<&str> = body.sequence_flows.iter().map(|flow| flow.id.as_str()).collect();
+    let (owned_shapes, remaining_shapes) = std::mem::take(&mut diagram.shapes)
+        .into_iter().partition(|shape| node_ids.contains(shape.element_id.as_str()));
+    let (owned_edges, remaining_edges) = std::mem::take(&mut diagram.edges)
+        .into_iter().partition(|edge| flow_ids.contains(edge.sequence_flow_id.as_str()));
+    body.diagram = ProcessDiagram { shapes: owned_shapes, edges: owned_edges };
+    diagram.shapes = remaining_shapes;
+    diagram.edges = remaining_edges;
+}
+
+fn graph_from_xml(element: &Element, namespace: &str) -> Result<(Vec<ProcessNode>, Vec<ProcessSequenceFlow>)> {
+    let mut nodes = Vec::new();
+    let mut sequence_flows = Vec::new();
+    for child in &element.children {
+        if child.is(BPMN, "extensionElements") { continue; }
+        if child.is(BPMN, "sequenceFlow") {
+            child.attrs_only(&["id", "sourceRef", "targetRef"])?;
+            child.children_only(&[(BPMN, "conditionExpression")])?;
+            ensure!(child.children.len() <= 1, "sequence flow has multiple conditions");
+            let condition = child.child(BPMN, "conditionExpression")?
+                .map(|condition| {
+                    condition.attrs_only(&["language"])?;
+                    if let Some(language) = condition.attr("language") {
+                        ensure!(language == "https://cel.dev/spec", "unsupported expression language");
+                    }
+                    ensure!(condition.children.is_empty(), "condition expression must be text");
+                    Ok(condition.text.clone())
+                }).transpose()?;
+            sequence_flows.push(ProcessSequenceFlow {
+                id: child.required("id")?, source_id: child.required("sourceRef")?,
+                target_id: child.required("targetRef")?, condition,
+            });
+        } else {
+            nodes.push(node_from_xml(child, namespace).map_err(|error| {
+                if error.downcast_ref::<XmlElementError>().is_some() { error }
+                else { XmlElementError {
+                    message: format!("invalid BPMN element {} at byte {}: {error}", child.local, child.offset),
+                    element_id: child.attr("id").map(str::to_string), offset: child.offset,
+                }.into() }
+            })?);
+        }
+    }
+    Ok((nodes, sequence_flows))
 }
 
 fn parse_model(xml: &str) -> Result<ProcessModel> {
@@ -836,69 +936,10 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
             .is_none_or(|value| value == "true"),
         "non-executable process is unsupported"
     );
-    process.children_only(&[
-        (BPMN, "extensionElements"),
-        (BPMN, "startEvent"),
-        (BPMN, "intermediateCatchEvent"),
-        (BPMN, "intermediateThrowEvent"),
-        (BPMN, "boundaryEvent"),
-        (BPMN, "endEvent"),
-        (BPMN, "userTask"),
-        (BPMN, "serviceTask"),
-        (BPMN, "exclusiveGateway"),
-        (BPMN, "eventBasedGateway"),
-        (BPMN, "parallelGateway"),
-        (BPMN, "sequenceFlow"),
-    ])?;
+    process.children_only(&GRAPH_ELEMENTS)?;
     let process_id = process.required("id")?;
     let (variables, timer_timezone, work_calendar, calendar_pin) = process_configuration(process, &process_id)?;
-    let mut nodes = Vec::new();
-    let mut sequence_flows = Vec::new();
-    for child in &process.children {
-        if child.is(BPMN, "extensionElements") {
-            continue;
-        }
-        if child.is(BPMN, "sequenceFlow") {
-            child.attrs_only(&["id", "sourceRef", "targetRef"])?;
-            child.children_only(&[(BPMN, "conditionExpression")])?;
-            ensure!(
-                child.children.len() <= 1,
-                "sequence flow has multiple conditions"
-            );
-            let condition = child
-                .child(BPMN, "conditionExpression")?
-                .map(|condition| {
-                    condition.attrs_only(&["language"])?;
-                    if let Some(language) = condition.attr("language") {
-                        ensure!(
-                            language == "https://cel.dev/spec",
-                            "unsupported expression language"
-                        );
-                    }
-                    ensure!(
-                        condition.children.is_empty(),
-                        "condition expression must be text"
-                    );
-                    Ok(condition.text.clone())
-                })
-                .transpose()?;
-            sequence_flows.push(ProcessSequenceFlow {
-                id: child.required("id")?,
-                source_id: child.required("sourceRef")?,
-                target_id: child.required("targetRef")?,
-                condition,
-            });
-        } else {
-            nodes.push(node_from_xml(child, namespace).map_err(|error| {
-                if error.downcast_ref::<XmlElementError>().is_some() { error }
-                else { XmlElementError {
-                    message: format!("invalid BPMN element {} at byte {}: {error}", child.local, child.offset),
-                    element_id: child.attr("id").map(str::to_string),
-                    offset: child.offset,
-                }.into() }
-            })?);
-        }
-    }
+    let (mut nodes, sequence_flows) = graph_from_xml(process, namespace)?;
     for node in &nodes {
         let message_ref = match &node.kind {
             ProcessNodeKind::MessageStart { message_ref, .. }
@@ -940,11 +981,16 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         .filter(|child| child.is(BPMNDI, "BPMNDiagram"))
         .collect();
     ensure!(diagrams.len() <= 1, "B1 XML supports one BPMN diagram");
-    let diagram = diagrams
+    let mut diagram = diagrams
         .first()
         .map(|element| diagram_from_xml(element, &process_id))
         .transpose()?
         .unwrap_or_default();
+    for node in &mut nodes {
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut node.kind {
+            partition_body_diagram(body, &mut diagram);
+        }
+    }
     let model = ProcessModel {
         schema_version: 1,
         process_id,
@@ -1000,34 +1046,24 @@ fn generated_xml_id(preferred: &str, used: &mut HashSet<String>) -> String {
     candidate
 }
 
-pub fn export_xml(model: &ProcessModel) -> Result<String> {
-    validate_model(model)?;
-    let namespace = model.target_namespace.as_deref().unwrap_or(TF);
-    let declarations = !model.messages.is_empty() || !model.errors.is_empty();
-    let tns = if declarations { format!(" xmlns:tns=\"{}\"", escaped(namespace)) } else { String::new() };
-    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns} targetNamespace=\"{}\">", escaped(namespace));
-    for message in &model.messages {
-        xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
+fn collect_diagram<'a>(
+    nodes: &'a [ProcessNode], diagram: &'a ProcessDiagram,
+    shapes: &mut Vec<&'a ProcessShape>, edges: &mut Vec<&'a ProcessEdgeDiagram>,
+    used_ids: &mut HashSet<String>,
+) {
+    used_ids.extend(nodes.iter().map(|node| node.id.clone()));
+    shapes.extend(&diagram.shapes);
+    edges.extend(&diagram.edges);
+    for node in nodes {
+        if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+            used_ids.extend(body.sequence_flows.iter().map(|flow| flow.id.clone()));
+            collect_diagram(&body.nodes, &body.diagram, shapes, edges, used_ids);
+        }
     }
-    for error in &model.errors {
-        xml.push_str(&format!("<bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\"/>", escaped(&error.error_id), escaped(&error.name), escaped(&error.error_code)));
-    }
-    xml.push_str(&format!("<bpmn:process id=\"{}\" isExecutable=\"true\">", escaped(&model.process_id)));
-    xml.push_str(&format!(
-        "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables>",
-        escaped(&serde_json::to_string(&model.variables)?)
-    ));
-    if let Some(timezone) = &model.timer_timezone {
-        xml.push_str(&format!("<tentaflow:timerTimezone>{}</tentaflow:timerTimezone>", escaped(timezone)));
-    }
-    if let Some(calendar) = &model.work_calendar {
-        xml.push_str(&format!("<tentaflow:workCalendar>{}</tentaflow:workCalendar>", escaped(&serde_json::to_string(calendar)?)));
-    }
-    if let Some(pin) = &model.calendar_pin {
-        xml.push_str(&format!("<tentaflow:calendarPin>{}</tentaflow:calendarPin>", escaped(&serde_json::to_string(pin)?)));
-    }
-    xml.push_str("</bpmn:extensionElements>");
-    for node in &model.nodes {
+}
+
+fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<()> {
+    for node in nodes {
         let (tag, extra) = match &node.kind {
             ProcessNodeKind::Start => ("startEvent", String::new()),
             ProcessNodeKind::TimerStart { .. } => ("startEvent", String::new()),
@@ -1061,6 +1097,7 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
             ),
             ProcessNodeKind::UserTask { .. } => ("userTask", String::new()),
             ProcessNodeKind::ServiceTask { .. } => ("serviceTask", String::new()),
+            ProcessNodeKind::SubProcess { .. } => ("subProcess", String::new()),
         };
         xml.push_str(&format!(
             "<bpmn:{tag} id=\"{}\" name=\"{}\"{extra}",
@@ -1174,10 +1211,26 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
                 xml.push_str("</tentaflow:service></bpmn:extensionElements>");
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
+            ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
+                xml.push_str("><bpmn:extensionElements><tentaflow:subProcess>");
+                xml.push_str(&format!("<tentaflow:variables>{}</tentaflow:variables>",
+                    escaped(&serde_json::to_string(&body.variables)?)));
+                if !input_mapping.is_empty() {
+                    xml.push_str(&format!("<tentaflow:inputMapping>{}</tentaflow:inputMapping>",
+                        escaped(&serde_json::to_string(input_mapping)?)));
+                }
+                if !output_mapping.is_empty() {
+                    xml.push_str(&format!("<tentaflow:outputMapping>{}</tentaflow:outputMapping>",
+                        escaped(&serde_json::to_string(output_mapping)?)));
+                }
+                xml.push_str("</tentaflow:subProcess></bpmn:extensionElements>");
+                write_graph(xml, &body.nodes, &body.sequence_flows)?;
+                xml.push_str(&format!("</bpmn:{tag}>"));
+            }
             _ => xml.push_str("/>"),
         }
     }
-    for flow in &model.sequence_flows {
+    for flow in flows {
         xml.push_str(&format!(
             "<bpmn:sequenceFlow id=\"{}\" sourceRef=\"{}\" targetRef=\"{}\"",
             escaped(&flow.id),
@@ -1190,21 +1243,58 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
             xml.push_str("/>");
         }
     }
+    Ok(())
+}
+
+pub fn export_xml(model: &ProcessModel) -> Result<String> {
+    validate_model(model)?;
+    let namespace = model.target_namespace.as_deref().unwrap_or(TF);
+    let declarations = !model.messages.is_empty() || !model.errors.is_empty();
+    let tns = if declarations { format!(" xmlns:tns=\"{}\"", escaped(namespace)) } else { String::new() };
+    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns} targetNamespace=\"{}\">", escaped(namespace));
+    for message in &model.messages {
+        xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
+    }
+    for error in &model.errors {
+        xml.push_str(&format!("<bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\"/>", escaped(&error.error_id), escaped(&error.name), escaped(&error.error_code)));
+    }
+    xml.push_str(&format!("<bpmn:process id=\"{}\" isExecutable=\"true\">", escaped(&model.process_id)));
+    xml.push_str(&format!(
+        "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables>",
+        escaped(&serde_json::to_string(&model.variables)?)
+    ));
+    if let Some(timezone) = &model.timer_timezone {
+        xml.push_str(&format!("<tentaflow:timerTimezone>{}</tentaflow:timerTimezone>", escaped(timezone)));
+    }
+    if let Some(calendar) = &model.work_calendar {
+        xml.push_str(&format!("<tentaflow:workCalendar>{}</tentaflow:workCalendar>", escaped(&serde_json::to_string(calendar)?)));
+    }
+    if let Some(pin) = &model.calendar_pin {
+        xml.push_str(&format!("<tentaflow:calendarPin>{}</tentaflow:calendarPin>", escaped(&serde_json::to_string(pin)?)));
+    }
+    xml.push_str("</bpmn:extensionElements>");
+    write_graph(&mut xml, &model.nodes, &model.sequence_flows)?;
     xml.push_str("</bpmn:process>");
-    if !model.diagram.shapes.is_empty() || !model.diagram.edges.is_empty() {
-        let mut used_ids = HashSet::from([model.process_id.clone()]);
-        used_ids.extend(model.messages.iter().map(|declaration| declaration.message_id.clone()));
-        used_ids.extend(model.errors.iter().map(|declaration| declaration.error_id.clone()));
-        used_ids.extend(model.nodes.iter().map(|node| node.id.clone()));
-        used_ids.extend(model.sequence_flows.iter().map(|flow| flow.id.clone()));
+    let mut used_ids = HashSet::from([model.process_id.clone()]);
+    used_ids.extend(model.messages.iter().map(|declaration| declaration.message_id.clone()));
+    used_ids.extend(model.errors.iter().map(|declaration| declaration.error_id.clone()));
+    used_ids.extend(model.sequence_flows.iter().map(|flow| flow.id.clone()));
+    let mut shapes = Vec::new();
+    let mut edges = Vec::new();
+    collect_diagram(&model.nodes, &model.diagram, &mut shapes, &mut edges, &mut used_ids);
+    if !shapes.is_empty() || !edges.is_empty() {
+        let subprocess_ids: HashSet<&str> = super::model::all_nodes(model).into_iter()
+            .filter(|node| matches!(node.kind, ProcessNodeKind::SubProcess { .. }))
+            .map(|node| node.id.as_str()).collect();
         let diagram_id = generated_xml_id("Diagram_1", &mut used_ids);
         let plane_id = generated_xml_id("Plane_1", &mut used_ids);
         xml.push_str(&format!("<bpmndi:BPMNDiagram id=\"{}\"><bpmndi:BPMNPlane id=\"{}\" bpmnElement=\"{}\">",escaped(&diagram_id),escaped(&plane_id),escaped(&model.process_id)));
-        for shape in &model.diagram.shapes {
+        for shape in shapes {
             let shape_id = generated_xml_id(&format!("DI_{}", shape.element_id), &mut used_ids);
-            xml.push_str(&format!("<bpmndi:BPMNShape id=\"{}\" bpmnElement=\"{}\"><dc:Bounds x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></bpmndi:BPMNShape>",escaped(&shape_id),escaped(&shape.element_id),shape.x,shape.y,shape.width,shape.height));
+            let collapsed = if subprocess_ids.contains(shape.element_id.as_str()) { " isExpanded=\"false\"" } else { "" };
+            xml.push_str(&format!("<bpmndi:BPMNShape id=\"{}\" bpmnElement=\"{}\"{collapsed}><dc:Bounds x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></bpmndi:BPMNShape>",escaped(&shape_id),escaped(&shape.element_id),shape.x,shape.y,shape.width,shape.height));
         }
-        for edge in &model.diagram.edges {
+        for edge in edges {
             let edge_id = generated_xml_id(&format!("DI_{}", edge.sequence_flow_id), &mut used_ids);
             xml.push_str(&format!(
                 "<bpmndi:BPMNEdge id=\"{}\" bpmnElement=\"{}\">",
@@ -1886,4 +1976,56 @@ mod tests {
         assert_eq!(diagnostics[0].element_id.as_deref(), Some("Process_1"));
         assert!(diagnostics[0].offset.is_some());
     }
+    #[test]
+    fn embedded_subprocess_xml_round_trip_partitions_di_and_rejects_expansion() {
+        let mut model = super::super::model::starter_model();
+        model.nodes.insert(1, ProcessNode {
+            id: "Sub_1".into(), name: "Review & scope".into(),
+            kind: ProcessNodeKind::SubProcess {
+                body: ProcessSubProcess {
+                    nodes: vec![
+                        ProcessNode { id: "LocalStart".into(), name: "Local start".into(), kind: ProcessNodeKind::Start },
+                        ProcessNode { id: "LocalEnd".into(), name: "Local end".into(), kind: ProcessNodeKind::End },
+                    ],
+                    sequence_flows: vec![ProcessSequenceFlow {
+                        id: "LocalFlow".into(), source_id: "LocalStart".into(),
+                        target_id: "LocalEnd".into(), condition: None,
+                    }],
+                    variables: BTreeMap::from([("local_ID".into(), serde_json::json!("A & B"))]),
+                    diagram: ProcessDiagram {
+                        shapes: vec![ProcessShape {
+                            element_id: "LocalStart".into(), x: 30.0, y: 40.0,
+                            width: 36.0, height: 36.0,
+                        }],
+                        edges: vec![ProcessEdgeDiagram {
+                            sequence_flow_id: "LocalFlow".into(),
+                            waypoints: vec![ProcessPoint { x: 66.0, y: 58.0 }, ProcessPoint { x: 130.0, y: 58.0 }],
+                        }],
+                    },
+                },
+                input_mapping: BTreeMap::from([("local_ID".into(), "vars.source_ID".into())]),
+                output_mapping: BTreeMap::from([("result_ID".into(), "outputs.local_ID".into())]),
+            },
+        });
+        model.sequence_flows[0].target_id = "Sub_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_2".into(), source_id: "Sub_1".into(), target_id: "End_1".into(), condition: None,
+        });
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "Sub_1".into(), x: 120.0, y: 80.0, width: 160.0, height: 100.0,
+        });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:subProcess id=\"Sub_1\""));
+        assert!(xml.contains("bpmnElement=\"Sub_1\" isExpanded=\"false\""));
+        assert_eq!(import_xml(&xml).0, Some(model.clone()));
+        let expanded = xml.replacen("isExpanded=\"false\"", "isExpanded=\"true\"", 1);
+        let (parsed, diagnostics) = import_xml(&expanded);
+        assert!(parsed.is_none());
+        assert_eq!(diagnostics[0].element_id.as_deref(), Some("Sub_1"));
+        assert!(diagnostics[0].offset.is_some());
+        let event_subprocess = xml.replacen("<bpmn:subProcess id=\"Sub_1\"",
+            "<bpmn:subProcess triggeredByEvent=\"true\" id=\"Sub_1\"", 1);
+        assert!(import_xml(&event_subprocess).0.is_none());
+    }
+
 }

@@ -1312,20 +1312,27 @@
 
 /* Process notation shares the editor shell and retains the model's DI bounds. */
 .fb-process-shell { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
-.fb-process-shell .fb-topbar { flex-wrap: wrap; padding-block: 8px; overflow-x: visible; gap: 8px; }
+.fb-process-shell .fb-topbar { flex-wrap: wrap; align-content: flex-start; max-height: 180px; padding-block: 8px; overflow-x: hidden; overflow-y: auto; gap: 8px; }
 .fb-process-shell .fb-topbar > tf-button { flex-shrink: 0; }
 .fb-process-shell .fb-topbar-separator { display: none; }
 .fb-process-shell .fb-topbar-spacer { flex-basis: 20px; }
-.fb-process-shell .fb-config-header { flex-shrink: 0; }
+.fb-process-shell .fb-config-header,
+.fb-process-shell .fb-config-footer { flex: none; }
+.fb-process-shell .fb-config-body { min-height: 0; }
 .fb-process-shell .fb-config-title,
 .fb-process-shell .fb-config-subtitle { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
-.fb-process-shell .fb-flow-name textarea,
+.fb-process-shell .fb-config-title { max-height: 4.5em; overflow-x: hidden; overflow-y: auto; }
+.fb-process-shell .fb-flow-name textarea { max-height: none; resize: none; overflow-wrap: anywhere; }
 .fb-process-shell [data-process="name"] textarea { max-height: none; resize: none; overflow-wrap: anywhere; }
-.fb-process-shell .fb-bottombar { flex-wrap: wrap; min-height: 44px; padding-block: 8px; overflow: visible; }
+.fb-process-shell .fb-bottombar { flex-wrap: wrap; align-content: flex-start; min-height: 44px; max-height: 132px; padding-block: 8px; overflow-x: hidden; overflow-y: auto; }
 .fb-process-shell .fb-breadcrumb { flex: 1 1 360px; min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .fb-process-shell .fb-breadcrumb .fb-crumb { min-width: 0; }
 .fb-process-shell .fb-breadcrumb .fb-crumb:first-child,
 .fb-process-shell .fb-breadcrumb .fb-sep { flex: none; }
+.fb-process-shell .fb-breadcrumb-scoped { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); flex: 1 0 100%; align-items: start; gap: 4px 8px; }
+.fb-process-shell .fb-breadcrumb-scoped [data-role="scope-path"] { grid-column: 3; max-height: 4em; overflow-y: auto; }
+.fb-process-shell .fb-breadcrumb-scoped .fb-sep { grid-column: 1; grid-row: 2; }
+.fb-process-shell .fb-breadcrumb-scoped [data-role="crumb-name"] { grid-column: 2 / -1; grid-row: 2; max-height: 4em; overflow-y: auto; }
 .fb-process-shell .fb-canvas-wrap { display: flex; flex-direction: column; }
 .fb-process-shell [data-role="canvas"] { position: relative; flex: 1; min-height: 0; }
 .fb-process-shell .fb-minimap { position: relative; right: auto; bottom: auto; align-self: flex-end; flex: none; width: 120px; height: 80px; margin: 12px; }

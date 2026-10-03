@@ -134,12 +134,13 @@ pub fn prepare_throw(
 }
 pub(super) fn mapped_variables(
     mapping: &std::collections::BTreeMap<String, String>,
-    variables: &Value,
+    local: &Value,
+    effective: &Value,
     payload: &Value,
     scope_name: &str,
     metadata: Value,
 ) -> Result<Value> {
-    let mut result = variables.clone();
+    let mut result = local.clone();
     let target = result
         .as_object_mut()
         .context("process variables must be an object")?;
@@ -148,7 +149,7 @@ pub(super) fn mapped_variables(
             name.clone(),
             super::runtime::evaluate(
                 expression,
-                variables,
+                effective,
                 payload,
                 &[(scope_name.to_owned(), metadata.clone())],
             )?,
@@ -182,6 +183,7 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64) -> Result<R
             let vars = mapped_variables(
                 output_mapping,
                 &serde_json::to_value(&version.model.variables)?,
+                &serde_json::to_value(&version.model.variables)?,
                 payload,
                 "message",
                 metadata.clone(),
@@ -199,6 +201,7 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64) -> Result<R
                 at_ms,
             )?;
             plan.events.push(repository::PlannedEvent {
+                scope_id: instance_id.clone(),
                 kind: "message_delivered".into(),
                 node_id: Some(start.id.clone()),
                 data: json!({"message":metadata,"payload":payload,"message_id":m.key.message_id}),
@@ -237,7 +240,9 @@ pub fn drain_pending(pool: &DbPool, at_ms: i64) -> MessageDrainOutcome {
                             repository::deliver_message(pool, &snapshot, &plan, at_ms)?
                         {
                             result.delivered += 1;
-                            result.cancelled_claims.extend(committed.cancelled_claims);
+                            result
+                                .cancelled_claims
+                                .extend(committed.transition.cancelled_claims);
                         }
                     }
                     MessageSelection::NoMatch => {
@@ -378,6 +383,7 @@ pub(crate) mod test_support {
             now,
         )
         .unwrap()
+        .instance
     }
     pub fn envelope(target: ProcessMessageTarget, payload: Value) -> PreparedMessage {
         PreparedMessage {
@@ -424,6 +430,13 @@ pub(crate) mod test_support {
         activity: &str,
         definitions: &[(&str, bool, &str)],
     ) -> ProcessModel {
+        let end_id = model
+            .nodes
+            .iter()
+            .find(|node| node.kind == ProcessNodeKind::End)
+            .unwrap()
+            .id
+            .clone();
         for (id, cancel, name) in definitions {
             let declaration = format!("Declaration_{id}");
             model.messages.push(ProcessMessageDeclaration {
@@ -451,7 +464,7 @@ pub(crate) mod test_support {
             });
             model.sequence_flows.extend([
                 edge(&format!("BoundaryPath_{id}"), id, &format!("Side_{id}")),
-                edge(&format!("BoundaryEnd_{id}"), &format!("Side_{id}"), "End_1"),
+                edge(&format!("BoundaryEnd_{id}"), &format!("Side_{id}"), &end_id),
             ]);
         }
         model
@@ -785,7 +798,8 @@ mod tests {
             &first.instance_id,
             first.revision,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         drain_pending(&f.db, at + 1).completion.unwrap();
         assert_eq!(current(&f, &message).message.status, M::Cancelled);
         assert_eq!(
@@ -1068,7 +1082,8 @@ mod tests {
             &plan,
             at,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, I::Completed);
         let message_id = completed.outgoing_messages[0].message_id.clone();
         assert_eq!(
@@ -1396,6 +1411,7 @@ mod tests {
         unrelated
             .add_incidents
             .push(tentaflow_protocol::processes::ProcessIncident {
+                scope_id: snapshot.instance.instance_id.clone(),
                 incident_id: id.clone(),
                 node_id: Some("Catch_1".into()),
                 node_name: None,
@@ -1413,7 +1429,8 @@ mod tests {
             &unrelated,
             at,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         let good = envelope(
             catch_target(
                 &version,
@@ -1870,7 +1887,8 @@ mod tests {
             &plan,
             at,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         drain_pending(&f.db, at + 1).completion.unwrap();
         let payload = repository::get_message(
             &f.db,

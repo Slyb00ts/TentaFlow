@@ -1,6 +1,6 @@
 // ============ File: repository.rs — transactional BPMN definitions and runtime state ============
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -13,11 +13,12 @@ use tentaflow_protocol::processes::{
     ProcessEventRaceStatus, ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection,
     ProcessInstance, ProcessInstancePageInfo, ProcessInstancePageRequest, ProcessInstanceStatus,
     ProcessInstanceSummary, ProcessMessageDetail, ProcessMessageOrigin, ProcessMessageStartSummary,
-    ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessModel,
-    ProcessNodeKind, ProcessPageInfo, ProcessPageSpec, ProcessPayload, ProcessSubscriptionKind,
-    ProcessSubscriptionStatus, ProcessSubscriptionSummary, ProcessTimerKind, ProcessTimerSpec,
-    ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask, ProcessUserTaskKind,
-    ProcessUserTaskStatus, ProcessUserTaskSummary, ProcessVersion, ProcessVersionSummary,
+    ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessModel, ProcessNode,
+    ProcessNodeKind, ProcessPageInfo, ProcessPageSpec, ProcessPayload, ProcessScopeSummary,
+    ProcessSubscriptionKind, ProcessSubscriptionStatus, ProcessSubscriptionSummary,
+    ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
+    ProcessUserTaskKind, ProcessUserTaskStatus, ProcessUserTaskSummary, ProcessVersion,
+    ProcessVersionSummary,
 };
 use uuid::Uuid;
 
@@ -84,6 +85,7 @@ pub struct ForkFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessToken {
     pub token_id: String,
+    pub scope_id: String,
     pub node_id: String,
     pub arrival_edge_id: Option<String>,
     pub fork_stack: Vec<ForkFrame>,
@@ -92,6 +94,7 @@ pub struct ProcessToken {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AndReceipt {
+    pub scope_id: String,
     pub join_node_id: String,
     pub activation_id: String,
     pub branch_edge_id: String,
@@ -102,6 +105,7 @@ pub struct AndReceipt {
 pub struct ProcessJob {
     pub job_id: String,
     pub instance_id: String,
+    pub scope_id: String,
     pub node_id: String,
     pub token_id: String,
     pub input: Value,
@@ -131,6 +135,7 @@ pub struct ObservedActivityResult {
 pub struct EventSubscription {
     pub subscription_id: String,
     pub instance_id: String,
+    pub scope_id: String,
     pub org_id: String,
     pub definition_id: String,
     pub version: u32,
@@ -160,6 +165,7 @@ pub struct SubscriptionUpdate {
 pub struct EventRace {
     pub race_id: String,
     pub instance_id: String,
+    pub scope_id: String,
     pub gateway_node_id: String,
     pub activation_id: String,
     pub revision: u64,
@@ -195,6 +201,7 @@ pub struct PreparedMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedMessage {
     pub message: PreparedMessage,
+    pub source_scope_id: String,
     pub source_node_id: String,
     pub source_activation_id: String,
     pub source_event_index: usize,
@@ -243,6 +250,7 @@ pub struct MessageRecord {
     pub matched_subscription_id: Option<String>,
     pub delivered_at_ms: Option<i64>,
     pub source_instance_id: Option<String>,
+    pub source_scope_id: Option<String>,
     pub source_node_id: Option<String>,
 }
 
@@ -278,8 +286,7 @@ pub enum MessageDeliveryTarget {
 #[derive(Debug)]
 pub struct MessageDeliveryOutcome {
     pub message: ProcessMessageSummary,
-    pub instance: Option<ProcessInstance>,
-    pub cancelled_claims: Vec<CancelledJobClaim>,
+    pub transition: ProcessTransitionOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +298,7 @@ pub struct ProcessTimer {
     pub node_id: String,
     pub kind: ProcessTimerKind,
     pub instance_id: Option<String>,
+    pub scope_id: Option<String>,
     pub token_id: Option<String>,
     pub rule: ProcessTimerSpec,
     pub total_firings: Option<u32>,
@@ -367,10 +375,13 @@ pub struct RuntimeSnapshot {
     pub subscriptions: Vec<EventSubscription>,
     pub event_races: Vec<EventRace>,
     pub incidents: Vec<ProcessIncident>,
+    pub scopes: Vec<ProcessScopeSummary>,
+    pub scope_variables: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedEvent {
+    pub scope_id: String,
     pub kind: String,
     pub node_id: Option<String>,
     pub data: Value,
@@ -379,6 +390,7 @@ pub struct PlannedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePlan {
     pub start_instance_id: Option<String>,
+    pub start_variables: Option<Value>,
     pub consume_token_ids: Vec<String>,
     pub cancel_token_ids: Vec<String>,
     pub create_tokens: Vec<ProcessToken>,
@@ -402,12 +414,33 @@ pub struct RuntimePlan {
     pub create_event_races: Vec<EventRace>,
     pub race_updates: Vec<EventRaceUpdate>,
     pub create_messages: Vec<PlannedMessage>,
+    pub create_scopes: Vec<PlannedScope>,
+    pub scope_updates: Vec<ScopeUpdate>,
+    pub cancel_scope_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedScope {
+    pub scope_id: String,
+    pub parent_scope_id: String,
+    pub parent_token_id: String,
+    pub subprocess_node_id: String,
+    pub variables: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeUpdate {
+    pub scope_id: String,
+    pub expected_revision: u64,
+    pub status: ProcessInstanceStatus,
+    pub variables: Option<Value>,
 }
 
 impl RuntimePlan {
     pub fn initial(variables: Value) -> Self {
         Self {
             start_instance_id: None,
+            start_variables: None,
             consume_token_ids: Vec::new(),
             cancel_token_ids: Vec::new(),
             create_tokens: Vec::new(),
@@ -431,6 +464,9 @@ impl RuntimePlan {
             create_event_races: Vec::new(),
             race_updates: Vec::new(),
             create_messages: Vec::new(),
+            create_scopes: Vec::new(),
+            scope_updates: Vec::new(),
+            cancel_scope_roots: Vec::new(),
         }
     }
 }
@@ -457,15 +493,21 @@ pub struct CancelledJobClaim {
 }
 
 #[derive(Debug)]
-pub struct TimerFireOutcome {
+pub struct ProcessTransitionOutcome {
     pub instance: ProcessInstance,
     pub cancelled_claims: Vec<CancelledJobClaim>,
+}
+
+#[derive(Deserialize)]
+struct StoredInstanceIdentity {
+    instance_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundaryActivationId {
     Timer(String),
     Subscription(String),
+    ScopeEntry(String),
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +620,11 @@ fn timer_on(conn: &Connection, timer_id: &str) -> Result<ProcessTimer> {
         version,
         node_id,
         kind: timer_kind_from_text(&kind)?,
+        scope_id: conn.query_row(
+            "SELECT scope_id FROM bpmn_timers WHERE timer_id=?1",
+            [timer_id],
+            |row| row.get(0),
+        )?,
         instance_id,
         token_id,
         rule,
@@ -601,21 +648,45 @@ fn timer_on(conn: &Connection, timer_id: &str) -> Result<ProcessTimer> {
     })
 }
 
-fn timer_summary(timer: &ProcessTimer, model: &ProcessModel) -> Result<ProcessTimerSummary> {
-    let node_name = model.nodes.iter().find(|node| node.id == timer.node_id)
-        .context("persisted timer node is absent from pinned process model")?.name.clone();
+fn timer_summary(
+    conn: &Connection,
+    timer: &ProcessTimer,
+    model: &ProcessModel,
+) -> Result<ProcessTimerSummary> {
+    let node_name = match (&timer.instance_id, &timer.scope_id) {
+        (Some(instance), Some(scope)) => {
+            scoped_node_on(conn, instance, scope, model, &timer.node_id)?
+                .name
+                .clone()
+        }
+        (None, None) if timer.kind == ProcessTimerKind::Start => model
+            .nodes
+            .iter()
+            .find(|node| node.id == timer.node_id)
+            .context("start timer node missing")?
+            .name
+            .clone(),
+        _ => bail!("timer scope ownership is invalid"),
+    };
     let total_firings = match &timer.rule {
         ProcessTimerSpec::Cycle { total_firings, .. }
         | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
         _ => None,
     };
     Ok(ProcessTimerSummary {
-        timer_id: timer.timer_id.clone(), node_id: timer.node_id.clone(), node_name,
-        kind: timer.kind.clone(), status: timer.status.clone(), due_at_ms: timer.due_at_ms,
-        timezone: timer.timezone.clone(), occurrence: timer.occurrence, total_firings,
+        scope_id: timer.scope_id.clone(),
+        timer_id: timer.timer_id.clone(),
+        node_id: timer.node_id.clone(),
+        node_name,
+        kind: timer.kind.clone(),
+        status: timer.status.clone(),
+        due_at_ms: timer.due_at_ms,
+        timezone: timer.timezone.clone(),
+        occurrence: timer.occurrence,
+        total_firings,
         last_reason: timer.last_reason.clone(),
         attached_to_id: if timer.kind == ProcessTimerKind::Boundary {
-            timer_activation_node(model, timer)?.map(str::to_owned)
+            timer_activation_node(conn, model, timer)?.map(str::to_owned)
         } else {
             None
         },
@@ -635,14 +706,23 @@ fn timer_ids_on(conn: &Connection, instance_id: &str) -> Result<Vec<String>> {
 }
 
 fn timer_activation_node<'a>(
+    conn: &Connection,
     model: &'a ProcessModel,
     timer: &ProcessTimer,
 ) -> Result<Option<&'a str>> {
-    let node = model
-        .nodes
+    let nodes = match (&timer.instance_id, &timer.scope_id) {
+        (Some(instance), Some(scope)) => {
+            let scopes = scopes_on(conn, instance, model)?;
+            let path = scope_path(&scopes, instance, scope)?;
+            super::model::scope_body(model, &path)?.0
+        }
+        (None, None) if timer.kind == ProcessTimerKind::Start => model.nodes.as_slice(),
+        _ => bail!("timer scope ownership is invalid"),
+    };
+    let node = nodes
         .iter()
         .find(|node| node.id == timer.node_id)
-        .context("process timer node is absent from its pinned model")?;
+        .context("timer node is absent from its exact pinned body")?;
     match (&timer.kind, &node.kind) {
         (ProcessTimerKind::Start, ProcessNodeKind::TimerStart { timer: rule })
             if rule == &timer.rule =>
@@ -662,27 +742,25 @@ fn timer_activation_node<'a>(
                 ..
             },
         ) if rule == &timer.rule => {
-            let activity = model
-                .nodes
-                .iter()
-                .find(|node| node.id == *attached_to_id)
-                .context("boundary timer attached activity is missing")?;
             ensure!(
-                matches!(
-                    &activity.kind,
-                    ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
-                ),
-                "boundary timer attachment is not an activity"
+                nodes.iter().any(|node| &node.id == attached_to_id
+                    && matches!(
+                        node.kind,
+                        ProcessNodeKind::UserTask { .. }
+                            | ProcessNodeKind::ServiceTask { .. }
+                            | ProcessNodeKind::SubProcess { .. }
+                    )),
+                "boundary attachment is not an activity in its body"
             );
             Ok(Some(attached_to_id))
         }
-        _ => bail!("process timer rule does not match its pinned node"),
+        _ => bail!("timer rule/kind differs from its pinned node"),
     }
 }
 
 fn timer_activation_live_on(conn: &Connection, timer: &ProcessTimer) -> Result<bool> {
     let model = current_version_model_on(conn, &timer.definition_id, timer.version)?;
-    let Some(node_id) = timer_activation_node(&model, timer)? else {
+    let Some(node_id) = timer_activation_node(conn, &model, timer)? else {
         return Ok(true);
     };
     let instance_id = timer
@@ -694,8 +772,8 @@ fn timer_activation_live_on(conn: &Connection, timer: &ProcessTimer) -> Result<b
         .as_deref()
         .context("activity timer lacks waiting token")?;
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND i.definition_id=?4 AND i.version=?5 AND i.org_id=?6 AND i.status NOT IN ('completed','cancelled'))",
-        params![token_id,instance_id,node_id,timer.definition_id,timer.version,timer.org_id],
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND t.scope_id=?7 AND EXISTS(SELECT 1 FROM bpmn_scopes s WHERE s.instance_id=t.instance_id AND s.scope_id=t.scope_id AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled'))) AND i.definition_id=?4 AND i.version=?5 AND i.org_id=?6 AND i.status NOT IN ('completed','cancelled'))",
+        params![token_id,instance_id,node_id,timer.definition_id,timer.version,timer.org_id,timer.scope_id],
         |row| row.get(0),
     )?)
 }
@@ -724,6 +802,18 @@ fn boundary_incidents_on(
                 activation: BoundaryActivationId::Subscription(r.get(0)?),
                 token_id: r.get(1)?,
                 incident_id: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    let mut q=conn.prepare("SELECT json_extract(e.data_json,'$.parent_token_id'),x.incident_id FROM bpmn_events e JOIN bpmn_incidents x ON x.incident_id=json_extract(e.data_json,'$.incident_id') AND x.instance_id=e.instance_id AND x.scope_id=e.scope_id JOIN bpmn_tokens t ON t.token_id=json_extract(e.data_json,'$.parent_token_id') AND t.instance_id=e.instance_id AND t.scope_id=e.scope_id WHERE e.instance_id=?1 AND e.kind='scope_entry_failed' AND x.resolved_at_ms IS NULL AND t.status='waiting'")?;
+    incidents.extend(
+        q.query_map([instance_id], |row| {
+            let token: String = row.get(0)?;
+            Ok(BoundaryEventIncident {
+                activation: BoundaryActivationId::ScopeEntry(token.clone()),
+                token_id: token,
+                incident_id: row.get(1)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -757,7 +847,7 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
         model.timer_timezone.as_deref() == Some(timer.timezone.as_str()),
         "process timer timezone differs from pinned model"
     );
-    timer_activation_node(&model, timer)?;
+    timer_activation_node(tx, &model, timer)?;
     let actual_org: String = tx.query_row(
         "SELECT org_id FROM bpmn_definitions WHERE definition_id=?1",
         [&timer.definition_id],
@@ -771,26 +861,29 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
         );
     } else {
         ensure!(
-            timer.instance_id.is_none() && timer.token_id.is_none(),
+            timer.instance_id.is_none() && timer.token_id.is_none() && timer.scope_id.is_none(),
             "start timer cannot have an instance token"
         );
     }
     if let Some(id) = &timer.race_id {
         let race = race_on(tx, id)?;
+        let scopes = scopes_on(tx, race.instance_id.as_str(), &model)?;
+        let path = scope_path(&scopes, &race.instance_id, &race.scope_id)?;
+        let flows = super::model::scope_body(&model, &path)?.1;
         ensure!(
             timer.kind == ProcessTimerKind::Catch
                 && timer.instance_id.as_deref() == Some(race.instance_id.as_str())
+                && timer.scope_id.as_deref() == Some(race.scope_id.as_str())
                 && race.status == ProcessEventRaceStatus::Open
-                && model
-                    .sequence_flows
+                && flows
                     .iter()
                     .any(|e| e.source_id == race.gateway_node_id && e.target_id == timer.node_id),
             "timer does not belong to its exact event race"
         );
     }
     tx.execute(
-        "INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-        params![timer.timer_id,timer.org_id,timer.definition_id,timer.version,timer.node_id,timer_kind_text(&timer.kind),timer.instance_id,timer.token_id,json(&timer.rule)?,timer.timezone,timer.anchor_at_ms,timer.due_at_ms,sql_integer(timer.occurrence)?,sql_integer(timer.revision)?,timer_status_text(&timer.status),timer.last_reason,timer.next_check_at_ms,timer.created_at_ms,timer.updated_at_ms,timer.race_id],
+        "INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        params![timer.timer_id,timer.org_id,timer.definition_id,timer.version,timer.node_id,timer_kind_text(&timer.kind),timer.instance_id,timer.token_id,json(&timer.rule)?,timer.timezone,timer.anchor_at_ms,timer.due_at_ms,sql_integer(timer.occurrence)?,sql_integer(timer.revision)?,timer_status_text(&timer.status),timer.last_reason,timer.next_check_at_ms,timer.created_at_ms,timer.updated_at_ms,timer.race_id,timer.scope_id],
     )?;
     Ok(())
 }
@@ -931,7 +1024,7 @@ fn timer_current_authority_on(conn: &Connection, timer: &ProcessTimer) -> Result
         return Ok(false);
     }
     let model = current_version_model_on(conn, &timer.definition_id, timer.version)?;
-    for node in &model.nodes {
+    for node in super::model::all_nodes(&model) {
         if let tentaflow_protocol::processes::ProcessNodeKind::UserTask {
             assignee_user_id: Some(assignee), ..
         } = &node.kind {
@@ -1003,11 +1096,22 @@ pub fn record_timer_blocked(
                 |row| row_u64(row, 0),
             )?;
             let model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
-            insert_event_on(&tx, instance_id, next_seq, None, &PlannedEvent {
-                kind: "timer_blocked".into(),
-                node_id: Some(timer.node_id.clone()),
-                data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"next_check_at_ms":next_check,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&model, &timer)? } else { None },"attached_token_id":timer.token_id}),
-            }, at_ms)?;
+            insert_event_on(
+                &tx,
+                instance_id,
+                next_seq,
+                None,
+                &PlannedEvent {
+                    scope_id: timer
+                        .scope_id
+                        .clone()
+                        .context("instance timer has no scope")?,
+                    kind: "timer_blocked".into(),
+                    node_id: Some(timer.node_id.clone()),
+                    data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"next_check_at_ms":next_check,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&tx, &model, &timer)? } else { None },"attached_token_id":timer.token_id}),
+                },
+                at_ms,
+            )?;
         } else {
             crate::db::repository::log_audit_scoped_tx(
                 &tx, None, "process.timer_blocked", &timer.timer_id,
@@ -1061,11 +1165,15 @@ pub fn record_timer_failed(
             "UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled') AND revision < 9223372036854775807",
             params![at_ms,instance_id],
         )?;
-        ensure!(changed_instance == 1, "catch timer instance closed during failure recording");
+        ensure!(
+            changed_instance == 1,
+            "catch timer instance closed during failure recording"
+        );
+        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",params![at_ms,instance_id,timer.scope_id])?;
         let incident_id = Uuid::new_v4().to_string();
         tx.execute(
-            "INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,NULL,'TIMER_ERROR',?4,?5)",
-            params![incident_id,instance_id,timer.node_id,incident_message(&full_reason),at_ms],
+            "INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,NULL,'TIMER_ERROR',?4,?5,?6)",
+            params![incident_id,instance_id,timer.node_id,incident_message(&full_reason),at_ms,timer.scope_id],
         )?;
         check_active_incident_budget_on(&tx, instance_id)?;
         let next_seq: u64 = tx.query_row(
@@ -1075,9 +1183,13 @@ pub fn record_timer_failed(
         )?;
         let model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
         let mut event = PlannedEvent {
+            scope_id: timer
+                .scope_id
+                .clone()
+                .context("instance timer has no scope")?,
             kind: "timer_error".into(),
             node_id: Some(timer.node_id.clone()),
-            data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"incident_id":incident_id,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&model, &timer)? } else { None },"attached_token_id":timer.token_id}),
+            data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"incident_id":incident_id,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&tx, &model, &timer)? } else { None },"attached_token_id":timer.token_id}),
         };
         if let Some(working_time) = super::calendar::working_time_summary(
             &timer.rule,
@@ -1106,11 +1218,12 @@ fn validate_boundary_plan_on(
     accepted_job_id: Option<&str>,
     plan: &RuntimePlan,
 ) -> Result<()> {
-    let (instance_id, definition_id, version, node_id, token_id) = match activation {
+    let (instance_id, scope_id, definition_id, version, node_id, token_id) = match activation {
         BoundaryActivationId::Timer(id) => {
             let timer = timer_on(tx, id)?;
             (
                 timer.instance_id.context("boundary lacks instance")?,
+                timer.scope_id.context("boundary lacks scope")?,
                 timer.definition_id,
                 timer.version,
                 timer.node_id,
@@ -1125,19 +1238,18 @@ fn validate_boundary_plan_on(
             );
             (
                 sub.instance_id,
+                sub.scope_id,
                 sub.definition_id,
                 sub.version,
                 sub.node_id,
                 sub.token_id,
             )
         }
+        BoundaryActivationId::ScopeEntry(_) => bail!("scope entry is not a firing boundary"),
     };
     let model = current_version_model_on(tx, &definition_id, version)?;
-    let node = model
-        .nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .context("boundary node is missing")?;
+    let scopes = scopes_on(tx, &instance_id, &model)?;
+    let node = scope_node(&model, &scopes, &instance_id, &scope_id, &node_id)?;
     let (attached_to_id, interrupt) = match &node.kind {
         ProcessNodeKind::BoundaryTimer {
             attached_to_id,
@@ -1153,8 +1265,8 @@ fn validate_boundary_plan_on(
         _ => bail!("activation is not a boundary"),
     };
     let (actual_node, stack, status): (String, String, String) = tx.query_row(
-        "SELECT node_id,fork_stack_json,status FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2",
-        params![token_id,instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        "SELECT node_id,fork_stack_json,status FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2 AND scope_id=?3",
+        params![token_id,instance_id,scope_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     )?;
     ensure!(
         actual_node == *attached_to_id
@@ -1183,49 +1295,196 @@ fn validate_boundary_plan_on(
         .filter(|link| link.token_id == token_id && (interrupt || &link.activation == activation))
         .map(|link| link.incident_id)
         .collect::<Vec<_>>();
+    let child = scopes.iter().find(|scope| {
+        scope.parent_token_id.as_deref() == Some(token_id.as_str())
+            && !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+    });
+    let expected_roots = if interrupt {
+        child
+            .map(|scope| vec![scope.scope_id.clone()])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    ensure!(
+        equal_ids(&plan.cancel_scope_roots, &expected_roots),
+        "boundary scope closure differs from its actual attached child"
+    );
+    let closure = if let Some(root) = expected_roots.first() {
+        descendant_scope_ids(&scopes, root)?
+    } else {
+        HashSet::new()
+    };
+    let active_scopes = scopes
+        .iter()
+        .filter(|scope| {
+            closure.contains(&scope.scope_id)
+                && !matches!(
+                    scope.status,
+                    ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                )
+        })
+        .map(|scope| scope.scope_id.clone())
+        .collect::<HashSet<_>>();
+    let selected = |scope: &str, token: &str| {
+        active_scopes.contains(scope) || (interrupt && token == token_id)
+    };
+    let mut stmt = tx.prepare("SELECT token_id,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
+    let expected_tokens = stmt
+        .query_map([&instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(id, scope)| selected(scope, id))
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    ensure!(
+        equal_ids(&plan.cancel_token_ids, &expected_tokens),
+        "boundary must close exactly its attachment and active child subtree"
+    );
     if !interrupt {
         ensure!(
-            plan.cancel_token_ids.is_empty()
-                && plan.cancel_user_task_ids.is_empty()
-                && plan.cancel_job_ids.is_empty()
-                && plan.consume_token_ids.iter().all(|id| id != &token_id),
-            "noninterrupting boundary cannot close its original activation"
+            !plan.consume_token_ids.contains(&token_id),
+            "noninterrupting boundary cannot consume its attachment"
         );
-    } else {
+    }
+    let mut stmt = tx.prepare("SELECT user_task_id,scope_id,token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open'")?;
+    let tasks = stmt
+        .query_map([&instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, scope, token)| selected(scope, token.as_deref().unwrap_or("")))
+        .map(|(id, _, _)| id)
+        .collect::<Vec<_>>();
+    ensure!(
+        equal_ids(&plan.cancel_user_task_ids, &tasks),
+        "boundary must cancel exactly its subtree's open work"
+    );
+    let mut stmt = tx.prepare("SELECT job_id,scope_id,token_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running','error')")?;
+    let jobs = stmt
+        .query_map([&instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(id, scope, token)| selected(scope, token) && Some(id.as_str()) != accepted_job_id)
+        .map(|(id, _, _)| id)
+        .collect::<Vec<_>>();
+    ensure!(
+        equal_ids(&plan.cancel_job_ids, &jobs),
+        "boundary must cancel exactly its subtree's active job generations"
+    );
+    if let Some(id) = accepted_job_id {
         ensure!(
-            plan.cancel_token_ids == [token_id.clone()],
-            "boundary must cancel exactly its current activation"
+            plan.complete_job_ids == [id.to_owned()],
+            "handled error must complete its accepted job"
         );
-        let mut stmt = tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
-        let tasks = stmt
-            .query_map(params![instance_id, token_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        ensure!(
-            equal_ids(&plan.cancel_user_task_ids, &tasks),
-            "boundary must cancel the exact open tasks"
-        );
-        let mut stmt = tx.prepare("SELECT job_id FROM bpmn_jobs WHERE instance_id=?1 AND token_id=?2 AND status IN ('queued','running','error')")?;
-        let jobs = stmt
-            .query_map(params![instance_id, token_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        let cancelled = jobs
-            .into_iter()
-            .filter(|id| Some(id.as_str()) != accepted_job_id)
-            .collect::<Vec<_>>();
-        ensure!(
-            equal_ids(&plan.cancel_job_ids, &cancelled),
-            "boundary must cancel the exact active jobs"
-        );
-        if let Some(id) = accepted_job_id {
-            ensure!(
-                plan.complete_job_ids == [id.to_owned()],
-                "handled business error must complete its exact accepted job"
-            );
+    }
+    let mut stmt = tx.prepare("SELECT incident_id,scope_id,job_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL")?;
+    for (id, scope, job) in stmt
+        .query_map([&instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        let own_job = if let Some(job) = job {
+            tx.query_row(
+                "SELECT token_id=?1 FROM bpmn_jobs WHERE job_id=?2 AND instance_id=?3",
+                params![token_id, job, instance_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        if active_scopes.contains(&scope) || (interrupt && own_job) {
+            own_incidents.push(id);
         }
-        let mut stmt = tx.prepare("SELECT x.incident_id FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id WHERE x.instance_id=?1 AND j.token_id=?2 AND x.resolved_at_ms IS NULL")?;
-        own_incidents.extend(
-            stmt.query_map(params![instance_id, token_id], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?,
+    }
+    if interrupt {
+        let mut stmt = tx.prepare("SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='scope_entry_failed'")?;
+        for data in stmt
+            .query_map(params![instance_id, scope_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        {
+            let data: Value = parse(data)?;
+            if data["parent_token_id"].as_str() == Some(token_id.as_str()) {
+                if let Some(id) = data["incident_id"].as_str() {
+                    let open:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND incident_id=?3 AND resolved_at_ms IS NULL)",params![instance_id,scope_id,id],|row|row.get(0))?;
+                    if open {
+                        own_incidents.push(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    let mut stmt=tx.prepare("SELECT scope_id,join_node_id,activation_id,branch_edge_id,token_id FROM bpmn_and_receipts WHERE instance_id=?1")?;
+    let receipts = stmt
+        .query_map([&instance_id], |row| {
+            Ok(AndReceipt {
+                scope_id: row.get(0)?,
+                join_node_id: row.get(1)?,
+                activation_id: row.get(2)?,
+                branch_edge_id: row.get(3)?,
+                token_id: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        receipts
+            .iter()
+            .filter(|row| active_scopes.contains(&row.scope_id))
+            .all(|row| plan
+                .remove_receipts
+                .iter()
+                .any(|removed| removed.scope_id == row.scope_id
+                    && removed.token_id == row.token_id
+                    && removed.activation_id == row.activation_id
+                    && removed.branch_edge_id == row.branch_edge_id
+                    && removed.join_node_id == row.join_node_id)),
+        "scope interruption omits a join receipt"
+    );
+    for scope in scopes
+        .iter()
+        .filter(|scope| active_scopes.contains(&scope.scope_id))
+    {
+        ensure!(
+            plan.scope_updates
+                .iter()
+                .any(|update| update.scope_id == scope.scope_id
+                    && update.expected_revision == scope.revision
+                    && update.status == ProcessInstanceStatus::Cancelled
+                    && update.variables.is_none()),
+            "scope interruption must retain locals and close every active scope"
+        );
+        ensure!(
+            plan.events
+                .iter()
+                .any(|event| event.scope_id == scope.scope_id
+                    && event.kind == "scope_cancelled"
+                    && event.data["parent_token_id"].as_str() == scope.parent_token_id.as_deref()),
+            "scope interruption lacks actual activation history"
         );
     }
     own_incidents.sort();
@@ -1240,8 +1499,9 @@ fn validate_boundary_plan_on(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|timer| {
-            timer.kind == ProcessTimerKind::Boundary
-                && timer.token_id.as_deref() == Some(token_id.as_str())
+            (active_scopes.contains(timer.scope_id.as_deref().unwrap_or(""))
+                || (timer.kind == ProcessTimerKind::Boundary
+                    && timer.token_id.as_deref() == Some(token_id.as_str())))
                 && matches!(
                     timer.status,
                     ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
@@ -1254,19 +1514,35 @@ fn validate_boundary_plan_on(
     };
     let expected_timers = timers
         .iter()
-        .filter(|timer| interrupt || Some(timer.timer_id.as_str()) == winner_timer)
+        .filter(|timer| {
+            active_scopes.contains(timer.scope_id.as_deref().unwrap_or(""))
+                || interrupt
+                || Some(timer.timer_id.as_str()) == winner_timer
+        })
         .map(|timer| timer.timer_id.clone())
         .collect::<Vec<_>>();
-    ensure!(
-        equal_ids(
-            &plan
-                .timer_updates
+    let current_timer_updates = plan
+        .timer_updates
+        .iter()
+        .filter(|u| {
+            !plan
+                .create_timers
                 .iter()
-                .map(|u| u.timer_id.clone())
-                .collect::<Vec<_>>(),
-            &expected_timers
-        ),
-        "boundary must settle only its complete current timer siblings"
+                .any(|timer| timer.timer_id == u.timer_id)
+                && !timer_on(tx, &u.timer_id).is_ok_and(|timer| {
+                    u.status == ProcessTimerStatus::Cancelled
+                        && u.last_reason.as_deref() == Some("activity_completed")
+                        && timer
+                            .token_id
+                            .as_ref()
+                            .is_some_and(|id| plan.consume_token_ids.contains(id))
+                })
+        })
+        .map(|u| u.timer_id.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        equal_ids(&current_timer_updates, &expected_timers),
+        "boundary must settle only its complete current timers and child subtree"
     );
     for timer in timers
         .iter()
@@ -1281,15 +1557,22 @@ fn validate_boundary_plan_on(
                     && u.fired_occurrence.is_none()
                     && u.due_at_ms.is_none()
                     && u.status == ProcessTimerStatus::Cancelled
-                    && u.last_reason.as_deref() == Some("sibling_interrupted")),
+                    && u.last_reason.as_deref()
+                        == Some(
+                            if active_scopes.contains(timer.scope_id.as_deref().unwrap_or("")) {
+                                "scope_cancelled"
+                            } else {
+                                "sibling_interrupted"
+                            }
+                        )),
             "boundary timer sibling cancellation changed"
         );
     }
     let subscriptions = subscriptions_on(tx, &instance_id)?
         .into_iter()
         .filter(|sub| {
-            sub.token_id == token_id
-                && sub.kind != ProcessSubscriptionKind::MessageCatch
+            (active_scopes.contains(&sub.scope_id)
+                || (sub.token_id == token_id && sub.kind != ProcessSubscriptionKind::MessageCatch))
                 && sub.status == ProcessSubscriptionStatus::Open
         })
         .collect::<Vec<_>>();
@@ -1299,23 +1582,36 @@ fn validate_boundary_plan_on(
     };
     let expected_subs = subscriptions
         .iter()
-        .filter(|sub| interrupt || Some(sub.subscription_id.as_str()) == winner_sub)
+        .filter(|sub| {
+            active_scopes.contains(&sub.scope_id)
+                || interrupt
+                || Some(sub.subscription_id.as_str()) == winner_sub
+        })
         .map(|sub| sub.subscription_id.clone())
         .collect::<Vec<_>>();
-    ensure!(
-        equal_ids(
-            &plan
-                .subscription_updates
+    let current_sub_updates = plan
+        .subscription_updates
+        .iter()
+        .filter(|u| {
+            !plan
+                .create_subscriptions
                 .iter()
-                .map(|u| u.subscription_id.clone())
-                .collect::<Vec<_>>(),
-            &expected_subs
-        ),
-        "boundary must settle only its complete current subscription siblings"
+                .any(|sub| sub.subscription_id == u.subscription_id)
+                && !subscription_on(tx, &u.subscription_id).is_ok_and(|sub| {
+                    u.status == ProcessSubscriptionStatus::Cancelled
+                        && u.last_reason.as_deref() == Some("activity_completed")
+                        && plan.consume_token_ids.contains(&sub.token_id)
+                })
+        })
+        .map(|u| u.subscription_id.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        equal_ids(&current_sub_updates, &expected_subs),
+        "boundary must settle its actual subscription siblings and child subtree"
     );
     for sub in subscriptions {
         let winning = Some(sub.subscription_id.as_str()) == winner_sub;
-        if interrupt || winning {
+        if active_scopes.contains(&sub.scope_id) || interrupt || winning {
             ensure!(
                 plan.subscription_updates
                     .iter()
@@ -1331,15 +1627,39 @@ fn validate_boundary_plan_on(
                             == if winning {
                                 None
                             } else {
-                                Some("sibling_interrupted")
+                                Some(if active_scopes.contains(&sub.scope_id) {
+                                    "scope_cancelled"
+                                } else {
+                                    "sibling_interrupted"
+                                })
                             }),
                 "boundary subscription sibling cancellation changed"
             );
         }
     }
+    let races = races_on(tx, &instance_id)?
+        .into_iter()
+        .filter(|race| {
+            active_scopes.contains(&race.scope_id) && race.status == ProcessEventRaceStatus::Open
+        })
+        .collect::<Vec<_>>();
     ensure!(
-        plan.race_updates.is_empty(),
-        "boundary cannot settle an unrelated event race"
+        equal_ids(
+            &plan
+                .race_updates
+                .iter()
+                .map(|u| u.race_id.clone())
+                .collect::<Vec<_>>(),
+            &races
+                .iter()
+                .map(|race| race.race_id.clone())
+                .collect::<Vec<_>>()
+        ) && plan.race_updates.iter().all(|update| update.status
+            == ProcessEventRaceStatus::Cancelled
+            && update.winner_node_id.is_none()
+            && update.winner_subscription_id.is_none()
+            && update.winner_timer_id.is_none()),
+        "boundary must close only its child subtree's open event races"
     );
     Ok(())
 }
@@ -1351,7 +1671,7 @@ pub fn fire_timer(
     expected_instance_revision: Option<u64>,
     plan: &RuntimePlan,
     at_ms: i64,
-) -> Result<Option<TimerFireOutcome>> {
+) -> Result<Option<ProcessTransitionOutcome>> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     let timer = timer_on(&tx, &candidate.timer_id)?;
@@ -1391,19 +1711,32 @@ pub fn fire_timer(
         )?;
     } else if timer.race_id.is_none() {
         ensure!(
-            plan.timer_updates.len() == 1,
+            plan.timer_updates
+                .iter()
+                .all(|update| update.timer_id == timer.timer_id
+                    || (update.status == ProcessTimerStatus::Cancelled
+                        && update.last_reason.as_deref() == Some("activity_completed")
+                        && timer_on(&tx, &update.timer_id).is_ok_and(|other| other.kind
+                            == ProcessTimerKind::Boundary
+                            && other
+                                .token_id
+                                .as_ref()
+                                .is_some_and(|id| plan.consume_token_ids.contains(id))))),
             "timer fire cannot update an unrelated timer"
         );
         ensure!(
             plan.cancel_token_ids.is_empty()
                 && plan.cancel_user_task_ids.is_empty()
-                && plan.cancel_job_ids.is_empty(),
+                && plan.cancel_job_ids.is_empty()
+                && plan.cancel_scope_roots.is_empty(),
             "only an interrupting boundary may cancel an activity"
         );
     }
     if let Some(race_id) = &timer.race_id {
         ensure!(
-            plan.cancel_user_task_ids.is_empty() && plan.cancel_job_ids.is_empty(),
+            plan.cancel_user_task_ids.is_empty()
+                && plan.cancel_job_ids.is_empty()
+                && plan.cancel_scope_roots.is_empty(),
             "event race cannot cancel another activity"
         );
         ensure!(
@@ -1486,7 +1819,7 @@ pub fn fire_timer(
         instance_on(&tx, actor, instance_id, None)?
     };
     tx.commit()?;
-    Ok(Some(TimerFireOutcome {
+    Ok(Some(ProcessTransitionOutcome {
         instance: result,
         cancelled_claims,
     }))
@@ -1757,7 +2090,7 @@ pub fn get_definition(
         let timer_start =
             if let (Some(id), Some(version)) = (timer_id, definition.published_version) {
                 let model = current_version_model_on(conn, definition_id, version)?;
-                Some(timer_summary(&timer_on(conn, &id)?, &model)?)
+                Some(timer_summary(conn, &timer_on(conn, &id)?, &model)?)
             } else {
                 None
             };
@@ -1996,7 +2329,7 @@ pub fn publish_definition(
         "publication needs a Current verified calendar pin"
     );
     let mut service_nodes = HashSet::new();
-    for node in &prepared_model.nodes {
+    for node in super::model::all_nodes(&prepared_model) {
         if let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { flow_id, .. } =
             &node.kind
         {
@@ -2073,6 +2406,7 @@ pub fn publish_definition(
         insert_timer_on(
             &tx,
             &ProcessTimer {
+                scope_id: None,
                 timer_id: Uuid::new_v4().to_string(),
                 org_id: actor.org_id.clone(),
                 definition_id: definition_id.to_string(),
@@ -2373,6 +2707,200 @@ fn current_version_model_on(
     parse(text)
 }
 
+pub(super) fn scope_path(
+    scopes: &[ProcessScopeSummary],
+    instance_id: &str,
+    scope_id: &str,
+) -> Result<Vec<String>> {
+    let mut path = Vec::new();
+    let mut current = scope_id;
+    let mut seen = HashSet::new();
+    loop {
+        ensure!(seen.insert(current), "cyclic process scope ancestry");
+        let scope = scopes
+            .iter()
+            .find(|s| s.scope_id == current)
+            .context("process scope is missing from its instance")?;
+        if current == instance_id {
+            ensure!(
+                scope.parent_scope_id.is_none() && scope.subprocess_node_id.is_none(),
+                "root scope identity is invalid"
+            );
+            break;
+        }
+        ensure!(path.len() < 3, "process scope depth exceeds three");
+        path.push(
+            scope
+                .subprocess_node_id
+                .clone()
+                .context("child scope has no subprocess node")?,
+        );
+        current = scope
+            .parent_scope_id
+            .as_deref()
+            .context("child scope has no parent")?;
+    }
+    path.reverse();
+    Ok(path)
+}
+
+pub(super) fn scope_node<'a>(
+    model: &'a ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    instance_id: &str,
+    scope_id: &str,
+    node_id: &str,
+) -> Result<&'a ProcessNode> {
+    let path = scope_path(scopes, instance_id, scope_id)?;
+    let (nodes, _, _) = super::model::scope_body(model, &path)?;
+    nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .context("node does not belong to its actual process scope")
+}
+
+fn scopes_on(
+    conn: &Connection,
+    instance_id: &str,
+    model: &ProcessModel,
+) -> Result<Vec<ProcessScopeSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT s.scope_id,s.parent_scope_id,s.subprocess_node_id,s.parent_token_id,COALESCE(s.revision,i.revision),COALESCE(s.status,i.status),COALESCE(s.created_at_ms,i.created_at_ms),COALESCE(s.updated_at_ms,i.updated_at_ms) FROM bpmn_scopes s JOIN bpmn_instances i ON i.instance_id=s.instance_id WHERE s.instance_id=?1 ORDER BY CASE WHEN COALESCE(s.status,i.status) IN ('completed','cancelled') THEN 1 ELSE 0 END,s.scope_id",
+    )?;
+    let rows = statement
+        .query_map([instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row_u64(row, 4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        !rows.is_empty() && rows.len() <= 129,
+        "process scope inventory is missing or exceeds its lifetime limit"
+    );
+    let mut scopes = rows
+        .into_iter()
+        .map(
+            |(
+                scope_id,
+                parent_scope_id,
+                subprocess_node_id,
+                parent_token_id,
+                revision,
+                status,
+                created_at_ms,
+                updated_at_ms,
+            )| {
+                Ok(ProcessScopeSummary {
+                    scope_id,
+                    parent_scope_id,
+                    subprocess_node_id,
+                    subprocess_node_name: None,
+                    parent_token_id,
+                    revision,
+                    status: status_from_text(&status)?,
+                    depth: 0,
+                    created_at_ms,
+                    updated_at_ms,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    for index in 0..scopes.len() {
+        let path = scope_path(&scopes, instance_id, &scopes[index].scope_id)?;
+        scopes[index].depth = u32::try_from(path.len())?;
+        if let (Some(parent), Some(node_id)) = (
+            &scopes[index].parent_scope_id,
+            &scopes[index].subprocess_node_id,
+        ) {
+            let node = scope_node(model, &scopes, instance_id, parent, node_id)?;
+            ensure!(
+                matches!(node.kind, ProcessNodeKind::SubProcess { .. }),
+                "child scope parent node is not a subprocess"
+            );
+            scopes[index].subprocess_node_name = Some(node.name.clone());
+        }
+    }
+    Ok(scopes)
+}
+
+fn scoped_node_on<'a>(
+    conn: &Connection,
+    instance_id: &str,
+    scope_id: &str,
+    model: &'a ProcessModel,
+    node_id: &str,
+) -> Result<&'a ProcessNode> {
+    let scopes = scopes_on(conn, instance_id, model)?;
+    scope_node(model, &scopes, instance_id, scope_id, node_id)
+}
+
+fn scope_variables_on(conn: &Connection, instance_id: &str, scope_id: &str) -> Result<Value> {
+    let text: String = conn.query_row(
+        "SELECT CASE WHEN s.scope_id=i.instance_id THEN i.variables_json ELSE s.local_variables_json END FROM bpmn_scopes s JOIN bpmn_instances i ON i.instance_id=s.instance_id WHERE s.instance_id=?1 AND s.scope_id=?2",
+        params![instance_id,scope_id], |row| row.get(0),
+    ).context("process scope local variables not found")?;
+    let value = parse(text)?;
+    validate_variables(&value)?;
+    Ok(value)
+}
+
+pub(super) fn effective_scope_variables(
+    scopes: &[ProcessScopeSummary],
+    locals: &BTreeMap<String, Value>,
+    instance_id: &str,
+    root_variables: &Value,
+    scope_id: &str,
+) -> Result<Value> {
+    let mut chain = Vec::new();
+    let mut current = scope_id;
+    let mut seen = HashSet::new();
+    while current != instance_id {
+        ensure!(seen.insert(current), "cyclic process variable ancestry");
+        let scope = scopes
+            .iter()
+            .find(|scope| scope.scope_id == current)
+            .context("process variable scope missing")?;
+        ensure!(
+            !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            ),
+            "terminal scope cannot supply active process variables"
+        );
+        chain.push(current);
+        current = scope
+            .parent_scope_id
+            .as_deref()
+            .context("variable scope has no parent")?;
+    }
+    let mut merged = root_variables
+        .as_object()
+        .context("root variables are not an object")?
+        .clone();
+    for id in chain.into_iter().rev() {
+        let local = locals
+            .get(id)
+            .context("active scope local variables missing")?;
+        for (key, value) in local
+            .as_object()
+            .context("scope variables are not an object")?
+        {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    let effective = Value::Object(merged);
+    validate_variables(&effective)?;
+    Ok(effective)
+}
+
 fn tasks_on(
     conn: &Connection,
     actor: &ProcessActor,
@@ -2414,7 +2942,7 @@ fn tasks_on(
                 let can_complete =
                     status == ProcessUserTaskStatus::Open && assignee_user_id == actor.user_id;
                 Ok(ProcessUserTask {
-                    user_task_id,
+                    user_task_id: user_task_id.clone(),
                     node_id,
                     name,
                     assignee_user_id,
@@ -2424,6 +2952,11 @@ fn tasks_on(
                     revision,
                     can_complete,
                     token_id,
+                    scope_id: conn.query_row(
+                        "SELECT scope_id FROM bpmn_user_tasks WHERE user_task_id=?1",
+                        [&user_task_id],
+                        |row| row.get(0),
+                    )?,
                 })
             },
         )
@@ -2460,6 +2993,11 @@ fn task_summaries_on(
                 let can_complete =
                     status == ProcessUserTaskStatus::Open && assignee_user_id == actor.user_id;
                 Ok(ProcessUserTaskSummary {
+                    scope_id: conn.query_row(
+                        "SELECT scope_id FROM bpmn_user_tasks WHERE user_task_id=?1",
+                        [&user_task_id],
+                        |row| row.get(0),
+                    )?,
                     user_task_id,
                     node_id,
                     name,
@@ -2526,16 +3064,23 @@ fn incident_on(
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
     let initiator = require_instance_reader(conn, actor, instance_id)?;
     let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
-    let node_name = node_id.as_ref().and_then(|id| {
-        model
-            .nodes
-            .iter()
-            .find(|n| &n.id == id)
-            .map(|n| n.name.clone())
-    });
+    let scope_id: String = conn.query_row(
+        "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
+        params![id, instance_id],
+        |row| row.get(0),
+    )?;
+    let node_name = node_id
+        .as_ref()
+        .map(|node| -> Result<String> {
+            Ok(scoped_node_on(conn, instance_id, &scope_id, model, node)?
+                .name
+                .clone())
+        })
+        .transpose()?;
     Ok(ProcessIncidentSelection {
         incident: ProcessIncident {
             incident_id: id.to_owned(),
+            scope_id,
             node_id,
             node_name,
             job_id,
@@ -2562,14 +3107,11 @@ fn incidents_on(
         .collect()
 }
 fn subscription_summary(
+    conn: &Connection,
     s: &EventSubscription,
     model: &ProcessModel,
 ) -> Result<ProcessSubscriptionSummary> {
-    let n = model
-        .nodes
-        .iter()
-        .find(|n| n.id == s.node_id)
-        .context("subscription node missing")?;
+    let n = scoped_node_on(conn, &s.instance_id, &s.scope_id, model, &s.node_id)?;
     let attached_to_id = match &n.kind {
         ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
         | ProcessNodeKind::BoundaryError { attached_to_id, .. } => Some(attached_to_id.clone()),
@@ -2577,6 +3119,7 @@ fn subscription_summary(
     };
     Ok(ProcessSubscriptionSummary {
         subscription_id: s.subscription_id.clone(),
+        scope_id: s.scope_id.clone(),
         node_id: s.node_id.clone(),
         node_name: n.name.clone(),
         token_id: s.token_id.clone(),
@@ -2596,11 +3139,7 @@ fn race_summary_on(
     r: &EventRace,
     model: &ProcessModel,
 ) -> Result<ProcessEventRaceSummary> {
-    let n = model
-        .nodes
-        .iter()
-        .find(|n| n.id == r.gateway_node_id)
-        .context("race gateway missing")?;
+    let n = scoped_node_on(conn, &r.instance_id, &r.scope_id, model, &r.gateway_node_id)?;
     let mut q=conn.prepare("SELECT subscription_id FROM bpmn_event_subscriptions WHERE race_id=?1 ORDER BY subscription_id")?;
     let branch_subscription_ids = q
         .query_map([&r.race_id], |row| row.get(0))?
@@ -2612,6 +3151,7 @@ fn race_summary_on(
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(ProcessEventRaceSummary {
         race_id: r.race_id.clone(),
+        scope_id: r.scope_id.clone(),
         gateway_node_id: r.gateway_node_id.clone(),
         gateway_name: n.name.clone(),
         status: r.status.clone(),
@@ -2685,6 +3225,15 @@ fn instance_on(
     let sub_spec = spec(|p| p.subscriptions.as_ref());
     let race_spec = spec(|p| p.event_races.as_ref());
     let out_spec = spec(|p| p.outgoing_messages.as_ref());
+    let scope_spec = spec(|p| p.scopes.as_ref());
+    let scope_inventory = scopes_on(conn, instance_id, &model)?;
+    let (scope_offset, scope_limit) = detail_page_spec(scope_spec)?;
+    let scopes = scope_inventory
+        .iter()
+        .skip(usize::try_from(scope_offset)?)
+        .take(usize::try_from(scope_limit)?)
+        .cloned()
+        .collect::<Vec<_>>();
     let counts:(u32,u32,u32,u32,u32)=conn.query_row("SELECT (SELECT COUNT(*) FROM bpmn_user_tasks WHERE instance_id=?1),(SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL),(SELECT COUNT(*) FROM bpmn_timers WHERE instance_id=?1),(SELECT COUNT(*) FROM bpmn_event_subscriptions WHERE instance_id=?1),(SELECT COUNT(*) FROM bpmn_event_races WHERE instance_id=?1)",[instance_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
     let (offset, limit) = detail_page_spec(task_spec)?;
     let user_tasks = task_summaries_on(conn, actor, instance_id, None, offset, limit)?;
@@ -2693,8 +3242,8 @@ fn instance_on(
         .iter()
         .map(|id| Ok(incident_on(conn, actor, instance_id, id, &model)?.incident))
         .collect::<Result<Vec<_>>>()?;
-    let timers=detail_ids_on(conn,"SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 ORDER BY CASE WHEN status IN ('pending','blocked') THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,timer_id LIMIT ?2 OFFSET ?3",instance_id,timer_spec)?.iter().map(|id|timer_summary(&timer_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
-    let subscriptions=detail_ids_on(conn,"SELECT subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,subscription_id LIMIT ?2 OFFSET ?3",instance_id,sub_spec)?.iter().map(|id|subscription_summary(&subscription_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
+    let timers=detail_ids_on(conn,"SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 ORDER BY CASE WHEN status IN ('pending','blocked') THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,timer_id LIMIT ?2 OFFSET ?3",instance_id,timer_spec)?.iter().map(|id|timer_summary(conn,&timer_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
+    let subscriptions=detail_ids_on(conn,"SELECT subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,subscription_id LIMIT ?2 OFFSET ?3",instance_id,sub_spec)?.iter().map(|id|subscription_summary(conn,&subscription_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
     let event_races=detail_ids_on(conn,"SELECT race_id FROM bpmn_event_races WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END,created_at_ms DESC,race_id LIMIT ?2 OFFSET ?3",instance_id,race_spec)?.iter().map(|id|race_summary_on(conn,&race_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
     let (outgoing_messages, outgoing_page) = outgoing_page_on(conn, actor, instance_id, out_spec)?;
     let selected_user_task = pages
@@ -2718,9 +3267,8 @@ fn instance_on(
         status,
         ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
     );
-    let mut message_names = model
-        .nodes
-        .iter()
+    let mut message_names = super::model::all_nodes(&model)
+        .into_iter()
         .filter_map(|n| match &n.kind {
             ProcessNodeKind::MessageCatch { message_ref, .. }
             | ProcessNodeKind::BoundaryMessage { message_ref, .. } => Some(message_ref),
@@ -2744,6 +3292,11 @@ fn instance_on(
         subscriptions: detail_page(sub_spec, counts.3, subscriptions.len())?,
         event_races: detail_page(race_spec, counts.4, event_races.len())?,
         outgoing_messages: outgoing_page,
+        scopes: detail_page(
+            scope_spec,
+            u32::try_from(scope_inventory.len())?,
+            scopes.len(),
+        )?,
     };
     let instance = ProcessInstance {
         instance_id: instance_id.to_owned(),
@@ -2770,6 +3323,7 @@ fn instance_on(
         pages: Some(page_info),
         selected_user_task,
         selected_incident,
+        scopes,
     };
     ensure_instance_wire_budget(&instance)?;
     Ok(instance)
@@ -2794,9 +3348,9 @@ fn ensure_instance_wire_budget(instance: &ProcessInstance) -> Result<()> {
 fn reproject_instance_on(
     conn: &Connection,
     actor: &ProcessActor,
-    prior: ProcessInstance,
+    instance_id: &str,
 ) -> Result<ProcessInstance> {
-    instance_on(conn, actor, &prior.instance_id, None)
+    instance_on(conn, actor, instance_id, None)
 }
 
 pub fn get_instance(
@@ -2808,6 +3362,48 @@ pub fn get_instance(
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         instance_on(conn, actor, instance_id, pages)
+    })
+}
+
+pub fn get_scope(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    instance_id: &str,
+    scope_id: &str,
+) -> Result<(ProcessScopeSummary, Value, Vec<String>)> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        require_instance_reader(conn, actor, instance_id)?;
+        let (definition_id, version): (String, u32) = conn.query_row(
+            "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
+            params![instance_id, actor.org_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let model = current_version_model_on(conn, &definition_id, version)?;
+        let scope = scopes_on(conn, instance_id, &model)?
+            .into_iter()
+            .find(|scope| scope.scope_id == scope_id)
+            .context("process scope not found")?;
+        let variables = scope_variables_on(conn, instance_id, scope_id)?;
+        let mut statement = conn.prepare("SELECT DISTINCT node_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining') ORDER BY node_id")?;
+        let active_node_ids = statement
+            .query_map(params![instance_id, scope_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        let frame = tentaflow_protocol::cbor::encode(
+            &tentaflow_protocol::message_body::MessageBody::ProcessBody(
+                ProcessPayload::ScopeGetResponse {
+                    scope: scope.clone(),
+                    variables: variables.clone(),
+                    active_node_ids: active_node_ids.clone(),
+                },
+            ),
+        )
+        .map_err(anyhow::Error::msg)?;
+        ensure!(
+            frame.len() <= 900 * 1024,
+            "process scope detail exceeds the wire budget"
+        );
+        Ok((scope, variables, active_node_ids))
     })
 }
 
@@ -2936,12 +3532,11 @@ pub fn list_events(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let model = current_version_model_on(&conn, &definition_id, version)?;
-        let names: std::collections::HashMap<&str, &str> = model
-            .nodes
-            .iter()
+        let names: std::collections::HashMap<&str, &str> = super::model::all_nodes(&model)
+            .into_iter()
             .map(|node| (node.id.as_str(), node.name.as_str()))
             .collect();
-        let mut stmt = conn.prepare("SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json FROM bpmn_events WHERE instance_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;
+        let mut stmt = conn.prepare("SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id FROM bpmn_events WHERE instance_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3")?;
         let rows = stmt
             .query_map(
                 params![instance_id, sql_integer(after_seq)?, limit],
@@ -2954,16 +3549,18 @@ pub fn list_events(
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut events = Vec::new();
-        for (event_id, seq, at_ms, kind, node_id, actor_user_id, data_json) in rows {
+        for (event_id, seq, at_ms, kind, node_id, actor_user_id, data_json, scope_id) in rows {
             let node_name = node_id
                 .as_ref()
                 .and_then(|id| names.get(id.as_str()).map(|name| (*name).to_string()));
             events.push(ProcessEvent {
+                scope_id,
                 event_id,
                 seq,
                 at_ms,
@@ -3038,6 +3635,11 @@ fn runtime_snapshot_on(
         .map(
             |(token_id, node_id, arrival_edge_id, fork_stack_json, status)| {
                 Ok(ProcessToken {
+                    scope_id: conn.query_row(
+                        "SELECT scope_id FROM bpmn_tokens WHERE token_id=?1",
+                        [&token_id],
+                        |row| row.get(0),
+                    )?,
                     token_id,
                     node_id,
                     arrival_edge_id,
@@ -3089,6 +3691,11 @@ fn runtime_snapshot_on(
                     .map(result_origin)
                     .transpose()?;
                 Ok(ProcessJob {
+                    scope_id: conn.query_row(
+                        "SELECT scope_id FROM bpmn_jobs WHERE job_id=?1",
+                        [&job_id],
+                        |row| row.get(0),
+                    )?,
                     job_id,
                     instance_id: instance_id.to_string(),
                     node_id,
@@ -3110,6 +3717,11 @@ fn runtime_snapshot_on(
     let receipts = receipt_stmt
         .query_map([instance_id], |row| {
             Ok(AndReceipt {
+                scope_id: conn.query_row(
+                    "SELECT scope_id FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2",
+                    params![row.get::<_, String>(3)?, instance_id],
+                    |token| token.get(0),
+                )?,
                 join_node_id: row.get(0)?,
                 activation_id: row.get(1)?,
                 branch_edge_id: row.get(2)?,
@@ -3127,6 +3739,21 @@ fn runtime_snapshot_on(
     let incidents = incidents_on(conn, actor, instance_id, &model)?;
     let subscriptions = subscriptions_on(conn, instance_id)?;
     let event_races = races_on(conn, instance_id)?;
+    let scopes = scopes_on(conn, instance_id, &model)?;
+    let mut scope_variables = BTreeMap::new();
+    for scope in &scopes {
+        if scope.scope_id != instance_id
+            && !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+        {
+            scope_variables.insert(
+                scope.scope_id.clone(),
+                scope_variables_on(conn, instance_id, &scope.scope_id)?,
+            );
+        }
+    }
     Ok(RuntimeSnapshot {
         org_id: actor.org_id.clone(),
         instance,
@@ -3141,6 +3768,8 @@ fn runtime_snapshot_on(
         subscriptions,
         event_races,
         incidents,
+        scopes,
+        scope_variables,
     })
 }
 
@@ -3158,8 +3787,8 @@ fn insert_event_on(
     );
     let event_id = Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![event_id,instance_id,sql_integer(seq)?,at_ms,event.kind,event.node_id,actor,json(&event.data)?],
+        "INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![event_id,instance_id,sql_integer(seq)?,at_ms,event.kind,event.node_id,actor,json(&event.data)?,event.scope_id],
     )?;
     let org_id: String = tx.query_row(
         "SELECT org_id FROM bpmn_instances WHERE instance_id=?1",
@@ -3189,10 +3818,379 @@ fn insert_event_on(
 }
 
 fn check_active_incident_budget_on(conn: &Connection, instance_id: &str) -> Result<()> {
-    let incident_bytes:i64=conn.query_row("SELECT COALESCE(SUM(length(message)),0) FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL",[instance_id],|row|row.get(0))?;
+    let incident_bytes:i64=conn.query_row("SELECT COALESCE(SUM(length(CAST(message AS BLOB))),0) FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL",[instance_id],|row|row.get(0))?;
     ensure!(
         incident_bytes <= 64 * 1024,
         "process active incidents exceed instance detail budget"
+    );
+    Ok(())
+}
+
+pub(super) fn descendant_scope_ids(
+    scopes: &[ProcessScopeSummary],
+    root: &str,
+) -> Result<HashSet<String>> {
+    ensure!(
+        scopes.iter().any(|scope| scope.scope_id == root),
+        "scope closure root is missing"
+    );
+    let mut closure = HashSet::from([root.to_owned()]);
+    loop {
+        let previous = closure.len();
+        for scope in scopes {
+            if scope
+                .parent_scope_id
+                .as_ref()
+                .is_some_and(|parent| closure.contains(parent))
+            {
+                closure.insert(scope.scope_id.clone());
+            }
+        }
+        if closure.len() == previous {
+            return Ok(closure);
+        }
+    }
+}
+
+fn validate_scope_plan_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    at_ms: i64,
+) -> Result<Vec<ProcessScopeSummary>> {
+    let (definition_id, version): (String, u32) = tx.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let model = current_version_model_on(tx, &definition_id, version)?;
+    let mut scopes = scopes_on(tx, instance_id, &model)?;
+    let retained_terminal = scopes
+        .iter()
+        .filter(|scope| {
+            matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+        })
+        .map(|scope| scope.scope_id.clone())
+        .collect::<HashSet<_>>();
+
+    ensure!(
+        scopes
+            .len()
+            .checked_add(plan.create_scopes.len())
+            .is_some_and(|total| total <= 129),
+        "process lifetime scope capacity exceeds 129"
+    );
+    let mut locals = BTreeMap::new();
+    for scope in &scopes {
+        if scope.scope_id != instance_id
+            && !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+        {
+            locals.insert(
+                scope.scope_id.clone(),
+                scope_variables_on(tx, instance_id, &scope.scope_id)?,
+            );
+        }
+    }
+    for child in &plan.create_scopes {
+        ensure!(
+            Uuid::parse_str(&child.scope_id).is_ok()
+                && child.scope_id != instance_id
+                && !scopes.iter().any(|scope| scope.scope_id == child.scope_id),
+            "new process scope identity already exists or is invalid"
+        );
+        let parent = scopes
+            .iter()
+            .find(|scope| scope.scope_id == child.parent_scope_id)
+            .context("new scope has no actual parent")?;
+        ensure!(
+            !matches!(
+                parent.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            ),
+            "new scope parent is terminal"
+        );
+        let node = scope_node(
+            &model,
+            &scopes,
+            instance_id,
+            &child.parent_scope_id,
+            &child.subprocess_node_id,
+        )?;
+        ensure!(
+            matches!(node.kind, ProcessNodeKind::SubProcess { .. }),
+            "new scope node is not a subprocess in its parent body"
+        );
+        ensure!(
+            plan.create_tokens
+                .iter()
+                .any(|token| token.token_id == child.parent_token_id
+                    && token.scope_id == child.parent_scope_id
+                    && token.node_id == child.subprocess_node_id
+                    && token.status == "waiting"),
+            "new child scope must own its new actual parent waiting token"
+        );
+        ensure!(
+            plan.events.iter().any(|event| event.kind == "scope_entered"
+                && event.scope_id == child.scope_id
+                && event.data["scope_id"].as_str() == Some(child.scope_id.as_str())
+                && event.data["parent_scope_id"].as_str() == Some(child.parent_scope_id.as_str())
+                && event.data["parent_token_id"].as_str() == Some(child.parent_token_id.as_str())
+                && event.data["subprocess_node_id"].as_str()
+                    == Some(child.subprocess_node_id.as_str())),
+            "new scope lacks its exact activation history"
+        );
+        validate_variables(&child.variables)?;
+        let depth = parent
+            .depth
+            .checked_add(1)
+            .context("process scope depth overflow")?;
+        ensure!(depth <= 3, "process scope depth exceeds three");
+        scopes.push(ProcessScopeSummary {
+            scope_id: child.scope_id.clone(),
+            parent_scope_id: Some(child.parent_scope_id.clone()),
+            subprocess_node_id: Some(child.subprocess_node_id.clone()),
+            subprocess_node_name: Some(node.name.clone()),
+            parent_token_id: Some(child.parent_token_id.clone()),
+            revision: 1,
+            status: ProcessInstanceStatus::Running,
+            depth,
+            created_at_ms: at_ms,
+            updated_at_ms: at_ms,
+        });
+        locals.insert(child.scope_id.clone(), child.variables.clone());
+    }
+    let mut updated = HashSet::new();
+    for update in &plan.scope_updates {
+        ensure!(
+            update.scope_id != instance_id && updated.insert(&update.scope_id),
+            "scope update duplicates or replaces canonical root state"
+        );
+        let scope = scopes
+            .iter_mut()
+            .find(|scope| scope.scope_id == update.scope_id)
+            .context("updated scope is outside this instance")?;
+        ensure!(
+            scope.revision == update.expected_revision
+                && !matches!(
+                    scope.status,
+                    ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                ),
+            "process scope revision conflict or terminal scope"
+        );
+        sql_incrementable(update.expected_revision)?;
+        if let Some(variables) = &update.variables {
+            validate_variables(variables)?;
+            locals.insert(update.scope_id.clone(), variables.clone());
+        }
+        scope.status = update.status.clone();
+    }
+    validate_variables(&plan.variables)?;
+    let mut active_bytes = if matches!(
+        plan.status,
+        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+    ) {
+        0usize
+    } else {
+        json(&plan.variables)?.len()
+    };
+    for scope in &scopes {
+        if scope.scope_id == instance_id
+            || matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+        {
+            continue;
+        }
+        ensure!(
+            !matches!(
+                plan.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            ),
+            "root cannot close with an active child scope"
+        );
+        let local = locals
+            .get(&scope.scope_id)
+            .context("active child has no proposed local variables")?;
+        validate_variables(local)?;
+        active_bytes = active_bytes
+            .checked_add(json(local)?.len())
+            .context("active scope variable budget overflow")?;
+        effective_scope_variables(
+            &scopes,
+            &locals,
+            instance_id,
+            &plan.variables,
+            &scope.scope_id,
+        )?;
+    }
+    ensure!(
+        active_bytes <= 1024 * 1024,
+        "active process scope variables exceed 1 MiB"
+    );
+    for scope in &scopes {
+        if scope.scope_id == instance_id
+            || !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+        {
+            continue;
+        }
+        let descendants = descendant_scope_ids(&scopes, &scope.scope_id)?;
+        ensure!(
+            scopes
+                .iter()
+                .filter(|child| descendants.contains(&child.scope_id))
+                .all(|child| matches!(
+                    child.status,
+                    ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                )),
+            "terminal scope still has an active descendant"
+        );
+    }
+    for token in &plan.create_tokens {
+        ensure!(
+            Uuid::parse_str(&token.token_id).is_ok()
+                && !retained_terminal.contains(&token.scope_id),
+            "new process token identity or terminal scope is invalid"
+        );
+        let path = scope_path(&scopes, instance_id, &token.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+        ensure!(
+            nodes.iter().any(|node| node.id == token.node_id),
+            "new token node is outside its exact scope body"
+        );
+        if let Some(edge) = &token.arrival_edge_id {
+            ensure!(
+                flows
+                    .iter()
+                    .any(|flow| &flow.id == edge && flow.target_id == token.node_id),
+                "token arrival edge is outside its exact scope body"
+            );
+        }
+        for frame in &token.fork_stack {
+            let pairs = super::model::and_pairs(nodes, flows)?;
+            ensure!(
+                pairs.get(&frame.split_node_id) == Some(&frame.join_node_id)
+                    && flows.iter().any(|flow| flow.id == frame.branch_edge_id
+                        && flow.source_id == frame.split_node_id),
+                "token fork frame is outside its exact scope body"
+            );
+        }
+    }
+    for event in &plan.events {
+        ensure!(
+            scopes.iter().any(|scope| scope.scope_id == event.scope_id),
+            "event scope is outside its actual instance"
+        );
+        if let Some(node_id) = &event.node_id {
+            let node = scope_node(&model, &scopes, instance_id, &event.scope_id, node_id)?;
+            if event.kind == "end_reached" {
+                let mut statement=tx.prepare("SELECT token_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND status='ready'")?;
+                let existing = statement
+                    .query_map(params![instance_id, event.scope_id, node_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ensure!(
+                    node.kind == ProcessNodeKind::End
+                        && (plan
+                            .create_tokens
+                            .iter()
+                            .any(|token| token.scope_id == event.scope_id
+                                && token.node_id == *node_id
+                                && plan.consume_token_ids.contains(&token.token_id))
+                            || existing
+                                .iter()
+                                .any(|id| plan.consume_token_ids.contains(id))),
+                    "End history lacks its actual consumed local End token"
+                );
+            }
+        }
+    }
+    for incident in &plan.add_incidents {
+        ensure!(
+            scopes
+                .iter()
+                .any(|scope| scope.scope_id == incident.scope_id),
+            "incident scope is outside its actual instance"
+        );
+        if let Some(node_id) = &incident.node_id {
+            scope_node(&model, &scopes, instance_id, &incident.scope_id, node_id)?;
+        }
+        if let Some(job_id) = &incident.job_id {
+            let job = if let Some(job) = plan.create_jobs.iter().find(|job| &job.job_id == job_id) {
+                (job.scope_id.clone(), job.node_id.clone())
+            } else {
+                tx.query_row(
+                    "SELECT scope_id,node_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2",
+                    params![instance_id, job_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .context("incident job is outside its actual instance")?
+            };
+            ensure!(
+                job.0 == incident.scope_id && incident.node_id.as_deref() == Some(job.1.as_str()),
+                "incident job differs from its actual scope and activity"
+            );
+        }
+    }
+    Ok(scopes)
+}
+
+fn insert_scoped_tokens_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    at_ms: i64,
+) -> Result<()> {
+    let mut inserted = HashSet::from([instance_id.to_owned()]);
+    let mut statement = tx.prepare("SELECT scope_id FROM bpmn_scopes WHERE instance_id=?1")?;
+    inserted.extend(
+        statement
+            .query_map([instance_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    drop(statement);
+    let mut tokens = HashSet::new();
+    loop {
+        let before = (inserted.len(), tokens.len());
+        for token in &plan.create_tokens {
+            if inserted.contains(&token.scope_id) && tokens.insert(token.token_id.clone()) {
+                ensure!(
+                    matches!(token.status.as_str(), "ready" | "waiting" | "joining"),
+                    "invalid new token status"
+                );
+                tx.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![token.token_id,instance_id,token.scope_id,token.node_id,token.arrival_edge_id,json(&token.fork_stack)?,token.status,at_ms])?;
+            }
+        }
+        for scope in &plan.create_scopes {
+            if !inserted.contains(&scope.scope_id)
+                && inserted.contains(&scope.parent_scope_id)
+                && tokens.contains(&scope.parent_token_id)
+            {
+                tx.execute("INSERT INTO bpmn_scopes(scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,1,'running',?6,?7,?7)",params![scope.scope_id,instance_id,scope.parent_scope_id,scope.subprocess_node_id,scope.parent_token_id,json(&scope.variables)?,at_ms])?;
+                inserted.insert(scope.scope_id.clone());
+            }
+        }
+        if before == (inserted.len(), tokens.len()) {
+            break;
+        }
+    }
+    ensure!(
+        tokens.len() == plan.create_tokens.len()
+            && plan
+                .create_scopes
+                .iter()
+                .all(|scope| inserted.contains(&scope.scope_id)),
+        "new scopes/tokens cannot be inserted in actual parent order"
     );
     Ok(())
 }
@@ -3205,48 +4203,23 @@ fn apply_plan_on(
     plan: &RuntimePlan,
     at_ms: i64,
 ) -> Result<Vec<CancelledJobClaim>> {
-    validate_variables(&plan.variables)?;
-    for incident_id in &plan.resolve_incident_ids {
-        let affected = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL", params![at_ms,incident_id,instance_id])?;
-        ensure!(affected == 1, "process incident changed before transition");
-    }
-    let unresolved_incident: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_timers x JOIN bpmn_tokens t ON t.token_id=x.token_id AND t.instance_id=x.instance_id WHERE x.instance_id=?1 AND x.kind='catch' AND x.status='error' AND t.status='waiting') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL)",
+    let (current_revision, current_status): (u64, String) = tx.query_row(
+        "SELECT revision,status FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
-        |row| row.get(0),
-    )?;
-    let status = if unresolved_incident {
-        ProcessInstanceStatus::Incident
-    } else {
-        plan.status.clone()
-    };
-    let mut cancelled_claims = Vec::new();
-    let affected = tx.execute(
-        "UPDATE bpmn_instances SET status=?1,variables_json=?2,revision=revision+1,updated_at_ms=?3 WHERE instance_id=?4 AND revision=?5 AND status NOT IN ('completed','cancelled')",
-        params![status_text(&status),json(&plan.variables)?,at_ms,instance_id,sql_incrementable(expected_revision)?],
+        |row| Ok((row_u64(row, 0)?, row.get(1)?)),
     )?;
     ensure!(
-        affected == 1,
+        current_revision == expected_revision
+            && !matches!(current_status.as_str(), "completed" | "cancelled"),
         "process instance revision conflict or closed instance"
     );
-    for token_id in &plan.consume_token_ids {
-        let affected = tx.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id=?1 AND instance_id=?2 AND status IN ('ready','waiting','joining')",params![token_id,instance_id])?;
-        ensure!(affected == 1, "process token changed before transition");
-    }
-    for token_id in &plan.cancel_token_ids {
-        let affected = tx.execute("UPDATE bpmn_tokens SET status='cancelled' WHERE token_id=?1 AND instance_id=?2 AND status='waiting'",params![token_id,instance_id])?;
-        ensure!(
-            affected == 1,
-            "interrupted activity token changed before transition"
-        );
-    }
-    for token in &plan.create_tokens {
-        ensure!(
-            matches!(token.status.as_str(), "ready" | "waiting" | "joining"),
-            "invalid new token status"
-        );
-        tx.execute("INSERT INTO bpmn_tokens(token_id,instance_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![token.token_id,instance_id,token.node_id,token.arrival_edge_id,json(&token.fork_stack)?,token.status,at_ms])?;
-    }
+    sql_incrementable(expected_revision)?;
+    let proposed_scopes = validate_scope_plan_on(tx, instance_id, plan, at_ms)?;
+    let (definition_id,version,org_id,initiator):(String,u32,String,String)=tx.query_row("SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",[instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    let model = current_version_model_on(tx, &definition_id, version)?;
+
+    let mut cancelled_claims = Vec::new();
+    insert_scoped_tokens_on(tx, instance_id, plan, at_ms)?;
     apply_event_plan_on(tx, instance_id, plan, at_ms)?;
     for token_id in &plan.consume_token_ids {
         let mut statement = tx.prepare("SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 AND token_id=?2 AND kind='boundary' AND status IN ('pending','blocked')")?;
@@ -3301,7 +4274,7 @@ fn apply_plan_on(
                 .context("boundary cancellation lacks its reason")?;
             ensure!(
                 (reason == "activity_completed" && plan.consume_token_ids.iter().any(|id|id == token_id))
-                    || (reason == "sibling_interrupted" && plan.cancel_token_ids.iter().any(|id|id == token_id)),
+                    || (matches!(reason,"sibling_interrupted"|"scope_cancelled") && plan.cancel_token_ids.iter().any(|id|id == token_id)),
                 "boundary cancellation does not follow its exact activity completion or interruption"
             );
             ensure!(
@@ -3317,25 +4290,26 @@ fn apply_plan_on(
         update_timer_on(tx, update, at_ms)?;
     }
     for receipt in &plan.remove_receipts {
-        let affected=tx.execute("DELETE FROM bpmn_and_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id])?;
+        let affected=tx.execute("DELETE FROM bpmn_and_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5 AND scope_id=?6",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,receipt.scope_id])?;
         ensure!(
             affected == 1,
             "parallel join receipt changed before transition"
         );
     }
     for receipt in &plan.add_receipts {
-        tx.execute("INSERT INTO bpmn_and_receipts(instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,at_ms])?;
-    }
-    for task_id in &plan.complete_user_task_ids {
-        let affected=tx.execute("UPDATE bpmn_user_tasks SET status='completed',revision=revision+1,updated_at_ms=?1 WHERE user_task_id=?2 AND instance_id=?3 AND status='open'",params![at_ms,task_id,instance_id])?;
-        ensure!(affected == 1, "user task changed before transition");
-    }
-    for task_id in &plan.cancel_user_task_ids {
-        let affected = tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE user_task_id=?2 AND instance_id=?3 AND status='open' AND token_id IN (SELECT token_id FROM bpmn_tokens WHERE instance_id=?3 AND status='cancelled')",params![at_ms,task_id,instance_id])?;
+        let (node,stack,status,scope):(String,String,String,String)=tx.query_row("SELECT node_id,fork_stack_json,status,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",params![instance_id,receipt.token_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let stack: Vec<ForkFrame> = parse(stack)?;
+        let frame = stack.last().context("joining receipt lacks a fork frame")?;
         ensure!(
-            affected == 1,
-            "interrupted user task changed before transition"
+            status == "joining"
+                && scope == receipt.scope_id
+                && node == receipt.join_node_id
+                && frame.join_node_id == receipt.join_node_id
+                && frame.activation_id == receipt.activation_id
+                && frame.branch_edge_id == receipt.branch_edge_id,
+            "join receipt differs from its actual scoped joining token"
         );
+        tx.execute("INSERT INTO bpmn_and_receipts(instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,at_ms,receipt.scope_id])?;
     }
     for task in &plan.create_user_tasks {
         ensure!(
@@ -3366,12 +4340,114 @@ fn apply_plan_on(
             .token_id
             .as_deref()
             .context("new user task lacks its waiting activation")?;
-        let waiting: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2 AND node_id=?3 AND status='waiting')",params![token_id,instance_id,task.node_id],|row|row.get(0))?;
+        let waiting: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2 AND node_id=?3 AND scope_id=?4 AND status='waiting')",params![token_id,instance_id,task.node_id,task.scope_id],|row|row.get(0))?;
         ensure!(
             waiting,
             "new user task does not match its waiting activation"
         );
-        tx.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES(?1,?2,?3,?4,?5,?6,'open',?7,1,?8,?8,?9)",params![task.user_task_id,instance_id,task.node_id,task.name,task.assignee_user_id,task_kind_text(&task.kind),json(&task.outputs)?,at_ms,token_id])?;
+        let node = scope_node(
+            &model,
+            &proposed_scopes,
+            instance_id,
+            &task.scope_id,
+            &task.node_id,
+        )?;
+        let expected_assignee = match (&node.kind, &task.kind) {
+            (
+                ProcessNodeKind::UserTask {
+                    assignee_user_id, ..
+                },
+                ProcessUserTaskKind::Work,
+            ) => assignee_user_id.as_deref().unwrap_or(&initiator),
+            (ProcessNodeKind::ServiceTask { .. }, ProcessUserTaskKind::Verification) => {
+                initiator.as_str()
+            }
+            _ => bail!("new user task kind differs from its exact scoped activity"),
+        };
+        ensure!(
+            task.assignee_user_id == expected_assignee && task.name == node.name,
+            "new work identity differs from its pinned scoped activity"
+        );
+        tx.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id,scope_id) VALUES(?1,?2,?3,?4,?5,?6,'open',?7,1,?8,?8,?9,?10)",params![task.user_task_id,instance_id,task.node_id,task.name,task.assignee_user_id,task_kind_text(&task.kind),json(&task.outputs)?,at_ms,token_id,task.scope_id])?;
+    }
+    for job in &plan.create_jobs {
+        ensure!(
+            job.instance_id == instance_id
+                && job.status == "queued"
+                && job.attempt == 0
+                && job.fence == 0,
+            "invalid queued service job"
+        );
+        let node = scope_node(
+            &model,
+            &proposed_scopes,
+            instance_id,
+            &job.scope_id,
+            &job.node_id,
+        )?;
+        let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind else {
+            bail!("queued job node is not a service in its scope body")
+        };
+        require_flow_current(
+            tx,
+            &ProcessActor {
+                org_id: org_id.clone(),
+                user_id: initiator.clone(),
+            },
+            flow_id,
+            None,
+        )?;
+        validate_output(&job.input)?;
+        let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",params![instance_id,job.scope_id,job.token_id,job.node_id],|row|row.get(0))?;
+        ensure!(
+            waiting,
+            "new job differs from its actual scoped service wait"
+        );
+        tx.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,'queued',?6,?6,?7)",params![job.job_id,instance_id,job.node_id,job.token_id,json(&job.input)?,at_ms,job.scope_id])?;
+    }
+    for token_id in &plan.consume_token_ids {
+        let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
+        ensure!(
+            statement
+                .query_map(params![instance_id, token_id], |row| row
+                    .get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .all(|id| plan.complete_user_task_ids.contains(id)),
+            "token consumption omits its actual open work"
+        );
+        let mut statement=tx.prepare("SELECT job_id FROM bpmn_jobs WHERE instance_id=?1 AND token_id=?2 AND status IN ('queued','running')")?;
+        ensure!(
+            statement
+                .query_map(params![instance_id, token_id], |row| row
+                    .get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .all(|id| plan.complete_job_ids.contains(id)),
+            "token consumption omits its actual active service job"
+        );
+    }
+    for token_id in &plan.consume_token_ids {
+        let affected = tx.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id=?1 AND instance_id=?2 AND status IN ('ready','waiting','joining')",params![token_id,instance_id])?;
+        ensure!(affected == 1, "process token changed before transition");
+    }
+    for token_id in &plan.cancel_token_ids {
+        let affected = tx.execute("UPDATE bpmn_tokens SET status='cancelled' WHERE token_id=?1 AND instance_id=?2 AND status IN ('ready','waiting','joining')",params![token_id,instance_id])?;
+        ensure!(
+            affected == 1,
+            "interrupted activity token changed before transition"
+        );
+    }
+    for task_id in &plan.complete_user_task_ids {
+        let affected=tx.execute("UPDATE bpmn_user_tasks SET status='completed',revision=revision+1,updated_at_ms=?1 WHERE user_task_id=?2 AND instance_id=?3 AND status='open'",params![at_ms,task_id,instance_id])?;
+        ensure!(affected == 1, "user task changed before transition");
+    }
+    for task_id in &plan.cancel_user_task_ids {
+        let affected = tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE user_task_id=?2 AND instance_id=?3 AND status='open' AND token_id IN (SELECT token_id FROM bpmn_tokens WHERE instance_id=?3 AND status='cancelled')",params![at_ms,task_id,instance_id])?;
+        ensure!(
+            affected == 1,
+            "interrupted user task changed before transition"
+        );
     }
     for job_id in &plan.complete_job_ids {
         let affected=tx.execute("UPDATE bpmn_jobs SET status='completed',updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND status='running'",params![at_ms,job_id,instance_id])?;
@@ -3401,22 +4477,16 @@ fn apply_plan_on(
             "service job generation changed before interruption"
         );
     }
-    for job in &plan.create_jobs {
-        ensure!(
-            job.instance_id == instance_id
-                && job.status == "queued"
-                && job.attempt == 0
-                && job.fence == 0,
-            "invalid queued service job"
-        );
-        tx.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,'queued',?6,?6)",params![job.job_id,instance_id,job.node_id,job.token_id,json(&job.input)?,at_ms])?;
-    }
     for incident in &plan.add_incidents {
         ensure!(
             incident.message.len() <= 32 * 1024,
             "process incident message exceeds 32 KiB"
         );
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![incident.incident_id,instance_id,incident.node_id,incident.job_id,incident.code,incident_message(&incident.message),at_ms])?;
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident.incident_id,instance_id,incident.node_id,incident.job_id,incident.code,incident_message(&incident.message),at_ms,incident.scope_id])?;
+    }
+    for incident_id in &plan.resolve_incident_ids {
+        let affected = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL",params![at_ms,incident_id,instance_id])?;
+        ensure!(affected == 1, "process incident changed before transition");
     }
     check_active_incident_budget_on(tx, instance_id)?;
     let next_seq: u64 = tx.query_row(
@@ -3425,7 +4495,37 @@ fn apply_plan_on(
         |row| row_u64(row, 0),
     )?;
     let mut event_ids = Vec::new();
-    for (index, event) in plan.events.iter().enumerate() {
+    for (index, planned) in plan.events.iter().enumerate() {
+        let mut event = planned.clone();
+        if event.kind == "scope_error_propagated" {
+            let source_index = usize::try_from(
+                event.data["source_result_index"]
+                    .as_u64()
+                    .context("propagated error source index missing")?,
+            )?;
+            let source = plan
+                .events
+                .get(source_index)
+                .context("propagated error source event missing")?;
+            ensure!(
+                source_index < index
+                    && source.kind == "service_result"
+                    && source.data["result_origin"].as_str() == Some("contract")
+                    && source.scope_id
+                        == event.data["source_scope_id"]
+                            .as_str()
+                            .context("propagated error source scope missing")?,
+                "propagated error must reference an earlier factual contract result"
+            );
+            event
+                .data
+                .as_object_mut()
+                .context("propagation facts must be an object")?
+                .remove("source_result_index");
+            event.data["result_event_id"] = serde_json::json!(event_ids
+                .get(source_index)
+                .context("accepted result event not committed in this plan")?);
+        }
         event_ids.push(insert_event_on(
             tx,
             instance_id,
@@ -3433,7 +4533,7 @@ fn apply_plan_on(
                 .checked_add(u64::try_from(index)?)
                 .context("process event sequence overflow")?,
             Some(actor_id),
-            event,
+            &event,
             at_ms,
         )?);
     }
@@ -3453,6 +4553,7 @@ fn apply_plan_on(
             .context("outbox event index is absent")?;
         ensure!(
             event.kind == "message_queued"
+                && event.scope_id == message.source_scope_id
                 && event.node_id.as_deref() == Some(message.source_node_id.as_str())
                 && event.data["message_id"].as_str() == Some(message.message.message_id.as_str())
                 && event.data["source_activation_id"].as_str()
@@ -3465,6 +4566,7 @@ fn apply_plan_on(
             &message.message,
             Some((
                 instance_id,
+                &message.source_scope_id,
                 &message.source_node_id,
                 &message.source_activation_id,
                 &event_ids[message.source_event_index],
@@ -3472,6 +4574,117 @@ fn apply_plan_on(
             at_ms,
         )?;
     }
+    for update in &plan.scope_updates {
+        if matches!(
+            update.status,
+            ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+        ) {
+            let controls:bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_and_receipts WHERE instance_id=?1 AND scope_id=?2) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.scope_id=j.scope_id AND t.instance_id=j.instance_id WHERE j.instance_id=?1 AND j.scope_id=?2 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND scope_id=?2 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND resolved_at_ms IS NULL)",
+                params![instance_id,update.scope_id],|row|row.get(0))?;
+            ensure!(
+                !controls,
+                "terminal child scope retains active control state or incidents"
+            );
+            let scope = proposed_scopes
+                .iter()
+                .find(|scope| scope.scope_id == update.scope_id)
+                .context("terminal child missing")?;
+            if update.status == ProcessInstanceStatus::Completed {
+                let ended:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='end_reached')",params![instance_id,scope.scope_id],|row|row.get(0))?;
+                ensure!(
+                    ended,
+                    "child completion has not reached its actual local End"
+                );
+                let parent_token = scope
+                    .parent_token_id
+                    .as_deref()
+                    .context("completed scope parent wait missing")?;
+                ensure!(
+                    plan.consume_token_ids.iter().any(|id| id == parent_token)
+                        && plan
+                            .events
+                            .iter()
+                            .any(|event| event.kind == "scope_completed"
+                                && event.scope_id == scope.scope_id
+                                && event.data["parent_token_id"].as_str() == Some(parent_token)),
+                    "scope completion does not consume its exact parent waiting activation"
+                );
+            } else {
+                ensure!(
+                    plan.cancel_scope_roots
+                        .iter()
+                        .any(|root| descendant_scope_ids(&proposed_scopes, root)
+                            .is_ok_and(|ids| ids.contains(&scope.scope_id))),
+                    "scope cancellation lacks its validated closure"
+                );
+            }
+        }
+        let count = tx.execute("UPDATE bpmn_scopes SET status=?1,local_variables_json=COALESCE(?2,local_variables_json),revision=revision+1,updated_at_ms=?3 WHERE scope_id=?4 AND instance_id=?5 AND revision=?6 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",
+            params![status_text(&update.status),update.variables.as_ref().map(json).transpose()?,at_ms,update.scope_id,instance_id,sql_incrementable(update.expected_revision)?])?;
+        ensure!(
+            count == 1,
+            "process scope revision conflict or terminal scope"
+        );
+    }
+    let mut closure = HashSet::new();
+    for root in &plan.cancel_scope_roots {
+        closure.extend(descendant_scope_ids(&proposed_scopes, root)?);
+    }
+    if !closure.is_empty() {
+        let mut query = tx.prepare("SELECT org_id,sender_user_id,message_id FROM bpmn_messages WHERE source_instance_id=?1 AND status IN ('pending','blocked','ambiguous') ORDER BY sender_user_id,message_id")?;
+        let keys = query
+            .query_map([instance_id], |row| {
+                Ok(MessageKey {
+                    org_id: row.get(0)?,
+                    sender_user_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(query);
+        for key in keys {
+            let message = message_on(tx, &key, false)?;
+            if message
+                .source_scope_id
+                .as_ref()
+                .is_some_and(|id| closure.contains(id))
+            {
+                ensure!(
+                    update_message_state_on(
+                        tx,
+                        &message,
+                        ProcessMessageStatus::Cancelled,
+                        Some("scope_cancelled"),
+                        at_ms,
+                        at_ms
+                    )?,
+                    "outgoing scope receipt changed before closure"
+                );
+            }
+        }
+    }
+    let unresolved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_timers x JOIN bpmn_tokens t ON t.token_id=x.token_id AND t.instance_id=x.instance_id AND t.scope_id=x.scope_id WHERE x.instance_id=?1 AND x.kind='catch' AND x.status='error' AND t.status='waiting')",[instance_id],|row|row.get(0))?;
+    let status = if unresolved {
+        ProcessInstanceStatus::Incident
+    } else {
+        plan.status.clone()
+    };
+    if status == ProcessInstanceStatus::Completed {
+        let ended:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?1 AND kind='end_reached')",[instance_id],|row|row.get(0))?;
+        ensure!(ended, "root completion has not reached its actual End");
+        let active:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled'))",[instance_id],|row|row.get(0))?;
+        ensure!(
+            !active,
+            "root completion retains active tokens or child scopes"
+        );
+    }
+    let affected = tx.execute("UPDATE bpmn_instances SET status=?1,variables_json=?2,revision=revision+1,updated_at_ms=?3 WHERE instance_id=?4 AND revision=?5 AND status NOT IN ('completed','cancelled')",
+        params![status_text(&status),json(&plan.variables)?,at_ms,instance_id,sql_incrementable(expected_revision)?])?;
+    ensure!(
+        affected == 1,
+        "process instance revision conflict or closed instance"
+    );
     Ok(cancelled_claims)
 }
 
@@ -3496,9 +4709,13 @@ pub fn replay_instance_command(
                 hash == stamp.request_hash,
                 "command_id was reused for a different request"
             );
-            let prior: ProcessInstance = parse(result)?;
+            let prior: StoredInstanceIdentity = parse(result)?;
             require_instance_reader(conn, actor, &prior.instance_id)?;
-            return Ok(Some(reproject_instance_on(conn, actor, prior)?));
+            return Ok(Some(reproject_instance_on(
+                conn,
+                actor,
+                &prior.instance_id,
+            )?));
         }
         Ok(None)
     })
@@ -3519,9 +4736,9 @@ pub fn start_instance(
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     require_owner(&tx, actor, definition_id)?;
-    if let Some(prior) = command_replay::<ProcessInstance>(&tx, actor, stamp)? {
+    if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
         require_instance_reader(&tx, actor, &prior.instance_id)?;
-        return reproject_instance_on(&tx, actor, prior);
+        return reproject_instance_on(&tx, actor, &prior.instance_id);
     }
     let result = start_instance_on(
         &tx,
@@ -3564,6 +4781,13 @@ fn start_instance_on(
     ensure!(
         !definition.archived,
         "archived process cannot start new instances"
+    );
+    ensure!(
+        plan.cancel_scope_roots.is_empty()
+            && plan.cancel_token_ids.is_empty()
+            && plan.cancel_user_task_ids.is_empty()
+            && plan.cancel_job_ids.is_empty(),
+        "instance start cannot interrupt existing work"
     );
     let model = current_version_model_on(tx, definition_id, version)?;
     let start = model
@@ -3622,7 +4846,7 @@ fn start_instance_on(
     }
     validate_variables(&vars)?;
     ensure!(
-        plan.variables == vars,
+        plan.start_variables.as_ref() == Some(&vars),
         "initial transition variables differ from requested inputs"
     );
     let snapshots_json: String = tx.query_row(
@@ -3635,6 +4859,10 @@ fn start_instance_on(
         require_flow_current(tx, actor, &snapshot.info.flow_id, None)?;
     }
     tx.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence) VALUES(?1,?2,?3,?4,?5,1,'running',?6,?7,?7,?8,?9)",params![instance_id,definition_id,version,actor.org_id,actor.user_id,json(&vars)?,at_ms,start_identity.map(|(id,_)|id),start_identity.map(|(_,slot)|sql_integer(slot)).transpose()?])?;
+    tx.execute(
+        "INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES(?1,?1)",
+        [instance_id],
+    )?;
     apply_plan_on(tx, instance_id, &actor.user_id, 1, plan, at_ms)?;
     instance_on(tx, actor, instance_id, None)
 }
@@ -3646,7 +4874,14 @@ pub fn apply_transition(
     expected_revision: u64,
     plan: &RuntimePlan,
     at_ms: i64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
+    ensure!(
+        plan.cancel_scope_roots.is_empty()
+            && plan.cancel_token_ids.is_empty()
+            && plan.cancel_job_ids.is_empty()
+            && plan.cancel_user_task_ids.is_empty(),
+        "ordinary advancement cannot authorize interruption"
+    );
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
@@ -3662,7 +4897,7 @@ pub fn apply_transition(
     for snapshot in &snapshots {
         require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
     }
-    apply_plan_on(
+    let cancelled_claims = apply_plan_on(
         &tx,
         instance_id,
         &actor.user_id,
@@ -3672,7 +4907,10 @@ pub fn apply_transition(
     )?;
     let result = instance_on(&tx, actor, instance_id, None)?;
     tx.commit()?;
-    Ok(result)
+    Ok(ProcessTransitionOutcome {
+        instance: result,
+        cancelled_claims,
+    })
 }
 
 pub fn complete_user_task(
@@ -3686,19 +4924,29 @@ pub fn complete_user_task(
     approved: Option<bool>,
     plan: &RuntimePlan,
     at_ms: i64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
     validate_output(outputs)?;
+    ensure!(
+        plan.cancel_scope_roots.is_empty()
+            && plan.cancel_token_ids.is_empty()
+            && plan.cancel_job_ids.is_empty()
+            && plan.cancel_user_task_ids.is_empty(),
+        "ordinary advancement cannot authorize interruption"
+    );
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     require_instance_reader(&tx, actor, instance_id)?;
-    if let Some(prior) = command_replay::<ProcessInstance>(&tx, actor, stamp)? {
+    if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
         require_instance_reader(&tx, actor, &prior.instance_id)?;
-        return reproject_instance_on(&tx, actor, prior);
+        return Ok(ProcessTransitionOutcome {
+            instance: reproject_instance_on(&tx, actor, &prior.instance_id)?,
+            cancelled_claims: Vec::new(),
+        });
     }
     let (assignee,kind,status,token_id,node_id):(String,String,String,Option<String>,String)=tx.query_row("SELECT assignee_user_id,kind,status,token_id,node_id FROM bpmn_user_tasks WHERE user_task_id=?1 AND instance_id=?2",params![user_task_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).context("user task not found")?;
     let token_id = token_id.context("open user task lacks its waiting activation")?;
-    let activation_live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND i.status NOT IN ('completed','cancelled'))",params![token_id,instance_id,node_id],|row|row.get(0))?;
+    let activation_live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled')) AND i.status NOT IN ('completed','cancelled'))",params![token_id,instance_id,node_id],|row|row.get(0))?;
     ensure!(activation_live, "user task activation is no longer waiting");
     ensure!(
         assignee == actor.user_id && status == "open",
@@ -3714,7 +4962,7 @@ pub fn complete_user_task(
             .any(|id| id == user_task_id),
         "completion plan does not consume the requested user task"
     );
-    apply_plan_on(
+    let cancelled_claims = apply_plan_on(
         &tx,
         instance_id,
         &actor.user_id,
@@ -3729,7 +4977,10 @@ pub fn complete_user_task(
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
-    Ok(result)
+    Ok(ProcessTransitionOutcome {
+        instance: result,
+        cancelled_claims,
+    })
 }
 
 pub fn cancel_instance(
@@ -3738,15 +4989,33 @@ pub fn cancel_instance(
     stamp: &CommandStamp,
     instance_id: &str,
     expected_revision: u64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
     let at_ms = now_ms()?;
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     let initiator = require_instance_reader(&tx, actor, instance_id)?;
     ensure!(initiator, "only process initiator may cancel");
-    if let Some(prior) = command_replay::<ProcessInstance>(&tx, actor, stamp)? {
-        return reproject_instance_on(&tx, actor, prior);
+    if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
+        return Ok(ProcessTransitionOutcome {
+            instance: reproject_instance_on(&tx, actor, &prior.instance_id)?,
+            cancelled_claims: Vec::new(),
+        });
+    }
+    let mut claims = tx.prepare("SELECT job_id,attempt,fence,worker_id FROM bpmn_jobs WHERE instance_id=?1 AND status='running' ORDER BY job_id")?;
+    let cancelled_claims = claims
+        .query_map([instance_id], |row| {
+            Ok(CancelledJobClaim {
+                job_id: row.get(0)?,
+                attempt: row.get(1)?,
+                fence: row_u64(row, 2)?,
+                worker_id: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(claims);
+    for claim in &cancelled_claims {
+        sql_incrementable(claim.fence)?;
     }
     let changed=tx.execute("UPDATE bpmn_instances SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND revision=?3 AND status NOT IN ('completed','cancelled')",params![at_ms,instance_id,sql_incrementable(expected_revision)?])?;
     ensure!(
@@ -3772,10 +5041,19 @@ pub fn cancel_instance(
             [instance_id],
             |row| row_u64(row, 0),
         )?;
-        insert_event_on(&tx, instance_id, seq, Some(&actor.user_id), &PlannedEvent {
+        insert_event_on(
+            &tx,
+            instance_id,
+            seq,
+            Some(&actor.user_id),
+            &PlannedEvent {
+                scope_id: timer
+                    .scope_id
+                    .clone()
+                    .context("instance timer has no scope")?,
                 kind: "timer_cancelled".into(),
                 node_id: Some(timer.node_id.clone()),
-                data: serde_json::json!({"timer_id":id,"kind":timer.kind,"reason":"instance_cancelled","attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&model,&timer)? } else { None },"attached_token_id":timer.token_id}),
+                data: serde_json::json!({"timer_id":id,"kind":timer.kind,"reason":"instance_cancelled","attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&tx,&model,&timer)? } else { None },"attached_token_id":timer.token_id}),
             },
             at_ms,
         )?;
@@ -3796,6 +5074,7 @@ pub fn cancel_instance(
             seq,
             Some(&actor.user_id),
             &PlannedEvent {
+                scope_id: subscription.scope_id.clone(),
                 kind: "subscription_cancelled".into(),
                 node_id: Some(subscription.node_id),
                 data: serde_json::json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"reason":"instance_cancelled"}),
@@ -3819,6 +5098,7 @@ pub fn cancel_instance(
             seq,
             Some(&actor.user_id),
             &PlannedEvent {
+                scope_id: race.scope_id.clone(),
                 kind: "event_race_cancelled".into(),
                 node_id: Some(race.gateway_node_id),
                 data: serde_json::json!({"race_id":race.race_id,"reason":"instance_cancelled"}),
@@ -3844,9 +5124,42 @@ pub fn cancel_instance(
             )?;
         }
     }
+    tx.execute(
+        "DELETE FROM bpmn_and_receipts WHERE instance_id=?1",
+        [instance_id],
+    )?;
     tx.execute("UPDATE bpmn_tokens SET status='cancelled' WHERE instance_id=?1 AND status IN ('ready','waiting','joining')",[instance_id])?;
     tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND status='open'",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_jobs SET status='cancelled',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE instance_id=?1 AND status IN ('queued','running','error')",params![instance_id,at_ms])?;
+    tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE instance_id=?2 AND resolved_at_ms IS NULL",params![at_ms,instance_id])?;
+    let children = scopes_on(&tx, instance_id, &model)?;
+    for child in children.into_iter().filter(|scope| {
+        scope.parent_scope_id.is_some()
+            && !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+            )
+    }) {
+        tx.execute("UPDATE bpmn_scopes SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE scope_id=?2 AND instance_id=?3 AND revision=?4 AND status NOT IN ('completed','cancelled')",params![at_ms,child.scope_id,instance_id,sql_incrementable(child.revision)?])?;
+        let seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [instance_id],
+            |row| row_u64(row, 0),
+        )?;
+        insert_event_on(
+            &tx,
+            instance_id,
+            seq,
+            Some(&actor.user_id),
+            &PlannedEvent {
+                scope_id: child.scope_id.clone(),
+                kind: "scope_cancelled".into(),
+                node_id: None,
+                data: serde_json::json!({"scope_id":child.scope_id,"parent_scope_id":child.parent_scope_id,"parent_token_id":child.parent_token_id,"subprocess_node_id":child.subprocess_node_id,"reason":"instance_cancelled"}),
+            },
+            at_ms,
+        )?;
+    }
     let next_seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [instance_id],
@@ -3858,6 +5171,7 @@ pub fn cancel_instance(
         next_seq,
         Some(&actor.user_id),
         &PlannedEvent {
+            scope_id: instance_id.to_owned(),
             kind: "cancelled".into(),
             node_id: None,
             data: Value::Null,
@@ -3867,32 +5181,26 @@ pub fn cancel_instance(
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
-    Ok(result)
+    Ok(ProcessTransitionOutcome {
+        instance: result,
+        cancelled_claims,
+    })
 }
 
-fn job_flow_id_on(
-    conn: &Connection,
-    definition_id: &str,
-    version: u32,
-    node_id: &str,
-) -> Result<String> {
-    let model = current_version_model_on(conn, definition_id, version)?;
-    match model
-        .nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .map(|node| &node.kind)
-    {
-        Some(tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { flow_id, .. }) => {
-            Ok(flow_id.clone())
-        }
-        _ => bail!("service job references a non-service process node"),
+fn job_flow_id_on(conn: &Connection, job_id: &str) -> Result<String> {
+    let (instance,scope,definition,version,node):(String,String,String,u32,String)=conn.query_row(
+        "SELECT j.instance_id,j.scope_id,i.definition_id,i.version,j.node_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1",[job_id],
+        |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+    let model = current_version_model_on(conn, &definition, version)?;
+    match &scoped_node_on(conn, &instance, &scope, &model, &node)?.kind {
+        ProcessNodeKind::ServiceTask { flow_id, .. } => Ok(flow_id.clone()),
+        _ => bail!("service job references a non-service node in its exact scope"),
     }
 }
 
 fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1 AND t.status='waiting' AND i.status NOT IN ('completed','cancelled'))",
+        "SELECT EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id AND t.scope_id=j.scope_id JOIN bpmn_scopes s ON s.scope_id=j.scope_id AND s.instance_id=j.instance_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1 AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled')) AND i.status NOT IN ('completed','cancelled'))",
         [job_id], |row| row.get(0),
     )?)
 }
@@ -3904,28 +5212,24 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     );
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let queued:Option<(String,String,String,String,String,u32)>=tx.query_row(
-        "SELECT j.job_id,j.instance_id,j.node_id,i.org_id,i.initiator_user_id,i.version FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE j.status='queued' AND i.status IN ('running','waiting','incident') AND t.status='waiting' ORDER BY j.created_at_ms,j.job_id LIMIT 1",
+    let queued:Option<(String,String,String,String,String,String)>=tx.query_row(
+        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled')) ORDER BY j.created_at_ms,j.job_id LIMIT 1",
         [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
     ).optional()?;
-    let Some((job_id, instance_id, node_id, org_id, user_id, version)) = queued else {
+    let Some((job_id, instance_id, scope_id, node_id, org_id, user_id)) = queued else {
         return Ok(None);
     };
     let actor = ProcessActor { org_id, user_id };
-    let definition_id: String = tx.query_row(
-        "SELECT definition_id FROM bpmn_instances WHERE instance_id=?1",
-        [&instance_id],
-        |row| row.get(0),
-    )?;
-    let flow_id = job_flow_id_on(&tx, &definition_id, version, &node_id)?;
+    let flow_id = job_flow_id_on(&tx, &job_id)?;
     if let Err(error) =
         require_actor(&tx, &actor).and_then(|_| require_flow_current(&tx, &actor, &flow_id, None))
     {
         let reason = bounded_failure_message(&error.to_string());
         tx.execute("UPDATE bpmn_jobs SET status='error',updated_at_ms=?1 WHERE job_id=?2 AND status='queued'",params![now_ms,job_id])?;
         tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2",params![now_ms,instance_id])?;
+        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",params![now_ms,instance_id,scope_id])?;
         let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,'SOURCE_ACCESS_REVOKED',?5,?6)",params![incident_id,instance_id,node_id,job_id,incident_message(&reason),now_ms])?;
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,'SOURCE_ACCESS_REVOKED',?5,?6,?7)",params![incident_id,instance_id,node_id,job_id,incident_message(&reason),now_ms,scope_id])?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [&instance_id],
@@ -3937,6 +5241,7 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
             next_seq,
             None,
             &PlannedEvent {
+                scope_id: scope_id.clone(),
                 kind: "job_denied".into(),
                 node_id: Some(node_id),
                 data: serde_json::json!({"job_id":job_id,"incident_id":incident_id,"reason":reason}),
@@ -3964,6 +5269,7 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
         next_seq,
         Some(&actor.user_id),
         &PlannedEvent {
+            scope_id: scope_id.clone(),
             kind: "service_claimed".into(),
             node_id: Some(node_id),
             data: serde_json::json!({"job_id":job_id,"attempt":attempt,"fence":fence}),
@@ -3998,13 +5304,13 @@ pub fn renew_job_lease(
     if !job_activation_live_on(&tx, job_id)? {
         return Ok(false);
     }
-    let owner:Option<(String,String,String,u32,String)>=tx.query_row("SELECT i.org_id,i.initiator_user_id,i.definition_id,i.version,j.node_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
-    let Some((org_id, user_id, definition_id, version, node_id)) = owner else {
+    let owner:Option<(String,String)>=tx.query_row("SELECT i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    let Some((org_id, user_id)) = owner else {
         return Ok(false);
     };
     let actor = ProcessActor { org_id, user_id };
     require_actor(&tx, &actor)?;
-    let flow_id = job_flow_id_on(&tx, &definition_id, version, &node_id)?;
+    let flow_id = job_flow_id_on(&tx, &job_id)?;
     require_flow_current(&tx, &actor, &flow_id, None)?;
     let changed=tx.execute("UPDATE bpmn_jobs SET lease_until_ms=?1,updated_at_ms=?2 WHERE job_id=?3 AND worker_id=?4 AND attempt=?5 AND fence=?6 AND status='running' AND lease_until_ms>=?2",params![now_ms+30_000,now_ms,job_id,worker_id,attempt,sql_integer(fence)?])?;
     tx.commit()?;
@@ -4020,11 +5326,19 @@ fn validate_job_result_plan_on(
     plan: &RuntimePlan,
 ) -> Result<()> {
     let model = current_version_model_on(tx, &instance.definition_id, instance.version)?;
-    let node = model
-        .nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .context("service result node missing")?;
+    let (source_scope, token_id): (String, String) = tx.query_row(
+        "SELECT scope_id,token_id FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2",
+        params![job_id, instance.instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let scopes = scopes_on(tx, &instance.instance_id, &model)?;
+    let node = scope_node(
+        &model,
+        &scopes,
+        &instance.instance_id,
+        &source_scope,
+        node_id,
+    )?;
     let ProcessNodeKind::ServiceTask {
         result_expression, ..
     } = &node.kind
@@ -4050,32 +5364,55 @@ fn validate_job_result_plan_on(
                 .events
                 .iter()
                 .any(|event| event.kind == "service_result"
+                    && event.scope_id == source_scope
                     && event.node_id.as_deref() == Some(node_id)
                     && event.data == expected),
         "service result plan does not retain its actual result and origin"
     );
-    let token_id: String = tx.query_row(
-        "SELECT token_id FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2",
-        params![job_id, instance.instance_id],
-        |row| row.get(0),
-    )?;
     let open = subscriptions_on(tx, &instance.instance_id)?
         .into_iter()
         .filter(|sub| {
-            sub.token_id == token_id
-                && sub.kind == ProcessSubscriptionKind::BoundaryError
+            sub.kind == ProcessSubscriptionKind::BoundaryError
                 && sub.status == ProcessSubscriptionStatus::Open
         })
         .collect::<Vec<_>>();
-    let handler = if observed.origin == ActivityResultOrigin::Contract
+    let mut attached_token = token_id.clone();
+    let mut scope_id = source_scope.clone();
+    let mut hops = Vec::new();
+    let mut handler = None;
+    if observed.origin == ActivityResultOrigin::Contract
         && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::Error
     {
-        open.iter()
-            .find(|sub| sub.error_code.is_some() && sub.error_code == observed.result.code)
-            .or_else(|| open.iter().find(|sub| sub.error_code.is_none()))
-    } else {
-        None
-    };
+        loop {
+            let local = open
+                .iter()
+                .filter(|sub| sub.scope_id == scope_id && sub.token_id == attached_token)
+                .collect::<Vec<_>>();
+            if let Some(sub) = local
+                .iter()
+                .find(|sub| sub.error_code.is_some() && sub.error_code == observed.result.code)
+                .or_else(|| local.iter().find(|sub| sub.error_code.is_none()))
+            {
+                handler = Some(*sub);
+                break;
+            }
+            let scope = scopes
+                .iter()
+                .find(|scope| scope.scope_id == scope_id)
+                .context("error source scope is absent")?;
+            let Some(parent) = &scope.parent_scope_id else {
+                break;
+            };
+            hops.push((scope_id.clone(), parent.clone()));
+            attached_token = scope
+                .parent_token_id
+                .clone()
+                .context("enclosing subprocess wait is absent")?;
+            scope_id = parent.clone();
+            let live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND status='waiting')",params![instance.instance_id,scope_id,attached_token],|row|row.get(0))?;
+            ensure!(live, "error propagation lost an actual enclosing wait");
+        }
+    }
     let caught = plan
         .events
         .iter()
@@ -4085,15 +5422,43 @@ fn validate_job_result_plan_on(
         Some(sub) => {
             ensure!(
                 caught.len() == 1
+                    && caught[0].scope_id == sub.scope_id
                     && caught[0].node_id.as_deref() == Some(sub.node_id.as_str())
                     && caught[0].data["subscription_id"].as_str()
                         == Some(sub.subscription_id.as_str())
-                    && caught[0].data["attached_token_id"].as_str() == Some(token_id.as_str())
+                    && caught[0].data["attached_token_id"].as_str()
+                        == Some(attached_token.as_str())
                     && caught[0].data["job_id"].as_str() == Some(job_id)
                     && caught[0].data["error_code"] == serde_json::to_value(&observed.result.code)?
                     && caught[0].data["result_origin"].as_str() == Some("contract"),
                 "business error handler does not match its accepted contract result"
             );
+            let propagation = plan
+                .events
+                .iter()
+                .filter(|event| event.kind == "scope_error_propagated")
+                .collect::<Vec<_>>();
+            ensure!(
+                propagation.len() == hops.len(),
+                "business error propagation omits an actual enclosing scope"
+            );
+            let result_index = plan
+                .events
+                .iter()
+                .position(|event| event.kind == "service_result")
+                .context("accepted result event missing")?;
+            for (event, (from, to)) in propagation.iter().zip(&hops) {
+                ensure!(event.scope_id==sub.scope_id && event.node_id.as_deref()==Some(sub.node_id.as_str())
+                    && event.data["source_scope_id"].as_str()==Some(source_scope.as_str())
+                    && event.data["source_job_id"].as_str()==Some(job_id)
+                    && event.data["source_token_id"].as_str()==Some(token_id.as_str())
+                    && event.data["from_scope_id"].as_str()==Some(from.as_str())
+                    && event.data["to_scope_id"].as_str()==Some(to.as_str())
+                    && event.data["handler_node_id"].as_str()==Some(sub.node_id.as_str())
+                    && event.data["code"]==serde_json::to_value(&observed.result.code)?
+                    && event.data["source_result_index"].as_u64()==Some(u64::try_from(result_index)?),
+                    "business error propagation differs from accepted result and actual scope ancestry");
+            }
             validate_boundary_plan_on(
                 tx,
                 &BoundaryActivationId::Subscription(sub.subscription_id.clone()),
@@ -4102,6 +5467,17 @@ fn validate_job_result_plan_on(
             )?;
         }
         None => {
+            ensure!(
+                plan.cancel_scope_roots.is_empty()
+                    && plan.cancel_token_ids.is_empty()
+                    && plan.cancel_job_ids.is_empty()
+                    && plan.cancel_user_task_ids.is_empty()
+                    && !plan
+                        .events
+                        .iter()
+                        .any(|event| event.kind == "scope_error_propagated"),
+                "uncaught or platform result cannot interrupt another scope"
+            );
             ensure!(
                 caught.is_empty()
                     && !plan.subscription_updates.iter().any(|update| update.status
@@ -4127,7 +5503,7 @@ pub fn accept_job_result(
     expected_revision: u64,
     plan: &RuntimePlan,
     at_ms: i64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
     let result = &observed.result;
     validate_output(&result.outputs)?;
     ensure!(
@@ -4161,7 +5537,10 @@ pub fn accept_job_result(
                     == Some(result_origin_text(&observed.origin)),
             "service job result conflicts with accepted result"
         );
-        return Ok(instance);
+        return Ok(ProcessTransitionOutcome {
+            instance,
+            cancelled_claims: Vec::new(),
+        });
     }
     let commit_now_ms = now_ms()?;
     ensure!(
@@ -4173,14 +5552,14 @@ pub fn accept_job_result(
             && job_activation_live_on(&tx, job_id)?,
         "service job fence is stale"
     );
-    let flow_id = job_flow_id_on(&tx, &instance.definition_id, instance.version, &node_id)?;
+    let flow_id = job_flow_id_on(&tx, job_id)?;
     require_flow_current(&tx, actor, &flow_id, None)?;
     ensure!(
         plan.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
     );
     validate_job_result_plan_on(&tx, &instance, &node_id, job_id, observed, plan)?;
-    apply_plan_on(
+    let cancelled_claims = apply_plan_on(
         &tx,
         &instance_id,
         &actor.user_id,
@@ -4197,7 +5576,10 @@ pub fn accept_job_result(
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
     let result_instance = instance_on(&tx, actor, &instance_id, None)?;
     tx.commit()?;
-    Ok(result_instance)
+    Ok(ProcessTransitionOutcome {
+        instance: result_instance,
+        cancelled_claims,
+    })
 }
 
 pub fn retry_job(
@@ -4217,8 +5599,8 @@ pub fn retry_job(
         instance.initiator_user_id == actor.user_id,
         "only process initiator may retry"
     );
-    if let Some(prior) = command_replay::<ProcessInstance>(&tx, actor, stamp)? {
-        return reproject_instance_on(&tx, actor, prior);
+    if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
+        return reproject_instance_on(&tx, actor, &prior.instance_id);
     }
     ensure!(
         instance.revision == expected_revision
@@ -4230,13 +5612,14 @@ pub fn retry_job(
         job_activation_live_on(&tx, job_id)?,
         "service activity is no longer retryable"
     );
-    let node_id:String=tx.query_row("SELECT j.node_id FROM bpmn_jobs j JOIN bpmn_incidents x ON x.job_id=j.job_id AND x.instance_id=j.instance_id AND x.resolved_at_ms IS NULL WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status IN ('error','completed')",params![job_id,instance_id],|row|row.get(0)).context("retryable job not found")?;
-    let flow_id = job_flow_id_on(&tx, &instance.definition_id, instance.version, &node_id)?;
+    let (node_id,scope_id):(String,String)=tx.query_row("SELECT j.node_id,j.scope_id FROM bpmn_jobs j JOIN bpmn_incidents x ON x.job_id=j.job_id AND x.instance_id=j.instance_id AND x.resolved_at_ms IS NULL WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status IN ('error','completed')",params![job_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?))).context("retryable job not found")?;
+    let flow_id = job_flow_id_on(&tx, job_id)?;
     require_flow_current(&tx, actor, &flow_id, None)?;
     let affected=tx.execute("UPDATE bpmn_jobs SET status='queued',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,result_json=NULL,result_origin=NULL,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND status IN ('error','completed')",params![at_ms,job_id,instance_id])?;
     ensure!(affected == 1, "retryable job changed");
     tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND token_id=(SELECT token_id FROM bpmn_jobs WHERE job_id=?3) AND kind='verification' AND status='open'",params![at_ms,instance_id,job_id])?;
     tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE instance_id=?2 AND job_id=?3 AND resolved_at_ms IS NULL",params![at_ms,instance_id,job_id])?;
+    tx.execute("UPDATE bpmn_scopes SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND scope_id=?3 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",params![at_ms,instance_id,scope_id])?;
     tx.execute("UPDATE bpmn_instances SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2",params![at_ms,instance_id])?;
     let next_seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
@@ -4249,6 +5632,7 @@ pub fn retry_job(
         next_seq,
         Some(&actor.user_id),
         &PlannedEvent {
+            scope_id: scope_id.clone(),
             kind: "job_retried".into(),
             node_id: Some(node_id),
             data: serde_json::json!({"job_id":job_id}),
@@ -4264,26 +5648,28 @@ pub fn retry_job(
 pub fn recover_jobs(pool: &DbPool, worker_id: Option<&str>, now_ms: i64) -> Result<u32> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let mut stmt=tx.prepare("SELECT j.job_id,j.instance_id,j.node_id FROM bpmn_jobs j WHERE j.status='running' AND (?1 IS NULL OR j.worker_id=?1) ORDER BY j.created_at_ms,j.job_id")?;
+    let mut stmt=tx.prepare("SELECT j.job_id,j.instance_id,j.node_id,j.scope_id FROM bpmn_jobs j WHERE j.status='running' AND (?1 IS NULL OR j.worker_id=?1) ORDER BY j.created_at_ms,j.job_id")?;
     let rows = stmt
         .query_map([worker_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    for (job_id, instance_id, node_id) in &rows {
+    for (job_id, instance_id, node_id, scope_id) in &rows {
         ensure!(
             job_activation_live_on(&tx, job_id)?,
             "running service job no longer has a waiting activation"
         );
         tx.execute("UPDATE bpmn_jobs SET status='error',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",params![now_ms,job_id])?;
         tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled')",params![now_ms,instance_id])?;
+        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",params![now_ms,instance_id,scope_id])?;
         let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,'INTERRUPTED','The worker stopped before the external effect was confirmed',?5)",params![incident_id,instance_id,node_id,job_id,now_ms])?;
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,'INTERRUPTED','The worker stopped before the external effect was confirmed',?5,?6)",params![incident_id,instance_id,node_id,job_id,now_ms,scope_id])?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [instance_id],
@@ -4295,6 +5681,7 @@ pub fn recover_jobs(pool: &DbPool, worker_id: Option<&str>, now_ms: i64) -> Resu
             next_seq,
             None,
             &PlannedEvent {
+                scope_id: scope_id.clone(),
                 kind: "job_interrupted".into(),
                 node_id: Some(node_id.clone()),
                 data: serde_json::json!({"job_id":job_id,"incident_id":incident_id}),
@@ -4315,6 +5702,7 @@ pub fn fail_job(
     code: &str,
     message: &str,
     now_ms: i64,
+    observed: Option<&ObservedActivityResult>,
 ) -> Result<bool> {
     ensure!(
         !code.is_empty() && code.len() <= 128,
@@ -4323,12 +5711,66 @@ pub fn fail_job(
     let message = bounded_failure_message(message);
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let row:Option<(String,String)>=tx.query_row("SELECT instance_id,node_id FROM bpmn_jobs WHERE job_id=?1 AND status='running' AND attempt=?2 AND fence=?3 AND worker_id=?4",params![job_id,attempt,sql_integer(fence)?,worker_id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-    let Some((instance_id, node_id)) = row else {
+    let row:Option<(String,String,String)>=tx.query_row("SELECT instance_id,node_id,scope_id FROM bpmn_jobs WHERE job_id=?1 AND status='running' AND attempt=?2 AND fence=?3 AND worker_id=?4",params![job_id,attempt,sql_integer(fence)?,worker_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+    let Some((instance_id, node_id, scope_id)) = row else {
         return Ok(false);
     };
     if !job_activation_live_on(&tx, job_id)? {
         return Ok(false);
+    }
+    if let Some(observed) = observed {
+        validate_output(&observed.result.outputs)?;
+        ensure!(
+            json(&observed.result)?.len() <= 384 * 1024 - 4096,
+            "observed result exceeds history budget"
+        );
+        if observed.origin == ActivityResultOrigin::Contract {
+            super::jobs::parse_contract_result(serde_json::to_value(&observed.result)?)?;
+            let (definition, version): (String, u32) = tx.query_row(
+                "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+                [&instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let model = current_version_model_on(&tx, &definition, version)?;
+            ensure!(
+                matches!(
+                    &scoped_node_on(&tx, &instance_id, &scope_id, &model, &node_id)?.kind,
+                    ProcessNodeKind::ServiceTask {
+                        result_expression: Some(_),
+                        ..
+                    }
+                ),
+                "contract provenance has no pinned result expression"
+            );
+        }
+        tx.execute(
+            "UPDATE bpmn_jobs SET result_json=?1,result_origin=?2 WHERE job_id=?3",
+            params![
+                json(&observed.result)?,
+                result_origin_text(&observed.origin),
+                job_id
+            ],
+        )?;
+        let seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [&instance_id],
+            |row| row_u64(row, 0),
+        )?;
+        let mut data = serde_json::to_value(&observed.result)?;
+        data["result_origin"] = serde_json::json!(result_origin_text(&observed.origin));
+        insert_event_on(
+            &tx,
+            &instance_id,
+            seq,
+            None,
+            &PlannedEvent {
+                scope_id: scope_id.clone(),
+                kind: "service_result".into(),
+                node_id: Some(node_id.clone()),
+                data,
+            },
+            now_ms,
+        )?;
     }
     let changed=tx.execute("UPDATE bpmn_jobs SET status='error',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running' AND attempt=?3 AND fence=?4 AND worker_id=?5",params![now_ms,job_id,attempt,sql_integer(fence)?,worker_id])?;
     if changed == 0 {
@@ -4336,8 +5778,9 @@ pub fn fail_job(
     }
     let active=tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled')",params![now_ms,instance_id])?;
     if active == 1 {
+        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled')",params![now_ms,instance_id,scope_id])?;
         let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![incident_id,instance_id,node_id,job_id,code,incident_message(&message),now_ms])?;
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident_id,instance_id,node_id,job_id,code,incident_message(&message),now_ms,scope_id])?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [&instance_id],
@@ -4349,6 +5792,7 @@ pub fn fail_job(
             next_seq,
             None,
             &PlannedEvent {
+                scope_id: scope_id.clone(),
                 kind: "job_failed".into(),
                 node_id: Some(node_id),
                 data: serde_json::json!({"job_id":job_id,"incident_id":incident_id,"code":code,"message":message}),
@@ -4410,6 +5854,11 @@ fn race_status(value: &str) -> Result<ProcessEventRaceStatus> {
 fn subscription_on(conn: &Connection, id: &str) -> Result<EventSubscription> {
     let row = conn.query_row("SELECT instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions WHERE subscription_id=?1",[id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u32>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?,row_u64(r,11)?,r.get::<_,String>(12)?,r.get::<_,Option<String>>(13)?,r.get::<_,i64>(14)?,r.get::<_,i64>(15)?))).context("subscription not found")?;
     Ok(EventSubscription {
+        scope_id: conn.query_row(
+            "SELECT scope_id FROM bpmn_event_subscriptions WHERE subscription_id=?1",
+            [id],
+            |row| row.get(0),
+        )?,
         subscription_id: id.to_owned(),
         instance_id: row.0,
         org_id: row.1,
@@ -4439,6 +5888,11 @@ fn subscriptions_on(conn: &Connection, instance_id: &str) -> Result<Vec<EventSub
 fn race_on(conn: &Connection, id: &str) -> Result<EventRace> {
     let r=conn.query_row("SELECT instance_id,gateway_node_id,activation_id,revision,status,winner_node_id,winner_subscription_id,winner_timer_id,won_at_ms,created_at_ms,updated_at_ms FROM bpmn_event_races WHERE race_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,row_u64(r,3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<i64>>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?))).context("event race not found")?;
     Ok(EventRace {
+        scope_id: conn.query_row(
+            "SELECT scope_id FROM bpmn_event_races WHERE race_id=?1",
+            [id],
+            |row| row.get(0),
+        )?,
         race_id: id.to_owned(),
         instance_id: r.0,
         gateway_node_id: r.1,
@@ -4462,12 +5916,12 @@ fn races_on(conn: &Connection, instance_id: &str) -> Result<Vec<EventRace>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ids.iter().map(|id| race_on(conn, id)).collect()
 }
-fn subscription_activation<'a>(model: &'a ProcessModel, s: &EventSubscription) -> Result<&'a str> {
-    let node = model
-        .nodes
-        .iter()
-        .find(|n| n.id == s.node_id)
-        .context("subscription pinned node is absent")?;
+fn subscription_activation<'a>(
+    conn: &Connection,
+    model: &'a ProcessModel,
+    s: &EventSubscription,
+) -> Result<&'a str> {
+    let node = scoped_node_on(conn, &s.instance_id, &s.scope_id, model, &s.node_id)?;
     let (attachment, message_ref, error_ref) = match (&s.kind, &node.kind) {
         (
             ProcessSubscriptionKind::MessageCatch,
@@ -4530,13 +5984,16 @@ fn subscription_activation<'a>(model: &'a ProcessModel, s: &EventSubscription) -
 }
 fn subscription_live_on(conn: &Connection, s: &EventSubscription) -> Result<bool> {
     let model = current_version_model_on(conn, &s.definition_id, s.version)?;
-    let node = subscription_activation(&model, s)?;
-    let live:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND i.org_id=?4 AND i.definition_id=?5 AND i.version=?6 AND i.status NOT IN ('completed','cancelled'))",params![s.token_id,s.instance_id,node,s.org_id,s.definition_id,s.version],|r|r.get(0))?;
+    let node = subscription_activation(conn, &model, s)?;
+    let live:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND t.scope_id=?7 AND EXISTS(SELECT 1 FROM bpmn_scopes x WHERE x.instance_id=t.instance_id AND x.scope_id=t.scope_id AND (x.parent_scope_id IS NULL OR x.status NOT IN ('completed','cancelled'))) AND i.org_id=?4 AND i.definition_id=?5 AND i.version=?6 AND i.status NOT IN ('completed','cancelled'))",params![s.token_id,s.instance_id,node,s.org_id,s.definition_id,s.version,s.scope_id],|r|r.get(0))?;
     if !live {
         return Ok(false);
     }
     if let Some(id) = &s.race_id {
-        return Ok(race_on(conn, id)?.status == ProcessEventRaceStatus::Open);
+        let race = race_on(conn, id)?;
+        return Ok(race.instance_id == s.instance_id
+            && race.scope_id == s.scope_id
+            && race.status == ProcessEventRaceStatus::Open);
     }
     Ok(true)
 }
@@ -4565,17 +6022,21 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
     if let Some(id) = &s.race_id {
         let race = race_on(tx, id)?;
         let model = current_version_model_on(tx, &s.definition_id, s.version)?;
+        let scopes = scopes_on(tx, &s.instance_id, &model)?;
+        let path = scope_path(&scopes, &s.instance_id, &s.scope_id)?;
+        let flows = super::model::scope_body(&model, &path)?.1;
         ensure!(
             s.kind == ProcessSubscriptionKind::MessageCatch
                 && race.instance_id == s.instance_id
-                && model
-                    .sequence_flows
+                && race.scope_id == s.scope_id
+                && race.status == ProcessEventRaceStatus::Open
+                && flows
                     .iter()
                     .any(|e| e.source_id == race.gateway_node_id && e.target_id == s.node_id),
             "subscription is not a branch of its event race"
         );
     }
-    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13,?14,?15,?16)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms])?;
+    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13,?14,?15,?16,?17)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms,s.scope_id])?;
     Ok(())
 }
 fn apply_event_plan_on(
@@ -4591,6 +6052,9 @@ fn apply_event_plan_on(
     )?;
     let model = current_version_model_on(tx, &definition_id, version)?;
     for race in &plan.create_event_races {
+        let scopes = scopes_on(tx, instance_id, &model)?;
+        let path = scope_path(&scopes, instance_id, &race.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
         ensure!(
             race.instance_id == instance_id
                 && race.revision == 1
@@ -4604,9 +6068,10 @@ fn apply_event_plan_on(
             "new event race is invalid"
         );
         ensure!(
-            model.nodes.iter().any(|n| n.id == race.gateway_node_id
+            nodes.iter().any(|n| n.id == race.gateway_node_id
                 && matches!(n.kind, ProcessNodeKind::EventBasedGateway))
                 && plan.events.iter().any(|e| e.kind == "event_race_armed"
+                    && e.scope_id == race.scope_id
                     && e.data["race_id"].as_str() == Some(race.race_id.as_str())
                     && e.data["activation_id"].as_str() == Some(race.activation_id.as_str())),
             "event race lacks its logical gateway activation"
@@ -4615,8 +6080,7 @@ fn apply_event_plan_on(
             Uuid::parse_str(&race.race_id).is_ok() && Uuid::parse_str(&race.activation_id).is_ok(),
             "event race identity must be an actual UUID"
         );
-        let branches = model
-            .sequence_flows
+        let branches = flows
             .iter()
             .filter(|edge| edge.source_id == race.gateway_node_id)
             .collect::<Vec<_>>();
@@ -4626,8 +6090,7 @@ fn apply_event_plan_on(
         );
         let mut actual_nodes = Vec::new();
         for edge in &branches {
-            let node = model
-                .nodes
+            let node = nodes
                 .iter()
                 .find(|node| node.id == edge.target_id)
                 .context("race branch missing")?;
@@ -4638,6 +6101,7 @@ fn apply_event_plan_on(
                         .iter()
                         .filter(|sub| {
                             sub.race_id.as_deref() == Some(race.race_id.as_str())
+                                && sub.scope_id == race.scope_id
                                 && sub.node_id == node.id
                         })
                         .collect::<Vec<_>>();
@@ -4653,6 +6117,7 @@ fn apply_event_plan_on(
                         .iter()
                         .filter(|timer| {
                             timer.race_id.as_deref() == Some(race.race_id.as_str())
+                                && timer.scope_id.as_deref() == Some(race.scope_id.as_str())
                                 && timer.node_id == node.id
                         })
                         .collect::<Vec<_>>();
@@ -4671,6 +6136,7 @@ fn apply_event_plan_on(
                 plan.create_tokens
                     .iter()
                     .any(|token| &token.token_id == token_id
+                        && token.scope_id == race.scope_id
                         && token.node_id == node.id
                         && token.status == "waiting"
                         && token.arrival_edge_id.as_deref() == Some(edge.id.as_str())),
@@ -4690,7 +6156,7 @@ fn apply_event_plan_on(
                     .all(|timer| actual_nodes.contains(&timer.node_id.as_str())),
             "race includes a foreign branch"
         );
-        tx.execute("INSERT INTO bpmn_event_races(race_id,instance_id,gateway_node_id,activation_id,revision,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,1,'open',?5,?5)",params![race.race_id,instance_id,race.gateway_node_id,race.activation_id,at_ms])?;
+        tx.execute("INSERT INTO bpmn_event_races(race_id,instance_id,gateway_node_id,activation_id,revision,status,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,1,'open',?5,?5,?6)",params![race.race_id,instance_id,race.gateway_node_id,race.activation_id,at_ms,race.scope_id])?;
     }
     for s in &plan.create_subscriptions {
         ensure!(
@@ -4727,6 +6193,8 @@ fn apply_event_plan_on(
                     let s = subscription_on(tx, id)?;
                     ensure!(
                         s.race_id.as_deref() == Some(actual.race_id.as_str())
+                            && s.scope_id == actual.scope_id
+                            && s.instance_id == instance_id
                             && s.node_id == winner
                             && s.status == ProcessSubscriptionStatus::Open,
                         "race winning subscription changed"
@@ -4736,6 +6204,8 @@ fn apply_event_plan_on(
                     let t = timer_on(tx, id)?;
                     ensure!(
                         t.race_id.as_deref() == Some(actual.race_id.as_str())
+                            && t.scope_id.as_deref() == Some(actual.scope_id.as_str())
+                            && t.instance_id.as_deref() == Some(instance_id)
                             && t.node_id == winner
                             && matches!(
                                 t.status,
@@ -4864,15 +6334,11 @@ fn apply_event_plan_on(
             let token_advanced = plan.consume_token_ids.contains(&actual.token_id)
                 || plan.cancel_token_ids.contains(&actual.token_id);
             let noninterrupt = matches!(
-                model
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == actual.node_id)
-                    .map(|n| &n.kind),
-                Some(ProcessNodeKind::BoundaryMessage {
+                &scoped_node_on(tx, instance_id, &actual.scope_id, &model, &actual.node_id)?.kind,
+                ProcessNodeKind::BoundaryMessage {
                     cancel_activity: false,
                     ..
-                })
+                }
             );
             ensure!(
                 token_advanced || noninterrupt,
@@ -4887,8 +6353,10 @@ fn apply_event_plan_on(
             ensure!(
                 (reason == "activity_completed"
                     && plan.consume_token_ids.contains(&actual.token_id))
-                    || (matches!(reason, "sibling_interrupted" | "event_race_lost")
-                        && plan.cancel_token_ids.contains(&actual.token_id)),
+                    || (matches!(
+                        reason,
+                        "sibling_interrupted" | "event_race_lost" | "scope_cancelled"
+                    ) && plan.cancel_token_ids.contains(&actual.token_id)),
                 "subscription cancellation is unrelated to its exact activation"
             );
         }
@@ -4983,6 +6451,7 @@ fn message_on(conn: &Connection, key: &MessageKey, load_payload: bool) -> Result
         matched_node_id: r.24,
         matched_subscription_id: r.25,
         delivered_at_ms: r.26,
+        source_scope_id: conn.query_row("SELECT source_scope_id FROM bpmn_messages WHERE org_id=?1 AND sender_user_id=?2 AND message_id=?3", params![key.org_id,key.sender_user_id,key.message_id], |row| row.get(0))?,
         source_instance_id: r.27,
         source_node_id: r.28,
         payload_available: r.29,
@@ -5034,17 +6503,17 @@ fn require_version_execution_on(
     for pin in v.service_flows {
         require_flow_current(conn, actor, &pin.flow_id, None)?;
     }
-    for node in v.model.nodes {
+    for node in super::model::all_nodes(&v.model) {
         if let ProcessNodeKind::UserTask {
             assignee_user_id: Some(id),
             ..
-        } = node.kind
+        } = &node.kind
         {
             require_actor(
                 conn,
                 &ProcessActor {
                     org_id: actor.org_id.clone(),
-                    user_id: id,
+                    user_id: id.clone(),
                 },
             )?;
         }
@@ -5088,6 +6557,11 @@ fn message_summary_on(
         matched_instance_id: m.matched_instance_id.clone(),
         matched_version: m.matched_version,
         matched_subscription_id: m.matched_subscription_id.clone(),
+        source_scope_id: if source_readable {
+            m.source_scope_id.clone()
+        } else {
+            None
+        },
         source_instance_id: if source_readable {
             m.source_instance_id.clone()
         } else {
@@ -5113,9 +6587,9 @@ fn require_message_source_on(
     message_name: &str,
     correlation_key: &str,
     target: &ProcessMessageTarget,
-    source: (&str, &str, &str, &str),
+    source: (&str, &str, &str, &str, &str),
 ) -> Result<(String, u32)> {
-    let (instance_id, node_id, activation_id, event_id) = source;
+    let (instance_id, scope_id, node_id, activation_id, event_id) = source;
     require_actor(conn, actor)?;
     let (definition_id, version, status): (String, u32, String) = conn.query_row(
         "SELECT definition_id,version,status FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2 AND initiator_user_id=?3",
@@ -5128,11 +6602,14 @@ fn require_message_source_on(
     require_owner(conn, actor, &definition_id)?;
     require_version_execution_on(conn, actor, &definition_id, version)?;
     let model = current_version_model_on(conn, &definition_id, version)?;
-    let node = model
-        .nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .context("message source node missing")?;
+    let scope = scopes_on(conn, instance_id, &model)?
+        .into_iter()
+        .find(|scope| scope.scope_id == scope_id)
+        .context("message source scope is missing")?;
+    if scope.status == ProcessInstanceStatus::Cancelled {
+        return Err(MessageClosed::Source.into());
+    }
+    let node = scoped_node_on(conn, instance_id, scope_id, &model, node_id)?;
     let ProcessNodeKind::MessageThrow {
         message_ref,
         target: declared_target,
@@ -5176,8 +6653,8 @@ fn require_message_source_on(
     );
     let (kind, event_node, data): (String, Option<String>, String) = conn
         .query_row(
-            "SELECT kind,node_id,data_json FROM bpmn_events WHERE event_id=?1 AND instance_id=?2",
-            params![event_id, instance_id],
+            "SELECT kind,node_id,data_json FROM bpmn_events WHERE event_id=?1 AND instance_id=?2 AND scope_id=?3",
+            params![event_id,instance_id,scope_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .context("message source event is missing")?;
@@ -5199,7 +6676,7 @@ fn insert_message_on(
     tx: &Transaction<'_>,
     actor: &ProcessActor,
     prepared: &PreparedMessage,
-    source: Option<(&str, &str, &str, &str)>,
+    source: Option<(&str, &str, &str, &str, &str)>,
     at_ms: i64,
 ) -> Result<MessageRecord> {
     super::messages::validate_message(prepared)?;
@@ -5268,9 +6745,10 @@ fn insert_message_on(
     let expires = at_ms
         .checked_add(i64::from(prepared.ttl_seconds) * 1000)
         .context("message TTL overflow")?;
-    let (source_instance, source_node, source_activation, source_event) = match source {
-        Some((i, n, a, e)) => (Some(i), Some(n), Some(a), Some(e)),
-        None => (None, None, None, None),
+    let (source_instance, source_scope, source_node, source_activation, source_event) = match source
+    {
+        Some((i, s, n, a, e)) => (Some(i), Some(s), Some(n), Some(a), Some(e)),
+        None => (None, None, None, None, None),
     };
     let source_identity = source
         .map(|facts| {
@@ -5285,7 +6763,7 @@ fn insert_message_on(
             )
         })
         .transpose()?;
-    tx.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,source_instance_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1,'pending',?16,?16,?18,?19,?20,?21,?22,?23)",params![actor.org_id,actor.user_id,prepared.message_id,hash,if source.is_some(){"process"}else{"api"},kind,definition_id,instance_id,subscription_id,prepared.message_name,prepared.correlation_key,payload,hex::encode(Sha256::digest(payload.as_bytes())),u32::try_from(payload.len())?,prepared.ttl_seconds,at_ms,expires,source_instance,source_identity.as_ref().map(|r|r.0.as_str()),source_identity.as_ref().map(|r|r.1),source_node,source_activation,source_event])?;
+    tx.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,source_instance_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id,source_scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1,'pending',?16,?16,?18,?19,?20,?21,?22,?23,?24)",params![actor.org_id,actor.user_id,prepared.message_id,hash,if source.is_some(){"process"}else{"api"},kind,definition_id,instance_id,subscription_id,prepared.message_name,prepared.correlation_key,payload,hex::encode(Sha256::digest(payload.as_bytes())),u32::try_from(payload.len())?,prepared.ttl_seconds,at_ms,expires,source_instance,source_identity.as_ref().map(|r|r.0.as_str()),source_identity.as_ref().map(|r|r.1),source_node,source_activation,source_event,source_scope])?;
     message_on(tx, &key, true)
 }
 pub fn send_message(
@@ -5443,7 +6921,15 @@ fn message_selection_on(conn: &Connection, c: &MessageCandidate) -> Result<Messa
                 &m.message_name,
                 &m.correlation_key,
                 &m.target,
-                (&instance, &node, &activation, &event)
+                (
+                    &instance,
+                    m.source_scope_id
+                        .as_deref()
+                        .context("process message source scope missing")?,
+                    &node,
+                    &activation,
+                    &event
+                )
             )? == (definition, version),
             "message source identity differs from its immutable instance"
         );
@@ -5619,6 +7105,10 @@ fn message_receipt_on(
             seq,
             Some(&m.key.sender_user_id),
             &PlannedEvent {
+                scope_id: m
+                    .source_scope_id
+                    .clone()
+                    .context("process receipt source scope missing")?,
                 kind: kind.to_owned(),
                 node_id: m.source_node_id.clone(),
                 data,
@@ -5915,6 +7405,7 @@ pub fn record_message_failed(
     }) = ready
     {
         let incident = ProcessIncident {
+            scope_id: subscription.scope_id.clone(),
             incident_id: Uuid::new_v4().to_string(),
             node_id: Some(subscription.node_id.clone()),
             node_name: None,
@@ -5926,7 +7417,7 @@ pub fn record_message_failed(
         };
         let mut plan = RuntimePlan::initial(snapshot.instance.variables.clone());
         plan.status = ProcessInstanceStatus::Incident;
-        plan.events.push(PlannedEvent{kind:"message_error".into(),node_id:Some(subscription.node_id.clone()),data:serde_json::json!({"message_id":m.key.message_id,"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"incident_id":incident.incident_id,"reason":bounded_failure_message(reason)})});
+        plan.events.push(PlannedEvent{scope_id:subscription.scope_id.clone(),kind:"message_error".into(),node_id:Some(subscription.node_id.clone()),data:serde_json::json!({"message_id":m.key.message_id,"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"incident_id":incident.incident_id,"reason":bounded_failure_message(reason)})});
         plan.add_incidents.push(incident);
         apply_plan_on(
             &tx,
@@ -6066,7 +7557,9 @@ pub fn deliver_message(
                 )?;
             } else {
                 ensure!(
-                    plan.cancel_user_task_ids.is_empty() && plan.cancel_job_ids.is_empty(),
+                    plan.cancel_user_task_ids.is_empty()
+                        && plan.cancel_job_ids.is_empty()
+                        && plan.cancel_scope_roots.is_empty(),
                     "message catch cannot cancel an activity"
                 );
                 if let Some(id) = &subscription.race_id {
@@ -6082,7 +7575,9 @@ pub fn deliver_message(
                 }
                 ensure!(
                     subscription.race_id.is_some()
-                        || (plan.cancel_token_ids.is_empty() && plan.race_updates.is_empty()),
+                        || (plan.cancel_token_ids.is_empty()
+                            && plan.race_updates.is_empty()
+                            && plan.cancel_scope_roots.is_empty()),
                     "ordinary catch cannot cancel another activation"
                 );
             }
@@ -6124,8 +7619,10 @@ pub fn deliver_message(
     tx.commit()?;
     Ok(Some(MessageDeliveryOutcome {
         message,
-        instance: Some(instance),
-        cancelled_claims: claims,
+        transition: ProcessTransitionOutcome {
+            instance,
+            cancelled_claims: claims,
+        },
     }))
 }
 pub fn expire_messages(pool: &DbPool, at_ms: i64, limit: u32) -> Result<u32> {
@@ -6210,8 +7707,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn complete_detail_frame_with_six_maximum_pages_utf8_floats_and_selected_rows_fits_wire_budget()
-    {
+    fn complete_detail_frame_with_seven_maximum_pages_utf8_floats_and_selected_rows_fits_wire_budget(
+    ) {
         use tentaflow_protocol::processes::HolidayPolicy;
         let fixture = super::super::runtime::test_support::Fixture::new();
         let mut instance = super::super::runtime::test_support::start_model(
@@ -6240,6 +7737,7 @@ mod tests {
         task.revision = i64::MAX as u64;
         instance.user_tasks = vec![task.clone(); 20];
         let incident = ProcessIncident {
+            scope_id: instance.instance_id.clone(),
             incident_id: uuid.clone(),
             node_id: Some(identifier.clone()),
             node_name: Some(name.clone()),
@@ -6251,6 +7749,7 @@ mod tests {
         };
         instance.incidents = vec![incident.clone(); 20];
         let timer = ProcessTimerSummary {
+            scope_id: Some(instance.instance_id.clone()),
             timer_id: uuid.clone(),
             node_id: identifier.clone(),
             node_name: name.clone(),
@@ -6275,6 +7774,7 @@ mod tests {
         instance.timers = vec![timer; 20];
         instance.subscriptions = vec![
             ProcessSubscriptionSummary {
+                scope_id: instance.instance_id.clone(),
                 subscription_id: uuid.clone(),
                 node_id: identifier.clone(),
                 node_name: name.clone(),
@@ -6294,6 +7794,7 @@ mod tests {
         // Charging both full branch arrays exceeds the combined eight-branch graph bound.
         instance.event_races = vec![
             ProcessEventRaceSummary {
+                scope_id: instance.instance_id.clone(),
                 race_id: uuid.clone(),
                 gateway_node_id: identifier.clone(),
                 gateway_name: name.clone(),
@@ -6306,6 +7807,7 @@ mod tests {
             20
         ];
         let outgoing = ProcessMessageSummary {
+            source_scope_id: Some(instance.instance_id.clone()),
             message_id: uuid.clone(),
             sender_user_id: "u".repeat(128),
             origin: ProcessMessageOrigin::Process,
@@ -6335,6 +7837,16 @@ mod tests {
             can_cancel: true,
         };
         instance.outgoing_messages = vec![outgoing; 20];
+        let mut scope = instance.scopes[0].clone();
+        scope.parent_scope_id = Some(instance.instance_id.clone());
+        scope.subprocess_node_id = Some("s".repeat(128));
+        scope.subprocess_node_name = Some("界".repeat(85) + "x");
+        scope.parent_token_id = Some(uuid::Uuid::new_v4().to_string());
+        scope.scope_id = uuid::Uuid::new_v4().to_string();
+        scope.revision = i64::MAX as u64;
+        scope.created_at_ms = i64::MAX;
+        scope.updated_at_ms = i64::MAX;
+        instance.scopes = vec![scope; 20];
         let info = ProcessPageInfo {
             offset: u32::MAX - 20,
             total: u32::MAX,
@@ -6347,7 +7859,8 @@ mod tests {
             timers: info.clone(),
             subscriptions: info.clone(),
             event_races: info.clone(),
-            outgoing_messages: info,
+            outgoing_messages: info.clone(),
+            scopes: info,
         });
         instance.selected_user_task = Some(task);
         instance.selected_incident = Some(ProcessIncidentSelection {
@@ -6621,11 +8134,27 @@ mod tests {
         let task_id = started.user_tasks[0].user_task_id.clone();
         let task_snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
         let completed_plan = super::super::runtime::plan_user_completion(
-            &task_snapshot, &task_id, &json!({}), None, 1_500,
-        ).unwrap();
-        let waiting = complete_user_task(&db, &participant, &stamp("complete before timer"),
-            &instance_id, &task_id, started.revision, &json!({}), None,
-            &completed_plan, 1_500).unwrap();
+            &task_snapshot,
+            &task_id,
+            &json!({}),
+            None,
+            1_500,
+        )
+        .unwrap();
+        let waiting = complete_user_task(
+            &db,
+            &participant,
+            &stamp("complete before timer"),
+            &instance_id,
+            &task_id,
+            started.revision,
+            &json!({}),
+            None,
+            &completed_plan,
+            1_500,
+        )
+        .unwrap()
+        .instance;
         assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
         let due = due_timers(&db, 2_500, 32).unwrap();
         assert_eq!(due.len(), 1);
@@ -6905,7 +8434,8 @@ mod tests {
             &plan,
             2_000,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(
             get_user_task(&db, &participant, &instance_id, &task_id)
@@ -6938,7 +8468,8 @@ mod tests {
             &plan,
             2_000,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(replayed, completed);
         let after_events: i64 = db
             .read()

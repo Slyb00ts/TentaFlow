@@ -309,7 +309,7 @@ export class FlowConfig {
     const model = this.opts.getCanvas().processModel;
     const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
     const boundary = () => {
-      const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task'].includes(candidate.type) && (kind !== 'BoundaryError' || candidate.type === 'bpmn_service_task'));
+      const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process'].includes(candidate.type) && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task'));
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
       return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}">${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>`;
     };
@@ -334,6 +334,10 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
+    } else if (kind === 'SubProcess') {
+      fields += `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
+        <tf-button variant="secondary" data-process-enter>${escapeHtml(I18n.t('bpmn.enter_subprocess'))}</tf-button>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.subprocess_hint'))}</p>`;
     } else if (kind === 'TimerStart' || kind === 'TimerCatch' || kind === 'BoundaryTimer') {
       if (kind === 'BoundaryTimer') {
         fields += `${boundary()}
@@ -391,6 +395,7 @@ export class FlowConfig {
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="secondary" icon="copy" data-process="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
     this.root.querySelectorAll('tf-keyvalue-editor').forEach((editor) => { editor.value = config[editor.dataset.process]; });
+    this.root.querySelector('[data-process-enter]')?.addEventListener('click', () => this.opts.onEnterProcess?.(node.id));
     const loadTargets = this.root.querySelector('[data-load-targets]');
     if (loadTargets) {
       let offset = 0;

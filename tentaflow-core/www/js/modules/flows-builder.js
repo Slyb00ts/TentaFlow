@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processCommand, processEditorLabels, processHasTimerStart, processHasMessageStart } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processBody, processCommand, processEditorLabels, processHasTimer, processHasTimerStart, processHasMessageStart } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-input.js';
@@ -92,6 +92,7 @@ const FlowBuilderScreen = {
         <footer class="fb-bottombar">
           <div class="fb-breadcrumb">
             <span class="fb-crumb">${escapeHtml(I18n.t('flows_builder.crumb_root'))}</span>
+            ${process ? `<tf-button variant="ghost" size="sm" data-role="scope-up" hidden>${escapeHtml(I18n.t('bpmn.leave_subprocess'))}</tf-button><span class="fb-crumb" data-role="scope-path" hidden></span>` : ''}
             <span class="fb-sep">›</span>
             <span class="fb-crumb active" data-role="crumb-name">${escapeHtml(I18n.t('flows_builder.crumb_empty'))}</span>
           </div>
@@ -215,7 +216,10 @@ const FlowBuilderScreen = {
         this._markDirty();
         this._updateStats();
         this._renderMinimap();
-        if (state.mode === 'bpmn' && state.config) this._syncProcessControls();
+        if (state.mode === 'bpmn' && state.config) {
+          this._syncProcessPath();
+          this._syncProcessControls();
+        }
       },
       onSelect: (node, edge) => {
         const tpl = node ? state.templatesMap.get(node.type) : null;
@@ -268,6 +272,13 @@ const FlowBuilderScreen = {
       },
       onDelete: (id) => { state.canvas.removeNodes([id]); state.config.renderEmpty(); },
       onDuplicate: (id) => { state.canvas.duplicateNodes([id]); },
+      onEnterProcess: (id) => {
+        state.canvas.navigateProcessBody([...state.canvas.processPath, id]);
+        state.config.renderEmpty();
+        this._syncProcessPath();
+        this._updateStats();
+        this._renderMinimap();
+      },
     });
 
     // Topbar bindings
@@ -277,6 +288,13 @@ const FlowBuilderScreen = {
     nameEl.value = state.flow.name || '';
     statusEl.value = state.flow.status || 'draft';
     crumbName.textContent = state.flow.name || I18n.t('flows_builder.crumb_empty');
+    root.querySelector('[data-role="scope-up"]')?.addEventListener('click', () => {
+      state.canvas.navigateProcessBody(state.canvas.processPath.slice(0, -1));
+      state.config.renderEmpty();
+      this._syncProcessPath();
+      this._updateStats();
+      this._renderMinimap();
+    });
 
     if (state.readOnly && state.mode !== 'bpmn') {
       root.classList.add('fb-readonly');
@@ -436,7 +454,7 @@ const FlowBuilderScreen = {
     schedule.hidden = !state.publishedTimerStart;
     schedule.toggleAttribute('disabled', !!state.operationBusy);
     const timezone = state.root.querySelector('[data-role="timer-timezone"]');
-    timezone.hidden = !state.canvas.processModel.workCalendar && !state.canvas.nodes.some((node) => ['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type));
+    timezone.hidden = !state.canvas.processModel.workCalendar && !processHasTimer(state.canvas.getData());
     timezone.value = state.canvas.processModel.timerTimezone || '';
     timezone.toggleAttribute('disabled', readOnly);
     const calendarState = state.root.querySelector('[data-role="calendar-state"]');
@@ -750,6 +768,26 @@ const FlowBuilderScreen = {
     if (stats) stats.textContent = I18n.t('flows_builder.stats', { nodes: s.canvas.nodes.length, edges: s.canvas.edges.length });
   },
 
+  _syncProcessPath() {
+    const state = this._state;
+    if (!state || state.mode !== 'bpmn') return;
+    const path = state.canvas.processPath;
+    state.palette.setProcessDepth(path.length);
+    const up = state.root.querySelector('[data-role="scope-up"]');
+    const label = state.root.querySelector('[data-role="scope-path"]');
+    state.root.querySelector('.fb-breadcrumb').classList.toggle('fb-breadcrumb-scoped', path.length > 0);
+    up.hidden = path.length === 0;
+    label.hidden = path.length === 0;
+    let body = state.canvas.processModel;
+    const names = [];
+    for (const id of path) {
+      const node = body.nodes.find((candidate) => candidate.id === id);
+      names.push(node.name || id);
+      body = processBody(body, [id]);
+    }
+    label.textContent = names.join(' › ');
+  },
+
   async _save({ silent = false } = {}) {
     const s = this._state;
     if (!s || s.saving || s.readOnly) return false;
@@ -825,10 +863,9 @@ const FlowBuilderScreen = {
     if (!s) return;
     if (s.readOnly) return;
     if (s.mode === 'bpmn') {
-      openProcessVariables(s.canvas.processModel.variables, (values) => {
+      openProcessVariables(processBody(s.canvas.processModel, s.canvas.processPath).variables, (values) => {
         if (!this._current(s) || s.readOnly) return;
-        s.canvas.processModel.variables = values;
-        this._markDirty();
+        s.canvas.updateProcessVariables(values);
       });
       return;
     }

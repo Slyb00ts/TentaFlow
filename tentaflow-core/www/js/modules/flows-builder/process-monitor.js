@@ -113,6 +113,16 @@ export function processEventText(event) {
   if (event.kind === 'business_error_caught') return text('event_business_error_caught', {
     node, code: event.data.error_code || text('error_catch_all_hint'),
   });
+  if (['scope_entered', 'scope_completed', 'scope_cancelled'].includes(event.kind)) return text(`event_${event.kind}`, {
+    element: event.data.subprocess_node_id || '',
+    reason: processLifecycleReasonText(event.data.reason || ''),
+  });
+  if (event.kind === 'scope_entry_failed') return text('event_scope_entry_failed', {
+    node, reason: processLifecycleReasonText(event.data.reason || ''),
+  });
+  if (event.kind === 'scope_error_propagated') return text('event_scope_error_propagated', {
+    node, code: event.data.code || '',
+  });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
   return text(`event_${event.kind}`, { node });
 }
@@ -130,6 +140,8 @@ export function processLifecycleReasonText(reason) {
     case 'activity_completed': return text('timer_reason_activity_completed');
     case 'sibling_interrupted': return text('timer_reason_sibling_interrupted');
     case 'event_race_lost': return text('timer_reason_event_race_lost');
+    case 'scope_cancelled': return text('reason_scope_cancelled');
+    case 'scope_limit': return text('reason_scope_limit');
     case 'definition_archived': return text('timer_reason_definition_archived');
     case 'missed_during_archive': return text('timer_reason_missed_during_archive');
     case 'finite_schedule_exhausted_during_archive': return text('timer_reason_finite_schedule_exhausted_during_archive');
@@ -199,7 +211,7 @@ export async function openProcessSchedule(definitionId) {
 
 function processIncidentText(incident) {
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
-  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT'];
+  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 
@@ -245,6 +257,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   const win = readWindow(text('instance'), 'play', 940);
   const host = win.querySelector('[data-content]');
   host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
+    <section data-scopes><h3>${escapeHtml(text('scopes'))}</h3><div data-scope-rows></div><div data-scope-detail></div></section>
     <section data-subscriptions><h3>${escapeHtml(text('message_subscriptions'))}</h3><div data-subscription-rows></div></section>
     <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
     <section data-outgoing><h3>${escapeHtml(text('outgoing_messages'))}</h3><div data-outgoing-rows></div></section>
@@ -263,10 +276,12 @@ export async function openProcessInstance(instanceId, initial = null) {
   const retryCommand = processCommand();
   const events = host.querySelector('[data-events]');
   const workWindows = new Set();
-  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages'];
+  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes'];
   const pageSpecs = Object.fromEntries(collectionNames.map((name) => [name, { offset: 0, limit: 20 }]));
   let selectedUserTaskId = null;
   let selectedIncidentId = null;
+  let selectedScopeId = null;
+  let scopeReadGeneration = 0;
   const requestPages = () => ({ ...pageSpecs, selectedUserTaskId, selectedIncidentId });
   const requestInstance = () => ApiBinary.one('processInstanceGetRequest', { instanceId, pages: requestPages() });
 
@@ -406,7 +421,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     for (const task of instance.userTasks) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(task.name)}</strong><p>${escapeHtml(text(`work_kind_${task.kind.toLowerCase()}`))} · ${escapeHtml(processStatusLabel(task.status))}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(task.name)}</strong><p>${escapeHtml(text(`work_kind_${task.kind.toLowerCase()}`))} · ${escapeHtml(processStatusLabel(task.status))}</p><p>${escapeHtml(text('scope_id'))}: ${escapeHtml(task.scopeId)}</p></div>
         ${task.canComplete && task.status === 'Open' ? `<tf-button variant="primary" data-complete>${escapeHtml(text(task.kind === 'Verification' ? 'review_result' : 'complete_work'))}</tf-button>` : ''}`;
       row.querySelector('[data-complete]')?.addEventListener('click', () => complete(task));
       work.appendChild(row);
@@ -417,7 +432,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('scope_id'))}: ${escapeHtml(incident.scopeId)}</p></div>
         <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -477,6 +492,33 @@ export async function openProcessInstance(instanceId, initial = null) {
       outgoing.append(row);
     }
     renderPageControls(host.querySelector('[data-outgoing]'), 'outgoingMessages');
+    const scopeRows = host.querySelector('[data-scope-rows]');
+    scopeRows.replaceChildren();
+    for (const scope of instance.scopes) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.dataset.scopeId = scope.scopeId;
+      row.innerHTML = `<div><strong>${escapeHtml(scope.subprocessNodeName || text('root_scope'))}</strong>
+        <p>${escapeHtml(processStatusLabel(scope.status))} · ${escapeHtml(text('scope_depth', { depth: scope.depth }))}</p>
+        <p>${escapeHtml(text('scope_id'))}: ${escapeHtml(scope.scopeId)}</p>
+        ${scope.parentScopeId ? `<p>${escapeHtml(text('parent_scope_id'))}: ${escapeHtml(scope.parentScopeId)}</p>` : ''}</div>
+        <tf-button variant="secondary" data-scope-inspect>${escapeHtml(text('scope_inspect'))}</tf-button>`;
+      row.querySelector('[data-scope-inspect]').addEventListener('click', async () => {
+        selectedScopeId = scope.scopeId;
+        const generation = ++scopeReadGeneration;
+        try {
+          const result = await ApiBinary.one('processScopeGetRequest', { instanceId, scopeId: selectedScopeId });
+          if (!win.isConnected || generation !== scopeReadGeneration || selectedScopeId !== result.scope.scopeId) return;
+          const detail = host.querySelector('[data-scope-detail]');
+          detail.replaceChildren(jsonSection(text('scope_variables'), result.variables, false));
+          const nodes = document.createElement('p');
+          nodes.textContent = `${text('scope_active_nodes')}: ${result.activeNodeIds.join(', ') || text('none')}`;
+          detail.append(nodes);
+        } catch (error) { if (win.isConnected && generation === scopeReadGeneration) showError(win, error); }
+      });
+      scopeRows.append(row);
+    }
+    renderPageControls(host.querySelector('[data-scopes]'), 'scopes');
   }
 
   async function refresh() {

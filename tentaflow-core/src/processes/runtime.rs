@@ -8,16 +8,17 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ActivityVerification, ProcessIncident, ProcessInstanceStatus,
-    ProcessModel, ProcessNode, ProcessNodeKind, ProcessTimerKind, ProcessTimerStatus,
-    ProcessUserTask, ProcessUserTaskKind, ProcessUserTaskStatus,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessScopeSummary, ProcessTimerKind,
+    ProcessTimerStatus, ProcessUserTask, ProcessUserTaskKind, ProcessUserTaskStatus,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::model::{and_pairs, validate_variables, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
-    AndReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, ProcessActor,
-    ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
+    AndReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
+    ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
+    ScopeUpdate,
 };
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -98,15 +99,20 @@ pub fn prepare_service_input(
 
 fn patch_variables(
     mapping: &BTreeMap<String, String>,
-    variables: &Value,
+    local: &Value,
+    effective: &Value,
     outputs: &Value,
+    extra: &[(String, Value)],
 ) -> Result<Value> {
-    let mut patched = variables
+    let mut patched = local
         .as_object()
         .context("process variables must be an object")?
         .clone();
     for (key, expression) in mapping {
-        patched.insert(key.clone(), evaluate(expression, variables, outputs, &[])?);
+        patched.insert(
+            key.clone(),
+            evaluate(expression, effective, outputs, extra)?,
+        );
     }
     let value = Value::Object(patched);
     validate_variables(&value)?;
@@ -121,7 +127,9 @@ struct Transition<'a> {
     definition_id: &'a str,
     version: u32,
     now_ms: i64,
-    pairs: HashMap<String, String>,
+    current_scope: String,
+    scopes: Vec<ProcessScopeSummary>,
+    scope_variables: BTreeMap<String, Value>,
     tokens: Vec<ProcessToken>,
     jobs: Vec<ProcessJob>,
     tasks: Vec<ProcessUserTask>,
@@ -154,7 +162,20 @@ impl<'a> Transition<'a> {
             definition_id,
             version,
             now_ms,
-            pairs: and_pairs(model)?,
+            current_scope: instance_id.to_owned(),
+            scopes: vec![ProcessScopeSummary {
+                scope_id: instance_id.to_owned(),
+                parent_scope_id: None,
+                subprocess_node_id: None,
+                subprocess_node_name: None,
+                parent_token_id: None,
+                revision: 1,
+                status: ProcessInstanceStatus::Running,
+                depth: 0,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            }],
+            scope_variables: BTreeMap::new(),
             tokens: Vec::new(),
             jobs: Vec::new(),
             tasks: Vec::new(),
@@ -180,6 +201,8 @@ impl<'a> Transition<'a> {
             now_ms,
         )?;
         transition.tokens = snapshot.tokens.clone();
+        transition.scopes = snapshot.scopes.clone();
+        transition.scope_variables = snapshot.scope_variables.clone();
         transition.jobs = snapshot.jobs.clone();
         transition.tasks = snapshot.user_tasks.clone();
         transition.receipts = snapshot.receipts.clone();
@@ -192,15 +215,116 @@ impl<'a> Transition<'a> {
     }
 
     fn node(&self, id: &str) -> Result<&ProcessNode> {
-        self.model
-            .nodes
-            .iter()
-            .find(|node| node.id == id)
-            .context("process token references a missing node")
+        super::repository::scope_node(
+            self.model,
+            &self.scopes,
+            self.instance_id,
+            &self.current_scope,
+            id,
+        )
+    }
+
+    fn body(
+        &self,
+    ) -> Result<(
+        &[ProcessNode],
+        &[tentaflow_protocol::processes::ProcessSequenceFlow],
+    )> {
+        let path =
+            super::repository::scope_path(&self.scopes, self.instance_id, &self.current_scope)?;
+        let (nodes, flows, _) = super::model::scope_body(self.model, &path)?;
+        Ok((nodes, flows))
+    }
+
+    fn local(&self) -> Result<&Value> {
+        if self.current_scope == self.instance_id {
+            Ok(&self.plan.variables)
+        } else {
+            self.scope_variables
+                .get(&self.current_scope)
+                .context("active scope local variables are missing")
+        }
+    }
+
+    fn effective(&self) -> Result<Value> {
+        super::repository::effective_scope_variables(
+            &self.scopes,
+            &self.scope_variables,
+            self.instance_id,
+            &self.plan.variables,
+            &self.current_scope,
+        )
+    }
+
+    fn set_variables(&mut self, value: Value) -> Result<()> {
+        validate_variables(&value)?;
+        if self.current_scope == self.instance_id {
+            self.plan.variables = value;
+        } else {
+            self.scope_variables
+                .insert(self.current_scope.clone(), value.clone());
+            let scope = self
+                .scopes
+                .iter()
+                .find(|scope| scope.scope_id == self.current_scope)
+                .context("current child scope is missing")?
+                .clone();
+            self.update_scope(&scope.scope_id, scope.status, Some(value))?;
+        }
+        Ok(())
+    }
+
+    fn update_scope(
+        &mut self,
+        id: &str,
+        status: ProcessInstanceStatus,
+        variables: Option<Value>,
+    ) -> Result<()> {
+        let scope = self
+            .scopes
+            .iter_mut()
+            .find(|scope| scope.scope_id == id && scope.parent_scope_id.is_some())
+            .context("child scope update references a missing child")?;
+        scope.status = status.clone();
+        if let Some(update) = self
+            .plan
+            .scope_updates
+            .iter_mut()
+            .find(|update| update.scope_id == id)
+        {
+            update.status = status;
+            if variables.is_some() {
+                update.variables = variables;
+            }
+        } else {
+            self.plan.scope_updates.push(ScopeUpdate {
+                scope_id: id.to_owned(),
+                expected_revision: scope.revision,
+                status,
+                variables,
+            });
+        }
+        Ok(())
+    }
+
+    fn map_outputs(
+        &mut self,
+        mapping: &BTreeMap<String, String>,
+        outputs: &Value,
+        extra: &[(String, Value)],
+    ) -> Result<()> {
+        self.set_variables(patch_variables(
+            mapping,
+            self.local()?,
+            &self.effective()?,
+            outputs,
+            extra,
+        )?)
     }
 
     fn event(&mut self, kind: &str, node_id: Option<String>, data: Value) {
         self.plan.events.push(PlannedEvent {
+            scope_id: self.current_scope.clone(),
             kind: kind.into(),
             node_id,
             data,
@@ -217,16 +341,7 @@ impl<'a> Transition<'a> {
 
     fn consume(&mut self, token_id: &str) {
         self.tokens.retain(|token| token.token_id != token_id);
-        if self
-            .plan
-            .create_tokens
-            .iter()
-            .any(|token| token.token_id == token_id)
-        {
-            self.plan
-                .create_tokens
-                .retain(|token| token.token_id != token_id);
-        } else if !self.plan.consume_token_ids.iter().any(|id| id == token_id) {
+        if !self.plan.consume_token_ids.iter().any(|id| id == token_id) {
             self.plan.consume_token_ids.push(token_id.to_owned());
         }
     }
@@ -241,13 +356,14 @@ impl<'a> Transition<'a> {
 
     fn follow(&mut self, token: &ProcessToken, edge_id: &str) -> Result<()> {
         let edge = self
-            .model
-            .sequence_flows
+            .body()?
+            .1
             .iter()
             .find(|flow| flow.id == edge_id)
             .context("sequence flow is missing")?;
         self.create_token(ProcessToken {
             token_id: String::new(),
+            scope_id: self.current_scope.clone(),
             node_id: edge.target_id.clone(),
             arrival_edge_id: Some(edge.id.clone()),
             fork_stack: token.fork_stack.clone(),
@@ -257,8 +373,9 @@ impl<'a> Transition<'a> {
     }
 
     fn outgoing(&self, node_id: &str) -> Vec<String> {
-        self.model
-            .sequence_flows
+        self.body()
+            .expect("current scope body was validated")
+            .1
             .iter()
             .filter(|flow| flow.source_id == node_id)
             .map(|flow| flow.id.clone())
@@ -266,13 +383,9 @@ impl<'a> Transition<'a> {
     }
 
     fn incident(&mut self, node_id: &str, job_id: Option<String>, code: &str, message: String) {
-        let node_name = self
-            .model
-            .nodes
-            .iter()
-            .find(|node| node.id == node_id)
-            .map(|node| node.name.clone());
+        let node_name = self.node(node_id).ok().map(|node| node.name.clone());
         self.plan.add_incidents.push(ProcessIncident {
+            scope_id: self.current_scope.clone(),
             incident_id: Uuid::new_v4().to_string(),
             node_id: Some(node_id.to_owned()),
             node_name,
@@ -298,6 +411,7 @@ impl<'a> Transition<'a> {
         token_id: &str,
     ) {
         let task = ProcessUserTask {
+            scope_id: self.current_scope.clone(),
             user_task_id: Uuid::new_v4().to_string(),
             node_id: node.id.clone(),
             name: node.name.clone(),
@@ -357,6 +471,7 @@ impl<'a> Transition<'a> {
             }
         };
         let timer = ProcessTimer {
+            scope_id: Some(self.current_scope.clone()),
             timer_id: Uuid::new_v4().to_string(),
             org_id: self.org_id.to_owned(),
             definition_id: self.definition_id.to_owned(),
@@ -417,8 +532,8 @@ impl<'a> Transition<'a> {
 
     fn arm_boundaries(&mut self, activity: &ProcessNode, token_id: &str) -> Result<()> {
         let nodes = self
-            .model
-            .nodes
+            .body()?
+            .0
             .iter()
             .filter(|n| match &n.kind {
                 ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
@@ -531,13 +646,21 @@ impl<'a> Transition<'a> {
             token.fork_stack.is_empty(),
             "boundary interruption requires an empty parallel activation stack"
         );
+        if let Some(child) = self
+            .scopes
+            .iter()
+            .find(|scope| scope.parent_token_id.as_deref() == Some(token.token_id.as_str()))
+            .cloned()
+        {
+            self.cancel_scope(&child.scope_id, winning_timer_id)?;
+        }
         let job_ids = self
             .jobs
             .iter()
             .filter(|job| job.token_id == token.token_id)
             .map(|job| job.job_id.clone())
             .collect::<Vec<_>>();
-        self.plan.cancel_job_ids = self
+        let cancelled_jobs = self
             .jobs
             .iter()
             .filter(|job| {
@@ -545,10 +668,11 @@ impl<'a> Transition<'a> {
                     && matches!(job.status.as_str(), "queued" | "running" | "error")
             })
             .map(|job| job.job_id.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        self.plan.cancel_job_ids.extend(cancelled_jobs);
         self.jobs
             .retain(|job| !self.plan.cancel_job_ids.contains(&job.job_id));
-        self.plan.cancel_user_task_ids = self
+        let cancelled_tasks = self
             .tasks
             .iter()
             .filter(|task| {
@@ -556,7 +680,8 @@ impl<'a> Transition<'a> {
                     && task.status == ProcessUserTaskStatus::Open
             })
             .map(|task| task.user_task_id.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        self.plan.cancel_user_task_ids.extend(cancelled_tasks);
         self.tasks
             .retain(|task| !self.plan.cancel_user_task_ids.contains(&task.user_task_id));
         self.tokens
@@ -582,6 +707,265 @@ impl<'a> Transition<'a> {
         for id in incidents {
             self.resolve_incident(&id);
         }
+        Ok(())
+    }
+
+    fn cancel_scope(&mut self, root: &str, boundary_id: &str) -> Result<()> {
+        let closure = super::repository::descendant_scope_ids(&self.scopes, root)?;
+        let active = self
+            .scopes
+            .iter()
+            .filter(|scope| {
+                closure.contains(&scope.scope_id)
+                    && !matches!(
+                        scope.status,
+                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_ids = active
+            .iter()
+            .map(|scope| scope.scope_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.plan.cancel_scope_roots.push(root.to_owned());
+        for token in self
+            .tokens
+            .iter()
+            .filter(|token| active_ids.contains(&token.scope_id))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.plan.cancel_token_ids.push(token.token_id.clone());
+            self.tokens
+                .retain(|actual| actual.token_id != token.token_id);
+        }
+        for receipt in self
+            .receipts
+            .iter()
+            .filter(|receipt| active_ids.contains(&receipt.scope_id))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.receipts
+                .retain(|actual| actual.token_id != receipt.token_id);
+            if self
+                .plan
+                .add_receipts
+                .iter()
+                .any(|actual| actual.token_id == receipt.token_id)
+            {
+                self.plan
+                    .add_receipts
+                    .retain(|actual| actual.token_id != receipt.token_id);
+            } else {
+                self.plan.remove_receipts.push(receipt);
+            }
+        }
+        self.plan.cancel_user_task_ids.extend(
+            self.tasks
+                .iter()
+                .filter(|task| {
+                    active_ids.contains(&task.scope_id)
+                        && task.status == ProcessUserTaskStatus::Open
+                })
+                .map(|task| task.user_task_id.clone()),
+        );
+        self.tasks
+            .retain(|task| !self.plan.cancel_user_task_ids.contains(&task.user_task_id));
+        self.plan.cancel_job_ids.extend(
+            self.jobs
+                .iter()
+                .filter(|job| {
+                    active_ids.contains(&job.scope_id)
+                        && matches!(job.status.as_str(), "queued" | "running" | "error")
+                })
+                .map(|job| job.job_id.clone()),
+        );
+        self.jobs
+            .retain(|job| !self.plan.cancel_job_ids.contains(&job.job_id));
+        let previous = self.current_scope.clone();
+        for timer in self
+            .timers
+            .iter()
+            .filter(|timer| {
+                timer
+                    .scope_id
+                    .as_ref()
+                    .is_some_and(|id| active_ids.contains(id))
+                    && matches!(
+                        timer.status,
+                        ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.current_scope = timer
+                .scope_id
+                .clone()
+                .context("instance timer lacks scope")?;
+            self.plan
+                .timer_updates
+                .push(super::repository::TimerUpdate {
+                    timer_id: timer.timer_id.clone(),
+                    expected_revision: timer.revision,
+                    fired_occurrence: None,
+                    occurrence: timer.occurrence,
+                    due_at_ms: None,
+                    status: ProcessTimerStatus::Cancelled,
+                    last_reason: Some("scope_cancelled".into()),
+                    next_check_at_ms: self.now_ms,
+                });
+            self.event("timer_cancelled", Some(timer.node_id.clone()), json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_token_id":timer.token_id,"reason":"scope_cancelled"}));
+        }
+        for subscription in self
+            .subscriptions
+            .iter()
+            .filter(|subscription| {
+                active_ids.contains(&subscription.scope_id)
+                    && subscription.status
+                        == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.current_scope = subscription.scope_id.clone();
+            self.settle_subscription(
+                &subscription,
+                tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled,
+                Some("scope_cancelled"),
+            );
+        }
+        for race in self
+            .event_races
+            .iter()
+            .filter(|race| {
+                active_ids.contains(&race.scope_id)
+                    && race.status == tentaflow_protocol::processes::ProcessEventRaceStatus::Open
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.current_scope = race.scope_id.clone();
+            self.plan
+                .race_updates
+                .push(super::repository::EventRaceUpdate {
+                    race_id: race.race_id.clone(),
+                    expected_revision: race.revision,
+                    status: tentaflow_protocol::processes::ProcessEventRaceStatus::Cancelled,
+                    winner_node_id: None,
+                    winner_subscription_id: None,
+                    winner_timer_id: None,
+                });
+            self.event(
+                "event_race_cancelled",
+                Some(race.gateway_node_id.clone()),
+                json!({"race_id":race.race_id,"reason":"scope_cancelled"}),
+            );
+        }
+        for id in self
+            .incidents
+            .iter()
+            .chain(self.plan.add_incidents.iter())
+            .filter(|incident| active_ids.contains(&incident.scope_id))
+            .map(|incident| incident.incident_id.clone())
+            .collect::<Vec<_>>()
+        {
+            self.resolve_incident(&id);
+        }
+        for scope in active {
+            self.current_scope = scope.scope_id.clone();
+            self.update_scope(&scope.scope_id, ProcessInstanceStatus::Cancelled, None)?;
+            self.event("scope_cancelled", None,
+                json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,"subprocess_node_id":scope.subprocess_node_id,"reason":"scope_cancelled","boundary_id":boundary_id}));
+        }
+        self.current_scope = previous;
+        Ok(())
+    }
+
+    fn enter_scope(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let ProcessNodeKind::SubProcess {
+            body,
+            input_mapping,
+            ..
+        } = &node.kind
+        else {
+            anyhow::bail!("scope entry requires an embedded subprocess");
+        };
+        let parent_scope = self.current_scope.clone();
+        let waiting = self.wait(token, "waiting");
+        self.arm_boundaries(node, &waiting)?;
+        if self.scopes.len() >= 129 {
+            self.incident(
+                &node.id,
+                None,
+                "SCOPE_LIMIT",
+                "process instance reached its 129-scope lifetime limit".into(),
+            );
+            let incident_id = self
+                .plan
+                .add_incidents
+                .last()
+                .context("scope limit incident missing")?
+                .incident_id
+                .clone();
+            self.event("scope_entry_failed", Some(node.id.clone()), json!({"parent_token_id":waiting,"scope_id":parent_scope,"subprocess_node_id":node.id,"incident_id":incident_id,"code":"SCOPE_LIMIT","reason":"scope_limit"}));
+            return Ok(());
+        }
+        let local = patch_variables(
+            input_mapping,
+            &serde_json::to_value(&body.variables)?,
+            &self.effective()?,
+            &Value::Null,
+            &[],
+        )?;
+        let start = body
+            .nodes
+            .iter()
+            .find(|node| node.kind == ProcessNodeKind::Start)
+            .context("embedded subprocess start missing")?;
+        let scope_id = Uuid::new_v4().to_string();
+        let depth = self
+            .scopes
+            .iter()
+            .find(|scope| scope.scope_id == parent_scope)
+            .context("parent scope missing")?
+            .depth
+            .checked_add(1)
+            .context("scope depth overflow")?;
+        ensure!(depth <= 3, "embedded subprocess depth exceeds three");
+        self.plan.create_scopes.push(PlannedScope {
+            scope_id: scope_id.clone(),
+            parent_scope_id: parent_scope.clone(),
+            parent_token_id: waiting.clone(),
+            subprocess_node_id: node.id.clone(),
+            variables: local.clone(),
+        });
+        self.scopes.push(ProcessScopeSummary {
+            scope_id: scope_id.clone(),
+            parent_scope_id: Some(parent_scope.clone()),
+            subprocess_node_id: Some(node.id.clone()),
+            subprocess_node_name: Some(node.name.clone()),
+            parent_token_id: Some(waiting.clone()),
+            revision: 1,
+            status: ProcessInstanceStatus::Running,
+            depth,
+            created_at_ms: self.now_ms,
+            updated_at_ms: self.now_ms,
+        });
+        self.scope_variables.insert(scope_id.clone(), local);
+        self.current_scope = scope_id.clone();
+        self.event("scope_entered", None, json!({"scope_id":scope_id,"parent_scope_id":parent_scope,"parent_token_id":waiting,"subprocess_node_id":node.id}));
+        self.create_token(ProcessToken {
+            token_id: String::new(),
+            scope_id: scope_id.clone(),
+            node_id: start.id.clone(),
+            arrival_edge_id: None,
+            fork_stack: Vec::new(),
+            status: "ready".into(),
+        });
+        self.current_scope = parent_scope;
         Ok(())
     }
 
@@ -652,8 +1036,9 @@ impl<'a> Transition<'a> {
                     .context("boundary error declaration missing")
             })
             .transpose()?;
+        let effective = self.effective()?;
         let predicate = correlation
-            .map(|expression| super::messages::evaluate_key(expression, &self.plan.variables))
+            .map(|expression| super::messages::evaluate_key(expression, &effective))
             .transpose();
         let (key, status, reason) = match predicate {
             Ok(key) => (key, S::Open, None),
@@ -665,6 +1050,7 @@ impl<'a> Transition<'a> {
         };
         let s = super::repository::EventSubscription {
             subscription_id: Uuid::new_v4().to_string(),
+            scope_id: self.current_scope.clone(),
             instance_id: self.instance_id.to_owned(),
             org_id: self.org_id.to_owned(),
             definition_id: self.definition_id.to_owned(),
@@ -825,6 +1211,7 @@ impl<'a> Transition<'a> {
         let id = Uuid::new_v4().to_string();
         let race = super::repository::EventRace {
             race_id: id.clone(),
+            scope_id: self.current_scope.clone(),
             instance_id: self.instance_id.to_owned(),
             gateway_node_id: node.id.clone(),
             activation_id: token.token_id.clone(),
@@ -847,14 +1234,15 @@ impl<'a> Transition<'a> {
         );
         for edge in self.outgoing(&node.id) {
             let branch = self
-                .model
-                .sequence_flows
+                .body()?
+                .1
                 .iter()
                 .find(|f| f.id == edge)
                 .context("race branch edge missing")?;
             let child = self.node(&branch.target_id)?.clone();
             let waiting = self.create_token(ProcessToken {
                 token_id: String::new(),
+                scope_id: self.current_scope.clone(),
                 node_id: child.id.clone(),
                 arrival_edge_id: Some(edge),
                 fork_stack: token.fork_stack.clone(),
@@ -882,13 +1270,14 @@ impl<'a> Transition<'a> {
         Ok(())
     }
     fn throw_message(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
-        let prepared = super::messages::prepare_throw(self.model, node, &self.plan.variables)?;
+        let prepared = super::messages::prepare_throw(self.model, node, &self.effective()?)?;
         let event_index = self.plan.events.len();
         self.event("message_queued",Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
         self.plan
             .create_messages
             .push(super::repository::PlannedMessage {
                 message: prepared,
+                source_scope_id: self.current_scope.clone(),
                 source_node_id: node.id.clone(),
                 source_activation_id: token.token_id.clone(),
                 source_event_index: event_index,
@@ -914,12 +1303,14 @@ impl<'a> Transition<'a> {
             !self
                 .receipts
                 .iter()
-                .any(|receipt| receipt.activation_id == frame.activation_id
+                .any(|receipt| receipt.scope_id == self.current_scope
+                    && receipt.activation_id == frame.activation_id
                     && receipt.branch_edge_id == frame.branch_edge_id),
             "parallel branch arrived twice"
         );
         let token_id = self.wait(token, "joining");
         let receipt = AndReceipt {
+            scope_id: self.current_scope.clone(),
             join_node_id: token.node_id.clone(),
             activation_id: frame.activation_id.clone(),
             branch_edge_id: frame.branch_edge_id.clone(),
@@ -931,7 +1322,8 @@ impl<'a> Transition<'a> {
             .receipts
             .iter()
             .filter(|receipt| {
-                receipt.activation_id == frame.activation_id
+                receipt.scope_id == self.current_scope
+                    && receipt.activation_id == frame.activation_id
                     && receipt.join_node_id == frame.join_node_id
             })
             .cloned()
@@ -983,6 +1375,7 @@ impl<'a> Transition<'a> {
             .find(|token| token.status == "ready")
             .cloned()
         {
+            self.current_scope = token.scope_id.clone();
             let id = token.token_id.clone();
             let node = self.node(&token.node_id)?.clone();
             let outgoing = self.outgoing(&node.id);
@@ -1000,6 +1393,7 @@ impl<'a> Transition<'a> {
                     self.consume(&id);
                     self.event("end_reached", Some(node.id), Value::Null);
                 }
+                ProcessNodeKind::SubProcess { .. } => self.enter_scope(&node, &token)?,
                 ProcessNodeKind::UserTask {
                     assignee_user_id, ..
                 } => {
@@ -1041,12 +1435,13 @@ impl<'a> Transition<'a> {
                     anyhow::bail!("boundary events are entered only by their attached timer")
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
-                    match prepare_service_input(&input_mapping, &self.plan.variables) {
+                    match prepare_service_input(&input_mapping, &self.effective()?) {
                         Ok(input) => {
                             let token_id = self.wait(&token, "waiting");
                             let job = ProcessJob {
                                 job_id: Uuid::new_v4().to_string(),
                                 instance_id: self.instance_id.to_owned(),
+                                scope_id: self.current_scope.clone(),
                                 node_id: node.id.clone(),
                                 token_id: token_id.clone(),
                                 input,
@@ -1084,13 +1479,13 @@ impl<'a> Transition<'a> {
                             continue;
                         }
                         let edge = self
-                            .model
-                            .sequence_flows
+                            .body()?
+                            .1
                             .iter()
                             .find(|flow| flow.id == *edge_id)
                             .context("sequence flow missing")?;
                         match edge.condition.as_ref().map_or(Ok(true), |expression| {
-                            condition(expression, &self.plan.variables, &Value::Null)
+                            condition(expression, &self.effective()?, &Value::Null)
                         }) {
                             Ok(true) => matches.push(edge_id.clone()),
                             Ok(false) => {}
@@ -1133,7 +1528,10 @@ impl<'a> Transition<'a> {
                     self.follow(&token, &edge)?;
                 }
                 ProcessNodeKind::ParallelGateway => {
-                    if let Some(join_node_id) = self.pairs.get(&node.id).cloned() {
+                    if let Some(join_node_id) = and_pairs(self.body()?.0, self.body()?.1)?
+                        .get(&node.id)
+                        .cloned()
+                    {
                         self.consume(&id);
                         let activation_id = Uuid::new_v4().to_string();
                         self.event(
@@ -1157,13 +1555,217 @@ impl<'a> Transition<'a> {
                 }
             }
         }
+        if self.complete_scopes()? {
+            self.advance()?;
+        }
         Ok(())
     }
 
-    fn finish(mut self) -> RuntimePlan {
-        self.plan.status = if !self.incidents.is_empty() || !self.plan.add_incidents.is_empty() {
+    fn complete_scopes(&mut self) -> Result<bool> {
+        let mut scopes = self
+            .scopes
+            .iter()
+            .filter(|scope| {
+                scope.parent_scope_id.is_some()
+                    && !matches!(
+                        scope.status,
+                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        scopes.sort_by_key(|scope| std::cmp::Reverse(scope.depth));
+        let mut progressed = false;
+        for scope in scopes {
+            if self
+                .tokens
+                .iter()
+                .any(|token| token.scope_id == scope.scope_id)
+                || self
+                    .receipts
+                    .iter()
+                    .any(|receipt| receipt.scope_id == scope.scope_id)
+                || self.jobs.iter().any(|job| {
+                    job.scope_id == scope.scope_id
+                        && matches!(job.status.as_str(), "queued" | "running" | "error")
+                        && self
+                            .tokens
+                            .iter()
+                            .any(|token| token.token_id == job.token_id)
+                })
+                || self.tasks.iter().any(|task| {
+                    task.scope_id == scope.scope_id && task.status == ProcessUserTaskStatus::Open
+                })
+                || self
+                    .incidents
+                    .iter()
+                    .chain(self.plan.add_incidents.iter())
+                    .any(|incident| {
+                        incident.scope_id == scope.scope_id
+                            && !self
+                                .plan
+                                .resolve_incident_ids
+                                .contains(&incident.incident_id)
+                    })
+                || self.scopes.iter().any(|child| {
+                    child.parent_scope_id.as_deref() == Some(scope.scope_id.as_str())
+                        && !matches!(
+                            child.status,
+                            ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                        )
+                })
+            {
+                continue;
+            }
+            let parent = scope
+                .parent_scope_id
+                .clone()
+                .context("child parent scope missing")?;
+            let waiting = scope
+                .parent_token_id
+                .as_deref()
+                .context("child parent wait missing")?;
+            let token = self
+                .tokens
+                .iter()
+                .find(|token| {
+                    token.token_id == waiting
+                        && token.scope_id == parent
+                        && token.status == "waiting"
+                })
+                .context("completing child lost its parent waiting activation")?
+                .clone();
+            self.current_scope = parent;
+            let node = self.node(&token.node_id)?.clone();
+            let ProcessNodeKind::SubProcess { output_mapping, .. } = &node.kind else {
+                anyhow::bail!("child completion parent activation is not a subprocess");
+            };
+            let outputs = self
+                .scope_variables
+                .get(&scope.scope_id)
+                .context("completing child local variables missing")?
+                .clone();
+            if let Err(error) = self.map_outputs(output_mapping, &outputs, &[]) {
+                self.current_scope = scope.scope_id.clone();
+                let incident_id = Uuid::new_v4().to_string();
+                let message = super::repository::bounded_failure_message(&format!("{error:#}"));
+                self.plan.add_incidents.push(ProcessIncident {
+                    incident_id: incident_id.clone(),
+                    scope_id: scope.scope_id.clone(),
+                    node_id: None,
+                    node_name: None,
+                    job_id: None,
+                    code: "SCOPE_RETURN_ERROR".into(),
+                    message: message.clone(),
+                    at_ms: self.now_ms,
+                    can_retry: false,
+                });
+                self.event("incident", None, json!({"incident_id":incident_id,"code":"SCOPE_RETURN_ERROR","message":message,"parent_token_id":waiting}));
+                self.update_scope(&scope.scope_id, ProcessInstanceStatus::Incident, None)?;
+                continue;
+            }
+            self.update_scope(
+                &scope.scope_id,
+                ProcessInstanceStatus::Completed,
+                Some(outputs),
+            )?;
+            let parent_scope = self.current_scope.clone();
+            self.current_scope = scope.scope_id.clone();
+            self.event("scope_completed", None, json!({"scope_id":scope.scope_id,"parent_scope_id":parent_scope,"parent_token_id":waiting,"subprocess_node_id":node.id}));
+            self.current_scope = parent_scope;
+            self.disarm_boundaries(waiting, "activity_completed", None)?;
+            self.resolve_boundary_incidents(waiting);
+            self.consume(waiting);
+            for edge in self.outgoing(&node.id) {
+                self.follow(&token, &edge)?;
+            }
+            progressed = true;
+        }
+        Ok(progressed)
+    }
+
+    fn error_handler(
+        &self,
+        token: &ProcessToken,
+        code: Option<&str>,
+    ) -> Result<
+        Option<(
+            super::repository::EventSubscription,
+            ProcessToken,
+            Vec<String>,
+        )>,
+    > {
+        let mut attached = token.clone();
+        let mut hops = Vec::new();
+        loop {
+            let open = self
+                .subscriptions
+                .iter()
+                .filter(|subscription| {
+                    subscription.scope_id == attached.scope_id
+                        && subscription.token_id == attached.token_id
+                        && subscription.kind
+                            == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError
+                        && subscription.status
+                            == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+                })
+                .collect::<Vec<_>>();
+            if let Some(handler) = open
+                .iter()
+                .find(|subscription| {
+                    subscription.error_code.is_some() && subscription.error_code.as_deref() == code
+                })
+                .or_else(|| {
+                    open.iter()
+                        .find(|subscription| subscription.error_code.is_none())
+                })
+            {
+                return Ok(Some(((*handler).clone(), attached, hops)));
+            }
+            let scope = self
+                .scopes
+                .iter()
+                .find(|scope| scope.scope_id == attached.scope_id)
+                .context("error source scope is missing")?;
+            let Some(parent) = &scope.parent_scope_id else {
+                return Ok(None);
+            };
+            hops.push(scope.scope_id.clone());
+            attached = self
+                .tokens
+                .iter()
+                .find(|candidate| {
+                    candidate.scope_id == *parent
+                        && Some(candidate.token_id.as_str()) == scope.parent_token_id.as_deref()
+                        && candidate.status == "waiting"
+                })
+                .context("error propagation lost enclosing subprocess activation")?
+                .clone();
+        }
+    }
+
+    fn finish(mut self) -> Result<RuntimePlan> {
+        self.plan.status = if self
+            .incidents
+            .iter()
+            .chain(self.plan.add_incidents.iter())
+            .any(|incident| {
+                !self
+                    .plan
+                    .resolve_incident_ids
+                    .contains(&incident.incident_id)
+            }) {
             ProcessInstanceStatus::Incident
-        } else if self.tokens.is_empty() {
+        } else if self.tokens.is_empty()
+            && !self.scopes.iter().any(|scope| {
+                scope.parent_scope_id.is_some()
+                    && !matches!(
+                        scope.status,
+                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                    )
+            })
+        {
+            self.current_scope = self.instance_id.to_owned();
             self.event("instance_completed", None, Value::Null);
             ProcessInstanceStatus::Completed
         } else if self
@@ -1176,7 +1778,42 @@ impl<'a> Transition<'a> {
         } else {
             ProcessInstanceStatus::Waiting
         };
-        self.plan
+        for scope in self.scopes.clone().into_iter().filter(|scope| {
+            scope.parent_scope_id.is_some()
+                && !matches!(
+                    scope.status,
+                    ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                )
+        }) {
+            let status = if self
+                .incidents
+                .iter()
+                .chain(self.plan.add_incidents.iter())
+                .any(|incident| {
+                    incident.scope_id == scope.scope_id
+                        && !self
+                            .plan
+                            .resolve_incident_ids
+                            .contains(&incident.incident_id)
+                }) {
+                ProcessInstanceStatus::Incident
+            } else if self.jobs.iter().any(|job| {
+                job.scope_id == scope.scope_id
+                    && matches!(job.status.as_str(), "queued" | "running")
+            }) || self
+                .tokens
+                .iter()
+                .any(|token| token.scope_id == scope.scope_id && token.status == "ready")
+            {
+                ProcessInstanceStatus::Running
+            } else {
+                ProcessInstanceStatus::Waiting
+            };
+            if scope.status != status {
+                self.update_scope(&scope.scope_id, status, None)?;
+            }
+        }
+        Ok(self.plan)
     }
 }
 
@@ -1247,8 +1884,10 @@ pub fn plan_start(
         _ => anyhow::bail!("timer firing does not match the process start event"),
     };
     transition.plan.start_instance_id = Some(instance_id.to_owned());
+    transition.plan.start_variables = Some(transition.plan.variables.clone());
     transition.create_token(ProcessToken {
         token_id: String::new(),
+        scope_id: instance_id.to_owned(),
         node_id: start.id.clone(),
         arrival_edge_id: None,
         fork_stack: Vec::new(),
@@ -1256,13 +1895,13 @@ pub fn plan_start(
     });
     transition.event("instance_started", None, facts);
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64) -> Result<RuntimePlan> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub fn plan_user_completion(
@@ -1279,6 +1918,7 @@ pub fn plan_user_completion(
         .iter()
         .find(|task| task.user_task_id == task_id && task.status == ProcessUserTaskStatus::Open)
         .context("open process user task not found")?;
+    transition.current_scope = task.scope_id.clone();
     let node = transition.node(&task.node_id)?.clone();
     let token = transition
         .tokens
@@ -1322,7 +1962,7 @@ pub fn plan_user_completion(
                     Some(node.id),
                     json!({"user_task_id": task_id, "outputs": outputs}),
                 );
-                return Ok(transition.finish());
+                return transition.finish();
             }
             let result: ActivityResult = serde_json::from_value(task.outputs.clone())
                 .context("verification has no persisted activity result")?;
@@ -1334,8 +1974,7 @@ pub fn plan_user_completion(
         | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
         _ => anyhow::bail!("user task node is not an activity"),
     };
-    transition.plan.variables =
-        patch_variables(mapping, &transition.plan.variables, &effective_outputs)?;
+    transition.map_outputs(mapping, &effective_outputs, &[])?;
     transition
         .plan
         .complete_user_task_ids
@@ -1357,7 +1996,7 @@ pub fn plan_user_completion(
         transition.follow(&token, &edge)?;
     }
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub fn plan_job_result(
@@ -1369,6 +2008,7 @@ pub fn plan_job_result(
     let result = &observed.result;
     validate_output(&result.outputs)?;
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
     let token = transition
         .tokens
@@ -1396,55 +2036,45 @@ pub fn plan_job_result(
     if observed.origin == super::repository::ActivityResultOrigin::Contract
         && result.outcome == ActivityOutcome::Error
     {
-        if let Some(subscription) = transition
-            .subscriptions
-            .iter()
-            .filter(|s| {
-                s.token_id == token.token_id
-                    && s.kind
-                        == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError
-                    && s.status == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
-            })
-            .find(|s| s.error_code.as_deref() == result.code.as_deref() && s.error_code.is_some())
-            .or_else(|| {
-                transition.subscriptions.iter().find(|s| {
-                    s.token_id == token.token_id
-                        && s.kind
-                            == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError
-                        && s.status
-                            == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
-                        && s.error_code.is_none()
-                })
-            })
-            .cloned()
+        if let Some((subscription, attached, hops)) =
+            transition.error_handler(&token, result.code.as_deref())?
         {
+            let source_scope = transition.current_scope.clone();
+            let result_index = transition.plan.events.len() - 1;
+            transition.current_scope = subscription.scope_id.clone();
             let handler = transition.node(&subscription.node_id)?.clone();
             let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
-                anyhow::bail!("error subscription is not a boundary")
+                anyhow::bail!("error subscription is not a boundary");
             };
-            transition.plan.variables = super::messages::mapped_variables(
+            transition.map_outputs(
                 output_mapping,
-                &transition.plan.variables,
                 &result.outputs,
-                "activity_result",
-                serde_json::to_value(result)?,
+                &[("activity_result".into(), serde_json::to_value(result)?)],
             )?;
             transition.settle_subscription(
                 &subscription,
                 tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
                 None,
             );
-            transition.interrupt_activity(&token, &subscription.subscription_id)?;
+            transition.interrupt_activity(&attached, &subscription.subscription_id)?;
             transition
                 .plan
                 .cancel_job_ids
                 .retain(|id| id != &job.job_id);
-            transition.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":token.token_id,"job_id":job.job_id,"error_code":result.code,"result_origin":super::repository::result_origin_text(&observed.origin)}));
+            for (index, from) in hops.iter().enumerate() {
+                let to = hops.get(index + 1).unwrap_or(&subscription.scope_id);
+                transition.event("scope_error_propagated", Some(handler.id.clone()), json!({
+                    "source_scope_id":source_scope,"source_job_id":job.job_id,"source_token_id":token.token_id,
+                    "from_scope_id":from,"to_scope_id":to,"handler_node_id":handler.id,"code":result.code,
+                    "source_result_index":result_index,
+                }));
+            }
+            transition.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":attached.token_id,"job_id":job.job_id,"error_code":result.code,"result_origin":super::repository::result_origin_text(&observed.origin)}));
             for edge in transition.outgoing(&handler.id) {
-                transition.follow(&token, &edge)?;
+                transition.follow(&attached, &edge)?;
             }
             transition.advance()?;
-            return Ok(transition.finish());
+            return transition.finish();
         }
     }
     if matches!(
@@ -1457,7 +2087,7 @@ pub fn plan_job_result(
             result.code.as_deref().unwrap_or("SERVICE_ERROR"),
             result.summary.clone(),
         );
-        return Ok(transition.finish());
+        return transition.finish();
     }
     match verification {
         _ if result.outcome == ActivityOutcome::NeedsHuman => {
@@ -1479,14 +2109,16 @@ pub fn plan_job_result(
             );
         }
         ActivityVerification::Condition { expression } => {
-            match condition(expression, &transition.plan.variables, &result.outputs) {
+            match condition(expression, &transition.effective()?, &result.outputs) {
                 Ok(true) => match patch_variables(
                     output_mapping,
-                    &transition.plan.variables,
+                    transition.local()?,
+                    &transition.effective()?,
                     &result.outputs,
+                    &[],
                 ) {
                     Ok(variables) => {
-                        transition.plan.variables = variables;
+                        transition.set_variables(variables)?;
                         transition.disarm_boundaries(
                             &token.token_id,
                             "activity_completed",
@@ -1526,7 +2158,7 @@ pub fn plan_job_result(
             }
         }
     }
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub(super) fn plan_message_catch(
@@ -1537,6 +2169,7 @@ pub(super) fn plan_message_catch(
     now_ms: i64,
 ) -> Result<RuntimePlan> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();
     let (mapping, interrupt) = match &node.kind {
         ProcessNodeKind::MessageCatch { output_mapping, .. } => (output_mapping, None),
@@ -1553,13 +2186,7 @@ pub(super) fn plan_message_catch(
         .find(|t| t.token_id == subscription.token_id && t.status == "waiting")
         .context("subscription activation is closed")?
         .clone();
-    transition.plan.variables = super::messages::mapped_variables(
-        mapping,
-        &transition.plan.variables,
-        payload,
-        "message",
-        metadata.clone(),
-    )?;
+    transition.map_outputs(mapping, payload, &[("message".into(), metadata.clone())])?;
     transition.settle_subscription(
         subscription,
         tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
@@ -1579,7 +2206,7 @@ pub(super) fn plan_message_catch(
         transition.follow(&token, &edge)?;
     }
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub(super) fn plan_timer_catch(
@@ -1596,6 +2223,7 @@ pub(super) fn plan_timer_catch(
         "catch timer does not match its pinned instance"
     );
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = timer.scope_id.clone().context("catch timer lacks scope")?;
     let token_id = timer
         .token_id
         .as_deref()
@@ -1622,7 +2250,7 @@ pub(super) fn plan_timer_catch(
         transition.follow(&token, &edge)?;
     }
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 pub(super) fn plan_timer_boundary(
@@ -1639,6 +2267,10 @@ pub(super) fn plan_timer_boundary(
         "boundary timer does not match its pinned instance"
     );
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = timer
+        .scope_id
+        .clone()
+        .context("boundary timer lacks scope")?;
     let node = transition.node(&timer.node_id)?.clone();
     let ProcessNodeKind::BoundaryTimer {
         attached_to_id,
@@ -1673,11 +2305,10 @@ pub(super) fn plan_timer_boundary(
         transition.follow(&token, &edge)?;
     }
     transition.advance()?;
-    Ok(transition.finish())
+    transition.finish()
 }
 
 struct RunningJob {
-    instance_id: String,
     attempt: u32,
     fence: u64,
     worker_id: String,
@@ -1731,13 +2362,9 @@ pub fn wake(dispatcher: &FlowDispatcher) {
     }
 }
 
-pub fn cancel_instance(dispatcher: &FlowDispatcher, instance_id: &str) {
+pub fn signal_cancelled_claims(dispatcher: &FlowDispatcher, claims: &[CancelledJobClaim]) {
     if let Some(runtime) = dispatcher.process_runtime.lock().as_ref() {
-        for job in runtime.running.iter() {
-            if job.instance_id == instance_id {
-                job.cancel.cancel();
-            }
-        }
+        runtime.signal_cancelled_claims(claims);
         runtime.wake.notify_one();
     }
 }
@@ -1813,7 +2440,6 @@ impl ProcessRuntime {
                 self.running.insert(
                     job_id.clone(),
                     RunningJob {
-                        instance_id: claimed.job.instance_id.clone(),
                         attempt: claimed.job.attempt,
                         fence: claimed.job.fence,
                         worker_id: self.worker_id.clone(),
@@ -1841,7 +2467,7 @@ impl ProcessRuntime {
                     };
                     if let Some(error) = failure {
                         tracing::error!(job_id, error, "process job execution failed");
-                        if let Err(error) = super::repository::fail_job(&worker.db, &job_id, attempt, fence, &worker.worker_id, "WORKER_ERROR", &error, chrono::Utc::now().timestamp_millis()) {
+                        if let Err(error) = super::repository::fail_job(&worker.db, &job_id, attempt, fence, &worker.worker_id, "WORKER_ERROR", &error, chrono::Utc::now().timestamp_millis(), None) {
                             tracing::error!(job_id, error = %error, "process worker could not persist its incident");
                         }
                     }
@@ -2019,12 +2645,56 @@ pub(crate) mod test_support {
         model
     }
 
+    pub fn embedded_model(mut model: ProcessModel, scope_id: &str) -> ProcessModel {
+        let body = tentaflow_protocol::processes::ProcessSubProcess {
+            nodes: std::mem::take(&mut model.nodes),
+            sequence_flows: std::mem::take(&mut model.sequence_flows),
+            variables: std::mem::take(&mut model.variables),
+            diagram: std::mem::take(&mut model.diagram),
+        };
+        let start_id = format!("RootStart_{scope_id}");
+        let end_id = format!("RootEnd_{scope_id}");
+        model.nodes = vec![
+            ProcessNode {
+                id: start_id.clone(),
+                name: "Enter embedded work".into(),
+                kind: ProcessNodeKind::Start,
+            },
+            ProcessNode {
+                id: scope_id.into(),
+                name: format!("Embedded {scope_id}"),
+                kind: ProcessNodeKind::SubProcess {
+                    body,
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+            ProcessNode {
+                id: end_id.clone(),
+                name: "Finish embedded work".into(),
+                kind: ProcessNodeKind::End,
+            },
+        ];
+        model.sequence_flows = vec![
+            edge(&format!("Enter_{scope_id}"), &start_id, scope_id),
+            edge(&format!("Leave_{scope_id}"), scope_id, &end_id),
+        ];
+        model
+    }
+
     pub fn with_boundaries(
         mut model: ProcessModel,
         activity: &str,
         boundaries: &[(&str, bool, u32)],
     ) -> ProcessModel {
         model.timer_timezone = Some("UTC".into());
+        let end_id = model
+            .nodes
+            .iter()
+            .find(|node| node.kind == ProcessNodeKind::End)
+            .unwrap()
+            .id
+            .clone();
         for (id, interrupt, seconds) in boundaries {
             model.nodes.push(ProcessNode {
                 id: (*id).into(),
@@ -2039,7 +2709,7 @@ pub(crate) mod test_support {
             });
             model
                 .sequence_flows
-                .push(edge(&format!("From_{id}"), id, "End_1"));
+                .push(edge(&format!("From_{id}"), id, &end_id));
         }
         model
     }
@@ -2127,7 +2797,7 @@ pub(crate) mod test_support {
         )
         .expect("save real process definition");
         let mut snapshots = Vec::new();
-        for node in &model.nodes {
+        for node in super::super::model::all_nodes(model) {
             if let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind {
                 let dispatcher = fixture.dispatcher();
                 let meta = dispatcher
@@ -2263,7 +2933,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(completed.variables["answer"], "reviewed");
         let events = repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200)
@@ -2281,7 +2952,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(replay.instance_id, completed.instance_id);
         assert_eq!(
             repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200)
@@ -2385,7 +3057,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
         let path = fixture.directory.path().join("processes.db");
         let owner = fixture.owner.clone();
@@ -2430,7 +3103,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         repository::complete_user_task(
             &reopened,
@@ -2444,7 +3118,8 @@ mod tests {
             &plan,
             at_ms,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         let snapshot =
             repository::runtime_snapshot(&reopened, &owner, &waiting.instance_id).unwrap();
         assert!(snapshot.tokens.is_empty());
@@ -2600,7 +3275,6 @@ mod tests {
         runtime.running.insert(
             claim.job.job_id.clone(),
             RunningJob {
-                instance_id: claim.job.instance_id.clone(),
                 attempt: claim.job.attempt,
                 fence: claim.job.fence,
                 worker_id: claim.job.worker_id.clone().unwrap(),
@@ -2618,13 +3292,16 @@ mod tests {
             &graph("must not execute", None),
         );
         let model = with_boundaries(
-            service_model(
-                &flow_id,
-                ActivityVerification::Condition {
-                    expression: "true".into(),
-                },
+            embedded_model(
+                service_model(
+                    &flow_id,
+                    ActivityVerification::Condition {
+                        expression: "true".into(),
+                    },
+                ),
+                "Scope",
             ),
-            "Service",
+            "Scope",
             &[("Limit", true, 1)],
         );
         let started = start_model(&fixture, &model);
@@ -2693,11 +3370,14 @@ mod tests {
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("new generation", None));
         let started = start_model(
             &fixture,
-            &service_model(
-                &flow_id,
-                ActivityVerification::Condition {
-                    expression: "true".into(),
-                },
+            &embedded_model(
+                service_model(
+                    &flow_id,
+                    ActivityVerification::Condition {
+                        expression: "true".into(),
+                    },
+                ),
+                "Scope",
             ),
         );
         let old = repository::claim_job(
@@ -2715,7 +3395,8 @@ mod tests {
             "old-worker",
             "INTERRUPTED",
             "controlled worker interruption",
-            chrono::Utc::now().timestamp_millis()
+            chrono::Utc::now().timestamp_millis(),
+            None
         )
         .unwrap());
         let incident =
@@ -2784,6 +3465,13 @@ mod tests {
             "new-worker",
         );
         assert!(runtime.running.is_empty());
+        assert!(
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap()
+                .scopes
+                .iter()
+                .all(|scope| scope.status == ProcessInstanceStatus::Completed)
+        );
     }
 
     #[tokio::test]
@@ -2793,13 +3481,16 @@ mod tests {
         let mut instances = Vec::new();
         for seconds in [1, 2] {
             let model = with_boundaries(
-                service_model(
-                    &flow_id,
-                    ActivityVerification::Condition {
-                        expression: "true".into(),
-                    },
+                embedded_model(
+                    service_model(
+                        &flow_id,
+                        ActivityVerification::Condition {
+                            expression: "true".into(),
+                        },
+                    ),
+                    "Scope",
                 ),
-                "Service",
+                "Scope",
                 &[("Limit", true, seconds)],
             );
             instances.push(start_model(&fixture, &model));
@@ -2857,6 +3548,16 @@ mod tests {
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &second.0.job.instance_id)
                 .unwrap();
         assert_eq!(committed.jobs[0].status, "cancelled");
+        assert!(committed
+            .scopes
+            .iter()
+            .filter(|scope| scope.parent_scope_id.is_some())
+            .all(|scope| scope.status == ProcessInstanceStatus::Cancelled));
+        assert!(rolled_back
+            .scopes
+            .iter()
+            .filter(|scope| scope.parent_scope_id.is_some())
+            .all(|scope| scope.status == ProcessInstanceStatus::Running));
         assert_eq!(committed.jobs[0].fence, first.0.job.fence + 1);
         assert_eq!(rolled_back.jobs[0].status, "running");
         assert_eq!(rolled_back.jobs[0].fence, second.0.job.fence);
@@ -3060,8 +3761,11 @@ mod tests {
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("batch effect", None));
         let model = boundary_messages(
-            service_model(&flow_id, ActivityVerification::Human),
-            "Service",
+            embedded_model(
+                service_model(&flow_id, ActivityVerification::Human),
+                "Scope",
+            ),
+            "Scope",
             &[("Stop", true, "EvidenceReady")],
         );
         let version = published(&fixture, &model);
@@ -3136,6 +3840,16 @@ mod tests {
         let second_actual =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &second.instance_id).unwrap();
         assert_eq!(first_actual.jobs[0].status, "cancelled");
+        assert!(first_actual
+            .scopes
+            .iter()
+            .filter(|scope| scope.parent_scope_id.is_some())
+            .all(|scope| scope.status == ProcessInstanceStatus::Cancelled));
+        assert!(second_actual
+            .scopes
+            .iter()
+            .filter(|scope| scope.parent_scope_id.is_some())
+            .all(|scope| scope.status == ProcessInstanceStatus::Running));
         assert_eq!(second_actual.jobs[0].status, "running");
         assert_eq!(second_actual.jobs[0].fence, second_claim.0.job.fence);
         assert_eq!(
@@ -3147,5 +3861,754 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[tokio::test]
+    async fn subprocess_parent_and_local_join_receipts_remain_isolated_after_reopen() {
+        use super::super::messages::test_support::complete;
+        for peer_first in [false, true] {
+            let fixture = Fixture::new();
+            let mut child = super::super::model::starter_model();
+            child.nodes.splice(
+                1..1,
+                [
+                    ProcessNode {
+                        id: "ChildSplit".into(),
+                        name: "Start local parallel work".into(),
+                        kind: ProcessNodeKind::ParallelGateway,
+                    },
+                    ProcessNode {
+                        id: "ChildA".into(),
+                        name: "First child review".into(),
+                        kind: ProcessNodeKind::UserTask {
+                            assignee_user_id: None,
+                            output_mapping: BTreeMap::new(),
+                        },
+                    },
+                    ProcessNode {
+                        id: "ChildB".into(),
+                        name: "Second child review".into(),
+                        kind: ProcessNodeKind::UserTask {
+                            assignee_user_id: None,
+                            output_mapping: BTreeMap::new(),
+                        },
+                    },
+                    ProcessNode {
+                        id: "ChildJoin".into(),
+                        name: "Finish local parallel work".into(),
+                        kind: ProcessNodeKind::ParallelGateway,
+                    },
+                ],
+            );
+            child.sequence_flows = vec![
+                edge("ChildEnter", "Start_1", "ChildSplit"),
+                edge("ChildLeft", "ChildSplit", "ChildA"),
+                edge("ChildRight", "ChildSplit", "ChildB"),
+                edge("ChildAJoin", "ChildA", "ChildJoin"),
+                edge("ChildBJoin", "ChildB", "ChildJoin"),
+                edge("ChildLeave", "ChildJoin", "End_1"),
+            ];
+            let mut model = embedded_model(child, "Scope");
+            model.nodes.extend([
+                ProcessNode {
+                    id: "ParentSplit".into(),
+                    name: "Start parent parallel work".into(),
+                    kind: ProcessNodeKind::ParallelGateway,
+                },
+                ProcessNode {
+                    id: "Peer".into(),
+                    name: "Independent parent work".into(),
+                    kind: ProcessNodeKind::UserTask {
+                        assignee_user_id: None,
+                        output_mapping: BTreeMap::new(),
+                    },
+                },
+                ProcessNode {
+                    id: "ParentJoin".into(),
+                    name: "Finish parent parallel work".into(),
+                    kind: ProcessNodeKind::ParallelGateway,
+                },
+            ]);
+            model.sequence_flows = vec![
+                edge("ParentEnter", "RootStart_Scope", "ParentSplit"),
+                edge("ParentChild", "ParentSplit", "Scope"),
+                edge("ParentPeer", "ParentSplit", "Peer"),
+                edge("ScopeJoin", "Scope", "ParentJoin"),
+                edge("PeerJoin", "Peer", "ParentJoin"),
+                edge("ParentLeave", "ParentJoin", "RootEnd_Scope"),
+            ];
+            let started = start_model(&fixture, &model);
+            let child_id = started
+                .scopes
+                .iter()
+                .find(|scope| scope.subprocess_node_id.as_deref() == Some("Scope"))
+                .unwrap()
+                .scope_id
+                .clone();
+            let task_id = |node: &str| {
+                started
+                    .user_tasks
+                    .iter()
+                    .find(|task| task.node_id == node)
+                    .unwrap()
+                    .user_task_id
+                    .clone()
+            };
+            let first = if peer_first { "Peer" } else { "ChildA" };
+            let second = if peer_first { "ChildA" } else { "Peer" };
+            complete(&fixture, &started.instance_id, &task_id(first));
+            complete(&fixture, &started.instance_id, &task_id(second));
+            let partial =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            assert_eq!(partial.receipts.len(), 2);
+            assert!(
+                partial
+                    .receipts
+                    .iter()
+                    .any(|receipt| receipt.scope_id == child_id
+                        && receipt.join_node_id == "ChildJoin")
+            );
+            assert!(partial
+                .receipts
+                .iter()
+                .any(|receipt| receipt.scope_id == started.instance_id
+                    && receipt.join_node_id == "ParentJoin"));
+            let parent_wait = partial
+                .tokens
+                .iter()
+                .find(|token| token.node_id == "Scope")
+                .unwrap();
+            assert_eq!(parent_wait.fork_stack[0].split_node_id, "ParentSplit");
+            let child_wait = partial
+                .tokens
+                .iter()
+                .find(|token| token.node_id == "ChildB")
+                .unwrap();
+            assert_eq!(child_wait.fork_stack[0].split_node_id, "ChildSplit");
+            assert_ne!(
+                parent_wait.fork_stack[0].activation_id,
+                child_wait.fork_stack[0].activation_id
+            );
+            let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+            let snapshot =
+                repository::runtime_snapshot(&reopened, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let at = chrono::Utc::now().timestamp_millis();
+            let command = stamp("finish scoped and joins");
+            let plan =
+                plan_user_completion(&snapshot, &task_id("ChildB"), &json!({}), None, at).unwrap();
+            let outcome = repository::complete_user_task(
+                &reopened,
+                &fixture.owner,
+                &command,
+                &started.instance_id,
+                &task_id("ChildB"),
+                snapshot.instance.revision,
+                &json!({}),
+                None,
+                &plan,
+                at,
+            )
+            .unwrap();
+            assert!(outcome.cancelled_claims.is_empty());
+            assert_eq!(outcome.instance.status, ProcessInstanceStatus::Completed);
+            let finished =
+                repository::runtime_snapshot(&reopened, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            assert!(finished.tokens.is_empty() && finished.receipts.is_empty());
+            assert!(finished
+                .scopes
+                .iter()
+                .all(|scope| scope.status == ProcessInstanceStatus::Completed));
+            let events =
+                repository::list_events(&reopened, &fixture.owner, &started.instance_id, 0, 200)
+                    .unwrap()
+                    .0;
+            let joined = events
+                .iter()
+                .filter(|event| event.kind == "parallel_joined")
+                .collect::<Vec<_>>();
+            assert_eq!(joined.len(), 2);
+            assert!(joined.iter().any(|event| event.scope_id == child_id));
+            assert!(joined
+                .iter()
+                .any(|event| event.scope_id == started.instance_id));
+            let replay = repository::complete_user_task(
+                &reopened,
+                &fixture.owner,
+                &command,
+                &started.instance_id,
+                &task_id("ChildB"),
+                snapshot.instance.revision,
+                &json!({}),
+                None,
+                &plan,
+                at,
+            )
+            .unwrap();
+            assert!(replay.cancelled_claims.is_empty());
+            assert_eq!(replay.instance.revision, outcome.instance.revision);
+            assert_eq!(
+                repository::list_events(&reopened, &fixture.owner, &started.instance_id, 0, 200)
+                    .unwrap()
+                    .0,
+                events
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn subprocess_boundaries_compete_on_exact_child_and_preserve_earlier_parent_side_work() {
+        use super::super::messages::{
+            self,
+            test_support::{
+                boundary_messages, catch_target, complete, envelope, published, send, start_version,
+            },
+        };
+        use tentaflow_protocol::processes::{ProcessMessageStatus, ProcessTimerStatus};
+        for winner in ["message", "timer", "completion"] {
+            let fixture = Fixture::new();
+            let mut child = user_model(None);
+            if let ProcessNodeKind::UserTask { output_mapping, .. } = &mut child.nodes[1].kind {
+                output_mapping.clear();
+            }
+            child
+                .variables
+                .insert("retained".into(), json!("actual child local"));
+            let model = boundary_messages(
+                with_boundaries(
+                    embedded_model(child, "Scope"),
+                    "Scope",
+                    &[("Limit", true, 5)],
+                ),
+                "Scope",
+                &[
+                    ("Note", false, "NoteReady"),
+                    ("Stop", true, "EvidenceReady"),
+                ],
+            );
+            let version = published(&fixture, &model);
+            let started = start_version(&fixture, &version);
+            let child_id = started
+                .scopes
+                .iter()
+                .find(|scope| scope.subprocess_node_id.as_deref() == Some("Scope"))
+                .unwrap()
+                .scope_id
+                .clone();
+            let snap =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let note = snap
+                .subscriptions
+                .iter()
+                .find(|sub| sub.node_id == "Note")
+                .unwrap();
+            let stop = snap
+                .subscriptions
+                .iter()
+                .find(|sub| sub.node_id == "Stop")
+                .unwrap()
+                .clone();
+            let due = snap
+                .timers
+                .iter()
+                .find(|timer| timer.node_id == "Limit")
+                .unwrap()
+                .due_at_ms
+                .unwrap();
+            let mut message = envelope(
+                catch_target(
+                    &version,
+                    Some(&started.instance_id),
+                    Some(&note.subscription_id),
+                ),
+                Value::Null,
+            );
+            message.message_name = "NoteReady".into();
+            let receipt = send(&fixture, &message);
+            let drained = messages::drain_pending(&fixture.db, receipt.received_at_ms);
+            assert!(drained.completion.is_ok());
+            assert_eq!(drained.delivered, 1);
+            let before =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let side = before
+                .user_tasks
+                .iter()
+                .find(|task| task.node_id == "Side_Note")
+                .unwrap()
+                .user_task_id
+                .clone();
+            let work = before
+                .user_tasks
+                .iter()
+                .find(|task| task.node_id == "Work")
+                .unwrap()
+                .clone();
+            if winner == "message" {
+                let stop_message = envelope(
+                    catch_target(
+                        &version,
+                        Some(&started.instance_id),
+                        Some(&stop.subscription_id),
+                    ),
+                    json!({"stop":true}),
+                );
+                let receipt = send(&fixture, &stop_message);
+                let drained = messages::drain_pending(&fixture.db, receipt.received_at_ms);
+                assert!(drained.completion.is_ok());
+                assert_eq!(drained.delivered, 1);
+                assert_eq!(
+                    repository::get_message(
+                        &fixture.db,
+                        &fixture.owner,
+                        &fixture.owner.user_id,
+                        &stop_message.message_id
+                    )
+                    .unwrap()
+                    .message
+                    .status,
+                    ProcessMessageStatus::Delivered
+                );
+            } else if winner == "timer" {
+                let drained = super::super::timers::drain_due(&fixture.db, due);
+                assert!(drained.completion.is_ok());
+                assert_eq!(drained.fired, 1);
+            } else {
+                complete(&fixture, &started.instance_id, &work.user_task_id);
+            }
+            let actual =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let expected = if winner == "completion" {
+                ProcessInstanceStatus::Completed
+            } else {
+                ProcessInstanceStatus::Cancelled
+            };
+            assert_eq!(
+                actual
+                    .scopes
+                    .iter()
+                    .find(|scope| scope.scope_id == child_id)
+                    .unwrap()
+                    .status,
+                expected
+            );
+            assert_eq!(
+                actual
+                    .user_tasks
+                    .iter()
+                    .find(|task| task.user_task_id == side)
+                    .unwrap()
+                    .status,
+                ProcessUserTaskStatus::Open
+            );
+            assert_eq!(
+                actual
+                    .user_tasks
+                    .iter()
+                    .find(|task| task.user_task_id == work.user_task_id)
+                    .unwrap()
+                    .status,
+                if winner == "completion" {
+                    ProcessUserTaskStatus::Completed
+                } else {
+                    ProcessUserTaskStatus::Cancelled
+                }
+            );
+            assert_eq!(
+                repository::get_scope(&fixture.db, &fixture.owner, &started.instance_id, &child_id)
+                    .unwrap()
+                    .1["retained"],
+                "actual child local"
+            );
+            assert_eq!(
+                actual
+                    .timers
+                    .iter()
+                    .find(|timer| timer.node_id == "Limit")
+                    .unwrap()
+                    .status,
+                if winner == "timer" {
+                    ProcessTimerStatus::Fired
+                } else {
+                    ProcessTimerStatus::Cancelled
+                }
+            );
+            let later = super::super::timers::drain_due(&fixture.db, due);
+            assert!(later.completion.is_ok());
+            assert_eq!(later.fired, 0);
+            if winner != "message" {
+                let late = envelope(
+                    catch_target(
+                        &version,
+                        Some(&started.instance_id),
+                        Some(&stop.subscription_id),
+                    ),
+                    Value::Null,
+                );
+                let receipt = send(&fixture, &late);
+                let drained = messages::drain_pending(&fixture.db, receipt.received_at_ms);
+                assert!(drained.completion.is_ok());
+                assert_eq!(drained.delivered, 0);
+                let terminal = repository::get_message(
+                    &fixture.db,
+                    &fixture.owner,
+                    &fixture.owner.user_id,
+                    &late.message_id,
+                )
+                .unwrap();
+                assert_eq!(terminal.message.status, ProcessMessageStatus::Cancelled);
+                assert_eq!(
+                    terminal.message.last_reason.as_deref(),
+                    Some("activation_closed")
+                );
+            }
+            let stale =
+                plan_user_completion(&before, &work.user_task_id, &json!({}), None, due).unwrap();
+            assert!(repository::complete_user_task(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("stale child completion"),
+                &started.instance_id,
+                &work.user_task_id,
+                before.instance.revision,
+                &json!({}),
+                None,
+                &stale,
+                due
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn subprocess_nearest_contract_error_preserves_result_and_cancels_only_committed_child_generation(
+    ) {
+        use super::super::repository::{ActivityResultOrigin, ObservedActivityResult};
+        use tentaflow_protocol::processes::{ProcessErrorDeclaration, ProcessSubscriptionStatus};
+        let fixture = Fixture::new();
+        let business = json!({"outcome":"Error","code":"REJECTED","summary":"A real pinned business rejection","outputs":{"customer_ID":42},"evidence":["actual scoped execution"]});
+        let business_graph=json!({"nodes":[
+            {"id":"trigger","type":"trigger","config":{"output_mapping":{"actual_result":serde_json::to_string(&business).unwrap()}}},
+            {"id":"output","type":"output","config":{}}
+        ],"edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}],
+            "variables":[{"name":"actual_result","type":"json"}]}).to_string();
+        let source_flow = flow(&fixture.db, &fixture.owner, &business_graph);
+        let other_flow = flow(
+            &fixture.db,
+            &fixture.owner,
+            &graph("must not execute child sibling", None),
+        );
+        let mut child = service_model(
+            &source_flow,
+            ActivityVerification::Condition {
+                expression: "true".into(),
+            },
+        );
+        if let ProcessNodeKind::ServiceTask {
+            result_expression,
+            output_mapping,
+            ..
+        } = &mut child.nodes[1].kind
+        {
+            *result_expression = Some("outputs.variables.actual_result".into());
+            output_mapping.clear();
+        }
+        let mut other = service_model(
+            &other_flow,
+            ActivityVerification::Condition {
+                expression: "true".into(),
+            },
+        )
+        .nodes
+        .remove(1);
+        other.id = "OtherService".into();
+        other.name = "Still running inside the interrupted child".into();
+        child.nodes.extend([
+            ProcessNode {
+                id: "LocalSplit".into(),
+                name: "Start child branches".into(),
+                kind: ProcessNodeKind::ParallelGateway,
+            },
+            other,
+            ProcessNode {
+                id: "LocalJoin".into(),
+                name: "Finish child branches".into(),
+                kind: ProcessNodeKind::ParallelGateway,
+            },
+        ]);
+        child.sequence_flows = vec![
+            edge("LocalEnter", "Start_1", "LocalSplit"),
+            edge("LocalSource", "LocalSplit", "Service"),
+            edge("LocalOther", "LocalSplit", "OtherService"),
+            edge("SourceJoin", "Service", "LocalJoin"),
+            edge("OtherJoin", "OtherService", "LocalJoin"),
+            edge("LocalLeave", "LocalJoin", "End_1"),
+        ];
+        let mut inner = embedded_model(child, "Inner");
+        inner.errors.push(ProcessErrorDeclaration {
+            error_id: "BusinessError".into(),
+            name: "A real business error".into(),
+            error_code: "REJECTED".into(),
+        });
+        inner.nodes.extend([
+            ProcessNode {
+                id: "Near".into(),
+                name: "Nearest enclosing handler".into(),
+                kind: ProcessNodeKind::BoundaryError {
+                    attached_to_id: "Inner".into(),
+                    error_ref: Some("BusinessError".into()),
+                    output_mapping: BTreeMap::from([
+                        ("original_result".into(), "activity_result".into()),
+                        ("customer".into(), "outputs.customer_ID".into()),
+                    ]),
+                },
+            },
+            ProcessNode {
+                id: "NearWork".into(),
+                name: "Review the child error".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        inner.sequence_flows.extend([
+            edge("NearPath", "Near", "NearWork"),
+            edge("NearEnd", "NearWork", "RootEnd_Inner"),
+        ]);
+        let mut model = embedded_model(inner, "Outer");
+        model.nodes.extend([
+            ProcessNode {
+                id: "Far".into(),
+                name: "Outer catch all".into(),
+                kind: ProcessNodeKind::BoundaryError {
+                    attached_to_id: "Outer".into(),
+                    error_ref: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+            ProcessNode {
+                id: "FarWork".into(),
+                name: "Review outer error".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        model.sequence_flows.extend([
+            edge("FarPath", "Far", "FarWork"),
+            edge("FarEnd", "FarWork", "RootEnd_Outer"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let runtime = Arc::new(registry_runtime(&fixture, "scoped-error-worker"));
+        *fixture.dispatcher().process_runtime.lock() = Some(runtime.clone());
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            claims.push(
+                repository::claim_job(
+                    &fixture.db,
+                    "scoped-error-worker",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        let source = claims
+            .iter()
+            .find(|claim| claim.job.node_id == "Service")
+            .unwrap()
+            .clone();
+        let sibling = claims
+            .iter()
+            .find(|claim| claim.job.node_id == "OtherService")
+            .unwrap()
+            .clone();
+        let source_cancel = CancellationToken::new();
+        let sibling_cancel = CancellationToken::new();
+        register_claim(&runtime, &source, &source_cancel);
+        register_claim(&runtime, &sibling, &sibling_cancel);
+        let snapshot =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        let observed = ObservedActivityResult {
+            result: serde_json::from_value(business.clone()).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+        };
+        let mut forged = plan_job_result(
+            &snapshot,
+            &source.job,
+            &observed,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+        forged.cancel_job_ids.clear();
+        let events_before =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &source.job.job_id,
+            source.job.attempt,
+            source.job.fence,
+            "scoped-error-worker",
+            &observed,
+            snapshot.instance.revision,
+            &forged,
+            chrono::Utc::now().timestamp_millis()
+        )
+        .is_err());
+        assert_eq!(
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0,
+            events_before
+        );
+        assert!(!sibling_cancel.is_cancelled());
+        super::super::jobs::execute_claimed(
+            &fixture.db,
+            fixture.dispatcher(),
+            "scoped-error-worker",
+            source.clone(),
+            source_cancel.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(sibling_cancel.is_cancelled());
+        assert!(!source_cancel.is_cancelled());
+        let actual =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        let inner_scope = actual
+            .scopes
+            .iter()
+            .find(|scope| scope.subprocess_node_id.as_deref() == Some("Inner"))
+            .unwrap();
+        let outer_scope = actual
+            .scopes
+            .iter()
+            .find(|scope| scope.subprocess_node_id.as_deref() == Some("Outer"))
+            .unwrap();
+        assert_eq!(inner_scope.status, ProcessInstanceStatus::Cancelled);
+        assert_eq!(outer_scope.status, ProcessInstanceStatus::Waiting);
+        assert!(actual
+            .user_tasks
+            .iter()
+            .any(|task| task.node_id == "NearWork" && task.scope_id == outer_scope.scope_id));
+        assert!(!actual
+            .user_tasks
+            .iter()
+            .any(|task| task.node_id == "FarWork"));
+        assert_eq!(
+            actual
+                .subscriptions
+                .iter()
+                .find(|sub| sub.node_id == "Near")
+                .unwrap()
+                .status,
+            ProcessSubscriptionStatus::Consumed
+        );
+        assert_eq!(
+            actual
+                .subscriptions
+                .iter()
+                .find(|sub| sub.node_id == "Far")
+                .unwrap()
+                .status,
+            ProcessSubscriptionStatus::Open
+        );
+        let retained = actual
+            .jobs
+            .iter()
+            .find(|job| job.job_id == source.job.job_id)
+            .unwrap();
+        assert_eq!(retained.result.as_ref().unwrap(), &observed.result);
+        assert_eq!(retained.result_origin, Some(ActivityResultOrigin::Contract));
+        assert_eq!(retained.status, "error");
+        let cancelled = actual
+            .jobs
+            .iter()
+            .find(|job| job.job_id == sibling.job.job_id)
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.fence, sibling.job.fence + 1);
+        assert_eq!(
+            repository::get_scope(
+                &fixture.db,
+                &fixture.owner,
+                &started.instance_id,
+                &outer_scope.scope_id
+            )
+            .unwrap()
+            .1["original_result"],
+            business
+        );
+        let events =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        let result_event = events
+            .iter()
+            .find(|event| event.kind == "service_result")
+            .unwrap();
+        assert_eq!(result_event.scope_id, inner_scope.scope_id);
+        let propagation = events
+            .iter()
+            .filter(|event| event.kind == "scope_error_propagated")
+            .collect::<Vec<_>>();
+        assert_eq!(propagation.len(), 1);
+        assert_eq!(
+            propagation[0].data["result_event_id"],
+            result_event.event_id
+        );
+        assert_eq!(propagation[0].data["from_scope_id"], inner_scope.scope_id);
+        assert_eq!(propagation[0].data["to_scope_id"], outer_scope.scope_id);
+        assert!(propagation[0].data.get("source_result_index").is_none());
+        assert!(!repository::renew_job_lease(
+            &fixture.db,
+            &sibling.job.job_id,
+            sibling.job.attempt,
+            sibling.job.fence,
+            "scoped-error-worker",
+            chrono::Utc::now().timestamp_millis()
+        )
+        .unwrap());
+        super::super::jobs::execute_claimed(
+            &fixture.db,
+            fixture.dispatcher(),
+            "scoped-error-worker",
+            sibling.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(repository::retry_job(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("closed child cannot retry"),
+            &started.instance_id,
+            &source.job.job_id,
+            actual.instance.revision
+        )
+        .is_err());
+        assert!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &other_flow, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &source_flow, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!actual.instance.can_retry);
+        *fixture.dispatcher().process_runtime.lock() = None;
     }
 }

@@ -421,9 +421,9 @@ function processMessageTarget(target, expressionTarget = false) {
 function processInstancePages(pages) {
   if (pages == null) return null;
   processKnownFields(pages, ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces',
-    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId'], 'process detail pages');
+    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId', 'scopes'], 'process detail pages');
   const mapped = {};
-  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages']) {
+  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes']) {
     if (pages[name] == null) continue;
     processKnownFields(pages[name], ['offset', 'limit'], 'process page');
     mapped[name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)] = {
@@ -435,7 +435,7 @@ function processInstancePages(pages) {
   return mapped;
 }
 
-function processModel(model) {
+function processModel(model, nested = false) {
   if (!model || typeof model !== 'object') throw new TypeError('process model is required');
   const nodes = (model.nodes ?? []).map((node) => {
     const kind = node.kind;
@@ -496,15 +496,17 @@ function processModel(model) {
       processKnownFields(body, ['attachedToId', 'errorRef', 'outputMapping'], 'boundary error');
       fields = { attached_to_id: body.attachedToId, error_ref: body.errorRef ?? null,
         output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'SubProcess') {
+      processKnownFields(body, ['body', 'inputMapping', 'outputMapping'], 'subprocess');
+      fields = { body: processModel(body.body, true), input_mapping: body.inputMapping ?? {},
+        output_mapping: body.outputMapping ?? {} };
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }
     return { id: String(node.id), name: String(node.name ?? ''), kind: { [tag]: fields } };
   });
   const diagram = model.diagram ?? {};
-  return {
-    schema_version: Number(processField(model, 'schemaVersion') ?? 1),
-    process_id: String(processField(model, 'processId') ?? ''),
+  const graph = {
     nodes,
     sequence_flows: (processField(model, 'sequenceFlows') ?? []).map((flow) => ({
       id: String(flow.id), source_id: String(processField(flow, 'sourceId') ?? ''),
@@ -512,6 +514,25 @@ function processModel(model) {
       condition: flow.condition ?? null,
     })),
     variables: model.variables ?? {},
+    diagram: {
+      shapes: (diagram.shapes ?? []).map((shape) => ({
+        element_id: String(processField(shape, 'elementId') ?? ''),
+        x: Number(shape.x), y: Number(shape.y), width: Number(shape.width), height: Number(shape.height),
+      })),
+      edges: (diagram.edges ?? []).map((edge) => ({
+        sequence_flow_id: String(processField(edge, 'sequenceFlowId') ?? ''),
+        waypoints: (edge.waypoints ?? []).map((point) => ({ x: Number(point.x), y: Number(point.y) })),
+      })),
+    },
+  };
+  if (nested) {
+    processKnownFields(model, ['nodes', 'sequenceFlows', 'variables', 'diagram'], 'subprocess body');
+    return graph;
+  }
+  return {
+    schema_version: Number(processField(model, 'schemaVersion') ?? 1),
+    process_id: String(processField(model, 'processId') ?? ''),
+    ...graph,
     timer_timezone: processField(model, 'timerTimezone') ?? null,
     ...(model.workCalendar == null ? {} : { work_calendar: processWorkCalendar(model.workCalendar) }),
     ...(model.calendarPin == null ? {} : { calendar_pin: processCalendarPin(model.calendarPin) }),
@@ -524,16 +545,6 @@ function processModel(model) {
       return { error_id: error.errorId, name: error.name, error_code: error.errorCode };
     }) } : {}),
     ...(model.targetNamespace == null ? {} : { target_namespace: model.targetNamespace }),
-    diagram: {
-      shapes: (diagram.shapes ?? []).map((shape) => ({
-        element_id: String(processField(shape, 'elementId') ?? ''),
-        x: Number(shape.x), y: Number(shape.y), width: Number(shape.width), height: Number(shape.height),
-      })),
-      edges: (diagram.edges ?? []).map((edge) => ({
-        sequence_flow_id: String(processField(edge, 'sequenceFlowId') ?? ''),
-        waypoints: (edge.waypoints ?? []).map((point) => ({ x: Number(point.x), y: Number(point.y) })),
-      })),
-    },
   };
 }
 
@@ -559,6 +570,7 @@ function processRequestBody(variant, payload) {
     MessageListRequest: ['definitionId', 'instanceId', 'offset', 'limit'],
     MessageResolveRequest: ['commandId', 'messageId', 'expectedRevision', 'instanceId', 'subscriptionId'],
     MessageCancelRequest: ['commandId', 'messageId', 'expectedRevision'],
+    ScopeGetRequest: ['instanceId', 'scopeId'],
   }[variant];
   if (!fieldNames) throw new TypeError(`unknown process request ${variant}`);
   for (const name of fieldNames) {
@@ -654,6 +666,9 @@ export const encode = {
   },
   processMessageCancelRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'MessageCancelRequest', payload);
+  },
+  processScopeGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'ScopeGetRequest', payload);
   },
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {

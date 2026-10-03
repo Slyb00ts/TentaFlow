@@ -25965,6 +25965,37 @@ mod process_wire_tests {
     }
 
     #[test]
+    fn process_request_encoder_keeps_embedded_body_and_scope_selector() {
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,"name":"Nested","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Sub_1","name":"Review","kind":{"SubProcess":{
+                    "body":{"nodes":[{"id":"Child_Start","name":"Enter","kind":"Start"}],
+                        "sequence_flows":[],"variables":{"customer_ID":{"original_key":7}},
+                        "diagram":{"shapes":[],"edges":[]}},
+                    "input_mapping":{"local_ID":"vars.customer_ID"},"output_mapping":{}}}}],
+                "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        let tentaflow_protocol::processes::ProcessNodeKind::SubProcess { body, input_mapping, .. } = &model.nodes[0].kind else {
+            panic!("typed embedded subprocess expected");
+        };
+        assert_eq!(body.variables["customer_ID"]["original_key"], 7);
+        assert_eq!(input_mapping["local_ID"], "vars.customer_ID");
+        let bytes = encode_process_request("ScopeGetRequest".into(), serde_json::json!({
+            "instance_id":"instance-1","scope_id":"scope-1",
+        }).to_string()).unwrap();
+        assert!(matches!(tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).unwrap(),
+            MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::ScopeGetRequest {
+                instance_id, scope_id,
+            }) if instance_id == "instance-1" && scope_id == "scope-1"));
+    }
+
+    #[test]
     fn process_request_encoder_preserves_working_calendar_and_explicit_repin() {
         let fields = serde_json::json!({
             "command_id":"7c865aaa-febd-4621-9ae6-35977200a0fd",

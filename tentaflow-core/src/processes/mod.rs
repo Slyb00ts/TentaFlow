@@ -8,3 +8,6 @@ pub mod messages;
 pub mod repository;
 pub mod runtime;
 pub mod timers;
+
+#[cfg(test)]
+mod scope_tests;

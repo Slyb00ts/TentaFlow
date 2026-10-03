@@ -419,7 +419,13 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
     let skipped_from = (advance.skipped_count > 0).then_some(timer.occurrence);
     let skipped_through = (advance.skipped_count > 0).then(|| advance.selected_occurrence - 1);
     let mut event = PlannedEvent {
-        kind: "timer_fired".into(), node_id: Some(timer.node_id.clone()),
+        scope_id: timer
+            .scope_id
+            .clone()
+            .or_else(|| plan.start_instance_id.clone())
+            .context("timer fire scope missing")?,
+        kind: "timer_fired".into(),
+        node_id: Some(timer.node_id.clone()),
         data: json!({"timer_id":timer.timer_id,"kind":timer.kind,"occurrence":advance.selected_occurrence,
             "planned_due_at_ms":advance.planned_due_at_ms,"fired_at_ms":at_ms,"skipped_count":advance.skipped_count,
             "skipped_from_occurrence":skipped_from,"skipped_through_occurrence":skipped_through}),
@@ -433,12 +439,16 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
         event.data["timezone"] = json!(timer.timezone);
     }
     if let TimerSnapshot::Boundary { snapshot, .. } = snapshot {
-        let node = snapshot
-            .model
-            .nodes
-            .iter()
-            .find(|node| node.id == timer.node_id)
-            .context("boundary node is missing")?;
+        let node = super::repository::scope_node(
+            &snapshot.model,
+            &snapshot.scopes,
+            &snapshot.instance.instance_id,
+            timer
+                .scope_id
+                .as_deref()
+                .context("boundary timer scope missing")?,
+            &timer.node_id,
+        )?;
         let tentaflow_protocol::processes::ProcessNodeKind::BoundaryTimer {
             attached_to_id,
             cancel_activity,
@@ -567,6 +577,7 @@ mod tests {
         };
         let due = resolve_timer_due(&rule, zone, ProcessTimerKind::Start, anchor, None).unwrap();
         ProcessTimer {
+            scope_id: None,
             timer_id: Uuid::new_v4().to_string(),
             org_id: Uuid::new_v4().to_string(),
             definition_id: Uuid::new_v4().to_string(),
@@ -876,7 +887,24 @@ mod tests {
             .start_instance_id
             .clone()
             .expect("a Start to End plan retains its actual UUID");
-        assert!(plan.create_jobs.is_empty() && plan.create_tokens.is_empty());
+        assert!(plan.create_jobs.is_empty() && plan.create_user_tasks.is_empty());
+        assert!(plan.create_scopes.is_empty());
+        assert_eq!(plan.status, ProcessInstanceStatus::Completed);
+        assert_eq!(plan.create_tokens.len(), model.nodes.len());
+        assert!(plan.create_tokens.iter().all(|token| {
+            token.scope_id == id
+                && token.status == "ready"
+                && model.nodes.iter().any(|node| node.id == token.node_id)
+        }));
+        assert_eq!(
+            plan.create_tokens
+                .iter()
+                .map(|token| &token.token_id)
+                .collect::<std::collections::HashSet<_>>(),
+            plan.consume_token_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
         let path = fixture.directory.path().join("processes.db");
         let owner = fixture.owner.clone();
         let Fixture {
@@ -922,6 +950,28 @@ mod tests {
         let first = &committed[0].instance;
         assert!(first.instance_id == id || first.instance_id == other_id);
         assert_eq!(first.status, ProcessInstanceStatus::Completed);
+        assert_eq!(first.scopes.len(), 1);
+        assert_eq!(first.scopes[0].scope_id, first.instance_id);
+        let retained_tokens: Vec<(String, String, String)> = {
+            let conn = reopened.read().unwrap();
+            let mut query = conn
+                .prepare("SELECT scope_id,node_id,status FROM bpmn_tokens WHERE instance_id=?1 ORDER BY node_id")
+                .unwrap();
+            let rows = query
+                .query_map([&first.instance_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(retained_tokens.len(), model.nodes.len());
+        assert!(retained_tokens.iter().all(|(scope, node, status)| {
+            scope == &first.instance_id
+                && status == "consumed"
+                && model.nodes.iter().any(|actual| &actual.id == node)
+        }));
         assert!(
             repository::fire_timer(&reopened, &candidate, &owner, None, &plan, at_ms)
                 .unwrap()
@@ -1010,7 +1060,8 @@ mod tests {
             &waiting.instance_id,
             waiting.revision,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert!(repository::fire_timer(
             &reopened,
             &candidate,
@@ -1174,7 +1225,8 @@ mod tests {
             &plan,
             at_ms + 61_000,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         let events = repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200)
             .unwrap()
@@ -1530,7 +1582,8 @@ mod tests {
             &plan,
             at_ms + 61_000,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(still_incident.status, ProcessInstanceStatus::Incident);
         assert_eq!(still_incident.incidents.len(), 1);
         assert_eq!(still_incident.incidents[0].code, "TIMER_ERROR");
@@ -1886,6 +1939,7 @@ mod tests {
             at_ms,
         )
         .unwrap()
+        .instance
     }
 
     #[tokio::test]
@@ -2209,8 +2263,11 @@ mod tests {
         let fixture = Fixture::new();
         let flow_id = flow(&fixture.db, &fixture.owner, &graph("pinned result", None));
         let model = with_boundaries(
-            service_model(&flow_id, ActivityVerification::Human),
-            "Service",
+            embedded_model(
+                service_model(&flow_id, ActivityVerification::Human),
+                "Scope",
+            ),
+            "Scope",
             &[("Limit", true, 1)],
         );
         let at_ms = Utc::now().timestamp_millis();
@@ -2257,6 +2314,11 @@ mod tests {
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
             .unwrap();
         assert_eq!(after.jobs[0].status, "completed");
+        assert!(after
+            .scopes
+            .iter()
+            .filter(|scope| scope.parent_scope_id.is_some())
+            .all(|scope| scope.status == ProcessInstanceStatus::Cancelled));
         assert_eq!(after.jobs[0].result, Some(accepted_result.clone()));
         assert_eq!(after.jobs[0].fence, before.jobs[0].fence);
         assert_eq!(after.user_tasks[0].status, ProcessUserTaskStatus::Cancelled);
@@ -2286,18 +2348,32 @@ mod tests {
             &repository::RuntimePlan::initial(json!({})),
             at_ms + 1_000,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(replay, after.instance);
     }
 
     #[tokio::test]
     async fn boundary_error_resolves_on_exact_activity_completion_without_erasing_unrelated_incident(
     ) {
-        for unrelated in [false, true] {
+        for (unrelated, scoped) in [(false, false), (true, false), (false, true), (true, true)] {
             let fixture = Fixture::new();
-            let mut model = with_boundaries(user_model(None), "Work", &[("Broken", true, 2)]);
+            let base = if scoped {
+                embedded_model(user_model(None), "Scope")
+            } else {
+                user_model(None)
+            };
+            let activity = if scoped { "Scope" } else { "Work" };
+            let end_id = base
+                .nodes
+                .iter()
+                .find(|node| node.kind == ProcessNodeKind::End)
+                .unwrap()
+                .id
+                .clone();
+            let mut model = with_boundaries(base, activity, &[("Broken", true, 2)]);
             if unrelated {
-                model = with_boundaries(model, "Work", &[("Reminder", false, 1)]);
+                model = with_boundaries(model, activity, &[("Reminder", false, 1)]);
                 model.nodes.push(ProcessNode {
                     id: "Choice".into(),
                     name: "Unmatched side choice".into(),
@@ -2312,7 +2388,7 @@ mod tests {
                     .unwrap()
                     .target_id = "Choice".into();
                 for id in ["Choice_A", "Choice_B"] {
-                    let mut branch = edge(id, "Choice", "End_1");
+                    let mut branch = edge(id, "Choice", &end_id);
                     branch.condition = Some("false".into());
                     model.sequence_flows.push(branch);
                 }
@@ -2405,6 +2481,17 @@ mod tests {
                     .status,
                 ProcessTimerStatus::Error
             );
+            if scoped {
+                assert_eq!(
+                    finished
+                        .scopes
+                        .iter()
+                        .find(|scope| scope.parent_scope_id.is_some())
+                        .unwrap()
+                        .status,
+                    ProcessInstanceStatus::Completed
+                );
+            }
             assert!(repository::due_timers(&fixture.db, 4_000, 32)
                 .unwrap()
                 .is_empty());
@@ -2419,7 +2506,7 @@ mod tests {
             assert_eq!(error.data["incident_id"], linked);
             assert_eq!(
                 error.data["attached_token_id"],
-                task.token_id.clone().unwrap()
+                timer.token_id.clone().unwrap()
             );
             assert!(error.data["reason"]
                 .as_str()
@@ -2458,7 +2545,8 @@ mod tests {
             &started.instance_id,
             before.revision,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(cancelled.status, ProcessInstanceStatus::Cancelled);
         assert!(cancelled.incidents.is_empty());
         assert!(repository::due_timers(&fixture.db, 10_000, 32)
@@ -2755,6 +2843,7 @@ mod tests {
                     at_ms,
                 )
                 .unwrap()
+                .instance
             } else {
                 snapshot.instance
             };
@@ -2911,7 +3000,8 @@ mod tests {
                 &completion,
                 activation,
             )
-            .unwrap();
+            .unwrap()
+            .instance;
             assert_eq!(opened.timers.len(), 1);
             let due = at("2026-11-09T15:00:00Z");
             assert_eq!(opened.timers[0].due_at_ms, Some(due));
@@ -3124,7 +3214,8 @@ mod tests {
                     &completion,
                     anchor + 1000,
                 )
-                .unwrap();
+                .unwrap()
+                .instance;
                 assert!(repository::fire_timer(
                     &fixture.db,
                     &candidate,
@@ -3404,7 +3495,8 @@ mod tests {
             &catch.instance_id,
             catch.revision,
         )
-        .unwrap();
+        .unwrap()
+        .instance;
         assert_eq!(cancelled.status, ProcessInstanceStatus::Cancelled);
         let repeated = drain_due(&fixture.db, anchor + 2000);
         repeated.completion.unwrap();

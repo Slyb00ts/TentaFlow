@@ -172,6 +172,15 @@ pub struct ProcessNode {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProcessSubProcess {
+    pub nodes: Vec<ProcessNode>,
+    pub sequence_flows: Vec<ProcessSequenceFlow>,
+    pub variables: BTreeMap<String, Value>,
+    pub diagram: ProcessDiagram,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProcessNodeKind {
     Start,
     End,
@@ -232,6 +241,11 @@ pub enum ProcessNodeKind {
         error_ref: Option<String>,
         output_mapping: BTreeMap<String, String>,
     },
+    SubProcess {
+        body: ProcessSubProcess,
+        input_mapping: BTreeMap<String, String>,
+        output_mapping: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +299,8 @@ pub struct ProcessTimerSummary {
     pub attached_to_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_time: Option<ProcessWorkingTimeSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -461,6 +477,7 @@ pub struct ProcessUserTask {
     pub can_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -473,6 +490,7 @@ pub struct ProcessUserTaskSummary {
     pub status: ProcessUserTaskStatus,
     pub revision: u64,
     pub can_complete: bool,
+    pub scope_id: String,
 }
 
 impl From<&ProcessUserTask> for ProcessUserTaskSummary {
@@ -486,6 +504,7 @@ impl From<&ProcessUserTask> for ProcessUserTaskSummary {
             status: value.status.clone(),
             revision: value.revision,
             can_complete: value.can_complete,
+            scope_id: value.scope_id.clone(),
         }
     }
 }
@@ -500,6 +519,7 @@ pub struct ProcessIncident {
     pub message: String,
     pub at_ms: i64,
     pub can_retry: bool,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -580,6 +600,8 @@ pub struct ProcessMessageSummary {
     pub payload_available: bool,
     pub can_resolve: bool,
     pub can_cancel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_scope_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -632,6 +654,8 @@ pub struct ProcessInstancePageRequest {
     pub selected_user_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_incident_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<ProcessPageSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -643,6 +667,22 @@ pub struct ProcessInstancePageInfo {
     pub subscriptions: ProcessPageInfo,
     pub event_races: ProcessPageInfo,
     pub outgoing_messages: ProcessPageInfo,
+    pub scopes: ProcessPageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessScopeSummary {
+    pub scope_id: String,
+    pub parent_scope_id: Option<String>,
+    pub subprocess_node_id: Option<String>,
+    pub subprocess_node_name: Option<String>,
+    pub parent_token_id: Option<String>,
+    pub revision: u64,
+    pub status: ProcessInstanceStatus,
+    pub depth: u32,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -678,6 +718,7 @@ pub struct ProcessSubscriptionSummary {
     pub attached_to_id: Option<String>,
     pub race_id: Option<String>,
     pub last_reason: Option<String>,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -691,6 +732,7 @@ pub struct ProcessEventRaceSummary {
     pub winner_node_id: Option<String>,
     pub branch_subscription_ids: Vec<String>,
     pub branch_timer_ids: Vec<String>,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -728,6 +770,8 @@ pub struct ProcessInstance {
     pub selected_user_task: Option<ProcessUserTaskSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_incident: Option<ProcessIncidentSelection>,
+    #[serde(default)]
+    pub scopes: Vec<ProcessScopeSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -790,6 +834,7 @@ pub struct ProcessEvent {
     pub node_name: Option<String>,
     pub actor_user_id: Option<String>,
     pub data: Value,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1021,6 +1066,15 @@ pub enum ProcessPayload {
     MessageCancelResponse {
         message: ProcessMessageSummary,
     },
+    ScopeGetRequest {
+        instance_id: String,
+        scope_id: String,
+    },
+    ScopeGetResponse {
+        scope: ProcessScopeSummary,
+        variables: Value,
+        active_node_ids: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -1075,6 +1129,7 @@ mod tests {
             matched_version: None, matched_subscription_id: None, source_instance_id: None,
             source_node_id: None, last_reason: None, payload_sha256: "sha".into(),
             payload_bytes: 4, payload_available: true, can_resolve: false, can_cancel: true,
+            source_scope_id: None,
         };
         let available = ProcessMessageDetail { message: summary.clone(), payload: Some(Value::Null) };
         let bytes = crate::cbor::encode(&available).unwrap();
@@ -1105,7 +1160,7 @@ mod tests {
             crate::cbor::decode(&crate::cbor::encode(&body).unwrap()).unwrap();
         let json = serde_json::to_value(decoded).unwrap();
         let instance = &json["ProcessBody"]["InstanceGetResponse"]["instance"];
-        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names"] {
+        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names", "scopes"] {
             assert_eq!(instance[field], serde_json::json!([]), "{field} must be an array");
         }
         assert_eq!(instance["can_send_message"], true);
@@ -1245,6 +1300,7 @@ mod tests {
             revision: 1,
             can_complete: true,
             token_id: None,
+            scope_id: "i1".into(),
         };
         let summary = ProcessUserTaskSummary::from(&task);
         let summary_json = serde_json::to_value(&summary).unwrap();
@@ -1290,6 +1346,7 @@ mod tests {
             timezone: "UTC".into(), occurrence: 1, total_firings: None,
             last_reason: None, attached_to_id: Some("Review_1".into()),
             working_time: None,
+            scope_id: None,
         };
         assert_eq!(crate::cbor::decode::<ProcessTimerSummary>(&crate::cbor::encode(&timer).unwrap()).unwrap(), timer);
         assert_eq!(serde_json::to_value(&timer).unwrap()["attached_to_id"], "Review_1");
@@ -1302,11 +1359,46 @@ mod tests {
             name: "Review".into(), assignee_user_id: "user-1".into(),
             kind: ProcessUserTaskKind::Work, status: ProcessUserTaskStatus::Completed,
             outputs: Value::Null, revision: 2, can_complete: false, token_id: None,
+            scope_id: "i1".into(),
         };
         assert!(serde_json::to_value(&older_task).unwrap().get("token_id").is_none());
         let mut active = older_task;
         active.status = ProcessUserTaskStatus::Open;
         active.token_id = Some("waiting-1".into());
         assert_eq!(serde_json::to_value(&active).unwrap()["token_id"], "waiting-1");
+    }
+
+    #[test]
+    fn embedded_scope_body_and_detail_round_trip_without_rewriting_opaque_variables() {
+        let body = ProcessSubProcess {
+            nodes: vec![
+                ProcessNode { id: "Child_Start".into(), name: "Enter".into(), kind: ProcessNodeKind::Start },
+                ProcessNode { id: "Child_End".into(), name: "Leave".into(), kind: ProcessNodeKind::End },
+            ],
+            sequence_flows: vec![ProcessSequenceFlow { id: "Child_Flow".into(),
+                source_id: "Child_Start".into(), target_id: "Child_End".into(), condition: None }],
+            variables: BTreeMap::from([("customer_ID".into(), serde_json::json!({"original_key": 7}))]),
+            diagram: ProcessDiagram::default(),
+        };
+        let kind = ProcessNodeKind::SubProcess { body, input_mapping: BTreeMap::from([
+            ("local_ID".into(), "vars.customer_ID".into()),
+        ]), output_mapping: BTreeMap::new() };
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&kind).unwrap()).unwrap(), kind);
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["SubProcess"]["body"]["variables"]["customer_ID"]["original_key"], 7);
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "SubProcess": {"body": {"nodes": [], "sequence_flows": [], "variables": {},
+                "diagram": {"shapes": [], "edges": []}, "timer_timezone": "UTC"},
+                "input_mapping": {}, "output_mapping": {}}
+        })).is_err());
+        let scope = ProcessScopeSummary { scope_id: "child-1".into(), parent_scope_id: Some("instance-1".into()),
+            subprocess_node_id: Some("Child_1".into()), subprocess_node_name: Some("Review".into()),
+            parent_token_id: Some("wait-1".into()), revision: 2, status: ProcessInstanceStatus::Running,
+            depth: 1, created_at_ms: 100, updated_at_ms: 200 };
+        let payload = ProcessPayload::ScopeGetResponse { scope: scope.clone(),
+            variables: serde_json::json!({"customer_ID":{"original_key":7}}),
+            active_node_ids: vec!["Child_Start".into()] };
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&payload).unwrap()).unwrap(), payload);
+        assert_eq!(serde_json::to_value(scope).unwrap()["scope_id"], "child-1");
     }
 }
