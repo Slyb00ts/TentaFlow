@@ -38,6 +38,35 @@ function cbor(value) {
   return [...head(5, entries.length), ...entries.flatMap(([key, item]) => [...cbor(key), ...cbor(item)])];
 }
 
+test('inclusive gateway save keeps the selected default and opaque variables', { skip }, () => {
+  const model = {
+    schemaVersion: 1, processId: 'P_1',
+    nodes: [
+      { id: 'OR_Split', name: 'Select', kind: { InclusiveGateway: { defaultFlowId: 'Flow_Default' } } },
+      { id: 'OR_Join', name: 'Join', kind: { InclusiveGateway: { defaultFlowId: null } } },
+    ],
+    sequenceFlows: [
+      { id: 'Flow_A', sourceId: 'OR_Split', targetId: 'Task_A', condition: 'vars.business_key == true' },
+      { id: 'Flow_Default', sourceId: 'OR_Split', targetId: 'Task_B', condition: null },
+    ],
+    variables: { business_key: { inner_value: 'Łódź & <ok>' } },
+    diagram: { shapes: [], edges: [] },
+  };
+  const body = request('processDefinitionSaveRequest', {
+    commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
+    expectedRevision: 0, name: 'Selection', description: '', model,
+  });
+  assert.deepEqual(body.model.nodes[0].kind, model.nodes[0].kind);
+  assert.deepEqual(body.model.nodes[1].kind, model.nodes[1].kind);
+  assert.equal(body.model.sequenceFlows[0].condition, 'vars.business_key == true');
+  assert.deepEqual(body.model.variables, model.variables);
+  assert.throws(() => request('processDefinitionSaveRequest', {
+    commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
+    expectedRevision: 0, name: 'Selection', description: '',
+    model: { ...model, nodes: [{ id: 'Bad', name: '', kind: { InclusiveGateway: { defaultFlowId: null, unknown: true } } }] },
+  }), /unknown field|unsupported/i);
+});
+
 test('BPMN typed save retains mapping and variable business keys', { skip }, () => {
   const model = {
     schemaVersion: 1, processId: 'P_1', variables: { user_id: 'u1', nested_value: { inner_key: 4 } },

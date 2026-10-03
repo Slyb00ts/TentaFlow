@@ -1,6 +1,6 @@
 // ============ File: repository.rs — transactional BPMN definitions and runtime state ============
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -23,7 +23,7 @@ use tentaflow_protocol::processes::{
 };
 use uuid::Uuid;
 
-use super::model::{starter_model, validate_model, validate_variables, MAX_MODEL_BYTES};
+use super::model::{starter_model, validate_model, validate_variables, GatewayKind, MAX_MODEL_BYTES};
 use super::runtime::validate_output;
 use crate::db::DbPool;
 
@@ -166,12 +166,15 @@ pub enum BusinessErrorSource {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkFrame {
     pub activation_id: String,
     pub split_node_id: String,
     pub join_node_id: String,
     pub branch_edge_id: String,
+    pub gateway_kind: GatewayKind,
+    pub selected_branch_edge_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,8 +188,9 @@ pub struct ProcessToken {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AndReceipt {
+pub struct GatewayReceipt {
     pub scope_id: String,
+    pub gateway_kind: GatewayKind,
     pub join_node_id: String,
     pub activation_id: String,
     pub branch_edge_id: String,
@@ -460,7 +464,7 @@ pub struct RuntimeSnapshot {
     pub user_tasks: Vec<ProcessUserTask>,
     pub tokens: Vec<ProcessToken>,
     pub jobs: Vec<ProcessJob>,
-    pub receipts: Vec<AndReceipt>,
+    pub receipts: Vec<GatewayReceipt>,
     pub service_snapshots: Vec<PinnedServiceSnapshot>,
     pub timers: Vec<ProcessTimer>,
     pub boundary_incidents: Vec<BoundaryEventIncident>,
@@ -489,8 +493,8 @@ pub struct RuntimePlan {
     pub consume_token_ids: Vec<String>,
     pub cancel_token_ids: Vec<String>,
     pub create_tokens: Vec<ProcessToken>,
-    pub add_receipts: Vec<AndReceipt>,
-    pub remove_receipts: Vec<AndReceipt>,
+    pub add_gateway_receipts: Vec<GatewayReceipt>,
+    pub remove_gateway_receipts: Vec<GatewayReceipt>,
     pub create_user_tasks: Vec<ProcessUserTask>,
     pub complete_user_task_ids: Vec<String>,
     pub cancel_user_task_ids: Vec<String>,
@@ -545,8 +549,8 @@ impl RuntimePlan {
             consume_token_ids: Vec::new(),
             cancel_token_ids: Vec::new(),
             create_tokens: Vec::new(),
-            add_receipts: Vec::new(),
-            remove_receipts: Vec::new(),
+            add_gateway_receipts: Vec::new(),
+            remove_gateway_receipts: Vec::new(),
             create_user_tasks: Vec::new(),
             complete_user_task_ids: Vec::new(),
             cancel_user_task_ids: Vec::new(),
@@ -1566,15 +1570,16 @@ fn validate_boundary_plan_on(
             }
         }
     }
-    let mut stmt=tx.prepare("SELECT scope_id,join_node_id,activation_id,branch_edge_id,token_id FROM bpmn_and_receipts WHERE instance_id=?1")?;
+    let mut stmt=tx.prepare("SELECT scope_id,join_node_id,activation_id,branch_edge_id,token_id,gateway_kind FROM bpmn_gateway_receipts WHERE instance_id=?1")?;
     let receipts = stmt
         .query_map([&instance_id], |row| {
-            Ok(AndReceipt {
+            Ok(GatewayReceipt {
                 scope_id: row.get(0)?,
                 join_node_id: row.get(1)?,
                 activation_id: row.get(2)?,
                 branch_edge_id: row.get(3)?,
                 token_id: row.get(4)?,
+                gateway_kind: match row.get::<_, String>(5)?.as_str() { "parallel" => GatewayKind::Parallel, "inclusive" => GatewayKind::Inclusive, _ => return Err(rusqlite::Error::InvalidQuery) },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1583,7 +1588,7 @@ fn validate_boundary_plan_on(
             .iter()
             .filter(|row| active_scopes.contains(&row.scope_id))
             .all(|row| plan
-                .remove_receipts
+                .remove_gateway_receipts
                 .iter()
                 .any(|removed| removed.scope_id == row.scope_id
                     && removed.token_id == row.token_id
@@ -4438,22 +4443,17 @@ fn runtime_snapshot_on(
             },
         )
         .collect::<Result<Vec<_>>>()?;
-    let mut receipt_stmt = conn.prepare("SELECT join_node_id,activation_id,branch_edge_id,token_id FROM bpmn_and_receipts WHERE instance_id=?1")?;
-    let receipts = receipt_stmt
-        .query_map([instance_id], |row| {
-            Ok(AndReceipt {
-                scope_id: conn.query_row(
-                    "SELECT scope_id FROM bpmn_tokens WHERE token_id=?1 AND instance_id=?2",
-                    params![row.get::<_, String>(3)?, instance_id],
-                    |token| token.get(0),
-                )?,
-                join_node_id: row.get(0)?,
-                activation_id: row.get(1)?,
-                branch_edge_id: row.get(2)?,
-                token_id: row.get(3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut receipt_stmt = conn.prepare("SELECT join_node_id,activation_id,branch_edge_id,token_id,scope_id,gateway_kind FROM bpmn_gateway_receipts WHERE instance_id=?1")?;
+    let receipts = receipt_stmt.query_map([instance_id], |row| {
+        Ok(GatewayReceipt {
+            join_node_id: row.get(0)?, activation_id: row.get(1)?,
+            branch_edge_id: row.get(2)?, token_id: row.get(3)?, scope_id: row.get(4)?,
+            gateway_kind: match row.get::<_, String>(5)?.as_str() {
+                "parallel" => GatewayKind::Parallel, "inclusive" => GatewayKind::Inclusive,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            },
+        })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(token_stmt);
     drop(job_stmt);
     drop(receipt_stmt);
@@ -4901,14 +4901,18 @@ fn validate_scope_plan_on(
                 "token arrival edge is outside its exact scope body"
             );
         }
+        let pairs = super::model::gateway_pairs(nodes, flows)?;
         for frame in &token.fork_stack {
-            let pairs = super::model::and_pairs(nodes, flows)?;
-            ensure!(
-                pairs.get(&frame.split_node_id) == Some(&frame.join_node_id)
-                    && flows.iter().any(|flow| flow.id == frame.branch_edge_id
-                        && flow.source_id == frame.split_node_id),
-                "token fork frame is outside its exact scope body"
-            );
+            let pair = pairs.get(&frame.split_node_id).context("token fork pair missing from its exact body")?;
+            let selected = &frame.selected_branch_edge_ids;
+            ensure!(pair.join_node_id == frame.join_node_id && pair.kind == frame.gateway_kind
+                && !selected.is_empty()
+                && selected.windows(2).all(|window| window[0] < window[1])
+                && selected.binary_search(&frame.branch_edge_id).is_ok()
+                && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+                && (frame.gateway_kind == GatewayKind::Inclusive
+                    || selected.iter().map(String::as_str).eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+                "token fork frame differs from selected branches of its paired body");
         }
     }
     for event in &plan.events {
@@ -4916,6 +4920,72 @@ fn validate_scope_plan_on(
             scopes.iter().any(|scope| scope.scope_id == event.scope_id),
             "event scope is outside its actual instance"
         );
+        if event.kind == "parallel_split" {
+            let node_id = event.node_id.as_deref().context("parallel split node missing")?;
+            let activation = event.data["activation_id"].as_str().context("parallel split activation missing")?;
+            let path = scope_path(&scopes, instance_id, &event.scope_id)?;
+            let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+            let pair = super::model::gateway_pairs(nodes, flows)?.remove(node_id)
+                .context("parallel split event has no paired model")?;
+            ensure!(pair.kind == GatewayKind::Parallel,
+                "parallel split event refers to another gateway kind");
+            let expected = pair.branch_to_incoming_edge.keys().map(String::as_str).collect::<HashSet<_>>();
+            let frames = plan.create_tokens.iter().filter(|token| token.scope_id == event.scope_id)
+                .flat_map(|token| token.fork_stack.iter().filter(|frame|
+                    frame.activation_id == activation && frame.split_node_id == node_id))
+                .collect::<Vec<_>>();
+            ensure!(!frames.is_empty() && frames.iter().all(|frame|
+                frame.gateway_kind == GatewayKind::Parallel
+                    && frame.join_node_id == pair.join_node_id
+                    && frame.selected_branch_edge_ids.iter().map(String::as_str).collect::<HashSet<_>>() == expected),
+                "parallel split event has a mismatched planned fork frame");
+            let created = frames.iter().map(|frame| frame.branch_edge_id.as_str()).collect::<HashSet<_>>();
+            ensure!(created == expected, "parallel split did not create every paired branch");
+        }
+        if event.kind == "inclusive_split" {
+            let node_id = event.node_id.as_deref().context("inclusive split node missing")?;
+            let activation = event.data["activation_id"].as_str().context("inclusive split activation missing")?;
+            let selected = event.data["selected_branch_edge_ids"].as_array()
+                .context("inclusive split selected edges missing")?
+                .iter().map(|edge| edge.as_str().map(str::to_owned)
+                    .context("inclusive split selected edge is not a string"))
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(!selected.is_empty() && selected.windows(2).all(|window| window[0] < window[1])
+                && event.data["default_selected"].is_boolean(),
+                "inclusive split event has invalid selected set");
+            let node = scope_node(&model, &scopes, instance_id, &event.scope_id, node_id)?;
+            let ProcessNodeKind::InclusiveGateway { default_flow_id } = &node.kind else {
+                bail!("inclusive split event refers to another node kind")
+            };
+            ensure!(event.data["default_selected"].as_bool() == Some(default_flow_id.as_ref().is_some_and(|edge| selected.len() == 1 && &selected[0] == edge)),
+                "inclusive split default fact differs from selected edges");
+            let created_frames = plan.create_tokens.iter().filter(|token| token.scope_id == event.scope_id)
+                .flat_map(|token| token.fork_stack.iter().filter(|frame|
+                    frame.activation_id == activation && frame.split_node_id == node_id))
+                .collect::<Vec<_>>();
+            ensure!(!created_frames.is_empty() && created_frames.iter().all(|frame|
+                frame.gateway_kind == GatewayKind::Inclusive
+                    && frame.selected_branch_edge_ids == selected
+                    && selected.binary_search(&frame.branch_edge_id).is_ok()),
+                "inclusive split event has a mismatched planned fork frame");
+            let created = created_frames.iter().map(|frame| frame.branch_edge_id.as_str())
+                .collect::<HashSet<_>>();
+            ensure!(created.len() == selected.len() && selected.iter().all(|edge| created.contains(edge.as_str())),
+                "inclusive split event lacks its actual selected branch tokens");
+        }
+        if event.kind == "incident" && event.data["code"] == "INCLUSIVE_GATEWAY_ERROR" {
+            let source = event.data["source_token_id"].as_str().context("inclusive incident source token missing")?;
+            let waiting = event.data["waiting_token_id"].as_str().context("inclusive incident waiting token missing")?;
+            ensure!(matches!(event.data["reason"].as_str(), Some("no_matching_flow" | "condition_evaluation_failed" | "non_boolean_condition"))
+                && plan.consume_token_ids.iter().any(|id| id == source)
+                && plan.create_tokens.iter().any(|token| token.token_id == waiting
+                    && token.scope_id == event.scope_id && token.node_id == event.node_id.as_deref().unwrap_or_default()
+                    && token.status == "waiting" && token.fork_stack.iter().all(|frame| frame.gateway_kind != GatewayKind::Inclusive || frame.split_node_id != token.node_id))
+                && plan.add_incidents.iter().any(|incident| incident.code == "INCLUSIVE_GATEWAY_ERROR"
+                    && incident.scope_id == event.scope_id && incident.node_id == event.node_id
+                    && incident.job_id.is_none() && !incident.can_retry),
+                "inclusive incident lacks its actual waiting token and nonretryable incident");
+        }
         if event.kind == "error_end_reached" {
             let node_id = event
                 .node_id
@@ -5645,6 +5715,309 @@ fn apply_call_steps_on(
     Ok(claims)
 }
 
+fn validate_gateway_join_plan_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    plan: &RuntimePlan,
+) -> Result<()> {
+    let mut affected: HashMap<(String, String, String), (ForkFrame, usize)> = HashMap::new();
+    let mut stmt = tx.prepare("SELECT token_id,scope_id,fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
+    let prior = stmt.query_map([instance_id], |row| Ok((row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (token_id, scope_id, stack_json) in prior {
+        for frame in parse::<Vec<ForkFrame>>(stack_json)? {
+            let key = (scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            let survives = !plan.consume_token_ids.contains(&token_id)
+                && !plan.cancel_token_ids.contains(&token_id);
+            match affected.get_mut(&key) {
+                Some((original, count)) => {
+                    ensure!(original.split_node_id == frame.split_node_id
+                        && original.gateway_kind == frame.gateway_kind
+                        && original.selected_branch_edge_ids == frame.selected_branch_edge_ids,
+                        "gateway activation has conflicting original frames");
+                    *count += if survives { 1 } else { 0 };
+                }
+                None => {
+                    affected.insert(key, (frame, if survives { 1 } else { 0 }));
+                }
+            }
+        }
+    }
+    let prior_keys = affected.keys().cloned().collect::<HashSet<_>>();
+    for token in &plan.create_tokens {
+        for frame in &token.fork_stack {
+            let key = (token.scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            if !prior_keys.contains(&key) {
+                let split_kind = if frame.gateway_kind == GatewayKind::Inclusive {
+                    "inclusive_split"
+                } else {
+                    "parallel_split"
+                };
+                ensure!(plan.events.iter().any(|event| event.kind == split_kind
+                    && event.scope_id == token.scope_id
+                    && event.node_id.as_deref() == Some(frame.split_node_id.as_str())
+                    && event.data["activation_id"].as_str() == Some(frame.activation_id.as_str())),
+                    "new gateway activation has no factual split");
+            }
+            let survives = matches!(token.status.as_str(), "ready" | "waiting" | "joining")
+                && !plan.consume_token_ids.contains(&token.token_id)
+                && !plan.cancel_token_ids.contains(&token.token_id);
+            match affected.get_mut(&key) {
+                Some((original, count)) => {
+                    ensure!(original.split_node_id == frame.split_node_id
+                        && original.gateway_kind == frame.gateway_kind
+                        && original.selected_branch_edge_ids == frame.selected_branch_edge_ids,
+                        "planned gateway frame changed its original activation");
+                    *count += if survives { 1 } else { 0 };
+                }
+                None => {
+                    affected.insert(key, (frame.clone(), if survives { 1 } else { 0 }));
+                }
+            }
+        }
+    }
+    let mut joined = HashSet::new();
+    for event in plan.events.iter().filter(|event| {
+        matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined")
+    }) {
+        let join_id = event.node_id.as_deref().context("gateway join event has no node")?;
+        let activation_id = event.data["activation_id"].as_str()
+            .context("gateway join event has no activation")?;
+        let key = (event.scope_id.clone(), join_id.to_owned(), activation_id.to_owned());
+        ensure!(joined.insert(key.clone()), "gateway activation joined more than once");
+        let path = scope_path(scopes, instance_id, &event.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let pair = super::model::gateway_pairs(nodes, flows)?
+            .into_values().find(|pair| pair.join_node_id == join_id)
+            .context("gateway join event has no paired model")?;
+        let kind = if event.kind == "inclusive_joined" {
+            GatewayKind::Inclusive
+        } else {
+            GatewayKind::Parallel
+        };
+        ensure!(pair.kind == kind, "gateway join event kind differs from pinned pair");
+        let mut selected_from_state = None;
+        let mut stmt = tx.prepare("SELECT fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining')")?;
+        let stacks = stmt.query_map(params![instance_id,event.scope_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for stack in stacks {
+            for frame in parse::<Vec<ForkFrame>>(stack)? {
+                if frame.join_node_id == join_id && frame.activation_id == activation_id {
+                    ensure!(frame.split_node_id == pair.split_node_id && frame.gateway_kind == kind,
+                        "gateway join activation differs from its pinned pair");
+                    if let Some(previous) = &selected_from_state {
+                        ensure!(previous == &frame.selected_branch_edge_ids,
+                            "gateway join activation has conflicting original selections");
+                    } else {
+                        selected_from_state = Some(frame.selected_branch_edge_ids);
+                    }
+                }
+            }
+        }
+        let selected = if let Some(selected) = selected_from_state {
+            selected
+        } else {
+            let split_kind = if kind == GatewayKind::Inclusive {
+                "inclusive_split"
+            } else {
+                "parallel_split"
+            };
+            let split = plan.events.iter().find(|candidate| candidate.kind == split_kind
+                && candidate.scope_id == event.scope_id
+                && candidate.node_id.as_deref() == Some(pair.split_node_id.as_str())
+                && candidate.data["activation_id"].as_str() == Some(activation_id))
+                .context("gateway join has no original activation or same-plan split")?;
+            if kind == GatewayKind::Inclusive {
+                serde_json::from_value::<Vec<String>>(split.data["selected_branch_edge_ids"].clone())?
+            } else {
+                pair.branch_to_incoming_edge.keys().cloned().collect()
+            }
+        };
+        ensure!(!selected.is_empty()
+            && selected.windows(2).all(|window| window[0] < window[1])
+            && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+            && (kind == GatewayKind::Inclusive
+                || selected.iter().map(String::as_str)
+                    .eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+            "gateway join selection differs from pinned pair");
+        if kind == GatewayKind::Inclusive {
+            ensure!(event.data["selected_branch_edge_ids"] == serde_json::to_value(&selected)?,
+                "inclusive join event differs from original selected branches");
+        }
+        let mut arrivals: HashMap<String, (String, Vec<ForkFrame>, Option<String>)> = HashMap::new();
+        let mut persisted = HashSet::new();
+        let mut stmt = tx.prepare("SELECT r.branch_edge_id,r.token_id,r.gateway_kind,t.node_id,t.arrival_edge_id,t.status,t.fork_stack_json FROM bpmn_gateway_receipts r JOIN bpmn_tokens t ON t.instance_id=r.instance_id AND t.scope_id=r.scope_id AND t.token_id=r.token_id WHERE r.instance_id=?1 AND r.scope_id=?2 AND r.join_node_id=?3 AND r.activation_id=?4")?;
+        let rows = stmt.query_map(params![instance_id,event.scope_id,join_id,activation_id], |row| {
+            Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,row.get::<_, Option<String>>(4)?,row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (branch, token_id, receipt_kind, node_id, arrival, status, stack_json) in rows {
+            ensure!(node_id == join_id && status == "joining"
+                && receipt_kind == (if kind == GatewayKind::Inclusive { "inclusive" } else { "parallel" }),
+                "gateway join prior receipt differs from its joining token");
+            let stack: Vec<ForkFrame> = parse(stack_json)?;
+            ensure!(arrivals.insert(branch.clone(), (token_id.clone(), stack, arrival)).is_none(),
+                "gateway join has duplicate prior branch receipts");
+            persisted.insert((branch.clone(), token_id.clone()));
+            ensure!(plan.remove_gateway_receipts.iter().filter(|receipt| receipt.scope_id == event.scope_id
+                && receipt.join_node_id == join_id && receipt.activation_id == activation_id
+                && receipt.branch_edge_id == branch && receipt.token_id == token_id
+                && receipt.gateway_kind == kind).count() == 1,
+                "gateway join did not remove its exact prior receipt");
+        }
+        for token in plan.create_tokens.iter().filter(|token| token.scope_id == event.scope_id
+            && token.node_id == join_id && token.status == "joining"
+            && token.fork_stack.last().is_some_and(|frame| frame.activation_id == activation_id)) {
+            let frame = token.fork_stack.last().context("new join arrival has no frame")?;
+            ensure!(arrivals.insert(frame.branch_edge_id.clone(),
+                (token.token_id.clone(), token.fork_stack.clone(), token.arrival_edge_id.clone())).is_none(),
+                "gateway join has duplicate newly arrived branch");
+            ensure!(!plan.add_gateway_receipts.iter().any(|receipt| receipt.token_id == token.token_id),
+                "completed gateway join retained a new receipt");
+        }
+        ensure!(arrivals.len() == selected.len()
+            && selected.iter().all(|branch| arrivals.contains_key(branch)),
+            "gateway join did not collect exactly its selected branches");
+        let mut outer_stack = None;
+        let mut consumed = HashSet::new();
+        for (branch, (token_id, stack, arrival)) in arrivals {
+            let frame = stack.last().context("gateway arrival has no top frame")?;
+            ensure!(frame.gateway_kind == kind && frame.split_node_id == pair.split_node_id
+                && frame.join_node_id == join_id && frame.activation_id == activation_id
+                && frame.branch_edge_id == branch && frame.selected_branch_edge_ids == selected
+                && pair.branch_to_incoming_edge.get(&branch) == arrival.as_ref()
+                && consumed.insert(token_id.clone())
+                && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1,
+                "gateway join consumed a mismatched or unselected arrival");
+            let parent = stack[..stack.len() - 1].to_vec();
+            if let Some(previous) = &outer_stack {
+                ensure!(previous == &parent, "gateway join branch frames disagree below the activation");
+            } else {
+                outer_stack = Some(parent);
+            }
+        }
+        ensure!(plan.remove_gateway_receipts.iter().filter(|receipt| receipt.scope_id == event.scope_id
+            && receipt.join_node_id == join_id && receipt.activation_id == activation_id).count()
+            == persisted.len(), "gateway join removed a receipt outside its prior arrivals");
+        let outgoing = flows.iter().filter(|flow| flow.source_id == join_id).collect::<Vec<_>>();
+        ensure!(outgoing.len() == 1, "gateway join has no unique continuation edge");
+        let edge = outgoing[0];
+        let outer_stack = outer_stack.context("gateway join has no selected arrival frame")?;
+        ensure!(plan.create_tokens.iter().filter(|token| token.scope_id == event.scope_id
+            && token.status == "ready" && token.node_id == edge.target_id
+            && token.arrival_edge_id.as_deref() == Some(edge.id.as_str())
+            && token.fork_stack == outer_stack)
+            .count() == 1, "gateway join lacks exactly one popped-frame continuation");
+    }
+    if plan.cancel_scope_roots.is_empty() && !reaches_error_end(plan) {
+        ensure!(plan.remove_gateway_receipts.iter().all(|receipt| joined.contains(&(
+            receipt.scope_id.clone(), receipt.join_node_id.clone(), receipt.activation_id.clone()))),
+            "ordinary transition removed a gateway receipt without a join");
+    }
+    let mut cancelled = HashSet::new();
+    for root in &plan.cancel_scope_roots {
+        cancelled.extend(descendant_scope_ids(scopes, root)?);
+    }
+    for ((scope_id, join_id, activation_id), (original, survivors)) in affected {
+        if joined.contains(&(scope_id.clone(), join_id.clone(), activation_id.clone())) {
+            ensure!(survivors == 0, "joined gateway activation still has an active frame");
+            continue;
+        }
+        if survivors != 0 {
+            continue;
+        }
+        let factual_error = (plan.terminal_error.as_ref().is_some_and(|fact| fact.source_scope_id == scope_id)
+            || plan.scope_terminal_errors.contains_key(&scope_id))
+            && plan.events.iter().any(|event| event.kind == "error_end_reached"
+            && event.scope_id == scope_id
+            && event.data["source_token_id"].as_str().is_some_and(|source| {
+                plan.create_tokens.iter().find(|token| token.scope_id == scope_id
+                    && token.token_id == source).map(|token| token.fork_stack.clone())
+                    .or_else(|| tx.query_row("SELECT fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3",
+                        params![instance_id,scope_id.as_str(),source], |row| row.get::<_, String>(0))
+                        .ok().and_then(|json| parse::<Vec<ForkFrame>>(json).ok()))
+                    .is_some_and(|frames| frames.iter().any(|frame|
+                        frame.join_node_id == join_id && frame.activation_id == activation_id
+                        && frame.split_node_id == original.split_node_id))
+            }));
+        ensure!(cancelled.contains(&scope_id) || factual_error,
+            "gateway activation disappeared without its factual join");
+    }
+    Ok(())
+}
+
+fn validate_gateway_state_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+) -> Result<()> {
+    let mut groups: HashMap<(String, String, String), (GatewayKind, Vec<String>)> = HashMap::new();
+    let mut tokens: HashMap<String, (String, String, Option<String>, String, Vec<ForkFrame>)> = HashMap::new();
+    let mut stmt = tx.prepare("SELECT token_id,scope_id,node_id,arrival_edge_id,status,fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
+    let rows = stmt.query_map([instance_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (token_id, scope_id, node_id, arrival_edge_id, status, stack_json) in rows {
+        let frames: Vec<ForkFrame> = parse(stack_json)?;
+        let path = scope_path(scopes, instance_id, &scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let pairs = super::model::gateway_pairs(nodes, flows)?;
+        for frame in &frames {
+            let pair = pairs.get(&frame.split_node_id).context("active fork pair missing from pinned scope")?;
+            let selected = &frame.selected_branch_edge_ids;
+            ensure!(pair.join_node_id == frame.join_node_id && pair.kind == frame.gateway_kind
+                && !selected.is_empty() && selected.windows(2).all(|window| window[0] < window[1])
+                && selected.binary_search(&frame.branch_edge_id).is_ok()
+                && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+                && (frame.gateway_kind == GatewayKind::Inclusive
+                    || selected.iter().map(String::as_str).eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+                "active fork frame differs from pinned gateway pair");
+            let key = (scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            if let Some((kind, branches)) = groups.get(&key) {
+                ensure!(*kind == frame.gateway_kind && branches == selected,
+                    "gateway activation has conflicting selected branches");
+            } else {
+                groups.insert(key, (frame.gateway_kind, selected.clone()));
+            }
+        }
+        tokens.insert(token_id, (scope_id, node_id, arrival_edge_id, status, frames));
+    }
+    let mut stmt = tx.prepare("SELECT scope_id,join_node_id,activation_id,branch_edge_id,token_id,gateway_kind FROM bpmn_gateway_receipts WHERE instance_id=?1")?;
+    let rows = stmt.query_map([instance_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut receipt_tokens = HashSet::new();
+    for (scope_id, join_id, activation_id, branch_id, token_id, kind_text) in rows {
+        ensure!(receipt_tokens.insert(token_id.clone()), "joining token has multiple gateway receipts");
+        let (token_scope, token_node, arrival, status, frames) = tokens.get(&token_id)
+            .context("gateway receipt refers to an inactive token")?;
+        let frame = frames.last().context("gateway receipt token lacks top fork frame")?;
+        let kind = match kind_text.as_str() { "parallel" => GatewayKind::Parallel,
+            "inclusive" => GatewayKind::Inclusive, _ => bail!("invalid gateway receipt kind") };
+        let key = (scope_id.clone(), join_id.clone(), activation_id.clone());
+        let (group_kind, selected) = groups.get(&key).context("gateway receipt has no active activation")?;
+        ensure!(token_scope == &scope_id && token_node == &join_id && status == "joining"
+            && frame.join_node_id == join_id && frame.activation_id == activation_id
+            && frame.branch_edge_id == branch_id && frame.gateway_kind == kind
+            && group_kind == &kind && &frame.selected_branch_edge_ids == selected
+            && selected.binary_search(&branch_id).is_ok(),
+            "gateway receipt differs from its active selected joining token");
+        let path = scope_path(scopes, instance_id, &scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let pairs = super::model::gateway_pairs(nodes, flows)?;
+        let pair = pairs.get(&frame.split_node_id).context("gateway receipt pair missing")?;
+        ensure!(pair.kind == kind && pair.join_node_id == join_id
+            && pair.branch_to_incoming_edge.get(&branch_id) == arrival.as_ref(),
+            "gateway receipt arrived through another paired edge");
+    }
+    ensure!(tokens.iter().filter(|(_, (_, _, _, status, _))| status.as_str() == "joining")
+        .all(|(token_id, _)| receipt_tokens.contains(token_id)),
+        "joining token lacks a gateway receipt");
+    Ok(())
+}
+
 fn apply_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -5667,6 +6040,8 @@ fn apply_plan_on(
     let proposed_scopes = validate_scope_plan_on(tx, instance_id, plan, at_ms)?;
     let (definition_id,version,org_id,initiator):(String,u32,String,String)=tx.query_row("SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",[instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
     let model = current_version_model_on(tx, &definition_id, version)?;
+    validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
+    validate_gateway_join_plan_on(tx, instance_id, &model, &proposed_scopes, plan)?;
 
     let mut cancelled_claims = Vec::new();
     insert_scoped_tokens_on(tx, instance_id, plan, at_ms)?;
@@ -5739,14 +6114,14 @@ fn apply_plan_on(
         }
         update_timer_on(tx, update, at_ms)?;
     }
-    for receipt in &plan.remove_receipts {
-        let affected=tx.execute("DELETE FROM bpmn_and_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5 AND scope_id=?6",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,receipt.scope_id])?;
+    for receipt in &plan.remove_gateway_receipts {
+        let affected=tx.execute("DELETE FROM bpmn_gateway_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5 AND scope_id=?6 AND gateway_kind=?7",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,receipt.scope_id,match receipt.gateway_kind { GatewayKind::Parallel => "parallel", GatewayKind::Inclusive => "inclusive" }])?;
         ensure!(
             affected == 1,
-            "parallel join receipt changed before transition"
+            "gateway join receipt changed before transition"
         );
     }
-    for receipt in &plan.add_receipts {
+    for receipt in &plan.add_gateway_receipts {
         let (node,stack,status,scope):(String,String,String,String)=tx.query_row("SELECT node_id,fork_stack_json,status,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",params![instance_id,receipt.token_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
         let stack: Vec<ForkFrame> = parse(stack)?;
         let frame = stack.last().context("joining receipt lacks a fork frame")?;
@@ -5756,10 +6131,11 @@ fn apply_plan_on(
                 && node == receipt.join_node_id
                 && frame.join_node_id == receipt.join_node_id
                 && frame.activation_id == receipt.activation_id
-                && frame.branch_edge_id == receipt.branch_edge_id,
+                && frame.branch_edge_id == receipt.branch_edge_id
+                && frame.gateway_kind == receipt.gateway_kind,
             "join receipt differs from its actual scoped joining token"
         );
-        tx.execute("INSERT INTO bpmn_and_receipts(instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,at_ms,receipt.scope_id])?;
+        tx.execute("INSERT INTO bpmn_gateway_receipts(instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,scope_id,gateway_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,at_ms,receipt.scope_id,match receipt.gateway_kind { GatewayKind::Parallel => "parallel", GatewayKind::Inclusive => "inclusive" }])?;
     }
     for task in &plan.create_user_tasks {
         ensure!(
@@ -6046,7 +6422,7 @@ fn apply_plan_on(
                 | ProcessInstanceStatus::Error
         ) {
             let controls:bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_and_receipts WHERE instance_id=?1 AND scope_id=?2) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.scope_id=j.scope_id AND t.instance_id=j.instance_id WHERE j.instance_id=?1 AND j.scope_id=?2 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND scope_id=?2 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_calls WHERE parent_instance_id=?1 AND parent_scope_id=?2 AND status IN ('waiting','return_incident'))",
+                "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_gateway_receipts WHERE instance_id=?1 AND scope_id=?2) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.scope_id=j.scope_id AND t.instance_id=j.instance_id WHERE j.instance_id=?1 AND j.scope_id=?2 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND scope_id=?2 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND scope_id=?2 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_calls WHERE parent_instance_id=?1 AND parent_scope_id=?2 AND status IN ('waiting','return_incident'))",
                 params![instance_id,update.scope_id],|row|row.get(0))?;
             ensure!(
                 !controls,
@@ -6138,6 +6514,7 @@ fn apply_plan_on(
             }
         }
     }
+    validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
     let unresolved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_timers x JOIN bpmn_tokens t ON t.token_id=x.token_id AND t.instance_id=x.instance_id AND t.scope_id=x.scope_id WHERE x.instance_id=?1 AND x.kind='catch' AND x.status='error' AND t.status='waiting')",[instance_id],|row|row.get(0))?;
     let status = if unresolved {
         ProcessInstanceStatus::Incident
@@ -6150,7 +6527,7 @@ fn apply_plan_on(
             status == ProcessInstanceStatus::Error || ended,
             "root completion has not reached its actual End"
         );
-        let active:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')) OR EXISTS(SELECT 1 FROM bpmn_calls WHERE parent_instance_id=?1 AND status IN ('waiting','return_incident')) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id WHERE j.instance_id=?1 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_and_receipts WHERE instance_id=?1) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL)",[instance_id],|row|row.get(0))?;
+        let active:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')) OR EXISTS(SELECT 1 FROM bpmn_calls WHERE parent_instance_id=?1 AND status IN ('waiting','return_incident')) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id WHERE j.instance_id=?1 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_gateway_receipts WHERE instance_id=?1) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL)",[instance_id],|row|row.get(0))?;
         ensure!(
             !active,
             "root completion retains active tokens or child scopes"
@@ -7367,7 +7744,7 @@ fn cancel_instance_on(
         }
     }
     tx.execute(
-        "DELETE FROM bpmn_and_receipts WHERE instance_id=?1",
+        "DELETE FROM bpmn_gateway_receipts WHERE instance_id=?1",
         [instance_id],
     )?;
     tx.execute("UPDATE bpmn_tokens SET status='cancelled' WHERE instance_id=?1 AND status IN ('ready','waiting','joining')",[instance_id])?;

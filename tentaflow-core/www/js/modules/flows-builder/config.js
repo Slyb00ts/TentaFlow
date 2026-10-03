@@ -273,24 +273,31 @@ export class FlowConfig {
     const target = canvas.nodes.find((node) => node.id === edge.to_node);
     const name = (node) => node?.label || getNodeName(node?.type);
     const exclusive = source?.type === 'bpmn_exclusive_gateway';
+    const inclusive = source?.type === 'bpmn_inclusive_gateway'
+      && canvas.edges.filter((candidate) => candidate.from_node === source.id).length >= 2;
+    const inclusiveJoin = source?.type === 'bpmn_inclusive_gateway' && !inclusive;
+    const inclusiveDefault = inclusive && source.config.defaultFlowId === edge.id;
     this.root.innerHTML = `
       <div class="fb-config-header"><div class="fb-config-title-wrap">
         <div class="fb-config-title">${escapeHtml(I18n.t('bpmn.sequence_flow'))}</div>
         <div class="fb-config-subtitle">${escapeHtml(name(source))} → ${escapeHtml(name(target))}</div>
       </div></div>
       <div class="fb-config-body">
-        <tf-input data-process="condition" label="${escapeAttr(I18n.t('bpmn.condition'))}" hint="${escapeAttr(I18n.t('bpmn.condition_hint'))}" value="${escapeAttr(edge.condition || '')}" ${this.readOnly ? 'disabled' : ''}></tf-input>
-        ${exclusive ? `<tf-toggle data-process="default" label="${escapeAttr(I18n.t('bpmn.default_path'))}" ${source.config.defaultFlowId === edge.id ? 'checked' : ''} ${this.readOnly ? 'disabled' : ''}></tf-toggle>` : ''}
+        ${inclusiveJoin ? '' : inclusive ? `<tf-textarea data-process="condition" autogrow rows="3" label="${escapeAttr(I18n.t('bpmn.condition'))}" hint="${escapeAttr(I18n.t('bpmn.or_condition_hint'))}" value="${escapeAttr(edge.condition || '')}" ${this.readOnly || inclusiveDefault ? 'disabled' : ''}></tf-textarea>`
+          : `<tf-input data-process="condition" label="${escapeAttr(I18n.t('bpmn.condition'))}" hint="${escapeAttr(I18n.t('bpmn.condition_hint'))}" value="${escapeAttr(edge.condition || '')}" ${this.readOnly ? 'disabled' : ''}></tf-input>`}
+        ${exclusive || inclusive ? `<tf-toggle data-process="default" label="${escapeAttr(I18n.t('bpmn.default_path'))}" ${source.config.defaultFlowId === edge.id ? 'checked' : ''} ${this.readOnly ? 'disabled' : ''}></tf-toggle>` : ''}
         <tf-input readonly label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(edge.id)}"></tf-input>
       </div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
-    this.root.querySelector('[data-process="condition"]').addEventListener('change', (event) => {
-      if (event.target.tagName !== 'TF-INPUT' || this.readOnly) return;
+    this.root.querySelector('[data-process="condition"]')?.addEventListener('change', (event) => {
+      if (!['TF-INPUT', 'TF-TEXTAREA'].includes(event.target.tagName) || this.readOnly) return;
       this.opts.onEdgeChange(edge.id, { condition: event.target.value.trim() || null });
     });
     this.root.querySelector('[data-process="default"]')?.addEventListener('change', (event) => {
       if (event.target.tagName !== 'TF-TOGGLE' || this.readOnly) return;
+      if (inclusive && event.detail.checked) this.opts.onEdgeChange(edge.id, { condition: null });
       this.opts.onConfigChange(source.id, { defaultFlowId: event.detail.checked ? edge.id : null });
+      if (inclusive) this.root.querySelector('[data-process="condition"]').toggleAttribute('disabled', event.detail.checked);
     });
     this.root.querySelector('[data-process="delete"]')?.addEventListener('click', () => {
       canvas.selectedEdgeId = edge.id;
@@ -391,15 +398,17 @@ export class FlowConfig {
         fields += textarea('payloadExpression', 'message_payload_expression', config.payloadExpression, 4) + input('ttlSeconds', 'message_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"');
       }
       if (kind !== 'MessageThrow') fields += mapping('outputMapping', 'output_mapping');
-    } else if (kind === 'ExclusiveGateway') {
+    } else if (kind === 'ExclusiveGateway' || kind === 'InclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
-      fields += `<tf-select data-process="defaultFlowId" label="${escapeAttr(I18n.t('bpmn.default_path'))}" value="${escapeAttr(config.defaultFlowId || '')}" ${disabled}>
+      if (kind === 'InclusiveGateway' && outgoing.length < 2) {
+        fields += `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.or_join_hint'))}</p>`;
+      } else fields += `<tf-select data-process="defaultFlowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.default_path'))}" value="${escapeAttr(config.defaultFlowId || '')}" ${disabled}>
         <option value="">${escapeHtml(I18n.t('bpmn.no_default'))}</option>
         ${outgoing.map((edge) => {
           const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
           return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target?.label || getNodeName(target?.type))}${edge.condition ? ` — ${escapeHtml(edge.condition)}` : ''}</option>`;
-        }).join('')}</tf-select><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.xor_hint'))}</p>`;
+        }).join('')}</tf-select><p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'InclusiveGateway' ? 'bpmn.or_hint' : 'bpmn.xor_hint'))}</p>`;
     } else {
       fields += `<p class="fb-field-hint">${escapeHtml(getNodeName(node.type))}: ${escapeHtml(I18n.t(`bpmn.node_${node.type.slice(5)}_hint`))}</p>`;
     }
@@ -610,7 +619,10 @@ export class FlowConfig {
       } else if (key === 'targetDefinitionChoice') {
         return;
       } else if (key === 'resultExpression' || key === 'errorRef') this.opts.onConfigChange(node.id, { [key]: control.value || null });
-      else if (key !== 'elementId') this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
+      else if (key !== 'elementId') {
+        if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });
+        this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
+      }
       if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator');
     });
     const connect = this.root.querySelector('[data-connect]');

@@ -449,7 +449,8 @@ mod tests {
     use super::super::runtime::{self, test_support::*};
     use super::*;
     use tentaflow_protocol::processes::{
-        ActivityVerification, ProcessInstanceStatus, ProcessUserTaskStatus,
+        ActivityVerification, ProcessInstanceStatus, ProcessNode, ProcessNodeKind,
+        ProcessUserTaskStatus,
     };
 
     async fn execute(fixture: &Fixture, worker: &str) -> ClaimedProcessJob {
@@ -582,6 +583,66 @@ mod tests {
                 .0,
             history
         );
+    }
+
+    #[tokio::test]
+    async fn inclusive_selected_service_retry_keeps_real_job_fence_and_join_selection() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("selected service", None));
+        let mut model = service_model(&flow_id, ActivityVerification::Condition {
+            expression: "true".into(),
+        });
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Select service".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "Sibling".into(), name: "Independent review".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Join".into(), name: "Selected work done".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+        ]);
+        model.sequence_flows = vec![
+            edge("StartSplit", "Start_1", "Split"),
+            edge("ToService", "Split", "Service"),
+            edge("ToSibling", "Split", "Sibling"),
+            edge("ServiceJoin", "Service", "Join"),
+            edge("SiblingJoin", "Sibling", "Join"),
+            edge("JoinEnd", "Join", "End_1"),
+        ];
+        model.sequence_flows[1].condition = Some("true".into());
+        model.sequence_flows[2].condition = Some("true".into());
+        let started = start_model(&fixture, &model);
+        let old = repository::claim_job(&fixture.db, "old-selected-worker", now_ms()).unwrap().unwrap();
+        assert_eq!(old.job.node_id, "Service");
+        assert!(repository::fail_job(&fixture.db, &old.job.job_id, old.job.attempt,
+            old.job.fence, "old-selected-worker", "INTERRUPTED", "controlled worker interruption",
+            now_ms(), None).unwrap());
+        let incident = repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+        assert_eq!(incident.status, ProcessInstanceStatus::Incident);
+        repository::retry_job(&fixture.db, &fixture.owner, &stamp("retry selected service"),
+            &started.instance_id, &old.job.job_id, incident.revision).unwrap();
+        let claimed = repository::claim_job(&fixture.db, "selected-worker", now_ms()).unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, old.job.job_id);
+        assert!(claimed.job.attempt > old.job.attempt && claimed.job.fence > old.job.fence);
+        execute_claimed(&fixture.db, fixture.dispatcher(), "selected-worker", claimed,
+            CancellationToken::new()).await.unwrap();
+        let partial = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(partial.receipts.len(), 1);
+        assert_eq!(partial.receipts[0].branch_edge_id, "ToService");
+        let sibling = partial.instance.user_tasks.iter().find(|task| task.node_id == "Sibling"
+            && task.status == ProcessUserTaskStatus::Open).unwrap();
+        let at_ms = now_ms();
+        let plan = runtime::plan_user_completion(&partial, &sibling.user_task_id,
+            &Value::Null, None, at_ms).unwrap();
+        let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("complete sibling after service retry"), &started.instance_id,
+            &sibling.user_task_id, partial.instance.revision, &Value::Null, None, &plan, at_ms)
+            .unwrap().instance;
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        assert_eq!(crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+            .unwrap().len(), 1);
+        let events = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
     }
 
     #[tokio::test]

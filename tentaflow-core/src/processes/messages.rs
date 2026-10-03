@@ -1919,14 +1919,16 @@ mod tests {
     }
 
     #[test]
-    fn catch_race_continuation_preserves_independent_parallel_receipts() {
+    fn catch_race_continuation_preserves_independent_gateway_receipts() {
+        for inclusive in [false, true] {
         let f = Fixture::new();
         let mut model = race_model();
         model.nodes.extend([
             ProcessNode {
                 id: "Split_1".into(),
-                name: "Parallel start".into(),
-                kind: ProcessNodeKind::ParallelGateway,
+                name: "Selected start".into(),
+                kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway },
             },
             ProcessNode {
                 id: "Merge_1".into(),
@@ -1946,7 +1948,8 @@ mod tests {
             ProcessNode {
                 id: "Join_1".into(),
                 name: "Join work".into(),
-                kind: ProcessNodeKind::ParallelGateway,
+                kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway },
             },
         ]);
         model.sequence_flows = vec![
@@ -1961,6 +1964,10 @@ mod tests {
             runtime::test_support::edge("OtherJoin", "Other_1", "Join_1"),
             runtime::test_support::edge("JoinEnd", "Join_1", "End_1"),
         ];
+        if inclusive {
+            model.sequence_flows[1].condition = Some("true".into());
+            model.sequence_flows[2].condition = Some("true".into());
+        }
         let version = published(&f, &model);
         let started = start_version(&f, &version);
         let other = started
@@ -1983,6 +1990,9 @@ mod tests {
         assert_eq!(after.instance.status, I::Completed);
         assert!(after.receipts.is_empty());
         assert_eq!(after.event_races[0].status, R::Won);
+        let events = repository::list_events(&f.db, &f.owner, &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == if inclusive { "inclusive_joined" } else { "parallel_joined" }).count(), 1);
+        }
     }
 
     #[test]

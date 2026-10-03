@@ -615,7 +615,7 @@ export class FlowCanvas {
     if (this.mode !== 'bpmn') return;
     const ids = new Set(this.edges.map((edge) => edge.id));
     for (const node of this.nodes) {
-      if (node.type === 'bpmn_exclusive_gateway' && !ids.has(node.config.defaultFlowId)) node.config.defaultFlowId = null;
+      if (['bpmn_exclusive_gateway', 'bpmn_inclusive_gateway'].includes(node.type) && !ids.has(node.config.defaultFlowId)) node.config.defaultFlowId = null;
     }
   }
 
@@ -661,6 +661,7 @@ export class FlowCanvas {
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
+    this.onSelect(null);
     this.render();
     this.onChange();
   }
@@ -676,6 +677,9 @@ export class FlowCanvas {
       this.processModel = snap.processModel;
       this.processPath = snap.processPath;
     }
+    this.selectedIds.clear();
+    this.selectedEdgeId = null;
+    this.onSelect(null);
     this.render();
     this.onChange();
   }
@@ -881,7 +885,7 @@ export class FlowCanvas {
         config: structuredClone(n.config),
       };
       idMap.set(n.id, clone.id);
-      if (this.mode === 'bpmn' && clone.type === 'bpmn_exclusive_gateway') clone.config.defaultFlowId = null;
+      if (this.mode === 'bpmn' && ['bpmn_exclusive_gateway', 'bpmn_inclusive_gateway'].includes(clone.type)) clone.config.defaultFlowId = null;
       if (this.mode === 'bpmn' && clone.type === 'bpmn_sub_process') clone.config.body = cloneProcessBody(clone.config.body);
       clones.push(clone);
     }

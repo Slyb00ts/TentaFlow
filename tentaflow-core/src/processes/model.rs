@@ -1,8 +1,9 @@
-// ============ File: model.rs — B1 process graph validation and structured parallel joins ============
+// ============ File: model.rs — Process graph validation and structured gateway joins ============
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 use tentaflow_protocol::processes::{
     ProcessDiagram, ProcessMessageTargetSpec, ProcessModel, ProcessNode, ProcessNodeKind,
     ProcessSequenceFlow, ProcessTimerSpec,
@@ -17,6 +18,21 @@ pub const MAX_SEQUENCE_FLOWS: usize = 256;
 pub const MAX_VARIABLE_BYTES: usize = 256 * 1024;
 pub const MAX_VARIABLE_KEYS: usize = 128;
 const MAX_DI_COORDINATE: f64 = 1_000_000.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayKind {
+    Parallel,
+    Inclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayPair {
+    pub kind: GatewayKind,
+    pub split_node_id: String,
+    pub join_node_id: String,
+    pub branch_to_incoming_edge: BTreeMap<String, String>,
+}
 
 pub fn scope_body<'a>(
     model: &'a ProcessModel,
@@ -688,6 +704,32 @@ fn validate_body<'a>(
                 "parallel gateway {} must be a split or join",
                 node.id
             ),
+            ProcessNodeKind::InclusiveGateway { default_flow_id } => {
+                let split = in_count == 1 && (2..=8).contains(&out_count);
+                let join = (2..=8).contains(&in_count) && out_count == 1;
+                ensure!(split || join,
+                    "inclusive gateway {} must be a split or join with 2..=8 branches", node.id);
+                if split {
+                    if let Some(default_id) = default_flow_id {
+                        ensure!(graph_flows.iter().any(|flow| flow.id == *default_id
+                            && flow.source_id == node.id && flow.condition.is_none()),
+                            "inclusive gateway {} has invalid default flow {}", node.id, default_id);
+                    }
+                    for flow in graph_flows.iter().filter(|flow| flow.source_id == node.id) {
+                        if default_flow_id.as_deref() == Some(flow.id.as_str()) {
+                            ensure!(flow.condition.is_none(),
+                                "inclusive gateway {} default flow {} cannot have a condition", node.id, flow.id);
+                        } else {
+                            let condition = flow.condition.as_deref().filter(|condition| !condition.trim().is_empty())
+                                .with_context(|| format!("inclusive gateway {} flow {} requires a condition", node.id, flow.id))?;
+                            validate_expression(condition, &format!("inclusive gateway {} flow {} condition", node.id, flow.id), true)?;
+                        }
+                    }
+                } else {
+                    ensure!(default_flow_id.is_none(),
+                        "inclusive join {} cannot have a default flow", node.id);
+                }
+            }
             ProcessNodeKind::ExclusiveGateway { default_flow_id } => {
                 ensure!(
                     in_count >= 1 && out_count >= 1,
@@ -711,19 +753,23 @@ fn validate_body<'a>(
                 node.id
             ),
         }
-        if !matches!(node.kind, ProcessNodeKind::ExclusiveGateway { .. }) {
+        if !matches!(node.kind, ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::InclusiveGateway { .. }) {
             ensure!(
                 graph_flows.iter()
                     .filter(|flow| flow.source_id == node.id)
                     .all(|flow| flow.condition.is_none()),
-                "conditions require an exclusive gateway"
+                "conditions require an exclusive or inclusive gateway"
             );
+        } else if matches!(node.kind, ProcessNodeKind::InclusiveGateway { .. }) && out_count == 1 {
+            ensure!(graph_flows.iter().filter(|flow| flow.source_id == node.id)
+                .all(|flow| flow.condition.is_none()),
+                "inclusive join {} cannot have an outgoing condition", node.id);
         }
     }
-    let pairs = and_pairs(graph_nodes, graph_flows)?;
+    let pairs = gateway_pairs(graph_nodes, graph_flows)?;
     let joins: HashMap<&str, &str> = pairs
         .iter()
-        .map(|(split, join)| (join.as_str(), split.as_str()))
+        .map(|(split, pair)| (pair.join_node_id.as_str(), split.as_str()))
         .collect();
     let mut graph_outgoing = outgoing.clone();
     let mut degree: HashMap<&str, usize> = nodes
@@ -781,24 +827,24 @@ fn validate_body<'a>(
             .cloned()
             .context("process node has no activation region")?;
         let node = nodes[node_id];
-        if matches!(node.kind, ProcessNodeKind::ParallelGateway) {
+        if matches!(node.kind, ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. }) {
             if outgoing.get(node_id).is_some_and(|flows| flows.len() >= 2) {
                 stack.push((*node_id).to_string());
             } else {
-                let split = joins.get(node_id).context("parallel join lacks its paired split")?;
+                let split = joins.get(node_id).context("gateway join lacks its paired split")?;
                 ensure!(
                     stack.pop().as_deref() == Some(*split),
-                    "parallel join {} has an invalid activation stack",
+                    "gateway join {} has an invalid activation stack",
                     node_id
                 );
             }
         }
         if matches!(node.kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
-            ensure!(stack.is_empty(), "end event has an open parallel activation");
+            ensure!(stack.is_empty(), "end event has an open gateway activation");
         }
         for target in outgoing.get(node_id).into_iter().flatten() {
             if matches!(nodes[target].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
-                ensure!(stack.is_empty(), "boundary or main path ends inside a parallel fork");
+                ensure!(stack.is_empty(), "boundary or main path ends inside a gateway fork");
                 states.entry(*target).or_insert_with(|| (region.clone(), stack.clone()));
             } else if let Some(existing) = states.get(target) {
                 ensure!(
@@ -819,7 +865,7 @@ fn validate_body<'a>(
         }) {
             ensure!(
                 stack.is_empty(),
-                "boundary event {} attaches inside an active parallel fork",
+                "boundary event {} attaches inside an active gateway fork",
                 boundary.id
             );
             states.insert(boundary.id.as_str(), (boundary.id.clone(), Vec::new()));
@@ -945,56 +991,39 @@ fn validate_diagram(
     Ok(())
 }
 
-/// Maps each parallel split to the one join reached by every branch.
-pub fn and_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<HashMap<String, String>> {
-    let outgoing = |id: &str| {
-        flows
-            .iter()
-            .filter(|flow| flow.source_id == id)
-            .map(|flow| flow.target_id.as_str())
-            .collect::<Vec<_>>()
+/// Finds closed split/join regions and their exact branch arrival edges.
+pub fn gateway_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<HashMap<String, GatewayPair>> {
+    let kind = |node: &ProcessNode| match node.kind {
+        ProcessNodeKind::ParallelGateway => Some(GatewayKind::Parallel),
+        ProcessNodeKind::InclusiveGateway { .. } => Some(GatewayKind::Inclusive),
+        _ => None,
     };
-    let incoming = |id: &str| {
-        flows
-            .iter()
-            .filter(|flow| flow.target_id == id)
-            .count()
-    };
-    let joins: Vec<_> = nodes
-        .iter()
-        .filter(|node| {
-            matches!(node.kind, ProcessNodeKind::ParallelGateway) && incoming(&node.id) >= 2
-        })
-        .collect();
-    let splits: Vec<_> = nodes
-        .iter()
-        .filter(|node| {
-            matches!(node.kind, ProcessNodeKind::ParallelGateway) && outgoing(&node.id).len() >= 2
-        })
-        .collect();
-    ensure!(
-        joins.len() == splits.len(),
-        "parallel gateways must have paired splits and joins"
-    );
+    let outgoing = |id: &str| flows.iter().filter(|flow| flow.source_id == id).collect::<Vec<_>>();
+    let incoming = |id: &str| flows.iter().filter(|flow| flow.target_id == id).collect::<Vec<_>>();
+    let joins: Vec<_> = nodes.iter().filter(|node| kind(node).is_some() && incoming(&node.id).len() >= 2).collect();
+    let splits: Vec<_> = nodes.iter().filter(|node| kind(node).is_some() && outgoing(&node.id).len() >= 2).collect();
+    ensure!(joins.len() == splits.len(), "structured gateways require paired splits and joins");
     let mut pairs = HashMap::new();
     let mut used_joins = HashSet::new();
     for split in splits {
         let branches = outgoing(&split.id);
         let mut candidates = Vec::new();
         for join in &joins {
-            if incoming(&join.id) != branches.len() {
+            if kind(split) != kind(join) || incoming(&join.id).len() != branches.len() {
                 continue;
             }
             let mut branch_paths = Vec::new();
+            let mut branch_to_incoming_edge = BTreeMap::new();
             let mut valid = true;
             for branch in &branches {
                 let mut seen = HashSet::new();
-                let mut stack = vec![*branch];
+                let mut arrivals = HashSet::new();
+                let mut stack = vec![branch.target_id.as_str()];
+                if branch.target_id == join.id {
+                    arrivals.insert(branch.id.as_str());
+                }
                 while let Some(id) = stack.pop() {
-                    if id == join.id {
-                        continue;
-                    }
-                    if !seen.insert(id) {
+                    if id == join.id || !seen.insert(id) {
                         continue;
                     }
                     let next = outgoing(id);
@@ -1002,42 +1031,122 @@ pub fn and_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result
                         valid = false;
                         break;
                     }
-                    stack.extend(next);
+                    for edge in next {
+                        if edge.target_id == join.id {
+                            arrivals.insert(edge.id.as_str());
+                        } else {
+                            stack.push(edge.target_id.as_str());
+                        }
+                    }
+                }
+                if !valid || arrivals.len() != 1 {
+                    valid = false;
+                    break;
                 }
                 branch_paths.push(seen);
+                branch_to_incoming_edge.insert(branch.id.clone(), arrivals.into_iter().next().expect("one arrival checked").to_string());
             }
-            if valid
-                && branch_paths.iter().enumerate().all(|(i, path)| {
-                    branch_paths
-                        .iter()
-                        .skip(i + 1)
-                        .all(|other| path.is_disjoint(other))
-                })
-            {
-                candidates.push(join.id.clone());
+            if valid && branch_paths.iter().enumerate().all(|(i, path)| {
+                branch_paths.iter().skip(i + 1).all(|other| path.is_disjoint(other))
+            }) && branch_to_incoming_edge.values().collect::<HashSet<_>>().len() == branches.len() {
+                candidates.push((join.id.clone(), branch_to_incoming_edge));
             }
         }
-        ensure!(
-            candidates.len() == 1,
-            "parallel split {} requires one structurally paired join",
-            split.id
-        );
-        let join = candidates.pop().expect("one candidate checked");
-        ensure!(
-            used_joins.insert(join.clone()),
-            "parallel join {join} is paired twice"
-        );
-        pairs.insert(split.id.clone(), join);
+        ensure!(candidates.len() == 1,
+            "gateway split {} requires one closed, disjoint paired join with unique incoming edges", split.id);
+        let (join_node_id, branch_to_incoming_edge) = candidates.pop().expect("one candidate checked");
+        ensure!(used_joins.insert(join_node_id.clone()), "gateway join {} is paired twice", join_node_id);
+        pairs.insert(split.id.clone(), GatewayPair {
+            kind: kind(split).expect("split kind checked"),
+            split_node_id: split.id.clone(), join_node_id, branch_to_incoming_edge,
+        });
     }
-    if used_joins.len() != joins.len() {
-        bail!("unpaired parallel join");
-    }
+    ensure!(used_joins.len() == joins.len(), "unpaired structured gateway join");
     Ok(pairs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inclusive_pair_maps_selected_edges_and_rejects_invalid_conditions_and_crossing() {
+        let mut model = starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Select".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("To_C".into()) } },
+            ProcessNode { id: "Join".into(), name: "Synchronize".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+        ]);
+        for id in ["A", "B", "C"] {
+            model.nodes.push(ProcessNode { id: id.into(), name: id.into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
+        }
+        model.sequence_flows[0].target_id = "Split".into();
+        for (id, source, target, condition) in [
+            ("To_A", "Split", "A", Some("vars.a == true")),
+            ("To_B", "Split", "B", Some("vars.b == true")),
+            ("To_C", "Split", "C", None),
+            ("From_A", "A", "Join", None),
+            ("From_B", "B", "Join", None),
+            ("From_C", "C", "Join", None),
+            ("After_Join", "Join", "End_1", None),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: target.into(),
+                condition: condition.map(str::to_string),
+            });
+        }
+        validate_model(&model).unwrap();
+        let pair = gateway_pairs(&model.nodes, &model.sequence_flows).unwrap().remove("Split").unwrap();
+        assert_eq!(pair.kind, GatewayKind::Inclusive);
+        assert_eq!(pair.join_node_id, "Join");
+        assert_eq!(pair.branch_to_incoming_edge, BTreeMap::from([
+            ("To_A".into(), "From_A".into()),
+            ("To_B".into(), "From_B".into()),
+            ("To_C".into(), "From_C".into()),
+        ]));
+
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "To_B").unwrap().condition = None;
+        assert!(validate_model(&model).unwrap_err().to_string().contains("To_B"));
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "To_B").unwrap().condition = Some("vars.b == true".into());
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "To_C").unwrap().condition = Some("true".into());
+        assert!(validate_model(&model).unwrap_err().to_string().contains("default flow"));
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "To_C").unwrap().condition = None;
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "From_A").unwrap().target_id = "B".into();
+        assert!(validate_model(&model).is_err(), "one branch cannot enter another selected branch");
+    }
+
+    #[test]
+    fn parallel_pair_keeps_nine_branches_without_the_inclusive_limit() {
+        let mut model = starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+        ]);
+        model.sequence_flows[0].target_id = "Split".into();
+        for branch in 0..9 {
+            let id = format!("Branch_{branch}");
+            model.nodes.push(ProcessNode { id: id.clone(), name: id.clone(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: format!("To_{branch}"), source_id: "Split".into(), target_id: id.clone(), condition: None,
+            });
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: format!("From_{branch}"), source_id: id, target_id: "Join".into(), condition: None,
+            });
+        }
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "After_Join".into(), source_id: "Join".into(), target_id: "End_1".into(), condition: None,
+        });
+        validate_model(&model).unwrap();
+        assert_eq!(gateway_pairs(&model.nodes, &model.sequence_flows).unwrap()["Split"].branch_to_incoming_edge.len(), 9);
+        model.nodes.iter_mut().find(|node| node.id == "Split").unwrap().kind =
+            ProcessNodeKind::InclusiveGateway { default_flow_id: None };
+        model.nodes.iter_mut().find(|node| node.id == "Join").unwrap().kind =
+            ProcessNodeKind::InclusiveGateway { default_flow_id: None };
+        assert!(validate_model(&model).unwrap_err().to_string().contains("Split"));
+    }
 
     #[test]
     fn call_activity_and_error_end_require_exact_binding_and_closed_parallel_path() {

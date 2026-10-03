@@ -2630,14 +2630,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boundary_after_real_parallel_join_enters_its_own_closed_parallel_region() {
+    async fn real_due_timer_completes_selected_inclusive_branch() {
+        let fixture = Fixture::new();
+        let mut model = catch_model(ProcessTimerSpec::Duration { seconds: 60 });
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Select waits".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "Review".into(), name: "Independent review".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Join".into(), name: "Selected waits done".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+        ]);
+        model.sequence_flows = vec![
+            edge("ToSplit", "Start_1", "Split"),
+            edge("WaitBranch", "Split", "Wait"),
+            edge("ReviewBranch", "Split", "Review"),
+            edge("WaitJoin", "Wait", "Join"),
+            edge("ReviewJoin", "Review", "Join"),
+            edge("JoinEnd", "Join", "End_1"),
+        ];
+        model.sequence_flows[1].condition = Some("true".into());
+        model.sequence_flows[2].condition = Some("true".into());
+        let started = start_at(&fixture, &model, 1_000);
+        let candidate = repository::due_timers(&fixture.db, 61_000, 32).unwrap().remove(0);
+        assert_eq!(candidate.instance_id.as_deref(), Some(started.instance_id.as_str()));
+        let drained = drain_due(&fixture.db, 61_000);
+        drained.completion.unwrap();
+        assert_eq!(drained.fired, 1);
+        let partial = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(partial.receipts.len(), 1);
+        assert_eq!(partial.receipts[0].branch_edge_id, "WaitBranch");
+        let review = partial.user_tasks.iter().find(|task| task.node_id == "Review").unwrap();
+        complete_work(&fixture, &started.instance_id, &review.user_task_id, 61_001);
+        let final_state = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(final_state.instance.status, ProcessInstanceStatus::Completed);
+        assert!(final_state.receipts.is_empty());
+        let events = repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn boundary_after_real_gateway_join_enters_its_own_closed_region() {
+        for inclusive in [false, true] {
         let fixture = Fixture::new();
         let mut model = with_boundaries(user_model(None), "Work", &[("Limit", true, 1)]);
         for id in ["Split", "Join", "SideSplit", "SideJoin"] {
             model.nodes.push(ProcessNode {
                 id: id.into(),
                 name: id.into(),
-                kind: ProcessNodeKind::ParallelGateway,
+                kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway },
             });
         }
         for id in ["Main_A", "Main_B", "Side_A", "Side_B"] {
@@ -2675,6 +2717,13 @@ mod tests {
             ("S_E", "SideJoin", "End_1"),
         ] {
             model.sequence_flows.push(edge(id, source, target));
+        }
+        if inclusive {
+            for flow in &mut model.sequence_flows {
+                if ["M_A", "M_B", "S_A", "S_B"].contains(&flow.id.as_str()) {
+                    flow.condition = Some("true".into());
+                }
+            }
         }
         let started = start_at(&fixture, &model, 1_000);
         for (offset, node_id) in ["Main_A", "Main_B"].iter().enumerate() {
@@ -2741,10 +2790,11 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "parallel_joined")
+                .filter(|event| event.kind == if inclusive { "inclusive_joined" } else { "parallel_joined" })
                 .count(),
             2
         );
+        }
     }
 
     #[tokio::test]

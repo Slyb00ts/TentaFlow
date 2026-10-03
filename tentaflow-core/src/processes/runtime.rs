@@ -14,9 +14,9 @@ use tentaflow_protocol::processes::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::model::{and_pairs, validate_variables, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
+use super::model::{gateway_pairs, validate_variables, GatewayKind, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
-    AndReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
+    GatewayReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
     ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
     ScopeUpdate,
 };
@@ -134,7 +134,7 @@ struct Transition<'a> {
     tokens: Vec<ProcessToken>,
     jobs: Vec<ProcessJob>,
     tasks: Vec<ProcessUserTask>,
-    receipts: Vec<AndReceipt>,
+    receipts: Vec<GatewayReceipt>,
     incidents: Vec<ProcessIncident>,
     timers: Vec<ProcessTimer>,
     boundary_incidents: Vec<BoundaryEventIncident>,
@@ -757,15 +757,15 @@ impl<'a> Transition<'a> {
                 .retain(|actual| actual.token_id != receipt.token_id);
             if self
                 .plan
-                .add_receipts
+                .add_gateway_receipts
                 .iter()
                 .any(|actual| actual.token_id == receipt.token_id)
             {
                 self.plan
-                    .add_receipts
+                    .add_gateway_receipts
                     .retain(|actual| actual.token_id != receipt.token_id);
             } else {
-                self.plan.remove_receipts.push(receipt);
+                self.plan.remove_gateway_receipts.push(receipt);
             }
         }
         self.plan.cancel_user_task_ids.extend(
@@ -1444,81 +1444,67 @@ impl<'a> Transition<'a> {
     }
 
     fn join(&mut self, token: &ProcessToken) -> Result<()> {
-        let frame = token
-            .fork_stack
-            .last()
-            .context("parallel join has no fork activation")?
-            .clone();
-        ensure!(
-            frame.join_node_id == token.node_id,
-            "parallel join does not match the current fork activation"
-        );
-        ensure!(
-            !self
-                .receipts
-                .iter()
-                .any(|receipt| receipt.scope_id == self.current_scope
-                    && receipt.activation_id == frame.activation_id
-                    && receipt.branch_edge_id == frame.branch_edge_id),
-            "parallel branch arrived twice"
-        );
+        let frame = token.fork_stack.last().context("gateway join has no fork activation")?.clone();
+        ensure!(frame.join_node_id == token.node_id, "gateway join differs from its fork activation");
+        let pair = gateway_pairs(self.body()?.0, self.body()?.1)?
+            .remove(&frame.split_node_id)
+            .context("gateway fork pair is missing")?;
+        ensure!(pair.kind == frame.gateway_kind && pair.join_node_id == token.node_id,
+            "gateway join differs from the paired model");
+        ensure!(pair.branch_to_incoming_edge.get(&frame.branch_edge_id) == token.arrival_edge_id.as_ref(),
+            "gateway branch arrived through another join edge");
+        ensure!(frame.selected_branch_edge_ids.binary_search(&frame.branch_edge_id).is_ok(),
+            "gateway branch was not selected");
+        ensure!(!self.receipts.iter().any(|receipt| receipt.scope_id == self.current_scope
+            && receipt.join_node_id == frame.join_node_id
+            && receipt.activation_id == frame.activation_id
+            && receipt.branch_edge_id == frame.branch_edge_id), "gateway branch arrived twice");
         let token_id = self.wait(token, "joining");
-        let receipt = AndReceipt {
-            scope_id: self.current_scope.clone(),
-            join_node_id: token.node_id.clone(),
-            activation_id: frame.activation_id.clone(),
-            branch_edge_id: frame.branch_edge_id.clone(),
-            token_id,
+        let receipt = GatewayReceipt {
+            scope_id: self.current_scope.clone(), gateway_kind: frame.gateway_kind,
+            join_node_id: token.node_id.clone(), activation_id: frame.activation_id.clone(),
+            branch_edge_id: frame.branch_edge_id.clone(), token_id,
         };
         self.receipts.push(receipt.clone());
-        self.plan.add_receipts.push(receipt);
-        let arrivals = self
-            .receipts
-            .iter()
-            .filter(|receipt| {
-                receipt.scope_id == self.current_scope
-                    && receipt.activation_id == frame.activation_id
-                    && receipt.join_node_id == frame.join_node_id
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let branches = self.outgoing(&frame.split_node_id);
-        if arrivals.len() != branches.len() {
-            return Ok(());
-        }
-        ensure!(
-            branches.iter().all(|branch| arrivals
-                .iter()
-                .any(|receipt| receipt.branch_edge_id == *branch)),
-            "parallel receipts do not match the fork branches"
-        );
+        self.plan.add_gateway_receipts.push(receipt);
+        let arrivals = self.receipts.iter().filter(|receipt| receipt.scope_id == self.current_scope
+            && receipt.join_node_id == frame.join_node_id && receipt.activation_id == frame.activation_id)
+            .cloned().collect::<Vec<_>>();
+        ensure!(arrivals.iter().all(|receipt| {
+            let Some(joining) = self.tokens.iter().find(|candidate| candidate.token_id == receipt.token_id) else { return false; };
+            receipt.gateway_kind == frame.gateway_kind
+                && frame.selected_branch_edge_ids.binary_search(&receipt.branch_edge_id).is_ok()
+                && joining.status == "joining" && joining.scope_id == self.current_scope
+                && joining.node_id == frame.join_node_id
+                && joining.fork_stack.last().is_some_and(|sibling| sibling.gateway_kind == frame.gateway_kind
+                    && sibling.activation_id == frame.activation_id
+                    && sibling.join_node_id == frame.join_node_id
+                    && sibling.branch_edge_id == receipt.branch_edge_id
+                    && sibling.selected_branch_edge_ids == frame.selected_branch_edge_ids
+                    && pair.branch_to_incoming_edge.get(&sibling.branch_edge_id) == joining.arrival_edge_id.as_ref())
+        }), "gateway receipts differ from their selected joining tokens");
+        if arrivals.len() != frame.selected_branch_edge_ids.len() { return Ok(()); }
+        ensure!(frame.selected_branch_edge_ids.iter().all(|edge| arrivals.iter().any(|receipt| &receipt.branch_edge_id == edge)),
+            "gateway receipts do not match selected branches");
         for receipt in arrivals {
             self.consume(&receipt.token_id);
-            self.receipts
-                .retain(|existing| existing.token_id != receipt.token_id);
-            if self
-                .plan
-                .add_receipts
-                .iter()
-                .any(|existing| existing.token_id == receipt.token_id)
-            {
-                self.plan
-                    .add_receipts
-                    .retain(|existing| existing.token_id != receipt.token_id);
+            self.receipts.retain(|existing| existing.token_id != receipt.token_id);
+            if self.plan.add_gateway_receipts.iter().any(|existing| existing.token_id == receipt.token_id) {
+                self.plan.add_gateway_receipts.retain(|existing| existing.token_id != receipt.token_id);
             } else {
-                self.plan.remove_receipts.push(receipt);
+                self.plan.remove_gateway_receipts.push(receipt);
             }
         }
         let mut next = token.clone();
         next.fork_stack.pop();
-        self.event(
-            "parallel_joined",
-            Some(token.node_id.clone()),
-            json!({"activation_id": frame.activation_id}),
-        );
-        for edge in self.outgoing(&token.node_id) {
-            self.follow(&next, &edge)?;
-        }
+        let kind = match frame.gateway_kind { GatewayKind::Parallel => "parallel_joined", GatewayKind::Inclusive => "inclusive_joined" };
+        let data = match frame.gateway_kind {
+            GatewayKind::Parallel => json!({"activation_id": frame.activation_id}),
+            GatewayKind::Inclusive => json!({"activation_id": frame.activation_id,
+                "selected_branch_edge_ids": frame.selected_branch_edge_ids}),
+        };
+        self.event(kind, Some(token.node_id.clone()), data);
+        for edge in self.outgoing(&token.node_id) { self.follow(&next, &edge)?; }
         Ok(())
     }
 
@@ -1685,27 +1671,74 @@ impl<'a> Transition<'a> {
                     );
                     self.follow(&token, &edge)?;
                 }
-                ProcessNodeKind::ParallelGateway => {
-                    if let Some(join_node_id) = and_pairs(self.body()?.0, self.body()?.1)?
-                        .get(&node.id)
-                        .cloned()
-                    {
-                        self.consume(&id);
+                ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
+                    let gateway_kind = match &node.kind {
+                        ProcessNodeKind::ParallelGateway => GatewayKind::Parallel,
+                        ProcessNodeKind::InclusiveGateway { .. } => GatewayKind::Inclusive,
+                        _ => unreachable!(),
+                    };
+                    let pairs = gateway_pairs(self.body()?.0, self.body()?.1)?;
+                    if let Some(pair) = pairs.get(&node.id) {
+                        ensure!(pair.kind == gateway_kind, "gateway kind differs from paired body");
+                        let all_edges = pair.branch_to_incoming_edge.keys().cloned().collect::<Vec<_>>();
+                        let (selected, default_selected) = match &node.kind {
+                            ProcessNodeKind::ParallelGateway => (all_edges.clone(), false),
+                            ProcessNodeKind::InclusiveGateway { default_flow_id } => {
+                                let effective = self.effective()?;
+                                let mut selected = Vec::new();
+                                let mut failure = None;
+                                for edge_id in &all_edges {
+                                    if default_flow_id.as_ref() == Some(edge_id) { continue; }
+                                    let edge = self.body()?.1.iter().find(|flow| flow.id == *edge_id)
+                                        .context("inclusive sequence flow missing")?;
+                                    let expression = edge.condition.as_deref().context("inclusive condition missing")?;
+                                    match evaluate(expression, &effective, &Value::Null, &[]) {
+                                        Ok(Value::Bool(true)) => selected.push(edge_id.clone()),
+                                        Ok(Value::Bool(false)) => {},
+                                        Ok(_) => { if failure.is_none() { failure = Some(("non_boolean_condition", Some(edge_id.clone()), format!("condition on flow {edge_id} is not boolean"))); } },
+                                        Err(error) => { if failure.is_none() { failure = Some(("condition_evaluation_failed", Some(edge_id.clone()), format!("condition on flow {edge_id}: {error}"))); } },
+                                    }
+                                }
+                                let default_selected = selected.is_empty() && failure.is_none() && default_flow_id.is_some();
+                                if let Some(default_edge) = default_flow_id.as_ref().filter(|_| default_selected) {
+                                    selected.push(default_edge.clone());
+                                }
+                                if failure.is_none() && selected.is_empty() {
+                                    failure = Some(("no_matching_flow", None, format!("inclusive gateway {} has no matching flow", node.id)));
+                                }
+                                if let Some((reason, condition_edge_id, message)) = failure {
+                                    let waiting_token_id = self.wait(&token, "waiting");
+                                    let message = message.chars().take(512).collect::<String>();
+                                    self.incident(&node.id, None, "INCLUSIVE_GATEWAY_ERROR", message);
+                                    if let Some(event) = self.plan.events.last_mut() {
+                                        event.data["reason"] = json!(reason);
+                                        event.data["condition_edge_id"] = json!(condition_edge_id);
+                                        event.data["source_token_id"] = json!(id);
+                                        event.data["waiting_token_id"] = json!(waiting_token_id);
+                                    }
+                                    break;
+                                }
+                                (selected, default_selected)
+                            }
+                            _ => unreachable!(),
+                        };
                         let activation_id = Uuid::new_v4().to_string();
-                        self.event(
-                            "parallel_split",
-                            Some(node.id.clone()),
-                            json!({"activation_id": activation_id}),
-                        );
-                        for edge in outgoing {
+                        self.consume(&id);
+                        let kind = match gateway_kind { GatewayKind::Parallel => "parallel_split", GatewayKind::Inclusive => "inclusive_split" };
+                        let data = match gateway_kind {
+                            GatewayKind::Parallel => json!({"activation_id": activation_id}),
+                            GatewayKind::Inclusive => json!({"activation_id": activation_id,
+                                "selected_branch_edge_ids": selected, "default_selected": default_selected}),
+                        };
+                        self.event(kind, Some(node.id.clone()), data);
+                        for edge in &selected {
                             let mut branch = token.clone();
                             branch.fork_stack.push(ForkFrame {
-                                activation_id: activation_id.clone(),
-                                split_node_id: node.id.clone(),
-                                join_node_id: join_node_id.clone(),
-                                branch_edge_id: edge.clone(),
+                                activation_id: activation_id.clone(), split_node_id: node.id.clone(),
+                                join_node_id: pair.join_node_id.clone(), branch_edge_id: edge.clone(),
+                                gateway_kind, selected_branch_edge_ids: selected.clone(),
                             });
-                            self.follow(&branch, &edge)?;
+                            self.follow(&branch, edge)?;
                         }
                     } else {
                         self.join(&token)?;
@@ -2005,9 +2038,9 @@ pub(super) fn project_snapshot(
         !plan.consume_token_ids.contains(&t.token_id)
             && !plan.cancel_token_ids.contains(&t.token_id)
     });
-    next.receipts.extend(plan.add_receipts.clone());
+    next.receipts.extend(plan.add_gateway_receipts.clone());
     next.receipts.retain(|r| {
-        !plan.remove_receipts.iter().any(|v| {
+        !plan.remove_gateway_receipts.iter().any(|v| {
             v.scope_id == r.scope_id
                 && v.activation_id == r.activation_id
                 && v.branch_edge_id == r.branch_edge_id
@@ -3685,6 +3718,410 @@ mod tests {
                 assert!(events.iter().any(|event| event.kind == "exclusive_selected"
                     && event.data["sequence_flow_id"] == "Fallback"));
             }
+        }
+    }
+
+    fn inclusive_model(default: Option<&str>, a: bool, b: bool) -> ProcessModel {
+        let mut model = super::super::model::starter_model();
+        model.variables.insert("a".into(), json!(a));
+        model.variables.insert("b".into(), json!(b));
+        model.nodes.splice(1..1, [
+            ProcessNode { id: "Split".into(), name: "Choose reviews".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: default.map(str::to_owned) } },
+            ProcessNode { id: "A".into(), name: "Review A".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "B".into(), name: "Review B".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "C".into(), name: "Review C".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Join".into(), name: "Selected reviews".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+        ]);
+        model.sequence_flows = vec![
+            edge("StartSplit", "Start_1", "Split"), edge("To_A", "Split", "A"),
+            edge("To_B", "Split", "B"), edge("To_C", "Split", "C"),
+            edge("From_A", "A", "Join"), edge("From_B", "B", "Join"),
+            edge("From_C", "C", "Join"), edge("JoinEnd", "Join", "End_1"),
+        ];
+        model.sequence_flows[1].condition = Some("vars.a == true".into());
+        model.sequence_flows[2].condition = Some("vars.b == true".into());
+        if default.is_none() { model.sequence_flows[3].condition = Some("false".into()); }
+        model
+    }
+
+    #[tokio::test]
+    async fn inclusive_selected_pair_reopens_after_one_arrival_and_joins_once() {
+        let fixture = Fixture::new();
+        let waiting = start_model(&fixture, &inclusive_model(Some("To_C"), true, true));
+        assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
+        assert_eq!(waiting.user_tasks.len(), 2);
+        assert!(waiting.user_tasks.iter().all(|task| task.node_id != "C"));
+        let first = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let partial = repository::complete_user_task(&fixture.db, &fixture.owner, &stamp("inclusive first"),
+            &waiting.instance_id, &first.user_task_id, waiting.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+        assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
+        let path = fixture.directory.path().join("processes.db");
+        let owner = fixture.owner.clone();
+        let Fixture { directory, db, router, .. } = fixture;
+        drop(router); drop(db);
+        let reopened = crate::db::init(&path).unwrap();
+        let snapshot = repository::runtime_snapshot(&reopened, &owner, &waiting.instance_id).unwrap();
+        assert_eq!(snapshot.receipts.len(), 1);
+        assert_eq!(snapshot.receipts[0].branch_edge_id, "To_B");
+        assert_eq!(snapshot.receipts[0].gateway_kind, GatewayKind::Inclusive);
+        let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
+        let plan = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let command = stamp("inclusive second");
+        let completed = repository::complete_user_task(&reopened, &owner, &command,
+            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        let replay = repository::complete_user_task(&reopened, &owner, &command,
+            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+        assert_eq!(replay.revision, completed.revision);
+        let events = repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200).unwrap().0;
+        let split = events.iter().find(|event| event.kind == "inclusive_split").unwrap();
+        assert_eq!(split.data["selected_branch_edge_ids"], json!(["To_A", "To_B"]));
+        assert_eq!(split.data["default_selected"], false);
+        assert_eq!(events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "end_reached").count(), 1);
+        drop(reopened); drop(directory);
+    }
+
+    #[tokio::test]
+    async fn nested_gateway_pairs_preserve_each_selected_activation() {
+        for (outer_inclusive, inner_inclusive, inner_b, completion_order) in [
+            (true, false, true, &["C", "A", "B"][..]),
+            (true, true, false, &["A", "C"][..]),
+            (false, true, true, &["C", "A", "B"][..]),
+        ] {
+            let fixture = Fixture::new();
+            let mut model = super::super::model::starter_model();
+            model.nodes.insert(1, ProcessNode { id: "OuterSplit".into(), name: "Choose".into(),
+                kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway } });
+            model.nodes.insert(2, ProcessNode { id: "InnerSplit".into(), name: "Nested choice".into(),
+                kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway } });
+            model.nodes.insert(3, ProcessNode { id: "InnerJoin".into(), name: "Nested done".into(),
+                kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway } });
+            model.nodes.insert(4, ProcessNode { id: "OuterJoin".into(), name: "Selected done".into(),
+                kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                    else { ProcessNodeKind::ParallelGateway } });
+            for id in ["A", "B", "C"] {
+                model.nodes.push(ProcessNode { id: id.into(), name: id.into(),
+                    kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+            }
+            model.sequence_flows = vec![
+                edge("StartOuter", "Start_1", "OuterSplit"),
+                edge("OuterInner", "OuterSplit", "InnerSplit"),
+                edge("OuterC", "OuterSplit", "C"),
+                edge("InnerA", "InnerSplit", "A"),
+                edge("InnerB", "InnerSplit", "B"),
+                edge("AInner", "A", "InnerJoin"),
+                edge("BInner", "B", "InnerJoin"),
+                edge("InnerOuter", "InnerJoin", "OuterJoin"),
+                edge("COuter", "C", "OuterJoin"),
+                edge("OuterEnd", "OuterJoin", "End_1"),
+            ];
+            if outer_inclusive {
+                model.sequence_flows[1].condition = Some("true".into());
+                model.sequence_flows[2].condition = Some("true".into());
+            }
+            if inner_inclusive {
+                model.sequence_flows[3].condition = Some("true".into());
+                model.sequence_flows[4].condition = Some(if inner_b { "true" } else { "false" }.into());
+            }
+            let mut instance = start_model(&fixture, &model);
+            assert_eq!(instance.user_tasks.len(), completion_order.len());
+            for node_id in completion_order {
+                let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance.instance_id).unwrap();
+                let task = snapshot.instance.user_tasks.iter().find(|task| task.node_id == *node_id).unwrap();
+                let at_ms = chrono::Utc::now().timestamp_millis();
+                let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+                instance = repository::complete_user_task(&fixture.db, &fixture.owner,
+                    &stamp(&format!("nested {node_id}")), &instance.instance_id, &task.user_task_id,
+                    instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+            }
+            assert_eq!(instance.status, ProcessInstanceStatus::Completed);
+            let events = repository::list_events(&fixture.db, &fixture.owner, &instance.instance_id, 0, 200).unwrap().0;
+            let outer_join_kind = if outer_inclusive { "inclusive_joined" } else { "parallel_joined" };
+            let inner_join_kind = if inner_inclusive { "inclusive_joined" } else { "parallel_joined" };
+            assert_eq!(events.iter().filter(|event| event.kind == outer_join_kind && event.node_id.as_deref() == Some("OuterJoin")).count(), 1);
+            assert_eq!(events.iter().filter(|event| event.kind == inner_join_kind && event.node_id.as_deref() == Some("InnerJoin")).count(), 1);
+            if inner_inclusive {
+                let selected = events.iter().find(|event| event.kind == "inclusive_split" && event.node_id.as_deref() == Some("InnerSplit")).unwrap();
+                assert_eq!(selected.data["selected_branch_edge_ids"], if inner_b { json!(["InnerA", "InnerB"]) } else { json!(["InnerA"]) });
+            }
+            if outer_inclusive {
+                let selected = events.iter().find(|event| event.kind == "inclusive_split" && event.node_id.as_deref() == Some("OuterSplit")).unwrap();
+                assert_eq!(selected.data["selected_branch_edge_ids"], json!(["OuterC", "OuterInner"]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_nine_branch_join_keeps_all_selected_edges() {
+        let fixture = Fixture::new();
+        let mut model = super::super::model::starter_model();
+        model.nodes.insert(1, ProcessNode { id: "Split".into(), name: "Parallel".into(),
+            kind: ProcessNodeKind::ParallelGateway });
+        model.nodes.insert(2, ProcessNode { id: "Join".into(), name: "All branches".into(),
+            kind: ProcessNodeKind::ParallelGateway });
+        model.sequence_flows = vec![edge("StartSplit", "Start_1", "Split")];
+        for index in 0..9 {
+            let node_id = format!("Branch_{index}");
+            model.nodes.push(ProcessNode { id: node_id.clone(), name: node_id.clone(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+            model.sequence_flows.push(edge(&format!("To_{index}"), "Split", &node_id));
+            model.sequence_flows.push(edge(&format!("From_{index}"), &node_id, "Join"));
+        }
+        model.sequence_flows.push(edge("JoinEnd", "Join", "End_1"));
+        let mut instance = start_model(&fixture, &model);
+        assert_eq!(instance.user_tasks.len(), 9);
+        for index in 0..9 {
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance.instance_id).unwrap();
+            let task = snapshot.instance.user_tasks.iter().find(|task| task.status == ProcessUserTaskStatus::Open).unwrap();
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+            instance = repository::complete_user_task(&fixture.db, &fixture.owner,
+                &stamp(&format!("parallel nine branch {index}")), &instance.instance_id,
+                &task.user_task_id, instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+        }
+        assert_eq!(instance.status, ProcessInstanceStatus::Completed);
+        let events = repository::list_events(&fixture.db, &fixture.owner, &instance.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "parallel_joined").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn inclusive_writer_rejects_conflicting_selected_set_without_partial_receipt() {
+        let fixture = Fixture::new();
+        let waiting = start_model(&fixture, &inclusive_model(None, true, true));
+        let task = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
+        let before = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let mut plan = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let joining = plan.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
+        joining.fork_stack.last_mut().unwrap().selected_branch_edge_ids = vec!["To_B".into()];
+        assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("forged selected set"), &waiting.instance_id, &task.user_task_id,
+            waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        assert_eq!(after.instance.revision, before.instance.revision);
+        assert_eq!(after.tokens.len(), before.tokens.len());
+        assert_eq!(after.receipts.len(), before.receipts.len());
+        assert_eq!(after.instance.user_tasks.len(), before.instance.user_tasks.len());
+        let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
+        assert!(events.iter().all(|event| event.kind != "inclusive_joined"));
+        let mut wrong_arrival = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let joining = wrong_arrival.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
+        joining.arrival_edge_id = Some("From_A".into());
+        assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("wrong join incoming edge"), &waiting.instance_id, &task.user_task_id,
+            waiting.revision, &Value::Null, None, &wrong_arrival, at_ms).is_err());
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        assert_eq!(after.instance.revision, before.instance.revision);
+        assert!(after.receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inclusive_last_arrival_rejects_forgery_atomically_then_joins_once() {
+        let fixture = Fixture::new();
+        let waiting = start_model(&fixture, &inclusive_model(None, true, true));
+        let first = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        let first_plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let partial = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("first selected branch"), &waiting.instance_id, &first.user_task_id,
+            waiting.revision, &Value::Null, None, &first_plan, at_ms).unwrap().instance;
+        assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        assert_eq!(snapshot.receipts.len(), 1);
+        let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
+        let valid = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms).unwrap();
+        assert_eq!(valid.remove_gateway_receipts.len(), 1);
+        assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            ["bpmn_instances", "bpmn_scopes", "bpmn_tokens", "bpmn_gateway_receipts",
+                "bpmn_user_tasks", "bpmn_jobs", "bpmn_incidents", "bpmn_timers",
+                "bpmn_event_subscriptions", "bpmn_event_races", "bpmn_messages", "bpmn_calls",
+                "bpmn_events", "bpmn_commands"]
+                .iter().map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+                .collect::<Vec<_>>()
+        };
+        let before = rows();
+        let mut forged_frame = valid.clone();
+        let joining = forged_frame.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
+        joining.fork_stack.last_mut().unwrap().selected_branch_edge_ids = vec!["To_A".into()];
+        assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("forged final selected set"), &waiting.instance_id, &second.user_task_id,
+            partial.revision, &Value::Null, None, &forged_frame, at_ms).is_err());
+        assert_eq!(rows(), before);
+        let mut forged_event = valid.clone();
+        forged_event.events.iter_mut().find(|event| event.kind == "inclusive_joined").unwrap()
+            .data["selected_branch_edge_ids"] = json!(["To_A"]);
+        assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("forged final join event"), &waiting.instance_id, &second.user_task_id,
+            partial.revision, &Value::Null, None, &forged_event, at_ms).is_err());
+        assert_eq!(rows(), before);
+        let command = stamp("valid final selected join");
+        let complete = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &command, &waiting.instance_id, &second.user_task_id, partial.revision,
+            &Value::Null, None, &valid, at_ms).unwrap().instance;
+        assert_eq!(complete.status, ProcessInstanceStatus::Completed);
+        let completed_rows = rows();
+        let replay = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &command, &waiting.instance_id, &second.user_task_id, partial.revision,
+            &Value::Null, None, &valid, at_ms).unwrap().instance;
+        assert_eq!(replay.revision, complete.revision);
+        assert_eq!(rows(), completed_rows);
+        let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "end_reached").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn inclusive_single_selected_activation_requires_factual_join_before_disappearing() {
+        let fixture = Fixture::new();
+        let waiting = start_model(&fixture, &inclusive_model(None, true, false));
+        assert_eq!(waiting.user_tasks.len(), 1);
+        let task = &waiting.user_tasks[0];
+        assert_eq!(task.node_id, "A");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        let valid = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        assert!(valid.remove_gateway_receipts.is_empty());
+        assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            ["bpmn_instances", "bpmn_scopes", "bpmn_tokens", "bpmn_gateway_receipts",
+                "bpmn_user_tasks", "bpmn_jobs", "bpmn_incidents", "bpmn_timers",
+                "bpmn_event_subscriptions", "bpmn_event_races", "bpmn_messages", "bpmn_calls",
+                "bpmn_events", "bpmn_commands"]
+                .iter().map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+                .collect::<Vec<_>>()
+        };
+        let before = rows();
+        let mut missing_event = valid.clone();
+        missing_event.events.retain(|event| event.kind != "inclusive_joined");
+        let error = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("singleton omitted join event"), &waiting.instance_id, &task.user_task_id,
+            waiting.revision, &Value::Null, None, &missing_event, at_ms).err().unwrap();
+        assert!(format!("{error:#}").contains("gateway activation disappeared"));
+        assert_eq!(rows(), before);
+        let mut missing_arrival = missing_event.clone();
+        let joining = missing_arrival.create_tokens.iter().find(|token| token.status == "joining")
+            .unwrap().token_id.clone();
+        missing_arrival.create_tokens.retain(|token| token.token_id != joining);
+        missing_arrival.consume_token_ids.retain(|id| id != &joining);
+        let error = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("singleton omitted join arrival and event"), &waiting.instance_id,
+            &task.user_task_id, waiting.revision, &Value::Null, None, &missing_arrival, at_ms)
+            .err().unwrap();
+        assert!(format!("{error:#}").contains("gateway activation disappeared"));
+        assert_eq!(rows(), before);
+        let mut changed_replacement = valid.clone();
+        let replacement = changed_replacement.create_tokens.iter_mut()
+            .find(|token| token.status == "joining").unwrap();
+        replacement.fork_stack.last_mut().unwrap().selected_branch_edge_ids =
+            vec!["To_A".into(), "To_B".into()];
+        let replacement_id = replacement.token_id.clone();
+        changed_replacement.consume_token_ids.retain(|id| id != &replacement_id);
+        let error = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("singleton changed replacement selection"), &waiting.instance_id,
+            &task.user_task_id, waiting.revision, &Value::Null, None, &changed_replacement,
+            at_ms).err().unwrap();
+        assert!(format!("{error:#}").contains("planned gateway frame changed"));
+        assert_eq!(rows(), before);
+        let command = stamp("singleton factual join");
+        let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
+            &Value::Null, None, &valid, at_ms).unwrap().instance;
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        let committed_rows = rows();
+        let replay = repository::complete_user_task(&fixture.db, &fixture.owner,
+            &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
+            &Value::Null, None, &valid, at_ms).unwrap().instance;
+        assert_eq!(replay.revision, completed.revision);
+        assert_eq!(rows(), committed_rows);
+        let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "end_reached").count(), 1);
+    }
+
+    #[test]
+    fn runtime_fork_frame_rejects_unknown_fields_and_rolls_back_transition() {
+        let fixture = Fixture::new();
+        let waiting = start_model(&fixture, &inclusive_model(None, true, true));
+        let task = waiting.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
+        let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let token_id = snapshot.tokens.iter().find(|token| token.node_id == "A").unwrap().token_id.clone();
+        let original: String = fixture.db.read().unwrap().query_row(
+            "SELECT fork_stack_json FROM bpmn_tokens WHERE token_id=?1", [&token_id], |row| row.get(0)).unwrap();
+        let mut malformed: Value = serde_json::from_str(&original).unwrap();
+        malformed[0].as_object_mut().unwrap().insert("unexpected".into(), json!(1));
+        assert!(serde_json::from_value::<ForkFrame>(malformed[0].clone()).is_err());
+        fixture.db.write().unwrap().execute(
+            "UPDATE bpmn_tokens SET fork_stack_json=?1 WHERE token_id=?2",
+            rusqlite::params![malformed.to_string(), token_id]).unwrap();
+        let before = {
+            let conn = fixture.db.read().unwrap();
+            ["bpmn_instances", "bpmn_tokens", "bpmn_gateway_receipts", "bpmn_user_tasks",
+                "bpmn_events", "bpmn_commands"].iter()
+                .map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+                .collect::<Vec<_>>()
+        };
+        assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+            &stamp("malformed frame"), &waiting.instance_id, &task.user_task_id,
+            waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
+        let after = {
+            let conn = fixture.db.read().unwrap();
+            ["bpmn_instances", "bpmn_tokens", "bpmn_gateway_receipts", "bpmn_user_tasks",
+                "bpmn_events", "bpmn_commands"].iter()
+                .map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn inclusive_default_and_nonretryable_failures_use_factual_waiting_tokens() {
+        let fixture = Fixture::new();
+        let default = start_model(&fixture, &inclusive_model(Some("To_C"), false, false));
+        assert_eq!(default.user_tasks.len(), 1);
+        assert_eq!(default.user_tasks[0].node_id, "C");
+        let events = repository::list_events(&fixture.db, &fixture.owner, &default.instance_id, 0, 200).unwrap().0;
+        let split = events.iter().find(|event| event.kind == "inclusive_split").unwrap();
+        assert_eq!(split.data["selected_branch_edge_ids"], json!(["To_C"]));
+        assert_eq!(split.data["default_selected"], true);
+        for (condition, reason) in [("false", "no_matching_flow"), ("1", "non_boolean_condition"), ("1 / 0 == 1", "condition_evaluation_failed")] {
+            let mut model = inclusive_model(None, false, false);
+            model.sequence_flows[1].condition = Some(condition.into());
+            let blocked = start_model(&fixture, &model);
+            assert_eq!(blocked.status, ProcessInstanceStatus::Incident);
+            assert_eq!(blocked.incidents.len(), 1);
+            assert_eq!(blocked.incidents[0].code, "INCLUSIVE_GATEWAY_ERROR");
+            assert!(!blocked.incidents[0].can_retry);
+            assert!(blocked.incidents[0].job_id.is_none());
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &blocked.instance_id).unwrap();
+            assert!(snapshot.receipts.is_empty());
+            assert_eq!(snapshot.tokens.len(), 1);
+            assert_eq!(snapshot.tokens[0].status, "waiting");
+            assert!(snapshot.tokens[0].fork_stack.is_empty());
+            let events = repository::list_events(&fixture.db, &fixture.owner, &blocked.instance_id, 0, 200).unwrap().0;
+            let incident = events.iter().find(|event| event.kind == "incident").unwrap();
+            assert_eq!(incident.data["reason"], reason);
+            if reason == "no_matching_flow" { assert!(incident.data["condition_edge_id"].is_null()); }
+            else { assert_eq!(incident.data["condition_edge_id"], "To_A"); }
+            assert_eq!(incident.data["waiting_token_id"], snapshot.tokens[0].token_id);
+            assert!(events.iter().all(|event| event.kind != "inclusive_split"));
         }
     }
 

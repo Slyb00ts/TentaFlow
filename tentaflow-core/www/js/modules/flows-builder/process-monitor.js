@@ -109,6 +109,11 @@ export function processEventText(event) {
   if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
   if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
+  if (event.kind === 'inclusive_split') return text('event_inclusive_split', { node,
+    count: event.data.selected_branch_edge_ids.length,
+    default: event.data.default_selected ? text('inclusive_default_selected') : '' });
+  if (event.kind === 'inclusive_joined') return text('event_inclusive_joined', { node,
+    count: event.data.selected_branch_edge_ids.length });
   if (event.kind.startsWith('message_')) return text(`event_${event.kind}`, {
     node, message: event.data.message_name || event.data.message_id || '',
     reason: processLifecycleReasonText(event.data.reason || ''), key: event.data.correlation_key || '',
@@ -238,6 +243,7 @@ export async function openProcessSchedule(definitionId) {
 
 function processIncidentText(incident) {
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
+  if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
   const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }

@@ -21,13 +21,13 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
-const GRAPH_ELEMENTS: [(&str, &str); 14] = [
+const GRAPH_ELEMENTS: [(&str, &str); 15] = [
     (BPMN, "extensionElements"), (BPMN, "startEvent"),
     (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
     (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
     (BPMN, "serviceTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
     (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
-    (BPMN, "parallelGateway"), (BPMN, "sequenceFlow"),
+    (BPMN, "parallelGateway"), (BPMN, "inclusiveGateway"), (BPMN, "sequenceFlow"),
 ];
 
 #[derive(Debug)]
@@ -632,6 +632,13 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 default_flow_id: element.attr("default").map(str::to_string),
             }
         }
+        "inclusiveGateway" => {
+            element.attrs_only(&["id", "name", "default", "gatewayDirection"])?;
+            element.children_only(&[])?;
+            ProcessNodeKind::InclusiveGateway {
+                default_flow_id: element.attr("default").map(str::to_string),
+            }
+        }
         "eventBasedGateway" => {
             element.attrs_only(&["id", "name", "gatewayDirection", "eventGatewayType", "instantiate"])?;
             element.children_only(&[])?;
@@ -1145,6 +1152,13 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                 "eventBasedGateway", " gatewayDirection=\"Diverging\" eventGatewayType=\"Exclusive\" instantiate=\"false\"".into()),
             ProcessNodeKind::ExclusiveGateway { default_flow_id } => (
                 "exclusiveGateway",
+                default_flow_id
+                    .as_ref()
+                    .map(|id| format!(" default=\"{}\"", escaped(id)))
+                    .unwrap_or_default(),
+            ),
+            ProcessNodeKind::InclusiveGateway { default_flow_id } => (
+                "inclusiveGateway",
                 default_flow_id
                     .as_ref()
                     .map(|id| format!(" default=\"{}\"", escaped(id)))
@@ -2172,6 +2186,57 @@ mod tests {
         let event_subprocess = xml.replacen("<bpmn:subProcess id=\"Sub_1\"",
             "<bpmn:subProcess triggeredByEvent=\"true\" id=\"Sub_1\"", 1);
         assert!(import_xml(&event_subprocess).0.is_none());
+    }
+
+    #[test]
+    fn inclusive_gateway_xml_preserves_conditions_default_ids_and_di() {
+        let mut model = super::super::model::starter_model();
+        model.variables.insert("approval_ID".into(), serde_json::json!("A&B"));
+        model.nodes.extend([
+            ProcessNode { id: "OR_Split".into(), name: "Select & notify".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Flow_Default".into()) } },
+            ProcessNode { id: "Task_A".into(), name: "Review A".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Task_B".into(), name: "Review B".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "OR_Join".into(), name: "All selected".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+        ]);
+        model.sequence_flows[0].target_id = "OR_Split".into();
+        for (id, source, target, condition) in [
+            ("Flow_A", "OR_Split", "Task_A", Some("vars.approval_ID == \"A&B\"")),
+            ("Flow_Default", "OR_Split", "Task_B", None),
+            ("Flow_A_Join", "Task_A", "OR_Join", None),
+            ("Flow_B_Join", "Task_B", "OR_Join", None),
+            ("Flow_End", "OR_Join", "End_1", None),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: target.into(),
+                condition: condition.map(str::to_string),
+            });
+        }
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "OR_Split".into(), x: 120.0, y: 160.0, width: 72.0, height: 72.0,
+        });
+        model.diagram.edges.push(ProcessEdgeDiagram {
+            sequence_flow_id: "Flow_A".into(),
+            waypoints: vec![ProcessPoint { x: 192.0, y: 196.0 }, ProcessPoint { x: 340.0, y: 196.0 }],
+        });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:inclusiveGateway id=\"OR_Split\""));
+        assert!(xml.contains("default=\"Flow_Default\""));
+        assert!(xml.contains("vars.approval_ID == &quot;A&amp;B&quot;"));
+        let (parsed, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(parsed, Some(model));
+
+        let invalid = xml.replacen("default=\"Flow_Default\"", "default=\"Flow_Missing\"", 1);
+        let (parsed, diagnostics) = import_xml(&invalid);
+        assert!(parsed.is_none());
+        assert!(diagnostics[0].fatal && diagnostics[0].message.contains("OR_Split"));
+        assert!(diagnostics[0].offset.is_some());
+        let invalid = xml.replacen("<bpmn:inclusiveGateway", "<bpmn:foreignGateway", 1);
+        assert!(import_xml(&invalid).0.is_none());
     }
 
 }

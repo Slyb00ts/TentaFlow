@@ -1119,6 +1119,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         (184, "bpmn_messages_and_event_races", MigrationStep::Sql(BPMN_MESSAGES_AND_EVENT_RACES)),
         (185, "bpmn_scopes", MigrationStep::RustSelfManaged(bpmn_scopes)),
         (186, "bpmn_calls_and_terminal_errors", MigrationStep::RustSelfManaged(bpmn_calls_and_terminal_errors)),
+        (187, "bpmn_gateway_receipts", MigrationStep::Rust(bpmn_gateway_receipts)),
     ]
 }
 
@@ -2118,6 +2119,155 @@ fn bpmn_calls_and_terminal_errors(conn: &Connection, version: i64, name: &str) -
             Ok(())
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyForkFrame {
+    activation_id: String,
+    split_node_id: String,
+    join_node_id: String,
+    branch_edge_id: String,
+}
+
+fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    use std::collections::{HashMap, HashSet};
+    use crate::processes::{model, repository};
+    use model::GatewayKind;
+    use tentaflow_protocol::processes::ProcessModel;
+
+    type TokenState = (String, String, String, Option<String>, String, Vec<repository::ForkFrame>);
+    let mut tokens: HashMap<String, TokenState> = HashMap::new();
+    let mut groups: HashMap<(String, String, String, String), Vec<String>> = HashMap::new();
+    let mut converted: Vec<(String, String)> = Vec::new();
+    let mut stmt = conn.prepare("SELECT t.token_id,t.instance_id,t.scope_id,t.node_id,t.arrival_edge_id,t.status,t.fork_stack_json,v.model_json FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, Option<String>>(4)?,row.get::<_, String>(5)?,row.get::<_, String>(6)?,row.get::<_, String>(7)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let old_token_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_tokens", [], |row| row.get(0))?;
+    ensure!(rows.len() as i64 == old_token_count, "B2e migration: token lacks pinned published model");
+    for (token_id, instance_id, scope_id, node_id, arrival_edge_id, status, stack_json, model_json) in rows {
+        let old: Vec<LegacyForkFrame> = serde_json::from_str(&stack_json)
+            .with_context(|| format!("B2e migration: malformed fork stack on token {token_id}"))?;
+        let pinned: ProcessModel = serde_json::from_str(&model_json)
+            .with_context(|| format!("B2e migration: malformed pinned model for token {token_id}"))?;
+        let mut path = Vec::new();
+        let mut current = scope_id.clone();
+        let mut visited = HashSet::new();
+        loop {
+            ensure!(visited.insert(current.clone()), "B2e migration: cyclic scope ancestry for {token_id}");
+            let scope: (Option<String>, Option<String>) = conn.query_row(
+                "SELECT parent_scope_id,subprocess_node_id FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2",
+                rusqlite::params![instance_id,current], |row| Ok((row.get(0)?,row.get(1)?)))
+                .with_context(|| format!("B2e migration: scope {current} missing for token {token_id}"))?;
+            if current == instance_id {
+                ensure!(scope.0.is_none() && scope.1.is_none(), "B2e migration: invalid root scope for {token_id}");
+                break;
+            }
+            ensure!(path.len() < 3, "B2e migration: scope too deep for {token_id}");
+            path.push(scope.1.context("B2e migration: child scope lacks subprocess node")?);
+            current = scope.0.context("B2e migration: child scope lacks parent")?;
+        }
+        path.reverse();
+        let (nodes, flows, _) = model::scope_body(&pinned, &path)?;
+        let pairs = model::gateway_pairs(nodes, flows)?;
+        ensure!(nodes.iter().any(|node| node.id == node_id), "B2e migration: token outside pinned scope body");
+        let mut stack = Vec::with_capacity(old.len());
+        for frame in old {
+            ensure!(!frame.activation_id.is_empty() && !frame.split_node_id.is_empty()
+                && !frame.join_node_id.is_empty() && !frame.branch_edge_id.is_empty(),
+                "B2e migration: empty legacy fork identity on token {token_id}");
+            let pair = pairs.get(&frame.split_node_id)
+                .with_context(|| format!("B2e migration: fork {} missing on token {token_id}", frame.split_node_id))?;
+            ensure!(pair.kind == GatewayKind::Parallel && pair.join_node_id == frame.join_node_id
+                && pair.branch_to_incoming_edge.contains_key(&frame.branch_edge_id),
+                "B2e migration: legacy fork does not match pinned parallel pair on token {token_id}");
+            let selected: Vec<String> = pair.branch_to_incoming_edge.keys().cloned().collect();
+            let key = (instance_id.clone(),scope_id.clone(),frame.join_node_id.clone(),frame.activation_id.clone());
+            if let Some(previous) = groups.get(&key) {
+                ensure!(previous == &selected, "B2e migration: conflicting legacy fork activation");
+            } else { groups.insert(key, selected.clone()); }
+            stack.push(repository::ForkFrame { activation_id: frame.activation_id,
+                split_node_id: frame.split_node_id, join_node_id: frame.join_node_id,
+                branch_edge_id: frame.branch_edge_id, gateway_kind: GatewayKind::Parallel,
+                selected_branch_edge_ids: selected });
+        }
+        if !stack.is_empty() {
+            converted.push((token_id.clone(), serde_json::to_string(&stack)?));
+        } else {
+            ensure!(stack_json == "[]", "B2e migration: empty fork stack is not canonical on token {token_id}");
+        }
+        tokens.insert(token_id, (instance_id, scope_id, node_id, arrival_edge_id, status, stack));
+    }
+    let old_receipt_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_and_receipts", [], |row| row.get(0))?;
+    let mut stmt = conn.prepare("SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id FROM bpmn_and_receipts")?;
+    let receipts = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    ensure!(receipts.len() as i64 == old_receipt_count, "B2e migration: receipt count changed while reading");
+    let mut receipt_tokens = HashSet::new();
+    for (instance_id,scope_id,join_id,activation_id,branch_id,token_id) in receipts {
+        ensure!(receipt_tokens.insert(token_id.clone()), "B2e migration: token has duplicate gateway receipts");
+        let (token_instance,token_scope,node_id,arrival_edge_id,status,stack) = tokens.get(&token_id)
+            .with_context(|| format!("B2e migration: receipt token {token_id} missing"))?;
+        let frame = stack.last().context("B2e migration: joining receipt has no top frame")?;
+        ensure!(token_instance == &instance_id && token_scope == &scope_id
+            && node_id == &join_id && status == "joining"
+            && frame.gateway_kind == GatewayKind::Parallel
+            && frame.join_node_id == join_id && frame.activation_id == activation_id
+            && frame.branch_edge_id == branch_id,
+            "B2e migration: receipt differs from its joining token {token_id}");
+        let selected = groups.get(&(instance_id.clone(),scope_id.clone(),join_id.clone(),activation_id.clone()))
+            .context("B2e migration: receipt activation missing")?;
+        ensure!(selected == &frame.selected_branch_edge_ids && selected.binary_search(&branch_id).is_ok(),
+            "B2e migration: receipt branch is not selected");
+        // The token's arrival must be the paired join incoming flow, not another route.
+        let model_json: String = conn.query_row("SELECT v.model_json FROM bpmn_instances i JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version WHERE i.instance_id=?1", [&instance_id], |row| row.get(0))?;
+        let pinned: ProcessModel = serde_json::from_str(&model_json)?;
+        let mut path = Vec::new(); let mut current = scope_id.clone(); let mut visited = HashSet::new();
+        while current != instance_id {
+            ensure!(visited.insert(current.clone()) && path.len() < 3, "B2e migration: invalid receipt scope ancestry");
+            let (parent,node): (String,String) = conn.query_row("SELECT parent_scope_id,subprocess_node_id FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2", rusqlite::params![instance_id,current], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            path.push(node); current=parent;
+        }
+        path.reverse();
+        let (nodes,flows,_) = model::scope_body(&pinned,&path)?;
+        let pairs=model::gateway_pairs(nodes,flows)?;
+        ensure!(pairs.get(&frame.split_node_id).and_then(|pair| pair.branch_to_incoming_edge.get(&branch_id)) == arrival_edge_id.as_ref(),
+            "B2e migration: receipt arrived through a wrong join edge");
+    }
+    for (token_id, (_, _, _, _, status, _)) in &tokens {
+        ensure!(status != "joining" || receipt_tokens.contains(token_id),
+            "B2e migration: joining token {token_id} lacks a gateway receipt");
+    }
+    for (token_id, json) in converted {
+        ensure!(conn.execute("UPDATE bpmn_tokens SET fork_stack_json=?1 WHERE token_id=?2", rusqlite::params![json,token_id])? == 1,
+            "B2e migration: token disappeared while converting");
+    }
+    conn.execute_batch("CREATE TABLE bpmn_gateway_receipts (
+        instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+        scope_id TEXT NOT NULL,
+        join_node_id TEXT NOT NULL,
+        activation_id TEXT NOT NULL,
+        branch_edge_id TEXT NOT NULL,
+        token_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        gateway_kind TEXT NOT NULL CHECK(gateway_kind IN ('parallel','inclusive')),
+        PRIMARY KEY(instance_id,scope_id,join_node_id,activation_id,branch_edge_id),
+        FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO bpmn_gateway_receipts(instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,gateway_kind)
+    SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,'parallel' FROM bpmn_and_receipts;
+    DROP TABLE bpmn_and_receipts;")?;
+    let new_receipt_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_gateway_receipts", [], |row| row.get(0))?;
+    ensure!(new_receipt_count == old_receipt_count, "B2e migration: gateway receipt count differs");
+    let foreign_key_violations: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
+    ensure!(foreign_key_violations == 0, "B2e migration: foreign key check failed");
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    ensure!(integrity == "ok", "B2e migration: integrity check failed: {integrity}");
+    Ok(())
 }
 
 // v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
@@ -15746,11 +15896,11 @@ mod tests {
             "SELECT name FROM flows WHERE id='flow-retained'", [], |row| row.get(0),
         ).unwrap();
         assert_eq!(retained, "Existing");
-        for table in ["bpmn_definitions", "bpmn_versions", "bpmn_instances", "bpmn_tokens", "bpmn_and_receipts", "bpmn_user_tasks", "bpmn_jobs", "bpmn_events", "bpmn_commands", "bpmn_timers"] {
+        for table in ["bpmn_definitions", "bpmn_versions", "bpmn_instances", "bpmn_tokens", "bpmn_gateway_receipts", "bpmn_user_tasks", "bpmn_jobs", "bpmn_events", "bpmn_commands", "bpmn_timers"] {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 186);
+        assert_eq!(version, 187);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -15775,7 +15925,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('message-event','message-instance',1,1,'instance_started',NULL,'message-owner','{\"customer_ID\":\"kept\"}')", []).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 186);
+        assert_eq!(version, 187);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -15877,7 +16027,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_commands(org_id,actor_user_id,command_id,request_hash,result_json,created_at_ms) VALUES('org-default','boundary-owner','old-command','old-hash','{\"instance_id\":\"boundary-instance\",\"opaque_ID\":true}',1)", []).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 186);
+        assert_eq!(version, 187);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(String, String, Option<String>, String, i64, String, Option<String>, Option<String>)> = {
@@ -15912,6 +16062,355 @@ mod tests {
         assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         let trigger: String = conn.query_row("SELECT name FROM sqlite_master WHERE type='trigger' AND name='bpmn_message_envelope_immutable'", [], |row| row.get(0)).unwrap();
         assert_eq!(trigger, "bpmn_message_envelope_immutable");
+    }
+
+    fn gateway_migration_fixture(conn: &Connection) -> (String, String) {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessNodeKind, ProcessSequenceFlow};
+
+        run_ladder_up_to(conn, 186);
+        let mut model = crate::processes::model::starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+        ]);
+        model.sequence_flows[0].target_id = "Split".into();
+        for branch in 0..9 {
+            let node_id = format!("Branch_{branch}");
+            model.nodes.push(ProcessNode { id: node_id.clone(), name: node_id.clone(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: format!("To_{branch}"), source_id: "Split".into(), target_id: node_id.clone(), condition: None,
+            });
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: format!("From_{branch}"), source_id: node_id, target_id: "Join".into(), condition: None,
+            });
+        }
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "After_Join".into(), source_id: "Join".into(), target_id: "End_1".into(), condition: None,
+        });
+        crate::processes::model::validate_model(&model).unwrap();
+        let model_json = serde_json::to_string(&model).unwrap();
+        let model_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('and-owner','AND owner','x',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('and-nine','org-default','and-owner','Nine','',1,?1,1,0,1,1)", [&model_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('and-nine',1,?1,?2,'[]',1,'and-owner')", rusqlite::params![&model_json, &model_hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('and-instance','and-nine',1,'org-default','and-owner',1,'waiting','{\"business_key\":\"retained\"}',1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES('and-instance','and-instance')", []).unwrap();
+        for branch in 0..9 {
+            let frame = serde_json::json!([{ "activation_id": "and-activation", "split_node_id": "Split",
+                "join_node_id": "Join", "branch_edge_id": format!("To_{branch}") }]).to_string();
+            let (node_id, status) = match branch {
+                0 => ("Join".to_string(), "joining"),
+                1 => (format!("Branch_{branch}"), "cancelled"),
+                _ => (format!("Branch_{branch}"), "consumed"),
+            };
+            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,'and-instance','and-instance',?2,?3,?4,?5,1)",
+                rusqlite::params![format!("token-{branch}"),node_id,format!("From_{branch}"),frame,status]).unwrap();
+        }
+        conn.execute("INSERT INTO bpmn_and_receipts(instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms) VALUES('and-instance','and-instance','Join','and-activation','To_0','token-0',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('and-event','and-instance','and-instance',1,1,'parallel_split','Split','and-owner','{\"opaque_ID\":true}')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_commands(org_id,actor_user_id,command_id,request_hash,result_json,created_at_ms) VALUES('org-default','and-owner','and-command','hash','{\"business_key\":\"unchanged\"}',1)", []).unwrap();
+        (model_json, model_hash)
+    }
+
+    #[test]
+    fn gateway_migration_preserves_populated_parallel_nine_branch_receipt_and_opaque_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("gateway-upgrade.db")).unwrap();
+        let (model_json, model_hash) = gateway_migration_fixture(&conn);
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 187);
+        assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
+        let receipt: (String, String, String) = conn.query_row("SELECT branch_edge_id,token_id,gateway_kind FROM bpmn_gateway_receipts", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(receipt, ("To_0".into(), "token-0".into(), "parallel".into()));
+        let mut stmt = conn.prepare("SELECT token_id,status,fork_stack_json FROM bpmn_tokens ORDER BY token_id").unwrap();
+        let rows: Vec<(String,String,String)> = stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows.len(), 9);
+        for (id,status,json) in rows {
+            let frame: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(frame[0]["gateway_kind"], "parallel", "{id}");
+            assert_eq!(frame[0]["selected_branch_edge_ids"].as_array().unwrap().len(), 9, "{id}");
+            assert_eq!(frame[0]["branch_edge_id"], format!("To_{}", id.trim_start_matches("token-")));
+            if id == "token-0" { assert_eq!(status, "joining"); }
+            if id == "token-1" { assert_eq!(status, "cancelled"); }
+        }
+        let retained: (String,String,String,String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json,c.result_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='and-instance' JOIN bpmn_commands c ON c.command_id='and-command' WHERE v.definition_id='and-nine'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(retained, (model_json,model_hash,"{\"opaque_ID\":true}".into(),"{\"business_key\":\"unchanged\"}".into()));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn gateway_migration_reopens_live_nine_branch_join_and_completes_once() {
+        use crate::processes::{repository, runtime};
+        use tentaflow_protocol::processes::{ProcessInstanceStatus, ProcessUserTaskStatus};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live-and-nine.db");
+        let conn = Connection::open(&path).unwrap();
+        let (model_json, model_hash) = gateway_migration_fixture(&conn);
+        conn.execute("INSERT INTO org_memberships(org_id,user_id,role_id,granted_at,granted_by) VALUES('org-default','and-owner','role-org-admin',datetime('now'),'and-owner')", []).unwrap();
+        for branch in 1..9 {
+            conn.execute("UPDATE bpmn_tokens SET status='waiting',arrival_edge_id=?1 WHERE token_id=?2",
+                rusqlite::params![format!("To_{branch}"), format!("token-{branch}")]).unwrap();
+            conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES(?1,'and-instance','and-instance',?2,?2,'and-owner','work','open','{}',1,1,1,?3)",
+                rusqlite::params![format!("task-{branch}"),format!("Branch_{branch}"),format!("token-{branch}")]).unwrap();
+        }
+        for (branch, status) in [(1, "consumed"), (2, "cancelled")] {
+            let frame = serde_json::json!([{ "activation_id": "settled-activation", "split_node_id": "Split",
+                "join_node_id": "Join", "branch_edge_id": format!("To_{branch}") }]).to_string();
+            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,'and-instance','and-instance',?2,?3,?4,?5,1)",
+                rusqlite::params![format!("historic-{branch}"),format!("Branch_{branch}"),format!("To_{branch}"),frame,status]).unwrap();
+        }
+        let original_receipt: (String,String,String,String,String,String,i64) = conn.query_row(
+            "SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms FROM bpmn_and_receipts", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
+        run(&conn).unwrap();
+        let converted_receipt: (String,String,String,String,String,String,i64,String) = conn.query_row(
+            "SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,gateway_kind FROM bpmn_gateway_receipts", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))).unwrap();
+        assert_eq!((&converted_receipt.0,&converted_receipt.1,&converted_receipt.2,&converted_receipt.3,&converted_receipt.4,&converted_receipt.5,converted_receipt.6),
+            (&original_receipt.0,&original_receipt.1,&original_receipt.2,&original_receipt.3,&original_receipt.4,&original_receipt.5,original_receipt.6));
+        assert_eq!(converted_receipt.7, "parallel");
+        let retained: (String,String,String,String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json,c.result_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='and-instance' JOIN bpmn_commands c ON c.command_id='and-command' WHERE v.definition_id='and-nine'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(retained, (model_json,model_hash,"{\"opaque_ID\":true}".into(),"{\"business_key\":\"unchanged\"}".into()));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        drop(conn);
+
+        let db = crate::db::init(&path).unwrap();
+        let actor = repository::ProcessActor { org_id: "org-default".into(), user_id: "and-owner".into() };
+        let mut last_command = None;
+        let mut last_task = String::new();
+        let mut last_revision = 0;
+        let mut last_plan = None;
+        let mut last_at_ms = 0;
+        for branch in 1..9 {
+            let snapshot = repository::runtime_snapshot(&db, &actor, "and-instance").unwrap();
+            assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Waiting);
+            let task = snapshot.instance.user_tasks.iter().find(|task| task.node_id == format!("Branch_{branch}") && task.status == ProcessUserTaskStatus::Open).unwrap();
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&serde_json::Value::Null,None,at_ms).unwrap();
+            let stamp = repository::CommandStamp { command_id: uuid::Uuid::new_v4().to_string(), request_hash: repository::request_hash(&format!("complete branch {branch}")).unwrap() };
+            last_task = task.user_task_id.clone();
+            last_revision = snapshot.instance.revision;
+            last_plan = Some(plan.clone());
+            last_at_ms = at_ms;
+            last_command = Some(stamp.clone());
+            let result = repository::complete_user_task(&db,&actor,&stamp,"and-instance",&task.user_task_id,
+                snapshot.instance.revision,&serde_json::Value::Null,None,&plan,at_ms).unwrap().instance;
+            let receipt_count: i64 = db.read().unwrap().query_row(
+                "SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id='and-instance' AND activation_id='and-activation'", [], |row| row.get(0)).unwrap();
+            if branch == 8 {
+                assert_eq!(result.status, ProcessInstanceStatus::Completed);
+                assert_eq!(receipt_count, 0);
+            } else {
+                assert_eq!(result.status, ProcessInstanceStatus::Waiting);
+                assert_eq!(receipt_count, i64::from(branch) + 1);
+            }
+        }
+        let events = repository::list_events(&db,&actor,"and-instance",0,200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "parallel_joined").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "end_reached").count(), 1);
+        let event_count = events.len();
+        let replay = repository::complete_user_task(&db,&actor,&last_command.unwrap(),"and-instance",&last_task,
+            last_revision,&serde_json::Value::Null,None,&last_plan.unwrap(),last_at_ms).unwrap().instance;
+        assert_eq!(replay.status, ProcessInstanceStatus::Completed);
+        assert_eq!(repository::list_events(&db,&actor,"and-instance",0,200).unwrap().0.len(), event_count);
+        let conn = db.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id='and-instance'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_user_tasks WHERE instance_id='and-instance' AND status='open'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_tokens WHERE instance_id='and-instance' AND status IN ('ready','waiting','joining')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        let retained_after: (String,String,String,String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json,c.result_json FROM bpmn_versions v JOIN bpmn_events e ON e.event_id='and-event' JOIN bpmn_commands c ON c.command_id='and-command' WHERE v.definition_id='and-nine'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(retained_after, retained);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn gateway_migration_rejects_corrupt_retained_frame_without_partial_schema_or_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("gateway-corrupt.db")).unwrap();
+        let (model_json, model_hash) = gateway_migration_fixture(&conn);
+        let corrupt = "[{\"activation_id\":\"and-activation\",\"split_node_id\":\"Split\",\"join_node_id\":\"Join\",\"branch_edge_id\":\"To_1\",\"unknown\":true}]";
+        conn.execute("UPDATE bpmn_tokens SET fork_stack_json=?1 WHERE token_id='token-1'", [corrupt]).unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 186);
+        assert!(table_exists(&conn, "bpmn_and_receipts").unwrap());
+        assert!(!table_exists(&conn, "bpmn_gateway_receipts").unwrap());
+        assert_eq!(conn.query_row("SELECT fork_stack_json FROM bpmn_tokens WHERE token_id='token-1'", [], |row| row.get::<_, String>(0)).unwrap(), corrupt);
+        let retained: (String,String,String) = conn.query_row("SELECT model_json,model_sha256,(SELECT data_json FROM bpmn_events WHERE event_id='and-event') FROM bpmn_versions WHERE definition_id='and-nine'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(retained, (model_json,model_hash,"{\"opaque_ID\":true}".into()));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gateway_migration_rejects_joining_token_without_receipt_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("gateway-orphan.db")).unwrap();
+        let (model_json, model_hash) = gateway_migration_fixture(&conn);
+        conn.execute("DELETE FROM bpmn_and_receipts WHERE token_id='token-0'", []).unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 186);
+        assert!(table_exists(&conn, "bpmn_and_receipts").unwrap());
+        assert!(!table_exists(&conn, "bpmn_gateway_receipts").unwrap());
+        let retained: (String, String, String) = conn.query_row(
+            "SELECT model_json,model_sha256,(SELECT fork_stack_json FROM bpmn_tokens WHERE token_id='token-0') FROM bpmn_versions WHERE definition_id='and-nine'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(retained.0, model_json);
+        assert_eq!(retained.1, model_hash);
+        assert!(!retained.2.contains("gateway_kind"), "a failed migration must preserve the legacy token frame");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gateway_migration_uses_the_pinned_embedded_body_for_child_receipts() {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessSubProcess};
+
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("gateway-child.db")).unwrap();
+        gateway_migration_fixture(&conn);
+        let original: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&original).unwrap();
+        let child_nodes = vec![
+            ProcessNode { id: "Child_Start".into(), name: String::new(), kind: ProcessNodeKind::Start },
+            ProcessNode { id: "Child_Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Child_A".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Child_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { id: "Nested_A".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { id: "Nested_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { id: "Nested_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Child_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Child_End".into(), name: String::new(), kind: ProcessNodeKind::End },
+        ];
+        let child_flows = [
+            ("Child_Entry", "Child_Start", "Child_Split"),
+            ("Child_To_A", "Child_Split", "Child_A"),
+            ("Child_To_B", "Child_Split", "Child_B"),
+            ("Nested_To_A", "Child_A", "Nested_A"),
+            ("Nested_To_B", "Child_A", "Nested_B"),
+            ("Nested_From_A", "Nested_A", "Nested_Join"),
+            ("Nested_From_B", "Nested_B", "Nested_Join"),
+            ("Child_From_A", "Nested_Join", "Child_Join"),
+            ("Child_From_B", "Child_B", "Child_Join"),
+            ("Child_Exit", "Child_Join", "Child_End"),
+        ].into_iter().map(|(id, source_id, target_id)| ProcessSequenceFlow {
+            id: id.into(), source_id: source_id.into(), target_id: target_id.into(), condition: None,
+        }).collect();
+        model.nodes.iter_mut().find(|node| node.id == "Branch_1").unwrap().kind = ProcessNodeKind::SubProcess {
+            body: ProcessSubProcess { nodes: child_nodes, sequence_flows: child_flows, variables: Default::default(), diagram: Default::default() },
+            input_mapping: Default::default(), output_mapping: Default::default(),
+        };
+        crate::processes::model::validate_model(&model).unwrap();
+        let pinned_json = serde_json::to_string(&model).unwrap();
+        let pinned_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='and-nine'", rusqlite::params![&pinned_json, &pinned_hash]).unwrap();
+        conn.execute("UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id='and-nine'", [&pinned_json]).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='waiting' WHERE token_id='token-1'", []).unwrap();
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms) VALUES('child-scope','and-instance','and-instance','Branch_1','token-1',1,'waiting','{\"Child_ID\":\"retained\"}',1,1)", []).unwrap();
+        let frame = serde_json::json!([
+            { "activation_id": "child-activation", "split_node_id": "Child_Split",
+                "join_node_id": "Child_Join", "branch_edge_id": "Child_To_A" },
+            { "activation_id": "nested-activation", "split_node_id": "Child_A",
+                "join_node_id": "Nested_Join", "branch_edge_id": "Nested_To_A" }
+        ]).to_string();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('child-token','and-instance','child-scope','Nested_Join','Nested_From_A',?1,'joining',1)", [&frame]).unwrap();
+        conn.execute("INSERT INTO bpmn_and_receipts(instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms) VALUES('and-instance','child-scope','Nested_Join','nested-activation','Nested_To_A','child-token',1)", []).unwrap();
+
+        run(&conn).unwrap();
+        let converted: String = conn.query_row("SELECT fork_stack_json FROM bpmn_tokens WHERE token_id='child-token'", [], |row| row.get(0)).unwrap();
+        let converted: serde_json::Value = serde_json::from_str(&converted).unwrap();
+        assert_eq!(converted[0]["gateway_kind"], "parallel");
+        assert_eq!(converted[0]["selected_branch_edge_ids"], serde_json::json!(["Child_To_A", "Child_To_B"]));
+        assert_eq!(converted[1]["gateway_kind"], "parallel");
+        assert_eq!(converted[1]["selected_branch_edge_ids"], serde_json::json!(["Nested_To_A", "Nested_To_B"]));
+        assert_eq!(conn.query_row("SELECT gateway_kind FROM bpmn_gateway_receipts WHERE token_id='child-token'", [], |row| row.get::<_, String>(0)).unwrap(), "parallel");
+        assert_eq!(conn.query_row("SELECT local_variables_json FROM bpmn_scopes WHERE scope_id='child-scope'", [], |row| row.get::<_, String>(0)).unwrap(), "{\"Child_ID\":\"retained\"}");
+        let persisted: (String, String) = conn.query_row("SELECT model_json,model_sha256 FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(persisted, (pinned_json, pinned_hash));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gateway_migration_preserves_active_call_parent_frame_and_child_facts() {
+        use tentaflow_protocol::processes::{ProcessCallableReference, ProcessNode, ProcessNodeKind, ProcessSequenceFlow};
+
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("gateway-call.db")).unwrap();
+        gateway_migration_fixture(&conn);
+        conn.execute("INSERT INTO org_memberships(org_id,user_id,role_id,granted_at,granted_by) VALUES('org-default','and-owner','role-org-admin',datetime('now'),'and-owner')", []).unwrap();
+        let parent_json: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get(0)).unwrap();
+        let mut parent: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&parent_json).unwrap();
+        let called_definition_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let reference = ProcessCallableReference { namespace_uri: "https://tentaflow.app/bpmn/1".into(), process_id: "Called_Process".into() };
+        parent.nodes.iter_mut().find(|node| node.id == "Branch_1").unwrap().kind = ProcessNodeKind::CallActivity {
+            called_definition_id: called_definition_id.into(), called_version: 1, called_element: reference.clone(),
+            input_mapping: Default::default(), output_mapping: Default::default(),
+        };
+        crate::processes::model::validate_model(&parent).unwrap();
+        let parent_json = serde_json::to_string(&parent).unwrap();
+        let parent_hash = crate::processes::repository::request_hash(&parent).unwrap();
+        let mut child = crate::processes::model::starter_model();
+        child.process_id = "Called_Process".into();
+        child.nodes.insert(1, ProcessNode { id: "Child_Work".into(), name: "Child work".into(),
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
+        child.sequence_flows[0].target_id = "Child_Work".into();
+        child.sequence_flows.push(ProcessSequenceFlow { id: "Child_Exit".into(), source_id: "Child_Work".into(), target_id: "End_1".into(), condition: None });
+        crate::processes::model::validate_model(&child).unwrap();
+        let child_json = serde_json::to_string(&child).unwrap();
+        let child_hash = crate::processes::repository::request_hash(&child).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='and-nine'", rusqlite::params![&parent_json,&parent_hash]).unwrap();
+        conn.execute("UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id='and-nine'", [&parent_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES(?1,'org-default','and-owner','Called','',1,?2,1,0,1,1)", rusqlite::params![called_definition_id,&child_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES(?1,1,?2,?3,'[]',1,'and-owner')", rusqlite::params![called_definition_id,&child_json,&child_hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_call_pins(definition_id,version,node_id,called_definition_id,called_version,called_element_json,model_sha256) VALUES('and-nine',1,'Branch_1',?1,1,?2,?3)", rusqlite::params![called_definition_id,serde_json::to_string(&reference).unwrap(),&child_hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_call_dependencies(definition_id,version,called_definition_id,called_version,model_sha256) VALUES('and-nine',1,?1,1,?2)", rusqlite::params![called_definition_id,&child_hash]).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET node_id='Branch_1',arrival_edge_id='To_1',status='waiting' WHERE token_id='token-1'", []).unwrap();
+        conn.execute(r#"INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('called-instance',?1,1,'org-default','and-owner',1,'waiting','{"opaque_child_ID":true}',1,1)"#, [called_definition_id]).unwrap();
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES('called-instance','called-instance')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('called-token','called-instance','called-instance','Child_Work','Flow_1','[]','waiting',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES('called-task','called-instance','called-instance','Child_Work','Child work','and-owner','work','open','{}',1,1,1,'called-token')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES('active-call','and-instance','and-instance','token-1','Branch_1','called-instance','and-nine',1,?1,1,?2,1,'waiting',1,1)", rusqlite::params![called_definition_id,&child_hash]).unwrap();
+        let before: (String,String,String,String) = conn.query_row("SELECT c.call_id,c.status,i.variables_json,t.fork_stack_json FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id JOIN bpmn_tokens t ON t.token_id=c.parent_token_id WHERE c.call_id='active-call'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        run(&conn).unwrap();
+        let after: (String,String,String,String) = conn.query_row("SELECT c.call_id,c.status,i.variables_json,t.fork_stack_json FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id JOIN bpmn_tokens t ON t.token_id=c.parent_token_id WHERE c.call_id='active-call'", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!((&after.0,&after.1,&after.2), (&before.0,&before.1,&before.2));
+        let frame: serde_json::Value = serde_json::from_str(&after.3).unwrap();
+        assert_eq!(frame[0]["gateway_kind"], "parallel");
+        assert_eq!(frame[0]["selected_branch_edge_ids"].as_array().unwrap().len(), 9);
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_user_tasks WHERE user_task_id='called-task'", [], |row| row.get::<_, String>(0)).unwrap(), "open");
+        assert_eq!(conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id=?1", [called_definition_id], |row| row.get::<_, String>(0)).unwrap(), child_json);
+        assert_eq!(conn.query_row("SELECT model_sha256 FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get::<_, String>(0)).unwrap(), parent_hash);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        drop(conn);
+        let db = crate::db::init(&directory.path().join("gateway-call.db")).unwrap();
+        let actor = crate::processes::repository::ProcessActor { org_id: "org-default".into(), user_id: "and-owner".into() };
+        let parent = crate::processes::repository::get_instance(&db, &actor, "and-instance", None).unwrap();
+        assert_eq!(parent.calls.len(), 1);
+        match &parent.calls[0] {
+            tentaflow_protocol::processes::ProcessCallSummary::Outgoing { call_node_id, status, child, .. } => {
+                assert_eq!(call_node_id, "Branch_1");
+                assert_eq!(*status, tentaflow_protocol::processes::ProcessCallStatus::Waiting);
+                assert_eq!(child.as_ref().unwrap().instance_id, "called-instance");
+            }
+            other => panic!("expected the parent's actual outgoing call, got {other:?}"),
+        }
+        let child = crate::processes::repository::get_instance(&db, &actor, "called-instance", None).unwrap();
+        assert_eq!(child.variables["opaque_child_ID"], true);
+        assert_eq!(child.user_tasks.len(), 1);
     }
 
 }

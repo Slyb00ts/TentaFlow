@@ -26069,4 +26069,34 @@ mod process_wire_tests {
             MessageBody::ProcessBody(ProcessPayload::InstanceGetRequest { pages: Some(pages), .. })
                 if pages.calls.as_ref().is_some_and(|page| page.offset == 20 && page.limit == 20)));
     }
+
+    #[test]
+    fn process_request_encoder_keeps_inclusive_gateway_default_and_conditions() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Selection","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[
+                    {"id":"OR_1","name":"Select","kind":{"InclusiveGateway":{"default_flow_id":"Flow_Default"}}},
+                    {"id":"OR_Join","name":"Join","kind":{"InclusiveGateway":{"default_flow_id":null}}}
+                ],"sequence_flows":[
+                    {"id":"Flow_A","source_id":"OR_1","target_id":"Task_A","condition":"vars.business_key == 1"},
+                    {"id":"Flow_Default","source_id":"OR_1","target_id":"Task_B","condition":null}
+                ],"variables":{"business_key":{"inner_value":7}},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::InclusiveGateway {
+            default_flow_id: Some("Flow_Default".into()),
+        });
+        assert_eq!(model.nodes[1].kind, ProcessNodeKind::InclusiveGateway { default_flow_id: None });
+        assert_eq!(model.sequence_flows[0].condition.as_deref(), Some("vars.business_key == 1"));
+        assert_eq!(model.variables["business_key"]["inner_value"], 7);
+    }
 }

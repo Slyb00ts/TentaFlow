@@ -94,7 +94,7 @@ fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         "bpmn_instances",
         "bpmn_scopes",
         "bpmn_tokens",
-        "bpmn_and_receipts",
+        "bpmn_gateway_receipts",
         "bpmn_user_tasks",
         "bpmn_jobs",
         "bpmn_incidents",
@@ -1062,101 +1062,119 @@ fn parent_sibling_revision_race_replans_return_without_incident_and_interruption
 }
 
 #[test]
-fn parent_and_child_parallel_receipts_are_isolated_in_both_completion_orders() {
-    for child_first in [false, true] {
-        let f = Fixture::new();
-        let mut inner = user_model(None);
-        inner
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == "Work")
-            .unwrap()
-            .kind = ProcessNodeKind::UserTask {
-            assignee_user_id: None,
-            output_mapping: BTreeMap::new(),
-        };
-        inner.nodes.extend([
-            ProcessNode {
-                id: "ChildSplit".into(),
-                name: "Split child".into(),
-                kind: ProcessNodeKind::ParallelGateway,
-            },
-            ProcessNode {
-                id: "ChildJoin".into(),
-                name: "Join child".into(),
-                kind: ProcessNodeKind::ParallelGateway,
-            },
-            ProcessNode {
-                id: "OtherWork".into(),
-                name: "Other child work".into(),
-                kind: ProcessNodeKind::UserTask {
-                    assignee_user_id: None,
-                    output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
-                },
-            },
-        ]);
-        inner.sequence_flows = vec![
-            edge("ChildStartSplit", "Start_1", "ChildSplit"),
-            edge("ChildSplitLeft", "ChildSplit", "Work"),
-            edge("ChildSplitRight", "ChildSplit", "OtherWork"),
-            edge("ChildLeftJoin", "Work", "ChildJoin"),
-            edge("ChildRightJoin", "OtherWork", "ChildJoin"),
-            edge("ChildJoinEnd", "ChildJoin", "End_1"),
-        ];
-        let leaf = publish_model(&f, &inner);
-        let outer = publish_model(&f, &parallel_caller(&leaf));
-        let parent = messages::test_support::start_version(&f, &outer);
-        let child = child_id(&f, &parent.instance_id);
-        complete(&f, &f.owner, &child, json!({"answer":42}));
-        let halfway = repository::runtime_snapshot(&f.db, &f.owner, &child).unwrap();
-        assert_eq!(halfway.receipts.len(), 1);
-        assert_eq!(halfway.receipts[0].scope_id, child);
-        assert_eq!(halfway.receipts[0].join_node_id, "ChildJoin");
-        assert!(
-            repository::runtime_snapshot(&f.db, &f.owner, &parent.instance_id)
+fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
+    for inclusive in [false, true] {
+        for child_first in [false, true] {
+            let f = Fixture::new();
+            let mut inner = user_model(None);
+            inner
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "Work")
                 .unwrap()
-                .receipts
-                .is_empty()
-        );
-        let order = if child_first {
-            [&child, &parent.instance_id]
-        } else {
-            [&parent.instance_id, &child]
-        };
-        complete(&f, &f.owner, order[0], json!({"answer":42}));
-        let waiting_parent =
-            repository::runtime_snapshot(&f.db, &f.owner, &parent.instance_id).unwrap();
-        assert_eq!(
-            waiting_parent.instance.status,
-            ProcessInstanceStatus::Waiting
-        );
-        assert_eq!(waiting_parent.receipts.len(), 1);
-        assert_eq!(waiting_parent.receipts[0].scope_id, parent.instance_id);
-        assert_eq!(waiting_parent.receipts[0].join_node_id, "Join");
-        complete(&f, &f.owner, order[1], json!({"answer":42}));
-        for id in [&child, &parent.instance_id] {
-            let final_state = repository::runtime_snapshot(&f.db, &f.owner, id).unwrap();
-            assert_eq!(
-                final_state.instance.status,
-                ProcessInstanceStatus::Completed
+                .kind = ProcessNodeKind::UserTask {
+                assignee_user_id: None,
+                output_mapping: BTreeMap::new(),
+            };
+            inner.nodes.extend([
+                ProcessNode {
+                    id: "ChildSplit".into(),
+                    name: "Split child".into(),
+                    kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                        else { ProcessNodeKind::ParallelGateway },
+                },
+                ProcessNode {
+                    id: "ChildJoin".into(),
+                    name: "Join child".into(),
+                    kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
+                        else { ProcessNodeKind::ParallelGateway },
+                },
+                ProcessNode {
+                    id: "OtherWork".into(),
+                    name: "Other child work".into(),
+                    kind: ProcessNodeKind::UserTask {
+                        assignee_user_id: None,
+                        output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
+                    },
+                },
+            ]);
+            inner.sequence_flows = vec![
+                edge("ChildStartSplit", "Start_1", "ChildSplit"),
+                edge("ChildSplitLeft", "ChildSplit", "Work"),
+                edge("ChildSplitRight", "ChildSplit", "OtherWork"),
+                edge("ChildLeftJoin", "Work", "ChildJoin"),
+                edge("ChildRightJoin", "OtherWork", "ChildJoin"),
+                edge("ChildJoinEnd", "ChildJoin", "End_1"),
+            ];
+            if inclusive {
+                inner.sequence_flows[1].condition = Some("true".into());
+                inner.sequence_flows[2].condition = Some("true".into());
+            }
+            let leaf = publish_model(&f, &inner);
+            let mut outer_model = parallel_caller(&leaf);
+            if inclusive {
+                for node in &mut outer_model.nodes {
+                    if node.id == "Split" || node.id == "Join" {
+                        node.kind = ProcessNodeKind::InclusiveGateway { default_flow_id: None };
+                    }
+                }
+                outer_model.sequence_flows[1].condition = Some("true".into());
+                outer_model.sequence_flows[2].condition = Some("true".into());
+            }
+            let outer = publish_model(&f, &outer_model);
+            let parent = messages::test_support::start_version(&f, &outer);
+            let child = child_id(&f, &parent.instance_id);
+            complete(&f, &f.owner, &child, json!({"answer":42}));
+            let halfway = repository::runtime_snapshot(&f.db, &f.owner, &child).unwrap();
+            assert_eq!(halfway.receipts.len(), 1);
+            assert_eq!(halfway.receipts[0].scope_id, child);
+            assert_eq!(halfway.receipts[0].join_node_id, "ChildJoin");
+            assert!(
+                repository::runtime_snapshot(&f.db, &f.owner, &parent.instance_id)
+                    .unwrap()
+                    .receipts
+                    .is_empty()
             );
-            assert!(final_state.receipts.is_empty());
-            assert!(final_state.tokens.is_empty());
+            let order = if child_first {
+                [&child, &parent.instance_id]
+            } else {
+                [&parent.instance_id, &child]
+            };
+            complete(&f, &f.owner, order[0], json!({"answer":42}));
+            let waiting_parent =
+                repository::runtime_snapshot(&f.db, &f.owner, &parent.instance_id).unwrap();
             assert_eq!(
-                events(&f, id)
+                waiting_parent.instance.status,
+                ProcessInstanceStatus::Waiting
+            );
+            assert_eq!(waiting_parent.receipts.len(), 1);
+            assert_eq!(waiting_parent.receipts[0].scope_id, parent.instance_id);
+            assert_eq!(waiting_parent.receipts[0].join_node_id, "Join");
+            complete(&f, &f.owner, order[1], json!({"answer":42}));
+            for id in [&child, &parent.instance_id] {
+                let final_state = repository::runtime_snapshot(&f.db, &f.owner, id).unwrap();
+                assert_eq!(
+                    final_state.instance.status,
+                    ProcessInstanceStatus::Completed
+                );
+                assert!(final_state.receipts.is_empty());
+                assert!(final_state.tokens.is_empty());
+                assert_eq!(
+                    events(&f, id)
+                        .iter()
+                        .filter(|event| event.kind == if inclusive { "inclusive_joined" } else { "parallel_joined" })
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                events(&f, &parent.instance_id)
                     .iter()
-                    .filter(|event| event.kind == "parallel_joined")
+                    .filter(|event| event.kind == "call_returned")
                     .count(),
                 1
             );
         }
-        assert_eq!(
-            events(&f, &parent.instance_id)
-                .iter()
-                .filter(|event| event.kind == "call_returned")
-                .count(),
-            1
-        );
     }
 }
 

@@ -243,6 +243,47 @@ test('editor enters a real subprocess and saves its complete root model after re
   assert.equal(saved.nodes[1].kind.SubProcess.body.variables.local_ID.business_key, 'kept');
 });
 
+test('undo and redo clear selections and restore the active scope inspector and breadcrumb', async () => {
+  const current = definition('undo-root-definition', { model: embeddedModel() });
+  const state = await mount(current);
+  state.canvas.selectNode('Scope_Review');
+  click(state.config.root.querySelector('[data-process-enter]'));
+  assert.deepEqual(state.canvas.processPath, ['Scope_Review']);
+  const template = processTemplates().find((item) => item.node_type === 'bpmn_inclusive_gateway');
+  const added = state.canvas.addNodeFromTemplate(template, 300, 200);
+  assert.deepEqual([...state.canvas.selectedIds], [added.id]);
+  assert.equal(state.config.node?.id, added.id);
+  assert.ok(state.config.root.querySelector('[data-process="name"]'));
+
+  state.canvas.undo();
+  assert.deepEqual(state.canvas.processPath, []);
+  assert.deepEqual(state.canvas.getData(), current.model);
+  assert.deepEqual([...state.canvas.selectedIds], []);
+  assert.equal(state.canvas.selectedEdgeId, null);
+  assert.ok(state.config.root.querySelector('.fb-config-empty'));
+  assert.equal(state.config.node, null);
+  assert.equal(state.config.root.querySelector('[data-process="name"]'), null);
+  assert.equal(state.root.querySelector('[data-role="scope-path"]').hidden, true);
+  assert.equal(state.root.querySelector('[data-role="crumb-name"]').textContent, current.name);
+  assert.deepEqual(state.canvas.nodes.map((node) => node.id), ['Start', 'Scope_Review', 'End']);
+
+  state.canvas.selectNode('Scope_Review');
+  assert.deepEqual([...state.canvas.selectedIds], ['Scope_Review']);
+  assert.equal(state.config.node?.id, 'Scope_Review');
+  state.canvas.redo();
+  assert.deepEqual(state.canvas.processPath, ['Scope_Review']);
+  assert.ok(state.canvas.nodes.some((node) => node.id === added.id));
+  assert.equal(state.canvas.nodes.some((node) => node.id === 'Scope_Review'), false);
+  assert.deepEqual([...state.canvas.selectedIds], []);
+  assert.equal(state.canvas.selectedEdgeId, null);
+  assert.equal(state.config.node, null);
+  assert.ok(state.config.root.querySelector('.fb-config-empty'));
+  assert.equal(state.config.root.querySelector('[data-process="name"]'), null);
+  assert.equal(state.root.querySelector('[data-role="scope-path"]').hidden, false);
+  assert.match(state.root.querySelector('[data-role="scope-path"]').textContent, /Review department/);
+  assert.equal(state.root.querySelector('[data-role="crumb-name"]').textContent, current.name);
+});
+
 test('participant inspects a scoped run through authorized ScopeGet without definition access', async () => {
   const scope = { scopeId: 'scope-child-1', parentScopeId: 'instance-scoped', subprocessNodeId: 'Scope_Review',
     subprocessNodeName: 'Review department', parentTokenId: 'waiting-parent', revision: 2,
@@ -292,6 +333,37 @@ test('all five locales render persisted subprocess history and interruption reas
   assert.match(win.textContent, /Scope_Review/);
   assert.match(win.textContent, /<Review>/);
   assert.equal(win.querySelector('review'), null, 'node names remain escaped text in history');
+});
+
+test('inclusive split and join history shows selected paths and a no-job incident without offering Retry', async () => {
+  const events = [
+    { kind: 'inclusive_split', nodeName: '<Choose>', data: { selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } },
+    { kind: 'inclusive_joined', nodeName: '<Join>', data: { selected_branch_edge_ids: ['Flow_A', 'Flow_B'] } },
+    { kind: 'inclusive_split', nodeName: '<Choose>', data: { selected_branch_edge_ids: ['Flow_Default'], default_selected: true } },
+  ];
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      assert.notEqual(I18n.t('bpmn.node_inclusive_gateway'), 'bpmn.node_inclusive_gateway');
+      for (const event of events) {
+        const rendered = processEventText(event);
+        assert.match(rendered, new RegExp(String(event.data.selected_branch_edge_ids.length)));
+        assert.doesNotMatch(rendered, /bpmn\.|Flow_A|Flow_B|Flow_Default|\{(?:node|count|default)\}/);
+      }
+      assert.ok(processEventText(events[2]).includes(I18n.t('bpmn.inclusive_default_selected')));
+      const current = instance(`or-${language}`, { canCancel: true, status: 'Incident', incidents: [{
+        incidentId: 'or-incident', nodeId: 'OR_Split', nodeName: '<Choose>', scopeId: `or-${language}`,
+        jobId: null, code: 'INCLUSIVE_GATEWAY_ERROR', message: 'non_boolean_condition', canRetry: false,
+      }] });
+      const history = events.map((event, index) => ({ ...event, seq: index + 1, atMs: 1000 + index }));
+      const win = await monitor(current, { processHistoryRequest: { events: history, nextSeq: history.length, hasMore: false } });
+      assert.ok(win.querySelector('[data-incidents]').textContent.includes(I18n.t('bpmn.incident_inclusive_guidance')));
+      assert.equal(win.querySelector('[data-incidents] [data-retry]'), null);
+      assert.ok(win.querySelector('[data-cancel]'), 'the actual initiator retains the existing Cancel action');
+      assert.equal(win.querySelector('choose'), null, 'untrusted node names remain text');
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
 });
 
 test('duplicating a subprocess rekeys its complete local graph without rewriting the original', () => {
@@ -709,6 +781,54 @@ test('canvas connection and undo preserve identity and deletion clears an XOR de
   graph.destroy();
 });
 
+test('inclusive gateway inspector saves every condition and a stable default through clone and deletion', async () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_inclusive_gateway'), 220, 100);
+  const split = graph.nodes.at(-1);
+  const review = userNode(graph);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_inclusive_gateway'), 520, 100);
+  const join = graph.nodes.at(-1);
+  graph.connectNodes(split.id, review.id);
+  const conditional = graph.edges.at(-1);
+  graph.connectNodes(split.id, join.id);
+  const fallback = graph.edges.at(-1);
+  assert.ok(graph.edges.some((edge) => edge.id === fallback.id && edge.from_node === split.id));
+  const config = inspector(graph);
+  config.show(split, graph.templates.get(split.type));
+  await flush(1);
+  assert.ok(config.root.querySelector('[data-process="defaultFlowId"]').hasAttribute('wrap-selected'));
+  const defaultPicker = config.root.querySelector('[data-process="defaultFlowId"]');
+  assert.ok(Array.from(defaultPicker._select.options).some((option) => option.value === fallback.id), 'the real select lists the outgoing fallback');
+  change(defaultPicker, fallback.id);
+  assert.equal(defaultPicker.value, fallback.id, 'the real select retains the selected edge');
+  assert.equal(split.config.defaultFlowId, fallback.id, 'selecting the default updates the gateway');
+  config.showEdge(conditional);
+  assert.equal(config.root.querySelector('[data-process="condition"]').tagName, 'TF-TEXTAREA');
+  change(config.root.querySelector('[data-process="condition"]'), 'vars.Request_ID == "yes"');
+  assert.equal(conditional.condition, 'vars.Request_ID == "yes"');
+  assert.equal(split.config.defaultFlowId, fallback.id);
+  const selected = graph.getData();
+  const saved = selected.nodes.find((node) => node.id === split.id).kind.InclusiveGateway;
+  assert.equal(saved.defaultFlowId, fallback.id);
+  assert.equal(selected.sequenceFlows.find((flow) => flow.id === conditional.id).condition, 'vars.Request_ID == "yes"');
+  config.show(split, graph.templates.get(split.type));
+  await flush(1);
+  change(config.root.querySelector('[data-process="defaultFlowId"]'), conditional.id);
+  assert.equal(split.config.defaultFlowId, conditional.id);
+  assert.equal(conditional.condition, null, 'selecting a default clears its CEL condition');
+  config.showEdge(conditional);
+  assert.ok(config.root.querySelector('[data-process="condition"]').hasAttribute('disabled'));
+  config.show(split, graph.templates.get(split.type));
+  await flush(1);
+  change(config.root.querySelector('[data-process="defaultFlowId"]'), fallback.id);
+  graph.selectNode(split.id);
+  graph.duplicateNodes([split.id]);
+  assert.equal(graph.nodes.at(-1).config.defaultFlowId, null, 'a cloned gateway must not refer to the original path');
+  graph.selectEdge(fallback.id); graph.deleteSelected();
+  assert.equal(split.config.defaultFlowId, null, 'deleting a path clears its selected default');
+  graph.destroy(); config.destroy();
+});
+
 test('inspector selects an eligible person by stable ID and inner blur cannot clear the assignment', () => {
   const graph = canvas(); const node = userNode(graph); const config = inspector(graph);
   config.show(node, graph.templates.get(node.type));
@@ -749,7 +869,7 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 18);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 19);
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1311,13 +1431,13 @@ test('run uses immutable selected version variables and blocks oversized input b
 });
 
 test('all five locales translate supported elements, current statuses and every finite event without exposing internal IDs', async () => {
-  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
+  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 18);
+    assert.equal(processTemplates().length, 19);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
-      const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
+      const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });
       assert.doesNotMatch(output, /bpmn\.|raw-job|raw-task|SOURCE_ACCESS_REVOKED/);
     }
   }

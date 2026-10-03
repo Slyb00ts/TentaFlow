@@ -458,7 +458,8 @@ function processModel(model, nested = false) {
         verification: verified ?? 'Human',
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
         ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }) };
-    } else if (tag === 'ExclusiveGateway') {
+    } else if (tag === 'ExclusiveGateway' || tag === 'InclusiveGateway') {
+      if (tag === 'InclusiveGateway') processKnownFields(body, ['defaultFlowId'], 'inclusive gateway');
       fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };
     } else if (tag === 'TimerStart' || tag === 'TimerCatch') {
       if (Object.keys(body).some((key) => key !== 'timer')) throw new TypeError(`unsupported ${tag} field`);

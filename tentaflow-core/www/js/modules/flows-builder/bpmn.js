@@ -20,6 +20,7 @@ const ELEMENTS = [
   ['CallActivity', 'call_activity', 'layers', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
   ['ParallelGateway', 'parallel_gateway', 'plus', 'gateways', 72, 72],
+  ['InclusiveGateway', 'inclusive_gateway', 'branch', 'gateways', 72, 72],
   ['EventBasedGateway', 'event_based_gateway', 'branch', 'gateways', 72, 72],
 ];
 
@@ -42,7 +43,7 @@ export function processNodeKind(type) {
 export function processNodeConfig(kind) {
   if (kind === 'UserTask') return { assigneeUserId: null, outputMapping: {} };
   if (kind === 'ServiceTask') return { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60 };
-  if (kind === 'ExclusiveGateway') return { defaultFlowId: null };
+  if (kind === 'ExclusiveGateway' || kind === 'InclusiveGateway') return { defaultFlowId: null };
   if (kind === 'TimerStart' || kind === 'TimerCatch') return { timer: { Duration: { seconds: 60 } } };
   if (kind === 'BoundaryTimer') return { attachedToId: null, cancelActivity: true, timer: { Duration: { seconds: 60 } } };
   if (kind === 'MessageStart') return { messageRef: '', outputMapping: {} };
@@ -122,7 +123,7 @@ export function cloneProcessBody(body) {
     if (typeof node.kind !== 'object') continue;
     const [kind, config] = Object.entries(node.kind)[0];
     if (kind === 'SubProcess') config.body = cloneProcessBody(config.body);
-    if (kind === 'ExclusiveGateway' && config.defaultFlowId) config.defaultFlowId = flows.get(config.defaultFlowId);
+    if (['ExclusiveGateway', 'InclusiveGateway'].includes(kind) && config.defaultFlowId) config.defaultFlowId = flows.get(config.defaultFlowId);
     if (['BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind)) config.attachedToId = ids.get(config.attachedToId);
   }
   for (const flow of copy.sequenceFlows) {

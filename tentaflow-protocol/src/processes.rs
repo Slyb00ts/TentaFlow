@@ -263,6 +263,9 @@ pub enum ProcessNodeKind {
     ErrorEnd {
         error_ref: String,
     },
+    InclusiveGateway {
+        default_flow_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1160,6 +1163,22 @@ pub enum ProcessPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inclusive_gateway_appends_a_typed_variant_without_changing_old_parallel_shape() {
+        let parallel = ProcessNodeKind::ParallelGateway;
+        assert_eq!(serde_json::to_string(&parallel).unwrap(), "\"ParallelGateway\"");
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&parallel).unwrap()).unwrap(), parallel);
+        let inclusive = ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Flow_default".into()) };
+        let bytes = crate::cbor::encode(&inclusive).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&bytes).unwrap(), inclusive);
+        assert_eq!(serde_json::to_value(&inclusive).unwrap(), serde_json::json!({
+            "InclusiveGateway": { "default_flow_id": "Flow_default" }
+        }));
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "InclusiveGateway": { "default_flow_id": null, "unknown": true }
+        })).is_err());
+    }
 
     #[test]
     fn message_variants_round_trip_without_rewriting_opaque_payload_or_old_model_bytes() {
