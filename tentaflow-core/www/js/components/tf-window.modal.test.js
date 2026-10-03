@@ -9,14 +9,19 @@
 import { window } from '../sdk-runtime/_dom-test-harness.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 if (typeof globalThis.ResizeObserver !== 'function') {
   globalThis.ResizeObserver = window.ResizeObserver || class { observe() {} disconnect() {} };
 }
+if (typeof globalThis.MutationObserver !== 'function') {
+  globalThis.MutationObserver = window.MutationObserver;
+}
 // shared-styles.js probes `Document.prototype` and fetches the sprite.
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 globalThis.fetch = () => Promise.resolve({ ok: true, text: () => Promise.resolve('') });
-await import('./tf-window.js');
+await import('./tf-button.js');
+const { TfWindow } = await import('./tf-window.js');
 
 test('a modal window brings its backdrop and takes it away', () => {
   const win = document.createElement('tf-window');
@@ -86,4 +91,46 @@ test('a window that leaves the document says so once, however it went', async ()
   win.remove();
   await Promise.resolve();
   assert.equal(closed, 1);
+});
+
+test('confirmation actions wrap full labels and retain cancel and confirm behavior', async () => {
+  const styles = document.createElement('style');
+  styles.textContent = readFileSync(new URL('../../css/controls.css', import.meta.url), 'utf8');
+  document.head.appendChild(styles);
+  const confirmLabel = 'Actualiser les données du calendrier et publier une nouvelle version';
+  const cancelLabel = 'Annuler';
+  try {
+    for (const action of ['cancel', 'confirm']) {
+      const response = TfWindow.confirm({
+        title: 'Actualiser le calendrier',
+        message: 'Confirm the calendar update.',
+        confirmLabel,
+        cancelLabel,
+      });
+      const win = document.querySelector('tf-window');
+      assert.ok(win);
+      const footer = win.querySelector('[slot="footer"]');
+      const cancel = footer.querySelector('tf-button[data-action="cancel"]');
+      const confirm = footer.querySelector('tf-button[data-action="confirm"]');
+      assert.equal(cancel.querySelector('button').textContent, cancelLabel);
+      assert.equal(confirm.querySelector('button').textContent, confirmLabel);
+      for (const button of [cancel, confirm]) {
+        const inner = button.querySelector('button');
+        assert.ok(button.hasAttribute('wrap'));
+        assert.ok(inner.classList.contains('tf-btn-wrap'));
+        assert.equal(window.getComputedStyle(inner).whiteSpace, 'normal');
+        assert.equal(window.getComputedStyle(inner.querySelector(':scope > span')).overflowWrap, 'anywhere');
+      }
+      const actions = [];
+      win.addEventListener('action', (event) => { actions.push(event.detail?.action); });
+      // Happy DOM does not route slotted clicks into the shadow footer listener.
+      footer.addEventListener('click', win._onFooterClick);
+      footer.querySelector(`tf-button[data-action="${action}"] button`).click();
+      assert.deepEqual(actions, [action]);
+      assert.equal(await response, action === 'confirm');
+      assert.equal(win.isConnected, false);
+    }
+  } finally {
+    styles.remove();
+  }
 });

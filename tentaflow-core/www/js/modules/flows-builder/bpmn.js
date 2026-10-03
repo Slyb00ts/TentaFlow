@@ -93,6 +93,8 @@ export function canvasToProcess(model, nodes, edges, edgePoints) {
   return { schemaVersion: model.schemaVersion, processId: model.processId,
     variables: structuredClone(model.variables),
     ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
+    ...(model.workCalendar == null ? {} : { workCalendar: structuredClone(model.workCalendar) }),
+    ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',

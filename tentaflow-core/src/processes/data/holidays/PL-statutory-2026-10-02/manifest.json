@@ -1,0 +1,80 @@
+{
+  "release_id": "PL-statutory-2026-10-02",
+  "release_claim": "PL statutory rules known as of 2026-10-02; later dates are projections under reviewed law, not a guarantee of future law.",
+  "rules_sha256": "f4b4a2461a3d6821a7aa74718ba2eb44712f17403d347bbbec443f82441388db",
+  "audit_manifest_sha256": "19b045f9f8dff6b233ee6f93d24a5d21b543904012efbfb033ca61438d30eee6",
+  "primary_source_count": 17,
+  "pm_regulations_reviewed": 517,
+  "indexed_legal_bases": 516,
+  "identified_extraordinary_dates": [],
+  "files": [
+    {
+      "path": "sources/du-1951-28-meta.json",
+      "sha256": "b4d296e9ba5c6cc5962ab5e632065f644842593f83dd58b6568ee7f692da021a"
+    },
+    {
+      "path": "sources/du-2020-1920.html",
+      "sha256": "242ea50b52a1303cf07fc2ddf7b59dec31fa5c1136d50b2a60426e2dbc5ce611"
+    },
+    {
+      "path": "sources/du-2024-1965.html",
+      "sha256": "363015e8afec9c6c7fe80ab3e1b44bac4a7434a3b0843cd97cd30c527f0ebe3d"
+    },
+    {
+      "path": "sources/du-2025-296.pdf",
+      "sha256": "50ce5df0f79a4d0f2e3a045b03acaac6ede826ab3b667f421d06854795c2deff"
+    },
+    {
+      "path": "sources/du-2025-296-meta.json",
+      "sha256": "8f1063309865490a22307ed8af4926fba31ba2aa15b3221dea9706635b0c4909"
+    },
+    {
+      "path": "sources/du-1951-28-references.json",
+      "sha256": "adfa7946f0e76b5765a70cb6ec380225a46a3483fb4469bd4b7269e4ab3229a2"
+    },
+    {
+      "path": "sources/art1a-free-day.json",
+      "sha256": "479c4f6d5c2b929ab897b8f898dab5f2330a188dfdcada8882b716ce26e087b7"
+    },
+    {
+      "path": "sources/art1a-free-days.json",
+      "sha256": "5a5f2b7efec27b9a3a6fc8ced5b1448d85f3942f994dd268a168b021459a99df"
+    },
+    {
+      "path": "sources/art1a-day-free.json",
+      "sha256": "1edda9e65ab9b2dfe302e40a4b0a160080ce7803ef123d34e49b6c651ab482fe"
+    },
+    {
+      "path": "sources/du-2020-1920-references.json",
+      "sha256": "3bb218a5f9d7a2f4f05aa14f81bd93a3a1207eda0be448cc8adabbabb79d86c8"
+    },
+    {
+      "path": "sources/du-2020-695-references.json",
+      "sha256": "bdfd5a1f374e5b7aec9cc0493003204173e82fd01769ebed93bd973b1a2be982"
+    },
+    {
+      "path": "sources/du-2025-296-references.json",
+      "sha256": "3bb218a5f9d7a2f4f05aa14f81bd93a3a1207eda0be448cc8adabbabb79d86c8"
+    },
+    {
+      "path": "sources/pm-regulations-search-2020-2026.json",
+      "sha256": "351683ac057adbd39b4e4d9524223274024f8f7cf9fe1b629953d84bbe5961ed"
+    },
+    {
+      "path": "sources/pm-regulations-search-2020-2026-offset500.json",
+      "sha256": "e5279522d6a9eae22644c67bdc0c2a28e8ed34d9aad0deeed88d1323c4bcc07f"
+    },
+    {
+      "path": "sources/du-2026-1215-meta.json",
+      "sha256": "020154349a1d64086948689704438a97cfec346cc23b11eb1528a6e1054a52ed"
+    },
+    {
+      "path": "sources/du-2026-1215.html",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "sources/du-2026-1215.pdf",
+      "sha256": "792f6b792e6db85c3cc612ced21c97debd5b5151daae1dc59644dd1e5036a568"
+    }
+  ]
+}

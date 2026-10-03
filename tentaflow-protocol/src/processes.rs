@@ -16,6 +16,117 @@ pub struct ProcessModel {
     pub diagram: ProcessDiagram,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_calendar: Option<ProcessWorkCalendar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_pin: Option<ProcessCalendarPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWorkCalendar {
+    pub name: String,
+    pub weekly_windows: Vec<WorkWindow>,
+    pub manual_days_off: Vec<ManualDayOff>,
+    pub holiday_policy: HolidayPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWindow {
+    pub weekday: u8,
+    pub start_minute: u16,
+    pub end_minute: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualDayOff {
+    pub date: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HolidayPolicy {
+    PolandStatutory,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCalendarPin {
+    pub calendar: ProcessWorkCalendar,
+    pub legal_release: ProcessLegalRelease,
+    pub timezone_data: ProcessTimezoneData,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessLegalRelease {
+    pub release_id: String,
+    pub as_of_date: String,
+    pub valid_from: String,
+    pub valid_until: String,
+    pub audit_manifest_sha256: String,
+    pub sources: Vec<ProcessCalendarSource>,
+    pub rules: Vec<ProcessHolidayRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCalendarSource {
+    pub source_id: String,
+    pub url: String,
+    pub sha256: String,
+    pub retrieved_on: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessHolidayRule {
+    pub rule_id: String,
+    pub source_id: String,
+    pub effective_from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_until: Option<String>,
+    pub kind: ProcessHolidayRuleKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessHolidayRuleKind {
+    Fixed { month: u8, day: u8 },
+    GregorianEasterOffset { days: i16 },
+    Weekday { weekday: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTimezoneData {
+    pub iana_name: String,
+    pub release_id: String,
+    pub horizon_start_ms: i64,
+    pub horizon_end_ms: i64,
+    pub initial_offset_seconds: i32,
+    pub transitions: Vec<ProcessOffsetTransition>,
+    pub source_url: String,
+    pub source_sha256: String,
+    pub dataset_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessOffsetTransition {
+    pub at_utc_ms: i64,
+    pub offset_seconds: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessCalendarPinState {
+    Unpinned,
+    Current,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,6 +183,7 @@ pub enum ProcessTimerSpec {
         minute: u8,
         total_firings: Option<u32>,
     },
+    WorkingDuration { seconds: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +218,21 @@ pub struct ProcessTimerSummary {
     pub last_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_time: Option<ProcessWorkingTimeSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWorkingTimeSummary {
+    pub calendar_name: String,
+    pub holiday_policy: HolidayPolicy,
+    pub pin_sha256: String,
+    pub legal_release_id: String,
+    pub legal_as_of_date: String,
+    pub tzdb_release_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_offset_seconds: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -162,6 +289,8 @@ pub struct ProcessDefinition {
     pub model: ProcessModel,
     pub published_version: Option<u32>,
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_pin_state: Option<ProcessCalendarPinState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +302,8 @@ pub struct ProcessDefinitionSummary {
     pub draft_revision: u64,
     pub published_version: Option<u32>,
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_pin_state: Option<ProcessCalendarPinState>,
 }
 
 impl From<&ProcessDefinition> for ProcessDefinitionSummary {
@@ -185,6 +316,7 @@ impl From<&ProcessDefinition> for ProcessDefinitionSummary {
             draft_revision: value.draft_revision,
             published_version: value.published_version,
             archived: value.archived,
+            calendar_pin_state: value.calendar_pin_state.clone(),
         }
     }
 }
@@ -448,6 +580,8 @@ pub enum ProcessPayload {
         command_id: String,
         definition_id: String,
         expected_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repin_calendar: Option<bool>,
     },
     DefinitionPublishResponse {
         definition: ProcessDefinitionSummary,
@@ -575,6 +709,7 @@ mod tests {
             schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
             sequence_flows: Vec::new(), variables: BTreeMap::new(),
             diagram: ProcessDiagram::default(), timer_timezone: None,
+            work_calendar: None, calendar_pin: None,
         };
         let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
         assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
@@ -599,6 +734,34 @@ mod tests {
     }
 
     #[test]
+    fn working_calendar_and_pin_round_trip_without_rewriting_business_keys() {
+        let raw = serde_json::json!({
+            "schema_version":1,"process_id":"P_1","nodes":[{"id":"Start_1","name":"Start",
+                "kind":{"TimerStart":{"timer":{"WorkingDuration":{"seconds":3600}}}}}],
+            "sequence_flows":[],"variables":{"business_key":{"inner_value":"Łódź"}},
+            "diagram":{"shapes":[],"edges":[]},"timer_timezone":"Europe/Warsaw",
+            "work_calendar":{"name":"Office","weekly_windows":[{"weekday":1,"start_minute":540,"end_minute":1020}],
+                "manual_days_off":[],"holiday_policy":"PolandStatutory"},
+            "calendar_pin":{"calendar":{"name":"Office","weekly_windows":[{"weekday":1,"start_minute":540,"end_minute":1020}],
+                    "manual_days_off":[],"holiday_policy":"PolandStatutory"},
+                "legal_release":{"release_id":"PL-statutory-2026-10-02","as_of_date":"2026-10-02",
+                    "valid_from":"2024-01-01","valid_until":"2041-01-01","audit_manifest_sha256":"a",
+                    "sources":[],"rules":[{"rule_id":"sunday","source_id":"DU/2024/1965",
+                        "effective_from":"2024-01-01","kind":{"Weekday":{"weekday":7}}}]},
+                "timezone_data":{"iana_name":"Europe/Warsaw","release_id":"2026e","horizon_start_ms":1,
+                    "horizon_end_ms":2,"initial_offset_seconds":3600,"transitions":[],
+                    "source_url":"https://example.invalid","source_sha256":"b","dataset_sha256":"c"},"sha256":"d"}
+        });
+        let model: ProcessModel = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&model).unwrap(), raw);
+        assert_eq!(crate::cbor::decode::<ProcessModel>(&crate::cbor::encode(&model).unwrap()).unwrap(), model);
+        assert_eq!(model.variables["business_key"]["inner_value"], "Łódź");
+        let mut invalid = raw;
+        invalid["work_calendar"]["weekly_windows"][0]["surprise"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ProcessModel>(invalid).is_err());
+    }
+
+    #[test]
     fn process_payload_round_trip_preserves_nested_model_and_tag() {
         let payload = ProcessPayload::DefinitionSaveRequest {
             command_id: "77b1c94f-6f69-4b71-a344-97caa34cb2c0".into(),
@@ -618,6 +781,8 @@ mod tests {
                 variables: BTreeMap::new(),
                 diagram: ProcessDiagram::default(),
                 timer_timezone: None,
+                work_calendar: None,
+                calendar_pin: None,
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();
@@ -639,6 +804,7 @@ mod tests {
                     draft_revision: 2,
                     published_version: Some(1),
                     archived: false,
+                    calendar_pin_state: None,
                 }],
                 total: 1,
                 has_more: false,
@@ -711,6 +877,7 @@ mod tests {
             status: ProcessTimerStatus::Pending, due_at_ms: Some(1_000),
             timezone: "UTC".into(), occurrence: 1, total_firings: None,
             last_reason: None, attached_to_id: Some("Review_1".into()),
+            working_time: None,
         };
         assert_eq!(crate::cbor::decode::<ProcessTimerSummary>(&crate::cbor::encode(&timer).unwrap()).unwrap(), timer);
         assert_eq!(serde_json::to_value(&timer).unwrap()["attached_to_id"], "Review_1");

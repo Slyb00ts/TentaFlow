@@ -1,0 +1,152 @@
+{
+  "sources": [
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/1951/28",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-1951-28-meta.json",
+      "bytes": 1486,
+      "sha256": "b4d296e9ba5c6cc5962ab5e632065f644842593f83dd58b6568ee7f692da021a",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2020/1920/text.html",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2020-1920.html",
+      "bytes": 25407,
+      "sha256": "242ea50b52a1303cf07fc2ddf7b59dec31fa5c1136d50b2a60426e2dbc5ce611",
+      "content_type": "text/html",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2024/1965/text.html",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2024-1965.html",
+      "bytes": 29267,
+      "sha256": "363015e8afec9c6c7fe80ab3e1b44bac4a7434a3b0843cd97cd30c527f0ebe3d",
+      "content_type": "text/html",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2025/296/text.pdf",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2025-296.pdf",
+      "bytes": 205582,
+      "sha256": "50ce5df0f79a4d0f2e3a045b03acaac6ede826ab3b667f421d06854795c2deff",
+      "content_type": "application/pdf",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2025/296",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2025-296-meta.json",
+      "bytes": 1021,
+      "sha256": "8f1063309865490a22307ed8af4926fba31ba2aa15b3221dea9706635b0c4909",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/DU/1951/28/references",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-1951-28-references.json",
+      "bytes": 5123,
+      "sha256": "adfa7946f0e76b5765a70cb6ec380225a46a3483fb4469bd4b7269e4ab3229a2",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/search?publisher=DU&type=Rozporz%C4%85dzenie&title=dniem+wolnym&dateFrom=2020-04-18&dateTo=2026-10-02&limit=1000",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/art1a-free-day.json",
+      "bytes": 409,
+      "sha256": "479c4f6d5c2b929ab897b8f898dab5f2330a188dfdcada8882b716ce26e087b7",
+      "content_type": "application/json",
+      "totalCount": 0,
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/search?publisher=DU&type=Rozporz%C4%85dzenie&title=dni+wolne+od+pracy&dateFrom=2020-04-18&dateTo=2026-10-02&limit=1000",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/art1a-free-days.json",
+      "bytes": 415,
+      "sha256": "5a5f2b7efec27b9a3a6fc8ced5b1448d85f3942f994dd268a168b021459a99df",
+      "content_type": "application/json",
+      "totalCount": 0,
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/search?publisher=DU&type=Rozporz%C4%85dzenie&title=dzie%C5%84+wolny+od+pracy&dateFrom=2020-04-18&dateTo=2026-10-02&limit=1000",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/art1a-day-free.json",
+      "bytes": 418,
+      "sha256": "1edda9e65ab9b2dfe302e40a4b0a160080ce7803ef123d34e49b6c651ab482fe",
+      "content_type": "application/json",
+      "totalCount": 0,
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/DU/2020/1920/references",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2020-1920-references.json",
+      "bytes": 1136,
+      "sha256": "3bb218a5f9d7a2f4f05aa14f81bd93a3a1207eda0be448cc8adabbabb79d86c8",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/DU/2020/695/references",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2020-695-references.json",
+      "bytes": 33760,
+      "sha256": "bdfd5a1f374e5b7aec9cc0493003204173e82fd01769ebed93bd973b1a2be982",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/DU/2025/296/references",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2025-296-references.json",
+      "bytes": 1136,
+      "sha256": "3bb218a5f9d7a2f4f05aa14f81bd93a3a1207eda0be448cc8adabbabb79d86c8",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/search?publisher=DU&type=Rozporz%C4%85dzenie&title=Prezesa+Rady+Ministr%C3%B3w&dateFrom=2020-04-18&dateTo=2026-10-02&limit=1000",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/pm-regulations-search-2020-2026.json",
+      "bytes": 552409,
+      "sha256": "351683ac057adbd39b4e4d9524223274024f8f7cf9fe1b629953d84bbe5961ed",
+      "content_type": "application/json",
+      "totalCount": 518,
+      "returnedCount": 500,
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://api.sejm.gov.pl/eli/acts/search?publisher=DU&type=Rozporz%C4%85dzenie&title=Prezesa+Rady+Ministr%C3%B3w&dateFrom=2020-04-18&dateTo=2026-10-02&limit=500&offset=500",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/pm-regulations-search-2020-2026-offset500.json",
+      "bytes": 20191,
+      "sha256": "e5279522d6a9eae22644c67bdc0c2a28e8ed34d9aad0deeed88d1323c4bcc07f",
+      "content_type": "application/json",
+      "totalCount": 518,
+      "returnedCount": 18,
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2026/1215",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2026-1215-meta.json",
+      "bytes": 828,
+      "sha256": "020154349a1d64086948689704438a97cfec346cc23b11eb1528a6e1054a52ed",
+      "content_type": "application/json",
+      "retrieved_on": "2026-10-03"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2026/1215/text.html",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2026-1215.html",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "content_type": "text/html",
+      "retrieved_on": "2026-10-03"
+    },
+    {
+      "url": "https://eli.gov.pl/api/acts/DU/2026/1215/text.pdf",
+      "path": "/Users/critix/.tentaflow-org-work/research/eli/du-2026-1215.pdf",
+      "bytes": 243276,
+      "sha256": "792f6b792e6db85c3cc612ced21c97debd5b5151daae1dc59644dd1e5036a568",
+      "content_type": "application/pdf",
+      "retrieved_on": "2026-10-03"
+    }
+  ],
+  "as_of": "2026-10-02",
+  "retrieval_dates": [
+    "2026-10-02",
+    "2026-10-03"
+  ]
+}

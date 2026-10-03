@@ -1,0 +1,18 @@
+{
+  "release_id": "2026e",
+  "source_url": "https://data.iana.org/time-zones/releases/tzdata2026e.tar.gz",
+  "source_sha256": "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
+  "dataset_sha256": "17ca1435b3eebef27b70e8964b4e0347c41fbbcda938249f4e816c885662dc0b",
+  "horizon_start_ms": 1703980800000,
+  "horizon_end_ms": 2240697600000,
+  "zone_count": 597,
+  "names_sha256": "e662bd9ba4b0674e7070f14a950012a955ed21928cfb151b8fdfbbfe3d60d30d",
+  "compiler_version": "zic (tzcode) 2022g",
+  "compiler_sha256": "05925eb7afffea7c53ee5561497e4d17852f6d0bb1c3a76ca452b3bc846c0934",
+  "arguments": [
+    "-b",
+    "fat",
+    "-r",
+    "@1703980800/@2240697600"
+  ]
+}

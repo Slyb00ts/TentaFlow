@@ -208,6 +208,7 @@ pub fn process_dispatch(
             command_id,
             definition_id,
             expected_revision,
+            repin_calendar,
         } => {
             let stamp = stamp(payload, command_id)?;
             if let Some((definition, version)) =
@@ -252,6 +253,7 @@ pub fn process_dispatch(
                 definition_id,
                 *expected_revision,
                 &snapshots,
+                *repin_calendar,
             )
             .map_err(error)?;
             if let Some(executor) = ctx.state.router.flow_dispatcher() {
@@ -691,6 +693,7 @@ mod tests {
                 command_id: uuid::Uuid::new_v4().to_string(),
                 definition_id: definition.definition_id.clone(),
                 expected_revision: definition.draft_revision,
+                repin_calendar: None,
             },
         )
         .await;
@@ -845,6 +848,7 @@ mod tests {
             command_id: uuid::Uuid::new_v4().to_string(),
             definition_id: definition.definition_id.clone(),
             expected_revision: definition.draft_revision,
+            repin_calendar: None,
         };
         let P::DefinitionPublishResponse { version, .. } = request(&ctx, publication.clone()).await
         else {
@@ -889,6 +893,7 @@ mod tests {
                 command_id: uuid::Uuid::new_v4().to_string(),
                 definition_id: definition.definition_id.clone(),
                 expected_revision: definition.draft_revision,
+                repin_calendar: None,
             },
         )
         .await;
@@ -1030,6 +1035,7 @@ mod tests {
             command_id: uuid::Uuid::new_v4().to_string(),
             definition_id: definition.definition_id.clone(),
             expected_revision: definition.draft_revision,
+            repin_calendar: None,
         };
         let P::DefinitionPublishResponse { version, .. } = request(&ctx, publish.clone()).await
         else {
@@ -1136,6 +1142,7 @@ mod tests {
                 command_id: uuid::Uuid::new_v4().to_string(),
                 definition_id: definition.definition_id.clone(),
                 expected_revision: definition.draft_revision,
+                repin_calendar: None,
             },
         )
         .await;
@@ -1253,6 +1260,168 @@ mod tests {
             .await
             .code,
             ProtocolErrorCode::PolicyDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn private_calendar_publication_returns_current_pin_revision_and_rejects_stale_or_revoked_replay(
+    ) {
+        use tentaflow_protocol::processes::{
+            HolidayPolicy, ProcessCalendarPinState, ProcessWorkCalendar, WorkWindow,
+        };
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "calendar-author");
+        let other = test_support::actor(&state.db, "other-calendar-author");
+        let ctx = context(&state, &owner);
+        let outsider = context(&state, &other);
+        let mut model = crate::processes::model::starter_model();
+        model.timer_timezone = Some("America/Winnipeg".into());
+        model.variables.insert(
+            "project_id".into(),
+            json!({"source_id":"opaque_business_fact"}),
+        );
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "Private business hours".into(),
+            weekly_windows: (1..=7)
+                .map(|weekday| WorkWindow {
+                    weekday,
+                    start_minute: 0,
+                    end_minute: 1440,
+                })
+                .collect(),
+            manual_days_off: Vec::new(),
+            holiday_policy: HolidayPolicy::None,
+        });
+        let draft = save(&ctx, model).await;
+        assert_eq!(
+            draft.calendar_pin_state,
+            Some(ProcessCalendarPinState::Unpinned)
+        );
+        let publication = P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: draft.definition_id.clone(),
+            expected_revision: draft.draft_revision,
+            repin_calendar: None,
+        };
+        let reply = request(&ctx, publication.clone()).await;
+        let P::DefinitionPublishResponse {
+            definition,
+            version,
+        } = &reply
+        else {
+            panic!("actual calendar publication response");
+        };
+        assert_eq!(
+            definition.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert_eq!(definition.draft_revision, draft.draft_revision + 1);
+        assert!(version.model.calendar_pin.is_some());
+        assert_eq!(
+            version.model.variables["project_id"]["source_id"],
+            "opaque_business_fact"
+        );
+        assert_eq!(request(&ctx, publication.clone()).await, reply);
+        assert_eq!(
+            refused(&outsider, publication.clone()).await.code,
+            ProtocolErrorCode::NotFound
+        );
+        let mut edited = version.model.clone();
+        edited.nodes[0].name = "Ordinary saved name after mint".into();
+        let P::DefinitionSaveResponse {
+            definition: ordinary,
+        } = request(
+            &ctx,
+            P::DefinitionSaveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: Some(definition.definition_id.clone()),
+                expected_revision: definition.draft_revision,
+                name: "Saved returned pin".into(),
+                description: "".into(),
+                model: edited,
+            },
+        )
+        .await
+        else {
+            panic!("actual saved current pin");
+        };
+        assert_eq!(
+            ordinary.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert_eq!(ordinary.model.calendar_pin, version.model.calendar_pin);
+        let mut changed = ordinary.model.clone();
+        changed.work_calendar.as_mut().unwrap().holiday_policy = HolidayPolicy::PolandStatutory;
+        let P::DefinitionSaveResponse { definition: stale } = request(
+            &ctx,
+            P::DefinitionSaveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: Some(ordinary.definition_id.clone()),
+                expected_revision: ordinary.draft_revision,
+                name: ordinary.name.clone(),
+                description: ordinary.description.clone(),
+                model: changed,
+            },
+        )
+        .await
+        else {
+            panic!("actual stale draft");
+        };
+        assert_eq!(
+            stale.calendar_pin_state,
+            Some(ProcessCalendarPinState::Stale)
+        );
+        refused(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: stale.definition_id.clone(),
+                expected_revision: stale.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        let refresh = P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: stale.definition_id.clone(),
+            expected_revision: stale.draft_revision,
+            repin_calendar: Some(true),
+        };
+        let refreshed = request(&ctx, refresh.clone()).await;
+        let P::DefinitionPublishResponse {
+            definition: current,
+            version: v2,
+        } = &refreshed
+        else {
+            panic!("explicit refreshed publication");
+        };
+        assert_eq!(
+            current.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert_eq!(v2.version, 2);
+        assert_ne!(v2.model.calendar_pin, version.model.calendar_pin);
+        let bytes = tentaflow_protocol::cbor::encode(&MessageBody::ProcessBody(refreshed)).unwrap();
+        assert!(bytes.len() < 900 * 1024);
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+                [&owner.user_id],
+            )
+            .unwrap();
+        refused(&ctx, refresh).await;
+        assert_eq!(
+            state
+                .db
+                .read()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM bpmn_versions", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            2
         );
     }
 }

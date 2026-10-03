@@ -429,6 +429,9 @@ export class FlowCanvas {
   validate() {
     if (this.mode === 'bpmn') {
       const errors = [];
+      if (this.processModel.workCalendar && !this.processModel.timerTimezone?.trim()) {
+        errors.push(I18n.t('bpmn.timer_timezone_required'));
+      }
       for (const node of this.nodes) {
         if (!['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type)) continue;
         const [kind, timer] = Object.entries(node.config.timer)[0];
@@ -440,13 +443,16 @@ export class FlowCanvas {
           if (!parent || !['bpmn_user_task', 'bpmn_service_task'].includes(parent.type)) {
             errors.push(I18n.t('bpmn.boundary_required'));
           }
-          if (!['Date', 'Duration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
+          if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
             errors.push(I18n.t('bpmn.boundary_timer_invalid', { node: node.label || node.id }));
           }
         }
         const fields = kind === 'Daily'
           ? [['hour', 'timer_hour', 0, 23], ['minute', 'timer_minute', 0, 59]]
-          : ['Duration', 'Cycle'].includes(kind) ? [['seconds', 'timer_seconds', kind === 'Cycle' ? 300 : 1, 31536000]] : [];
+          : ['Duration', 'Cycle', 'WorkingDuration'].includes(kind) ? [['seconds', kind === 'WorkingDuration' ? 'timer_working_seconds' : 'timer_seconds', kind === 'Cycle' ? 300 : 1, 31536000]] : [];
+        if (kind === 'WorkingDuration' && !this.processModel.workCalendar) {
+          errors.push(I18n.t('bpmn.calendar_required'));
+        }
         if (['Cycle', 'Daily'].includes(kind) && timer.totalFirings != null) fields.push(['totalFirings', 'timer_total', 1, 4294967295]);
         for (const [field, label, min, max] of fields) {
           if (!Number.isInteger(timer[field]) || timer[field] < min || timer[field] > max) {
@@ -616,7 +622,9 @@ export class FlowCanvas {
     // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
-      ...(this.mode === 'bpmn' ? { timerTimezone: this.processModel.timerTimezone ?? null } : {}) }));
+      ...(this.mode === 'bpmn' ? { timerTimezone: this.processModel.timerTimezone ?? null,
+        workCalendar: this.processModel.workCalendar ?? null,
+        calendarPin: this.processModel.calendarPin ?? null } : {}) }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -631,6 +639,10 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
       else this.processModel.timerTimezone = snap.timerTimezone;
+      if (snap.workCalendar === null) delete this.processModel.workCalendar;
+      else this.processModel.workCalendar = snap.workCalendar;
+      if (snap.calendarPin === null) delete this.processModel.calendarPin;
+      else this.processModel.calendarPin = snap.calendarPin;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -648,6 +660,10 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       if (snap.timerTimezone === null) delete this.processModel.timerTimezone;
       else this.processModel.timerTimezone = snap.timerTimezone;
+      if (snap.workCalendar === null) delete this.processModel.workCalendar;
+      else this.processModel.workCalendar = snap.workCalendar;
+      if (snap.calendarPin === null) delete this.processModel.calendarPin;
+      else this.processModel.calendarPin = snap.calendarPin;
     }
     this.render();
     this.onChange();
@@ -662,6 +678,30 @@ export class FlowCanvas {
     else this.processModel.timerTimezone = value;
     this._pushHistory();
     this.onChange();
+  }
+
+  updateProcessCalendar(calendar) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    if (calendar === null) {
+      delete this.processModel.workCalendar;
+      delete this.processModel.calendarPin;
+    } else {
+      this.processModel.workCalendar = structuredClone(calendar);
+    }
+    this._pushHistory();
+    this.onChange();
+  }
+
+  adoptPublishedProcessModel(model) {
+    if (this.mode !== 'bpmn') return;
+    this.processModel = structuredClone(model);
+    for (const snapshot of this.history) {
+      snapshot.calendarPin = snapshot.workCalendar === null ? null : structuredClone(model.calendarPin ?? null);
+    }
+    if (this.historyIndex >= 0) {
+      this.history[this.historyIndex].timerTimezone = model.timerTimezone ?? null;
+      this.history[this.historyIndex].workCalendar = structuredClone(model.workCalendar ?? null);
+    }
   }
 
   addNodeFromTemplate(tpl, clientX, clientY) {

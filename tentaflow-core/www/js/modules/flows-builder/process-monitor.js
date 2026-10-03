@@ -9,10 +9,25 @@ import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
+import '/js/components/tf-toggle.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
 const tone = (status) => status === 'Completed' ? 'ok' : status === 'Incident' ? 'err' : status === 'Cancelled' ? 'neutral' : 'info';
+
+function workingDate(ms, summary, zone) {
+  if (summary?.dueOffsetSeconds == null) return new Date(ms).toISOString();
+  const offset = summary.dueOffsetSeconds;
+  const magnitude = Math.abs(offset);
+  const hours = String(Math.floor(magnitude / 3600)).padStart(2, '0');
+  const minutes = String(Math.floor(magnitude % 3600 / 60)).padStart(2, '0');
+  const seconds = magnitude % 60;
+  const signedOffset = `${offset < 0 ? '-' : '+'}${hours}:${minutes}${seconds ? `:${String(seconds).padStart(2, '0')}` : ''}`;
+  const local = new Date(Number(ms) + offset * 1000).toLocaleString(I18n.getLanguage(), { timeZone: 'UTC' });
+  return text('calendar_due_exact', { local, offset: signedOffset, utc: new Date(ms).toISOString(), zone });
+}
 
 function readWindow(title, icon, width = 820) {
   const win = document.createElement('tf-window');
@@ -64,13 +79,19 @@ function validateJson(section, object = false) {
 
 export function processEventText(event) {
   const node = event.nodeName || text('element_unavailable');
-  if (event.kind === 'timer_armed') return text('event_timer_armed', { node, due: date(event.data.due_at_ms), timezone: event.data.timezone });
+  if (event.kind === 'timer_armed') return text('event_timer_armed', { node,
+    due: event.data.working_time ? workingDate(event.data.due_at_ms, {
+      dueOffsetSeconds: event.data.working_time.due_offset_seconds,
+    }, event.data.timezone) : date(event.data.due_at_ms), timezone: event.data.timezone });
   if (event.kind === 'timer_fired') {
+    const due = event.data.working_time ? workingDate(event.data.planned_due_at_ms, {
+      dueOffsetSeconds: event.data.working_time.due_offset_seconds,
+    }, event.data.timezone) : date(event.data.planned_due_at_ms);
     if (event.data.kind === 'Boundary') return text('event_boundary_fired', {
-      node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms),
+      node, due, actual: event.data.working_time ? new Date(event.data.fired_at_ms).toISOString() : date(event.data.fired_at_ms),
       mode: text(event.data.cancel_activity ? 'boundary_interrupting' : 'boundary_noninterrupting'),
     });
-    return text('event_timer_fired', { node, due: date(event.data.planned_due_at_ms), actual: date(event.data.fired_at_ms), count: event.data.skipped_count });
+    return text('event_timer_fired', { node, due, actual: event.data.working_time ? new Date(event.data.fired_at_ms).toISOString() : date(event.data.fired_at_ms), count: event.data.skipped_count });
   }
   if (event.kind === 'timer_cancelled') {
     if (event.data.reason === 'instance_cancelled') return text('event_timer_cancelled', { node });
@@ -84,7 +105,9 @@ export function processEventText(event) {
 }
 
 export function processTimerText(timer) {
-  const due = timer.dueAtMs == null ? text('timer_no_due') : new Date(timer.dueAtMs).toLocaleString(I18n.getLanguage(), { timeZone: timer.timezone, timeZoneName: 'short' });
+  const due = timer.dueAtMs == null ? text('timer_no_due') : timer.workingTime
+    ? workingDate(timer.dueAtMs, timer.workingTime, timer.timezone)
+    : new Date(timer.dueAtMs).toLocaleString(I18n.getLanguage(), { timeZone: timer.timezone, timeZoneName: 'short' });
   return text('timer_brief', { status: text(`timer_status_${timer.status.toLowerCase()}`), due, timezone: timer.timezone });
 }
 
@@ -110,6 +133,12 @@ function renderTimers(host, timers) {
     row.innerHTML = `<div><strong>${escapeHtml(timer.nodeName || text(timer.kind === 'Start' ? 'node_timer_start' : timer.kind === 'Boundary' ? 'node_boundary_timer' : 'node_timer_catch'))}</strong>
       <p>${escapeHtml(processTimerText(timer))}</p><dl><dt>${escapeHtml(text('timer_occurrence'))}</dt><dd>${escapeHtml(timer.totalFirings == null ? String(timer.occurrence) : text('timer_slot', { occurrence: timer.occurrence, total: timer.totalFirings }))}</dd>
       ${timer.kind === 'Boundary' ? `<dt>${escapeHtml(text('boundary_attached_element_id'))}</dt><dd>${escapeHtml(timer.attachedToId)}</dd>` : ''}
+      ${timer.workingTime ? `<dt>${escapeHtml(text('calendar_name'))}</dt><dd>${escapeHtml(timer.workingTime.calendarName)}</dd>
+      <dt>${escapeHtml(text('calendar_holiday_policy'))}</dt><dd>${escapeHtml(text(timer.workingTime.holidayPolicy === 'None' ? 'calendar_policy_none' : 'calendar_policy_poland'))}</dd>
+      <dt>${escapeHtml(text('calendar_release'))}</dt><dd>${escapeHtml(text('calendar_pin_info', {
+        release: timer.workingTime.legalReleaseId, asOf: timer.workingTime.legalAsOfDate,
+        timezone: timer.workingTime.tzdbReleaseId, digest: timer.workingTime.pinSha256,
+      }))}</dd>` : ''}
       ${timer.lastReason ? `<dt>${escapeHtml(text('timer_reason'))}</dt><dd>${escapeHtml(processTimerReasonText(timer.lastReason))}</dd>` : ''}</dl></div>`;
     host.append(row);
   }
@@ -403,5 +432,119 @@ export function openProcessVariables(value, onSave) {
   return openFormWindow({ title: text('variables'), icon: 'code', sections: [section], submitLabel: text('apply'),
     validate: () => validateJson(section, true), collect: () => section.jsonValue,
     onSubmit: async (values) => { onSave(values); return { message: text('variables_updated') }; },
+  });
+}
+
+export function openProcessCalendar(calendar, pin, pinState, readOnly, onSave) {
+  const current = structuredClone(calendar ?? {
+    name: '', weeklyWindows: [1, 2, 3, 4, 5].map((weekday) => ({ weekday, startMinute: 540, endMinute: 1020 })),
+    manualDaysOff: [], holidayPolicy: 'PolandStatutory',
+  });
+  const section = document.createElement('section');
+  section.className = 'fb-process-calendar';
+  section.innerHTML = `<div class="fb-process-calendar-heading"><span>${escapeHtml(text('calendar_enabled'))}</span>
+      <tf-toggle data-calendar-enabled aria-label="${escapeAttr(text('calendar_enabled'))}" ${calendar ? 'checked' : ''} ${readOnly ? 'disabled' : ''}></tf-toggle></div>
+    <div data-calendar-fields>
+      <tf-textarea data-calendar-name label="${escapeAttr(text('calendar_name'))}" value="${escapeAttr(current.name)}" maxlength="256" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+      <tf-select data-calendar-policy label="${escapeAttr(text('calendar_holiday_policy'))}" value="${escapeAttr(current.holidayPolicy)}" ${readOnly ? 'disabled' : ''}>
+        <option value="PolandStatutory">${escapeHtml(text('calendar_policy_poland'))}</option>
+        <option value="None">${escapeHtml(text('calendar_policy_none'))}</option>
+      </tf-select>
+      <p class="fb-field-hint">${escapeHtml(text('calendar_timezone_hint'))}</p>
+      <h3>${escapeHtml(text('calendar_windows'))}</h3><div data-calendar-windows></div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-calendar-add-window>${escapeHtml(text('calendar_add_window'))}</tf-button>`}
+      <h3>${escapeHtml(text('calendar_days_off'))}</h3><div data-calendar-days></div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-calendar-add-day>${escapeHtml(text('calendar_add_day'))}</tf-button>`}
+    </div>
+    <p class="fb-field-hint" data-calendar-state>${escapeHtml(text(`calendar_state_${(pinState ?? 'Unpinned').toLowerCase()}`))}</p>
+    ${pin ? `<p class="fb-field-hint">${escapeHtml(text('calendar_pin_info', {
+      release: pin.legalRelease.releaseId, asOf: pin.legalRelease.asOfDate,
+      timezone: pin.timezoneData.releaseId, digest: pin.sha256,
+    }))}</p><p class="fb-field-hint" data-calendar-coverage>${escapeHtml(text('calendar_coverage', {
+      from: pin.legalRelease.validFrom, until: pin.legalRelease.validUntil,
+    }))}</p><p class="fb-field-hint">${escapeHtml(text('calendar_projection_hint'))}</p>` : ''}
+    <tf-alert data-calendar-error tone="danger" hidden></tf-alert>`;
+  const fields = section.querySelector('[data-calendar-fields]');
+  const enabled = section.querySelector('[data-calendar-enabled]');
+  fields.hidden = !enabled.checked;
+  enabled.addEventListener('change', (event) => { fields.hidden = !(event.detail?.checked ?? enabled.checked); });
+  const windows = section.querySelector('[data-calendar-windows]');
+  const days = section.querySelector('[data-calendar-days]');
+  const minuteText = (minute) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+  const addWindow = (window) => {
+    const row = document.createElement('div');
+    row.className = 'fb-calendar-row';
+    row.innerHTML = `<tf-select data-calendar-weekday label="${escapeAttr(text('calendar_weekday'))}" value="${Number(window.weekday)}" ${readOnly ? 'disabled' : ''}>
+      ${[1, 2, 3, 4, 5, 6, 7].map((day) => `<option value="${day}">${escapeHtml(text(`calendar_weekday_${day}`))}</option>`).join('')}</tf-select>
+      <tf-input data-calendar-start label="${escapeAttr(text('calendar_start'))}" value="${minuteText(window.startMinute)}" placeholder="09:00" ${readOnly ? 'disabled' : ''}></tf-input>
+      <tf-input data-calendar-end label="${escapeAttr(text('calendar_end'))}" value="${minuteText(window.endMinute)}" placeholder="17:00" ${readOnly ? 'disabled' : ''}></tf-input>
+      ${readOnly ? '' : `<tf-button variant="ghost" data-calendar-remove aria-label="${escapeAttr(text('calendar_remove_window'))}">${escapeHtml(text('calendar_remove'))}</tf-button>`}`;
+    windows.append(row);
+  };
+  const addDay = (day) => {
+    const row = document.createElement('div');
+    row.className = 'fb-calendar-row';
+    row.innerHTML = `<tf-input data-calendar-date type="date" label="${escapeAttr(text('calendar_date'))}" value="${escapeAttr(day.date)}" ${readOnly ? 'disabled' : ''}></tf-input>
+      <tf-textarea data-calendar-reason label="${escapeAttr(text('calendar_reason'))}" value="${escapeAttr(day.reason)}" maxlength="128" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+      ${readOnly ? '' : `<tf-button variant="ghost" data-calendar-remove aria-label="${escapeAttr(text('calendar_remove_day'))}">${escapeHtml(text('calendar_remove'))}</tf-button>`}`;
+    days.append(row);
+  };
+  current.weeklyWindows.forEach(addWindow);
+  current.manualDaysOff.forEach(addDay);
+  section.addEventListener('click', (event) => {
+    if (readOnly) return;
+    if (event.target.closest('[data-calendar-add-window]')) addWindow({ weekday: 1, startMinute: 540, endMinute: 1020 });
+    else if (event.target.closest('[data-calendar-add-day]')) addDay({ date: '', reason: '' });
+    else event.target.closest('[data-calendar-remove]')?.closest('.fb-calendar-row')?.remove();
+  });
+  const error = section.querySelector('[data-calendar-error]');
+  let result;
+  const fail = (message) => { error.setAttribute('message', message); error.hidden = false; return false; };
+  const parseMinute = (value) => {
+    if (!/^\d{2}:\d{2}$/.test(value)) throw new Error(text('calendar_invalid_window'));
+    const [hour, minute] = value.split(':').map(Number);
+    if (hour > 24 || minute > 59 || (hour === 24 && minute !== 0)) throw new Error(text('calendar_invalid_window'));
+    return hour * 60 + minute;
+  };
+  return openFormWindow({ title: text('calendar_title'), icon: 'clock', width: 720, sections: [section],
+    submitLabel: text('apply'), canSubmit: () => !readOnly,
+    validate: () => {
+      error.hidden = true;
+      if (!enabled.checked) { result = null; return true; }
+      try {
+        const weeklyWindows = Array.from(windows.children).map((row) => ({
+          weekday: Number(row.querySelector('[data-calendar-weekday]').value),
+          startMinute: parseMinute(row.querySelector('[data-calendar-start]').value),
+          endMinute: parseMinute(row.querySelector('[data-calendar-end]').value),
+        })).sort((a, b) => a.weekday - b.weekday || a.startMinute - b.startMinute || a.endMinute - b.endMinute);
+        const dayCounts = new Map();
+        if (!weeklyWindows.length || weeklyWindows.length > 56 || weeklyWindows.some((window, index) => {
+          dayCounts.set(window.weekday, (dayCounts.get(window.weekday) ?? 0) + 1);
+          return window.weekday < 1 || window.weekday > 7 || dayCounts.get(window.weekday) > 8 ||
+          window.startMinute >= window.endMinute ||
+          (index > 0 && weeklyWindows[index - 1].weekday === window.weekday && weeklyWindows[index - 1].endMinute > window.startMinute);
+        })) {
+          return fail(text('calendar_invalid_window'));
+        }
+        const manualDaysOff = Array.from(days.children).map((row) => ({
+          date: row.querySelector('[data-calendar-date]').value,
+          reason: row.querySelector('[data-calendar-reason]').value,
+        })).sort((a, b) => a.date.localeCompare(b.date));
+        if (manualDaysOff.length > 256 || manualDaysOff.some((day, index) =>
+          !/^\d{4}-\d{2}-\d{2}$/.test(day.date) ||
+          day.date < '2024-01-01' || day.date >= '2041-01-01' ||
+          Number.isNaN(Date.parse(`${day.date}T00:00:00Z`)) || new Date(`${day.date}T00:00:00Z`).toISOString().slice(0, 10) !== day.date ||
+          !day.reason.trim() || new TextEncoder().encode(day.reason).length > 128 || /[\x00-\x1f\x7f]/.test(day.reason) ||
+          (index > 0 && manualDaysOff[index - 1].date === day.date))) {
+          return fail(text('calendar_invalid_day'));
+        }
+        const name = section.querySelector('[data-calendar-name]').value.trim();
+        if (!name || new TextEncoder().encode(name).length > 256) return fail(text('calendar_invalid_name'));
+        result = { name, weeklyWindows, manualDaysOff,
+          holidayPolicy: section.querySelector('[data-calendar-policy]').value };
+        return true;
+      } catch (failure) { return fail(failure.message); }
+    }, collect: () => result,
+    onSubmit: async (value) => { onSave(value); return { message: text('calendar_updated') }; },
   });
 }

@@ -309,10 +309,22 @@ impl<'a> Transition<'a> {
             .as_deref()
             .context("process timer timezone is missing")?
             .to_owned();
-        let due = super::timers::resolve_timer_due(rule, &zone, kind.clone(), self.now_ms);
+        let due = super::timers::resolve_timer_due(
+            rule,
+            &zone,
+            kind.clone(),
+            self.now_ms,
+            self.model.calendar_pin.as_ref(),
+        );
         let (due_at_ms, status, last_reason, error_reason) = match due {
             Ok(due) => (Some(due), ProcessTimerStatus::Pending, None, None),
-            Err(error) if kind == ProcessTimerKind::Boundary => {
+            Err(error)
+                if kind == ProcessTimerKind::Boundary
+                    || matches!(
+                        rule,
+                        tentaflow_protocol::processes::ProcessTimerSpec::WorkingDuration { .. }
+                    ) =>
+            {
                 let reason = format!("{error:#}");
                 (
                     None,
@@ -353,18 +365,31 @@ impl<'a> Transition<'a> {
             _ => None,
         };
         if status == ProcessTimerStatus::Error {
-            let reason = error_reason.context("failed boundary timer has no reason")?;
+            let reason = error_reason.context("failed timer has no reason")?;
             self.incident(&node.id, None, "TIMER_ERROR", reason.clone());
             let incident_id = self
                 .plan
                 .add_incidents
                 .last()
-                .context("boundary timer failure incident was not created")?
+                .context("timer failure incident was not created")?
                 .incident_id
                 .clone();
             self.event("timer_error", Some(node.id.clone()), json!({"kind":kind,"timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":token_id,"incident_id":incident_id,"reason":reason,"due_at_ms":due_at_ms}));
         } else {
             self.event("timer_armed", Some(node.id.clone()), json!({"kind":kind,"timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":if kind == ProcessTimerKind::Boundary {Some(token_id)} else {None},"due_at_ms":due_at_ms,"timezone":zone,"occurrence":1}));
+        }
+        if let Some(working_time) = super::calendar::working_time_summary(
+            rule,
+            self.model.calendar_pin.as_ref(),
+            due_at_ms,
+        )? {
+            let event = self
+                .plan
+                .events
+                .last_mut()
+                .context("armed timer lacks its event")?;
+            event.data["working_time"] = serde_json::to_value(working_time)?;
+            event.data["timezone"] = json!(zone);
         }
         self.timers.push(timer.clone());
         self.plan.create_timers.push(timer);
@@ -1600,6 +1625,7 @@ pub(crate) mod test_support {
             &definition.definition_id,
             definition.draft_revision,
             &snapshots,
+            None,
         )
         .expect("publish immutable process")
         .1
@@ -1612,7 +1638,7 @@ pub(crate) mod test_support {
         let variables = serde_json::to_value(&model.variables).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
         let plan = super::plan_start(
-            model,
+            &version.model,
             &id,
             actor,
             &version.definition_id,

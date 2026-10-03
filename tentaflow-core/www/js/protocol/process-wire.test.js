@@ -100,6 +100,36 @@ test('timer model wire preserves each typed rule and opaque variables', { skip }
   }), /unsupported timer rule/);
 });
 
+test('working calendar wire preserves typed pin and opaque business keys', { skip }, () => {
+  const calendar = { name: 'Office', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [{ date: '2027-05-04', reason: 'Team & family' }], holidayPolicy: 'None' };
+  const pin = { calendar, legalRelease: { releaseId: 'PL-statutory-2026-10-02', asOfDate: '2026-10-02',
+      validFrom: '2024-01-01', validUntil: '2041-01-01', auditManifestSha256: 'a',
+      sources: [{ sourceId: 'DU/2024/1965', url: 'https://example.invalid', sha256: 'b', retrievedOn: '2026-10-02' }],
+      rules: [{ ruleId: 'sunday', sourceId: 'DU/2024/1965', effectiveFrom: '2024-01-01',
+        kind: { Weekday: { weekday: 7 } } }] },
+    timezoneData: { ianaName: 'Europe/Warsaw', releaseId: '2026e', horizonStartMs: 1,
+      horizonEndMs: 2, initialOffsetSeconds: 3600, transitions: [{ atUtcMs: 2, offsetSeconds: 7200 }],
+      sourceUrl: 'https://example.invalid/tz', sourceSha256: 'c', datasetSha256: 'd' }, sha256: 'e' };
+  const model = { schemaVersion: 1, processId: 'P_1', timerTimezone: 'Europe/Warsaw',
+    workCalendar: calendar, calendarPin: pin,
+    nodes: [{ id: 'Start_1', name: 'Start', kind: { TimerStart: { timer: { WorkingDuration: { seconds: 3600 } } } } }],
+    sequenceFlows: [], variables: { business_key: { inner_value: 'Łódź' } }, diagram: { shapes: [], edges: [] } };
+  const body = request('processDefinitionSaveRequest', { commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd',
+    definitionId: null, expectedRevision: 0, name: 'Working', description: '', model });
+  assert.deepEqual(body.model.variables, model.variables);
+  assert.deepEqual(body.model.nodes[0].kind.TimerStart.timer, { WorkingDuration: { seconds: 3600 } });
+  assert.deepEqual(body.model.workCalendar.weeklyWindows, calendar.weeklyWindows);
+  assert.deepEqual(body.model.calendarPin.timezoneData.transitions, pin.timezoneData.transitions);
+  assert.deepEqual(body.model.calendarPin.legalRelease.rules[0].kind, { Weekday: { weekday: 7 } });
+  assert.throws(() => codec.encode.processDefinitionSaveRequest(17, { commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd',
+    definitionId: null, expectedRevision: 0, name: 'Bad', description: '',
+    model: { ...model, workCalendar: { ...calendar, secretRule: true } } }), /unsupported work calendar field/);
+  const publish = request('processDefinitionPublishRequest', { commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd',
+    definitionId: 'definition-1', expectedRevision: 3, repinCalendar: true });
+  assert.equal(publish.repinCalendar, true);
+});
+
 test('boundary timer wire keeps attachment, cancellation and opaque business keys', { skip }, () => {
   const model = {
     schemaVersion: 1, processId: 'Boundary_1', timerTimezone: 'Europe/Warsaw',

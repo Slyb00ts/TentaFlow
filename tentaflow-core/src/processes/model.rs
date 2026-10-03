@@ -41,6 +41,8 @@ pub fn starter_model() -> ProcessModel {
         variables: Default::default(),
         diagram: ProcessDiagram::default(),
         timer_timezone: None,
+        work_calendar: None,
+        calendar_pin: None,
     }
 }
 
@@ -102,6 +104,10 @@ pub fn validate_timer_spec(spec: &ProcessTimerSpec, is_start: bool) -> Result<()
                 "timer firing count must be positive"
             );
         }
+        ProcessTimerSpec::WorkingDuration { seconds } => ensure!(
+            (1..=31_536_000).contains(seconds),
+            "working timer duration must be 1..=31536000 seconds"
+        ),
     }
     Ok(())
 }
@@ -113,22 +119,37 @@ fn validate_timer_model(model: &ProcessModel) -> Result<()> {
             ProcessNodeKind::TimerStart { timer } => {
                 validate_timer_spec(timer, true)
                     .with_context(|| format!("timer start {}", node.id))?;
+                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
+                    ensure!(model.work_calendar.is_some(), "working timer requires a configured calendar");
+                }
                 has_timer = true;
             }
             ProcessNodeKind::TimerCatch { timer }
             | ProcessNodeKind::BoundaryTimer { timer, .. } => {
                 validate_timer_spec(timer, false)
                     .with_context(|| format!("timer event {}", node.id))?;
+                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
+                    ensure!(model.work_calendar.is_some(), "working timer requires a configured calendar");
+                }
                 has_timer = true;
             }
             _ => {}
         }
     }
-    if has_timer {
+    if let Some(calendar) = &model.work_calendar {
+        super::calendar::validate_work_calendar(calendar)?;
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "work_calendar": calendar,
+            "calendar_pin": &model.calendar_pin,
+        }))?;
+        ensure!(bytes.len() <= 128 * 1024, "process calendar and pin exceed 128 KiB");
+    }
+    super::calendar::calendar_pin_state(model)?;
+    if has_timer || model.work_calendar.is_some() {
         let timezone = model
             .timer_timezone
             .as_deref()
-            .context("timed process requires an explicit IANA timezone")?;
+            .context("timed process or calendar requires an explicit IANA timezone")?;
         ensure!(
             !timezone.is_empty() && timezone.trim() == timezone,
             "timer timezone must be a nonempty IANA name"
@@ -682,6 +703,31 @@ pub fn and_pairs(model: &ProcessModel) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_without_timer_requires_zone_and_working_rule_requires_calendar() {
+        use tentaflow_protocol::processes::{HolidayPolicy, ProcessWorkCalendar, WorkWindow};
+        let mut model = starter_model();
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "Office".into(),
+            weekly_windows: vec![WorkWindow { weekday: 1, start_minute: 540, end_minute: 1020 }],
+            manual_days_off: Vec::new(), holiday_policy: HolidayPolicy::None,
+        });
+        assert!(validate_model(&model).is_err());
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        validate_model(&model).unwrap();
+        model.nodes[0].kind = ProcessNodeKind::TimerStart {
+            timer: ProcessTimerSpec::WorkingDuration { seconds: 3600 },
+        };
+        validate_model(&model).unwrap();
+        model.work_calendar = None;
+        assert!(validate_model(&model).is_err());
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "Office".into(), weekly_windows: Vec::new(),
+            manual_days_off: Vec::new(), holiday_policy: HolidayPolicy::None,
+        });
+        assert!(validate_model(&model).is_err());
+    }
 
     fn boundary_model() -> ProcessModel {
         use tentaflow_protocol::processes::{ProcessNode, ProcessSequenceFlow};

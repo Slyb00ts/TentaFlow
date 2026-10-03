@@ -28,7 +28,7 @@ const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
 const { processTemplates } = await import('./bpmn.js');
-const { openProcessInstance, openProcessInstances, openProcessRun, openProcessSchedule, processEventText, processTimerReasonText, processTimerText } = await import('./process-monitor.js');
+const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessRun, openProcessSchedule, processEventText, processTimerReasonText, processTimerText } = await import('./process-monitor.js');
 const { default: builder } = await import('../flows-builder.js');
 const { default: flows } = await import('../flows.js');
 localStorage.setItem('tentaflow_lang', 'en');
@@ -172,7 +172,7 @@ test('boundary inspector uses stable activity selection and an actual checked to
   const attach = panel.root.querySelector('[data-process="attachedToId"]');
   assert.equal(attach.value, 'Review');
   assert.match(panel.root.querySelector('[data-boundary-target]').textContent, /Review contract/);
-  assert.deepEqual([...panel.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration']);
+  assert.deepEqual([...panel.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration', 'WorkingDuration']);
   const toggle = panel.root.querySelector('[data-process="cancelActivity"]');
   toggle.checked = false;
   toggle.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { checked: false } }));
@@ -447,6 +447,30 @@ test('published version paging and competing previews use the selected current r
   assert.equal(state.previewVersion, 2); assert.deepEqual(state.canvas.getData().variables, {}); assert.equal(state.canvas.readOnly, true);
 });
 
+test('preview shows its pinned calendar state and returning to the draft restores stale state', async () => {
+  const original = { name: 'Original', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [], holidayPolicy: 'None' };
+  const pin = { calendar: original, timezoneData: { ianaName: 'Europe/Warsaw' }, sha256: 'pin' };
+  const published = { ...emptyProcessModel(), timerTimezone: 'Europe/Warsaw', workCalendar: original, calendarPin: pin };
+  const draft = { ...published, workCalendar: { ...original, name: 'Revised' } };
+  const current = definition('calendar-preview', { model: draft, publishedVersion: 1, calendarPinState: 'Stale' });
+  const state = await mount(current, {
+    processDefinitionGetRequest: { definition: current },
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: { version: { version: 1, model: published } },
+  });
+  assert.equal(state.root.querySelector('[data-role="calendar-state"]').textContent, I18n.t('bpmn.calendar_state_stale'));
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush();
+  assert.equal(state.previewVersion, 1);
+  assert.equal(state.root.querySelector('[data-role="calendar-state"]').textContent, I18n.t('bpmn.calendar_state_current'));
+  click(state.root.querySelector('[data-role="draft"]'));
+  await flush();
+  assert.equal(state.previewVersion, null);
+  assert.equal(state.root.querySelector('[data-role="calendar-state"]').textContent, I18n.t('bpmn.calendar_state_stale'));
+});
+
 test('human completion fetches full authorized work and sends instance revision with unchanged output keys', async () => {
   const task = { userTaskId: 'work', nodeId: 'Review', name: 'Review contract', assigneeUserId: 'anna', kind: 'Work', status: 'Open', revision: 2, canComplete: true };
   const current = instance('work-run', { userTasks: [task] });
@@ -689,7 +713,7 @@ test('timer inspector edits Date, elapsed Duration, finite Cycle and Daily witho
   assert.equal(node.config.timer.Daily.hour, 14);
   const catchGraph = canvas(timedModel('TimerCatch')); const catchConfig = inspector(catchGraph);
   catchConfig.show(catchGraph.nodes[1], catchGraph.templates.get('bpmn_timer_catch'));
-  assert.deepEqual([...catchConfig.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration']);
+  assert.deepEqual([...catchConfig.root.querySelectorAll('[data-process="timerType"] option')].map((option) => option.value), ['Date', 'Duration', 'WorkingDuration']);
   assert.equal(catchConfig.root.querySelector('[data-process="timerTotal"]'), null);
   graph.destroy(); config.destroy(); readonly.destroy(); catchGraph.destroy(); catchConfig.destroy();
 });
@@ -731,6 +755,193 @@ test('boundary-only processes expose the editable timezone while timerless proce
   assert.equal(catchState.root.querySelector('[data-role="timer-timezone"]').hidden, false);
   const plainState = await mount(definition('plain-timezone'));
   assert.equal(plainState.root.querySelector('[data-role="timer-timezone"]').hidden, true);
+});
+
+test('calendar-only process exposes timezone and structured editor rejects invalid closures', async () => {
+  const state = await mount(definition('calendar-only'));
+  assert.equal(state.root.querySelector('[data-role="timer-timezone"]').hidden, true);
+  click(state.root.querySelector('[data-role="calendar"]'));
+  await flush();
+  const form = document.querySelector('.tf-act-window');
+  assert.ok(form);
+  const enabled = form.querySelector('[data-calendar-enabled]');
+  enabled.checked = true;
+  enabled.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+  change(form.querySelector('[data-calendar-name]'), 'Warsaw office');
+  assert.equal(form.querySelector('[data-calendar-windows]').children.length, 5);
+  click(form.querySelector('[data-calendar-add-day]'));
+  change(form.querySelector('[data-calendar-date]'), '2026-02-30');
+  change(form.querySelector('[data-calendar-reason]'), 'Maintenance');
+  click(form.querySelector('[data-act="submit"]'));
+  await flush();
+  assert.ok(form.isConnected, 'nonexistent civil date cannot be saved');
+  change(form.querySelector('[data-calendar-date]'), '2026-02-27');
+  click(form.querySelector('[data-act="submit"]'));
+  await flush();
+  assert.ok(form.shadowRoot.querySelector('.tf-window-closing'), 'valid structured calendar closes the form');
+  assert.equal(state.canvas.getData().workCalendar.manualDaysOff[0].date, '2026-02-27');
+  assert.equal(state.root.querySelector('[data-role="timer-timezone"]').hidden, false);
+  assert.equal(state.root.querySelector('[data-role="timer-timezone"]').value, '', 'no timezone is inferred');
+});
+
+test('calendar-only draft rejects an absent or blank timezone before saving or publishing', async () => {
+  const current = definition('calendar-zone');
+  const state = await mount(current, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...current, model: payload.model, draftRevision: 5 } }),
+  });
+  state.canvas.updateProcessCalendar({ name: 'Office', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [], holidayPolicy: 'None' });
+  assert.deepEqual(state.canvas.validate(), [I18n.t('bpmn.timer_timezone_required')]);
+  assert.equal(await builder._save(), false);
+  await builder._publish();
+  assert.equal(calls.some((call) => ['processDefinitionSaveRequest', 'processDefinitionPublishRequest'].includes(call.kind)), false);
+  state.canvas.updateProcessTimezone('   ');
+  assert.deepEqual(state.canvas.validate(), [I18n.t('bpmn.timer_timezone_required')]);
+  assert.equal(await builder._save(), false);
+  state.canvas.updateProcessTimezone('Europe/Warsaw');
+  assert.deepEqual(state.canvas.validate(), []);
+  assert.equal(await builder._save(), true);
+  assert.equal(calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model.timerTimezone, 'Europe/Warsaw');
+  const plain = canvas();
+  assert.deepEqual(plain.validate(), [], 'a process without a calendar or timer needs no timezone');
+  plain.destroy();
+});
+
+test('calendar name and closure reason show their complete escaped values in read-only multiline controls', () => {
+  const name = `Office <private> & ${'Łódź '.repeat(28)}`;
+  const reason = `Maintenance <script> & ${'review '.repeat(11)}`;
+  assert.ok(new TextEncoder().encode(name).length <= 256);
+  assert.ok(new TextEncoder().encode(reason).length <= 128);
+  const calendar = { name, weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [{ date: '2026-02-27', reason }], holidayPolicy: 'None' };
+  const form = openProcessCalendar(calendar, null, 'Unpinned', true, () => assert.fail('read-only calendar cannot save'));
+  const title = form.querySelector('[data-calendar-name]');
+  const closure = form.querySelector('[data-calendar-reason]');
+  for (const [field, value] of [[title, name], [closure, reason]]) {
+    assert.equal(field.tagName, 'TF-TEXTAREA');
+    assert.ok(field.hasAttribute('autogrow'));
+    assert.ok(field.hasAttribute('disabled'));
+    assert.equal(field.value, value);
+    assert.equal(field.querySelector('textarea').value, value);
+    assert.equal(field.querySelector('script'), null);
+  }
+  assert.ok(form.querySelector('[data-act="submit"]').hasAttribute('disabled'));
+});
+
+test('pinned calendar details show exact exclusive source coverage in all five languages', async () => {
+  const calendar = { name: 'Office', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [], holidayPolicy: 'None' };
+  const pin = { legalRelease: { releaseId: 'PL-2026-10', asOfDate: '2026-10-02',
+    validFrom: '2024-01-01', validUntil: '2041-01-01' }, timezoneData: { releaseId: '2026e' },
+    sha256: 'a'.repeat(64) };
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const form = openProcessCalendar(calendar, pin, 'Current', true, () => assert.fail('read-only calendar cannot save'));
+      const coverage = form.querySelector('[data-calendar-coverage]');
+      assert.equal(coverage.textContent, I18n.t('bpmn.calendar_coverage', {
+        from: '2024-01-01', until: '2041-01-01',
+      }));
+      assert.ok(coverage.textContent.includes('2024-01-01'));
+      assert.ok(coverage.textContent.includes('2041-01-01'));
+      assert.equal(coverage.children.length, 0, 'pin values render as text');
+      form.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('published calendar pin survives ordinary model edit, undo and autosave without repin', async () => {
+  const calendar = { name: 'Office', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [], holidayPolicy: 'PolandStatutory' };
+  const model = emptyProcessModel();
+  model.workCalendar = calendar;
+  model.timerTimezone = 'Europe/Warsaw';
+  model.variables = { Invoice_ID: { preserve_key: true } };
+  const current = definition('calendar-publish', { model, calendarPinState: 'Unpinned' });
+  const pin = { calendar, sha256: 'a'.repeat(64), legalRelease: { releaseId: 'PL-2026', asOfDate: '2026-10-02' },
+    timezoneData: { ianaName: 'Europe/Warsaw', releaseId: '2026e' } };
+  const published = { ...model, calendarPin: pin };
+  const state = await mount(current, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...current, draftRevision: payload.expectedRevision + 1,
+      name: payload.name, model: payload.model, calendarPinState: payload.model.calendarPin ? 'Current' : 'Unpinned' } }),
+    processDefinitionPublishRequest: (payload) => {
+      assert.equal(payload.repinCalendar, undefined);
+      return { definition: { ...current, draftRevision: payload.expectedRevision, publishedVersion: 1,
+        calendarPinState: 'Current' }, version: { version: 1, model: published } };
+    },
+  });
+  await builder._publish();
+  assert.deepEqual(state.canvas.getData().calendarPin, pin);
+  state.canvas.updateNodeLabel('Start', 'Renamed start');
+  state.canvas.undo();
+  assert.deepEqual(state.canvas.getData().calendarPin, pin, 'undo does not restore an unpinned pre-publication snapshot');
+  state.canvas.redo();
+  assert.deepEqual(state.canvas.getData().calendarPin, pin);
+  assert.equal(await builder._save(), true);
+  const saves = calls.filter((call) => call.kind === 'processDefinitionSaveRequest');
+  assert.deepEqual(saves.at(-1).payload.model.calendarPin, pin);
+  assert.deepEqual(saves.at(-1).payload.model.variables, { Invoice_ID: { preserve_key: true } });
+  assert.equal(state.root.querySelector('[data-role="calendar-state"]').textContent, I18n.t('bpmn.calendar_state_current'));
+});
+
+test('stale calendar requires explicit refresh and adopts the returned immutable pin', async () => {
+  const calendar = { name: 'Initial', weeklyWindows: [{ weekday: 1, startMinute: 540, endMinute: 1020 }],
+    manualDaysOff: [], holidayPolicy: 'None' };
+  const model = emptyProcessModel();
+  model.workCalendar = calendar;
+  model.timerTimezone = 'Europe/Warsaw';
+  model.calendarPin = { sha256: 'old-pin', calendar, timezoneData: { ianaName: 'Europe/Warsaw' } };
+  const current = definition('stale-calendar', { model, calendarPinState: 'Current' });
+  let savedModel = model;
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: next, expectedRevision }) => {
+      savedModel = next;
+      return { definition: { ...current, model: next, draftRevision: expectedRevision + 1,
+        calendarPinState: next.workCalendar.name === 'Revised' && next.calendarPin.sha256 !== 'new-pin' ? 'Stale' : 'Current' } };
+    },
+    processDefinitionPublishRequest: ({ repinCalendar, expectedRevision }) => {
+      assert.equal(repinCalendar, true);
+      assert.equal(expectedRevision, 5);
+      return { definition: { ...current, draftRevision: 5, publishedVersion: 2, calendarPinState: 'Current' },
+        version: { version: 2, model: { ...savedModel, calendarPin: { sha256: 'new-pin',
+          calendar: savedModel.workCalendar, timezoneData: { ianaName: 'Europe/Warsaw' } } } } };
+    },
+  });
+  state.canvas.updateProcessCalendar({ ...calendar, name: 'Revised' });
+  assert.equal(await builder._save(), true);
+  assert.equal(state.definition.calendarPinState, 'Stale');
+  const priorConfirm = TfWindow.confirm;
+  try {
+    const titles = { en: 'Refresh calendar', pl: 'Odświeżenie kalendarza',
+      de: 'Kalender aktualisieren', es: 'Actualizar calendario', fr: 'Actualiser le calendrier' };
+    const actions = { en: 'Refresh calendar data and publish a new version',
+      pl: 'Odśwież dane kalendarza i opublikuj nową wersję',
+      de: 'Kalenderdaten aktualisieren und neue Version veröffentlichen',
+      es: 'Actualizar los datos del calendario y publicar una nueva versión',
+      fr: 'Actualiser les données du calendrier et publier une nouvelle version' };
+    const cancellations = { en: 'Cancel', pl: 'Anuluj', de: 'Abbrechen', es: 'Cancelar', fr: 'Annuler' };
+    for (const [language, title] of Object.entries(titles)) {
+      await I18n.setLanguage(language);
+      TfWindow.confirm = async (options) => {
+        assert.equal(options.title, title);
+        assert.equal(options.message, I18n.t('bpmn.calendar_refresh_hint'));
+        assert.equal(options.confirmLabel, actions[language]);
+        assert.equal(options.cancelLabel, cancellations[language]);
+        assert.notEqual(options.title, options.confirmLabel, 'the full action stays in the confirmation button');
+        return false;
+      };
+      await builder._publish();
+      assert.equal(calls.some((call) => call.kind === 'processDefinitionPublishRequest'), false);
+    }
+    await I18n.setLanguage('en');
+    TfWindow.confirm = async () => true;
+    await builder._publish();
+  } finally { TfWindow.confirm = priorConfirm; await I18n.setLanguage('en'); }
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionPublishRequest').length, 1);
+  assert.equal(state.canvas.getData().calendarPin.sha256, 'new-pin');
+  state.canvas.updateNodeLabel('End', 'Ordinary edit');
+  assert.equal(await builder._save(), true);
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionSaveRequest').at(-1).payload.model.calendarPin.sha256, 'new-pin');
 });
 
 test('timer publication requires a real arming confirmation and refreshes the authoritative schedule', async () => {
@@ -932,6 +1143,33 @@ test('schedule renders a long unbroken definition name and untrusted markup as t
   assert.ok(summary.textContent.startsWith(name));
   assert.equal(summary.querySelector('img'), null);
   assert.equal(win.querySelector('[data-timers]').textContent.includes('Daily approval'), true);
+});
+
+test('working timer renders the pinned offset and provenance without browser timezone arithmetic', async () => {
+  const dueAtMs = Date.UTC(2027, 2, 28, 1, 30);
+  const workingTime = { calendarName: '<Warsaw office>', holidayPolicy: 'PolandStatutory', pinSha256: 'a'.repeat(64),
+    legalReleaseId: 'PL-2026-10', legalAsOfDate: '2026-10-02', tzdbReleaseId: '2026e', dueOffsetSeconds: 7200 };
+  const timer = savedTimer({ kind: 'Catch', nodeName: 'Review', dueAtMs, workingTime });
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const win = await monitor(instance(`working-${language}`, { timers: [timer] }));
+      const row = win.querySelector('[data-timers]');
+      assert.ok(row.textContent.includes('UTC+02:00'));
+      assert.ok(row.textContent.includes(new Date(dueAtMs).toISOString()));
+      assert.ok(row.textContent.includes('2026e'));
+      assert.ok(row.textContent.includes('PL-2026-10'));
+      assert.ok(row.textContent.includes(workingTime.pinSha256));
+      assert.ok(row.textContent.includes(I18n.t('bpmn.calendar_policy_poland')));
+      assert.equal(row.querySelector('warsaw'), null, 'calendar name is untrusted text');
+      const fired = processEventText({ kind: 'timer_fired', nodeName: 'Review', data: {
+        kind: 'Catch', planned_due_at_ms: dueAtMs, fired_at_ms: dueAtMs + 1000,
+        skipped_count: 0, timezone: 'Europe/Warsaw', working_time: { due_offset_seconds: 7200 },
+      } });
+      assert.ok(fired.includes(new Date(dueAtMs + 1000).toISOString()));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
 });
 
 test('schedule and current start localize known timer reasons in five languages without changing arbitrary errors', async () => {

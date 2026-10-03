@@ -303,6 +303,79 @@ function processField(value, camel) {
   return value?.[camel];
 }
 
+function processKnownFields(value, names, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).some((key) => !names.includes(key))) {
+    throw new TypeError(`unsupported ${label} field`);
+  }
+}
+
+function processWorkCalendar(calendar) {
+  processKnownFields(calendar, ['name', 'weeklyWindows', 'manualDaysOff', 'holidayPolicy'], 'work calendar');
+  if (!Array.isArray(calendar.weeklyWindows) || !Array.isArray(calendar.manualDaysOff) ||
+      !['None', 'PolandStatutory'].includes(calendar.holidayPolicy)) {
+    throw new TypeError('work calendar requires windows, closures and holiday policy');
+  }
+  return {
+    name: String(calendar.name ?? ''),
+    weekly_windows: calendar.weeklyWindows.map((window) => {
+      processKnownFields(window, ['weekday', 'startMinute', 'endMinute'], 'work window');
+      return { weekday: Number(window.weekday), start_minute: Number(window.startMinute), end_minute: Number(window.endMinute) };
+    }),
+    manual_days_off: calendar.manualDaysOff.map((day) => {
+      processKnownFields(day, ['date', 'reason'], 'manual day off');
+      return { date: String(day.date), reason: String(day.reason) };
+    }),
+    holiday_policy: calendar.holidayPolicy,
+  };
+}
+
+function processCalendarPin(pin) {
+  processKnownFields(pin, ['calendar', 'legalRelease', 'timezoneData', 'sha256'], 'calendar pin');
+  const release = pin.legalRelease;
+  const zone = pin.timezoneData;
+  processKnownFields(release, ['releaseId', 'asOfDate', 'validFrom', 'validUntil', 'auditManifestSha256', 'sources', 'rules'], 'legal release');
+  processKnownFields(zone, ['ianaName', 'releaseId', 'horizonStartMs', 'horizonEndMs', 'initialOffsetSeconds', 'transitions', 'sourceUrl', 'sourceSha256', 'datasetSha256'], 'timezone data');
+  if (!Array.isArray(release.sources) || !Array.isArray(release.rules) || !Array.isArray(zone.transitions)) {
+    throw new TypeError('calendar pin requires complete source, rule and transition lists');
+  }
+  return {
+    calendar: processWorkCalendar(pin.calendar),
+    legal_release: {
+      release_id: release.releaseId, as_of_date: release.asOfDate,
+      valid_from: release.validFrom, valid_until: release.validUntil,
+      audit_manifest_sha256: release.auditManifestSha256,
+      sources: release.sources.map((source) => {
+        processKnownFields(source, ['sourceId', 'url', 'sha256', 'retrievedOn'], 'calendar source');
+        return { source_id: source.sourceId, url: source.url, sha256: source.sha256, retrieved_on: source.retrievedOn };
+      }),
+      rules: release.rules.map((rule) => {
+        processKnownFields(rule, ['ruleId', 'sourceId', 'effectiveFrom', 'effectiveUntil', 'kind'], 'holiday rule');
+        processKnownFields(rule.kind, ['Fixed', 'GregorianEasterOffset', 'Weekday'], 'holiday rule kind');
+        if (Object.keys(rule.kind).length !== 1) throw new TypeError('holiday rule requires one kind');
+        const [tag, body] = Object.entries(rule.kind)[0];
+        if (!['Fixed', 'GregorianEasterOffset', 'Weekday'].includes(tag)) throw new TypeError('unsupported holiday rule');
+        processKnownFields(body, tag === 'Fixed' ? ['month', 'day'] : tag === 'Weekday' ? ['weekday'] : ['days'], 'holiday rule kind');
+        return { rule_id: rule.ruleId, source_id: rule.sourceId,
+          effective_from: rule.effectiveFrom,
+          ...(rule.effectiveUntil == null ? {} : { effective_until: rule.effectiveUntil }),
+          kind: { [tag]: body } };
+      }),
+    },
+    timezone_data: {
+      iana_name: zone.ianaName, release_id: zone.releaseId,
+      horizon_start_ms: zone.horizonStartMs, horizon_end_ms: zone.horizonEndMs,
+      initial_offset_seconds: zone.initialOffsetSeconds,
+      transitions: zone.transitions.map((transition) => {
+        processKnownFields(transition, ['atUtcMs', 'offsetSeconds'], 'timezone transition');
+        return { at_utc_ms: transition.atUtcMs, offset_seconds: transition.offsetSeconds };
+      }),
+      source_url: zone.sourceUrl, source_sha256: zone.sourceSha256, dataset_sha256: zone.datasetSha256,
+    },
+    sha256: pin.sha256,
+  };
+}
+
 function processTimerSpec(timer) {
   if (!timer || typeof timer !== 'object' || Array.isArray(timer)) throw new TypeError('timer rule is required');
   const entries = Object.entries(timer);
@@ -311,10 +384,12 @@ function processTimerSpec(timer) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('timer rule body is required');
   const allowed = {
     Date: ['at'], Duration: ['seconds'], Cycle: ['seconds', 'totalFirings'], Daily: ['hour', 'minute', 'totalFirings'],
+    WorkingDuration: ['seconds'],
   }[tag];
   if (!allowed || Object.keys(body).some((key) => !allowed.includes(key))) throw new TypeError(`unsupported timer rule ${tag}`);
   if (tag === 'Date') return { Date: { at: String(body.at ?? '') } };
   if (tag === 'Duration') return { Duration: { seconds: Number(body.seconds) } };
+  if (tag === 'WorkingDuration') return { WorkingDuration: { seconds: Number(body.seconds) } };
   if (tag === 'Cycle') return { Cycle: { seconds: Number(body.seconds), total_firings: body.totalFirings == null ? null : Number(body.totalFirings) } };
   return { Daily: { hour: Number(body.hour), minute: Number(body.minute), total_firings: body.totalFirings == null ? null : Number(body.totalFirings) } };
 }
@@ -354,8 +429,8 @@ function processModel(model) {
         throw new TypeError('boundary timer requires an attachment and cancellation choice');
       }
       const timer = processTimerSpec(body.timer);
-      if (!('Date' in timer) && !('Duration' in timer)) {
-        throw new TypeError('boundary timer supports Date or Duration only');
+      if (!('Date' in timer) && !('Duration' in timer) && !('WorkingDuration' in timer)) {
+        throw new TypeError('boundary timer supports Date, Duration or WorkingDuration only');
       }
       fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity, timer };
     } else {
@@ -375,6 +450,8 @@ function processModel(model) {
     })),
     variables: model.variables ?? {},
     timer_timezone: processField(model, 'timerTimezone') ?? null,
+    ...(model.workCalendar == null ? {} : { work_calendar: processWorkCalendar(model.workCalendar) }),
+    ...(model.calendarPin == null ? {} : { calendar_pin: processCalendarPin(model.calendarPin) }),
     diagram: {
       shapes: (diagram.shapes ?? []).map((shape) => ({
         element_id: String(processField(shape, 'elementId') ?? ''),
@@ -394,7 +471,7 @@ function processRequestBody(variant, payload) {
     OptionsRequest: [],
     DefinitionListRequest: ['offset', 'limit'], DefinitionGetRequest: ['definitionId'],
     DefinitionSaveRequest: ['commandId', 'definitionId', 'expectedRevision', 'name', 'description', 'model'],
-    DefinitionPublishRequest: ['commandId', 'definitionId', 'expectedRevision'],
+    DefinitionPublishRequest: ['commandId', 'definitionId', 'expectedRevision', 'repinCalendar'],
     DefinitionArchiveRequest: ['commandId', 'definitionId', 'expectedRevision', 'archived'],
     VersionListRequest: ['definitionId', 'offset', 'limit'], VersionGetRequest: ['definitionId', 'version'],
     XmlImportRequest: ['xml'], XmlExportRequest: ['definitionId', 'version'],
@@ -410,7 +487,7 @@ function processRequestBody(variant, payload) {
   for (const name of fieldNames) {
     const key = name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
     const value = processField(payload, name);
-    if (value === undefined && !['definitionId', 'version', 'approved'].includes(name)) {
+    if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
     fields[key] = name === 'model' ? processModel(value) : (value ?? null);

@@ -35,6 +35,8 @@ fn main() {
         println!("cargo:rustc-cfg=fast_build");
     }
 
+    generate_process_calendar_data(&out_dir_env);
+
     // Compile the fused GPU crop-preprocess CUDA kernel (nvcc) and emit its link
     // flags. CUDA preprocessing is supported on Linux and Windows; macOS uses
     // Metal. Done early so a missing CUDA toolchain fails fast.
@@ -1022,6 +1024,141 @@ fn write_if_changed(path: &Path, content: impl AsRef<[u8]>) {
         }
     }
     std::fs::write(path, content).unwrap();
+}
+
+fn generate_process_calendar_data(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
+
+    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let timezone = root.join("src/processes/data/tzdb/2026e");
+    let legal = root.join("src/processes/data/holidays/PL-statutory-2026-10-02");
+    let read = |path: &Path| {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let metadata = std::fs::symlink_metadata(path)
+            .unwrap_or_else(|error| panic!("calendar data {}: {error}", path.display()));
+        assert!(
+            metadata.is_file(),
+            "calendar data must be a regular file: {}",
+            path.display()
+        );
+        std::fs::read(path).unwrap()
+    };
+    let hash = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+    let tz_manifest: serde_json::Value =
+        serde_json::from_slice(&read(&timezone.join("manifest.json"))).unwrap();
+    let zones_bytes = read(&timezone.join("zones.json"));
+    assert_eq!(
+        hash(&zones_bytes),
+        tz_manifest["dataset_sha256"].as_str().unwrap(),
+        "calendar timezone bytes changed without a reviewed manifest"
+    );
+    let dataset: serde_json::Value = serde_json::from_slice(&zones_bytes).unwrap();
+    assert_eq!(dataset["tzdb_release"], tz_manifest["release_id"]);
+    assert_eq!(
+        dataset["valid_from_utc_ms"],
+        tz_manifest["horizon_start_ms"]
+    );
+    assert_eq!(dataset["valid_until_utc_ms"], tz_manifest["horizon_end_ms"]);
+    let start = dataset["valid_from_utc_ms"].as_i64().unwrap();
+    let end = dataset["valid_until_utc_ms"].as_i64().unwrap();
+    assert_eq!((start, end), (1_703_980_800_000, 2_240_697_600_000));
+    let zones = dataset["zones"].as_object().unwrap();
+    assert_eq!(
+        zones.len(),
+        597,
+        "calendar dataset must contain all reviewed zone names"
+    );
+    assert_eq!(
+        zones.len() as u64,
+        tz_manifest["zone_count"].as_u64().unwrap()
+    );
+    let mut names = zones.keys().map(String::as_str).collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        hash(names.join("\n").as_bytes()),
+        tz_manifest["names_sha256"].as_str().unwrap()
+    );
+    for (name, zone) in zones {
+        assert!(!name.is_empty() && name.is_ascii() && !name.contains(".."));
+        assert_eq!(zone.as_object().unwrap().len(), 2);
+        let mut previous_offset = zone["initial_offset_seconds"].as_i64().unwrap();
+        assert!(previous_offset > -86_400 && previous_offset < 86_400);
+        let transitions = zone["transitions"].as_array().unwrap();
+        assert!(transitions.len() <= 128);
+        let mut previous_at = start;
+        for transition in transitions {
+            assert_eq!(transition.as_object().unwrap().len(), 2);
+            let at = transition["at_utc_ms"].as_i64().unwrap();
+            let offset = transition["offset_seconds"].as_i64().unwrap();
+            assert!(
+                previous_at < at && at < end,
+                "unordered/out-of-horizon transition in {name}"
+            );
+            assert!(offset > -86_400 && offset < 86_400 && offset != previous_offset);
+            previous_at = at;
+            previous_offset = offset;
+        }
+    }
+    read(&timezone.join("LICENSE"));
+    let legal_manifest: serde_json::Value =
+        serde_json::from_slice(&read(&legal.join("manifest.json"))).unwrap();
+    let legal_bytes = read(&legal.join("rules.json"));
+    assert_eq!(
+        hash(&legal_bytes),
+        legal_manifest["rules_sha256"].as_str().unwrap()
+    );
+    let rules: serde_json::Value = serde_json::from_slice(&legal_bytes).unwrap();
+    assert_eq!(rules["release_id"], legal_manifest["release_id"]);
+    assert!(rules["sources"].as_array().unwrap().len() <= 8);
+    assert!(rules["rules"].as_array().unwrap().len() <= 64);
+    let audit_bytes = read(&legal.join("audit-source-manifest.json"));
+    assert_eq!(
+        hash(&audit_bytes),
+        legal_manifest["audit_manifest_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        rules["audit_manifest_sha256"],
+        legal_manifest["audit_manifest_sha256"]
+    );
+    let audit: serde_json::Value = serde_json::from_slice(&audit_bytes).unwrap();
+    for source in legal_manifest["files"].as_array().unwrap() {
+        let relative = Path::new(source["path"].as_str().unwrap());
+        assert!(relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))));
+        let bytes = read(&legal.join(relative));
+        let digest = hash(&bytes);
+        assert_eq!(digest, source["sha256"].as_str().unwrap());
+        assert!(audit["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["sha256"].as_str() == Some(digest.as_str())));
+    }
+    for source in rules["sources"].as_array().unwrap() {
+        assert!(audit["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["url"] == source["url"]
+                && entry["sha256"] == source["sha256"]
+                && entry["retrieved_on"] == source["retrieved_on"]));
+    }
+    println!("cargo:rerun-if-changed=../scripts/generate-process-timezones.py");
+    let mut generated =
+        String::from("// Generated from verified immutable calendar release bytes.\n");
+    for (name, path) in [
+        ("TZDB_JSON", timezone.join("zones.json")),
+        ("TZDB_MANIFEST_JSON", timezone.join("manifest.json")),
+        ("LEGAL_RELEASE_JSON", legal.join("rules.json")),
+        ("LEGAL_AUDIT_JSON", legal.join("audit-source-manifest.json")),
+    ] {
+        generated.push_str(&format!(
+            "pub(super) const {name}: &[u8] = include_bytes!({:?});\n",
+            path
+        ));
+    }
+    write_if_changed(&out_dir.join("process_calendar_data.rs"), generated);
 }
 
 /// Skanuje www/ i liczy zbiorczy SHA-256 calego frontu (ASSET_BUILD_HASH).

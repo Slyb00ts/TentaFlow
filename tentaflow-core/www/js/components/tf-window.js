@@ -791,8 +791,8 @@ TfWindow.confirm = function confirmDialog({
   `;
   const confirmVariant = danger ? 'danger-solid' : 'primary';
   const footerHtml = `
-    <tf-button variant="ghost" data-action="cancel">${cancelLabel}</tf-button>
-    <tf-button variant="${confirmVariant}"${danger ? ' icon="trash"' : ''} data-action="confirm">${confirmLabel}</tf-button>
+    <tf-button variant="ghost" wrap data-action="cancel">${cancelLabel}</tf-button>
+    <tf-button variant="${confirmVariant}" wrap${danger ? ' icon="trash"' : ''} data-action="confirm">${confirmLabel}</tf-button>
   `;
   return TfWindow.open({
     title,

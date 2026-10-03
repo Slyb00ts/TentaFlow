@@ -380,6 +380,11 @@ fn timer_summary(timer: &ProcessTimer, model: &ProcessModel) -> Result<ProcessTi
         } else {
             None
         },
+        working_time: super::calendar::working_time_summary(
+            &timer.rule,
+            model.calendar_pin.as_ref(),
+            timer.due_at_ms,
+        )?,
     })
 }
 
@@ -479,11 +484,13 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
     ensure!(
         timer.revision == 1 && timer.occurrence > 0
             && ((timer.status == ProcessTimerStatus::Pending && timer.due_at_ms.is_some())
-                || (timer.kind == ProcessTimerKind::Boundary
+                || ((timer.kind == ProcessTimerKind::Boundary
+                    || (timer.kind == ProcessTimerKind::Catch
+                        && matches!(&timer.rule, ProcessTimerSpec::WorkingDuration { .. })))
                     && timer.status == ProcessTimerStatus::Error
                     && timer.due_at_ms.is_none()
                     && timer.last_reason.is_some())),
-        "new process timer must be pending with a due slot"
+        "new process timer must have a pending due slot or an activity arming error"
     );
     let total_firings = match &timer.rule {
         ProcessTimerSpec::Cycle { total_firings, .. }
@@ -796,11 +803,20 @@ pub fn record_timer_failed(
             |row| row_u64(row, 0),
         )?;
         let model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
-        insert_event_on(&tx, instance_id, next_seq, None, &PlannedEvent {
-                kind: "timer_error".into(),
-                node_id: Some(timer.node_id.clone()),
-                data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"incident_id":incident_id,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&model, &timer)? } else { None },"attached_token_id":timer.token_id}),
-        }, at_ms)?;
+        let mut event = PlannedEvent {
+            kind: "timer_error".into(),
+            node_id: Some(timer.node_id.clone()),
+            data: serde_json::json!({"timer_id":timer.timer_id,"kind":timer.kind,"incident_id":incident_id,"reason":full_reason,"due_at_ms":candidate.due_at_ms,"attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(&model, &timer)? } else { None },"attached_token_id":timer.token_id}),
+        };
+        if let Some(working_time) = super::calendar::working_time_summary(
+            &timer.rule,
+            model.calendar_pin.as_ref(),
+            timer.due_at_ms,
+        )? {
+            event.data["working_time"] = serde_json::to_value(working_time)?;
+            event.data["timezone"] = serde_json::json!(timer.timezone);
+        }
+        insert_event_on(&tx, instance_id, next_seq, None, &event, at_ms)?;
     } else {
         crate::db::repository::log_audit_scoped_tx(
             &tx, None, "process.timer_error", &timer.timer_id,
@@ -1004,8 +1020,12 @@ pub fn fire_timer(
         );
     }
     let update = updates[0];
+    let pinned_model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
     let advance = super::timers::next_timer_occurrence(
-        &timer, at_ms, super::timers::TimerAdvanceMode::Fire,
+        &timer,
+        at_ms,
+        super::timers::TimerAdvanceMode::Fire,
+        pinned_model.calendar_pin.as_ref(),
     )?;
     ensure!(
         update.expected_revision == candidate.revision
@@ -1241,7 +1261,7 @@ fn store_command<T: Serialize>(
 }
 
 fn definition_on(conn: &Connection, definition_id: &str) -> Result<ProcessDefinition> {
-    conn.query_row(
+    let mut definition: ProcessDefinition = conn.query_row(
         "SELECT definition_id,name,description,owner_user_id,draft_revision,model_json,published_version,archived FROM bpmn_definitions WHERE definition_id=?1",
         [definition_id],
         |row| {
@@ -1251,9 +1271,12 @@ fn definition_on(conn: &Connection, definition_id: &str) -> Result<ProcessDefini
                 definition_id: row.get(0)?, name: row.get(1)?, description: row.get(2)?,
                 owner_user_id: row.get(3)?, draft_revision: row_u64(row, 4)?, model,
                 published_version: row.get(6)?, archived: row.get(7)?,
+                calendar_pin_state: None,
             })
         },
-    ).map_err(Into::into)
+    )?;
+    definition.calendar_pin_state = super::calendar::calendar_pin_state(&definition.model)?;
+    Ok(definition)
 }
 
 fn page(offset: u32, limit: u32) -> Result<()> {
@@ -1286,20 +1309,30 @@ pub fn list_definitions(
             params![actor.org_id, actor.user_id],
             |row| row.get(0),
         )?;
-        let mut stmt = conn.prepare("SELECT definition_id,name,description,owner_user_id,draft_revision,published_version,archived FROM bpmn_definitions WHERE org_id=?1 AND owner_user_id=?2 ORDER BY updated_at_ms DESC,definition_id DESC LIMIT ?3 OFFSET ?4")?;
+        let mut stmt = conn.prepare("SELECT definition_id,name,description,owner_user_id,draft_revision,published_version,archived,model_json FROM bpmn_definitions WHERE org_id=?1 AND owner_user_id=?2 ORDER BY updated_at_ms DESC,definition_id DESC LIMIT ?3 OFFSET ?4")?;
         let definitions = stmt
             .query_map(params![actor.org_id, actor.user_id, limit, offset], |row| {
-                Ok(ProcessDefinitionSummary {
-                    definition_id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    owner_user_id: row.get(3)?,
-                    draft_revision: row_u64(row, 4)?,
-                    published_version: row.get(5)?,
-                    archived: row.get(6)?,
-                })
+                Ok((
+                    ProcessDefinitionSummary {
+                        definition_id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        owner_user_id: row.get(3)?,
+                        draft_revision: row_u64(row, 4)?,
+                        published_version: row.get(5)?,
+                        archived: row.get(6)?,
+                        calendar_pin_state: None,
+                    },
+                    row.get::<_, String>(7)?,
+                ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .map(|row| {
+                let (mut summary, model_json) = row?;
+                let model: ProcessModel = serde_json::from_str(&model_json)?;
+                summary.calendar_pin_state = super::calendar::calendar_pin_state(&model)?;
+                Ok(summary)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok((definitions, total, offset.saturating_add(limit) < total))
     })
 }
@@ -1459,8 +1492,51 @@ pub fn publish_definition(
     definition_id: &str,
     expected_revision: u64,
     snapshots: &[PinnedServiceSnapshot],
+    repin_calendar: Option<bool>,
 ) -> Result<(ProcessDefinition, ProcessVersion)> {
-    let now = now_ms()?;
+    if let Some(result) = replay_definition_publication(pool, actor, stamp, definition_id)? {
+        return Ok(result);
+    }
+    let (original, _) = get_definition(pool, actor, definition_id)?;
+    ensure!(
+        !original.archived && original.draft_revision == expected_revision,
+        "process draft revision conflict or archived definition"
+    );
+    let mut prepared_model = original.model.clone();
+    let state = super::calendar::calendar_pin_state(&prepared_model)?;
+    if state == Some(tentaflow_protocol::processes::ProcessCalendarPinState::Stale) {
+        ensure!(
+            repin_calendar == Some(true),
+            "calendar data changed; refresh calendar data to publish a new version"
+        );
+    }
+    if let Some(calendar) = &prepared_model.work_calendar {
+        if state == Some(tentaflow_protocol::processes::ProcessCalendarPinState::Unpinned)
+            || repin_calendar == Some(true)
+        {
+            prepared_model.calendar_pin = Some(super::calendar::mint_calendar_pin(
+                calendar,
+                prepared_model
+                    .timer_timezone
+                    .as_deref()
+                    .context("configured calendar requires an explicit IANA timezone")?,
+            )?);
+        }
+    }
+    validate_model(&prepared_model)?;
+    let model_json = json(&prepared_model)?;
+    ensure!(
+        model_json.len() <= MAX_MODEL_BYTES,
+        "pinned process model exceeds 512 KiB"
+    );
+    let original_json = json(&original.model)?;
+    #[cfg(test)]
+    calendar_tests::PUBLICATION_PREFLIGHT.with(|gate| {
+        if let Some((ready, resume)) = gate.borrow().as_ref() {
+            ready.send(()).expect("publication preflight barrier");
+            resume.recv().expect("publication writer barrier");
+        }
+    });
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
@@ -1470,12 +1546,20 @@ pub fn publish_definition(
     }
     let definition = definition_on(&tx, definition_id)?;
     ensure!(
-        !definition.archived && definition.draft_revision == expected_revision,
+        !definition.archived
+            && definition.draft_revision == expected_revision
+            && definition.model == original.model,
         "process draft revision conflict or archived definition"
     );
-    validate_model(&definition.model)?;
+    let prepared_state = super::calendar::calendar_pin_state(&prepared_model)?;
+    ensure!(
+        prepared_model.work_calendar.is_none()
+            || prepared_state
+                == Some(tentaflow_protocol::processes::ProcessCalendarPinState::Current),
+        "publication needs a Current verified calendar pin"
+    );
     let mut service_nodes = HashSet::new();
-    for node in &definition.model.nodes {
+    for node in &prepared_model.nodes {
         if let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { flow_id, .. } =
             &node.kind
         {
@@ -1501,7 +1585,7 @@ pub fn publish_definition(
         );
         ensure!(
             snapshot.graph_json.len() <= MAX_MODEL_BYTES,
-            "flow snapshot exceeds 2 MiB"
+            "flow snapshot exceeds 512 KiB"
         );
         ensure!(
             snapshot.info.graph_sha256
@@ -1515,7 +1599,7 @@ pub fn publish_definition(
         .unwrap_or(0)
         .checked_add(1)
         .context("process version overflow")?;
-    let model_json = json(&definition.model)?;
+    let now = now_ms()?;
     tx.execute(
         "INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![definition_id, version, model_json, hex::encode(Sha256::digest(model_json.as_bytes())), json(&snapshots)?, now, actor.user_id],
@@ -1524,36 +1608,64 @@ pub fn publish_definition(
         "UPDATE bpmn_timers SET status='cancelled',last_reason='superseded_by_publication',due_at_ms=NULL,revision=revision+1,updated_at_ms=?1 WHERE definition_id=?2 AND kind='start' AND status IN ('pending','blocked','archived')",
         params![now, definition_id],
     )?;
-    if let Some(node) = definition.model.nodes.iter().find(|node| {
-        matches!(node.kind, tentaflow_protocol::processes::ProcessNodeKind::TimerStart { .. })
+    if let Some(node) = prepared_model.nodes.iter().find(|node| {
+        matches!(
+            node.kind,
+            tentaflow_protocol::processes::ProcessNodeKind::TimerStart { .. }
+        )
     }) {
         let tentaflow_protocol::processes::ProcessNodeKind::TimerStart { timer: rule } = &node.kind else {
             unreachable!("timer start node was selected by kind")
         };
-        let timezone = definition.model.timer_timezone.as_deref()
+        let timezone = prepared_model
+            .timer_timezone
+            .as_deref()
             .context("timed process lacks its validated timezone")?;
         let due = super::timers::resolve_timer_due(
-            rule, timezone, ProcessTimerKind::Start, now,
+            rule,
+            timezone,
+            ProcessTimerKind::Start,
+            now,
+            prepared_model.calendar_pin.as_ref(),
         )?;
         let total_firings = match rule {
             ProcessTimerSpec::Cycle { total_firings, .. }
             | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
             _ => Some(1),
         };
-        insert_timer_on(&tx, &ProcessTimer {
-            timer_id: Uuid::new_v4().to_string(),
-            org_id: actor.org_id.clone(), definition_id: definition_id.to_string(),
-            version, node_id: node.id.clone(), kind: ProcessTimerKind::Start,
-            instance_id: None, token_id: None, rule: rule.clone(), total_firings,
-            timezone: timezone.to_string(), anchor_at_ms: now, due_at_ms: Some(due),
-            occurrence: 1, revision: 1, status: ProcessTimerStatus::Pending,
-            last_reason: None, next_check_at_ms: due,
-            created_at_ms: now, updated_at_ms: now,
-        })?;
+        insert_timer_on(
+            &tx,
+            &ProcessTimer {
+                timer_id: Uuid::new_v4().to_string(),
+                org_id: actor.org_id.clone(),
+                definition_id: definition_id.to_string(),
+                version,
+                node_id: node.id.clone(),
+                kind: ProcessTimerKind::Start,
+                instance_id: None,
+                token_id: None,
+                rule: rule.clone(),
+                total_firings,
+                timezone: timezone.to_string(),
+                anchor_at_ms: now,
+                due_at_ms: Some(due),
+                occurrence: 1,
+                revision: 1,
+                status: ProcessTimerStatus::Pending,
+                last_reason: None,
+                next_check_at_ms: due,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )?;
+    }
+    let model_changed = model_json != original_json;
+    if model_changed {
+        sql_incrementable(definition.draft_revision)?;
     }
     tx.execute(
-        "UPDATE bpmn_definitions SET published_version=?1,updated_at_ms=?2 WHERE definition_id=?3",
-        params![version, now, definition_id],
+        "UPDATE bpmn_definitions SET published_version=?1,updated_at_ms=?2,model_json=?4,draft_revision=draft_revision+?5 WHERE definition_id=?3",
+        params![version, now, definition_id, model_json, i64::from(model_changed)],
     )?;
     let result = (
         definition_on(&tx, definition_id)?,
@@ -1657,8 +1769,12 @@ pub fn archive_definition(
                     last_reason: Some("definition_archived".into()), next_check_at_ms: now,
                 }), 0, None)
             } else if !archived && timer.status == ProcessTimerStatus::Archived {
+                let model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
                 let advance = super::timers::next_timer_occurrence(
-                    &timer, now, super::timers::TimerAdvanceMode::Restore,
+                    &timer,
+                    now,
+                    super::timers::TimerAdvanceMode::Restore,
+                    model.calendar_pin.as_ref(),
                 )?;
                 let status = advance.status;
                 let reason = match status {
@@ -3343,10 +3459,27 @@ mod tests {
         model.nodes[0].kind = ProcessNodeKind::TimerStart {
             timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(3) },
         };
-        let draft = save_definition(&db, &actor, &stamp("create timed"), None, 0,
-            "Timed", "", &model).unwrap();
-        let (_, pinned) = publish_definition(&db, &actor, &stamp("publish timed"),
-            &draft.definition_id, draft.draft_revision, &[]).unwrap();
+        let draft = save_definition(
+            &db,
+            &actor,
+            &stamp("create timed"),
+            None,
+            0,
+            "Timed",
+            "",
+            &model,
+        )
+        .unwrap();
+        let (_, pinned) = publish_definition(
+            &db,
+            &actor,
+            &stamp("publish timed"),
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
         assert_eq!(pinned.model, model);
         let (_, timer) = get_definition(&db, &actor, &draft.definition_id).unwrap();
         let timer = timer.unwrap();
@@ -3388,10 +3521,27 @@ mod tests {
         model.nodes[0].kind = ProcessNodeKind::TimerStart {
             timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: Some(1) },
         };
-        let draft = save_definition(&db, &actor, &stamp("create blocked start"), None, 0,
-            "Blocked start", "", &model).unwrap();
-        publish_definition(&db, &actor, &stamp("publish blocked start"), &draft.definition_id,
-            draft.draft_revision, &[]).unwrap();
+        let draft = save_definition(
+            &db,
+            &actor,
+            &stamp("create blocked start"),
+            None,
+            0,
+            "Blocked start",
+            "",
+            &model,
+        )
+        .unwrap();
+        publish_definition(
+            &db,
+            &actor,
+            &stamp("publish blocked start"),
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
         let (_, timer) = get_definition(&db, &actor, &draft.definition_id).unwrap();
         let due_at = timer.unwrap().due_at_ms.unwrap();
         let candidate = due_timers(&db, due_at, 32).unwrap().remove(0);
@@ -3427,10 +3577,27 @@ mod tests {
             id: "Flow_2".into(), source_id: "Wait_1".into(),
             target_id: "End_1".into(), condition: None,
         });
-        let draft = save_definition(&db, &actor, &stamp("create catch"), None, 0,
-            "Catch", "", &model).unwrap();
-        publish_definition(&db, &actor, &stamp("publish catch"), &draft.definition_id,
-            draft.draft_revision, &[]).unwrap();
+        let draft = save_definition(
+            &db,
+            &actor,
+            &stamp("create catch"),
+            None,
+            0,
+            "Catch",
+            "",
+            &model,
+        )
+        .unwrap();
+        publish_definition(
+            &db,
+            &actor,
+            &stamp("publish catch"),
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
         let instance_id = Uuid::new_v4().to_string();
         let plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000).unwrap();
@@ -3486,10 +3653,27 @@ mod tests {
             id: "Flow_3".into(), source_id: "Wait_1".into(),
             target_id: "End_1".into(), condition: None,
         });
-        let draft = save_definition(&db, &actor, &stamp("create revocation"), None, 0,
-            "Revocation", "", &model).unwrap();
-        publish_definition(&db, &actor, &stamp("publish revocation"), &draft.definition_id,
-            draft.draft_revision, &[]).unwrap();
+        let draft = save_definition(
+            &db,
+            &actor,
+            &stamp("create revocation"),
+            None,
+            0,
+            "Revocation",
+            "",
+            &model,
+        )
+        .unwrap();
+        publish_definition(
+            &db,
+            &actor,
+            &stamp("publish revocation"),
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
         let instance_id = Uuid::new_v4().to_string();
         let start_plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000).unwrap();
@@ -3663,6 +3847,7 @@ mod tests {
             &definition.definition_id,
             definition.draft_revision,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(published.published_version, Some(1));
@@ -3707,6 +3892,7 @@ mod tests {
             &definition.definition_id,
             definition.draft_revision,
             &[],
+            None,
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
@@ -3883,6 +4069,7 @@ mod tests {
             &definition.definition_id,
             definition.draft_revision,
             &[],
+            None,
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
@@ -4183,5 +4370,544 @@ mod tests {
             command_count, 3,
             "failed cancellation must not record a command"
         );
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+    use super::super::runtime::test_support::{Fixture, stamp};
+    use tentaflow_protocol::processes::{
+        HolidayPolicy, ManualDayOff, ProcessCalendarPinState, ProcessWorkCalendar, WorkWindow,
+    };
+
+    fn configured_model(timed: bool) -> ProcessModel {
+        let mut model = starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "Private published calendar".into(),
+            weekly_windows: (1..=7)
+                .map(|weekday| WorkWindow {
+                    weekday,
+                    start_minute: 0,
+                    end_minute: 1440,
+                })
+                .collect(),
+            manual_days_off: Vec::new(),
+            holiday_policy: HolidayPolicy::None,
+        });
+        if timed {
+            model.nodes[0].kind = ProcessNodeKind::TimerStart {
+                timer: ProcessTimerSpec::WorkingDuration { seconds: 1 },
+            };
+        }
+        model
+    }
+
+    fn save(
+        fixture: &Fixture,
+        previous: Option<&ProcessDefinition>,
+        model: &ProcessModel,
+    ) -> ProcessDefinition {
+        save_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("calendar save"),
+            previous.map(|item| item.definition_id.as_str()),
+            previous.map_or(0, |item| item.draft_revision),
+            "Private calendar process",
+            "",
+            model,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn calendar_publication_resolves_current_pin_preserves_version_and_replays_exact_command() {
+        let fixture = Fixture::new();
+        let draft = save(&fixture, None, &configured_model(false));
+        assert_eq!(
+            draft.calendar_pin_state,
+            Some(ProcessCalendarPinState::Unpinned)
+        );
+        let command = stamp("first mint without a timer");
+        let first = publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &command,
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.0.draft_revision, draft.draft_revision + 1);
+        assert_eq!(
+            first.0.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert!(first.1.model.calendar_pin.is_some());
+        assert_eq!(first.0.model, first.1.model);
+        assert_eq!(
+            publish_definition(
+                &fixture.db,
+                &fixture.owner,
+                &command,
+                &draft.definition_id,
+                draft.draft_revision,
+                &[],
+                None
+            )
+            .unwrap(),
+            first
+        );
+        let mut edited = first.0.model.clone();
+        edited.nodes[0].name = "Ordinary name edit after first mint".into();
+        let saved = save(&fixture, Some(&first.0), &edited);
+        assert_eq!(
+            saved.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert_eq!(saved.model.calendar_pin, first.1.model.calendar_pin);
+        let mut changed = saved.model.clone();
+        changed.work_calendar.as_mut().unwrap().weekly_windows[0].start_minute = 60;
+        let stale = save(&fixture, Some(&saved), &changed);
+        assert_eq!(
+            stale.calendar_pin_state,
+            Some(ProcessCalendarPinState::Stale)
+        );
+        for flag in [None, Some(false)] {
+            assert!(publish_definition(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("stale cannot silently refresh"),
+                &stale.definition_id,
+                stale.draft_revision,
+                &[],
+                flag
+            )
+            .is_err());
+        }
+        assert_eq!(
+            get_definition(&fixture.db, &fixture.owner, &stale.definition_id)
+                .unwrap()
+                .0,
+            stale
+        );
+        let refreshed = publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("explicit refresh"),
+            &stale.definition_id,
+            stale.draft_revision,
+            &[],
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed.0.calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        assert_eq!(refreshed.1.version, 2);
+        assert_eq!(refreshed.0.draft_revision, stale.draft_revision + 1);
+        assert_ne!(refreshed.1.model.calendar_pin, first.1.model.calendar_pin);
+        assert_eq!(
+            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap(),
+            first.1
+        );
+        let (list, total, _) = list_definitions(&fixture.db, &fixture.owner, 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(
+            list[0].calendar_pin_state,
+            Some(ProcessCalendarPinState::Current)
+        );
+        let unchanged = publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("preserve matching retained release"),
+            &refreshed.0.definition_id,
+            refreshed.0.draft_revision,
+            &[],
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(unchanged.0.draft_revision, refreshed.0.draft_revision);
+        assert_eq!(
+            unchanged.1.model.calendar_pin,
+            refreshed.1.model.calendar_pin
+        );
+    }
+
+    #[test]
+    fn concurrent_calendar_publication_commits_one_pin_version_and_start_timer() {
+        let fixture = Fixture::new();
+        let draft = save(&fixture, None, &configured_model(true));
+        let first = stamp("publication race one");
+        let second = stamp("publication race two");
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                barrier.wait();
+                publish_definition(
+                    &fixture.db,
+                    &fixture.owner,
+                    &first,
+                    &draft.definition_id,
+                    draft.draft_revision,
+                    &[],
+                    None,
+                )
+            });
+            let right = scope.spawn(|| {
+                barrier.wait();
+                publish_definition(
+                    &fixture.db,
+                    &fixture.owner,
+                    &second,
+                    &draft.definition_id,
+                    draft.draft_revision,
+                    &[],
+                    None,
+                )
+            });
+            vec![left.join().unwrap(), right.join().unwrap()]
+        });
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+        let (definition, timer) =
+            get_definition(&fixture.db, &fixture.owner, &draft.definition_id).unwrap();
+        let version = get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap();
+        let timer = timer.unwrap();
+        assert_eq!(timer.status, ProcessTimerStatus::Pending);
+        assert_eq!(timer.due_at_ms, Some(version.published_at_ms + 1000));
+        assert_eq!(timer.working_time.unwrap().due_offset_seconds, Some(0));
+        assert_eq!(definition.model, version.model);
+        let conn = fixture.db.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_versions", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_timers", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM bpmn_commands WHERE command_id IN (?1,?2)",
+                params![first.command_id, second.command_id],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn forged_refresh_and_complete_pin_byte_overflow_preserve_published_start_and_command_state() {
+        let fixture = Fixture::new();
+        let draft = save(&fixture, None, &configured_model(true));
+        let (published, version) = publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("valid initial publication"),
+            &draft.definition_id,
+            draft.draft_revision,
+            &[],
+            None,
+        )
+        .unwrap();
+        let old_timer = get_definition(&fixture.db, &fixture.owner, &draft.definition_id)
+            .unwrap()
+            .1;
+        let mut forged = published.model.clone();
+        let pin = forged.calendar_pin.as_mut().unwrap();
+        pin.timezone_data.initial_offset_seconds = 60;
+        let payload = serde_json::json!({"calendar":pin.calendar,"legal_release":pin.legal_release,"timezone_data":pin.timezone_data});
+        let mut hash = Sha256::new();
+        hash.update(b"tentaflow.process.calendar.pin\0");
+        hash.update(serde_json::to_vec(&payload).unwrap());
+        pin.sha256 = hex::encode(hash.finalize());
+        assert!(save_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("forged pin save"),
+            Some(&draft.definition_id),
+            published.draft_revision,
+            "Forged",
+            "",
+            &forged
+        )
+        .is_err());
+        // Exercise the publication trust boundary even if storage was corrupted after an authorized save.
+        let original_json = fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT model_json FROM bpmn_definitions WHERE definition_id=?1",
+                [&draft.definition_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        fixture
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id=?2",
+                params![json(&forged).unwrap(), draft.definition_id],
+            )
+            .unwrap();
+        let forged_command = stamp("forged explicit refresh");
+        assert!(publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &forged_command,
+            &draft.definition_id,
+            published.draft_revision,
+            &[],
+            Some(true)
+        )
+        .is_err());
+        fixture
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id=?2",
+                params![original_json, draft.definition_id],
+            )
+            .unwrap();
+        let mut oversized = published.model.clone();
+        let calendar = oversized.work_calendar.as_mut().unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        calendar.manual_days_off = (0..256)
+            .map(|offset| ManualDayOff {
+                date: day
+                    .checked_add_days(chrono::Days::new(offset))
+                    .unwrap()
+                    .to_string(),
+                reason: "\"".repeat(128),
+            })
+            .collect();
+        super::super::calendar::validate_work_calendar(calendar).unwrap();
+        let stale = save(&fixture, Some(&published), &oversized);
+        let overflow_command = stamp("full pin serialization overflow");
+        assert!(publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &overflow_command,
+            &draft.definition_id,
+            stale.draft_revision,
+            &[],
+            Some(true)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("128 KiB"));
+        assert_eq!(
+            get_definition(&fixture.db, &fixture.owner, &draft.definition_id).unwrap(),
+            (stale, old_timer)
+        );
+        assert_eq!(
+            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap(),
+            version
+        );
+        let conn = fixture.db.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_versions", [], |row| row
+                .get::<_, u32>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM bpmn_commands WHERE command_id IN (?1,?2)",
+                params![forged_command.command_id, overflow_command.command_id],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    thread_local! {
+        pub(super) static PUBLICATION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn prepared_calendar_publication_rechecks_revision_account_org_flow_and_storage_atomically() {
+        use super::super::runtime::test_support::{flow, graph, publish_model, service_model};
+        for mutation in 0..5 {
+            let fixture = Fixture::new();
+            let flow_id = flow(
+                &fixture.db,
+                &fixture.owner,
+                &graph("real source snapshot", None),
+            );
+            let mut model = service_model(
+                &flow_id,
+                tentaflow_protocol::processes::ActivityVerification::Human,
+            );
+            let base = configured_model(true);
+            model.nodes[0].kind = base.nodes[0].kind.clone();
+            model.work_calendar = base.work_calendar;
+            model.timer_timezone = base.timer_timezone;
+            let version = publish_model(&fixture, &model);
+            let original =
+                get_definition(&fixture.db, &fixture.owner, &version.definition_id).unwrap();
+            let snapshots: Vec<PinnedServiceSnapshot> = serde_json::from_str(&fixture.db.read().unwrap().query_row("SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=1", [&version.definition_id], |row| row.get::<_, String>(0)).unwrap()).unwrap();
+            let attempt = stamp("prepared publication must revalidate");
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            let mut expected = original.0.clone();
+            let result = std::thread::scope(|scope| {
+                let f = &fixture;
+                let draft = &original.0;
+                let request = &attempt;
+                let publishing = scope.spawn(move || {
+                    PUBLICATION_PREFLIGHT
+                        .with(|gate| *gate.borrow_mut() = Some((ready_tx, resume_rx)));
+                    let result = publish_definition(
+                        &f.db,
+                        &f.owner,
+                        request,
+                        &draft.definition_id,
+                        draft.draft_revision,
+                        &snapshots,
+                        None,
+                    );
+                    PUBLICATION_PREFLIGHT.with(|gate| *gate.borrow_mut() = None);
+                    result
+                });
+                ready_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("actual pin prepared before writer");
+                match mutation {
+                    0 => {
+                        fixture
+                            .db
+                            .write()
+                            .unwrap()
+                            .execute(
+                                "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+                                [&fixture.owner.user_id],
+                            )
+                            .unwrap();
+                    }
+                    1 => {
+                        fixture
+                            .db
+                            .write()
+                            .unwrap()
+                            .execute(
+                                "DELETE FROM org_memberships WHERE org_id=?1 AND user_id=?2",
+                                params![fixture.owner.org_id, fixture.owner.user_id],
+                            )
+                            .unwrap();
+                    }
+                    2 => {
+                        crate::db::repository::resource_permissions::set(
+                            &fixture.db,
+                            "flow",
+                            &flow_id,
+                            "user",
+                            &fixture.owner.user_id,
+                            "deny",
+                        )
+                        .unwrap();
+                    }
+                    3 => {
+                        let mut changed = original.0.model.clone();
+                        changed.work_calendar.as_mut().unwrap().weekly_windows[0].start_minute = 1;
+                        expected = save(&fixture, Some(&original.0), &changed);
+                    }
+                    4 => {
+                        fixture.db.write().unwrap().execute_batch("CREATE TRIGGER reject_prepared_start BEFORE INSERT ON bpmn_timers BEGIN SELECT RAISE(ABORT,'controlled timer storage failure'); END;").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                resume_tx.send(()).unwrap();
+                publishing.join().unwrap()
+            });
+            assert!(
+                result.is_err(),
+                "current mutation {mutation} cannot publish prepared data"
+            );
+            match mutation {
+                0 => {
+                    fixture
+                        .db
+                        .write()
+                        .unwrap()
+                        .execute(
+                            "UPDATE user_accounts SET is_active=1 WHERE id=?1",
+                            [&fixture.owner.user_id],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    crate::services::org::repo::add_membership(
+                        &fixture.db,
+                        &fixture.owner.org_id,
+                        &fixture.owner.user_id,
+                        "role-org-viewer",
+                        &fixture.owner.user_id,
+                    )
+                    .unwrap();
+                }
+                2 => {
+                    crate::db::repository::resource_permissions::set(
+                        &fixture.db,
+                        "flow",
+                        &flow_id,
+                        "user",
+                        &fixture.owner.user_id,
+                        "allow",
+                    )
+                    .unwrap();
+                }
+                4 => {
+                    fixture
+                        .db
+                        .write()
+                        .unwrap()
+                        .execute_batch("DROP TRIGGER reject_prepared_start")
+                        .unwrap();
+                }
+                _ => (),
+            }
+            assert_eq!(
+                get_definition(&fixture.db, &fixture.owner, &version.definition_id).unwrap(),
+                (expected, original.1)
+            );
+            assert_eq!(
+                get_version(&fixture.db, &fixture.owner, &version.definition_id, 1).unwrap(),
+                version
+            );
+            let conn = fixture.db.read().unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM bpmn_versions", [], |row| row
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM bpmn_commands WHERE command_id=?1",
+                    [&attempt.command_id],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
     }
 }

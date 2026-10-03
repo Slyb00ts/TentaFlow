@@ -4,7 +4,9 @@ use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Days, Duration, LocalResult, NaiveDate, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde_json::json;
-use tentaflow_protocol::processes::{ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus};
+use tentaflow_protocol::processes::{
+    ProcessCalendarPin, ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus,
+};
 use uuid::Uuid;
 
 use super::repository::{
@@ -91,6 +93,7 @@ pub fn resolve_timer_due(
     zone: &str,
     kind: ProcessTimerKind,
     anchor_at_ms: i64,
+    calendar_pin: Option<&ProcessCalendarPin>,
 ) -> Result<i64> {
     timezone(zone)?;
     let anchor = instant(anchor_at_ms)?;
@@ -116,6 +119,14 @@ pub fn resolve_timer_due(
                 "timer Duration is outside the supported range"
             );
             elapsed_due(anchor_at_ms, *seconds, 1)
+        }
+        ProcessTimerSpec::WorkingDuration { seconds } => {
+            let pin = calendar_pin.context("WorkingDuration requires an immutable calendar pin")?;
+            ensure!(
+                pin.timezone_data.iana_name == zone,
+                "working timer timezone differs from its immutable pin"
+            );
+            super::calendar::working_due(pin, anchor_at_ms, *seconds)
         }
         ProcessTimerSpec::Cycle {
             seconds,
@@ -184,7 +195,11 @@ fn daily_date_due(date: NaiveDate, hour: u8, minute: u8, zone: &str) -> Result<i
     Ok(due)
 }
 
-fn due_for_occurrence(timer: &ProcessTimer, occurrence: u64) -> Result<i64> {
+fn due_for_occurrence(
+    timer: &ProcessTimer,
+    occurrence: u64,
+    calendar_pin: Option<&ProcessCalendarPin>,
+) -> Result<i64> {
     checked_occurrence(occurrence)?;
     match &timer.rule {
         ProcessTimerSpec::Cycle { seconds, .. } => {
@@ -193,6 +208,7 @@ fn due_for_occurrence(timer: &ProcessTimer, occurrence: u64) -> Result<i64> {
                 &timer.timezone,
                 timer.kind.clone(),
                 timer.anchor_at_ms,
+                calendar_pin,
             )?;
             elapsed_due(timer.anchor_at_ms, *seconds, occurrence)
         }
@@ -202,6 +218,7 @@ fn due_for_occurrence(timer: &ProcessTimer, occurrence: u64) -> Result<i64> {
                 &timer.timezone,
                 timer.kind.clone(),
                 timer.anchor_at_ms,
+                calendar_pin,
             )?;
             let first_date = local_date(instant(first)?, timezone(&timer.timezone)?)?;
             let date = first_date
@@ -219,6 +236,7 @@ fn due_for_occurrence(timer: &ProcessTimer, occurrence: u64) -> Result<i64> {
                 &timer.timezone,
                 timer.kind.clone(),
                 timer.anchor_at_ms,
+                calendar_pin,
             )
         }
     }
@@ -228,6 +246,7 @@ pub fn next_timer_occurrence(
     timer: &ProcessTimer,
     at_ms: i64,
     mode: TimerAdvanceMode,
+    calendar_pin: Option<&ProcessCalendarPin>,
 ) -> Result<TimerAdvance> {
     instant(at_ms)?;
     checked_occurrence(timer.occurrence)?;
@@ -235,7 +254,7 @@ pub fn next_timer_occurrence(
         .due_at_ms
         .context("timer has no pending due instant")?;
     ensure!(
-        due_for_occurrence(timer, timer.occurrence)? == due,
+        due_for_occurrence(timer, timer.occurrence, calendar_pin)? == due,
         "persisted timer due does not match its anchored occurrence"
     );
     let total = match &timer.rule {
@@ -293,6 +312,7 @@ pub fn next_timer_occurrence(
                 &timer.timezone,
                 timer.kind.clone(),
                 timer.anchor_at_ms,
+                calendar_pin,
             )?;
             let first_date = local_date(instant(first)?, tz)?;
             let current_date = local_date(instant(at_ms)?, tz)?;
@@ -302,7 +322,7 @@ pub fn next_timer_occurrence(
                 .checked_add(1)
                 .context("daily timer slot overflow")?;
             let guess = total.map_or(guess, |count| guess.min(u64::from(count)));
-            if due_for_occurrence(timer, guess)? > at_ms {
+            if due_for_occurrence(timer, guess, calendar_pin)? > at_ms {
                 guess
                     .checked_sub(1)
                     .context("daily timer has no due slot")?
@@ -318,7 +338,7 @@ pub fn next_timer_occurrence(
         selected >= timer.occurrence,
         "timer selected slot precedes its pending occurrence"
     );
-    let planned_due_at_ms = due_for_occurrence(timer, selected)?;
+    let planned_due_at_ms = due_for_occurrence(timer, selected, calendar_pin)?;
     let skipped_count = selected - timer.occurrence + u64::from(mode == TimerAdvanceMode::Restore);
     if total.is_some_and(|count| selected == u64::from(count)) {
         return Ok(TimerAdvance {
@@ -335,7 +355,7 @@ pub fn next_timer_occurrence(
             .checked_add(1)
             .context("timer occurrence overflow")?,
     )?;
-    let next_due = due_for_occurrence(timer, next_occurrence)?;
+    let next_due = due_for_occurrence(timer, next_occurrence, calendar_pin)?;
     ensure!(
         next_due > at_ms,
         "next timer occurrence is not strictly in the future"
@@ -356,7 +376,18 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
         | TimerSnapshot::Catch { timer, .. }
         | TimerSnapshot::Boundary { timer, .. } => timer,
     };
-    let advance = next_timer_occurrence(timer, at_ms, TimerAdvanceMode::Fire)?;
+    let model = match snapshot {
+        TimerSnapshot::Start { version, .. } => &version.model,
+        TimerSnapshot::Catch { snapshot, .. } | TimerSnapshot::Boundary { snapshot, .. } => {
+            &snapshot.model
+        }
+    };
+    let advance = next_timer_occurrence(
+        timer,
+        at_ms,
+        TimerAdvanceMode::Fire,
+        model.calendar_pin.as_ref(),
+    )?;
     let mut plan = match snapshot {
         TimerSnapshot::Start {
             actor,
@@ -393,6 +424,14 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
             "planned_due_at_ms":advance.planned_due_at_ms,"fired_at_ms":at_ms,"skipped_count":advance.skipped_count,
             "skipped_from_occurrence":skipped_from,"skipped_through_occurrence":skipped_through}),
     };
+    if let Some(working_time) = super::calendar::working_time_summary(
+        &timer.rule,
+        model.calendar_pin.as_ref(),
+        Some(advance.planned_due_at_ms),
+    )? {
+        event.data["working_time"] = serde_json::to_value(working_time)?;
+        event.data["timezone"] = json!(timer.timezone);
+    }
     if let TimerSnapshot::Boundary { snapshot, .. } = snapshot {
         let node = snapshot
             .model
@@ -526,7 +565,7 @@ mod tests {
             | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
             _ => Some(1),
         };
-        let due = resolve_timer_due(&rule, zone, ProcessTimerKind::Start, anchor).unwrap();
+        let due = resolve_timer_due(&rule, zone, ProcessTimerKind::Start, anchor, None).unwrap();
         ProcessTimer {
             timer_id: Uuid::new_v4().to_string(),
             org_id: Uuid::new_v4().to_string(),
@@ -574,7 +613,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let variables = serde_json::to_value(&model.variables).unwrap();
         let plan = runtime::plan_start(
-            model,
+            &version.model,
             &id,
             &fixture.owner,
             &version.definition_id,
@@ -605,16 +644,38 @@ mod tests {
             at: "2026-03-29T03:30:00+02:00".into(),
         };
         assert_eq!(
-            resolve_timer_due(&date, "Europe/Warsaw", ProcessTimerKind::Start, anchor).unwrap(),
+            resolve_timer_due(
+                &date,
+                "Europe/Warsaw",
+                ProcessTimerKind::Start,
+                anchor,
+                None
+            )
+            .unwrap(),
             anchor + 3_600_000
         );
-        assert!(resolve_timer_due(&date, "", ProcessTimerKind::Catch, anchor).is_err());
-        assert!(resolve_timer_due(&date, "Mars/Unknown", ProcessTimerKind::Catch, anchor).is_err());
+        assert!(resolve_timer_due(&date, "", ProcessTimerKind::Catch, anchor, None).is_err());
         assert!(
-            resolve_timer_due(&date, "UTC", ProcessTimerKind::Start, anchor + 3_600_000).is_err()
+            resolve_timer_due(&date, "Mars/Unknown", ProcessTimerKind::Catch, anchor, None)
+                .is_err()
         );
+        assert!(resolve_timer_due(
+            &date,
+            "UTC",
+            ProcessTimerKind::Start,
+            anchor + 3_600_000,
+            None
+        )
+        .is_err());
         assert_eq!(
-            resolve_timer_due(&date, "UTC", ProcessTimerKind::Catch, anchor + 7_200_000).unwrap(),
+            resolve_timer_due(
+                &date,
+                "UTC",
+                ProcessTimerKind::Catch,
+                anchor + 7_200_000,
+                None
+            )
+            .unwrap(),
             anchor + 3_600_000
         );
         assert!(resolve_timer_due(
@@ -623,7 +684,8 @@ mod tests {
             },
             "UTC",
             ProcessTimerKind::Catch,
-            anchor
+            anchor,
+            None
         )
         .is_err());
         assert_eq!(
@@ -631,7 +693,8 @@ mod tests {
                 &ProcessTimerSpec::Duration { seconds: 7200 },
                 "Europe/Warsaw",
                 ProcessTimerKind::Catch,
-                anchor
+                anchor,
+                None
             )
             .unwrap(),
             anchor + 7_200_000
@@ -640,7 +703,8 @@ mod tests {
             &ProcessTimerSpec::Duration { seconds: 0 },
             "UTC",
             ProcessTimerKind::Catch,
-            anchor
+            anchor,
+            None
         )
         .is_err());
         assert!(resolve_timer_due(
@@ -650,14 +714,16 @@ mod tests {
             },
             "UTC",
             ProcessTimerKind::Catch,
-            anchor
+            anchor,
+            None
         )
         .is_err());
         assert!(resolve_timer_due(
             &ProcessTimerSpec::Duration { seconds: 1 },
             "UTC",
             ProcessTimerKind::Catch,
-            DateTime::<Utc>::MAX_UTC.timestamp_millis()
+            DateTime::<Utc>::MAX_UTC.timestamp_millis(),
+            None
         )
         .is_err());
     }
@@ -674,7 +740,8 @@ mod tests {
             anchor,
         );
         let advance =
-            next_timer_occurrence(&finite, anchor + 1_005_000, TimerAdvanceMode::Fire).unwrap();
+            next_timer_occurrence(&finite, anchor + 1_005_000, TimerAdvanceMode::Fire, None)
+                .unwrap();
         assert_eq!(advance.selected_occurrence, 3);
         assert_eq!(advance.planned_due_at_ms, anchor + 900_000);
         assert_eq!(advance.skipped_count, 2);
@@ -690,24 +757,30 @@ mod tests {
             anchor,
         );
         let advance =
-            next_timer_occurrence(&unlimited, anchor + 1_005_000, TimerAdvanceMode::Fire).unwrap();
+            next_timer_occurrence(&unlimited, anchor + 1_005_000, TimerAdvanceMode::Fire, None)
+                .unwrap();
         assert_eq!(advance.next_occurrence, 4);
         assert_eq!(advance.next_due_at_ms, Some(anchor + 1_200_000));
-        let restore =
-            next_timer_occurrence(&unlimited, anchor + 1_005_000, TimerAdvanceMode::Restore)
-                .unwrap();
+        let restore = next_timer_occurrence(
+            &unlimited,
+            anchor + 1_005_000,
+            TimerAdvanceMode::Restore,
+            None,
+        )
+        .unwrap();
         assert_eq!(restore.skipped_count, 3);
         assert_eq!(restore.next_due_at_ms, Some(anchor + 1_200_000));
         assert!(elapsed_due(anchor, 300, u64::MAX).is_err());
         assert!(next_timer_occurrence(
             &unlimited,
             DateTime::<Utc>::MAX_UTC.timestamp_millis(),
-            TimerAdvanceMode::Fire
+            TimerAdvanceMode::Fire,
+            None
         )
         .is_err());
         let one_shot = timer(ProcessTimerSpec::Duration { seconds: 30 }, "UTC", anchor);
         assert_eq!(
-            next_timer_occurrence(&one_shot, anchor + 60_000, TimerAdvanceMode::Restore)
+            next_timer_occurrence(&one_shot, anchor + 60_000, TimerAdvanceMode::Restore, None)
                 .unwrap()
                 .status,
             ProcessTimerStatus::Missed
@@ -727,16 +800,20 @@ mod tests {
         );
         assert_eq!(spring.due_at_ms, Some(at("2026-03-28T01:30:00Z")));
         assert_eq!(
-            due_for_occurrence(&spring, 2).unwrap(),
+            due_for_occurrence(&spring, 2, None).unwrap(),
             at("2026-03-29T01:30:00Z")
         );
         assert_eq!(
-            due_for_occurrence(&spring, 3).unwrap(),
+            due_for_occurrence(&spring, 3, None).unwrap(),
             at("2026-03-30T00:30:00Z")
         );
-        let fired =
-            next_timer_occurrence(&spring, at("2026-03-30T10:00:00Z"), TimerAdvanceMode::Fire)
-                .unwrap();
+        let fired = next_timer_occurrence(
+            &spring,
+            at("2026-03-30T10:00:00Z"),
+            TimerAdvanceMode::Fire,
+            None,
+        )
+        .unwrap();
         assert_eq!(fired.selected_occurrence, 3);
         assert_eq!(fired.skipped_count, 2);
         assert_eq!(fired.next_due_at_ms, Some(at("2026-03-31T00:30:00Z")));
@@ -750,23 +827,24 @@ mod tests {
             at("2026-10-23T23:00:00Z"),
         );
         assert_eq!(
-            due_for_occurrence(&autumn, 2).unwrap(),
+            due_for_occurrence(&autumn, 2, None).unwrap(),
             at("2026-10-25T00:30:00Z")
         );
         assert_eq!(
-            due_for_occurrence(&autumn, 3).unwrap(),
+            due_for_occurrence(&autumn, 3, None).unwrap(),
             at("2026-10-26T01:30:00Z")
         );
         let restore = next_timer_occurrence(
             &autumn,
             at("2026-10-25T01:00:00Z"),
             TimerAdvanceMode::Restore,
+            None,
         )
         .unwrap();
         assert_eq!(restore.skipped_count, 2);
         assert_eq!(restore.next_occurrence, 3);
         assert_eq!(restore.next_due_at_ms, Some(at("2026-10-26T01:30:00Z")));
-        assert!(due_for_occurrence(&autumn, i64::MAX as u64).is_err());
+        assert!(due_for_occurrence(&autumn, i64::MAX as u64, None).is_err());
     }
 
     #[tokio::test]
@@ -1401,6 +1479,7 @@ mod tests {
             "UTC",
             ProcessTimerKind::Catch,
             horizon,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2678,5 +2757,648 @@ mod tests {
                 Some("activity_completed")
             );
         }
+    }
+
+    fn working_model(mut model: ProcessModel, zone: &str, start: u16, end: u16) -> ProcessModel {
+        model.timer_timezone = Some(zone.into());
+        model.work_calendar = Some(tentaflow_protocol::processes::ProcessWorkCalendar {
+            name: "Private immutable working windows".into(),
+            weekly_windows: (1..=7)
+                .map(|weekday| tentaflow_protocol::processes::WorkWindow {
+                    weekday,
+                    start_minute: start,
+                    end_minute: end,
+                })
+                .collect(),
+            manual_days_off: Vec::new(),
+            holiday_policy: tentaflow_protocol::processes::HolidayPolicy::None,
+        });
+        model
+    }
+
+    #[tokio::test]
+    async fn working_future_v1_catch_and_boundary_activation_keep_exact_pin_after_v2_and_restart() {
+        for boundary in [false, true] {
+            let fixture = Fixture::new();
+            let mut model = if boundary {
+                let mut model = with_boundaries(user_model(None), "Work", &[("Limit", true, 3600)]);
+                let ProcessNodeKind::BoundaryTimer { timer, .. } = &mut model
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == "Limit")
+                    .unwrap()
+                    .kind
+                else {
+                    panic!("boundary fixture");
+                };
+                *timer = ProcessTimerSpec::WorkingDuration { seconds: 3600 };
+                model
+            } else {
+                catch_model(ProcessTimerSpec::WorkingDuration { seconds: 3600 })
+            };
+            let target = if boundary { "Work" } else { "Wait" };
+            model.nodes.push(ProcessNode {
+                id: "Gate".into(),
+                name: "Future activation gate".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            });
+            model
+                .sequence_flows
+                .retain(|flow| flow.source_id != "Start_1");
+            model.sequence_flows.extend([
+                edge("ToGate", "Start_1", "Gate"),
+                edge("GateNext", "Gate", target),
+            ]);
+            model = working_model(model, "America/Winnipeg", 540, 1020);
+            let version = publish_model(&fixture, &model);
+            let id = Uuid::new_v4().to_string();
+            let anchor = at("2026-11-09T13:00:00Z");
+            let plan = runtime::plan_start(
+                &version.model,
+                &id,
+                &fixture.owner,
+                &version.definition_id,
+                version.version,
+                json!({}),
+                StartCause::Manual,
+                anchor,
+            )
+            .unwrap();
+            let waiting = repository::start_instance(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("V1 waits before future activation"),
+                &id,
+                &version.definition_id,
+                version.version,
+                &json!({}),
+                &plan,
+                anchor,
+            )
+            .unwrap();
+            assert!(waiting.timers.is_empty());
+            let prior =
+                repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
+                    .unwrap()
+                    .0;
+            let mut edited = prior.model.clone();
+            for window in &mut edited.work_calendar.as_mut().unwrap().weekly_windows {
+                window.start_minute = 720;
+            }
+            let saved = repository::save_definition(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("change V2 windows"),
+                Some(&prior.definition_id),
+                prior.draft_revision,
+                "Changed current windows",
+                "",
+                &edited,
+            )
+            .unwrap();
+            let (_, v2) = repository::publish_definition(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("publish new explicit calendar data"),
+                &saved.definition_id,
+                saved.draft_revision,
+                &[],
+                Some(true),
+            )
+            .unwrap();
+            assert_ne!(v2.model.calendar_pin, version.model.calendar_pin);
+            assert_eq!(
+                super::super::calendar::working_due(
+                    v2.model.calendar_pin.as_ref().unwrap(),
+                    at("2026-11-09T14:00:00Z"),
+                    3600
+                )
+                .unwrap(),
+                at("2026-11-09T18:00:00Z")
+            );
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &id).unwrap();
+            let task = &snapshot.user_tasks[0];
+            let activation = at("2026-11-09T14:00:00Z");
+            let completion = runtime::plan_user_completion(
+                &snapshot,
+                &task.user_task_id,
+                &json!({}),
+                None,
+                activation,
+            )
+            .unwrap();
+            let opened = repository::complete_user_task(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("activate old pinned V1 after V2"),
+                &id,
+                &task.user_task_id,
+                snapshot.instance.revision,
+                &json!({}),
+                None,
+                &completion,
+                activation,
+            )
+            .unwrap();
+            assert_eq!(opened.timers.len(), 1);
+            let due = at("2026-11-09T15:00:00Z");
+            assert_eq!(opened.timers[0].due_at_ms, Some(due));
+            assert_eq!(
+                opened.timers[0]
+                    .working_time
+                    .as_ref()
+                    .unwrap()
+                    .due_offset_seconds,
+                Some(-18000)
+            );
+            let old = repository::runtime_snapshot(&fixture.db, &fixture.owner, &id).unwrap();
+            assert_eq!(old.model.calendar_pin, version.model.calendar_pin);
+            assert_eq!(old.timers[0].anchor_at_ms, activation);
+            assert_eq!(old.timers[0].version, 1);
+            if boundary {
+                assert_ne!(old.timers[0].token_id, task.token_id);
+            }
+            let path = fixture.directory.path().join("processes.db");
+            let owner = fixture.owner.clone();
+            let Fixture {
+                directory,
+                db,
+                router,
+                ..
+            } = fixture;
+            drop(router);
+            drop(db);
+            let reopened = crate::db::init(&path).unwrap();
+            assert_eq!(
+                repository::get_instance(&reopened, &owner, &id)
+                    .unwrap()
+                    .timers,
+                opened.timers
+            );
+            reopened
+                .write()
+                .unwrap()
+                .execute(
+                    "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+                    [&owner.user_id],
+                )
+                .unwrap();
+            let blocked = drain_due(&reopened, due);
+            blocked.completion.unwrap();
+            assert_eq!(blocked.fired, 0);
+            reopened
+                .write()
+                .unwrap()
+                .execute(
+                    "UPDATE user_accounts SET is_active=1 WHERE id=?1",
+                    [&owner.user_id],
+                )
+                .unwrap();
+            let fired = drain_due(&reopened, due + 60000);
+            fired.completion.unwrap();
+            assert_eq!(fired.fired, 1);
+            let current = repository::get_instance(&reopened, &owner, &id).unwrap();
+            assert_eq!(current.status, ProcessInstanceStatus::Completed);
+            let events = repository::list_events(&reopened, &owner, &id, 0, 200)
+                .unwrap()
+                .0;
+            let fired = events
+                .iter()
+                .find(|event| event.kind == "timer_fired")
+                .unwrap();
+            assert_eq!(fired.data["planned_due_at_ms"], due);
+            assert_eq!(fired.data["fired_at_ms"], due + 60000);
+            assert_eq!(
+                fired.data["working_time"]["pin_sha256"],
+                version.model.calendar_pin.as_ref().unwrap().sha256
+            );
+            assert_eq!(fired.data["working_time"]["due_offset_seconds"], -18000);
+            assert_eq!(fired.data["timezone"], "America/Winnipeg");
+            assert_eq!(
+                repository::get_version(&reopened, &owner, &version.definition_id, 1).unwrap(),
+                version
+            );
+            let replay = drain_due(&reopened, due + 60000);
+            replay.completion.unwrap();
+            assert_eq!(replay.fired, 0);
+            drop(reopened);
+            drop(directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn working_start_snapshot_then_revoke_has_no_effect_and_restored_candidate_fires_once() {
+        let fixture = Fixture::new();
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].kind = ProcessNodeKind::TimerStart {
+            timer: ProcessTimerSpec::WorkingDuration { seconds: 1 },
+        };
+        let model = working_model(model, "UTC", 0, 1440);
+        let version = publish_model(&fixture, &model);
+        let due = version.published_at_ms + 1000;
+        let candidate = repository::due_timers(&fixture.db, due, 32)
+            .unwrap()
+            .remove(0);
+        let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        fixture
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+                [&fixture.owner.user_id],
+            )
+            .unwrap();
+        let error =
+            repository::fire_timer(&fixture.db, &candidate, &fixture.owner, None, &plan, due)
+                .unwrap_err();
+        assert!(error
+            .downcast_ref::<repository::ProcessAuthorityDenied>()
+            .is_some());
+        assert!(repository::record_timer_blocked(
+            &fixture.db,
+            &candidate,
+            &format!("{error:#}"),
+            due
+        )
+        .unwrap());
+        assert_eq!(
+            fixture
+                .db
+                .read()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM bpmn_instances", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        fixture
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET is_active=1 WHERE id=?1",
+                [&fixture.owner.user_id],
+            )
+            .unwrap();
+        let drained = drain_due(&fixture.db, due + 60000);
+        drained.completion.unwrap();
+        assert_eq!(drained.fired, 1);
+        let repeated = drain_due(&fixture.db, due + 60000);
+        repeated.completion.unwrap();
+        assert_eq!(repeated.fired, 0);
+        assert_eq!(
+            repository::list_instances(
+                &fixture.db,
+                &fixture.owner,
+                Some(&version.definition_id),
+                0,
+                100
+            )
+            .unwrap()
+            .1,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn working_boundary_completion_and_fire_orders_cancel_only_exact_siblings() {
+        for complete_first in [true, false] {
+            let fixture = Fixture::new();
+            let mut model = with_boundaries(
+                user_model(None),
+                "Work",
+                &[("First", true, 1), ("Second", false, 2)],
+            );
+            for node in &mut model.nodes {
+                if let ProcessNodeKind::BoundaryTimer { timer, .. } = &mut node.kind {
+                    let ProcessTimerSpec::Duration { seconds } = timer else {
+                        unreachable!()
+                    };
+                    *timer = ProcessTimerSpec::WorkingDuration { seconds: *seconds };
+                }
+            }
+            let model = working_model(model, "UTC", 0, 1440);
+            let anchor = at("2026-10-05T09:00:00Z");
+            let started = start_at(&fixture, &model, anchor);
+            let before =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            let task = &before.user_tasks[0];
+            let completion = runtime::plan_user_completion(
+                &before,
+                &task.user_task_id,
+                &json!({"answer":"completed"}),
+                None,
+                anchor + 1000,
+            )
+            .unwrap();
+            let candidate = repository::due_timers(&fixture.db, anchor + 1000, 32)
+                .unwrap()
+                .remove(0);
+            let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+            let fire = plan_timer_fire(&snapshot, anchor + 1000).unwrap();
+            if complete_first {
+                repository::complete_user_task(
+                    &fixture.db,
+                    &fixture.owner,
+                    &stamp("completion wins working boundary"),
+                    &started.instance_id,
+                    &task.user_task_id,
+                    before.instance.revision,
+                    &json!({"answer":"completed"}),
+                    None,
+                    &completion,
+                    anchor + 1000,
+                )
+                .unwrap();
+                assert!(repository::fire_timer(
+                    &fixture.db,
+                    &candidate,
+                    &fixture.owner,
+                    Some(before.instance.revision),
+                    &fire,
+                    anchor + 1000
+                )
+                .unwrap()
+                .is_none());
+            } else {
+                let outcome = repository::fire_timer(
+                    &fixture.db,
+                    &candidate,
+                    &fixture.owner,
+                    Some(before.instance.revision),
+                    &fire,
+                    anchor + 1000,
+                )
+                .unwrap()
+                .unwrap();
+                assert!(outcome.cancelled_claims.is_empty());
+                assert!(repository::complete_user_task(
+                    &fixture.db,
+                    &fixture.owner,
+                    &stamp("late working completion"),
+                    &started.instance_id,
+                    &task.user_task_id,
+                    before.instance.revision,
+                    &json!({"answer":"completed"}),
+                    None,
+                    &completion,
+                    anchor + 1000
+                )
+                .is_err());
+            }
+            let after =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+            assert_eq!(
+                after.user_tasks[0].status,
+                if complete_first {
+                    ProcessUserTaskStatus::Completed
+                } else {
+                    ProcessUserTaskStatus::Cancelled
+                }
+            );
+            assert_eq!(
+                after
+                    .timers
+                    .iter()
+                    .filter(|timer| timer.status == ProcessTimerStatus::Fired)
+                    .count(),
+                usize::from(!complete_first)
+            );
+            assert!(after
+                .timers
+                .iter()
+                .filter(|timer| timer.node_id == "Second")
+                .all(|timer| timer.status == ProcessTimerStatus::Cancelled));
+        }
+    }
+
+    #[tokio::test]
+    async fn working_horizon_error_is_terminal_and_boundary_resolution_preserves_other_incidents() {
+        let fixture = Fixture::new();
+        let mut model = with_boundaries(
+            user_model(None),
+            "Work",
+            &[("Broken", true, 1), ("Reminder", false, 1)],
+        );
+        let ProcessNodeKind::BoundaryTimer { timer, .. } = &mut model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Broken")
+            .unwrap()
+            .kind
+        else {
+            panic!("boundary");
+        };
+        *timer = ProcessTimerSpec::WorkingDuration { seconds: 31536000 };
+        model = working_model(model, "UTC", 0, 1);
+        model.nodes.push(ProcessNode {
+            id: "Choice".into(),
+            name: "Unmatched independent side path".into(),
+            kind: ProcessNodeKind::ExclusiveGateway {
+                default_flow_id: None,
+            },
+        });
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|edge| edge.source_id == "Reminder")
+            .unwrap()
+            .target_id = "Choice".into();
+        for id in ["Never_A", "Never_B"] {
+            let mut branch = edge(id, "Choice", "End_1");
+            branch.condition = Some("false".into());
+            model.sequence_flows.push(branch);
+        }
+        let anchor = at("2026-10-05T00:00:00Z");
+        let started = start_at(&fixture, &model, anchor);
+        assert_eq!(started.status, ProcessInstanceStatus::Incident);
+        let failed = started
+            .timers
+            .iter()
+            .find(|timer| timer.node_id == "Broken")
+            .unwrap();
+        assert_eq!(failed.status, ProcessTimerStatus::Error);
+        assert_eq!(failed.due_at_ms, None);
+        assert_eq!(
+            failed.working_time.as_ref().unwrap().due_offset_seconds,
+            None
+        );
+        let drained = drain_due(&fixture.db, anchor + 1000);
+        drained.completion.unwrap();
+        assert_eq!(drained.fired, 1);
+        let snapshot =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(snapshot.boundary_incidents.len(), 1);
+        let linked = snapshot.boundary_incidents[0].incident_id.clone();
+        let unrelated = snapshot
+            .instance
+            .incidents
+            .iter()
+            .find(|incident| incident.code == "NO_MATCHING_FLOW")
+            .unwrap()
+            .incident_id
+            .clone();
+        let task = snapshot
+            .user_tasks
+            .iter()
+            .find(|task| task.node_id == "Work")
+            .unwrap();
+        let finished = complete_work(
+            &fixture,
+            &started.instance_id,
+            &task.user_task_id,
+            anchor + 1001,
+        );
+        assert_eq!(finished.status, ProcessInstanceStatus::Incident);
+        assert!(finished
+            .incidents
+            .iter()
+            .all(|incident| incident.incident_id != linked));
+        assert_eq!(finished.incidents[0].incident_id, unrelated);
+        assert!(repository::due_timers(&fixture.db, anchor + 2000, 32)
+            .unwrap()
+            .is_empty());
+        let events =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        let errors = events
+            .iter()
+            .filter(|event| event.kind == "timer_error")
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].data["working_time"]["pin_sha256"],
+            failed.working_time.as_ref().unwrap().pin_sha256
+        );
+        assert_eq!(errors[0].data["timezone"], "UTC");
+        assert!(errors[0].data["reason"]
+            .as_str()
+            .unwrap()
+            .contains("horizon"));
+        let catch_model = working_model(
+            catch_model(ProcessTimerSpec::WorkingDuration { seconds: 31536000 }),
+            "UTC",
+            0,
+            1,
+        );
+        let version = publish_model(&fixture, &catch_model);
+        let id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&catch_model.variables).unwrap();
+        let plan = runtime::plan_start(
+            &version.model,
+            &id,
+            &fixture.owner,
+            &version.definition_id,
+            version.version,
+            variables.clone(),
+            StartCause::Manual,
+            anchor,
+        )
+        .unwrap();
+        assert_eq!(plan.create_timers.len(), 1);
+        let timer = &plan.create_timers[0];
+        assert_eq!(timer.kind, ProcessTimerKind::Catch);
+        assert_eq!(timer.status, ProcessTimerStatus::Error);
+        assert_eq!(timer.due_at_ms, None);
+        assert!(plan.create_tokens.iter().any(|token| {
+            Some(token.token_id.as_str()) == timer.token_id.as_deref()
+                && token.node_id == timer.node_id
+                && token.status == "waiting"
+        }));
+        let invalid_timers: [(&str, fn(&mut ProcessTimer)); 11] = [
+            ("revision", |timer| timer.revision = 2),
+            ("occurrence", |timer| timer.occurrence = 0),
+            ("error_due", |timer| {
+                timer.due_at_ms = Some(timer.anchor_at_ms)
+            }),
+            ("pending_without_due", |timer| {
+                timer.status = ProcessTimerStatus::Pending
+            }),
+            ("missing_reason", |timer| timer.last_reason = None),
+            ("start_kind", |timer| timer.kind = ProcessTimerKind::Start),
+            ("nonworking_catch", |timer| {
+                timer.rule = ProcessTimerSpec::Duration { seconds: 1 }
+            }),
+            ("timezone", |timer| timer.timezone = "Europe/Warsaw".into()),
+            ("organization", |timer| {
+                timer.org_id = Uuid::new_v4().to_string()
+            }),
+            ("waiting_token", |timer| {
+                timer.token_id = Some(Uuid::new_v4().to_string())
+            }),
+            ("instance", |timer| {
+                timer.instance_id = Some(Uuid::new_v4().to_string())
+            }),
+        ];
+        for (name, invalidate) in invalid_timers {
+            let mut forged = plan.clone();
+            invalidate(&mut forged.create_timers[0]);
+            let command = stamp(&format!("invalid working catch {name}"));
+            assert!(
+                repository::start_instance(
+                    &fixture.db,
+                    &fixture.owner,
+                    &command,
+                    &id,
+                    &version.definition_id,
+                    version.version,
+                    &variables,
+                    &forged,
+                    anchor,
+                )
+                .is_err(),
+                "invalid timer {name} was accepted"
+            );
+            let remaining: i64 = fixture
+                .db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM bpmn_instances WHERE instance_id=?1) + (SELECT COUNT(*) FROM bpmn_tokens WHERE instance_id=?1) + (SELECT COUNT(*) FROM bpmn_timers WHERE instance_id=?1) + (SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1) + (SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1) + (SELECT COUNT(*) FROM bpmn_commands WHERE command_id=?2)",
+                    rusqlite::params![id, command.command_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "invalid timer {name} left committed rows");
+        }
+        let catch = repository::start_instance(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("errored working catch"),
+            &id,
+            &version.definition_id,
+            version.version,
+            &variables,
+            &plan,
+            anchor,
+        )
+        .unwrap();
+        assert_eq!(catch.status, ProcessInstanceStatus::Incident);
+        assert_eq!(catch.timers[0].status, ProcessTimerStatus::Error);
+        assert_eq!(catch.timers[0].due_at_ms, None);
+        assert_eq!(catch.incidents.len(), 1);
+        assert_eq!(catch.incidents[0].code, "TIMER_ERROR");
+        let cancelled = repository::cancel_instance(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("cancel errored working catch"),
+            &catch.instance_id,
+            catch.revision,
+        )
+        .unwrap();
+        assert_eq!(cancelled.status, ProcessInstanceStatus::Cancelled);
+        let repeated = drain_due(&fixture.db, anchor + 2000);
+        repeated.completion.unwrap();
+        assert_eq!(repeated.fired, 0);
     }
 }

@@ -339,10 +339,10 @@ export class FlowConfig {
       }
       const timerKind = Object.keys(config.timer)[0];
       const timer = config.timer[timerKind];
-      const types = kind === 'TimerStart' ? ['Date', 'Duration', 'Cycle', 'Daily'] : ['Date', 'Duration'];
+      const types = kind === 'TimerStart' ? ['Date', 'Duration', 'Cycle', 'Daily', 'WorkingDuration'] : ['Date', 'Duration', 'WorkingDuration'];
       fields += `<tf-select data-process="timerType" label="${escapeAttr(I18n.t('bpmn.timer_type'))}" value="${escapeAttr(timerKind)}" ${disabled}>${types.map((type) => `<option value="${type}">${escapeHtml(I18n.t(`bpmn.timer_type_${type.toLowerCase()}`))}</option>`).join('')}</tf-select>`;
       if (timerKind === 'Date') fields += input('timerAt', 'timer_at', timer.at, 'placeholder="2026-10-02T15:30:00+02:00"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_date_hint'))}</p><p class="fb-timer-literal" data-timer-literal>${escapeHtml(timer.at)}</p>`;
-      else if (timerKind === 'Duration' || timerKind === 'Cycle') fields += input('timerSeconds', 'timer_seconds', timer.seconds, `type="number" min="${timerKind === 'Cycle' ? 300 : 1}" max="31536000" step="1"`) + `<p class="fb-field-hint">${escapeHtml(I18n.t(timerKind === 'Cycle' ? 'bpmn.timer_cycle_hint' : 'bpmn.timer_duration_hint'))}</p>`;
+      else if (timerKind === 'Duration' || timerKind === 'Cycle' || timerKind === 'WorkingDuration') fields += input('timerSeconds', timerKind === 'WorkingDuration' ? 'timer_working_seconds' : 'timer_seconds', timer.seconds, `type="number" min="${timerKind === 'Cycle' ? 300 : 1}" max="31536000" step="1"`) + `<p class="fb-field-hint">${escapeHtml(I18n.t(timerKind === 'Cycle' ? 'bpmn.timer_cycle_hint' : timerKind === 'WorkingDuration' ? 'bpmn.timer_working_hint' : 'bpmn.timer_duration_hint'))}</p>`;
       else if (timerKind === 'Daily') fields += `<div class="fb-timer-clock">${input('timerHour', 'timer_hour', timer.hour, 'type="number" min="0" max="23" step="1"')}${input('timerMinute', 'timer_minute', timer.minute, 'type="number" min="0" max="59" step="1"')}</div><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_daily_hint'))}</p>`;
       if (timerKind === 'Cycle' || timerKind === 'Daily') fields += input('timerTotal', 'timer_total', timer.totalFirings, 'type="number" min="1" max="4294967295" step="1"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_total_hint'))}</p>`;
       fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : kind === 'BoundaryTimer' ? 'bpmn.boundary_timer_hint' : 'bpmn.timer_catch_hint'))}</p>`;
@@ -398,7 +398,7 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
         this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';
       } else if (key === 'timerType') {
-        const values = { Date: { at: '' }, Duration: { seconds: 60 }, Cycle: { seconds: 300, totalFirings: null }, Daily: { hour: 9, minute: 0, totalFirings: null } };
+        const values = { Date: { at: '' }, Duration: { seconds: 60 }, Cycle: { seconds: 300, totalFirings: null }, Daily: { hour: 9, minute: 0, totalFirings: null }, WorkingDuration: { seconds: 3600 } };
         this.opts.onConfigChange(node.id, { timer: { [control.value]: values[control.value] } });
         this._renderProcess();
         this.root.querySelector('[data-process="timerType"]').focus();

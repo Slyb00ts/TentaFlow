@@ -1,0 +1,189 @@
+{
+  "release_id": "PL-statutory-2026-10-02",
+  "as_of_date": "2026-10-02",
+  "valid_from": "2024-01-01",
+  "valid_until": "2041-01-01",
+  "audit_manifest_sha256": "19b045f9f8dff6b233ee6f93d24a5d21b543904012efbfb033ca61438d30eee6",
+  "sources": [
+    {
+      "source_id": "DU/2020/1920",
+      "url": "https://eli.gov.pl/api/acts/DU/2020/1920/text.html",
+      "sha256": "242ea50b52a1303cf07fc2ddf7b59dec31fa5c1136d50b2a60426e2dbc5ce611",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "source_id": "DU/2024/1965",
+      "url": "https://eli.gov.pl/api/acts/DU/2024/1965/text.html",
+      "sha256": "363015e8afec9c6c7fe80ab3e1b44bac4a7434a3b0843cd97cd30c527f0ebe3d",
+      "retrieved_on": "2026-10-02"
+    },
+    {
+      "source_id": "DU/2025/296",
+      "url": "https://eli.gov.pl/api/acts/DU/2025/296/text.pdf",
+      "sha256": "50ce5df0f79a4d0f2e3a045b03acaac6ede826ab3b667f421d06854795c2deff",
+      "retrieved_on": "2026-10-02"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "easter-00",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "GregorianEasterOffset": {
+          "days": 0
+        }
+      }
+    },
+    {
+      "rule_id": "easter-01",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "GregorianEasterOffset": {
+          "days": 1
+        }
+      }
+    },
+    {
+      "rule_id": "easter-49",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "GregorianEasterOffset": {
+          "days": 49
+        }
+      }
+    },
+    {
+      "rule_id": "easter-60",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "GregorianEasterOffset": {
+          "days": 60
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-01-01",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 1,
+          "day": 1
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-01-06",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 1,
+          "day": 6
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-05-01",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 5,
+          "day": 1
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-05-03",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 5,
+          "day": 3
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-08-15",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 8,
+          "day": 15
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-11-01",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 11,
+          "day": 1
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-11-11",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 11,
+          "day": 11
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-12-24",
+      "source_id": "DU/2024/1965",
+      "effective_from": "2025-02-01",
+      "kind": {
+        "Fixed": {
+          "month": 12,
+          "day": 24
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-12-25",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 12,
+          "day": 25
+        }
+      }
+    },
+    {
+      "rule_id": "fixed-12-26",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Fixed": {
+          "month": 12,
+          "day": 26
+        }
+      }
+    },
+    {
+      "rule_id": "weekday-sunday",
+      "source_id": "DU/2020/1920",
+      "effective_from": "2024-01-01",
+      "kind": {
+        "Weekday": {
+          "weekday": 7
+        }
+      }
+    }
+  ]
+}

@@ -1372,3 +1372,15 @@
 .fb-process-timer dt, .fb-process-timer dd { margin: 0; overflow-wrap: anywhere; line-height: 1.5; }
 .fb-process-timer dt { color: var(--tf-text-3); }
 .fb-process-notice [data-role="timer-summary"] { flex-basis: 100%; overflow-wrap: anywhere; }
+.fb-process-calendar { display: flex; flex-direction: column; gap: 14px; min-width: 0; overflow-wrap: anywhere; }
+.fb-process-calendar-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.fb-process-calendar [data-calendar-fields] { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.fb-process-calendar h3 { margin: 8px 0 0; font-size: 14px; }
+.fb-calendar-row { display: grid; grid-template-columns: minmax(120px, 1.2fr) repeat(2, minmax(90px, 1fr)) auto; gap: 8px; align-items: end; min-width: 0; }
+.fb-calendar-row:has([data-calendar-date]) { grid-template-columns: minmax(140px, 1fr) minmax(180px, 2fr) auto; }
+.fb-calendar-row > * { min-width: 0; }
+.fb-process-calendar [data-calendar-state], .fb-process-calendar .fb-field-hint { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .fb-calendar-row, .fb-calendar-row:has([data-calendar-date]) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fb-calendar-row tf-button { justify-self: start; }
+}

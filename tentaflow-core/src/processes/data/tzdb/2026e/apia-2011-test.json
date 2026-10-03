@@ -1,0 +1,13 @@
+{
+  "iana_name": "Pacific/Apia",
+  "source_sha256": "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
+  "horizon_start_ms": 1325116800000,
+  "horizon_end_ms": 1325289600000,
+  "initial_offset_seconds": -36000,
+  "transitions": [
+    {
+      "at_utc_ms": 1325239200000,
+      "offset_seconds": 50400
+    }
+  ]
+}

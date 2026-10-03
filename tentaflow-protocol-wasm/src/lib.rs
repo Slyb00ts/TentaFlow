@@ -25931,4 +25931,37 @@ mod process_wire_tests {
             timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
         });
     }
+
+    #[test]
+    fn process_request_encoder_preserves_working_calendar_and_explicit_repin() {
+        let fields = serde_json::json!({
+            "command_id":"7c865aaa-febd-4621-9ae6-35977200a0fd",
+            "definition_id":null,"expected_revision":0,"name":"Working","description":"",
+            "model":{"schema_version":1,"process_id":"P_1","timer_timezone":"Europe/Warsaw",
+                "nodes":[{"id":"Start_1","name":"Start","kind":{"TimerStart":{"timer":{"WorkingDuration":{"seconds":3600}}}}}],
+                "sequence_flows":[],"variables":{"business_key":{"inner_key":"Łódź"}},
+                "diagram":{"shapes":[],"edges":[]},
+                "work_calendar":{"name":"Office","weekly_windows":[{"weekday":1,"start_minute":540,"end_minute":1020}],
+                    "manual_days_off":[],"holiday_policy":"None"}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.variables["business_key"]["inner_key"], "Łódź");
+        assert!(matches!(model.nodes[0].kind, tentaflow_protocol::processes::ProcessNodeKind::TimerStart {
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::WorkingDuration { seconds: 3600 }
+        }));
+        assert_eq!(model.work_calendar.unwrap().holiday_policy, tentaflow_protocol::processes::HolidayPolicy::None);
+
+        let bytes = encode_process_request("DefinitionPublishRequest".into(), serde_json::json!({
+            "command_id":"7c865aaa-febd-4621-9ae6-35977200a0fd",
+            "definition_id":"definition-1","expected_revision":3,"repin_calendar":true
+        }).to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        assert!(matches!(body, MessageBody::ProcessBody(
+            tentaflow_protocol::processes::ProcessPayload::DefinitionPublishRequest { repin_calendar: Some(true), .. }
+        )));
+    }
 }

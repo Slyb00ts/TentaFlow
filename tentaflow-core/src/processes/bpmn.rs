@@ -7,9 +7,9 @@ use quick_xml::events::Event;
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
-    ActivityVerification, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
+    ActivityVerification, ProcessCalendarPin, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
     ProcessNode, ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape,
-    ProcessTimerSpec,
+    ProcessTimerSpec, ProcessWorkCalendar,
 };
 
 use super::model::{validate_model, validate_timer_spec, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
@@ -251,12 +251,12 @@ fn mapping(parent: &Element, name: &str) -> Result<BTreeMap<String, String>> {
 fn process_configuration(
     process: &Element,
     process_id: &str,
-) -> Result<(BTreeMap<String, serde_json::Value>, Option<String>)> {
+) -> Result<(BTreeMap<String, serde_json::Value>, Option<String>, Option<ProcessWorkCalendar>, Option<ProcessCalendarPin>)> {
     let Some(extension) = process.child(BPMN, "extensionElements")? else {
-        return Ok((BTreeMap::new(), None));
+        return Ok((BTreeMap::new(), None, None, None));
     };
     extension.attrs_only(&[])?;
-    extension.children_only(&[(TF, "variables"), (TF, "timerTimezone")])?;
+    extension.children_only(&[(TF, "variables"), (TF, "timerTimezone"), (TF, "workCalendar"), (TF, "calendarPin")])?;
     let timer_timezone = extension.child(TF, "timerTimezone")?
         .map(|element| {
             element.attrs_only(&[])?;
@@ -288,7 +288,23 @@ fn process_configuration(
         serde_json::from_str(variables.text.trim()).map_err(|error| invalid(error.to_string()))?;
     validate_variables(&value).map_err(|error| invalid(error.to_string()))?;
     let variables = serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
-    Ok((variables, timer_timezone))
+    let work_calendar = extension.child(TF, "workCalendar")?.map(|element| -> Result<ProcessWorkCalendar> {
+        element.attrs_only(&[])?;
+        ensure!(element.children.is_empty(), "workCalendar must contain JSON text at byte {}", element.offset);
+        serde_json::from_str::<ProcessWorkCalendar>(element.text.trim()).map_err(|error| XmlElementError {
+            message: format!("invalid workCalendar at byte {}: {error}", element.offset),
+            element_id: Some(process_id.to_string()), offset: element.offset,
+        }.into())
+    }).transpose()?;
+    let calendar_pin = extension.child(TF, "calendarPin")?.map(|element| -> Result<ProcessCalendarPin> {
+        element.attrs_only(&[])?;
+        ensure!(element.children.is_empty(), "calendarPin must contain JSON text at byte {}", element.offset);
+        serde_json::from_str::<ProcessCalendarPin>(element.text.trim()).map_err(|error| XmlElementError {
+            message: format!("invalid calendarPin at byte {}: {error}", element.offset),
+            element_id: Some(process_id.to_string()), offset: element.offset,
+        }.into())
+    }).transpose()?;
+    Ok((variables, timer_timezone, work_calendar, calendar_pin))
 }
 
 fn timer_spec(element: &Element, node_id: &str) -> Result<ProcessTimerSpec> {
@@ -304,8 +320,15 @@ fn timer_spec(element: &Element, node_id: &str) -> Result<ProcessTimerSpec> {
     };
     if rule.is(BPMN, "extensionElements") {
         rule.attrs_only(&[])?;
-        rule.children_only(&[(TF, "dailyTimer")])?;
-        ensure!(rule.children.len() == 1, "timer extension requires one dailyTimer at byte {}", rule.offset);
+        rule.children_only(&[(TF, "dailyTimer"), (TF, "workingDuration")])?;
+        ensure!(rule.children.len() == 1, "timer extension requires one timer rule at byte {}", rule.offset);
+        if let Some(working) = rule.child(TF, "workingDuration")? {
+            working.attrs_only(&["seconds"])?;
+            ensure!(working.children.is_empty() && working.text.trim().is_empty(), "workingDuration must have only attributes at byte {}", working.offset);
+            return Ok(ProcessTimerSpec::WorkingDuration {
+                seconds: working.required("seconds")?.parse().map_err(|error| invalid(format!("invalid working seconds: {error}")))?,
+            });
+        }
         let daily = rule.child(TF, "dailyTimer")?.context("dailyTimer is required")?;
         daily.attrs_only(&["hour", "minute", "totalFirings"])?;
         ensure!(daily.children.is_empty() && daily.text.trim().is_empty(), "dailyTimer must have only attributes at byte {}", daily.offset);
@@ -622,7 +645,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         (BPMN, "sequenceFlow"),
     ])?;
     let process_id = process.required("id")?;
-    let (variables, timer_timezone) = process_configuration(process, &process_id)?;
+    let (variables, timer_timezone, work_calendar, calendar_pin) = process_configuration(process, &process_id)?;
     let mut nodes = Vec::new();
     let mut sequence_flows = Vec::new();
     for child in &process.children {
@@ -695,6 +718,8 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         variables,
         diagram,
         timer_timezone,
+        work_calendar,
+        calendar_pin,
     };
     validate_model(&model).map_err(|error| XmlElementError {
         message: error.to_string(),
@@ -736,6 +761,12 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     ));
     if let Some(timezone) = &model.timer_timezone {
         xml.push_str(&format!("<tentaflow:timerTimezone>{}</tentaflow:timerTimezone>", escaped(timezone)));
+    }
+    if let Some(calendar) = &model.work_calendar {
+        xml.push_str(&format!("<tentaflow:workCalendar>{}</tentaflow:workCalendar>", escaped(&serde_json::to_string(calendar)?)));
+    }
+    if let Some(pin) = &model.calendar_pin {
+        xml.push_str(&format!("<tentaflow:calendarPin>{}</tentaflow:calendarPin>", escaped(&serde_json::to_string(pin)?)));
     }
     xml.push_str("</bpmn:extensionElements>");
     for node in &model.nodes {
@@ -779,6 +810,9 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
                     ProcessTimerSpec::Daily { hour, minute, total_firings } => format!(
                         "<bpmn:extensionElements><tentaflow:dailyTimer hour=\"{hour}\" minute=\"{minute}\"{} /></bpmn:extensionElements>",
                         total_firings.map(|count| format!(" totalFirings=\"{count}\"")).unwrap_or_default()
+                    ),
+                    ProcessTimerSpec::WorkingDuration { seconds } => format!(
+                        "<bpmn:extensionElements><tentaflow:workingDuration seconds=\"{seconds}\" /></bpmn:extensionElements>"
                     ),
                 };
                 xml.push_str(&format!("><bpmn:timerEventDefinition>{rule}</bpmn:timerEventDefinition></bpmn:{tag}>"));
@@ -888,6 +922,80 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_calendar_xml_round_trips_without_changing_opaque_variables() {
+        use tentaflow_protocol::processes::{HolidayPolicy, WorkWindow};
+        let mut model = super::super::model::starter_model();
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "R&D Łódź".into(),
+            weekly_windows: vec![WorkWindow { weekday: 1, start_minute: 540, end_minute: 1020 }],
+            manual_days_off: Vec::new(),
+            holiday_policy: HolidayPolicy::None,
+        });
+        model.variables.insert("business_key".into(), serde_json::json!({"inner_value":"& <Łódź>"}));
+        model.nodes[0].kind = ProcessNodeKind::TimerStart {
+            timer: ProcessTimerSpec::WorkingDuration { seconds: 3600 },
+        };
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<tentaflow:workingDuration seconds=\"3600\" />"));
+        let (restored, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(restored.unwrap(), model);
+
+        let duplicated = xml.replacen("</bpmn:extensionElements>",
+            "<tentaflow:workCalendar>{}</tentaflow:workCalendar></bpmn:extensionElements>", 1);
+        let (model, diagnostics) = import_xml(&duplicated);
+        assert!(model.is_none());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal));
+
+        let malformed = xml.replacen("<tentaflow:workingDuration seconds=\"3600\" />",
+            "<tentaflow:workingDuration seconds=\"3600\" fallback=\"elapsed\" />", 1);
+        let (model, diagnostics) = import_xml(&malformed);
+        assert!(model.is_none());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal));
+    }
+
+    #[test]
+    fn trusted_calendar_pin_xml_round_trips_stale_and_rejects_forged_digest() {
+        use tentaflow_protocol::processes::{HolidayPolicy, WorkWindow};
+        let mut model = super::super::model::starter_model();
+        model.timer_timezone = Some("Europe/Warsaw".into());
+        model.work_calendar = Some(ProcessWorkCalendar {
+            name: "Office & contracts".into(),
+            weekly_windows: vec![WorkWindow { weekday: 1, start_minute: 540, end_minute: 1020 }],
+            manual_days_off: Vec::new(),
+            holiday_policy: HolidayPolicy::PolandStatutory,
+        });
+        model.calendar_pin = Some(super::super::calendar::mint_calendar_pin(
+            model.work_calendar.as_ref().unwrap(), "Europe/Warsaw",
+        ).unwrap());
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<tentaflow:calendarPin>"));
+        let (restored, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(restored.unwrap(), model);
+
+        let pin = model.calendar_pin.as_mut().unwrap();
+        pin.sha256 = "0".repeat(64);
+        let forged = serde_json::to_string(pin).unwrap();
+        let canonical = xml.split("<tentaflow:calendarPin>").nth(1).unwrap()
+            .split("</tentaflow:calendarPin>").next().unwrap();
+        let forged_xml = xml.replacen(canonical, &escaped(&forged), 1);
+        let (rejected, diagnostics) = import_xml(&forged_xml);
+        assert!(rejected.is_none());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal && diagnostic.element_id.as_deref() == Some(model.process_id.as_str())));
+
+        model.calendar_pin = Some(super::super::calendar::mint_calendar_pin(
+            model.work_calendar.as_ref().unwrap(), "Europe/Warsaw",
+        ).unwrap());
+        model.work_calendar.as_mut().unwrap().name = "Revised office".into();
+        let stale_xml = export_xml(&model).unwrap();
+        let (restored, diagnostics) = import_xml(&stale_xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(restored.unwrap(), model);
+    }
 
     #[test]
     fn boundary_xml_round_trip_preserves_siblings_attachment_cancellation_and_di() {
