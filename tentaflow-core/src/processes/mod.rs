@@ -4,6 +4,7 @@ pub mod bpmn;
 pub mod calendar;
 pub mod jobs;
 pub mod model;
+pub mod messages;
 pub mod repository;
 pub mod runtime;
 pub mod timers;

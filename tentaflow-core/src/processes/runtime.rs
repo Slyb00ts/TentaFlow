@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::model::{and_pairs, validate_variables, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
-    AndReceipt, BoundaryTimerIncident, CancelledJobClaim, ForkFrame, PlannedEvent, ProcessActor,
+    AndReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, ProcessActor,
     ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
 };
 use crate::db::DbPool;
@@ -38,7 +38,12 @@ pub fn validate_output(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn evaluate(expression: &str, variables: &Value, outputs: &Value) -> Result<Value> {
+pub(super) fn evaluate(
+    expression: &str,
+    variables: &Value,
+    outputs: &Value,
+    extra: &[(String, Value)],
+) -> Result<Value> {
     let vars = variables
         .as_object()
         .context("process variables must be an object")?
@@ -46,6 +51,13 @@ fn evaluate(expression: &str, variables: &Value, outputs: &Value) -> Result<Valu
         .map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
         .collect::<BTreeMap<_, _>>();
     let payload = FlowValue::Json(variables.clone());
+    let mut extras = Vec::with_capacity(extra.len() + 1);
+    extras.push(("outputs", outputs.clone()));
+    extras.extend(
+        extra
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone())),
+    );
     Ok(expr::evaluate(
         expression,
         &ExprScope {
@@ -53,14 +65,14 @@ fn evaluate(expression: &str, variables: &Value, outputs: &Value) -> Result<Valu
             payload: &payload,
             artifacts: &HashMap::new(),
             meta: &BTreeMap::new(),
-            extras: &[("outputs", outputs.clone())],
+            extras: &extras,
         },
         None,
     )?)
 }
 
 fn condition(expression: &str, variables: &Value, outputs: &Value) -> Result<bool> {
-    evaluate(expression, variables, outputs)?
+    evaluate(expression, variables, outputs, &[])?
         .as_bool()
         .context("process condition must evaluate to a boolean")
 }
@@ -72,7 +84,7 @@ pub fn prepare_service_input(
     let mut payload = variables.clone();
     let mut activity_vars = serde_json::Map::new();
     for (key, expression) in mapping {
-        let value = evaluate(expression, variables, &Value::Null)?;
+        let value = evaluate(expression, variables, &Value::Null, &[])?;
         if key == "payload" {
             payload = value;
         } else {
@@ -94,7 +106,7 @@ fn patch_variables(
         .context("process variables must be an object")?
         .clone();
     for (key, expression) in mapping {
-        patched.insert(key.clone(), evaluate(expression, variables, outputs)?);
+        patched.insert(key.clone(), evaluate(expression, variables, outputs, &[])?);
     }
     let value = Value::Object(patched);
     validate_variables(&value)?;
@@ -116,7 +128,9 @@ struct Transition<'a> {
     receipts: Vec<AndReceipt>,
     incidents: Vec<ProcessIncident>,
     timers: Vec<ProcessTimer>,
-    boundary_incidents: Vec<BoundaryTimerIncident>,
+    boundary_incidents: Vec<BoundaryEventIncident>,
+    subscriptions: Vec<super::repository::EventSubscription>,
+    event_races: Vec<super::repository::EventRace>,
     plan: RuntimePlan,
 }
 
@@ -148,6 +162,8 @@ impl<'a> Transition<'a> {
             incidents: Vec::new(),
             timers: Vec::new(),
             boundary_incidents: Vec::new(),
+            subscriptions: Vec::new(),
+            event_races: Vec::new(),
             plan: RuntimePlan::initial(variables),
         })
     }
@@ -167,9 +183,11 @@ impl<'a> Transition<'a> {
         transition.jobs = snapshot.jobs.clone();
         transition.tasks = snapshot.user_tasks.clone();
         transition.receipts = snapshot.receipts.clone();
-        transition.incidents = snapshot.instance.incidents.clone();
+        transition.incidents = snapshot.incidents.clone();
         transition.timers = snapshot.timers.clone();
         transition.boundary_incidents = snapshot.boundary_incidents.clone();
+        transition.subscriptions = snapshot.subscriptions.clone();
+        transition.event_races = snapshot.event_races.clone();
         Ok(transition)
     }
 
@@ -359,6 +377,7 @@ impl<'a> Transition<'a> {
             next_check_at_ms: due_at_ms.unwrap_or(self.now_ms),
             created_at_ms: self.now_ms,
             updated_at_ms: self.now_ms,
+            race_id: None,
         };
         let attached_to_id = match &node.kind {
             ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.as_str()),
@@ -397,12 +416,27 @@ impl<'a> Transition<'a> {
     }
 
     fn arm_boundaries(&mut self, activity: &ProcessNode, token_id: &str) -> Result<()> {
-        let boundaries = self.model.nodes.iter().filter(|node| matches!(&node.kind, ProcessNodeKind::BoundaryTimer { attached_to_id, .. } if attached_to_id == &activity.id)).cloned().collect::<Vec<_>>();
-        for node in boundaries {
-            let ProcessNodeKind::BoundaryTimer { timer, .. } = &node.kind else {
-                anyhow::bail!("boundary catalogue contains another node kind");
-            };
-            self.arm_timer(&node, token_id, ProcessTimerKind::Boundary, timer)?;
+        let nodes = self
+            .model
+            .nodes
+            .iter()
+            .filter(|n| match &n.kind {
+                ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryError { attached_to_id, .. } => {
+                    attached_to_id == &activity.id
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for node in nodes {
+            match &node.kind {
+                ProcessNodeKind::BoundaryTimer { timer, .. } => {
+                    self.arm_timer(&node, token_id, ProcessTimerKind::Boundary, timer)?
+                }
+                _ => self.arm_subscription(&node, token_id, None)?,
+            }
         }
         Ok(())
     }
@@ -445,6 +479,25 @@ impl<'a> Transition<'a> {
                     next_check_at_ms: self.now_ms,
                 });
             self.event("timer_cancelled",Some(node.id.clone()),json!({"kind":"Boundary","timer_id":timer.timer_id,"attached_to_id":attached_to_id,"attached_token_id":token_id,"reason":reason,"winning_timer_id":winning_timer_id}));
+        }
+        for subscription in self
+            .subscriptions
+            .iter()
+            .filter(|s| {
+                s.token_id == token_id
+                    && s.kind
+                        != tentaflow_protocol::processes::ProcessSubscriptionKind::MessageCatch
+                    && s.status == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+                    && Some(s.subscription_id.as_str()) != winning_timer_id
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.settle_subscription(
+                &subscription,
+                tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled,
+                Some(reason),
+            );
         }
         Ok(())
     }
@@ -528,6 +581,321 @@ impl<'a> Transition<'a> {
             .collect::<Vec<_>>();
         for id in incidents {
             self.resolve_incident(&id);
+        }
+        Ok(())
+    }
+
+    fn arm_subscription(
+        &mut self,
+        node: &ProcessNode,
+        token_id: &str,
+        race_id: Option<String>,
+    ) -> Result<()> {
+        use tentaflow_protocol::processes::{
+            ProcessSubscriptionKind as K, ProcessSubscriptionStatus as S,
+        };
+        let (kind, message_ref, correlation, error_ref, attachment) = match &node.kind {
+            ProcessNodeKind::MessageCatch {
+                message_ref,
+                correlation_expression,
+                ..
+            } => (
+                K::MessageCatch,
+                Some(message_ref),
+                Some(correlation_expression),
+                None,
+                None,
+            ),
+            ProcessNodeKind::BoundaryMessage {
+                attached_to_id,
+                message_ref,
+                correlation_expression,
+                ..
+            } => (
+                K::BoundaryMessage,
+                Some(message_ref),
+                Some(correlation_expression),
+                None,
+                Some(attached_to_id),
+            ),
+            ProcessNodeKind::BoundaryError {
+                attached_to_id,
+                error_ref,
+                ..
+            } => (
+                K::BoundaryError,
+                None,
+                None,
+                Some(error_ref),
+                Some(attached_to_id),
+            ),
+            _ => anyhow::bail!("node does not arm a subscription"),
+        };
+        let name = message_ref
+            .map(|id| {
+                self.model
+                    .messages
+                    .iter()
+                    .find(|d| &d.message_id == id)
+                    .map(|d| d.name.clone())
+                    .context("receiving message declaration missing")
+            })
+            .transpose()?;
+        let code = error_ref
+            .and_then(|id| id.as_ref())
+            .map(|id| {
+                self.model
+                    .errors
+                    .iter()
+                    .find(|d| &d.error_id == id)
+                    .map(|d| d.error_code.clone())
+                    .context("boundary error declaration missing")
+            })
+            .transpose()?;
+        let predicate = correlation
+            .map(|expression| super::messages::evaluate_key(expression, &self.plan.variables))
+            .transpose();
+        let (key, status, reason) = match predicate {
+            Ok(key) => (key, S::Open, None),
+            Err(e) => (
+                None,
+                S::Error,
+                Some(super::repository::timer_reason(&format!("{e:#}"))?),
+            ),
+        };
+        let s = super::repository::EventSubscription {
+            subscription_id: Uuid::new_v4().to_string(),
+            instance_id: self.instance_id.to_owned(),
+            org_id: self.org_id.to_owned(),
+            definition_id: self.definition_id.to_owned(),
+            version: self.version,
+            node_id: node.id.clone(),
+            token_id: token_id.to_owned(),
+            kind: kind.clone(),
+            message_name: name,
+            correlation_key: key,
+            error_code: code,
+            race_id,
+            revision: 1,
+            status: status.clone(),
+            last_reason: reason.clone(),
+            created_at_ms: self.now_ms,
+            updated_at_ms: self.now_ms,
+        };
+        if status == S::Error {
+            self.incident(
+                &node.id,
+                None,
+                "MESSAGE_PREDICATE_ERROR",
+                reason
+                    .clone()
+                    .context("subscription error reason missing")?,
+            );
+            let incident_id = self
+                .plan
+                .add_incidents
+                .last()
+                .context("predicate incident missing")?
+                .incident_id
+                .clone();
+            self.event("message_error",Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":token_id,"incident_id":incident_id,"reason":reason}));
+        } else {
+            self.event(if kind==K::BoundaryError{"error_boundary_armed"}else{"message_armed"},Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"token_id":token_id,"attached_to_id":attachment,"message_name":s.message_name,"correlation_key":s.correlation_key,"error_code":s.error_code,"race_id":s.race_id,"kind":kind}));
+        }
+        self.subscriptions.push(s.clone());
+        self.plan.create_subscriptions.push(s);
+        Ok(())
+    }
+    fn settle_subscription(
+        &mut self,
+        s: &super::repository::EventSubscription,
+        status: tentaflow_protocol::processes::ProcessSubscriptionStatus,
+        reason: Option<&str>,
+    ) {
+        if let Some(current) = self
+            .subscriptions
+            .iter_mut()
+            .find(|current| current.subscription_id == s.subscription_id)
+        {
+            current.status = status.clone();
+        }
+        self.plan
+            .subscription_updates
+            .push(super::repository::SubscriptionUpdate {
+                subscription_id: s.subscription_id.clone(),
+                expected_revision: s.revision,
+                status: status.clone(),
+                last_reason: reason.map(str::to_owned),
+            });
+        if status == tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled {
+            self.event("subscription_cancelled",Some(s.node_id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":s.token_id,"reason":reason}));
+        }
+    }
+    fn win_race(
+        &mut self,
+        race_id: &str,
+        node_id: &str,
+        subscription_id: Option<&str>,
+        timer_id: Option<&str>,
+    ) -> Result<()> {
+        use tentaflow_protocol::processes::{
+            ProcessEventRaceStatus as R, ProcessSubscriptionStatus as S,
+        };
+        let race = self
+            .event_races
+            .iter()
+            .find(|r| r.race_id == race_id && r.status == R::Open)
+            .context("event race is already settled")?
+            .clone();
+        self.plan
+            .race_updates
+            .push(super::repository::EventRaceUpdate {
+                race_id: race.race_id.clone(),
+                expected_revision: race.revision,
+                status: R::Won,
+                winner_node_id: Some(node_id.to_owned()),
+                winner_subscription_id: subscription_id.map(str::to_owned),
+                winner_timer_id: timer_id.map(str::to_owned),
+            });
+        for s in self
+            .subscriptions
+            .iter()
+            .filter(|s| {
+                s.race_id.as_deref() == Some(race_id) && matches!(s.status, S::Open | S::Error)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if Some(s.subscription_id.as_str()) == subscription_id {
+                continue;
+            }
+            if s.status == S::Open {
+                self.settle_subscription(&s, S::Cancelled, Some("event_race_lost"));
+            }
+            self.resolve_boundary_incidents(&s.token_id);
+            self.tokens.retain(|t| t.token_id != s.token_id);
+            self.plan.cancel_token_ids.push(s.token_id);
+        }
+        for t in self
+            .timers
+            .iter()
+            .filter(|t| {
+                t.race_id.as_deref() == Some(race_id)
+                    && Some(t.timer_id.as_str()) != timer_id
+                    && matches!(
+                        t.status,
+                        ProcessTimerStatus::Pending
+                            | ProcessTimerStatus::Blocked
+                            | ProcessTimerStatus::Error
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if t.status != ProcessTimerStatus::Error {
+                self.plan
+                    .timer_updates
+                    .push(super::repository::TimerUpdate {
+                        timer_id: t.timer_id.clone(),
+                        expected_revision: t.revision,
+                        fired_occurrence: None,
+                        occurrence: t.occurrence,
+                        due_at_ms: None,
+                        status: ProcessTimerStatus::Cancelled,
+                        last_reason: Some("event_race_lost".into()),
+                        next_check_at_ms: self.now_ms,
+                    });
+            }
+            let id = t.token_id.context("race timer lacks activation")?;
+            self.resolve_boundary_incidents(&id);
+            self.tokens.retain(|token| token.token_id != id);
+            self.plan.cancel_token_ids.push(id);
+            if t.status != ProcessTimerStatus::Error {
+                self.event(
+                    "timer_cancelled",
+                    Some(t.node_id),
+                    json!({"timer_id":t.timer_id,"race_id":race_id,"reason":"event_race_lost"}),
+                );
+            }
+        }
+        self.event("event_race_won",Some(race.gateway_node_id),json!({"race_id":race_id,"winner_node_id":node_id,"subscription_id":subscription_id,"timer_id":timer_id}));
+        Ok(())
+    }
+    fn enter_event_race(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let race = super::repository::EventRace {
+            race_id: id.clone(),
+            instance_id: self.instance_id.to_owned(),
+            gateway_node_id: node.id.clone(),
+            activation_id: token.token_id.clone(),
+            revision: 1,
+            status: tentaflow_protocol::processes::ProcessEventRaceStatus::Open,
+            winner_node_id: None,
+            winner_subscription_id: None,
+            winner_timer_id: None,
+            won_at_ms: None,
+            created_at_ms: self.now_ms,
+            updated_at_ms: self.now_ms,
+        };
+        self.consume(&token.token_id);
+        self.plan.create_event_races.push(race.clone());
+        self.event_races.push(race);
+        self.event(
+            "event_race_armed",
+            Some(node.id.clone()),
+            json!({"race_id":id,"activation_id":token.token_id}),
+        );
+        for edge in self.outgoing(&node.id) {
+            let branch = self
+                .model
+                .sequence_flows
+                .iter()
+                .find(|f| f.id == edge)
+                .context("race branch edge missing")?;
+            let child = self.node(&branch.target_id)?.clone();
+            let waiting = self.create_token(ProcessToken {
+                token_id: String::new(),
+                node_id: child.id.clone(),
+                arrival_edge_id: Some(edge),
+                fork_stack: token.fork_stack.clone(),
+                status: "waiting".into(),
+            });
+            match &child.kind {
+                ProcessNodeKind::MessageCatch { .. } => {
+                    self.arm_subscription(&child, &waiting, Some(id.clone()))?
+                }
+                ProcessNodeKind::TimerCatch { timer } => {
+                    self.arm_timer(&child, &waiting, ProcessTimerKind::Catch, timer)?;
+                    self.timers
+                        .last_mut()
+                        .context("race timer missing")?
+                        .race_id = Some(id.clone());
+                    self.plan
+                        .create_timers
+                        .last_mut()
+                        .context("planned race timer missing")?
+                        .race_id = Some(id.clone());
+                }
+                _ => anyhow::bail!("event race branch is not a one-shot catch"),
+            }
+        }
+        Ok(())
+    }
+    fn throw_message(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let prepared = super::messages::prepare_throw(self.model, node, &self.plan.variables)?;
+        let event_index = self.plan.events.len();
+        self.event("message_queued",Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
+        self.plan
+            .create_messages
+            .push(super::repository::PlannedMessage {
+                message: prepared,
+                source_node_id: node.id.clone(),
+                source_activation_id: token.token_id.clone(),
+                source_event_index: event_index,
+            });
+        self.consume(&token.token_id);
+        for edge in self.outgoing(&node.id) {
+            self.follow(token, &edge)?;
         }
         Ok(())
     }
@@ -619,7 +987,9 @@ impl<'a> Transition<'a> {
             let node = self.node(&token.node_id)?.clone();
             let outgoing = self.outgoing(&node.id);
             match node.kind.clone() {
-                ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } => {
+                ProcessNodeKind::Start
+                | ProcessNodeKind::TimerStart { .. }
+                | ProcessNodeKind::MessageStart { .. } => {
                     self.consume(&id);
                     self.event("node_completed", Some(node.id.clone()), Value::Null);
                     for edge in outgoing {
@@ -647,7 +1017,27 @@ impl<'a> Transition<'a> {
                     let token_id = self.wait(&token, "waiting");
                     self.arm_timer(&node, &token_id, ProcessTimerKind::Catch, &timer)?;
                 }
-                ProcessNodeKind::BoundaryTimer { .. } => {
+                ProcessNodeKind::MessageCatch { .. } => {
+                    let waiting = self.wait(&token, "waiting");
+                    self.arm_subscription(&node, &waiting, None)?;
+                }
+                ProcessNodeKind::MessageThrow { .. } => {
+                    if let Err(error) = self.throw_message(&node, &token) {
+                        self.wait(&token, "waiting");
+                        self.incident(
+                            &node.id,
+                            None,
+                            "MESSAGE_EXPRESSION_ERROR",
+                            super::repository::bounded_failure_message(&error.to_string()),
+                        );
+                    }
+                }
+                ProcessNodeKind::EventBasedGateway => {
+                    self.enter_event_race(&node, &token)?;
+                }
+                ProcessNodeKind::BoundaryTimer { .. }
+                | ProcessNodeKind::BoundaryMessage { .. }
+                | ProcessNodeKind::BoundaryError { .. } => {
                     anyhow::bail!("boundary events are entered only by their attached timer")
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
@@ -666,6 +1056,8 @@ impl<'a> Transition<'a> {
                                 worker_id: None,
                                 lease_until_ms: None,
                                 result: None,
+
+                                result_origin: None,
                             };
                             self.event(
                                 "service_queued",
@@ -790,6 +1182,7 @@ impl<'a> Transition<'a> {
 
 pub enum StartCause {
     Manual,
+    Message { message_id: String },
     Timer { timer_id: String, occurrence: u64 },
 }
 
@@ -819,7 +1212,9 @@ pub fn plan_start(
         .find(|node| {
             matches!(
                 node.kind,
-                ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+                ProcessNodeKind::Start
+                    | ProcessNodeKind::TimerStart { .. }
+                    | ProcessNodeKind::MessageStart { .. }
             )
         })
         .context("process start event missing")?;
@@ -840,7 +1235,13 @@ pub fn plan_start(
             );
             json!({"initiator_user_id":actor.user_id,"start_timer_id":timer_id,"start_occurrence":occurrence})
         }
-        (ProcessNodeKind::TimerStart { .. }, StartCause::Manual) => {
+        (ProcessNodeKind::MessageStart { .. }, StartCause::Message { message_id }) => {
+            json!({"initiator_user_id":actor.user_id,"start_message_id":message_id})
+        }
+        (
+            ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::MessageStart { .. },
+            StartCause::Manual,
+        ) => {
             anyhow::bail!("a timer-start process cannot be started manually")
         }
         _ => anyhow::bail!("timer firing does not match the process start event"),
@@ -962,9 +1363,10 @@ pub fn plan_user_completion(
 pub fn plan_job_result(
     snapshot: &RuntimeSnapshot,
     job: &ProcessJob,
-    result: &ActivityResult,
+    observed: &super::repository::ObservedActivityResult,
     now_ms: i64,
 ) -> Result<RuntimePlan> {
+    let result = &observed.result;
     validate_output(&result.outputs)?;
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
     let node = transition.node(&job.node_id)?.clone();
@@ -986,11 +1388,65 @@ pub fn plan_job_result(
     transition
         .jobs
         .retain(|existing| existing.job_id != job.job_id);
-    transition.event(
-        "service_result",
-        Some(node.id.clone()),
-        serde_json::to_value(result)?,
-    );
+    transition.event("service_result", Some(node.id.clone()), {
+        let mut data = serde_json::to_value(result)?;
+        data["result_origin"] = json!(super::repository::result_origin_text(&observed.origin));
+        data
+    });
+    if observed.origin == super::repository::ActivityResultOrigin::Contract
+        && result.outcome == ActivityOutcome::Error
+    {
+        if let Some(subscription) = transition
+            .subscriptions
+            .iter()
+            .filter(|s| {
+                s.token_id == token.token_id
+                    && s.kind
+                        == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError
+                    && s.status == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+            })
+            .find(|s| s.error_code.as_deref() == result.code.as_deref() && s.error_code.is_some())
+            .or_else(|| {
+                transition.subscriptions.iter().find(|s| {
+                    s.token_id == token.token_id
+                        && s.kind
+                            == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError
+                        && s.status
+                            == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+                        && s.error_code.is_none()
+                })
+            })
+            .cloned()
+        {
+            let handler = transition.node(&subscription.node_id)?.clone();
+            let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
+                anyhow::bail!("error subscription is not a boundary")
+            };
+            transition.plan.variables = super::messages::mapped_variables(
+                output_mapping,
+                &transition.plan.variables,
+                &result.outputs,
+                "activity_result",
+                serde_json::to_value(result)?,
+            )?;
+            transition.settle_subscription(
+                &subscription,
+                tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
+                None,
+            );
+            transition.interrupt_activity(&token, &subscription.subscription_id)?;
+            transition
+                .plan
+                .cancel_job_ids
+                .retain(|id| id != &job.job_id);
+            transition.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":token.token_id,"job_id":job.job_id,"error_code":result.code,"result_origin":super::repository::result_origin_text(&observed.origin)}));
+            for edge in transition.outgoing(&handler.id) {
+                transition.follow(&token, &edge)?;
+            }
+            transition.advance()?;
+            return Ok(transition.finish());
+        }
+    }
     if matches!(
         result.outcome,
         ActivityOutcome::Error | ActivityOutcome::Cancelled
@@ -1004,6 +1460,15 @@ pub fn plan_job_result(
         return Ok(transition.finish());
     }
     match verification {
+        _ if result.outcome == ActivityOutcome::NeedsHuman => {
+            transition.user_task(
+                &node,
+                ProcessUserTaskKind::Verification,
+                transition.initiator.to_owned(),
+                serde_json::to_value(result)?,
+                &token.token_id,
+            );
+        }
         ActivityVerification::Human => {
             transition.user_task(
                 &node,
@@ -1064,6 +1529,59 @@ pub fn plan_job_result(
     Ok(transition.finish())
 }
 
+pub(super) fn plan_message_catch(
+    snapshot: &RuntimeSnapshot,
+    subscription: &super::repository::EventSubscription,
+    payload: &Value,
+    metadata: Value,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let node = transition.node(&subscription.node_id)?.clone();
+    let (mapping, interrupt) = match &node.kind {
+        ProcessNodeKind::MessageCatch { output_mapping, .. } => (output_mapping, None),
+        ProcessNodeKind::BoundaryMessage {
+            output_mapping,
+            cancel_activity,
+            ..
+        } => (output_mapping, Some(*cancel_activity)),
+        _ => anyhow::bail!("message target is not a catch"),
+    };
+    let token = transition
+        .tokens
+        .iter()
+        .find(|t| t.token_id == subscription.token_id && t.status == "waiting")
+        .context("subscription activation is closed")?
+        .clone();
+    transition.plan.variables = super::messages::mapped_variables(
+        mapping,
+        &transition.plan.variables,
+        payload,
+        "message",
+        metadata.clone(),
+    )?;
+    transition.settle_subscription(
+        subscription,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
+        None,
+    );
+    for link in snapshot.boundary_incidents.iter().filter(|link|matches!(&link.activation,super::repository::BoundaryActivationId::Subscription(id)if id==&subscription.subscription_id)) {transition.resolve_incident(&link.incident_id);}
+    if let Some(race) = &subscription.race_id {
+        transition.win_race(race, &node.id, Some(&subscription.subscription_id), None)?;
+    }
+    match interrupt {
+        Some(true) => transition.interrupt_activity(&token, &subscription.subscription_id)?,
+        Some(false) => {}
+        None => transition.consume(&token.token_id),
+    }
+    transition.event("message_delivered",Some(node.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":metadata["message_id"],"message":metadata,"payload":payload}));
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    Ok(transition.finish())
+}
+
 pub(super) fn plan_timer_catch(
     snapshot: &RuntimeSnapshot,
     timer: &ProcessTimer,
@@ -1096,6 +1614,9 @@ pub(super) fn plan_timer_catch(
         matches!(&transition.node(&timer.node_id)?.kind, ProcessNodeKind::TimerCatch { timer: rule } if *rule == timer.rule),
         "catch timer rule does not match its pinned node"
     );
+    if let Some(race_id) = &timer.race_id {
+        transition.win_race(race_id, &timer.node_id, None, Some(&timer.timer_id))?;
+    }
     transition.consume(token_id);
     for edge in transition.outgoing(&timer.node_id) {
         transition.follow(&token, &edge)?;
@@ -1264,6 +1785,12 @@ impl ProcessRuntime {
             }
             let drained = super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis());
             self.handle_timer_drain(drained);
+            let messages =
+                super::messages::drain_pending(&self.db, chrono::Utc::now().timestamp_millis());
+            self.signal_cancelled_claims(&messages.cancelled_claims);
+            if let Err(error) = messages.completion {
+                tracing::error!(error=%error,"process message drain failed");
+            }
             while jobs.len() < 4 && !self.stop.is_cancelled() {
                 let Some(dispatcher) = self.dispatcher.upgrade() else {
                     self.stop.cancel();
@@ -1480,6 +2007,8 @@ pub(crate) mod test_support {
                     )]),
                     verification,
                     timeout_seconds: 10,
+
+                    result_expression: None,
                 },
             },
         );
@@ -1670,8 +2199,9 @@ pub(crate) mod test_support {
     ) -> ProcessInstance {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let instance = super::super::repository::get_instance(pool, actor, instance_id)
-                    .expect("read current process");
+                let instance =
+                    super::super::repository::get_instance(pool, actor, instance_id, None)
+                        .expect("read current process");
                 if instance.status == status {
                     return instance;
                 }
@@ -2189,7 +2719,8 @@ mod tests {
         )
         .unwrap());
         let incident =
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
+                .unwrap();
         repository::retry_job(
             &fixture.db,
             &fixture.owner,
@@ -2241,7 +2772,7 @@ mod tests {
             1
         );
         assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id)
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
                 .unwrap()
                 .status,
             ProcessInstanceStatus::Completed
@@ -2429,5 +2960,192 @@ mod tests {
             chrono::Utc::now().timestamp_millis()
         )
         .unwrap());
+    }
+    #[tokio::test]
+    async fn message_boundary_claim_registration_window_keeps_actual_flow_effect_count_zero() {
+        use super::super::messages::{
+            self,
+            test_support::{
+                boundary_messages, catch_target, envelope, published, send, start_version,
+            },
+        };
+        let fixture = Fixture::new();
+        let flow_id = flow(
+            &fixture.db,
+            &fixture.owner,
+            &graph("must not execute after message", None),
+        );
+        let model = boundary_messages(
+            service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            ),
+            "Service",
+            &[("Stop", true, "EvidenceReady")],
+        );
+        let version = published(&fixture, &model);
+        let started = start_version(&fixture, &version);
+        let claimed = repository::claim_job(
+            &fixture.db,
+            "message-registration",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .unwrap();
+        let runtime = registry_runtime(&fixture, "message-registration");
+        let cancel = CancellationToken::new();
+        let message = envelope(
+            catch_target(&version, Some(&started.instance_id), None),
+            Value::Null,
+        );
+        send(&fixture, &message);
+        let before = tokio::sync::Barrier::new(2);
+        let committed = tokio::sync::Barrier::new(2);
+        let deliver = async {
+            before.wait().await;
+            assert!(runtime.running.is_empty());
+            let drained =
+                messages::drain_pending(&fixture.db, chrono::Utc::now().timestamp_millis());
+            drained.completion.unwrap();
+            assert_eq!(drained.delivered, 1);
+            assert_eq!(drained.cancelled_claims.len(), 1);
+            runtime.signal_cancelled_claims(&drained.cancelled_claims);
+            committed.wait().await;
+        };
+        let register = async {
+            before.wait().await;
+            committed.wait().await;
+            register_claim(&runtime, &claimed, &cancel);
+            assert!(!cancel.is_cancelled());
+            super::super::jobs::execute_claimed(
+                &fixture.db,
+                fixture.dispatcher(),
+                "message-registration",
+                claimed.clone(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            runtime.remove_running_claim(
+                &claimed.job.job_id,
+                claimed.job.attempt,
+                claimed.job.fence,
+                "message-registration",
+            );
+        };
+        tokio::join!(deliver, register);
+        assert!(runtime.running.is_empty());
+        assert!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let actual =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(actual.jobs[0].status, "cancelled");
+        assert_eq!(actual.jobs[0].fence, claimed.job.fence + 1);
+        assert!(actual.jobs[0].result.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_midbatch_sqlite_failure_returns_earlier_committed_claim_and_signals_only_that_generation(
+    ) {
+        use super::super::messages::{
+            self,
+            test_support::{boundary_messages, catch_target, envelope, published, start_version},
+        };
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("batch effect", None));
+        let model = boundary_messages(
+            service_model(&flow_id, ActivityVerification::Human),
+            "Service",
+            &[("Stop", true, "EvidenceReady")],
+        );
+        let version = published(&fixture, &model);
+        let first = start_version(&fixture, &version);
+        let second = start_version(&fixture, &version);
+        let at = chrono::Utc::now().timestamp_millis();
+        let runtime = registry_runtime(&fixture, "message-batch");
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            let claim = repository::claim_job(&fixture.db, "message-batch", at)
+                .unwrap()
+                .unwrap();
+            let token = CancellationToken::new();
+            register_claim(&runtime, &claim, &token);
+            claims.push((claim, token));
+        }
+        let first_claim = claims
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == first.instance_id)
+            .unwrap();
+        let second_claim = claims
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == second.instance_id)
+            .unwrap();
+        let first_msg = envelope(
+            catch_target(&version, Some(&first.instance_id), None),
+            Value::Null,
+        );
+        let second_msg = envelope(
+            catch_target(&version, Some(&second.instance_id), None),
+            Value::Null,
+        );
+        repository::send_message(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("first batch message"),
+            &first_msg,
+            at,
+        )
+        .unwrap();
+        repository::send_message(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("second batch message"),
+            &second_msg,
+            at + 1,
+        )
+        .unwrap();
+        fixture.db.write().unwrap().execute_batch(&format!("CREATE TRIGGER fail_later_message BEFORE UPDATE ON bpmn_messages WHEN OLD.message_id='{}' AND NEW.status='delivered' BEGIN SELECT RAISE(ABORT,'controlled second message SQLite failure'); END;",second_msg.message_id)).unwrap();
+        let drained = messages::drain_pending(&fixture.db, at + 2);
+        assert_eq!(drained.delivered, 1);
+        assert_eq!(
+            drained.cancelled_claims,
+            vec![CancelledJobClaim {
+                job_id: first_claim.0.job.job_id.clone(),
+                attempt: first_claim.0.job.attempt,
+                fence: first_claim.0.job.fence,
+                worker_id: "message-batch".into()
+            }]
+        );
+        assert!(drained
+            .completion
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("controlled second message SQLite failure"));
+        runtime.signal_cancelled_claims(&drained.cancelled_claims);
+        assert!(first_claim.1.is_cancelled());
+        assert!(!second_claim.1.is_cancelled());
+        let first_actual =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &first.instance_id).unwrap();
+        let second_actual =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &second.instance_id).unwrap();
+        assert_eq!(first_actual.jobs[0].status, "cancelled");
+        assert_eq!(second_actual.jobs[0].status, "running");
+        assert_eq!(second_actual.jobs[0].fence, second_claim.0.job.fence);
+        assert_eq!(
+            second_actual.subscriptions[0].status,
+            tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+        );
+        assert!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

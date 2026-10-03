@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, ensure, Context, Result};
-use tentaflow_protocol::processes::{ProcessModel, ProcessNodeKind, ProcessTimerSpec};
+use tentaflow_protocol::processes::{
+    ProcessMessageTargetSpec, ProcessModel, ProcessNodeKind, ProcessTimerSpec,
+};
 
 use crate::flow_engine::expr;
 use crate::project_studio::schedules::parse_timezone;
@@ -43,6 +45,9 @@ pub fn starter_model() -> ProcessModel {
         timer_timezone: None,
         work_calendar: None,
         calendar_pin: None,
+        messages: Vec::new(),
+        errors: Vec::new(),
+        target_namespace: None,
     }
 }
 
@@ -53,6 +58,104 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn validate_declarations<'a>(model: &'a ProcessModel, ids: &mut HashSet<&'a str>) -> Result<()> {
+    if let Some(namespace) = &model.target_namespace {
+        ensure!(
+            !namespace.is_empty()
+                && namespace.len() <= 1024
+                && !namespace.chars().any(char::is_whitespace)
+                && !namespace.chars().any(char::is_control),
+            "invalid process target namespace"
+        );
+        let parsed = url::Url::parse(namespace).context("invalid process target namespace")?;
+        ensure!(!parsed.scheme().is_empty(), "process namespace must be absolute");
+    }
+    ensure!(
+        model.messages.len() <= 32 && model.errors.len() <= 32,
+        "process declaration limit exceeded"
+    );
+    let mut names = HashSet::new();
+    for message in &model.messages {
+        ensure!(
+            valid_id(&message.message_id) && ids.insert(message.message_id.as_str()),
+            "invalid or duplicate BPMN ID: {}",
+            message.message_id
+        );
+        ensure!(
+            !message.name.is_empty()
+                && message.name.len() <= 256
+                && !message.name.chars().any(char::is_control)
+                && names.insert(message.name.as_str()),
+            "invalid or duplicate message name: {}",
+            message.name
+        );
+    }
+    let mut codes = HashSet::new();
+    for error in &model.errors {
+        ensure!(
+            valid_id(&error.error_id) && ids.insert(error.error_id.as_str()),
+            "invalid or duplicate BPMN ID: {}",
+            error.error_id
+        );
+        ensure!(
+            !error.name.is_empty()
+                && error.name.len() <= 256
+                && !error.name.chars().any(char::is_control),
+            "invalid error name: {}",
+            error.error_id
+        );
+        ensure!(
+            (1..=64).contains(&error.error_code.len())
+                && error
+                    .error_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+                && codes.insert(error.error_code.as_str()),
+            "invalid or duplicate error code: {}",
+            error.error_code
+        );
+    }
+    Ok(())
+}
+
+fn validate_expression(expression: &str, context: &str, required: bool) -> Result<()> {
+    if expression.is_empty() && !required {
+        return Ok(());
+    }
+    ensure!(!expression.is_empty() && expression.len() <= 4096, "invalid {context} length");
+    expr::validate_syntax(expression, None).with_context(|| context.to_string())
+}
+
+fn validate_message_target(target: &ProcessMessageTargetSpec, complete: bool) -> Result<()> {
+    match target {
+        ProcessMessageTargetSpec::Start { definition_id } => {
+            if complete || !definition_id.is_empty() {
+                uuid::Uuid::parse_str(definition_id).context("invalid message start target definition")?;
+            }
+        }
+        ProcessMessageTargetSpec::Catch {
+            definition_id,
+            instance_id_expression,
+            subscription_id_expression,
+        } => {
+            if complete || !definition_id.is_empty() {
+                uuid::Uuid::parse_str(definition_id).context("invalid message catch target definition")?;
+            }
+            ensure!(
+                subscription_id_expression.is_none() || instance_id_expression.is_some(),
+                "subscription target requires an instance expression"
+            );
+            if let Some(expression) = instance_id_expression {
+                validate_expression(expression, "message target instance expression", complete)?;
+            }
+            if let Some(expression) = subscription_id_expression {
+                validate_expression(expression, "message target subscription expression", complete)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_timer_spec(spec: &ProcessTimerSpec, is_start: bool) -> Result<()> {
@@ -198,11 +301,13 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
     );
     validate_variables(&serde_json::to_value(&model.variables)?)?;
     validate_timer_model(model)?;
-    let mut node_ids = HashSet::new();
+    let mut all_ids = HashSet::from([model.process_id.as_str()]);
+    validate_declarations(model, &mut all_ids)?;
     for node in &model.nodes {
         ensure!(
-            valid_id(&node.id) && node_ids.insert(node.id.as_str()),
-            "invalid or duplicate node ID"
+            valid_id(&node.id) && all_ids.insert(node.id.as_str()),
+            "invalid or duplicate BPMN ID: {}",
+            node.id
         );
         ensure!(
             node.name.len() <= 256 && !node.name.chars().any(char::is_control),
@@ -214,6 +319,7 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
                 output_mapping,
                 verification,
                 timeout_seconds,
+                result_expression,
                 ..
             } => {
                 ensure!(
@@ -228,16 +334,47 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
                 {
                     expr::validate_syntax(expression, None)?;
                 }
+                if let Some(expression) = result_expression {
+                    validate_expression(expression, "service result expression", false)?;
+                }
             }
             ProcessNodeKind::UserTask { output_mapping, .. } => validate_mapping(output_mapping)?,
+            ProcessNodeKind::MessageStart { output_mapping, .. }
+            | ProcessNodeKind::BoundaryError { output_mapping, .. } => validate_mapping(output_mapping)?,
+            ProcessNodeKind::MessageCatch {
+                correlation_expression,
+                output_mapping,
+                ..
+            }
+            | ProcessNodeKind::BoundaryMessage {
+                correlation_expression,
+                output_mapping,
+                ..
+            } => {
+                validate_expression(correlation_expression, "message correlation expression", false)?;
+                validate_mapping(output_mapping)?;
+            }
+            ProcessNodeKind::MessageThrow {
+                target,
+                correlation_expression,
+                payload_expression,
+                ttl_seconds,
+                ..
+            } => {
+                validate_message_target(target, false)?;
+                validate_expression(correlation_expression, "message correlation expression", false)?;
+                validate_expression(payload_expression, "message payload expression", false)?;
+                ensure!((1..=604_800).contains(ttl_seconds), "message TTL outside 1..=604800 seconds");
+            }
             _ => {}
         }
     }
     let mut flow_ids = HashSet::new();
     for flow in &model.sequence_flows {
         ensure!(
-            valid_id(&flow.id) && flow_ids.insert(flow.id.as_str()),
-            "invalid or duplicate sequence flow ID"
+            valid_id(&flow.id) && flow_ids.insert(flow.id.as_str()) && all_ids.insert(flow.id.as_str()),
+            "invalid or duplicate BPMN ID: {}",
+            flow.id
         );
         if let Some(expression) = &flow.condition {
             expr::validate_syntax(expression, None)?;
@@ -252,6 +389,7 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
 }
 
 pub fn validate_model(model: &ProcessModel) -> Result<()> {
+    validate_draft(model)?;
     ensure!(
         model.schema_version == 1,
         "unsupported process model schema version"
@@ -273,6 +411,11 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
     validate_timer_model(model)?;
 
     let mut nodes = HashMap::new();
+    let message_ids: HashSet<_> = model.messages.iter().map(|message| message.message_id.as_str()).collect();
+    let error_ids: HashSet<_> = model.errors.iter().map(|error| error.error_id.as_str()).collect();
+    let mut used_messages = HashSet::new();
+    let mut used_errors = HashSet::new();
+    let mut boundary_error_handlers = HashSet::new();
     for node in &model.nodes {
         ensure!(valid_id(&node.id), "invalid node ID: {}", node.id);
         ensure!(
@@ -292,6 +435,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 output_mapping,
                 verification,
                 timeout_seconds,
+                result_expression,
             } => {
                 ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
                 ensure!(
@@ -308,6 +452,9 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                     expr::validate_syntax(expression, None)
                         .with_context(|| format!("service task {} verification", node.id))?;
                 }
+                if let Some(expression) = result_expression {
+                    validate_expression(expression, "service result expression", true)?;
+                }
             }
             ProcessNodeKind::UserTask {
                 assignee_user_id,
@@ -322,9 +469,39 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
                 }
                 validate_mapping(output_mapping)?;
             }
+            ProcessNodeKind::MessageStart { message_ref, output_mapping } => {
+                ensure!(message_ids.contains(message_ref.as_str()), "message start {} references an unknown declaration", node.id);
+                used_messages.insert(message_ref.as_str());
+                validate_mapping(output_mapping)?;
+            }
+            ProcessNodeKind::MessageCatch { message_ref, correlation_expression, output_mapping }
+            | ProcessNodeKind::BoundaryMessage { message_ref, correlation_expression, output_mapping, .. } => {
+                ensure!(message_ids.contains(message_ref.as_str()), "message event {} references an unknown declaration", node.id);
+                used_messages.insert(message_ref.as_str());
+                validate_expression(correlation_expression, "message correlation expression", true)?;
+                validate_mapping(output_mapping)?;
+            }
+            ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
+                ensure!(message_ids.contains(message_ref.as_str()), "message throw {} references an unknown declaration", node.id);
+                used_messages.insert(message_ref.as_str());
+                validate_message_target(target, true)?;
+                validate_expression(correlation_expression, "message correlation expression", true)?;
+                validate_expression(payload_expression, "message payload expression", true)?;
+                ensure!((1..=604_800).contains(ttl_seconds), "message TTL outside 1..=604800 seconds");
+            }
+            ProcessNodeKind::BoundaryError { attached_to_id, error_ref, output_mapping } => {
+                if let Some(reference) = error_ref {
+                    ensure!(error_ids.contains(reference.as_str()), "boundary error {} references an unknown declaration", node.id);
+                    used_errors.insert(reference.as_str());
+                }
+                ensure!(boundary_error_handlers.insert((attached_to_id.as_str(), error_ref.as_deref())), "duplicate boundary error handler on {}", attached_to_id);
+                validate_mapping(output_mapping)?;
+            }
             _ => {}
         }
     }
+    ensure!(message_ids == used_messages, "unreferenced message declaration");
+    ensure!(error_ids == used_errors, "unreferenced error declaration");
     let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut flow_ids = HashSet::new();
@@ -363,7 +540,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
     let starts: Vec<_> = model
         .nodes
         .iter()
-        .filter(|node| matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }))
+        .filter(|node| matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::MessageStart { .. }))
         .collect();
     ensure!(
         starts.len() == 1,
@@ -380,22 +557,45 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         let in_count = incoming.get(node.id.as_str()).map_or(0, Vec::len);
         let out_count = outgoing.get(node.id.as_str()).map_or(0, Vec::len);
         match &node.kind {
-            ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } => ensure!(
+            ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::MessageStart { .. } => ensure!(
                 in_count == 0 && out_count == 1,
                 "start event must have one outgoing flow and no incoming flow"
             ),
-            ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. } => {
                 ensure!(
                     in_count == 0 && out_count == 1,
-                    "boundary timer {} needs one outgoing flow and no incoming flow",
+                    "boundary event {} needs one outgoing flow and no incoming flow",
                     node.id
                 );
                 ensure!(
                     matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                        Some(ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. })),
-                    "boundary timer {} must attach to a user or service task",
+                        Some(ProcessNodeKind::ServiceTask { .. }))
+                        || (!matches!(node.kind, ProcessNodeKind::BoundaryError { .. })
+                            && matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                                Some(ProcessNodeKind::UserTask { .. }))),
+                    "boundary event {} has an unsupported attachment",
                     node.id
                 );
+            }
+            ProcessNodeKind::EventBasedGateway => {
+                ensure!(in_count == 1 && (2..=8).contains(&out_count), "event gateway {} needs one incoming and 2..=8 outgoing flows", node.id);
+                for flow in model.sequence_flows.iter().filter(|flow| flow.source_id == node.id) {
+                    ensure!(flow.condition.is_none(), "event gateway {} cannot have conditions", node.id);
+                    let branch = nodes[flow.target_id.as_str()];
+                    ensure!(
+                        matches!(branch.kind, ProcessNodeKind::MessageCatch { .. })
+                            || matches!(&branch.kind, ProcessNodeKind::TimerCatch { timer } if matches!(timer, ProcessTimerSpec::Date { .. } | ProcessTimerSpec::Duration { .. } | ProcessTimerSpec::WorkingDuration { .. })),
+                        "event gateway {} must branch directly to one-shot catches",
+                        node.id
+                    );
+                    ensure!(incoming.get(branch.id.as_str()).map_or(0, Vec::len) == 1
+                        && outgoing.get(branch.id.as_str()).map_or(0, Vec::len) == 1,
+                        "event gateway child {} must have one incoming and outgoing flow",
+                        branch.id
+                    );
+                }
             }
             ProcessNodeKind::End => ensure!(
                 out_count == 0 && in_count >= 1,
@@ -453,7 +653,9 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         .map(|id| (*id, incoming.get(id).map_or(0, Vec::len)))
         .collect();
     for node in &model.nodes {
-        if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &node.kind {
+        if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+        | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+        | ProcessNodeKind::BoundaryError { attached_to_id, .. } = &node.kind {
             graph_outgoing
                 .entry(attached_to_id.as_str())
                 .or_default()
@@ -531,18 +733,74 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             }
         }
         for boundary in model.nodes.iter().filter(|candidate| {
-            matches!(&candidate.kind, ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            matches!(&candidate.kind,
+                ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryError { attached_to_id, .. }
                 if attached_to_id.as_str() == *node_id)
         }) {
             ensure!(
                 stack.is_empty(),
-                "boundary timer {} attaches inside an active parallel fork",
+                "boundary event {} attaches inside an active parallel fork",
                 boundary.id
             );
             states.insert(boundary.id.as_str(), (boundary.id.clone(), Vec::new()));
         }
     }
+    validate_event_gateway_regions(model, &nodes, &outgoing, &order)?;
     validate_diagram(model, &nodes, &flow_ids)?;
+    Ok(())
+}
+
+fn validate_event_gateway_regions<'a>(
+    model: &'a ProcessModel,
+    nodes: &HashMap<&'a str, &'a tentaflow_protocol::processes::ProcessNode>,
+    outgoing: &HashMap<&'a str, Vec<&'a str>>,
+    order: &[&'a str],
+) -> Result<()> {
+    for gateway in model.nodes.iter().filter(|node| matches!(node.kind, ProcessNodeKind::EventBasedGateway)) {
+        let branches = outgoing.get(gateway.id.as_str()).context("event gateway lacks branches")?;
+        let mut branch_reach = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let mut reached = HashSet::new();
+            let mut queue = VecDeque::from([*branch]);
+            while let Some(current) = queue.pop_front() {
+                if reached.insert(current) {
+                    queue.extend(outgoing.get(current).into_iter().flatten().copied());
+                }
+            }
+            branch_reach.push(reached);
+        }
+        let common = order.iter().copied().find(|node_id| {
+            branch_reach.iter().all(|reach| reach.contains(node_id))
+        }).with_context(|| format!("event gateway {} has no common exclusive merge or end", gateway.id))?;
+        ensure!(
+            matches!(nodes[common].kind, ProcessNodeKind::End)
+                || matches!(&nodes[common].kind, ProcessNodeKind::ExclusiveGateway { default_flow_id: None }
+                    if outgoing.get(common).map_or(0, Vec::len) == 1
+                        && model.sequence_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
+            "event gateway {} branches merge at unsupported node {}",
+            gateway.id,
+            common
+        );
+        let mut visited_regions = HashSet::new();
+        for branch in branches {
+            let mut reached = HashSet::new();
+            let mut queue = VecDeque::from([*branch]);
+            while let Some(current) = queue.pop_front() {
+                if current == common || !reached.insert(current) {
+                    continue;
+                }
+                ensure!(!matches!(nodes[current].kind, ProcessNodeKind::End),
+                    "event gateway {} branch ends before common merge {}", gateway.id, common);
+                ensure!(!matches!(nodes[current].kind, ProcessNodeKind::EventBasedGateway),
+                    "event gateway {} has a nested event race", gateway.id);
+                ensure!(visited_regions.insert(current),
+                    "event gateway {} branches share node {} before merge", gateway.id, current);
+                queue.extend(outgoing.get(current).into_iter().flatten().copied());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -703,6 +961,53 @@ pub fn and_pairs(model: &ProcessModel) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_declarations_keep_incomplete_drafts_but_publication_requires_real_references() {
+        use tentaflow_protocol::processes::{ProcessErrorDeclaration, ProcessMessageDeclaration};
+        let mut model = starter_model();
+        model.target_namespace = Some("urn:example:customer:v1".into());
+        model.messages.push(ProcessMessageDeclaration { message_id: "Message_Order".into(), name: "order.received".into() });
+        validate_draft(&model).unwrap();
+        assert!(validate_model(&model).is_err(), "unused executable declaration cannot publish");
+        model.nodes[0].kind = ProcessNodeKind::MessageStart { message_ref: "Message_Order".into(), output_mapping: Default::default() };
+        validate_model(&model).unwrap();
+        model.nodes[0].kind = ProcessNodeKind::MessageStart { message_ref: "Missing".into(), output_mapping: Default::default() };
+        validate_draft(&model).unwrap();
+        assert!(validate_model(&model).is_err(), "a draft may retain a deleted reference but publication cannot");
+        model.nodes[0].kind = ProcessNodeKind::MessageStart { message_ref: "Message_Order".into(), output_mapping: Default::default() };
+        model.errors.push(ProcessErrorDeclaration { error_id: "Message_Order".into(), name: "bad".into(), error_code: "BUSINESS".into() });
+        assert!(validate_draft(&model).is_err(), "XML IDs are unique across declarations and nodes");
+        model.errors[0].error_id = "Error_Business".into();
+        assert!(validate_model(&model).is_err(), "an unused error declaration cannot publish");
+    }
+
+    #[test]
+    fn event_gateway_accepts_disjoint_one_shot_branches_and_rejects_shared_activity() {
+        use tentaflow_protocol::processes::{ProcessMessageDeclaration, ProcessNode, ProcessSequenceFlow};
+        let mut model = starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "signal".into() });
+        model.nodes.extend([
+            ProcessNode { id: "Race_1".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { id: "Catch_Message".into(), name: "Message".into(), kind: ProcessNodeKind::MessageCatch {
+                message_ref: "Message_1".into(), correlation_expression: "vars.case_id".into(), output_mapping: Default::default(),
+            } },
+            ProcessNode { id: "Catch_Timer".into(), name: "Timeout".into(), kind: ProcessNodeKind::TimerCatch {
+                timer: ProcessTimerSpec::Duration { seconds: 60 },
+            } },
+        ]);
+        model.sequence_flows[0].target_id = "Race_1".into();
+        for (id, source, target) in [
+            ("Flow_2", "Race_1", "Catch_Message"), ("Flow_3", "Race_1", "Catch_Timer"),
+            ("Flow_4", "Catch_Message", "End_1"), ("Flow_5", "Catch_Timer", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        validate_model(&model).unwrap();
+        model.sequence_flows[4].target_id = "Catch_Message".into();
+        assert!(validate_model(&model).is_err(), "a race child cannot be shared by both alternatives");
+    }
 
     #[test]
     fn calendar_without_timer_requires_zone_and_working_rule_requires_calendar() {

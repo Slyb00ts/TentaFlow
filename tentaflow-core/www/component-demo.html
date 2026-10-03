@@ -129,7 +129,7 @@ fetch('/index.html').then(r => r.text()).then(html => {
     </div>
   </div>
   <div style="height:16px"></div>
-  <div style="display:grid;grid-template-columns:240px 180px 1fr;gap:16px;align-items:start">
+  <div style="display:grid;grid-template-columns:240px minmax(180px, 1fr) 180px 180px;gap:16px;align-items:start">
     <div class="box">
       <div class="label">tf-select</div>
       <tf-select>
@@ -140,15 +140,28 @@ fetch('/index.html').then(r => r.text()).then(html => {
       </tf-select>
     </div>
     <div class="box">
+      <div class="label">tf-select wrap-selected</div>
+      <tf-select wrap-selected label="Declaration" value="message">
+        <option value="message">Customer approval message with a long readable declaration name · Message_CustomerApproval</option>
+        <option value="error">Validation error · Error_Validation</option>
+      </tf-select>
+    </div>
+    <div class="box">
       <div class="label">tf-toggle</div>
       <div style="display:flex;gap:12px;margin-top:8px">
-        <tf-toggle></tf-toggle>
+        <tf-toggle label="Notifications"></tf-toggle>
         <tf-toggle checked></tf-toggle>
       </div>
     </div>
     <div class="box">
       <div class="label">tf-slider</div>
       <tf-slider min="0" max="100" value="68" step="1"></tf-slider>
+    </div>
+  </div>
+  <div class="row col w500">
+    <div class="box">
+      <div class="label">tf-keyvalue-editor multiline</div>
+      <tf-keyvalue-editor id="demo-multiline-mapping" multiline key-placeholder="Mapping key" value-placeholder="CEL expression" add-label="Add mapping" remove-label="Remove mapping"></tf-keyvalue-editor>
     </div>
   </div>
   <div style="height:16px"></div>
@@ -770,6 +783,9 @@ moveTree.addEventListener('expand', (event) => { moveTree.expandedIds = [...move
 moveTree.addEventListener('collapse', (event) => { moveTree.expandedIds = [...moveTree.expandedIds].filter((id) => id !== event.detail.id); });
 moveTree.addEventListener('move', (event) => { document.getElementById('demo-tree-intent').textContent = `Move requested: ${event.detail.id} → ${event.detail.parentId}`; });
 // Populate data-driven components
+document.getElementById('demo-multiline-mapping').value = {
+  Customer_contract_reference_with_full_identifier: 'vars.Customer_ID == "approved" && vars.Contract_ID != null',
+};
 const kv = document.getElementById('kv-runtime');
 if (kv) kv.entries = [
   { key: 'Frame bus throughput', value: '312 fps total' },

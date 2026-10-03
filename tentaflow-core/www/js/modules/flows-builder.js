@@ -16,8 +16,8 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processCommand, processEditorLabels, processHasTimerStart } from '/js/modules/flows-builder/bpmn.js';
-import { openProcessCalendar, openProcessInstances, openProcessRun, openProcessSchedule, openProcessVariables, processTimerReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
+import { checkProcessDocument, processCommand, processEditorLabels, processHasTimerStart, processHasMessageStart } from '/js/modules/flows-builder/bpmn.js';
+import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
@@ -63,11 +63,14 @@ const FlowBuilderScreen = {
           ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="calendar">${escapeHtml(I18n.t('bpmn.calendar_title'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="mail" data-role="declarations">${escapeHtml(I18n.t('bpmn.declarations'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="refresh" data-role="refresh-calendar" hidden>${escapeHtml(I18n.t('bpmn.calendar_refresh'))}</tf-button>
           <tf-button variant="secondary" size="sm" icon="check" data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="play" data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="mail" data-role="send-start" hidden>${escapeHtml(I18n.t('bpmn.send_message'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="schedule" hidden>${escapeHtml(I18n.t('bpmn.timer_schedule'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
+          ${process ? `<tf-button variant="ghost" size="sm" icon="mail" data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-button>` : ''}
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
         </header>
@@ -157,6 +160,7 @@ const FlowBuilderScreen = {
         state.definition = response.definition;
         state.timerStart = response.timerStart ?? null;
         state.publishedTimerStart = !!response.timerStart;
+        state.messageStart = response.messageStart ?? null;
         state.processOptions = options;
         state.flow = { id: flowId, name: response.definition.name, description: response.definition.description };
         state.readOnly = response.definition.archived;
@@ -334,6 +338,15 @@ const FlowBuilderScreen = {
           state.canvas.processModel.calendarPin ?? null, state.calendarPinState,
           state.readOnly, (value) => state.canvas.updateProcessCalendar(value));
       });
+      root.querySelector('[data-role="declarations"]').addEventListener('click', () => {
+        if (!this._current(state)) return;
+        openProcessDeclarations(state.canvas.processModel, state.readOnly, (value) => {
+          if (!this._current(state) || state.readOnly) return;
+          state.canvas.updateProcessDeclarations(value);
+          const selected = state.canvas.nodes.find((node) => state.canvas.selectedIds.has(node.id));
+          if (selected) state.config.show(selected, state.templatesMap.get(selected.type));
+        });
+      });
       root.querySelector('[data-role="refresh-calendar"]').addEventListener('click', () => this._publish({ refreshCalendar: true }));
       const timezone = root.querySelector('[data-role="timer-timezone"]');
       timezone.addEventListener('change', (event) => {
@@ -341,6 +354,11 @@ const FlowBuilderScreen = {
         state.canvas.updateProcessTimezone(timezone.value);
       });
       root.querySelector('[data-role="instances"]').addEventListener('click', () => openProcessInstances(state.flowId));
+      root.querySelector('[data-role="messages"]').addEventListener('click', () => openProcessMessages(state.flowId));
+      root.querySelector('[data-role="send-start"]').addEventListener('click', () => {
+        if (!this._current(state) || !state.messageStart?.canSend || state.definition.archived) return;
+        openProcessMessageSend({ Start: { definitionId: state.flowId } }, [state.messageStart.messageName]);
+      });
       root.querySelector('[data-role="import"]').addEventListener('click', () => this._importProcess());
       root.querySelector('[data-role="export"]').addEventListener('click', () => this._exportProcess());
       root.querySelector('[data-role="archive"]').addEventListener('click', () => this._archiveProcess());
@@ -405,11 +423,15 @@ const FlowBuilderScreen = {
     }
     if (state.palette.readOnly !== readOnly) { state.palette.readOnly = readOnly; state.palette._render(); }
     state.root.querySelector('[data-role="name"]').toggleAttribute('disabled', readOnly);
-    for (const role of ['save', 'variables', 'publish', 'import', 'undo', 'redo', 'refresh-calendar']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
+    for (const role of ['save', 'variables', 'declarations', 'publish', 'import', 'undo', 'redo', 'refresh-calendar']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
     const timedVersion = state.previewVersion === null ? state.publishedTimerStart : processHasTimerStart(state.canvas.getData());
     const run = state.root.querySelector('[data-role="run"]');
-    run.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived || !!state.operationBusy || timedVersion);
-    run.setAttribute('title', I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : 'bpmn.run_hint'));
+    const messageVersion = state.previewVersion === null ? !!state.messageStart : processHasMessageStart(state.canvas.getData());
+    run.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived || !!state.operationBusy || timedVersion || messageVersion);
+    run.setAttribute('title', I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : messageVersion ? 'bpmn.message_start_manual_hint' : 'bpmn.run_hint'));
+    const sendStart = state.root.querySelector('[data-role="send-start"]');
+    sendStart.hidden = !state.messageStart || state.previewVersion !== null;
+    sendStart.toggleAttribute('disabled', !!state.operationBusy || state.definition.archived || !state.messageStart?.canSend);
     const schedule = state.root.querySelector('[data-role="schedule"]');
     schedule.hidden = !state.publishedTimerStart;
     schedule.toggleAttribute('disabled', !!state.operationBusy);
@@ -434,7 +456,7 @@ const FlowBuilderScreen = {
     state.root.querySelector('[data-role="refresh-calendar"]').hidden = !currentCalendar;
     const timerSummary = state.root.querySelector('[data-role="timer-summary"]');
     timerSummary.hidden = !state.timerStart;
-    timerSummary.textContent = state.timerStart ? I18n.t('bpmn.timer_latest_summary', { version: state.definition.publishedVersion, summary: processTimerText(state.timerStart) }) + (state.timerStart.lastReason ? ` · ${I18n.t('bpmn.timer_reason')}: ${processTimerReasonText(state.timerStart.lastReason)}` : '') : '';
+    timerSummary.textContent = state.timerStart ? I18n.t('bpmn.timer_latest_summary', { version: state.definition.publishedVersion, summary: processTimerText(state.timerStart) }) + (state.timerStart.lastReason ? ` · ${I18n.t('bpmn.timer_reason')}: ${processLifecycleReasonText(state.timerStart.lastReason)}` : '') : '';
     state.root.querySelector('[data-role="draft"]').hidden = state.previewVersion === null;
     state.root.querySelector('[data-role="archive"]').textContent = I18n.t(state.definition.archived ? 'bpmn.unarchive' : 'bpmn.archive');
     state.root.querySelector('[data-role="archive"]').toggleAttribute('disabled', !!state.operationBusy || state.previewVersion !== null);
@@ -488,12 +510,14 @@ const FlowBuilderScreen = {
       current.definition = { ...response.definition, model: response.version.model };
       current.canvas.adoptPublishedProcessModel(response.version.model);
       current.publishedTimerStart = processHasTimerStart(response.version.model);
+      current.messageStart = null;
       current.timerStart = null;
       toast(I18n.t('bpmn.published', { version: response.version.version }), 'success');
-      if (current.publishedTimerStart || previouslyTimed) {
+      if (current.publishedTimerStart || previouslyTimed || processHasMessageStart(response.version.model)) {
         const actual = await ApiBinary.one('processDefinitionGetRequest', { definitionId: current.flowId });
         if (!this._current(current)) return;
         current.timerStart = actual.timerStart ?? null;
+        current.messageStart = actual.messageStart ?? null;
       }
     });
   },
@@ -508,6 +532,12 @@ const FlowBuilderScreen = {
       if (processHasTimerStart(response.version.model)) {
         if (version === current.definition.publishedVersion) current.publishedTimerStart = true;
         await openProcessSchedule(current.flowId);
+        return;
+      }
+      if (processHasMessageStart(response.version.model)) {
+        if (version === current.definition.publishedVersion && current.messageStart?.canSend) {
+          openProcessMessageSend({ Start: { definitionId: current.flowId } }, [current.messageStart.messageName]);
+        }
         return;
       }
       openProcessRun({ ...current.definition, model: response.version.model }, [response.version]);
@@ -525,10 +555,11 @@ const FlowBuilderScreen = {
       const response = await ApiBinary.one('processDefinitionArchiveRequest', current.archiveCommand({ definitionId: current.flowId, expectedRevision: current.definition.draftRevision, archived }));
       if (!this._current(current)) return;
       current.definition = response.definition;
-      if (current.publishedTimerStart) {
+      if (current.publishedTimerStart || current.messageStart) {
         const actual = await ApiBinary.one('processDefinitionGetRequest', { definitionId: current.flowId });
         if (!this._current(current)) return;
         current.timerStart = actual.timerStart ?? null;
+        current.messageStart = actual.messageStart ?? null;
       }
       current.root.querySelector('[data-role="system-readonly"]')?.remove();
       current.root.classList.remove('fb-readonly');
@@ -541,6 +572,7 @@ const FlowBuilderScreen = {
       if (!this._current(state)) return;
       state.definition = response.definition;
       state.timerStart = response.timerStart ?? null;
+      state.messageStart = response.messageStart ?? null;
       state.publishedTimerStart = !!response.timerStart;
       state.previewVersion = null;
       state.canvas.setData(response.definition.model);

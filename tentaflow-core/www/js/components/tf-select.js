@@ -1,17 +1,13 @@
 // =============================================================================
-// Plik: tf-select.js
-// Opis: Komponent <tf-select> — wraper nad natywnym <select>. Dzieci <option>
-//       sa przejmowane i umieszczane w select. Emituje "change" z detail.value.
-// Przyklad: <tf-select value="rr"><option value="fa">First</option>...</tf-select>
-// Atrybuty: value, disabled, name, label (etykieta NAD polem), prefix (krotki
-//   podpis WEWNATRZ pola, przed wybrana wartoscia — np. "Instancja" w wyborze
-//   instancji aplikacji), dot (ok|warn|err — kropka stanu przed podpisem),
-//   hint (one explanatory line UNDER the field, same look as tf-input's hint).
+// File: tf-select.js — native select with optional full-width wrapped caption.
+// Options remain on the real select; wrap-selected only mirrors the chosen text.
+// Attributes: value, disabled, name, label, prefix, dot, hint, wrap-selected.
+// Event: change with detail.value.
 // =============================================================================
 
 class TfSelect extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot', 'hint'];
+    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot', 'hint', 'wrap-selected'];
   }
 
   constructor() {
@@ -19,6 +15,7 @@ class TfSelect extends HTMLElement {
     this._group = null;
     this._labelEl = null;
     this._prefixEl = null;
+    this._selectedEl = null;
     this._wrap = null;
     this._select = null;
     this._observer = null;
@@ -86,6 +83,7 @@ class TfSelect extends HTMLElement {
       this._select.value = String(selected);
       this.setAttribute('value', String(selected));
     }
+    this._updateSelected();
   }
 
   // `innerHTML = '<option>…'` on an upgraded host destroys the built structure,
@@ -103,9 +101,7 @@ class TfSelect extends HTMLElement {
   }
 
   _build() {
-    // Przejmij top-level <option> ORAZ <optgroup> z light DOM zachowujac ich
-    // kolejnosc i strukture grupowania. Wczesniej `querySelectorAll('option')`
-    // splaszczalo grupy, gubiac etykiety <optgroup> w finalnym UI.
+    // Move top-level options and groups in order; flattening loses group labels.
     const topLevel = Array.from(this.children).filter(
       (n) => n.tagName === 'OPTION' || n.tagName === 'OPTGROUP'
     );
@@ -132,7 +128,12 @@ class TfSelect extends HTMLElement {
     prefix.className = 'tf-select-prefix';
     prefix.setAttribute('aria-hidden', 'true');
 
+    const selected = document.createElement('span');
+    selected.className = 'tf-select-selected';
+    selected.setAttribute('aria-hidden', 'true');
+
     wrap.appendChild(prefix);
+    wrap.appendChild(selected);
     wrap.appendChild(select);
     group.appendChild(wrap);
     const hint = document.createElement('span');
@@ -144,6 +145,7 @@ class TfSelect extends HTMLElement {
     this._group = group;
     this._labelEl = label;
     this._prefixEl = prefix;
+    this._selectedEl = selected;
     this._wrap = wrap;
     this._select = select;
   }
@@ -161,7 +163,13 @@ class TfSelect extends HTMLElement {
     const hintText = this.getAttribute('hint') || '';
     this._hintEl.textContent = hintText;
     this._hintEl.style.display = hintText ? '' : 'none';
+    this._wrap.classList.toggle('tf-select-wrap--wrap-selected', this.hasAttribute('wrap-selected'));
     this._updatePrefix();
+    this._updateSelected();
+  }
+
+  _updateSelected() {
+    this._selectedEl.textContent = this._select.selectedOptions[0]?.textContent || '';
   }
 
   // The prefix sits over the field's left padding, so the padding follows its
@@ -181,23 +189,25 @@ class TfSelect extends HTMLElement {
     const on = Boolean(text || tone);
     this._wrap.classList.toggle('tf-select-wrap--prefix', on);
     if (text) this._select.setAttribute('aria-label', text);
+    else if (this.hasAttribute('wrap-selected') && this.getAttribute('label')) this._select.setAttribute('aria-label', this.getAttribute('label'));
     else if (this._select.getAttribute('aria-label') && !this.hasAttribute('aria-label')) this._select.removeAttribute('aria-label');
-    if (!on) { this._select.style.paddingLeft = ''; return; }
+    if (!on) { this._select.style.paddingLeft = ''; this._selectedEl.style.paddingLeft = ''; return; }
     const measure = () => {
       const w = this._prefixEl.offsetWidth;
-      if (w > 0) this._select.style.paddingLeft = `${w + 22}px`;
+      if (w > 0) {
+        this._select.style.paddingLeft = `${w + 22}px`;
+        this._selectedEl.style.paddingLeft = `${w + 22}px`;
+      }
     };
     measure();
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
   }
 
   _onChange(e) {
-    // Native <select> emituje wlasny `change` event ktory bubbles przez
-    // light DOM tf-select'a. Bez stopPropagation caller (np. login.js)
-    // dostawal DWA eventy: pierwszy native (bez detail) -> crash przy
-    // e.detail.value, drugi CustomEvent z detail.
+    // Stop the native event so callers receive only the typed component event.
     e.stopPropagation();
     this.setAttribute('value', this._select.value);
+    this._updateSelected();
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
       detail: { value: this._select.value },

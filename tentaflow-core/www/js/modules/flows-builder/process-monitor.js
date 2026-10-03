@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processCommand, processEditorLabels, processHasTimerStart, processJson, processStatusLabel } from './bpmn.js';
+import { checkProcessValue, processCommand, processEditorLabels, processHasMessageStart, processHasTimerStart, processJson, processStatusLabel } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
@@ -14,7 +14,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
-const date = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
+const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
 const tone = (status) => status === 'Completed' ? 'ok' : status === 'Incident' ? 'err' : status === 'Cancelled' ? 'neutral' : 'info';
 
 function workingDate(ms, summary, zone) {
@@ -82,7 +82,7 @@ export function processEventText(event) {
   if (event.kind === 'timer_armed') return text('event_timer_armed', { node,
     due: event.data.working_time ? workingDate(event.data.due_at_ms, {
       dueOffsetSeconds: event.data.working_time.due_offset_seconds,
-    }, event.data.timezone) : date(event.data.due_at_ms), timezone: event.data.timezone });
+    }, event.data.timezone) : date(event.data.due_at_ms, event.data.timezone), timezone: event.data.timezone });
   if (event.kind === 'timer_fired') {
     const due = event.data.working_time ? workingDate(event.data.planned_due_at_ms, {
       dueOffsetSeconds: event.data.working_time.due_offset_seconds,
@@ -95,11 +95,24 @@ export function processEventText(event) {
   }
   if (event.kind === 'timer_cancelled') {
     if (event.data.reason === 'instance_cancelled') return text('event_timer_cancelled', { node });
-    return text('event_timer_cancelled_reason', { node, reason: processTimerReasonText(event.data.reason) });
+    return text('event_timer_cancelled_reason', { node, reason: processLifecycleReasonText(event.data.reason) });
   }
   if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
   if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
+  if (event.kind.startsWith('message_')) return text(`event_${event.kind}`, {
+    node, message: event.data.message_name || event.data.message_id || '',
+    reason: processLifecycleReasonText(event.data.reason || ''), key: event.data.correlation_key || '',
+  });
+  if (event.kind.startsWith('event_race_')) return text(`event_${event.kind}`, {
+    node, winner: event.data.winner_node_id || '', reason: processLifecycleReasonText(event.data.reason || ''),
+  });
+  if (event.kind === 'subscription_cancelled') return text('event_subscription_cancelled', {
+    node, reason: processLifecycleReasonText(event.data.reason || ''),
+  });
+  if (event.kind === 'business_error_caught') return text('event_business_error_caught', {
+    node, code: event.data.error_code || text('error_catch_all_hint'),
+  });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
   return text(`event_${event.kind}`, { node });
 }
@@ -111,15 +124,20 @@ export function processTimerText(timer) {
   return text('timer_brief', { status: text(`timer_status_${timer.status.toLowerCase()}`), due, timezone: timer.timezone });
 }
 
-export function processTimerReasonText(reason) {
+export function processLifecycleReasonText(reason) {
   switch (reason) {
     case 'instance_cancelled': return text('event_cancelled');
     case 'activity_completed': return text('timer_reason_activity_completed');
     case 'sibling_interrupted': return text('timer_reason_sibling_interrupted');
+    case 'event_race_lost': return text('timer_reason_event_race_lost');
     case 'definition_archived': return text('timer_reason_definition_archived');
     case 'missed_during_archive': return text('timer_reason_missed_during_archive');
     case 'finite_schedule_exhausted_during_archive': return text('timer_reason_finite_schedule_exhausted_during_archive');
     case 'superseded_by_publication': return text('timer_reason_superseded_by_publication');
+    case 'sender_cancelled': return text('reason_sender_cancelled');
+    case 'ttl_expired': return text('reason_ttl_expired');
+    case 'activation_closed': return text('reason_activation_closed');
+    case 'target_instance_closed': return text('reason_target_instance_closed');
     default: return reason;
   }
 }
@@ -139,7 +157,7 @@ function renderTimers(host, timers) {
         release: timer.workingTime.legalReleaseId, asOf: timer.workingTime.legalAsOfDate,
         timezone: timer.workingTime.tzdbReleaseId, digest: timer.workingTime.pinSha256,
       }))}</dd>` : ''}
-      ${timer.lastReason ? `<dt>${escapeHtml(text('timer_reason'))}</dt><dd>${escapeHtml(processTimerReasonText(timer.lastReason))}</dd>` : ''}</dl></div>`;
+      ${timer.lastReason ? `<dt>${escapeHtml(text('timer_reason'))}</dt><dd>${escapeHtml(processLifecycleReasonText(timer.lastReason))}</dd>` : ''}</dl></div>`;
     host.append(row);
   }
 }
@@ -226,7 +244,10 @@ export async function openProcessInstances(definitionId = null) {
 export async function openProcessInstance(instanceId, initial = null) {
   const win = readWindow(text('instance'), 'play', 940);
   const host = win.querySelector('[data-content]');
-  host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section hidden><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
+  host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
+    <section data-subscriptions><h3>${escapeHtml(text('message_subscriptions'))}</h3><div data-subscription-rows></div></section>
+    <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
+    <section data-outgoing><h3>${escapeHtml(text('outgoing_messages'))}</h3><div data-outgoing-rows></div></section>
     <div data-variables></div><section class="fb-process-history"><h3>${escapeHtml(text('history'))}</h3><ol data-events></ol>
       <tf-button variant="secondary" data-more>${escapeHtml(text('more_history'))}</tf-button></section>`;
   let instance = initial;
@@ -242,6 +263,12 @@ export async function openProcessInstance(instanceId, initial = null) {
   const retryCommand = processCommand();
   const events = host.querySelector('[data-events]');
   const workWindows = new Set();
+  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages'];
+  const pageSpecs = Object.fromEntries(collectionNames.map((name) => [name, { offset: 0, limit: 20 }]));
+  let selectedUserTaskId = null;
+  let selectedIncidentId = null;
+  const requestPages = () => ({ ...pageSpecs, selectedUserTaskId, selectedIncidentId });
+  const requestInstance = () => ApiBinary.one('processInstanceGetRequest', { instanceId, pages: requestPages() });
 
   function syncWorkWindows() {
     for (const workWindow of workWindows) workWindow.dispatchEvent(new CustomEvent('change', { bubbles: true }));
@@ -250,7 +277,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   async function acceptSnapshot(snapshot) {
     if (!win.isConnected) return;
     if (instance && snapshot.revision < instance.revision) {
-      const response = await ApiBinary.one('processInstanceGetRequest', { instanceId });
+      const response = await requestInstance();
       if (!win.isConnected || response.instance.revision < instance.revision) return;
       snapshot = response.instance;
     }
@@ -276,6 +303,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         at.textContent = date(event.atMs);
         item.append(description, at);
         if (event.kind === 'service_result' && event.data.outputs !== undefined) item.append(jsonSection(text('actual_outputs'), event.data.outputs, false));
+        if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
       }
       afterSeq = response.nextSeq;
@@ -295,8 +323,8 @@ export async function openProcessInstance(instanceId, initial = null) {
       if (!win.isConnected) return;
       await acceptSnapshot(response.instance);
       if (historyEnded) await loadHistory();
-    } catch (error) { showError(win, error); mutation = false; await refresh(); }
-    finally { mutation = false; host.removeAttribute('inert'); }
+    } catch (error) { showError(win, error); }
+    finally { mutation = false; host.removeAttribute('inert'); await refresh(); }
   }
 
   async function complete(summary) {
@@ -308,6 +336,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       task = response.task;
     } catch (error) { showError(win, error); return; }
     if (!task.canComplete || task.status !== 'Open') { await refresh(); return; }
+    selectedUserTaskId = task.userTaskId;
     let revision = instance.revision;
     const outputs = jsonSection(text(task.kind === 'Verification' ? 'actual_outputs' : 'outputs'), task.outputs, task.kind !== 'Verification');
     const approval = document.createElement('div');
@@ -318,14 +347,14 @@ export async function openProcessInstance(instanceId, initial = null) {
       note: { text: text(task.kind === 'Verification' ? 'review_hint' : 'work_hint') },
       sections: [outputs, approval], submitLabel: text('complete_work'),
       validate: () => task.kind === 'Verification' || validateJson(outputs),
-      canSubmit: () => available && win.isConnected && instance.userTasks.some((current) => current.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open')
+      canSubmit: () => available && win.isConnected && [instance.selectedUserTask, ...instance.userTasks].some((current) => current?.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open')
         && (task.kind !== 'Verification' || approval.querySelector('tf-select').value !== ''),
       collect: () => ({ instanceId, userTaskId: task.userTaskId, expectedRevision: revision,
         outputs: task.kind === 'Verification' ? {} : outputs.jsonValue, approved: task.kind === 'Verification' ? approval.querySelector('tf-select').value === 'true' : null }),
       onSubmit: async (payload) => {
         try {
           const response = await ApiBinary.one('processUserTaskCompleteRequest', command(payload));
-          if (win.isConnected) { await acceptSnapshot(response.instance); if (historyEnded) await loadHistory(); }
+          if (win.isConnected) { await acceptSnapshot(response.instance); await refresh(); if (historyEnded) await loadHistory(); }
           return { message: text('work_completed') };
         } catch (error) {
           if (error.code === 'BadRequest') { await refresh(); revision = instance.revision; }
@@ -334,7 +363,29 @@ export async function openProcessInstance(instanceId, initial = null) {
       },
     });
     workWindows.add(workWindow);
-    workWindow.addEventListener('closed', () => workWindows.delete(workWindow), { once: true });
+    workWindow.addEventListener('closed', () => { workWindows.delete(workWindow); if (selectedUserTaskId === task.userTaskId) selectedUserTaskId = null; }, { once: true });
+  }
+
+  function renderPageControls(container, name) {
+    container.querySelector('[data-page-controls]')?.remove();
+    const info = instance.pages[name];
+    const controls = document.createElement('div');
+    controls.className = 'fb-process-page';
+    controls.dataset.pageControls = name;
+    controls.innerHTML = `<span>${escapeHtml(text('page_position', { first: info.total ? info.offset + 1 : 0,
+      last: Math.min(info.offset + pageSpecs[name].limit, info.total), total: info.total }))}</span>
+      <tf-button variant="secondary" data-page-prev ${info.offset === 0 ? 'disabled' : ''}>${escapeHtml(text('previous_page'))}</tf-button>
+      <tf-button variant="secondary" data-page-next ${info.hasMore ? '' : 'disabled'}>${escapeHtml(text('next_page'))}</tf-button>`;
+    controls.querySelector('[data-page-prev]').addEventListener('click', () => {
+      pageSpecs[name].offset = Math.max(0, info.offset - pageSpecs[name].limit);
+      refresh();
+    });
+    controls.querySelector('[data-page-next]').addEventListener('click', () => {
+      if (!info.hasMore) return;
+      pageSpecs[name].offset = info.nextOffset;
+      refresh();
+    });
+    container.append(controls);
   }
 
   function render() {
@@ -343,7 +394,9 @@ export async function openProcessInstance(instanceId, initial = null) {
     host.querySelector('[data-summary]').innerHTML = `<div class="fb-process-summary"><h2>${escapeHtml(instance.definitionName)}</h2>
       <tf-chip status="${tone(instance.status)}">${escapeHtml(processStatusLabel(instance.status))}</tf-chip>
       <span>${escapeHtml(text('version_number', { version: instance.version }))}</span>
+      ${instance.canSendMessage && instance.messageNames.length ? `<tf-button variant="secondary" icon="mail" data-send-instance>${escapeHtml(text('send_message'))}</tf-button>` : ''}
       ${instance.canCancel ? `<tf-button variant="danger" icon="x" data-cancel>${escapeHtml(text('cancel_instance'))}</tf-button>` : ''}</div>`;
+    host.querySelector('[data-send-instance]')?.addEventListener('click', () => openProcessMessageSend({ Catch: { definitionId: instance.definitionId, instanceId, subscriptionId: null } }, instance.messageNames, () => refresh()));
     host.querySelector('[data-cancel]')?.addEventListener('click', async () => {
       const approved = await customElements.get('tf-window').confirm({ title: text('cancel_instance'), message: text('cancel_hint'), danger: true, confirmLabel: text('cancel_instance') });
       if (approved && win.isConnected) await applyMutation('processInstanceCancelRequest', { instanceId, expectedRevision: instance.revision }, cancelCommand);
@@ -358,22 +411,72 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.querySelector('[data-complete]')?.addEventListener('click', () => complete(task));
       work.appendChild(row);
     }
+    renderPageControls(work, 'userTasks');
     const incidents = host.querySelector('[data-incidents]');
     incidents.innerHTML = instance.incidents.length ? `<h3>${escapeHtml(text('incidents'))}</h3>` : '';
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p></div>
+        <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
+      row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
       row.querySelector('[data-retry]')?.addEventListener('click', async () => {
+        selectedIncidentId = incident.incidentId;
         const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
         if (approved && win.isConnected) await applyMutation('processJobRetryRequest', { instanceId, jobId: incident.jobId, expectedRevision: instance.revision }, retryCommand);
       });
       incidents.appendChild(row);
     }
+    if (instance.selectedIncident) {
+      const { incident, resolvedAtMs } = instance.selectedIncident;
+      const detail = document.createElement('div');
+      detail.className = 'fb-process-work';
+      detail.dataset.selectedIncident = incident.incidentId;
+      detail.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || incident.nodeId)}</strong>
+        <p>${escapeHtml(incident.code)} · ${escapeHtml(incident.message)}</p>
+        ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
+        <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
+      detail.querySelector('[data-close-incident]').addEventListener('click', () => { selectedIncidentId = null; refresh(); });
+      incidents.append(detail);
+    }
+    renderPageControls(incidents, 'incidents');
     host.querySelector('[data-variables]').replaceChildren(jsonSection(text('current_variables'), instance.variables, false));
-    host.querySelector('[data-timer-section]').hidden = !instance.timers?.length;
+    host.querySelector('[data-timer-section]').hidden = !instance.timers?.length && !instance.pages.timers.total;
     renderTimers(host.querySelector('[data-timers]'), instance.timers || []);
+    renderPageControls(host.querySelector('[data-timer-section]'), 'timers');
+    const subscriptions = host.querySelector('[data-subscription-rows]');
+    subscriptions.replaceChildren();
+    for (const subscription of instance.subscriptions) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.dataset.subscriptionId = subscription.subscriptionId;
+      row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || subscription.nodeId)}</strong><p>${escapeHtml(subscription.messageName || subscription.errorCode || text('element_unavailable'))} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
+        <p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p><p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
+      subscriptions.append(row);
+    }
+    renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
+    const races = host.querySelector('[data-race-rows]');
+    races.replaceChildren();
+    for (const race of instance.eventRaces) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.innerHTML = `<div><strong>${escapeHtml(race.gatewayName || race.gatewayNodeId)}</strong><p>${escapeHtml(text(`race_status_${race.status.toLowerCase()}`))}${race.winnerNodeId ? ` · ${escapeHtml(text('race_winning_element_id'))}: ${escapeHtml(race.winnerNodeId)}` : ''}</p></div>`;
+      races.append(row);
+    }
+    renderPageControls(host.querySelector('[data-event-races]'), 'eventRaces');
+    const outgoing = host.querySelector('[data-outgoing-rows]');
+    outgoing.replaceChildren();
+    for (const message of instance.outgoingMessages) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.dataset.messageId = message.messageId;
+      row.innerHTML = `<div><strong>${escapeHtml(message.messageName)}</strong><p>${escapeHtml(text(`message_status_${message.status.toLowerCase()}`))} · ${escapeHtml(message.correlationKey)}</p><p>${escapeHtml(message.messageId)}</p></div>
+        <tf-button variant="secondary" data-message-detail>${escapeHtml(text('message_detail'))}</tf-button>`;
+      row.querySelector('[data-message-detail]').addEventListener('click', () => openProcessMessageDetail(message, refresh));
+      outgoing.append(row);
+    }
+    renderPageControls(host.querySelector('[data-outgoing]'), 'outgoingMessages');
   }
 
   async function refresh() {
@@ -381,7 +484,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     refreshing = true;
     const generation = ++readGeneration;
     try {
-      const response = await ApiBinary.one('processInstanceGetRequest', { instanceId });
+      const response = await requestInstance();
       if (!win.isConnected || generation !== readGeneration) return;
       host.querySelectorAll('[data-cancel], [data-complete], [data-retry]').forEach((control) => control.removeAttribute('disabled'));
       await acceptSnapshot(response.instance);
@@ -415,9 +518,9 @@ export function openProcessRun(definition, versions) {
   const variables = jsonSection(text('initial_variables'), definition.model.variables);
   const command = processCommand();
   return openFormWindow({ title: text('run'), icon: 'play', subject: definition.name,
-    note: { text: text(processHasTimerStart(definition.model) ? 'timer_start_manual_hint' : 'run_hint') }, sections: [selection, variables], submitLabel: text('run'),
+    note: { text: text(processHasTimerStart(definition.model) ? 'timer_start_manual_hint' : processHasMessageStart(definition.model) ? 'message_start_manual_hint' : 'run_hint') }, sections: [selection, variables], submitLabel: text('run'),
     validate: () => validateJson(variables, true),
-    canSubmit: () => versions.length > 0 && !definition.archived && !processHasTimerStart(definition.model),
+    canSubmit: () => versions.length > 0 && !definition.archived && !processHasTimerStart(definition.model) && !processHasMessageStart(definition.model),
     collect: () => ({ definitionId: definition.definitionId, version: Number(selection.querySelector('tf-select').value), variables: variables.jsonValue }),
     onSubmit: async (payload) => {
       const response = await ApiBinary.one('processInstanceStartRequest', command(payload));
@@ -433,6 +536,245 @@ export function openProcessVariables(value, onSave) {
     validate: () => validateJson(section, true), collect: () => section.jsonValue,
     onSubmit: async (values) => { onSave(values); return { message: text('variables_updated') }; },
   });
+}
+
+export function openProcessDeclarations(model, readOnly, onSave) {
+  const section = document.createElement('section');
+  section.className = 'fb-process-declarations';
+  section.innerHTML = `<tf-textarea data-declaration-namespace label="${escapeAttr(text('target_namespace'))}" value="${escapeAttr(model.targetNamespace || '')}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+    <h3>${escapeHtml(text('message_declarations'))}</h3><div data-message-rows></div>
+    ${readOnly ? '' : `<tf-button variant="secondary" data-add-message>${escapeHtml(text('add_message_declaration'))}</tf-button>`}
+    <h3>${escapeHtml(text('error_declarations'))}</h3><div data-error-rows></div>
+    ${readOnly ? '' : `<tf-button variant="secondary" data-add-error>${escapeHtml(text('add_error_declaration'))}</tf-button>`}
+    <tf-alert data-declaration-error tone="danger" hidden></tf-alert>`;
+  const addRow = (kind, declaration) => {
+    const row = document.createElement('div');
+    row.className = 'fb-declaration-row';
+    row.dataset.declarationKind = kind;
+    const message = kind === 'message';
+    row.innerHTML = `<tf-textarea data-declaration-id label="${escapeAttr(text(message ? 'message_declaration_id' : 'error_declaration_id'))}" value="${escapeAttr(message ? declaration.messageId : declaration.errorId)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+      <tf-textarea data-declaration-name label="${escapeAttr(text('declaration_name'))}" value="${escapeAttr(declaration.name)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+      ${message ? '' : `<tf-textarea data-declaration-code label="${escapeAttr(text('error_code'))}" value="${escapeAttr(declaration.errorCode)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>`}
+      ${readOnly ? '' : `<tf-button variant="ghost" wrap data-remove-declaration>${escapeHtml(text('remove_declaration'))}</tf-button>`}`;
+    section.querySelector(message ? '[data-message-rows]' : '[data-error-rows]').append(row);
+  };
+  (model.messages || []).forEach((item) => addRow('message', item));
+  (model.errors || []).forEach((item) => addRow('error', item));
+  section.addEventListener('click', (event) => {
+    if (readOnly) return;
+    if (event.target.closest('[data-add-message]')) addRow('message', { messageId: `Message_${crypto.randomUUID().replaceAll('-', '_')}`, name: '' });
+    else if (event.target.closest('[data-add-error]')) addRow('error', { errorId: `Error_${crypto.randomUUID().replaceAll('-', '_')}`, name: '', errorCode: '' });
+    else event.target.closest('[data-remove-declaration]')?.closest('.fb-declaration-row')?.remove();
+  });
+  const collect = () => {
+    const rows = (kind) => Array.from(section.querySelectorAll(`[data-declaration-kind="${kind}"]`)).map((row) => {
+      const id = row.querySelector('[data-declaration-id]').value;
+      const name = row.querySelector('[data-declaration-name]').value;
+      return kind === 'message' ? { messageId: id, name } : { errorId: id, name, errorCode: row.querySelector('[data-declaration-code]').value };
+    });
+    return { messages: rows('message'), errors: rows('error'), targetNamespace: section.querySelector('[data-declaration-namespace]').value || null };
+  };
+  return openFormWindow({ title: text('declarations'), icon: 'mail', width: 720, sections: [section],
+    submitLabel: text('apply'), canSubmit: () => !readOnly, collect,
+    onSubmit: async (declarations) => { onSave(declarations); return { message: text('declarations_updated') }; },
+  });
+}
+
+export function openProcessMessageSend(target, names, onSent = () => {}) {
+  const section = document.createElement('section');
+  section.className = 'fb-process-message-form';
+  section.innerHTML = `<tf-select data-message-name wrap-selected label="${escapeAttr(text('message_name'))}">${names.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join('')}</tf-select>
+    <tf-textarea data-message-key label="${escapeAttr(text('message_correlation_key'))}" autogrow rows="2"></tf-textarea>
+    <tf-input data-message-ttl type="number" min="1" max="604800" step="1" value="3600" label="${escapeAttr(text('message_ttl'))}"></tf-input>
+    <div data-message-payload></div><tf-alert data-message-error tone="danger" hidden></tf-alert>`;
+  const payload = jsonSection(text('message_payload'), null);
+  section.querySelector('[data-message-payload]').append(payload);
+  const error = section.querySelector('[data-message-error]');
+  const command = processCommand();
+  let values;
+  let previousMessage = null;
+  let messageId = null;
+  return openFormWindow({ title: text('send_message'), icon: 'mail', width: 700, sections: [section], submitLabel: text('send_message'),
+    validate: () => {
+      error.hidden = true;
+      const name = section.querySelector('[data-message-name]').value;
+      const key = section.querySelector('[data-message-key]').value;
+      const ttl = Number(section.querySelector('[data-message-ttl]').value);
+      if (!names.includes(name) || !key || new TextEncoder().encode(key).length > 256 || /[\u0000-\u001f\u007f]/u.test(key) || !Number.isInteger(ttl) || ttl < 1 || ttl > 604800) {
+        error.setAttribute('message', text('message_invalid_send'));
+        error.hidden = false;
+        return false;
+      }
+      if (!validateJson(payload)) return false;
+      const message = { target, messageName: name, correlationKey: key, payload: payload.jsonValue, ttlSeconds: ttl };
+      const signature = JSON.stringify(message);
+      if (signature !== previousMessage) {
+        previousMessage = signature;
+        messageId = crypto.randomUUID();
+      }
+      values = { messageId, ...message };
+      return true;
+    },
+    collect: () => values,
+    onSubmit: async (message) => {
+      const response = await ApiBinary.one('processMessageSendRequest', command(message));
+      onSent(response.message);
+      return { message: text('message_sent_status', { status: text(`message_status_${response.message.status.toLowerCase()}`) }) };
+    },
+  });
+}
+
+export async function openProcessMessageDetail(summary, onChanged = () => {}) {
+  const win = readWindow(text('message_detail'), 'mail', 760);
+  const host = win.querySelector('[data-content]');
+  let current = summary;
+  const cancelCommand = processCommand();
+  const resolveCommand = processCommand();
+  let readGeneration = 0;
+  async function render({ clearErrorOnSuccess = false } = {}) {
+    const generation = ++readGeneration;
+    let response;
+    try {
+      response = await ApiBinary.one('processMessageGetRequest', { senderUserId: current.senderUserId, messageId: current.messageId });
+    } catch (error) {
+      if (win.isConnected && generation === readGeneration) {
+        host.replaceChildren();
+        current = { ...current, canResolve: false, canCancel: false, payloadAvailable: false };
+      }
+      throw error;
+    }
+    if (!win.isConnected || generation !== readGeneration) return;
+    current = response.message.message;
+    host.innerHTML = `<div class="fb-process-work"><div><h3>${escapeHtml(current.messageName)}</h3>
+      <p>${escapeHtml(text(`message_status_${current.status.toLowerCase()}`))} · ${escapeHtml(current.correlationKey)}</p>
+      <p>${escapeHtml(text('message_sender'))}: ${escapeHtml(current.senderUserId)}</p>
+      <p>${escapeHtml(text('message_id'))}: ${escapeHtml(current.messageId)}</p>
+      ${current.lastReason ? `<p>${escapeHtml(processLifecycleReasonText(current.lastReason))}</p>` : ''}</div></div>
+      <div data-message-payload></div><div class="fb-process-actions">
+      ${current.canResolve ? `<tf-button variant="secondary" data-resolve>${escapeHtml(text('resolve_message'))}</tf-button>` : ''}
+      ${current.canCancel ? `<tf-button variant="danger" data-cancel-message>${escapeHtml(text('cancel_message'))}</tf-button>` : ''}</div>`;
+    const payloadHost = host.querySelector('[data-message-payload]');
+    if (current.payloadAvailable) payloadHost.append(jsonSection(text('message_payload'), response.message.payload, false));
+    else payloadHost.textContent = text('message_payload_unavailable');
+    host.querySelector('[data-cancel-message]')?.addEventListener('click', async () => {
+      const approved = await customElements.get('tf-window').confirm({ title: text('cancel_message'), message: text('cancel_message_hint'), danger: true,
+        confirmLabel: text('cancel_message'), cancelLabel: I18n.t('common.cancel') });
+      if (!approved || !win.isConnected) return;
+      try {
+        const result = await ApiBinary.one('processMessageCancelRequest', cancelCommand({ messageId: current.messageId, expectedRevision: current.revision }));
+        current = result.message;
+        win.querySelector('[data-error]').hidden = true;
+        await render();
+        onChanged();
+      } catch (error) { showError(win, error); }
+    });
+    host.querySelector('[data-resolve]')?.addEventListener('click', () => {
+      const section = document.createElement('section');
+      section.className = 'fb-process-message-form';
+      const target = current.target.Catch;
+      section.innerHTML = `<tf-textarea data-resolve-instance label="${escapeAttr(text('message_target_instance'))}" value="${escapeAttr(target?.instanceId || '')}" autogrow rows="2"></tf-textarea>
+        <tf-select data-resolve-subscription wrap-selected label="${escapeAttr(text('message_subscription'))}"><option value="">${escapeHtml(text('choose_subscription'))}</option></tf-select>
+        <tf-button variant="secondary" data-load-subscriptions>${escapeHtml(text('load_subscriptions'))}</tf-button>
+        <tf-alert data-resolve-error tone="danger" hidden></tf-alert>`;
+      const errorHost = section.querySelector('[data-resolve-error]');
+      const select = section.querySelector('[data-resolve-subscription]');
+      const instanceControl = section.querySelector('[data-resolve-instance]');
+      let loadGeneration = 0;
+      instanceControl.addEventListener('input', () => {
+        loadGeneration += 1;
+        select.replaceChildren();
+        errorHost.hidden = true;
+      });
+      instanceControl.addEventListener('change', () => {
+        loadGeneration += 1;
+        select.replaceChildren();
+        errorHost.hidden = true;
+      });
+      section.querySelector('[data-load-subscriptions]').addEventListener('click', async () => {
+        const generation = ++loadGeneration;
+        select.replaceChildren();
+        const empty = document.createElement('option'); empty.value = ''; empty.textContent = text('choose_subscription'); select.append(empty);
+        const targetInstanceId = instanceControl.value;
+        if (!targetInstanceId) return;
+        try {
+          let offset = 0;
+          let more = true;
+          while (more) {
+            const result = await ApiBinary.one('processInstanceGetRequest', { instanceId: targetInstanceId,
+              pages: { subscriptions: { offset, limit: 20 } } });
+            if (generation !== loadGeneration || instanceControl.value !== targetInstanceId || !section.isConnected) return;
+            if (result.instance.definitionId !== target.definitionId) throw new Error(text('message_target_mismatch'));
+            for (const subscription of result.instance.subscriptions) {
+              if (subscription.status !== 'Open' || subscription.messageName !== current.messageName || subscription.correlationKey !== current.correlationKey) continue;
+              const option = document.createElement('option'); option.value = subscription.subscriptionId;
+              option.textContent = `${subscription.nodeName || subscription.nodeId} · ${subscription.subscriptionId}`;
+              select.append(option);
+            }
+            more = result.instance.pages.subscriptions.hasMore;
+            offset = result.instance.pages.subscriptions.nextOffset;
+          }
+          errorHost.hidden = true;
+        } catch (error) {
+          if (generation !== loadGeneration || instanceControl.value !== targetInstanceId || !section.isConnected) return;
+          errorHost.setAttribute('message', error.message);
+          errorHost.hidden = false;
+        }
+      });
+      openFormWindow({ title: text('resolve_message'), icon: 'mail', sections: [section], submitLabel: text('resolve_message'),
+        canSubmit: () => !!section.querySelector('[data-resolve-instance]').value && !!select.value,
+        collect: () => ({ messageId: current.messageId, expectedRevision: current.revision,
+          instanceId: section.querySelector('[data-resolve-instance]').value, subscriptionId: select.value }),
+        onSubmit: async (value) => {
+          const result = await ApiBinary.one('processMessageResolveRequest', resolveCommand(value));
+          current = result.message;
+          win.querySelector('[data-error]').hidden = true;
+          await render();
+          onChanged();
+          return { message: text('message_resolved') };
+        },
+      });
+    });
+    if (clearErrorOnSuccess) win.querySelector('[data-error]').hidden = true;
+  }
+  try { await render({ clearErrorOnSuccess: true }); } catch (error) { showError(win, error); }
+  const timer = setInterval(() => { render().catch((error) => showError(win, error)); }, 3000);
+  win.addEventListener('closed', () => { clearInterval(timer); readGeneration += 1; }, { once: true });
+  return win;
+}
+
+export async function openProcessMessages(definitionId = null, instanceId = null) {
+  const win = readWindow(text('messages'), 'mail');
+  const host = win.querySelector('[data-content]');
+  host.innerHTML = `<tf-table data-messages empty-message="${escapeAttr(text('messages_empty'))}" page-size="20" page="1">
+    <tf-column key="messageName" label="${escapeAttr(text('message_name'))}"></tf-column>
+    <tf-column key="statusLabel" label="${escapeAttr(text('status'))}"></tf-column>
+    <tf-column key="received" label="${escapeAttr(text('updated'))}"></tf-column></tf-table>`;
+  const table = host.querySelector('[data-messages]');
+  table.rowKey = 'messageId';
+  table.rowActionsKey = (row) => row.messageId;
+  table.rowActions = (_row, _index, selected) => {
+    const button = document.createElement('tf-button');
+    button.setAttribute('variant', 'secondary');
+    button.textContent = text('message_detail');
+    button.addEventListener('click', () => openProcessMessageDetail(selected(), load));
+    return button;
+  };
+  let offset = 0;
+  let generation = 0;
+  async function load() {
+    const current = ++generation;
+    try {
+      const response = await ApiBinary.one('processMessageListRequest', { definitionId, instanceId, offset, limit: 20 });
+      if (!win.isConnected || current !== generation) return;
+      table.setAttribute('total', String(response.total));
+      table.setAttribute('page', String(offset / 20 + 1));
+      table.rows = response.messages.map((message) => ({ ...message,
+        statusLabel: text(`message_status_${message.status.toLowerCase()}`), received: date(message.receivedAtMs) }));
+    } catch (error) { if (current === generation) showError(win, error); }
+  }
+  table.addEventListener('page-change', (event) => { offset = (event.detail.page - 1) * 20; load(); });
+  await load();
+  return win;
 }
 
 export function openProcessCalendar(calendar, pin, pinState, readOnly, onSave) {

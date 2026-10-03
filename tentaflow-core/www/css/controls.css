@@ -607,6 +607,37 @@ tf-window [slot="footer"] {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.tf-select-selected { display: none; }
+.tf-select-wrap--wrap-selected > .tf-select-selected {
+  display: block;
+  box-sizing: border-box;
+  min-height: 40px;
+  padding: 10px 38px 10px 14px;
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  color: var(--tf-text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+.tf-select-wrap--wrap-selected > .tf-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+}
+.tf-select-wrap--wrap-selected:hover > .tf-select-selected { border-color: var(--tf-border-hover); }
+.tf-select-wrap--wrap-selected:focus-within > .tf-select-selected {
+  border-color: var(--tf-accent-1);
+  background: var(--tf-bg-card);
+  box-shadow: var(--tf-glow-accent);
+}
+tf-select[disabled] .tf-select-wrap--wrap-selected > .tf-select-selected { opacity: 0.5; }
 
 /* =============================================================================
    tf-toggle
@@ -625,6 +656,20 @@ tf-window [slot="footer"] {
   padding: 2px;
   flex-shrink: 0;
   overflow: hidden;
+}
+tf-toggle[label]:not([label=""]) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  max-width: 100%;
+  min-width: 0;
+  vertical-align: middle;
+}
+tf-toggle[label]:not([label=""]) .tf-toggle__label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  cursor: pointer;
 }
 .tf-toggle::after {
   content: '';
@@ -2104,6 +2149,7 @@ tf-menu[open] .tf-menu-item.disabled {
   font-size: 13px;
   font-weight: 700;
   line-height: 1.5;
+  padding-inline-end: 1px;
   color: var(--tf-text);
   white-space: nowrap;
   overflow: hidden;
@@ -3847,6 +3893,25 @@ tf-keyvalue-editor {
 .tf-kve-key,
 .tf-kve-value {
   min-width: 0;
+}
+.tf-kve--multiline .tf-kve-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.tf-kve--multiline .tf-kve-key,
+.tf-kve--multiline .tf-kve-value {
+  grid-column: 1;
+  width: 100%;
+}
+.tf-kve--multiline .tf-kve-key { grid-row: 1; }
+.tf-kve--multiline .tf-kve-value { grid-row: 2; }
+.tf-kve--multiline .tf-kve-row > [data-action="remove-row"] {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  align-self: start;
+}
+.tf-kve--multiline .tf-textarea {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* =============================================================================

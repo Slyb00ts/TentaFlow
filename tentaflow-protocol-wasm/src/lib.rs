@@ -12968,7 +12968,7 @@ fn process_json_to_js(value: &serde_json::Value, opaque: bool) -> JsValue {
             for (key, value) in values {
                 let dynamic = matches!(
                     key.as_str(),
-                    "variables" | "outputs" | "data" | "input_mapping" | "output_mapping"
+                    "variables" | "outputs" | "data" | "payload" | "input_mapping" | "output_mapping"
                 );
                 let out_key = if opaque {
                     key.clone()
@@ -12995,7 +12995,7 @@ fn decode_process_payload(
             if let Some((name, serde_json::Value::Object(fields))) = map.into_iter().next() {
                 set(obj, "variant", format!("Process{name}").into());
                 for (key, value) in fields {
-                    let dynamic = matches!(key.as_str(), "variables" | "outputs" | "data");
+                    let dynamic = matches!(key.as_str(), "variables" | "outputs" | "data" | "payload");
                     set(
                         obj,
                         &snake_key_to_camel(&key),
@@ -25882,6 +25882,38 @@ mod process_wire_tests {
         assert_eq!(body, MessageBody::ProcessBody(
             tentaflow_protocol::processes::ProcessPayload::DefinitionListRequest { offset: 10, limit: 25 }
         ));
+    }
+
+    #[test]
+    fn process_request_encoder_preserves_message_target_and_opaque_payload() {
+        let bytes = encode_process_request(
+            "MessageSendRequest".into(),
+            serde_json::json!({
+                "command_id": "command-1",
+                "message_id": "message-1",
+                "target": {"Catch": {
+                    "definition_id": "definition-1",
+                    "instance_id": "instance-1",
+                    "subscription_id": null
+                }},
+                "message_name": "order.received",
+                "correlation_key": "case-1",
+                "payload": {"customer_ID": {"attached_to_id": null}},
+                "ttl_seconds": 60
+            }).to_string(),
+        ).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(tentaflow_protocol::processes::ProcessPayload::MessageSendRequest {
+            target, payload, ..
+        }) = body else {
+            panic!("typed message send request expected");
+        };
+        assert_eq!(target, tentaflow_protocol::processes::ProcessMessageTarget::Catch {
+            definition_id: "definition-1".into(),
+            instance_id: Some("instance-1".into()),
+            subscription_id: None,
+        });
+        assert_eq!(payload["customer_ID"]["attached_to_id"], serde_json::Value::Null);
     }
 
     #[test]

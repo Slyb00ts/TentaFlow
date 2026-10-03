@@ -1,14 +1,14 @@
 // =============================================================================
 // File: tf-keyvalue-editor.js
 // Description: <tf-keyvalue-editor> — editable list of string key -> string
-//       value pairs, rendered as repeatable rows (tf-input key, tf-input
-//       value, tf-button remove) plus a trailing tf-button to add a row.
+//       value pairs, rendered as repeatable rows (tf-input or tf-textarea
+//       for key and value, tf-button remove) plus a trailing add button.
 //       Light DOM (no Shadow DOM) so controls.css styles it like every other
 //       tf-* primitive. Built for the generic node-config-form renderer's
 //       JSON-schema `type: "object"` arm (additionalProperties: string), but
 //       carries no flow-builder-specific knowledge — labels/placeholders are
 //       supplied by the caller via attributes, same as <tf-tag-input>.
-//       Attributes: disabled, key-placeholder, value-placeholder, add-label,
+//       Attributes: disabled, multiline, key-placeholder, value-placeholder, add-label,
 //       remove-label.
 //       Property: .value — plain object, e.g. {"content-type": "text/plain"}.
 //       Rows with an empty key or an empty value are dropped from `.value`
@@ -22,11 +22,12 @@
 // =============================================================================
 
 import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
 import '/js/components/tf-button.js';
 
 class TfKeyvalueEditor extends HTMLElement {
   static get observedAttributes() {
-    return ['disabled', 'key-placeholder', 'value-placeholder', 'add-label', 'remove-label'];
+    return ['disabled', 'multiline', 'key-placeholder', 'value-placeholder', 'add-label', 'remove-label'];
   }
 
   constructor() {
@@ -47,7 +48,8 @@ class TfKeyvalueEditor extends HTMLElement {
 
   attributeChangedCallback(name, oldVal, newVal) {
     if (oldVal === newVal || !this._wrap) return;
-    if (name === 'disabled' || name === 'key-placeholder' || name === 'value-placeholder') {
+    if (name === 'disabled' || name === 'multiline' || name === 'key-placeholder' || name === 'value-placeholder') {
+      this._rows = this._readLiveRows();
       this._renderRows();
     } else if (name === 'add-label') {
       this._updateAddButton();
@@ -105,6 +107,8 @@ class TfKeyvalueEditor extends HTMLElement {
     this.addEventListener('change', (ev) => {
       const field = ev.target?.dataset?.field;
       if (field !== 'key' && field !== 'value') return;
+      // Only the object-valued editor event may reach callers.
+      ev.stopImmediatePropagation();
       this._rows = this._readLiveRows();
       this._emitChange();
     });
@@ -155,26 +159,36 @@ class TfKeyvalueEditor extends HTMLElement {
 
   _renderRows() {
     const disabled = this.disabled;
+    const multiline = this.hasAttribute('multiline');
     const keyPh = this.getAttribute('key-placeholder') || '';
     const valPh = this.getAttribute('value-placeholder') || '';
     const removeLabel = this.getAttribute('remove-label') || '';
 
+    this._wrap.classList.toggle('tf-kve--multiline', multiline);
     this._list.innerHTML = '';
     this._rows.forEach((row, idx) => {
       const rowEl = document.createElement('div');
       rowEl.className = 'tf-kve-row';
       rowEl.dataset.idx = String(idx);
 
-      const keyInput = document.createElement('tf-input');
-      keyInput.setAttribute('type', 'text');
+      const keyInput = document.createElement(multiline ? 'tf-textarea' : 'tf-input');
+      if (multiline) {
+        keyInput.setAttribute('autogrow', '');
+        keyInput.setAttribute('rows', '1');
+        if (keyPh) keyInput.setAttribute('aria-label', keyPh);
+      } else keyInput.setAttribute('type', 'text');
       keyInput.className = 'tf-kve-key';
       keyInput.dataset.field = 'key';
       if (keyPh) keyInput.setAttribute('placeholder', keyPh);
       if (disabled) keyInput.setAttribute('disabled', '');
       keyInput.value = row.key;
 
-      const valInput = document.createElement('tf-input');
-      valInput.setAttribute('type', 'text');
+      const valInput = document.createElement(multiline ? 'tf-textarea' : 'tf-input');
+      if (multiline) {
+        valInput.setAttribute('autogrow', '');
+        valInput.setAttribute('rows', '1');
+        if (valPh) valInput.setAttribute('aria-label', valPh);
+      } else valInput.setAttribute('type', 'text');
       valInput.className = 'tf-kve-value';
       valInput.dataset.field = 'value';
       if (valPh) valInput.setAttribute('placeholder', valPh);

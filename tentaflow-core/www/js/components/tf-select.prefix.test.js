@@ -11,6 +11,10 @@ import '../sdk-runtime/_dom-test-harness.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+const { window } = await import('../sdk-runtime/_dom-test-harness.js');
+if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver) {
+  globalThis.MutationObserver = window.MutationObserver;
+}
 const { TfSelect } = await import('./tf-select.js');
 
 function mount(attrs = {}) {
@@ -55,4 +59,44 @@ test('without prefix or dot the field is unchanged', () => {
   el.setAttribute('prefix', 'Instancja');
   el.removeAttribute('prefix');
   assert.equal(el.querySelector('select').hasAttribute('aria-label'), false, 'the caption name goes with the caption');
+});
+
+test('wrapped caption follows the real native selection, options, and disabled state', async () => {
+  const longName = 'Customer approval and archival notification '.repeat(7) + '· Message_CustomerApproval';
+  const el = mount({ 'wrap-selected': '', label: 'Message declaration' });
+  el.setOptions([{ value: 'long', label: longName }, { value: 'short', label: 'Validation error' }], 'long');
+  const native = el.querySelector('select');
+  const caption = el.querySelector('.tf-select-selected');
+  assert.equal(el.querySelector('.tf-select-wrap').classList.contains('tf-select-wrap--wrap-selected'), true);
+  assert.equal(caption.getAttribute('aria-hidden'), 'true');
+  assert.equal(caption.textContent, longName);
+  assert.equal(native.value, 'long');
+  assert.equal(native.getAttribute('aria-label'), 'Message declaration');
+  el.focus();
+  assert.equal(document.activeElement, native);
+
+  const changes = [];
+  el.addEventListener('change', (event) => changes.push(event.detail.value));
+  native.value = 'short';
+  native.dispatchEvent(new Event('change', { bubbles: true }));
+  assert.deepEqual(changes, ['short']);
+  assert.equal(el.value, 'short');
+  assert.equal(caption.textContent, 'Validation error');
+
+  el.setOptions([{ value: 'new', label: 'Changed declaration · Message_New' }], 'new');
+  assert.equal(caption.textContent, 'Changed declaration · Message_New');
+  const appended = document.createElement('option');
+  appended.value = 'async';
+  appended.textContent = 'Asynchronously loaded declaration · Message_Async';
+  el.append(appended);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  el.value = 'async';
+  assert.equal(native.value, 'async');
+  assert.equal(caption.textContent, appended.textContent);
+
+  el.setAttribute('disabled', '');
+  assert.equal(native.disabled, true);
+  el.removeAttribute('wrap-selected');
+  assert.equal(el.querySelector('.tf-select-wrap').classList.contains('tf-select-wrap--wrap-selected'), false);
+  assert.equal(native.value, 'async');
 });

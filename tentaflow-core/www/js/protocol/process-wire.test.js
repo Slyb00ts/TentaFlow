@@ -67,6 +67,115 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
   assert.equal(Object.hasOwn(body.model.nodes[1].kind.ServiceTask, 'timeout_seconds'), false);
 });
 
+test('message model and send wire keep typed structure and opaque business keys', { skip }, () => {
+  const model = { schemaVersion: 1, processId: 'P_1', targetNamespace: 'urn:example:orders',
+    messages: [{ messageId: 'Message_1', name: 'order.received' }],
+    errors: [{ errorId: 'Error_1', name: 'Bad order', errorCode: 'BUSINESS.BAD' }],
+    nodes: [
+      { id: 'Start_1', name: 'Start', kind: { MessageStart: {
+        messageRef: 'Message_1', outputMapping: { customer_ID: 'outputs.customer_ID' },
+      } } },
+      { id: 'Service_1', name: 'Check', kind: { ServiceTask: {
+        flowId: 'flow', inputMapping: { attached_to_id: 'vars.customer_ID' }, outputMapping: {},
+        verification: 'Human', timeoutSeconds: 60, resultExpression: 'vars.result',
+      } } },
+      { id: 'Boundary_1', name: 'Error', kind: { BoundaryError: {
+        attachedToId: 'Service_1', errorRef: 'Error_1', outputMapping: {},
+      } } },
+      { id: 'End_1', name: 'End', kind: 'End' },
+    ], sequenceFlows: [], variables: { customer_ID: { attached_to_id: 'kept' } },
+    diagram: { shapes: [], edges: [] },
+  };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Orders', description: '', model });
+  assert.equal(saved.model.targetNamespace, 'urn:example:orders');
+  assert.equal(saved.model.messages[0].messageId, 'Message_1');
+  assert.equal(saved.model.errors[0].errorCode, 'BUSINESS.BAD');
+  assert.deepEqual(saved.model.variables, model.variables);
+  assert.deepEqual(saved.model.nodes[0].kind.MessageStart.outputMapping, { customer_ID: 'outputs.customer_ID' });
+  assert.equal(saved.model.nodes[1].kind.ServiceTask.resultExpression, 'vars.result');
+  const sent = request('processMessageSendRequest', { commandId: 'cmd', messageId: 'msg',
+    target: { Catch: { definitionId: 'definition', instanceId: 'instance', subscriptionId: null } },
+    messageName: 'order.received', correlationKey: 'case-1',
+    payload: { customer_ID: { attached_to_id: null } }, ttlSeconds: 60 });
+  assert.equal(sent.target.Catch.instanceId, 'instance');
+  assert.deepEqual(sent.payload, { customer_ID: { attached_to_id: null } });
+  assert.throws(() => codec.encode.processDefinitionSaveRequest(17, { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Orders', description: '', model: { ...model,
+      nodes: [{ ...model.nodes[0], kind: { MessageStart: { messageRef: 'Message_1', outputMapping: {}, hidden: true } } }] } }),
+  /unsupported message start field/);
+});
+
+test('instance pages encode exact selectors and message detail preserves null availability', { skip }, () => {
+  const body = request('processInstanceGetRequest', { instanceId: 'instance', pages: {
+    userTasks: { offset: 20, limit: 20 }, subscriptions: { offset: 0, limit: 2 },
+    selectedUserTaskId: 'task-1', selectedIncidentId: 'incident-1',
+  } });
+  assert.equal(body.pages.userTasks.offset, 20);
+  assert.equal(body.pages.subscriptions.limit, 2);
+  assert.equal(body.pages.selectedUserTaskId, 'task-1');
+  assert.equal(body.pages.selectedIncidentId, 'incident-1');
+  const message = { message_id: 'msg', sender_user_id: 'user', origin: 'Api',
+    target: { Start: { definition_id: 'def' } }, message_name: 'order.received', correlation_key: 'key',
+    revision: 1, status: 'Delivered', received_at_ms: 1, expires_at_ms: 2, updated_at_ms: 2,
+    delivered_at_ms: 2, matched_instance_id: 'inst', matched_version: 1, matched_subscription_id: null,
+    source_instance_id: null, source_node_id: null, last_reason: null, payload_sha256: 'sha',
+    payload_bytes: 4, payload_available: true, can_resolve: false, can_cancel: false };
+  const availableNull = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    MessageGetResponse: { message: { message, payload: null } },
+  } })));
+  assert.equal(availableNull.message.message.payloadAvailable, true);
+  assert.equal(availableNull.message.payload, null);
+  const unavailable = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    MessageGetResponse: { message: { message: { ...message, payload_available: false } } },
+  } })));
+  assert.equal(unavailable.message.message.payloadAvailable, false);
+  assert.equal(unavailable.message.payload, undefined);
+  const nested = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    MessageGetResponse: { message: { message, payload: { customer_ID: { attached_to_id: 1 } } } },
+  } })));
+  assert.deepEqual(nested.message.payload, { customer_ID: { attached_to_id: 1 } });
+});
+
+test('instance response decodes required empty and populated message collections', { skip }, () => {
+  const base = {
+    instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval',
+    initiator_user_id: 'u1', version: 1, revision: 1, status: 'Running',
+    variables: { business_key: 'kept' }, active_node_ids: [], user_tasks: [], incidents: [],
+    created_at_ms: 1, updated_at_ms: 1, can_cancel: true, can_retry: false,
+    can_send_message: true,
+  };
+  const decode = (instance) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance },
+  } })));
+  const populated = decode({ ...base,
+    subscriptions: [{ subscription_id: 's1', node_id: 'Wait_1', node_name: 'Wait', token_id: 't1',
+      kind: 'MessageCatch', status: 'Open', revision: 1, message_name: 'order.received',
+      correlation_key: 'case-1', error_code: null, attached_to_id: null, race_id: 'r1', last_reason: null }],
+    event_races: [{ race_id: 'r1', gateway_node_id: 'Race_1', gateway_name: 'First arrival',
+      status: 'Open', revision: 1, winner_node_id: null,
+      branch_subscription_ids: ['s1'], branch_timer_ids: [] }],
+    outgoing_messages: [{ message_id: 'm1', sender_user_id: 'u1', origin: 'Api',
+      target: { Start: { definition_id: 'd2' } }, message_name: 'order.received',
+      correlation_key: 'case-1', revision: 1, status: 'Pending', received_at_ms: 1,
+      expires_at_ms: 2, updated_at_ms: 1, delivered_at_ms: null, matched_instance_id: null,
+      matched_version: null, matched_subscription_id: null, source_instance_id: 'i1',
+      source_node_id: 'Throw_1', last_reason: null, payload_sha256: 'sha', payload_bytes: 4,
+      payload_available: false, can_resolve: false, can_cancel: false }],
+    message_names: ['order.received'],
+  });
+  assert.equal(populated.instance.subscriptions[0].subscriptionId, 's1');
+  assert.deepEqual(populated.instance.eventRaces[0].branchSubscriptionIds, ['s1']);
+  assert.equal(populated.instance.outgoingMessages[0].messageId, 'm1');
+  assert.deepEqual(populated.instance.messageNames, ['order.received']);
+  assert.deepEqual(populated.instance.variables, { business_key: 'kept' });
+  const empty = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [], message_names: [] });
+  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames']) {
+    assert.deepEqual(empty.instance[field], [], `${field} remains an array on an empty page`);
+  }
+  assert.equal(empty.instance.canSendMessage, true);
+});
+
 test('timer model wire preserves each typed rule and opaque variables', { skip }, () => {
   for (const timer of [
     { Date: { at: '2027-01-02T03:04:05+01:00' } },

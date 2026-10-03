@@ -10,12 +10,13 @@ import { Sfx } from '/js/lib/sfx.js';
 
 class TfToggle extends HTMLElement {
   static get observedAttributes() {
-    return ['checked', 'disabled', 'aria-label'];
+    return ['checked', 'disabled', 'aria-label', 'label'];
   }
 
   constructor() {
     super();
     this._root = null;
+    this._label = null;
     this._onClick = this._onClick.bind(this);
     this._onKey = this._onKey.bind(this);
   }
@@ -33,6 +34,12 @@ class TfToggle extends HTMLElement {
   set checked(v) {
     if (v) this.setAttribute('checked', '');
     else this.removeAttribute('checked');
+  }
+
+  get label() { return this.getAttribute('label') || ''; }
+  set label(v) {
+    if (v == null) this.removeAttribute('label');
+    else this.setAttribute('label', String(v));
   }
 
   _build() {
@@ -53,8 +60,22 @@ class TfToggle extends HTMLElement {
     this._root.classList.toggle('on', on);
     this._root.setAttribute('aria-checked', String(on));
     // The host is not the switch, so its accessible name has to be carried onto the element that is.
-    const name = this.getAttribute('aria-label');
+    const label = this.label;
+    if (label) {
+      if (!this._label) {
+        this._label = document.createElement('span');
+        this._label.className = 'tf-toggle__label';
+        this._label.addEventListener('click', this._onClick);
+        this.appendChild(this._label);
+      }
+      this._label.textContent = label;
+    } else if (this._label) {
+      this._label.remove();
+      this._label = null;
+    }
+    const name = this.getAttribute('aria-label') || label;
     if (name) this._root.setAttribute('aria-label', name);
+    else this._root.removeAttribute('aria-label');
     if (disabled) {
       this._root.setAttribute('aria-disabled', 'true');
       this._root.setAttribute('tabindex', '-1');

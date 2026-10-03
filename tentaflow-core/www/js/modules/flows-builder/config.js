@@ -17,7 +17,7 @@ import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
-import { processNodeKind } from './bpmn.js';
+import { processNodeKind, processBoundaryKind } from './bpmn.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -304,7 +304,15 @@ export class FlowConfig {
     const config = node.config;
     const disabled = this.readOnly ? 'disabled' : '';
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
-    const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
+    const textarea = (key, label, value, rows = 2) => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${disabled}></tf-textarea>`;
+    const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
+    const model = this.opts.getCanvas().processModel;
+    const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
+    const boundary = () => {
+      const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task'].includes(candidate.type) && (kind !== 'BoundaryError' || candidate.type === 'bpmn_service_task'));
+      const target = activities.find((candidate) => candidate.id === config.attachedToId);
+      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}">${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>`;
+    };
     let fields = `<tf-textarea data-process="name" label="${escapeAttr(I18n.t('bpmn.element_name'))}" value="${escapeAttr(node.label || '')}" autogrow rows="1" ${disabled}></tf-textarea>`;
     if (kind === 'UserTask') {
       const available = !config.assigneeUserId || this.opts.processOptions.assignees.some((user) => user.userId === config.assigneeUserId);
@@ -316,8 +324,9 @@ export class FlowConfig {
       const flows = this.opts.processOptions.serviceFlows;
       const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
-      fields += `<tf-select data-process="flowId" label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>
+      fields += `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>
         ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
+        ${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
         <tf-select data-process="verification" label="${escapeAttr(I18n.t('bpmn.verification'))}" value="${typeof config.verification === 'string' ? 'Human' : 'Condition'}" ${disabled}>
           <option value="Human">${escapeHtml(I18n.t('bpmn.verification_human'))}</option>
           <option value="Condition">${escapeHtml(I18n.t('bpmn.verification_condition'))}</option>
@@ -327,13 +336,7 @@ export class FlowConfig {
         ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
     } else if (kind === 'TimerStart' || kind === 'TimerCatch' || kind === 'BoundaryTimer') {
       if (kind === 'BoundaryTimer') {
-        const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task'].includes(candidate.type));
-        const target = activities.find((candidate) => candidate.id === config.attachedToId);
-        fields += `<tf-select data-process="attachedToId" label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}>
-          <option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>
-          ${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))}</option>`).join('')}
-          ${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable'))}</option>` : ''}
-        </tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>
+        fields += `${boundary()}
         <tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.boundary_mode_hint'))}</p>`;
       }
@@ -346,6 +349,24 @@ export class FlowConfig {
       else if (timerKind === 'Daily') fields += `<div class="fb-timer-clock">${input('timerHour', 'timer_hour', timer.hour, 'type="number" min="0" max="23" step="1"')}${input('timerMinute', 'timer_minute', timer.minute, 'type="number" min="0" max="59" step="1"')}</div><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_daily_hint'))}</p>`;
       if (timerKind === 'Cycle' || timerKind === 'Daily') fields += input('timerTotal', 'timer_total', timer.totalFirings, 'type="number" min="1" max="4294967295" step="1"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_total_hint'))}</p>`;
       fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : kind === 'BoundaryTimer' ? 'bpmn.boundary_timer_hint' : 'bpmn.timer_catch_hint'))}</p>`;
+    } else if (kind === 'MessageStart' || kind === 'MessageCatch' || kind === 'BoundaryMessage' || kind === 'MessageThrow' || kind === 'BoundaryError') {
+      if (processBoundaryKind(node.type)) fields += boundary();
+      if (kind === 'BoundaryMessage') fields += `<tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>`;
+      if (kind === 'BoundaryError') fields += declaration('errorRef', 'error_reference', model.errors, 'errorId', config.errorRef) + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.error_catch_all_hint'))}</p>`;
+      else fields += declaration('messageRef', 'message_reference', model.messages, 'messageId', config.messageRef);
+      if (kind === 'MessageCatch' || kind === 'BoundaryMessage' || kind === 'MessageThrow') fields += textarea('correlationExpression', 'correlation_expression', config.correlationExpression, 3);
+      if (kind === 'MessageThrow') {
+        const target = config.target || { Start: { definitionId: '' } };
+        const targetKind = Object.keys(target)[0];
+        fields += `<tf-select data-process="targetType" label="${escapeAttr(I18n.t('bpmn.message_target_type'))}" value="${escapeAttr(targetKind)}" ${disabled}><option value="Start">${escapeHtml(I18n.t('bpmn.message_target_start'))}</option><option value="Catch">${escapeHtml(I18n.t('bpmn.message_target_catch'))}</option></tf-select>`;
+        fields += `<tf-select data-process="targetDefinitionChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.message_target_choice'))}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_target_definition'))}</option></tf-select>
+          ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-targets>${escapeHtml(I18n.t('bpmn.load_target_definitions'))}</tf-button>`}
+          <p class="fb-field-hint" data-target-capability>${escapeHtml(I18n.t('bpmn.target_capability_hint'))}</p>`;
+        fields += textarea('targetDefinitionId', 'message_target_definition', target[targetKind]?.definitionId, 2);
+        if (targetKind === 'Catch') fields += textarea('instanceIdExpression', 'message_target_instance_expression', target.Catch.instanceIdExpression || '', 3) + textarea('subscriptionIdExpression', 'message_target_subscription_expression', target.Catch.subscriptionIdExpression || '', 3);
+        fields += textarea('payloadExpression', 'message_payload_expression', config.payloadExpression, 4) + input('ttlSeconds', 'message_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"');
+      }
+      if (kind !== 'MessageThrow') fields += mapping('outputMapping', 'output_mapping');
     } else if (kind === 'ExclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
@@ -364,12 +385,55 @@ export class FlowConfig {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
     fields += input('elementId', 'element_id', node.id, 'readonly');
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="secondary" icon="copy" data-process="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
     this.root.querySelectorAll('tf-keyvalue-editor').forEach((editor) => { editor.value = config[editor.dataset.process]; });
+    const loadTargets = this.root.querySelector('[data-load-targets]');
+    if (loadTargets) {
+      let offset = 0;
+      const choice = this.root.querySelector('[data-process="targetDefinitionChoice"]');
+      const capability = this.root.querySelector('[data-target-capability]');
+      loadTargets.addEventListener('click', async () => {
+        loadTargets.setAttribute('disabled', '');
+        try {
+          const page = await ApiBinary.one('processDefinitionListRequest', { offset, limit: 100 });
+          if (!this.root.contains(choice)) return;
+          for (const definition of page.definitions) {
+            const option = document.createElement('option'); option.value = definition.definitionId;
+            option.textContent = `${definition.name} · ${definition.definitionId}`;
+            choice.append(option);
+          }
+          offset += page.definitions.length;
+          loadTargets.hidden = !page.hasMore;
+        } catch (error) { capability.textContent = error.message; }
+        finally { loadTargets.removeAttribute('disabled'); }
+      });
+      choice.addEventListener('change', async () => {
+        if (!choice.value) return;
+        const target = node.config.target;
+        this.opts.onConfigChange(node.id, { target: { [Object.keys(target)[0]]: {
+          ...Object.values(target)[0], definitionId: choice.value,
+        } } });
+        this.root.querySelector('[data-process="targetDefinitionId"]').value = choice.value;
+        try {
+          const detail = await ApiBinary.one('processDefinitionGetRequest', { definitionId: choice.value });
+          if (!detail.definition.publishedVersion) { capability.textContent = I18n.t('bpmn.target_unpublished'); return; }
+          const published = await ApiBinary.one('processVersionGetRequest', { definitionId: choice.value, version: detail.definition.publishedVersion });
+          if (!this.root.contains(capability) || choice.value !== detail.definition.definitionId) return;
+          const publishedModel = published.version.model;
+          const names = publishedModel.nodes.flatMap((candidate) => {
+            if (typeof candidate.kind !== 'object') return [];
+            const [tag, body] = Object.entries(candidate.kind)[0];
+            if (!['MessageStart', 'MessageCatch', 'BoundaryMessage'].includes(tag)) return [];
+            return publishedModel.messages.filter((declaration) => declaration.messageId === body.messageRef).map((declaration) => declaration.name);
+          });
+          capability.textContent = `${I18n.t('bpmn.target_declared_names')}: ${[...new Set(names)].join(', ') || I18n.t('bpmn.none')}`;
+        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+      });
+    }
     const picker = this.root.querySelector('tf-person-picker');
     if (picker) {
       picker.items = this.opts.processOptions.assignees.map((user) => ({ id: user.userId, name: user.displayName }));
@@ -390,7 +454,7 @@ export class FlowConfig {
       else if (key === 'cancelActivity') {
         this.opts.onConfigChange(node.id, { cancelActivity: event.detail?.checked ?? control.checked });
       } else if (key === 'attachedToId') {
-        this.opts.onConfigChange(node.id, { attachedToId: control.value || null });
+        this.opts.onConfigChange(node.id, { attachedToId: control.value || (kind === 'BoundaryTimer' ? null : '') });
         const selected = canvas.nodes.find((candidate) => candidate.id === control.value);
         this.root.querySelector('[data-boundary-target]').textContent = selected
           ? (selected.label || getNodeName(selected.type)) : I18n.t('bpmn.boundary_required');
@@ -409,7 +473,21 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, { timer: { [timerKind]: { ...node.config.timer[timerKind], [field]: value } } });
         if (key === 'timerAt') this.root.querySelector('[data-timer-literal]').textContent = control.value;
       } else if (key === 'expression') this.opts.onConfigChange(node.id, { verification: { Condition: { expression: control.value } } });
-      else if (key !== 'elementId') this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
+      else if (key === 'targetType') {
+        const target = node.config.target;
+        this.opts.onConfigChange(node.id, { target: { [control.value]: control.value === 'Start'
+          ? { definitionId: Object.values(target)[0].definitionId }
+          : { definitionId: Object.values(target)[0].definitionId, instanceIdExpression: null, subscriptionIdExpression: null } } });
+        this._renderProcess();
+      } else if (['targetDefinitionId', 'instanceIdExpression', 'subscriptionIdExpression'].includes(key)) {
+        const target = node.config.target;
+        const targetKind = Object.keys(target)[0];
+        const field = key === 'targetDefinitionId' ? 'definitionId' : key;
+        this.opts.onConfigChange(node.id, { target: { [targetKind]: { ...target[targetKind], [field]: field === 'definitionId' ? control.value : control.value || null } } });
+      } else if (key === 'targetDefinitionChoice') {
+        return;
+      } else if (key === 'resultExpression' || key === 'errorRef') this.opts.onConfigChange(node.id, { [key]: control.value || null });
+      else if (key !== 'elementId') this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
       if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator');
     });
     const connect = this.root.querySelector('[data-connect]');

@@ -2853,6 +2853,17 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::JobRetryResponse { .. } => "ProcessJobRetryResponse",
                 P::HistoryRequest { .. } => "ProcessHistoryRequest",
                 P::HistoryResponse { .. } => "ProcessHistoryResponse",
+                P::MessageSendRequest { .. } => "ProcessMessageSendRequest",
+                P::MessageSendResponse { .. } => "ProcessMessageSendResponse",
+                P::MessageGetRequest { .. } => "ProcessMessageGetRequest",
+                P::MessageGetResponse { .. } => "ProcessMessageGetResponse",
+                P::MessageListRequest { .. } => "ProcessMessageListRequest",
+                P::MessageListResponse { .. } => "ProcessMessageListResponse",
+                P::MessageResolveRequest { .. } => "ProcessMessageResolveRequest",
+                P::MessageResolveResponse { .. } => "ProcessMessageResolveResponse",
+                P::MessageCancelRequest { .. } => "ProcessMessageCancelRequest",
+                P::MessageCancelResponse { .. } => "ProcessMessageCancelResponse",
+
             }
         }
         MessageBody::MapBody(p) => {

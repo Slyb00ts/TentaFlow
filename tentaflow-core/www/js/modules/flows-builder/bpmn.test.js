@@ -23,12 +23,12 @@ const { codecReady, encode } = await import('../../protocol/codec.js');
 const wasm = await codecReady;
 const { Router } = await import('../../router.js');
 const { TfWindow } = await import('../../components/tf-window.js');
-const { emptyProcessModel, processToCanvas, canvasToProcess, processCommand, processJson, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
+const { emptyProcessModel, processToCanvas, canvasToProcess, processBoundaryKind, processCommand, processJson, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
 const { processTemplates } = await import('./bpmn.js');
-const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessRun, openProcessSchedule, processEventText, processTimerReasonText, processTimerText } = await import('./process-monitor.js');
+const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { default: builder } = await import('../flows-builder.js');
 const { default: flows } = await import('../flows.js');
 localStorage.setItem('tentaflow_lang', 'en');
@@ -67,8 +67,13 @@ function definition(id = 'definition-one', overrides = {}) {
   return { definitionId: id, name: `Process ${id}`, description: '', ownerUserId: 'owner', draftRevision: 4, model: emptyProcessModel(), publishedVersion: null, archived: false, ...overrides };
 }
 function instance(id = 'instance-one', overrides = {}) {
-  return { instanceId: id, definitionId: 'definition-one', definitionName: 'Document approval', initiatorUserId: 'owner', version: 2, revision: 11,
-    status: 'Waiting', variables: { Purchase_ID: 'PO-7' }, activeNodeIds: ['Review'], userTasks: [], incidents: [], createdAtMs: 1000, updatedAtMs: 2000, canCancel: false, canRetry: false, ...overrides };
+  const value = { instanceId: id, definitionId: 'definition-one', definitionName: 'Document approval', initiatorUserId: 'owner', version: 2, revision: 11,
+    status: 'Waiting', variables: { Purchase_ID: 'PO-7' }, activeNodeIds: ['Review'], userTasks: [], incidents: [], timers: [],
+    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], canSendMessage: false,
+    createdAtMs: 1000, updatedAtMs: 2000, canCancel: false, canRetry: false, ...overrides };
+  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages'].map((name) =>
+    [name, { offset: 0, total: value[name].length, nextOffset: null, hasMore: false }]));
+  return value;
 }
 function fixtures(values) {
   responder = (kind, payload) => {
@@ -230,6 +235,147 @@ test('boundary moves with its activity once, cascades on delete and remaps clone
   graph.destroy();
 });
 
+test('message and error elements retain declarations, target expressions, attachment and DI through real canvas edits', async () => {
+  const model = emptyProcessModel();
+  model.targetNamespace = 'urn:example:orders';
+  model.messages = [{ messageId: 'Message_1', name: `order.received ${'Long declaration '.repeat(14)}<&>` }];
+  model.errors = [{ errorId: 'Error_1', name: 'Validation & retry', errorCode: 'BUSINESS.INVALID' }];
+  model.variables = { customer_ID: { attached_to_id: 'kept' } };
+  model.nodes.splice(1, 0,
+    { id: 'Task_1', name: 'Check', kind: { ServiceTask: { flowId: 'flow-one', inputMapping: { customer_ID: 'vars.customer_ID' },
+      outputMapping: {}, verification: 'Human', timeoutSeconds: 60, resultExpression: 'outputs.payload' } } },
+    { id: 'BoundaryMessage_1', name: 'Message', kind: { BoundaryMessage: { attachedToId: 'Task_1', cancelActivity: false,
+      messageRef: 'Message_1', correlationExpression: 'vars.customer_ID', outputMapping: { customer_ID: 'outputs.customer_ID' } } } },
+    { id: 'BoundaryError_1', name: 'Error', kind: { BoundaryError: { attachedToId: 'Task_1', errorRef: 'Error_1',
+      outputMapping: { customer_ID: 'activity_result.outputs.customer_ID' } } } },
+    { id: 'Gateway_1', name: 'First event', kind: 'EventBasedGateway' },
+    { id: 'Catch_1', name: 'Wait', kind: { MessageCatch: { messageRef: 'Message_1',
+      correlationExpression: 'vars.customer_ID', outputMapping: {} } } },
+    { id: 'Throw_1', name: 'Send', kind: { MessageThrow: { messageRef: 'Message_1',
+      target: { Catch: { definitionId: 'definition-one', instanceIdExpression: 'vars.instance_ID', subscriptionIdExpression: null } },
+      correlationExpression: 'vars.customer_ID', payloadExpression: 'vars.customer_ID', ttlSeconds: 60 } } });
+  model.diagram.shapes.splice(1, 0,
+    { elementId: 'Task_1', x: 200, y: 160, width: 240, height: 96 },
+    { elementId: 'BoundaryMessage_1', x: 412, y: 230, width: 56, height: 56 },
+    { elementId: 'BoundaryError_1', x: 172, y: 230, width: 56, height: 56 },
+    { elementId: 'Gateway_1', x: 500, y: 160, width: 72, height: 72 },
+    { elementId: 'Catch_1', x: 620, y: 160, width: 56, height: 56 },
+    { elementId: 'Throw_1', x: 720, y: 160, width: 56, height: 56 });
+  const graph = canvas(model);
+  assert.deepEqual(graph.getData(), model);
+  const config = inspector(graph);
+  const messageNode = graph.nodes.find((node) => node.id === 'BoundaryMessage_1');
+  config.show(messageNode, graph.templates.get(messageNode.type));
+  await flush(2);
+  const messageRef = config.root.querySelector('[data-process="messageRef"]');
+  assert.ok(messageRef.hasAttribute('wrap-selected'));
+  assert.equal(messageRef.querySelector('.tf-select-selected').textContent,
+    `${model.messages[0].name} · Message_1`);
+  assert.ok(config.root.querySelector('[data-process="attachedToId"]').hasAttribute('wrap-selected'));
+  assert.ok(config.root.querySelector('[data-process="outputMapping"]').hasAttribute('multiline'));
+  const errorNode = graph.nodes.find((node) => node.id === 'BoundaryError_1');
+  config.show(errorNode, graph.templates.get(errorNode.type));
+  assert.ok(config.root.querySelector('[data-process="errorRef"]').hasAttribute('wrap-selected'));
+  const throwNode = graph.nodes.find((node) => node.id === 'Throw_1');
+  config.show(throwNode, graph.templates.get(throwNode.type));
+  fixtures({
+    processDefinitionListRequest: { definitions: [{ definitionId: 'target-definition', name: 'Target' }], hasMore: false },
+    processDefinitionGetRequest: { definition: definition('target-definition', { publishedVersion: 1 }) },
+    processVersionGetRequest: { version: { model } },
+  });
+  click(config.root.querySelector('[data-load-targets]'));
+  await flush(2);
+  change(config.root.querySelector('[data-process="targetDefinitionChoice"]'), 'target-definition');
+  await flush(2);
+  const capability = config.root.querySelector('[data-target-capability]');
+  assert.equal(capability.textContent, `${I18n.t('bpmn.target_declared_names')}: ${model.messages[0].name}`);
+  assert.equal(capability.querySelector('script'), null);
+  graph.undo();
+  assert.deepEqual(graph.getData(), model);
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="BoundaryMessage_1"] .fb-port-in'), null);
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="BoundaryError_1"] .fb-port-in'), null);
+  assert.equal(graph.connectNodes('Start', 'BoundaryMessage_1'), false);
+  graph.duplicateNodes(['Task_1', 'BoundaryMessage_1', 'BoundaryError_1']);
+  const clones = graph.nodes.filter((node) => graph.selectedIds.has(node.id));
+  const task = clones.find((node) => node.type === 'bpmn_service_task');
+  assert.ok(task);
+  assert.equal(clones.filter((node) => processBoundaryKind(node.type)).length, 2);
+  assert.ok(clones.filter((node) => processBoundaryKind(node.type)).every((node) => node.config.attachedToId === task.id));
+  graph.undo();
+  assert.deepEqual(graph.getData(), model);
+  graph.updateProcessDeclarations({ messages: [{ messageId: 'Message_1', name: 'order.updated' }],
+    errors: model.errors, targetNamespace: model.targetNamespace });
+  assert.equal(graph.getData().messages[0].name, 'order.updated');
+  graph.undo();
+  assert.deepEqual(graph.getData(), model);
+  config.destroy();
+  graph.destroy();
+});
+
+test('sequential message target and TTL edits survive Save and the official process encoder', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.nodes.splice(1, 0, { id: 'Throw_1', name: 'Send order', kind: { MessageThrow: {
+    messageRef: 'Message_1', target: { Start: { definitionId: 'old-main-definition' } },
+    correlationExpression: 'vars.order_ID', payloadExpression: 'vars.payload', ttlSeconds: 60,
+  } } });
+  const current = definition('throw-ttl', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  state.canvas.selectNode('Throw_1');
+  await flush(2);
+  change(state.config.root.querySelector('[data-process="targetType"]'), 'Catch');
+  change(state.config.root.querySelector('[data-process="targetDefinitionId"]'), 'receiver-definition');
+  change(state.config.root.querySelector('[data-process="instanceIdExpression"]'), 'vars.receiver_instance_ID');
+  change(state.config.root.querySelector('[data-process="subscriptionIdExpression"]'), 'vars.receiver_subscription_ID');
+  const ttl = state.config.root.querySelector('[data-process="ttlSeconds"]');
+  change(ttl, '');
+  assert.equal(state.canvas.getData().nodes.find((node) => node.id === 'Throw_1').kind.MessageThrow.ttlSeconds, 0);
+  change(ttl, '1.5');
+  assert.equal(state.canvas.getData().nodes.find((node) => node.id === 'Throw_1').kind.MessageThrow.ttlSeconds, 1.5);
+  change(ttl, '240');
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload;
+  const savedMessage = saved.model.nodes.find((node) => node.id === 'Throw_1').kind.MessageThrow;
+  assert.deepEqual(savedMessage.target, { Catch: { definitionId: 'receiver-definition',
+    instanceIdExpression: 'vars.receiver_instance_ID', subscriptionIdExpression: 'vars.receiver_subscription_ID' } });
+  const savedTtl = savedMessage.ttlSeconds;
+  assert.equal(savedTtl, 240);
+  assert.equal(typeof savedTtl, 'number');
+  assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
+});
+
+test('boundary message switch click saves its checked boolean with a visible accessible label', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.nodes.splice(1, 0,
+    { id: 'Task_1', name: 'Review order', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } },
+    { id: 'BoundaryMessage_1', name: 'Receive update', kind: { BoundaryMessage: {
+      attachedToId: 'Task_1', cancelActivity: false, messageRef: 'Message_1',
+      correlationExpression: 'vars.order_ID', outputMapping: {},
+    } } });
+  const current = definition('message-boundary-toggle', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  state.canvas.selectNode('BoundaryMessage_1');
+  await flush(2);
+  const toggle = state.config.root.querySelector('[data-process="cancelActivity"]');
+  const switchControl = toggle.querySelector('[role="switch"]');
+  const label = I18n.t('bpmn.boundary_interrupting');
+  assert.equal(toggle.querySelector('.tf-toggle__label').textContent, label);
+  assert.equal(switchControl.getAttribute('aria-label'), label);
+  assert.equal(toggle.checked, false);
+  switchControl.click();
+  assert.equal(toggle.checked, true);
+  assert.equal(state.canvas.getData().nodes.find((node) => node.id === 'BoundaryMessage_1').kind.BoundaryMessage.cancelActivity, true);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload;
+  assert.equal(saved.model.nodes.find((node) => node.id === 'BoundaryMessage_1').kind.BoundaryMessage.cancelActivity, true);
+  assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
+});
+
 test('incomplete boundary attachment or date blocks the real save and publication requests', async () => {
   const original = definition('boundary-save', { model: boundaryModel() });
   const state = await mount(original, {
@@ -290,8 +436,15 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   assert.equal(node.config.verification, 'Human');
+  assert.ok(config.root.querySelector('[data-process="flowId"]').hasAttribute('wrap-selected'));
+  assert.ok(config.root.querySelector('[data-process="inputMapping"]').hasAttribute('multiline'));
+  assert.equal(config.root.querySelector('[data-process="inputMapping"] [data-field="key"]'), null);
   change(config.root.querySelector('[data-process="flowId"]'), 'flow-one');
   change(config.root.querySelector('[data-process="inputMapping"]'), { Request_ID: 'vars.Source_ID' });
+  const mapping = config.root.querySelector('[data-process="inputMapping"]');
+  assert.equal(mapping.querySelector('[data-field="key"]').tagName, 'TF-TEXTAREA');
+  assert.equal(mapping.querySelector('[data-field="key"]').value, 'Request_ID');
+  assert.equal(mapping.querySelector('[data-field="value"]').value, 'vars.Source_ID');
   change(config.root.querySelector('[data-process="verification"]'), 'Condition');
   change(config.root.querySelector('[data-process="expression"]'), 'outputs.Result_OK == true');
   change(config.root.querySelector('[data-process="timeoutSeconds"]'), '80');
@@ -302,10 +455,10 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
-test('palette offers only the nine supported elements and cancels drag/filter work when disposed', async () => {
+test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 9);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 15);
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -321,6 +474,254 @@ test('command retries retain identity for the same intent and changed values obt
   const first = command({ expectedRevision: 4, variables: { Source_ID: 'A' } });
   assert.deepEqual(command({ expectedRevision: 4, variables: { Source_ID: 'A' } }), first);
   assert.notEqual(command({ expectedRevision: 4, variables: { Source_ID: 'B' } }).commandId, first.commandId);
+});
+
+test('message send retry retains the durable message identity until its content changes', async () => {
+  let attempts = 0;
+  fixtures({ processMessageSendRequest: (payload) => {
+    if (++attempts < 3) throw new Error('Connection lost');
+    return { message: { status: 'Delivered' } };
+  } });
+  const form = openProcessMessageSend({ Start: { definitionId: 'definition-one' } }, ['order.received']);
+  assert.ok(form.querySelector('[data-message-name]').hasAttribute('wrap-selected'));
+  form.querySelector('[data-message-key]').value = 'case-1';
+  const editor = form.querySelector('tf-code-editor');
+  editor.value = '{"customer_ID":null}';
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  editor.value = '{"customer_ID":true}';
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  const sends = calls.filter((call) => call.kind === 'processMessageSendRequest').map((call) => call.payload);
+  assert.equal(sends.length, 3);
+  assert.equal(sends[0].messageId, sends[1].messageId);
+  assert.equal(sends[0].commandId, sends[1].commandId);
+  assert.notEqual(sends[1].messageId, sends[2].messageId);
+  assert.notEqual(sends[1].commandId, sends[2].commandId);
+  assert.deepEqual(sends[2].payload, { customer_ID: true });
+});
+
+test('message detail distinguishes an available JSON null from an unavailable payload', async () => {
+  const summary = { messageId: 'message-1', senderUserId: 'owner', messageName: '<order.received>',
+    correlationKey: 'case-1', status: 'Delivered', revision: 1, payloadAvailable: true,
+    canResolve: false, canCancel: false };
+  fixtures({ processMessageGetRequest: { message: { message: summary, payload: null } } });
+  const available = await openProcessMessageDetail(summary);
+  assert.equal(available.querySelector('tf-code-editor').value, 'null');
+  assert.equal(available.querySelector('img'), null);
+  assert.match(available.textContent, /<order\.received>/);
+  available.remove();
+  fixtures({ processMessageGetRequest: { message: { message: { ...summary, payloadAvailable: false } } } });
+  const unavailable = await openProcessMessageDetail(summary);
+  assert.equal(unavailable.querySelector('tf-code-editor'), null);
+  assert.ok(unavailable.textContent.includes(I18n.t('bpmn.message_payload_unavailable')));
+});
+
+test('revoked message read clears the previously authorized payload and actions on refresh', async () => {
+  const summary = { messageId: 'message-1', senderUserId: 'owner', messageName: 'order.received',
+    correlationKey: 'case-1', status: 'Pending', revision: 1, payloadAvailable: true,
+    canResolve: true, canCancel: true };
+  let readable = true;
+  fixtures({ processMessageGetRequest: () => {
+    if (!readable) throw new Error('Current message access was revoked');
+    return { message: { message: summary, payload: { private_ID: 'secret' } } };
+  } });
+  const win = await openProcessMessageDetail(summary);
+  assert.match(win.querySelector('tf-code-editor').value, /private_ID/);
+  readable = false;
+  await poll(); await flush();
+  assert.equal(win.querySelector('tf-code-editor'), null);
+  assert.equal(win.querySelector('[data-resolve]'), null);
+  assert.equal(win.querySelector('[data-cancel-message]'), null);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /revoked/);
+});
+
+test('message detail clears an action error only after an explicit successful action and current read', async () => {
+  const summary = { messageId: 'message-1', senderUserId: 'owner', messageName: 'order.received',
+    correlationKey: 'case-1', status: 'Pending', revision: 1, payloadAvailable: true,
+    canResolve: false, canCancel: true };
+  let current = summary;
+  let cancelAttempts = 0;
+  let readFails = false;
+  fixtures({
+    processMessageGetRequest: () => {
+      if (readFails) throw new Error('Current message read failed');
+      return { message: { message: current, payload: { Purchase_ID: 'PO-7' } } };
+    },
+    processMessageCancelRequest: () => {
+      if (++cancelAttempts === 1) throw new Error('Cancel was rejected');
+      current = { ...summary, status: 'Cancelled', revision: 2, canCancel: false };
+      return { message: current };
+    },
+  });
+  const win = await openProcessMessageDetail(summary);
+  click(win.querySelector('[data-cancel-message]')); await flush();
+  assert.equal(win.querySelector('[data-error]').hidden, false);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /Cancel was rejected/);
+  click(win.querySelector('[data-cancel-message]')); await flush();
+  assert.equal(win.querySelector('[data-error]').hidden, true);
+  assert.equal(win.querySelector('[data-cancel-message]'), null);
+  assert.match(win.querySelector('tf-code-editor').value, /Purchase_ID/);
+  readFails = true;
+  await poll(); await flush();
+  assert.equal(win.querySelector('[data-error]').hidden, false);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /Current message read failed/);
+  readFails = false;
+  await poll(); await flush();
+  assert.equal(win.querySelector('[data-error]').hidden, false);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /Current message read failed/);
+  assert.equal(calls.filter((call) => call.kind === 'processMessageCancelRequest').length, 2);
+  assert.equal(calls.filter((call) => call.kind === 'processMessageGetRequest').length, 4);
+});
+
+test('message resolution ignores stale subscription pages after the target instance changes', async () => {
+  const delayed = deferred();
+  const summary = { messageId: 'message-1', senderUserId: 'owner', messageName: 'order.received',
+    correlationKey: 'case-1', status: 'Ambiguous', revision: 1, payloadAvailable: false,
+    canResolve: true, canCancel: true, target: { Catch: { definitionId: 'definition-one', instanceId: null, subscriptionId: null } } };
+  const response = (instanceId) => ({ instance: instance(instanceId, {
+    subscriptions: [{ subscriptionId: `subscription-${instanceId}`, nodeId: 'Wait', nodeName: `Wait ${instanceId}`,
+      status: 'Open', messageName: 'order.received', correlationKey: 'case-1' }],
+  }) });
+  fixtures({ processMessageGetRequest: { message: { message: summary } },
+    processInstanceGetRequest: ({ instanceId }) => instanceId === 'A' ? delayed.promise : response(instanceId) });
+  const detail = await openProcessMessageDetail(summary);
+  click(detail.querySelector('[data-resolve]'));
+  const form = document.querySelector('.tf-act-window');
+  const target = form.querySelector('[data-resolve-instance]');
+  change(target, 'A'); click(form.querySelector('[data-load-subscriptions]'));
+  change(target, 'B'); click(form.querySelector('[data-load-subscriptions]'));
+  await flush();
+  const choices = form.querySelector('[data-resolve-subscription]');
+  assert.ok(choices.hasAttribute('wrap-selected'));
+  assert.ok(choices.querySelector('option[value="subscription-B"]'));
+  delayed.resolve(response('A')); await flush();
+  assert.equal(choices.querySelector('option[value="subscription-A"]'), null);
+  assert.ok(choices.querySelector('option[value="subscription-B"]'));
+  change(target, 'C');
+  assert.equal(choices.querySelector('option[value="subscription-B"]'), null);
+  assert.ok(form.querySelector('[data-act="submit"]').hasAttribute('disabled'));
+});
+
+test('message receipts and cancellation history localize finite reasons while preserving diagnostics', async () => {
+  const reasons = [
+    ['sender_cancelled', 'reason_sender_cancelled'],
+    ['ttl_expired', 'reason_ttl_expired'],
+    ['activation_closed', 'reason_activation_closed'],
+    ['target_instance_closed', 'reason_target_instance_closed'],
+  ];
+  const markup = '<script>kept as text</script>';
+  const diagnostic = `${'x'.repeat(32768 - markup.length)}${markup}`;
+  assert.equal(new TextEncoder().encode(diagnostic).length, 32768);
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const [reason, key] of reasons) {
+        const summary = { messageId: 'message-1', senderUserId: 'owner', messageName: 'order.received',
+          correlationKey: 'case-1', status: 'Cancelled', revision: 2, payloadAvailable: false,
+          canResolve: false, canCancel: false, lastReason: reason };
+        fixtures({ processMessageGetRequest: { message: { message: summary } } });
+        const win = await openProcessMessageDetail(summary);
+        const label = I18n.t(`bpmn.${key}`);
+        assert.notEqual(label, `bpmn.${key}`);
+        assert.ok(win.querySelector('[data-content]').textContent.includes(label));
+        assert.ok(!win.querySelector('[data-content]').textContent.includes(reason));
+        win.remove();
+        assert.equal(processLifecycleReasonText(reason), label);
+        const event = { kind: 'message_cancelled', nodeName: 'Send',
+          data: { message_name: 'order.received', reason } };
+        const original = structuredClone(event);
+        assert.ok(processEventText(event).includes(label));
+        assert.deepEqual(event, original);
+      }
+      for (const [kind, reason, key] of [
+        ['event_race_cancelled', 'instance_cancelled', 'event_cancelled'],
+        ['subscription_cancelled', 'activity_completed', 'timer_reason_activity_completed'],
+        ['subscription_cancelled', 'event_race_lost', 'timer_reason_event_race_lost'],
+      ]) {
+        const event = { kind, nodeName: 'Wait', data: { reason } };
+        const label = I18n.t(`bpmn.${key}`);
+        const rendered = processEventText(event);
+        assert.ok(rendered.includes(label));
+        assert.doesNotMatch(rendered, /bpmn\.|\{node\}|\{reason\}/);
+      }
+      const summary = { messageId: 'message-2', senderUserId: 'owner', messageName: 'order.received',
+        correlationKey: 'case-2', status: 'Error', revision: 3, payloadAvailable: false,
+        canResolve: false, canCancel: false, lastReason: diagnostic };
+      fixtures({ processMessageGetRequest: { message: { message: summary } } });
+      const win = await openProcessMessageDetail(summary);
+      assert.ok(win.querySelector('[data-content]').textContent.includes(diagnostic));
+      assert.equal(win.querySelector('[data-content] script'), null);
+      win.remove();
+      assert.equal(processLifecycleReasonText(diagnostic), diagnostic);
+      assert.ok(processEventText({ kind: 'message_error', nodeName: 'Send', data: {
+        message_name: 'order.received', reason: diagnostic,
+      } }).includes(diagnostic));
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('five locales describe message and business-error outcomes without losing real event fields', async () => {
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const key of ['node_message_start', 'node_message_catch', 'node_message_throw',
+        'node_boundary_message', 'node_boundary_error', 'node_event_based_gateway',
+        'message_status_ambiguous', 'subscription_status_open', 'race_status_won']) {
+        assert.notEqual(I18n.t(`bpmn.${key}`), `bpmn.${key}`);
+      }
+      const queued = processEventText({ kind: 'message_queued', nodeName: 'Send',
+        data: { message_name: 'order.received', correlation_key: 'Case_ID' } });
+      assert.match(queued, /order\.received/);
+      assert.match(queued, /Case_ID/);
+      const race = processEventText({ kind: 'event_race_won', nodeName: 'First event',
+        data: { winner_node_id: 'Catch_1' } });
+      assert.match(race, /Catch_1/);
+      const winnerLabel = I18n.t('bpmn.race_winning_element_id');
+      assert.notEqual(winnerLabel, 'bpmn.race_winning_element_id');
+      assert.ok(race.toLocaleLowerCase(language).includes(winnerLabel.toLocaleLowerCase(language)));
+      const raceWindow = await monitor(instance(`race-${language}`, { eventRaces: [{
+        raceId: 'race-1', gatewayNodeId: 'Gateway_1', gatewayName: 'First event', status: 'Won',
+        winnerNodeId: 'Catch_1', branchSubscriptionIds: [], branchTimerIds: [],
+      }] }));
+      const raceRow = raceWindow.querySelector('[data-race-rows]');
+      assert.ok(raceRow.textContent.includes(`${winnerLabel}: Catch_1`));
+      assert.equal(raceRow.querySelector('script'), null);
+      raceWindow.dispatchEvent(new Event('closed'));
+      raceWindow.remove();
+      const caught = processEventText({ kind: 'business_error_caught', nodeName: 'Check',
+        data: { error_code: 'BUSINESS.INVALID' } });
+      assert.match(caught, /BUSINESS\.INVALID/);
+      const armed = processEventText({ kind: 'error_boundary_armed', nodeName: 'Check',
+        data: { subscription_id: 's1', attached_to_id: 'Check', error_code: 'BUSINESS.INVALID' } });
+      assert.match(armed, /Check/);
+      for (const value of [queued, race, caught, armed]) assert.doesNotMatch(value, /bpmn\.|\{node\}|\{message\}|\{key\}|\{winner\}|\{code\}|undefined/);
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('declaration editor keeps exact namespace and long names in the real draft save', async () => {
+  const current = definition('declarations-draft', { publishedVersion: 1 });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: definition('declarations-draft', { model: payload.model, draftRevision: 5, publishedVersion: 1 }),
+  }) });
+  click(state.root.querySelector('[data-role="declarations"]'));
+  const form = document.querySelector('.tf-act-window');
+  change(form.querySelector('[data-declaration-namespace]'), 'urn:orders:Łódź');
+  click(form.querySelector('[data-add-message]'));
+  const row = form.querySelector('[data-declaration-kind="message"]');
+  change(row.querySelector('[data-declaration-id]'), 'Message_Order');
+  const name = `${'Order'.repeat(40)}<&>`;
+  change(row.querySelector('[data-declaration-name]'), name);
+  assert.equal(row.querySelector('[data-declaration-name]').value, name);
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  assert.equal(state.canvas.processModel.targetNamespace, 'urn:orders:Łódź');
+  assert.equal(state.canvas.processModel.messages[0].name, name);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model;
+  assert.equal(saved.targetNamespace, 'urn:orders:Łódź');
+  assert.deepEqual(saved.messages, [{ messageId: 'Message_Order', name }]);
+  assert.deepEqual(saved.variables, {});
+  assert.equal(state.definition.publishedVersion, 1, 'draft edits do not mutate the published version');
 });
 
 test('documents and business JSON are bounded before sending without changing business keys', () => {
@@ -484,6 +885,47 @@ test('human completion fetches full authorized work and sends instance revision 
   assert.equal(win.querySelector('[data-complete]'), null);
 });
 
+test('instance pages advance independently and keep the exact incident selection while polling', async () => {
+  const task = (number) => ({ userTaskId: `work-${number}`, nodeId: 'Review', name: `Review ${number}`,
+    kind: 'Work', status: 'Open', canComplete: false });
+  const incident = { incidentId: 'incident-1', nodeId: 'Check', nodeName: 'Check', jobId: null,
+    code: 'INTERRUPTED', message: 'Actual failure', canRetry: false };
+  const page = (offset, total) => ({ offset, total, nextOffset: offset + 1 < total ? offset + 1 : null,
+    hasMore: offset + 1 < total });
+  const snapshot = (taskOffset, selected = false) => instance('paged-run', {
+    userTasks: [task(taskOffset + 1)], incidents: [incident],
+    selectedIncident: selected ? { incident, resolvedAtMs: null } : null,
+    pages: { ...instance().pages, userTasks: page(taskOffset, 2), incidents: page(0, 1) },
+  });
+  const win = await monitor(snapshot(0), { processInstanceGetRequest: ({ pages }) => ({
+    instance: snapshot(pages.userTasks.offset, pages.selectedIncidentId === 'incident-1'),
+  }) });
+  click(win.querySelector('[data-inspect-incident]')); await flush();
+  assert.equal(win.querySelector('[data-selected-incident]').dataset.selectedIncident, 'incident-1');
+  click(win.querySelector('[data-page-controls="userTasks"] [data-page-next]')); await flush();
+  const reads = calls.filter((call) => call.kind === 'processInstanceGetRequest').map((call) => call.payload.pages);
+  assert.equal(reads.at(-1).userTasks.offset, 1);
+  assert.equal(reads.at(-1).incidents.offset, 0);
+  assert.equal(reads.at(-1).selectedIncidentId, 'incident-1');
+  assert.match(win.querySelector('[data-work]').textContent, /Review 2/);
+  await poll(); await flush();
+  assert.equal(calls.filter((call) => call.kind === 'processInstanceGetRequest').at(-1).payload.pages.userTasks.offset, 1);
+  assert.equal(win.querySelector('[data-selected-incident]').dataset.selectedIncident, 'incident-1');
+});
+
+test('empty required message collections render each page for an active instance', async () => {
+  const current = instance('empty-message-pages', { canSendMessage: true, messageNames: [],
+    subscriptions: [], eventRaces: [], outgoingMessages: [] });
+  const win = await monitor(current);
+  for (const name of ['subscriptions', 'eventRaces', 'outgoingMessages']) {
+    assert.ok(win.querySelector(`[data-page-controls="${name}"]`), `${name} has a real empty page`);
+  }
+  assert.equal(win.querySelector('[data-subscription-rows]').children.length, 0);
+  assert.equal(win.querySelector('[data-race-rows]').children.length, 0);
+  assert.equal(win.querySelector('[data-outgoing-rows]').children.length, 0);
+  assert.equal(win.querySelector('[data-summary]').textContent.includes('undefined'), false);
+});
+
 test('instance window keeps its localized title while the full long definition name remains visible in the summary', async () => {
   const name = `Quarterly approval <source> & Łódź ${'long process title '.repeat(12)}`;
   try {
@@ -581,7 +1023,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 9);
+    assert.equal(processTemplates().length, 15);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
@@ -1114,6 +1556,23 @@ test('published timer start cannot submit a manual run even with a direct helper
   assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
 });
 
+test('published message start offers the current authorized send and never invokes manual start', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.nodes[0].kind = { MessageStart: { messageRef: 'Message_1', outputMapping: {} } };
+  const current = definition('message-start', { model, publishedVersion: 2 });
+  const messageStart = { nodeId: 'Start', nodeName: 'Start', messageName: 'order.received', version: 2, canSend: true };
+  const state = await mount(current, { processDefinitionGetRequest: { definition: current, messageStart },
+    processVersionGetRequest: { version: { version: 2, model } } });
+  assert.equal(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'), true);
+  assert.equal(state.root.querySelector('[data-role="send-start"]').hidden, false);
+  click(state.root.querySelector('[data-role="send-start"]'));
+  assert.ok(document.querySelector('.tf-act-window [data-message-name]'));
+  await builder._runProcess();
+  assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
+  assert.equal(document.querySelectorAll('.tf-act-window [data-message-name]').length, 2);
+});
+
 test('schedule reads persisted Pending, Blocked and Missed states and scopes delayed reads to its window', async () => {
   let actual = savedTimer();
   fixtures({ processDefinitionGetRequest: () => ({ definition: definition('schedule', { publishedVersion: 2 }), timerStart: actual }) });
@@ -1172,6 +1631,39 @@ test('working timer renders the pinned offset and provenance without browser tim
   } finally { await I18n.setLanguage('en'); }
 });
 
+test('timer arming history uses the persisted IANA zone instead of the browser zone', async () => {
+  const priorZone = process.env.TZ;
+  const dueAtMs = 1791020287134;
+  const event = { kind: 'timer_armed', nodeName: 'TimerWait', data: {
+    due_at_ms: dueAtMs, timezone: 'UTC', timer_id: 'timer-1',
+  } };
+  process.env.TZ = 'Europe/Warsaw';
+  try {
+    assert.equal(Intl.DateTimeFormat().resolvedOptions().timeZone, 'Europe/Warsaw');
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const zoned = new Date(dueAtMs).toLocaleString(language, { timeZone: 'UTC' });
+      const browser = new Date(dueAtMs).toLocaleString(language);
+      assert.notEqual(zoned, browser);
+      const original = structuredClone(event);
+      const rendered = processEventText(event);
+      assert.ok(rendered.includes(zoned));
+      assert.ok(rendered.includes('UTC'));
+      assert.ok(!rendered.includes(browser));
+      assert.deepEqual(event, original);
+      const working = processEventText({ ...event, data: {
+        ...event.data, working_time: { due_offset_seconds: 7200 },
+      } });
+      assert.ok(working.includes(new Date(dueAtMs).toISOString()));
+      assert.ok(working.includes('UTC+02:00'));
+    }
+  } finally {
+    if (priorZone === undefined) delete process.env.TZ;
+    else process.env.TZ = priorZone;
+    await I18n.setLanguage('en');
+  }
+});
+
 test('schedule and current start localize known timer reasons in five languages without changing arbitrary errors', async () => {
   const reasons = [
     ['instance_cancelled', 'event_cancelled'],
@@ -1197,7 +1689,7 @@ test('schedule and current start localize known timer reasons in five languages 
         await poll();
         const translated = I18n.t(`bpmn.${key}`);
         assert.notEqual(translated, `bpmn.${key}`);
-        assert.equal(processTimerReasonText(reason), translated);
+        assert.equal(processLifecycleReasonText(reason), translated);
         assert.equal(win.querySelector('[data-timers] dd:last-child').textContent, translated);
         assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(translated));
         assert.doesNotMatch(win.querySelector('[data-timers]').textContent, new RegExp(reason));
@@ -1209,7 +1701,7 @@ test('schedule and current start localize known timer reasons in five languages 
       assert.equal(win.querySelector('[data-timers] dd:last-child').textContent, arbitrary);
       assert.equal(win.querySelector('[data-timers] script'), null);
       assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(arbitrary));
-      assert.equal(processTimerReasonText(arbitrary), arbitrary);
+      assert.equal(processLifecycleReasonText(arbitrary), arbitrary);
       win.dispatchEvent(new Event('closed'));
       win.remove();
     }
@@ -1266,14 +1758,18 @@ test('all five locales render boundary cancellation truth and preserve arbitrary
   try {
     for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
       await I18n.setLanguage(language);
-      for (const reason of ['activity_completed', 'sibling_interrupted']) {
-        const label = processTimerReasonText(reason);
+      for (const reason of ['activity_completed', 'sibling_interrupted', 'event_race_lost']) {
+        const label = processLifecycleReasonText(reason);
         assert.equal(label, I18n.t(`bpmn.timer_reason_${reason}`));
-        assert.doesNotMatch(label, /bpmn\.|activity_completed|sibling_interrupted/);
+        assert.doesNotMatch(label, /bpmn\.|activity_completed|sibling_interrupted|event_race_lost/);
         const event = processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline', data: { kind: 'Boundary', reason, timer_id: 'private-id' } });
         assert.ok(event.includes(label));
         assert.doesNotMatch(event, /private-id|\{reason\}|\{node\}/);
       }
+      const interruptedByMessage = processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline',
+        data: { kind: 'Boundary', reason: 'sibling_interrupted', winning_timer_id: 'message-subscription-1' } });
+      assert.ok(interruptedByMessage.includes(I18n.t('bpmn.timer_reason_sibling_interrupted')));
+      assert.doesNotMatch(interruptedByMessage, /message-subscription-1|sibling_interrupted/);
       const noninterrupting = processEventText({ kind: 'timer_fired', nodeName: 'Reminder', data: {
         kind: 'Boundary', cancel_activity: false, planned_due_at_ms: 1000, fired_at_ms: 2000,
       } });
@@ -1282,7 +1778,7 @@ test('all five locales render boundary cancellation truth and preserve arbitrary
         kind: 'Boundary', cancel_activity: true, planned_due_at_ms: 1000, fired_at_ms: 2000,
       } });
       assert.ok(interrupting.includes(I18n.t('bpmn.boundary_interrupting')));
-      assert.equal(processTimerReasonText(arbitrary), arbitrary);
+      assert.equal(processLifecycleReasonText(arbitrary), arbitrary);
       assert.ok(processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline', data: { reason: arbitrary } }).includes(arbitrary));
     }
   } finally { await I18n.setLanguage('en'); }

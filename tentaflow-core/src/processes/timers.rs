@@ -587,6 +587,7 @@ mod tests {
             next_check_at_ms: due,
             created_at_ms: anchor,
             updated_at_ms: anchor,
+            race_id: None,
         }
     }
 
@@ -1036,7 +1037,8 @@ mod tests {
             },
             0
         );
-        let cancelled = repository::get_instance(&reopened, &owner, &waiting.instance_id).unwrap();
+        let cancelled =
+            repository::get_instance(&reopened, &owner, &waiting.instance_id, None).unwrap();
         assert_eq!(cancelled.timers[0].status, ProcessTimerStatus::Cancelled);
         assert!(
             repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200)
@@ -1079,7 +1081,7 @@ mod tests {
             0
         );
         assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &past.instance_id)
+            repository::get_instance(&fixture.db, &fixture.owner, &past.instance_id, None)
                 .unwrap()
                 .status,
             ProcessInstanceStatus::Completed
@@ -1278,7 +1280,7 @@ mod tests {
             1
         );
         assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id)
+            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id, None)
                 .unwrap()
                 .timers[0]
                 .status,
@@ -1331,7 +1333,8 @@ mod tests {
         )
         .unwrap());
         assert!(
-            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id).is_err()
+            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id, None)
+                .is_err()
         );
         crate::db::repository::update_user_account(
             &fixture.db,
@@ -1648,7 +1651,7 @@ mod tests {
             1
         );
         assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id)
+            repository::get_instance(&fixture.db, &fixture.owner, &waiting.instance_id, None)
                 .unwrap()
                 .status,
             ProcessInstanceStatus::Completed
@@ -1715,7 +1718,8 @@ mod tests {
         .await;
         runtime::stop(fixture.dispatcher()).await.unwrap();
         let still_waiting =
-            repository::get_instance(&fixture.db, &fixture.owner, &future.instance_id).unwrap();
+            repository::get_instance(&fixture.db, &fixture.owner, &future.instance_id, None)
+                .unwrap();
         assert_eq!(still_waiting.status, ProcessInstanceStatus::Waiting);
         assert_eq!(still_waiting.timers[0].status, ProcessTimerStatus::Pending);
         assert_eq!(
@@ -1738,7 +1742,7 @@ mod tests {
             1
         );
         assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &future.instance_id)
+            repository::get_instance(&fixture.db, &fixture.owner, &future.instance_id, None)
                 .unwrap()
                 .status,
             ProcessInstanceStatus::Completed
@@ -2274,7 +2278,10 @@ mod tests {
             claim.job.attempt,
             claim.job.fence,
             "human-service",
-            &accepted_result,
+            &crate::processes::repository::ObservedActivityResult {
+                result: (accepted_result).clone(),
+                origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+            },
             after.instance.revision,
             &repository::RuntimePlan::initial(json!({})),
             at_ms + 1_000,
@@ -2442,7 +2449,8 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_cancel_boundary")
             .unwrap();
         let before =
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
+                .unwrap();
         let cancelled = repository::cancel_instance(
             &fixture.db,
             &fixture.owner,
@@ -2527,7 +2535,8 @@ mod tests {
         resumed.completion.unwrap();
         assert_eq!(resumed.fired, 1);
         let after =
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
+                .unwrap();
         assert_eq!(after.status, ProcessInstanceStatus::Completed);
         assert_eq!(after.timers[0].status, ProcessTimerStatus::Fired);
     }
@@ -2933,7 +2942,7 @@ mod tests {
             drop(db);
             let reopened = crate::db::init(&path).unwrap();
             assert_eq!(
-                repository::get_instance(&reopened, &owner, &id)
+                repository::get_instance(&reopened, &owner, &id, None)
                     .unwrap()
                     .timers,
                 opened.timers
@@ -2960,7 +2969,7 @@ mod tests {
             let fired = drain_due(&reopened, due + 60000);
             fired.completion.unwrap();
             assert_eq!(fired.fired, 1);
-            let current = repository::get_instance(&reopened, &owner, &id).unwrap();
+            let current = repository::get_instance(&reopened, &owner, &id, None).unwrap();
             assert_eq!(current.status, ProcessInstanceStatus::Completed);
             let events = repository::list_events(&reopened, &owner, &id, 0, 200)
                 .unwrap()

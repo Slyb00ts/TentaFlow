@@ -1,6 +1,6 @@
 // ============ File: bpmn.rs — bounded BPMN B1 XML import and export ============
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{bail, ensure, Context, Result};
 use quick_xml::events::Event;
@@ -8,8 +8,9 @@ use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessCalendarPin, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
-    ProcessNode, ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape,
-    ProcessTimerSpec, ProcessWorkCalendar,
+    ProcessErrorDeclaration, ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessNode,
+    ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessTimerSpec,
+    ProcessWorkCalendar,
 };
 
 use super::model::{validate_model, validate_timer_spec, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
@@ -26,6 +27,7 @@ struct Element {
     ns: String,
     local: String,
     attrs: HashMap<(String, String), String>,
+    qnames: HashMap<String, (String, String)>,
     children: Vec<Element>,
     text: String,
     offset: usize,
@@ -62,6 +64,21 @@ impl Element {
                 self.local, self.offset
             )
         })
+    }
+    fn reference(&self, name: &str, namespace: &str) -> Result<String> {
+        let (uri, local) = self.qnames.get(name).ok_or_else(|| XmlElementError {
+            message: format!("{} at byte {} requires QName {name}", self.local, self.offset),
+            element_id: self.attr("id").map(str::to_string),
+            offset: self.offset,
+        })?;
+        if !uri.is_empty() && uri != namespace {
+            return Err(XmlElementError {
+                message: format!("foreign QName {name} at byte {}", self.offset),
+                element_id: self.attr("id").map(str::to_string),
+                offset: self.offset,
+            }.into());
+        }
+        Ok(local.clone())
     }
     fn attrs_only(&self, allowed: &[&str]) -> Result<()> {
         for (ns, name) in self.attrs.keys() {
@@ -124,6 +141,7 @@ fn parse_tree(xml: &str) -> Result<Element> {
     reader.config_mut().trim_text(false);
     let mut stack: Vec<Element> = Vec::new();
     let mut root = None;
+    let mut xml_ids = HashMap::new();
     let mut buffer = Vec::new();
     loop {
         let offset = reader.buffer_position() as usize;
@@ -134,6 +152,7 @@ fn parse_tree(xml: &str) -> Result<Element> {
                 let ns = ns_text(namespace)?;
                 let local = String::from_utf8(start.local_name().as_ref().to_vec())?;
                 let mut attrs = HashMap::new();
+                let mut qnames = HashMap::new();
                 for attr in start.attributes().with_checks(true) {
                     let attr = attr?;
                     let raw = attr.key.as_ref();
@@ -144,6 +163,27 @@ fn parse_tree(xml: &str) -> Result<Element> {
                     let attr_ns = ns_text(attr_ns)?;
                     let attr_local = String::from_utf8(attr_local.as_ref().to_vec())?;
                     let value = attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
+                    if attr_ns.is_empty() && matches!(attr_local.as_str(), "messageRef" | "errorRef") {
+                        let invalid_qname = |reason: &str| XmlElementError {
+                            message: format!("{reason} at byte {offset}"),
+                            element_id: stack.last().and_then(|parent| parent.attr("id")).map(str::to_string),
+                            offset,
+                        };
+                        let (uri, local) = if let Some((prefix, local)) = value.split_once(':') {
+                            if prefix.is_empty() || local.is_empty() || local.contains(':') {
+                                return Err(invalid_qname("malformed QName").into());
+                            }
+                            let (resolved, _) = reader.resolver().resolve_element(QName(value.as_bytes()));
+                            (ns_text(resolved).map_err(|_| invalid_qname("undeclared QName namespace"))?, local.to_string())
+                        } else {
+                            (String::new(), value.clone())
+                        };
+                        if local.is_empty() || !local.bytes().next().is_some_and(|first| first.is_ascii_alphabetic())
+                            || !local.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')) {
+                            return Err(invalid_qname("invalid QName").into());
+                        }
+                        qnames.insert(attr_local.clone(), (uri, local));
+                    }
                     if attr_ns == XSI && attr_local == "type" {
                         let (type_ns, type_local) =
                             reader.resolver().resolve_element(QName(value.as_bytes()));
@@ -158,10 +198,23 @@ fn parse_tree(xml: &str) -> Result<Element> {
                         "duplicate XML attribute at byte {offset}"
                     );
                 }
+                if [BPMN, BPMNDI, DC, DI].contains(&ns.as_str()) {
+                    if let Some(id) = attrs.get(&(String::new(), "id".to_string())) {
+                        if let Some(first_offset) = xml_ids.insert(id.clone(), offset) {
+                            return Err(XmlElementError {
+                                message: format!("duplicate XML ID {id} at byte {offset}; first at byte {first_offset}"),
+                                element_id: Some(id.clone()),
+                                offset,
+                            }
+                            .into());
+                        }
+                    }
+                }
                 let element = Element {
                     ns,
                     local,
                     attrs,
+                    qnames,
                     children: Vec::new(),
                     text: String::new(),
                     offset,
@@ -246,6 +299,53 @@ fn mapping(parent: &Element, name: &str) -> Result<BTreeMap<String, String>> {
         }
         None => Ok(BTreeMap::new()),
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageStartConfig {
+    output_mapping: BTreeMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageCatchConfig {
+    correlation_expression: String,
+    output_mapping: BTreeMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageThrowConfig {
+    target: ProcessMessageTargetSpec,
+    correlation_expression: String,
+    payload_expression: String,
+    ttl_seconds: u32,
+}
+
+fn message_configuration<T: serde::de::DeserializeOwned>(element: &Element) -> Result<T> {
+    let extension = element.child(BPMN, "extensionElements")?
+        .context("message event requires TentaFlow extension")?;
+    extension.attrs_only(&[])?;
+    extension.children_only(&[(TF, "message")])?;
+    ensure!(extension.children.len() == 1, "message event requires exactly one TentaFlow message config");
+    let config = extension.child(TF, "message")?.expect("validated message extension");
+    config.attrs_only(&[])?;
+    ensure!(config.children.is_empty(), "message config must contain JSON text");
+    serde_json::from_str(config.text.trim()).map_err(|error| XmlElementError {
+        message: format!("invalid message config at byte {}: {error}", config.offset),
+        element_id: element.attr("id").map(str::to_string),
+        offset: config.offset,
+    }.into())
+}
+
+fn event_reference(element: &Element, kind: &str, namespace: &str) -> Result<String> {
+    let definition = element.child(BPMN, kind)?.context("event definition is required")?;
+    let attribute = if kind == "messageEventDefinition" { "messageRef" } else { "errorRef" };
+    definition.attrs_only(&[attribute])?;
+    ensure!(definition.children.is_empty() && definition.text.trim().is_empty(),
+        "event definition cannot contain other content at byte {}", definition.offset);
+    definition.reference(attribute, namespace)
 }
 
 fn process_configuration(
@@ -391,7 +491,7 @@ fn timer_spec(element: &Element, node_id: &str) -> Result<ProcessTimerSpec> {
     })
 }
 
-fn node_from_xml(element: &Element) -> Result<ProcessNode> {
+fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNode> {
     let id = element.required("id")?;
     let name = element.attr("name").unwrap_or_default().to_string();
     let parsed_timer = || timer_spec(element, &id).map_err(|error| {
@@ -404,18 +504,52 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
     let kind = match element.local.as_str() {
         "startEvent" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[(BPMN, "timerEventDefinition")])?;
+            element.children_only(&[(BPMN, "timerEventDefinition"), (BPMN, "messageEventDefinition"), (BPMN, "extensionElements")])?;
             if element.children.is_empty() { ProcessNodeKind::Start }
-            else { ProcessNodeKind::TimerStart { timer: parsed_timer()? } }
+            else if element.child(BPMN, "timerEventDefinition")?.is_some() {
+                ensure!(element.children.len() == 1, "timer start cannot have another event definition");
+                ProcessNodeKind::TimerStart { timer: parsed_timer()? }
+            } else {
+                ensure!(element.children.len() == 2, "message start requires one definition and one config");
+                let config: MessageStartConfig = message_configuration(element)?;
+                ProcessNodeKind::MessageStart {
+                    message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
+                    output_mapping: config.output_mapping,
+                }
+            }
         }
         "intermediateCatchEvent" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[(BPMN, "timerEventDefinition")])?;
-            ProcessNodeKind::TimerCatch { timer: parsed_timer()? }
+            element.children_only(&[(BPMN, "timerEventDefinition"), (BPMN, "messageEventDefinition"), (BPMN, "extensionElements")])?;
+            if element.child(BPMN, "timerEventDefinition")?.is_some() {
+                ensure!(element.children.len() == 1, "timer catch cannot have another event definition");
+                ProcessNodeKind::TimerCatch { timer: parsed_timer()? }
+            } else {
+                ensure!(element.children.len() == 2, "message catch requires one definition and one config");
+                let config: MessageCatchConfig = message_configuration(element)?;
+                ProcessNodeKind::MessageCatch {
+                    message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
+                    correlation_expression: config.correlation_expression,
+                    output_mapping: config.output_mapping,
+                }
+            }
+        }
+        "intermediateThrowEvent" => {
+            element.attrs_only(&["id", "name"])?;
+            element.children_only(&[(BPMN, "messageEventDefinition"), (BPMN, "extensionElements")])?;
+            ensure!(element.children.len() == 2, "message throw requires one definition and one config");
+            let config: MessageThrowConfig = message_configuration(element)?;
+            ProcessNodeKind::MessageThrow {
+                message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
+                target: config.target,
+                correlation_expression: config.correlation_expression,
+                payload_expression: config.payload_expression,
+                ttl_seconds: config.ttl_seconds,
+            }
         }
         "boundaryEvent" => {
             element.attrs_only(&["id", "name", "attachedToRef", "cancelActivity"])?;
-            element.children_only(&[(BPMN, "timerEventDefinition")])?;
+            element.children_only(&[(BPMN, "timerEventDefinition"), (BPMN, "messageEventDefinition"), (BPMN, "errorEventDefinition"), (BPMN, "extensionElements")])?;
             let cancel_activity = match element.attr("cancelActivity") {
                 None | Some("true" | "1") => true,
                 Some("false" | "0") => false,
@@ -425,10 +559,45 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
                     offset: element.offset,
                 }.into()),
             };
-            ProcessNodeKind::BoundaryTimer {
-                attached_to_id: element.required("attachedToRef")?,
-                cancel_activity,
-                timer: parsed_timer()?,
+            if element.child(BPMN, "timerEventDefinition")?.is_some() {
+                ensure!(element.children.len() == 1, "boundary timer cannot have another event definition");
+                ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: element.required("attachedToRef")?,
+                    cancel_activity,
+                    timer: parsed_timer()?,
+                }
+            } else if element.child(BPMN, "messageEventDefinition")?.is_some() {
+                ensure!(element.children.len() == 2, "boundary message requires one definition and one config");
+                let config: MessageCatchConfig = message_configuration(element)?;
+                ProcessNodeKind::BoundaryMessage {
+                    attached_to_id: element.required("attachedToRef")?, cancel_activity,
+                    message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
+                    correlation_expression: config.correlation_expression,
+                    output_mapping: config.output_mapping,
+                }
+            } else {
+                ensure!(cancel_activity, "boundary error must interrupt its activity");
+                ensure!(element.child(BPMN, "timerEventDefinition")?.is_none()
+                    && element.child(BPMN, "messageEventDefinition")?.is_none(),
+                    "boundary error cannot contain another event definition");
+                let definition = element.child(BPMN, "errorEventDefinition")?
+                    .context("boundary error requires errorEventDefinition")?;
+                definition.attrs_only(&["errorRef"])?;
+                ensure!(definition.children.is_empty() && definition.text.trim().is_empty(), "error definition must be empty");
+                ensure!(element.children.len() <= 2, "boundary error has unsupported event definitions");
+                let output_mapping = if let Some(extension) = element.child(BPMN, "extensionElements")? {
+                    extension.attrs_only(&[])?;
+                    extension.children_only(&[(TF, "outputMapping")])?;
+                    ensure!(extension.children.len() == 1, "boundary error extension requires outputMapping");
+                    mapping(extension, "outputMapping")?
+                } else { BTreeMap::new() };
+                ProcessNodeKind::BoundaryError {
+                    attached_to_id: element.required("attachedToRef")?,
+                    error_ref: if definition.attr("errorRef").is_some() {
+                        Some(definition.reference("errorRef", target_namespace)?)
+                    } else { None },
+                    output_mapping,
+                }
             }
         }
         "endEvent" => {
@@ -447,6 +616,15 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
             ProcessNodeKind::ExclusiveGateway {
                 default_flow_id: element.attr("default").map(str::to_string),
             }
+        }
+        "eventBasedGateway" => {
+            element.attrs_only(&["id", "name", "gatewayDirection", "eventGatewayType", "instantiate"])?;
+            element.children_only(&[])?;
+            ensure!(element.attr("gatewayDirection").is_none_or(|value| value == "Diverging")
+                && element.attr("eventGatewayType").is_none_or(|value| value == "Exclusive")
+                && element.attr("instantiate").is_none_or(|value| value == "false"),
+                "unsupported event gateway profile at byte {}", element.offset);
+            ProcessNodeKind::EventBasedGateway
         }
         "userTask" => {
             element.attrs_only(&["id", "name"])?;
@@ -500,7 +678,13 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
                 (TF, "inputMapping"),
                 (TF, "outputMapping"),
                 (TF, "condition"),
+                (TF, "resultExpression"),
             ])?;
+            let result_expression = service.child(TF, "resultExpression")?.map(|result| -> Result<String> {
+                result.attrs_only(&[])?;
+                ensure!(result.children.is_empty(), "result expression must be text");
+                Ok(result.text.clone())
+            }).transpose()?;
             let verification = match service.attr("verification").unwrap_or("human") {
                 "human" => ActivityVerification::Human,
                 "condition" => {
@@ -536,6 +720,7 @@ fn node_from_xml(element: &Element) -> Result<ProcessNode> {
                     .required("timeoutSeconds")?
                     .parse()
                     .context("invalid service timeout")?,
+                result_expression,
             }
         }
         other => bail!("unsupported BPMN node {other} at byte {}", element.offset),
@@ -617,7 +802,26 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         "BPMN root must use the BPMN model namespace"
     );
     root.attrs_only(&["id", "targetNamespace"])?;
-    root.children_only(&[(BPMN, "process"), (BPMNDI, "BPMNDiagram")])?;
+    root.children_only(&[(BPMN, "process"), (BPMNDI, "BPMNDiagram"), (BPMN, "message"), (BPMN, "error")])?;
+    let has_declarations = root.children.iter().any(|child| child.is(BPMN, "message") || child.is(BPMN, "error"));
+    if has_declarations {
+        ensure!(root.attr("targetNamespace").is_some_and(|value| !value.is_empty()),
+            "BPMN declarations require explicit targetNamespace");
+    }
+    let namespace = root.attr("targetNamespace").unwrap_or(TF);
+    let mut messages = Vec::new();
+    let mut errors = Vec::new();
+    for child in &root.children {
+        if child.is(BPMN, "message") {
+            child.attrs_only(&["id", "name"])?;
+            ensure!(child.children.is_empty() && child.text.trim().is_empty(), "message declaration must be empty");
+            messages.push(ProcessMessageDeclaration { message_id: child.required("id")?, name: child.required("name")? });
+        } else if child.is(BPMN, "error") {
+            child.attrs_only(&["id", "name", "errorCode"])?;
+            ensure!(child.children.is_empty() && child.text.trim().is_empty(), "error declaration must be empty");
+            errors.push(ProcessErrorDeclaration { error_id: child.required("id")?, name: child.required("name")?, error_code: child.required("errorCode")? });
+        }
+    }
     let processes: Vec<_> = root
         .children
         .iter()
@@ -636,11 +840,13 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         (BPMN, "extensionElements"),
         (BPMN, "startEvent"),
         (BPMN, "intermediateCatchEvent"),
+        (BPMN, "intermediateThrowEvent"),
         (BPMN, "boundaryEvent"),
         (BPMN, "endEvent"),
         (BPMN, "userTask"),
         (BPMN, "serviceTask"),
         (BPMN, "exclusiveGateway"),
+        (BPMN, "eventBasedGateway"),
         (BPMN, "parallelGateway"),
         (BPMN, "sequenceFlow"),
     ])?;
@@ -683,7 +889,36 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
                 condition,
             });
         } else {
-            nodes.push(node_from_xml(child)?);
+            nodes.push(node_from_xml(child, namespace).map_err(|error| {
+                if error.downcast_ref::<XmlElementError>().is_some() { error }
+                else { XmlElementError {
+                    message: format!("invalid BPMN element {} at byte {}: {error}", child.local, child.offset),
+                    element_id: child.attr("id").map(str::to_string),
+                    offset: child.offset,
+                }.into() }
+            })?);
+        }
+    }
+    for node in &nodes {
+        let message_ref = match &node.kind {
+            ProcessNodeKind::MessageStart { message_ref, .. }
+            | ProcessNodeKind::MessageCatch { message_ref, .. }
+            | ProcessNodeKind::MessageThrow { message_ref, .. }
+            | ProcessNodeKind::BoundaryMessage { message_ref, .. } => Some(message_ref.as_str()),
+            _ => None,
+        };
+        let error_ref = match &node.kind {
+            ProcessNodeKind::BoundaryError { error_ref, .. } => error_ref.as_deref(),
+            _ => None,
+        };
+        if message_ref.is_some_and(|reference| !messages.iter().any(|declaration| declaration.message_id == reference))
+            || error_ref.is_some_and(|reference| !errors.iter().any(|declaration| declaration.error_id == reference)) {
+            let offset = process.children.iter().find(|child| child.attr("id") == Some(node.id.as_str()))
+                .map_or(process.offset, |child| child.offset);
+            return Err(XmlElementError {
+                message: format!("event {} references an unknown or wrong-type declaration at byte {offset}", node.id),
+                element_id: Some(node.id.clone()), offset,
+            }.into());
         }
     }
     if timer_timezone.is_none() {
@@ -720,6 +955,9 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         timer_timezone,
         work_calendar,
         calendar_pin,
+        messages,
+        errors,
+        target_namespace: (namespace != TF).then(|| namespace.to_string()),
     };
     validate_model(&model).map_err(|error| XmlElementError {
         message: error.to_string(),
@@ -752,9 +990,29 @@ fn escaped(text: &str) -> String {
     quick_xml::escape::escape(text).replace('\r', "&#13;")
 }
 
+fn generated_xml_id(preferred: &str, used: &mut HashSet<String>) -> String {
+    let mut candidate = preferred.to_string();
+    let mut suffix = 2;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{preferred}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
 pub fn export_xml(model: &ProcessModel) -> Result<String> {
     validate_model(model)?;
-    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\" targetNamespace=\"{TF}\"><bpmn:process id=\"{}\" isExecutable=\"true\">",escaped(&model.process_id));
+    let namespace = model.target_namespace.as_deref().unwrap_or(TF);
+    let declarations = !model.messages.is_empty() || !model.errors.is_empty();
+    let tns = if declarations { format!(" xmlns:tns=\"{}\"", escaped(namespace)) } else { String::new() };
+    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns} targetNamespace=\"{}\">", escaped(namespace));
+    for message in &model.messages {
+        xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
+    }
+    for error in &model.errors {
+        xml.push_str(&format!("<bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\"/>", escaped(&error.error_id), escaped(&error.name), escaped(&error.error_code)));
+    }
+    xml.push_str(&format!("<bpmn:process id=\"{}\" isExecutable=\"true\">", escaped(&model.process_id)));
     xml.push_str(&format!(
         "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables>",
         escaped(&serde_json::to_string(&model.variables)?)
@@ -773,14 +1031,27 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         let (tag, extra) = match &node.kind {
             ProcessNodeKind::Start => ("startEvent", String::new()),
             ProcessNodeKind::TimerStart { .. } => ("startEvent", String::new()),
+            ProcessNodeKind::MessageStart { .. } => ("startEvent", String::new()),
             ProcessNodeKind::TimerCatch { .. } => ("intermediateCatchEvent", String::new()),
+            ProcessNodeKind::MessageCatch { .. } => ("intermediateCatchEvent", String::new()),
+            ProcessNodeKind::MessageThrow { .. } => ("intermediateThrowEvent", String::new()),
             ProcessNodeKind::BoundaryTimer { attached_to_id, cancel_activity, .. } => (
                 "boundaryEvent",
                 format!(" attachedToRef=\"{}\" cancelActivity=\"{}\"",
                     escaped(attached_to_id), cancel_activity),
             ),
+            ProcessNodeKind::BoundaryMessage { attached_to_id, cancel_activity, .. } => (
+                "boundaryEvent",
+                format!(" attachedToRef=\"{}\" cancelActivity=\"{}\"", escaped(attached_to_id), cancel_activity),
+            ),
+            ProcessNodeKind::BoundaryError { attached_to_id, .. } => (
+                "boundaryEvent",
+                format!(" attachedToRef=\"{}\" cancelActivity=\"true\"", escaped(attached_to_id)),
+            ),
             ProcessNodeKind::End => ("endEvent", String::new()),
             ProcessNodeKind::ParallelGateway => ("parallelGateway", String::new()),
+            ProcessNodeKind::EventBasedGateway => (
+                "eventBasedGateway", " gatewayDirection=\"Diverging\" eventGatewayType=\"Exclusive\" instantiate=\"false\"".into()),
             ProcessNodeKind::ExclusiveGateway { default_flow_id } => (
                 "exclusiveGateway",
                 default_flow_id
@@ -817,6 +1088,32 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
                 };
                 xml.push_str(&format!("><bpmn:timerEventDefinition>{rule}</bpmn:timerEventDefinition></bpmn:{tag}>"));
             }
+            ProcessNodeKind::MessageStart { message_ref, output_mapping } => {
+                let config = serde_json::json!({ "output_mapping": output_mapping });
+                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
+                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+            }
+            ProcessNodeKind::MessageCatch { message_ref, correlation_expression, output_mapping }
+            | ProcessNodeKind::BoundaryMessage { message_ref, correlation_expression, output_mapping, .. } => {
+                let config = serde_json::json!({ "correlation_expression": correlation_expression, "output_mapping": output_mapping });
+                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
+                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+            }
+            ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
+                let config = serde_json::json!({ "target": target, "correlation_expression": correlation_expression,
+                    "payload_expression": payload_expression, "ttl_seconds": ttl_seconds });
+                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
+                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+            }
+            ProcessNodeKind::BoundaryError { error_ref, output_mapping, .. } => {
+                let reference = error_ref.as_ref().map(|id| format!(" errorRef=\"tns:{}\"", escaped(id))).unwrap_or_default();
+                xml.push_str(&format!("><bpmn:errorEventDefinition{reference}/>"));
+                if !output_mapping.is_empty() {
+                    xml.push_str(&format!("<bpmn:extensionElements><tentaflow:outputMapping>{}</tentaflow:outputMapping></bpmn:extensionElements>",
+                        escaped(&serde_json::to_string(output_mapping)?)));
+                }
+                xml.push_str(&format!("</bpmn:{tag}>"));
+            }
             ProcessNodeKind::UserTask {
                 assignee_user_id,
                 output_mapping,
@@ -845,6 +1142,7 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
                 output_mapping,
                 verification,
                 timeout_seconds,
+                result_expression,
             } => {
                 let verify = if matches!(verification, ActivityVerification::Human) {
                     "human"
@@ -870,6 +1168,9 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
                         escaped(expression)
                     ));
                 }
+                if let Some(expression) = result_expression {
+                    xml.push_str(&format!("<tentaflow:resultExpression>{}</tentaflow:resultExpression>", escaped(expression)));
+                }
                 xml.push_str("</tentaflow:service></bpmn:extensionElements>");
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
@@ -891,14 +1192,23 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     }
     xml.push_str("</bpmn:process>");
     if !model.diagram.shapes.is_empty() || !model.diagram.edges.is_empty() {
-        xml.push_str(&format!("<bpmndi:BPMNDiagram id=\"Diagram_1\"><bpmndi:BPMNPlane id=\"Plane_1\" bpmnElement=\"{}\">",escaped(&model.process_id)));
+        let mut used_ids = HashSet::from([model.process_id.clone()]);
+        used_ids.extend(model.messages.iter().map(|declaration| declaration.message_id.clone()));
+        used_ids.extend(model.errors.iter().map(|declaration| declaration.error_id.clone()));
+        used_ids.extend(model.nodes.iter().map(|node| node.id.clone()));
+        used_ids.extend(model.sequence_flows.iter().map(|flow| flow.id.clone()));
+        let diagram_id = generated_xml_id("Diagram_1", &mut used_ids);
+        let plane_id = generated_xml_id("Plane_1", &mut used_ids);
+        xml.push_str(&format!("<bpmndi:BPMNDiagram id=\"{}\"><bpmndi:BPMNPlane id=\"{}\" bpmnElement=\"{}\">",escaped(&diagram_id),escaped(&plane_id),escaped(&model.process_id)));
         for shape in &model.diagram.shapes {
-            xml.push_str(&format!("<bpmndi:BPMNShape id=\"DI_{}\" bpmnElement=\"{}\"><dc:Bounds x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></bpmndi:BPMNShape>",escaped(&shape.element_id),escaped(&shape.element_id),shape.x,shape.y,shape.width,shape.height));
+            let shape_id = generated_xml_id(&format!("DI_{}", shape.element_id), &mut used_ids);
+            xml.push_str(&format!("<bpmndi:BPMNShape id=\"{}\" bpmnElement=\"{}\"><dc:Bounds x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></bpmndi:BPMNShape>",escaped(&shape_id),escaped(&shape.element_id),shape.x,shape.y,shape.width,shape.height));
         }
         for edge in &model.diagram.edges {
+            let edge_id = generated_xml_id(&format!("DI_{}", edge.sequence_flow_id), &mut used_ids);
             xml.push_str(&format!(
-                "<bpmndi:BPMNEdge id=\"DI_{}\" bpmnElement=\"{}\">",
-                escaped(&edge.sequence_flow_id),
+                "<bpmndi:BPMNEdge id=\"{}\" bpmnElement=\"{}\">",
+                escaped(&edge_id),
                 escaped(&edge.sequence_flow_id)
             ));
             for point in &edge.waypoints {
@@ -922,6 +1232,176 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_and_error_xml_round_trip_preserves_custom_namespace_qnames_and_business_keys() {
+        let mut model = super::super::model::starter_model();
+        model.target_namespace = Some("urn:example:orders:v1".into());
+        model.messages = vec![
+            ProcessMessageDeclaration { message_id: "Message_Start".into(), name: "order.received".into() },
+            ProcessMessageDeclaration { message_id: "Message_Throw".into(), name: "order.sent".into() },
+        ];
+        model.errors = vec![ProcessErrorDeclaration { error_id: "Error_Validation".into(), name: "Bad & <order>".into(), error_code: "BUSINESS.INVALID".into() }];
+        model.nodes[0].kind = ProcessNodeKind::MessageStart { message_ref: "Message_Start".into(),
+            output_mapping: BTreeMap::from([("customer_ID".into(), "outputs.customer_ID".into())]) };
+        model.nodes.push(ProcessNode { id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
+            flow_id: "flow-123".into(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+            verification: ActivityVerification::Human, timeout_seconds: 60,
+            result_expression: Some("vars.business_result".into()),
+        } });
+        model.nodes.push(ProcessNode { id: "Throw_1".into(), name: "Send".into(), kind: ProcessNodeKind::MessageThrow {
+            message_ref: "Message_Throw".into(), target: ProcessMessageTargetSpec::Catch {
+                definition_id: "7c865aaa-febd-4621-9ae6-35977200a0fd".into(),
+                instance_id_expression: Some("vars.instance_ID".into()), subscription_id_expression: None,
+            }, correlation_expression: "vars.customer_ID".into(), payload_expression: "vars.payload".into(), ttl_seconds: 60,
+        } });
+        model.nodes.push(ProcessNode { id: "Boundary_Error".into(), name: "Error".into(), kind: ProcessNodeKind::BoundaryError {
+            attached_to_id: "Service_1".into(), error_ref: Some("Error_Validation".into()), output_mapping: BTreeMap::new(),
+        } });
+        model.sequence_flows[0].target_id = "Service_1".into();
+        for (id, source, target) in [
+            ("Flow_2", "Service_1", "Throw_1"), ("Flow_3", "Throw_1", "End_1"),
+            ("Flow_4", "Boundary_Error", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("targetNamespace=\"urn:example:orders:v1\""));
+        assert!(xml.contains("xmlns:tns=\"urn:example:orders:v1\""));
+        assert!(xml.contains("messageRef=\"tns:Message_Start\""));
+        assert!(xml.contains("errorRef=\"tns:Error_Validation\""));
+        assert!(xml.contains("<tentaflow:resultExpression>vars.business_result</tentaflow:resultExpression>"));
+        let (restored, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(restored, Some(model.clone()));
+
+        let equivalent_prefix = xml.replace("xmlns:tns=", "xmlns:orders=")
+            .replace("tns:Message_", "orders:Message_").replace("tns:Error_", "orders:Error_");
+        assert_eq!(import_xml(&equivalent_prefix).0, Some(model.clone()));
+        for invalid in [
+            xml.replace("tns:Message_Start", "other:Message_Start"),
+            xml.replace("tns:Message_Start", "tns:Error_Validation"),
+            xml.replace("tns:Message_Start", "tns:Missing"),
+            xml.replace("<bpmn:message id=\"Message_Start\"", "<bpmn:message id=\"Flow_1\""),
+        ] {
+            let (parsed, diagnostics) = import_xml(&invalid);
+            assert!(parsed.is_none(), "{invalid}");
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal && diagnostic.offset.is_some()), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn generated_di_ids_avoid_valid_declaration_ids_without_changing_the_model() {
+        for (declaration_id, generated_id) in [
+            ("Diagram_1", "Diagram_1_2"),
+            ("Plane_1", "Plane_1_2"),
+            ("DI_Start_1", "DI_Start_1_2"),
+            ("DI_Flow_1", "DI_Flow_1_2"),
+        ] {
+            let mut model = super::super::model::starter_model();
+            model.target_namespace = Some("urn:example:orders:v1".into());
+            model.messages = vec![ProcessMessageDeclaration {
+                message_id: declaration_id.into(),
+                name: "order.received".into(),
+            }];
+            model.nodes[0].kind = ProcessNodeKind::MessageStart {
+                message_ref: declaration_id.into(),
+                output_mapping: BTreeMap::new(),
+            };
+            model.diagram.shapes.push(ProcessShape {
+                element_id: "Start_1".into(), x: 20.0, y: 30.0, width: 56.0, height: 56.0,
+            });
+            model.diagram.edges.push(ProcessEdgeDiagram {
+                sequence_flow_id: "Flow_1".into(),
+                waypoints: vec![ProcessPoint { x: 76.0, y: 58.0 }, ProcessPoint { x: 180.0, y: 58.0 }],
+            });
+            let xml = export_xml(&model).unwrap();
+            assert!(xml.contains(&format!("<bpmn:message id=\"{declaration_id}\"")));
+            assert!(xml.contains(&format!("id=\"{generated_id}\"")), "{xml}");
+            let (restored, diagnostics) = import_xml(&xml);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(restored, Some(model));
+        }
+
+        let mut plain = super::super::model::starter_model();
+        plain.diagram.shapes.push(ProcessShape {
+            element_id: "Start_1".into(), x: 20.0, y: 30.0, width: 56.0, height: 56.0,
+        });
+        let xml = export_xml(&plain).unwrap();
+        assert!(xml.contains("<bpmndi:BPMNDiagram id=\"Diagram_1\"><bpmndi:BPMNPlane id=\"Plane_1\""));
+        assert!(xml.contains("<bpmndi:BPMNShape id=\"DI_Start_1\" bpmnElement=\"Start_1\""));
+    }
+
+    #[test]
+    fn import_rejects_duplicate_bpmn_and_di_ids_with_element_and_byte_context() {
+        let mut model = super::super::model::starter_model();
+        model.target_namespace = Some("urn:example:orders:v1".into());
+        model.messages = vec![ProcessMessageDeclaration {
+            message_id: "Diagram_1".into(), name: "order.received".into(),
+        }];
+        model.nodes[0].kind = ProcessNodeKind::MessageStart {
+            message_ref: "Diagram_1".into(), output_mapping: BTreeMap::new(),
+        };
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "Start_1".into(), x: 20.0, y: 30.0, width: 56.0, height: 56.0,
+        });
+        let xml = export_xml(&model).unwrap();
+        for (duplicate, id) in [
+            (xml.replace("<bpmndi:BPMNDiagram id=\"Diagram_1_2\"", "<bpmndi:BPMNDiagram id=\"Diagram_1\""), "Diagram_1"),
+            (xml.replace("<bpmndi:BPMNShape id=\"DI_Start_1\"", "<bpmndi:BPMNShape id=\"Start_1\""), "Start_1"),
+        ] {
+            let (parsed, diagnostics) = import_xml(&duplicate);
+            assert!(parsed.is_none());
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].fatal);
+            assert_eq!(diagnostics[0].element_id.as_deref(), Some(id));
+            assert!(diagnostics[0].offset.is_some());
+            assert!(diagnostics[0].message.contains("duplicate XML ID"));
+        }
+    }
+
+    #[test]
+    fn message_race_and_boundary_xml_round_trip_rejects_duplicate_extensions_with_context() {
+        let mut model = super::super::model::starter_model();
+        model.messages = vec![ProcessMessageDeclaration { message_id: "Message_1".into(), name: "order.received".into() }];
+        model.nodes.extend([
+            ProcessNode { id: "Race_1".into(), name: "First arrival".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { id: "Catch_A".into(), name: "First".into(), kind: ProcessNodeKind::MessageCatch {
+                message_ref: "Message_1".into(), correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
+            } },
+            ProcessNode { id: "Catch_B".into(), name: "Second".into(), kind: ProcessNodeKind::MessageCatch {
+                message_ref: "Message_1".into(), correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
+            } },
+            ProcessNode { id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
+                flow_id: "flow-123".into(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+                verification: ActivityVerification::Human, timeout_seconds: 60, result_expression: None,
+            } },
+            ProcessNode { id: "Boundary_1".into(), name: "Reminder".into(), kind: ProcessNodeKind::BoundaryMessage {
+                attached_to_id: "Service_1".into(), cancel_activity: false, message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
+            } },
+        ]);
+        model.sequence_flows[0].target_id = "Race_1".into();
+        for (id, source, target) in [
+            ("Flow_2", "Race_1", "Catch_A"), ("Flow_3", "Race_1", "Catch_B"),
+            ("Flow_4", "Catch_A", "Service_1"), ("Flow_5", "Service_1", "End_1"),
+            ("Flow_6", "Catch_B", "End_1"), ("Flow_7", "Boundary_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:eventBasedGateway id=\"Race_1\""));
+        assert!(xml.contains("cancelActivity=\"false\""));
+        assert_eq!(import_xml(&xml).0, Some(model));
+
+        let duplicate = xml.replacen("</tentaflow:message>",
+            "</tentaflow:message><tentaflow:message>{}</tentaflow:message>", 1);
+        let (parsed, diagnostics) = import_xml(&duplicate);
+        assert!(parsed.is_none());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].fatal && diagnostics[0].offset.is_some());
+        assert_eq!(diagnostics[0].element_id.as_deref(), Some("Catch_A"));
+    }
 
     #[test]
     fn working_calendar_xml_round_trips_without_changing_opaque_variables() {
@@ -1169,6 +1649,7 @@ mod tests {
                             .into(),
                 },
                 timeout_seconds: 60,
+                result_expression: None,
             },
         });
         model.sequence_flows[0].target_id = "Review_1".into();
@@ -1304,6 +1785,7 @@ mod tests {
                     expression: "vars.x".into(),
                 },
                 timeout_seconds: 60,
+                result_expression: None,
             },
         });
         model.sequence_flows[0].target_id = "Service_1".into();

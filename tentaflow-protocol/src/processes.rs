@@ -20,6 +20,40 @@ pub struct ProcessModel {
     pub work_calendar: Option<ProcessWorkCalendar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar_pin: Option<ProcessCalendarPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<ProcessMessageDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ProcessErrorDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMessageDeclaration {
+    pub message_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessErrorDeclaration {
+    pub error_id: String,
+    pub name: String,
+    pub error_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessMessageTargetSpec {
+    Start { definition_id: String },
+    Catch {
+        definition_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id_expression: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subscription_id_expression: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +185,8 @@ pub enum ProcessNodeKind {
         output_mapping: BTreeMap<String, String>,
         verification: ActivityVerification,
         timeout_seconds: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_expression: Option<String>,
     },
     ExclusiveGateway {
         default_flow_id: Option<String>,
@@ -166,6 +202,35 @@ pub enum ProcessNodeKind {
         attached_to_id: String,
         cancel_activity: bool,
         timer: ProcessTimerSpec,
+    },
+    MessageStart {
+        message_ref: String,
+        output_mapping: BTreeMap<String, String>,
+    },
+    MessageCatch {
+        message_ref: String,
+        correlation_expression: String,
+        output_mapping: BTreeMap<String, String>,
+    },
+    MessageThrow {
+        message_ref: String,
+        target: ProcessMessageTargetSpec,
+        correlation_expression: String,
+        payload_expression: String,
+        ttl_seconds: u32,
+    },
+    BoundaryMessage {
+        attached_to_id: String,
+        cancel_activity: bool,
+        message_ref: String,
+        correlation_expression: String,
+        output_mapping: BTreeMap<String, String>,
+    },
+    EventBasedGateway,
+    BoundaryError {
+        attached_to_id: String,
+        error_ref: Option<String>,
+        output_mapping: BTreeMap<String, String>,
     },
 }
 
@@ -438,6 +503,197 @@ pub struct ProcessIncident {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessMessageTarget {
+    Start { definition_id: String },
+    Catch {
+        definition_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subscription_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessMessageStatus {
+    Pending,
+    Blocked,
+    Ambiguous,
+    Delivered,
+    Expired,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessMessageOrigin {
+    Api,
+    Process,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessSubscriptionKind {
+    MessageCatch,
+    BoundaryMessage,
+    BoundaryError,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessSubscriptionStatus {
+    Open,
+    Consumed,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessEventRaceStatus {
+    Open,
+    Won,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMessageSummary {
+    pub message_id: String,
+    pub sender_user_id: String,
+    pub origin: ProcessMessageOrigin,
+    pub target: ProcessMessageTarget,
+    pub message_name: String,
+    pub correlation_key: String,
+    pub revision: u64,
+    pub status: ProcessMessageStatus,
+    pub received_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub delivered_at_ms: Option<i64>,
+    pub matched_instance_id: Option<String>,
+    pub matched_version: Option<u32>,
+    pub matched_subscription_id: Option<String>,
+    pub source_instance_id: Option<String>,
+    pub source_node_id: Option<String>,
+    pub last_reason: Option<String>,
+    pub payload_sha256: String,
+    pub payload_bytes: u32,
+    pub payload_available: bool,
+    pub can_resolve: bool,
+    pub can_cancel: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMessageDetail {
+    pub message: ProcessMessageSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_present_message_payload")]
+    pub payload: Option<Value>,
+}
+
+fn deserialize_present_message_payload<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessPageSpec {
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessPageInfo {
+    pub offset: u32,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessInstancePageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_tasks: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incidents: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timers: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriptions: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_races: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing_messages: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_user_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_incident_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessInstancePageInfo {
+    pub user_tasks: ProcessPageInfo,
+    pub incidents: ProcessPageInfo,
+    pub timers: ProcessPageInfo,
+    pub subscriptions: ProcessPageInfo,
+    pub event_races: ProcessPageInfo,
+    pub outgoing_messages: ProcessPageInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIncidentSelection {
+    pub incident: ProcessIncident,
+    pub resolved_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMessageStartSummary {
+    pub node_id: String,
+    pub node_name: String,
+    pub message_name: String,
+    pub version: u32,
+    pub can_send: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSubscriptionSummary {
+    pub subscription_id: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub token_id: String,
+    pub kind: ProcessSubscriptionKind,
+    pub status: ProcessSubscriptionStatus,
+    pub revision: u64,
+    pub message_name: Option<String>,
+    pub correlation_key: Option<String>,
+    pub error_code: Option<String>,
+    pub attached_to_id: Option<String>,
+    pub race_id: Option<String>,
+    pub last_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessEventRaceSummary {
+    pub race_id: String,
+    pub gateway_node_id: String,
+    pub gateway_name: String,
+    pub status: ProcessEventRaceStatus,
+    pub revision: u64,
+    pub winner_node_id: Option<String>,
+    pub branch_subscription_ids: Vec<String>,
+    pub branch_timer_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessInstance {
     pub instance_id: String,
     pub definition_id: String,
@@ -456,6 +712,22 @@ pub struct ProcessInstance {
     pub can_retry: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timers: Vec<ProcessTimerSummary>,
+    #[serde(default)]
+    pub subscriptions: Vec<ProcessSubscriptionSummary>,
+    #[serde(default)]
+    pub event_races: Vec<ProcessEventRaceSummary>,
+    #[serde(default)]
+    pub outgoing_messages: Vec<ProcessMessageSummary>,
+    #[serde(default)]
+    pub message_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_send_message: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<ProcessInstancePageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_user_task: Option<ProcessUserTaskSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_incident: Option<ProcessIncidentSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -564,6 +836,8 @@ pub enum ProcessPayload {
         definition: ProcessDefinition,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timer_start: Option<ProcessTimerSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_start: Option<ProcessMessageStartSummary>,
     },
     DefinitionSaveRequest {
         command_id: String,
@@ -648,6 +922,8 @@ pub enum ProcessPayload {
     },
     InstanceGetRequest {
         instance_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pages: Option<ProcessInstancePageRequest>,
     },
     InstanceGetResponse {
         instance: ProcessInstance,
@@ -697,11 +973,143 @@ pub enum ProcessPayload {
     UserTaskGetResponse {
         task: ProcessUserTask,
     },
+    MessageSendRequest {
+        command_id: String,
+        message_id: String,
+        target: ProcessMessageTarget,
+        message_name: String,
+        correlation_key: String,
+        payload: Value,
+        ttl_seconds: u32,
+    },
+    MessageSendResponse {
+        message: ProcessMessageSummary,
+    },
+    MessageGetRequest {
+        sender_user_id: String,
+        message_id: String,
+    },
+    MessageGetResponse {
+        message: ProcessMessageDetail,
+    },
+    MessageListRequest {
+        definition_id: Option<String>,
+        instance_id: Option<String>,
+        offset: u32,
+        limit: u32,
+    },
+    MessageListResponse {
+        messages: Vec<ProcessMessageSummary>,
+        total: u32,
+        has_more: bool,
+    },
+    MessageResolveRequest {
+        command_id: String,
+        message_id: String,
+        expected_revision: u64,
+        instance_id: String,
+        subscription_id: String,
+    },
+    MessageResolveResponse {
+        message: ProcessMessageSummary,
+    },
+    MessageCancelRequest {
+        command_id: String,
+        message_id: String,
+        expected_revision: u64,
+    },
+    MessageCancelResponse {
+        message: ProcessMessageSummary,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_variants_round_trip_without_rewriting_opaque_payload_or_old_model_bytes() {
+        let old = ProcessModel {
+            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
+            sequence_flows: Vec::new(), variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+            timer_timezone: None, work_calendar: None, calendar_pin: None,
+            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
+        };
+        assert_eq!(serde_json::to_string(&old).unwrap(),
+            "{\"schema_version\":1,\"process_id\":\"P_1\",\"nodes\":[],\"sequence_flows\":[],\"variables\":{},\"diagram\":{\"shapes\":[],\"edges\":[]}}");
+        let mut model = old;
+        model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "order.received".into() });
+        model.errors.push(ProcessErrorDeclaration { error_id: "Error_1".into(), name: "Validation".into(), error_code: "BUSINESS.INVALID".into() });
+        model.target_namespace = Some("urn:example:orders".into());
+        model.nodes.push(ProcessNode { id: "Start_1".into(), name: "Start".into(), kind: ProcessNodeKind::MessageStart {
+            message_ref: "Message_1".into(), output_mapping: BTreeMap::from([("business_key".into(), "outputs.customer_ID".into())]),
+        } });
+        for kind in [
+            ProcessNodeKind::MessageCatch { message_ref: "Message_1".into(), correlation_expression: "vars.case_id".into(), output_mapping: BTreeMap::new() },
+            ProcessNodeKind::MessageThrow { message_ref: "Message_1".into(), target: ProcessMessageTargetSpec::Catch {
+                definition_id: "7c865aaa-febd-4621-9ae6-35977200a0fd".into(), instance_id_expression: None, subscription_id_expression: None,
+            }, correlation_expression: "vars.case_id".into(), payload_expression: "vars.payload".into(), ttl_seconds: 60 },
+            ProcessNodeKind::BoundaryMessage { attached_to_id: "Task_1".into(), cancel_activity: false, message_ref: "Message_1".into(), correlation_expression: "vars.case_id".into(), output_mapping: BTreeMap::new() },
+            ProcessNodeKind::EventBasedGateway,
+            ProcessNodeKind::BoundaryError { attached_to_id: "Task_1".into(), error_ref: Some("Error_1".into()), output_mapping: BTreeMap::new() },
+        ] {
+            model.nodes.push(ProcessNode { id: format!("Node_{}", model.nodes.len()), name: String::new(), kind });
+        }
+        assert_eq!(crate::cbor::decode::<ProcessModel>(&crate::cbor::encode(&model).unwrap()).unwrap(), model);
+        let request = ProcessPayload::MessageSendRequest { command_id: "cmd".into(), message_id: "msg".into(),
+            target: ProcessMessageTarget::Start { definition_id: "def".into() }, message_name: "order.received".into(),
+            correlation_key: "key".into(), payload: serde_json::json!({"customer_ID":{"attached_to_id":null}}), ttl_seconds: 60 };
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&request).unwrap()).unwrap(), request);
+        assert!(serde_json::from_value::<ProcessMessageDeclaration>(serde_json::json!({"message_id":"M","name":"N","unknown":true})).is_err());
+        assert!(serde_json::from_value::<ProcessMessageTargetSpec>(serde_json::json!({"Start":{"definition_id":"d","instance_id_expression":"x"}})).is_err());
+    }
+
+    #[test]
+    fn available_json_null_message_payload_remains_distinct_from_unavailable_payload() {
+        let summary = ProcessMessageSummary {
+            message_id: "m".into(), sender_user_id: "u".into(), origin: ProcessMessageOrigin::Api,
+            target: ProcessMessageTarget::Start { definition_id: "d".into() },
+            message_name: "order.received".into(), correlation_key: "key".into(), revision: 1,
+            status: ProcessMessageStatus::Pending, received_at_ms: 1, expires_at_ms: 2,
+            updated_at_ms: 1, delivered_at_ms: None, matched_instance_id: None,
+            matched_version: None, matched_subscription_id: None, source_instance_id: None,
+            source_node_id: None, last_reason: None, payload_sha256: "sha".into(),
+            payload_bytes: 4, payload_available: true, can_resolve: false, can_cancel: true,
+        };
+        let available = ProcessMessageDetail { message: summary.clone(), payload: Some(Value::Null) };
+        let bytes = crate::cbor::encode(&available).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessMessageDetail>(&bytes).unwrap(), available);
+        assert!(serde_json::to_value(&available).unwrap().get("payload").is_some());
+        let unavailable = ProcessMessageDetail { message: ProcessMessageSummary {
+            payload_available: false, ..summary
+        }, payload: None };
+        let bytes = crate::cbor::encode(&unavailable).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessMessageDetail>(&bytes).unwrap(), unavailable);
+        assert!(serde_json::to_value(&unavailable).unwrap().get("payload").is_none());
+    }
+
+    #[test]
+    fn empty_instance_message_collections_remain_required_arrays_on_the_wire() {
+        let instance: ProcessInstance = serde_json::from_value(serde_json::json!({
+            "instance_id": "i1", "definition_id": "d1", "definition_name": "Approval",
+            "initiator_user_id": "u1", "version": 1, "revision": 1,
+            "status": "Running", "variables": {}, "active_node_ids": [],
+            "user_tasks": [], "incidents": [], "created_at_ms": 1,
+            "updated_at_ms": 1, "can_cancel": true, "can_retry": false,
+            "can_send_message": true
+        })).unwrap();
+        let body = crate::message_body::MessageBody::ProcessBody(
+            ProcessPayload::InstanceGetResponse { instance },
+        );
+        let decoded: crate::message_body::MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&body).unwrap()).unwrap();
+        let json = serde_json::to_value(decoded).unwrap();
+        let instance = &json["ProcessBody"]["InstanceGetResponse"]["instance"];
+        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names"] {
+            assert_eq!(instance[field], serde_json::json!([]), "{field} must be an array");
+        }
+        assert_eq!(instance["can_send_message"], true);
+    }
 
     #[test]
     fn timer_rules_round_trip_and_timerless_model_omits_new_fields() {
@@ -710,6 +1118,7 @@ mod tests {
             sequence_flows: Vec::new(), variables: BTreeMap::new(),
             diagram: ProcessDiagram::default(), timer_timezone: None,
             work_calendar: None, calendar_pin: None,
+            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
         };
         let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
         assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
@@ -783,6 +1192,9 @@ mod tests {
                 timer_timezone: None,
                 work_calendar: None,
                 calendar_pin: None,
+                messages: Vec::new(),
+                errors: Vec::new(),
+                target_namespace: None,
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();

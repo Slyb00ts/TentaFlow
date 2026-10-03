@@ -8,17 +8,23 @@ const ELEMENTS = [
   ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
   ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
   ['BoundaryTimer', 'boundary_timer', 'clock', 'events', 56, 56],
+  ['MessageStart', 'message_start', 'play', 'events', 56, 56],
+  ['MessageCatch', 'message_catch', 'mail', 'events', 56, 56],
+  ['MessageThrow', 'message_throw', 'send', 'events', 56, 56],
+  ['BoundaryMessage', 'boundary_message', 'mail', 'events', 56, 56],
+  ['BoundaryError', 'boundary_error', 'alert-triangle', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
   ['ParallelGateway', 'parallel_gateway', 'plus', 'gateways', 72, 72],
+  ['EventBasedGateway', 'event_based_gateway', 'branch', 'gateways', 72, 72],
 ];
 
 export function processTemplates() {
   return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: ['Start', 'TimerStart', 'BoundaryTimer'].includes(kind) ? [] : ['in'],
+    input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind) ? [] : ['in'],
     output_ports: kind === 'End' ? [] : ['full'],
     width, height,
   }));
@@ -36,11 +42,26 @@ export function processNodeConfig(kind) {
   if (kind === 'ExclusiveGateway') return { defaultFlowId: null };
   if (kind === 'TimerStart' || kind === 'TimerCatch') return { timer: { Duration: { seconds: 60 } } };
   if (kind === 'BoundaryTimer') return { attachedToId: null, cancelActivity: true, timer: { Duration: { seconds: 60 } } };
+  if (kind === 'MessageStart') return { messageRef: '', outputMapping: {} };
+  if (kind === 'MessageCatch') return { messageRef: '', correlationExpression: '', outputMapping: {} };
+  if (kind === 'MessageThrow') return { messageRef: '', target: { Start: { definitionId: '' } },
+    correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
+  if (kind === 'BoundaryMessage') return { attachedToId: '', cancelActivity: true,
+    messageRef: '', correlationExpression: '', outputMapping: {} };
+  if (kind === 'BoundaryError') return { attachedToId: '', errorRef: null, outputMapping: {} };
   return {};
 }
 
 export function processHasTimerStart(model) {
   return model.nodes.some((node) => typeof node.kind === 'object' && 'TimerStart' in node.kind);
+}
+
+export function processHasMessageStart(model) {
+  return model.nodes.some((node) => typeof node.kind === 'object' && 'MessageStart' in node.kind);
+}
+
+export function processBoundaryKind(type) {
+  return ['bpmn_boundary_timer', 'bpmn_boundary_message', 'bpmn_boundary_error'].includes(type);
 }
 
 export function emptyProcessModel() {
@@ -71,10 +92,10 @@ export function processToCanvas(model) {
   });
   const byId = new Map(nodes.map((node) => [node.id, node]));
   for (const node of nodes) {
-    if (node.type !== 'bpmn_boundary_timer' || shapes.has(node.id)) continue;
+    if (!processBoundaryKind(node.type) || shapes.has(node.id)) continue;
     const parent = byId.get(node.config.attachedToId);
     if (!parent) continue;
-    const siblings = nodes.filter((candidate) => candidate.type === 'bpmn_boundary_timer' && candidate.config.attachedToId === parent.id);
+    const siblings = nodes.filter((candidate) => processBoundaryKind(candidate.type) && candidate.config.attachedToId === parent.id);
     const angle = Math.PI / 4 + siblings.indexOf(node) * 2 * Math.PI / siblings.length;
     const dx = Math.cos(angle), dy = Math.sin(angle);
     const scale = 1 / Math.max(Math.abs(dx) / (parent.width / 2), Math.abs(dy) / (parent.height / 2));
@@ -95,10 +116,13 @@ export function canvasToProcess(model, nodes, edges, edgePoints) {
     ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
     ...(model.workCalendar == null ? {} : { workCalendar: structuredClone(model.workCalendar) }),
     ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
+    ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
+    ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
+    ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
-        kind: ['Start', 'End', 'ParallelGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) } };
+        kind: ['Start', 'End', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) } };
     }),
     sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null })),
     diagram: { shapes: nodes.map((node) => ({ elementId: node.id, x: node.x, y: node.y, width: node.width, height: node.height })),

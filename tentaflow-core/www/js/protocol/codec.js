@@ -394,6 +394,47 @@ function processTimerSpec(timer) {
   return { Daily: { hour: Number(body.hour), minute: Number(body.minute), total_firings: body.totalFirings == null ? null : Number(body.totalFirings) } };
 }
 
+function processMessageTarget(target, expressionTarget = false) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) throw new TypeError('message target is required');
+  const entries = Object.entries(target);
+  if (entries.length !== 1) throw new TypeError('message target requires one kind');
+  const [tag, body] = entries[0];
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('message target body is required');
+  if (tag === 'Start') {
+    processKnownFields(body, ['definitionId'], 'message start target');
+    return { Start: { definition_id: body.definitionId } };
+  }
+  if (tag === 'Catch') {
+    const names = expressionTarget
+      ? ['definitionId', 'instanceIdExpression', 'subscriptionIdExpression']
+      : ['definitionId', 'instanceId', 'subscriptionId'];
+    processKnownFields(body, names, 'message catch target');
+    return expressionTarget
+      ? { Catch: { definition_id: body.definitionId, instance_id_expression: body.instanceIdExpression ?? null,
+        subscription_id_expression: body.subscriptionIdExpression ?? null } }
+      : { Catch: { definition_id: body.definitionId, instance_id: body.instanceId ?? null,
+        subscription_id: body.subscriptionId ?? null } };
+  }
+  throw new TypeError(`unsupported message target ${tag}`);
+}
+
+function processInstancePages(pages) {
+  if (pages == null) return null;
+  processKnownFields(pages, ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces',
+    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId'], 'process detail pages');
+  const mapped = {};
+  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages']) {
+    if (pages[name] == null) continue;
+    processKnownFields(pages[name], ['offset', 'limit'], 'process page');
+    mapped[name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)] = {
+      offset: pages[name].offset, limit: pages[name].limit,
+    };
+  }
+  if (pages.selectedUserTaskId != null) mapped.selected_user_task_id = pages.selectedUserTaskId;
+  if (pages.selectedIncidentId != null) mapped.selected_incident_id = pages.selectedIncidentId;
+  return mapped;
+}
+
 function processModel(model) {
   if (!model || typeof model !== 'object') throw new TypeError('process model is required');
   const nodes = (model.nodes ?? []).map((node) => {
@@ -415,7 +456,8 @@ function processModel(model) {
         input_mapping: processField(body, 'inputMapping') ?? {},
         output_mapping: processField(body, 'outputMapping') ?? {},
         verification: verified ?? 'Human',
-        timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60) };
+        timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
+        ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }) };
     } else if (tag === 'ExclusiveGateway') {
       fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };
     } else if (tag === 'TimerStart' || tag === 'TimerCatch') {
@@ -433,6 +475,27 @@ function processModel(model) {
         throw new TypeError('boundary timer supports Date, Duration or WorkingDuration only');
       }
       fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity, timer };
+    } else if (tag === 'MessageStart') {
+      processKnownFields(body, ['messageRef', 'outputMapping'], 'message start');
+      fields = { message_ref: body.messageRef, output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'MessageCatch') {
+      processKnownFields(body, ['messageRef', 'correlationExpression', 'outputMapping'], 'message catch');
+      fields = { message_ref: body.messageRef, correlation_expression: body.correlationExpression,
+        output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'MessageThrow') {
+      processKnownFields(body, ['messageRef', 'target', 'correlationExpression', 'payloadExpression', 'ttlSeconds'], 'message throw');
+      fields = { message_ref: body.messageRef, target: processMessageTarget(body.target, true),
+        correlation_expression: body.correlationExpression, payload_expression: body.payloadExpression,
+        ttl_seconds: body.ttlSeconds };
+    } else if (tag === 'BoundaryMessage') {
+      processKnownFields(body, ['attachedToId', 'cancelActivity', 'messageRef', 'correlationExpression', 'outputMapping'], 'boundary message');
+      fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity,
+        message_ref: body.messageRef, correlation_expression: body.correlationExpression,
+        output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'BoundaryError') {
+      processKnownFields(body, ['attachedToId', 'errorRef', 'outputMapping'], 'boundary error');
+      fields = { attached_to_id: body.attachedToId, error_ref: body.errorRef ?? null,
+        output_mapping: body.outputMapping ?? {} };
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }
@@ -452,6 +515,15 @@ function processModel(model) {
     timer_timezone: processField(model, 'timerTimezone') ?? null,
     ...(model.workCalendar == null ? {} : { work_calendar: processWorkCalendar(model.workCalendar) }),
     ...(model.calendarPin == null ? {} : { calendar_pin: processCalendarPin(model.calendarPin) }),
+    ...(model.messages?.length ? { messages: model.messages.map((message) => {
+      processKnownFields(message, ['messageId', 'name'], 'message declaration');
+      return { message_id: message.messageId, name: message.name };
+    }) } : {}),
+    ...(model.errors?.length ? { errors: model.errors.map((error) => {
+      processKnownFields(error, ['errorId', 'name', 'errorCode'], 'error declaration');
+      return { error_id: error.errorId, name: error.name, error_code: error.errorCode };
+    }) } : {}),
+    ...(model.targetNamespace == null ? {} : { target_namespace: model.targetNamespace }),
     diagram: {
       shapes: (diagram.shapes ?? []).map((shape) => ({
         element_id: String(processField(shape, 'elementId') ?? ''),
@@ -476,21 +548,31 @@ function processRequestBody(variant, payload) {
     VersionListRequest: ['definitionId', 'offset', 'limit'], VersionGetRequest: ['definitionId', 'version'],
     XmlImportRequest: ['xml'], XmlExportRequest: ['definitionId', 'version'],
     InstanceStartRequest: ['commandId', 'definitionId', 'version', 'variables'],
-    InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId'],
+    InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId', 'pages'],
     UserTaskGetRequest: ['instanceId', 'userTaskId'],
     UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
     InstanceCancelRequest: ['commandId', 'instanceId', 'expectedRevision'],
     JobRetryRequest: ['commandId', 'instanceId', 'jobId', 'expectedRevision'],
     HistoryRequest: ['instanceId', 'afterSeq', 'limit'],
+    MessageSendRequest: ['commandId', 'messageId', 'target', 'messageName', 'correlationKey', 'payload', 'ttlSeconds'],
+    MessageGetRequest: ['senderUserId', 'messageId'],
+    MessageListRequest: ['definitionId', 'instanceId', 'offset', 'limit'],
+    MessageResolveRequest: ['commandId', 'messageId', 'expectedRevision', 'instanceId', 'subscriptionId'],
+    MessageCancelRequest: ['commandId', 'messageId', 'expectedRevision'],
   }[variant];
   if (!fieldNames) throw new TypeError(`unknown process request ${variant}`);
   for (const name of fieldNames) {
     const key = name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
     const value = processField(payload, name);
-    if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)) {
+    if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)
+      && !(variant === 'InstanceGetRequest' && name === 'pages')
+      && !(variant === 'MessageListRequest' && name === 'instanceId')) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
-    fields[key] = name === 'model' ? processModel(value) : (value ?? null);
+    fields[key] = name === 'model' ? processModel(value)
+      : (name === 'pages' ? processInstancePages(value)
+        : (name === 'target' ? processMessageTarget(value)
+          : (value ?? null)));
   }
   return _wasm.encodeProcessRequest(variant, JSON.stringify(fields));
 }
@@ -557,6 +639,21 @@ export const encode = {
   },
   processHistoryRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'HistoryRequest', payload);
+  },
+  processMessageSendRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'MessageSendRequest', payload);
+  },
+  processMessageGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'MessageGetRequest', payload);
+  },
+  processMessageListRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'MessageListRequest', payload);
+  },
+  processMessageResolveRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'MessageResolveRequest', payload);
+  },
+  processMessageCancelRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'MessageCancelRequest', payload);
   },
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {

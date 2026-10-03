@@ -148,3 +148,41 @@ test('disabled: rows render without a remove button and inputs carry disabled', 
   assert.equal(row.querySelector('[data-field="key"]').hasAttribute('disabled'), true);
   assert.equal(row.querySelector('[data-field="value"]').hasAttribute('disabled'), true);
 });
+
+test('multiline rows preserve long keys and CEL expressions through edits, add/remove and disabled', () => {
+  const el = mount();
+  el.setAttribute('multiline', '');
+  el.setAttribute('key-placeholder', 'Mapping key');
+  el.setAttribute('value-placeholder', 'CEL expression');
+  const key = 'Business_contract_identifier_'.repeat(12);
+  const expression = 'vars.Order_ID == "approved" && vars.Customer_ID != null '.repeat(10);
+  el.value = { [key]: expression };
+  const first = rowEls(el)[0];
+  const keyField = first.querySelector('tf-textarea[data-field="key"]');
+  const valueField = first.querySelector('tf-textarea[data-field="value"]');
+  assert.ok(el.querySelector('.tf-kve--multiline'));
+  assert.equal(keyField.getAttribute('autogrow'), '');
+  assert.equal(valueField.getAttribute('autogrow'), '');
+  assert.equal(keyField.querySelector('textarea').getAttribute('aria-label'), 'Mapping key');
+  assert.equal(valueField.querySelector('textarea').getAttribute('aria-label'), 'CEL expression');
+  assert.deepEqual(el.value, { [key]: expression });
+
+  const changes = [];
+  el.addEventListener('change', (event) => changes.push(event.detail.value));
+  valueField.value = expression + ' && vars.Result_OK';
+  valueField.querySelector('textarea').dispatchEvent(new window.Event('change', { bubbles: true }));
+  assert.deepEqual(changes.at(-1), { [key]: expression + ' && vars.Result_OK' });
+  el._addRow();
+  assert.equal(rowEls(el).length, 2);
+  assert.deepEqual(el.value, { [key]: expression + ' && vars.Result_OK' });
+  rowEls(el)[1].querySelector('[data-field="key"]').value = 'temporary';
+  rowEls(el)[1].querySelector('[data-action="remove-row"]').click();
+  assert.deepEqual(el.value, { [key]: expression + ' && vars.Result_OK' });
+  el.disabled = true;
+  assert.equal(rowEls(el)[0].querySelectorAll('tf-textarea[disabled]').length, 2);
+  assert.equal(rowEls(el)[0].querySelector('[data-action="remove-row"]'), null);
+  el.disabled = false;
+  el.removeAttribute('multiline');
+  assert.equal(rowEls(el)[0].querySelectorAll('tf-input').length, 2);
+  assert.deepEqual(el.value, { [key]: expression + ' && vars.Result_OK' });
+});

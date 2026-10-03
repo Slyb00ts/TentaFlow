@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processNodeKind, processNodeConfig } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -99,7 +99,7 @@ function markUnsupported(node, ports, side) {
 
 function portsForNode(node, template) {
   if (node.type.startsWith('bpmn_')) {
-    return { inputs: ['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(node.type) ? [] : [{ name: 'in', type: 'any' }],
+    return { inputs: (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(node.type) || processBoundaryKind(node.type)) ? [] : [{ name: 'in', type: 'any' }],
       outputs: node.type === 'bpmn_end' ? [] : [{ name: 'full', type: 'any' }] };
   }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
@@ -438,7 +438,7 @@ export class FlowCanvas {
         if (kind === 'Date' && (!timer.at || !timer.at.trim())) {
           errors.push(I18n.t('bpmn.timer_date_required', { node: node.label || node.id }));
         }
-        if (node.type === 'bpmn_boundary_timer') {
+        if (processBoundaryKind(node.type)) {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
           if (!parent || !['bpmn_user_task', 'bpmn_service_task'].includes(parent.type)) {
             errors.push(I18n.t('bpmn.boundary_required'));
@@ -624,7 +624,9 @@ export class FlowCanvas {
     this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
       ...(this.mode === 'bpmn' ? { timerTimezone: this.processModel.timerTimezone ?? null,
         workCalendar: this.processModel.workCalendar ?? null,
-        calendarPin: this.processModel.calendarPin ?? null } : {}) }));
+        calendarPin: this.processModel.calendarPin ?? null,
+        messages: this.processModel.messages ?? [], errors: this.processModel.errors ?? [],
+        targetNamespace: this.processModel.targetNamespace ?? null } : {}) }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -643,6 +645,10 @@ export class FlowCanvas {
       else this.processModel.workCalendar = snap.workCalendar;
       if (snap.calendarPin === null) delete this.processModel.calendarPin;
       else this.processModel.calendarPin = snap.calendarPin;
+      this.processModel.messages = snap.messages;
+      this.processModel.errors = snap.errors;
+      if (snap.targetNamespace === null) delete this.processModel.targetNamespace;
+      else this.processModel.targetNamespace = snap.targetNamespace;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -664,6 +670,10 @@ export class FlowCanvas {
       else this.processModel.workCalendar = snap.workCalendar;
       if (snap.calendarPin === null) delete this.processModel.calendarPin;
       else this.processModel.calendarPin = snap.calendarPin;
+      this.processModel.messages = snap.messages;
+      this.processModel.errors = snap.errors;
+      if (snap.targetNamespace === null) delete this.processModel.targetNamespace;
+      else this.processModel.targetNamespace = snap.targetNamespace;
     }
     this.render();
     this.onChange();
@@ -688,6 +698,16 @@ export class FlowCanvas {
     } else {
       this.processModel.workCalendar = structuredClone(calendar);
     }
+    this._pushHistory();
+    this.onChange();
+  }
+
+  updateProcessDeclarations({ messages, errors, targetNamespace }) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    this.processModel.messages = structuredClone(messages);
+    this.processModel.errors = structuredClone(errors);
+    if (targetNamespace) this.processModel.targetNamespace = targetNamespace;
+    else delete this.processModel.targetNamespace;
     this._pushHistory();
     this.onChange();
   }
@@ -746,7 +766,7 @@ export class FlowCanvas {
     }
     if (!changed) return;
     n.config = { ...n.config, ...patch };
-    if (this.mode === 'bpmn' && n.type === 'bpmn_boundary_timer' && Object.hasOwn(patch, 'attachedToId')) {
+    if (this.mode === 'bpmn' && processBoundaryKind(n.type) && Object.hasOwn(patch, 'attachedToId')) {
       this._positionBoundary(n);
     }
     this._pushHistory();
@@ -771,7 +791,7 @@ export class FlowCanvas {
       sides.sort((left, right) => left[0] - right[0]);
       [, x, y] = sides[0];
     }
-    const occupied = this.nodes.filter((candidate) => candidate !== node && candidate.type === 'bpmn_boundary_timer'
+    const occupied = this.nodes.filter((candidate) => candidate !== node && processBoundaryKind(candidate.type)
       && candidate.config.attachedToId === parent.id);
     if (occupied.some((candidate) => Math.hypot(candidate.x + candidate.width / 2 - x, candidate.y + candidate.height / 2 - y) < node.width)) {
       const positions = [];
@@ -823,7 +843,7 @@ export class FlowCanvas {
     const idSet = new Set(ids);
     if (this.mode === 'bpmn') {
       for (const node of this.nodes) {
-        if (node.type === 'bpmn_boundary_timer' && idSet.has(node.config.attachedToId)) idSet.add(node.id);
+        if (processBoundaryKind(node.type) && idSet.has(node.config.attachedToId)) idSet.add(node.id);
       }
     }
     this.nodes = this.nodes.filter((n) => !idSet.has(n.id));
@@ -855,12 +875,12 @@ export class FlowCanvas {
     }
     if (this.mode === 'bpmn') {
       for (const clone of clones) {
-        if (clone.type !== 'bpmn_boundary_timer') continue;
+        if (!processBoundaryKind(clone.type)) continue;
         clone.config.attachedToId = idMap.get(clone.config.attachedToId) || clone.config.attachedToId;
       }
     }
     this.nodes.push(...clones);
-    if (this.mode === 'bpmn') clones.filter((clone) => clone.type === 'bpmn_boundary_timer').forEach((clone) => this._positionBoundary(clone));
+    if (this.mode === 'bpmn') clones.filter((clone) => processBoundaryKind(clone.type)).forEach((clone) => this._positionBoundary(clone));
     this.selectedIds = new Set(clones.map((c) => c.id));
     this._pushHistory();
     this.render();
@@ -1001,7 +1021,7 @@ export class FlowCanvas {
     const source = this.nodes.find((node) => node.id === sourceId);
     const target = this.nodes.find((node) => node.id === targetId);
     if (!source || !target) return false;
-    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || ['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(target.type))) return false;
+    if (this.mode === 'bpmn' && (source.type === 'bpmn_end' || (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) || processBoundaryKind(target.type)))) return false;
     if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
     const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
     if (this.mode === 'bpmn') edge.condition = null;
@@ -1100,8 +1120,8 @@ export class FlowCanvas {
   _renderNodes() {
     this.nodesLayer.innerHTML = '';
     const ordered = this.mode === 'bpmn'
-      ? [...this.nodes.filter((node) => node.type !== 'bpmn_boundary_timer'),
-        ...this.nodes.filter((node) => node.type === 'bpmn_boundary_timer')]
+      ? [...this.nodes.filter((node) => !processBoundaryKind(node.type)),
+        ...this.nodes.filter((node) => processBoundaryKind(node.type))]
       : this.nodes;
     for (const n of ordered) {
       this.nodesLayer.appendChild(this._buildNodeEl(n));
@@ -1143,9 +1163,9 @@ export class FlowCanvas {
       div.style.width = `${n.width}px`;
       div.style.height = `${n.height}px`;
       const title = n.label || tmpl.label;
-      const event = ['bpmn_start', 'bpmn_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(n.type);
-      if (n.type === 'bpmn_boundary_timer') {
-        div.classList.add(n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
+      const event = (['bpmn_start', 'bpmn_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_message_start', 'bpmn_message_catch', 'bpmn_message_throw'].includes(n.type) || processBoundaryKind(n.type));
+      if (processBoundaryKind(n.type)) {
+        div.classList.add(n.type === 'bpmn_boundary_error' || n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
       }
       const gateway = n.type.endsWith('_gateway');
       div.innerHTML = `
@@ -1153,7 +1173,7 @@ export class FlowCanvas {
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}</div>
         <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
         <span class="fb-process-label-leader" aria-hidden="true"></span>
-        ${['bpmn_start', 'bpmn_timer_start', 'bpmn_boundary_timer'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
+        ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
         ${n.type === 'bpmn_end' ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
       div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
       div.setAttribute('aria-label', title);
@@ -1220,7 +1240,7 @@ export class FlowCanvas {
       if (outside) labels.push({ node, element, label, leader });
     }
     labels.sort((left, right) => {
-      const priority = ({ node }) => node.type === 'bpmn_boundary_timer' ? 1
+      const priority = ({ node }) => processBoundaryKind(node.type) ? 1
         : ['bpmn_user_task', 'bpmn_service_task'].includes(node.type) ? 0 : 2;
       return priority(left) - priority(right) || left.node.id.localeCompare(right.node.id);
     });
@@ -1234,7 +1254,7 @@ export class FlowCanvas {
       if (!width || !height) continue;
       const centerX = node.x + node.width / 2;
       const centerY = node.y + node.height / 2;
-      const parent = node.type === 'bpmn_boundary_timer'
+      const parent = processBoundaryKind(node.type)
         ? this.nodes.find((candidate) => candidate.id === node.config.attachedToId) : null;
       const side = parent && Math.abs(centerX - (parent.x + parent.width)) <= 1 ? 'right'
         : parent && Math.abs(centerX - parent.x) <= 1 ? 'left'
@@ -1691,7 +1711,7 @@ export class FlowCanvas {
       if (!this.selectedIds.has(id)) this.selectNode(id, { additive });
       this._bringToFront(nodeEl);
       if (this.mode === 'bpmn') {
-        for (const boundary of this.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_timer' && candidate.config.attachedToId === id)) {
+        for (const boundary of this.nodes.filter((candidate) => processBoundaryKind(candidate.type) && candidate.config.attachedToId === id)) {
           const boundaryEl = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(boundary.id)}"]`);
           if (boundaryEl) this._bringToFront(boundaryEl);
         }
@@ -1705,7 +1725,7 @@ export class FlowCanvas {
       const dependents = new Map();
       if (this.mode === 'bpmn') {
         for (const boundary of this.nodes) {
-          if (boundary.type !== 'bpmn_boundary_timer' || this.selectedIds.has(boundary.id)) continue;
+          if (!processBoundaryKind(boundary.type) || this.selectedIds.has(boundary.id)) continue;
           if (origs.has(boundary.config.attachedToId)) {
             dependents.set(boundary.id, { x: boundary.x, y: boundary.y, parentId: boundary.config.attachedToId });
           }
@@ -1775,7 +1795,7 @@ export class FlowCanvas {
         if (!n || !orig) continue;
         n.x = Math.round((orig.x + dx) / GRID) * GRID;
         n.y = Math.round((orig.y + dy) / GRID) * GRID;
-        if (this.mode === 'bpmn' && n.type === 'bpmn_boundary_timer' && !this._draggingNode.origs.has(n.config.attachedToId)) {
+        if (this.mode === 'bpmn' && processBoundaryKind(n.type) && !this._draggingNode.origs.has(n.config.attachedToId)) {
           this._positionBoundary(n);
         }
         const el = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(id)}"]`);

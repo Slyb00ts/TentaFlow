@@ -1116,8 +1116,112 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_boundary_timers",
             MigrationStep::RustSelfManaged(bpmn_boundary_timers),
         ),
+        (184, "bpmn_messages_and_event_races", MigrationStep::Sql(BPMN_MESSAGES_AND_EVENT_RACES)),
     ]
 }
+
+const BPMN_MESSAGES_AND_EVENT_RACES: &str = r#"
+CREATE TABLE bpmn_event_races (
+    race_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    gateway_node_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','won','cancelled')),
+    winner_node_id TEXT,
+    winner_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    winner_timer_id TEXT REFERENCES bpmn_timers(timer_id),
+    won_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE(instance_id,gateway_node_id,activation_id),
+    CHECK((status='won' AND winner_node_id IS NOT NULL AND won_at_ms IS NOT NULL AND ((winner_subscription_id IS NOT NULL AND winner_timer_id IS NULL) OR (winner_subscription_id IS NULL AND winner_timer_id IS NOT NULL))) OR (status IN ('open','cancelled') AND winner_node_id IS NULL AND winner_subscription_id IS NULL AND winner_timer_id IS NULL AND won_at_ms IS NULL))
+);
+CREATE INDEX idx_bpmn_event_races_instance ON bpmn_event_races(instance_id,status,created_at_ms,race_id);
+CREATE TABLE bpmn_event_subscriptions (
+    subscription_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    kind TEXT NOT NULL CHECK(kind IN ('message_catch','boundary_message','boundary_error')),
+    message_name TEXT,
+    correlation_key TEXT,
+    error_code TEXT,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','consumed','cancelled','error')),
+    last_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    UNIQUE(instance_id,node_id,token_id),
+    CHECK((kind='boundary_error' AND message_name IS NULL AND correlation_key IS NULL AND race_id IS NULL) OR (kind IN ('message_catch','boundary_message') AND error_code IS NULL AND ((status='error' AND correlation_key IS NULL) OR (message_name IS NOT NULL AND length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256 AND correlation_key IS NOT NULL AND length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256)))),
+    CHECK(kind='message_catch' OR race_id IS NULL)
+);
+CREATE INDEX idx_bpmn_subscriptions_match ON bpmn_event_subscriptions(org_id,definition_id,message_name,correlation_key,status,instance_id,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_instance ON bpmn_event_subscriptions(instance_id,status,created_at_ms,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_race ON bpmn_event_subscriptions(race_id);
+ALTER TABLE bpmn_timers ADD COLUMN race_id TEXT REFERENCES bpmn_event_races(race_id);
+CREATE INDEX idx_bpmn_timers_race ON bpmn_timers(race_id);
+ALTER TABLE bpmn_jobs ADD COLUMN result_origin TEXT CHECK(result_origin IS NULL OR result_origin IN ('envelope','contract','platform'));
+CREATE TABLE bpmn_messages (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    sender_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    message_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK(origin IN ('api','process')),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('start','catch')),
+    definition_id TEXT NOT NULL REFERENCES bpmn_definitions(definition_id),
+    target_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    target_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    message_name TEXT NOT NULL CHECK(length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256),
+    correlation_key TEXT NOT NULL CHECK(length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256),
+    payload_json TEXT,
+    payload_sha256 TEXT NOT NULL,
+    payload_bytes INTEGER NOT NULL CHECK(typeof(payload_bytes)='integer' AND payload_bytes BETWEEN 1 AND 262144),
+    ttl_seconds INTEGER NOT NULL CHECK(typeof(ttl_seconds)='integer' AND ttl_seconds BETWEEN 1 AND 604800),
+    received_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>received_at_ms),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('pending','blocked','ambiguous','delivered','expired','cancelled','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    payload_pruned_at_ms INTEGER,
+    resolved_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    resolved_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    resolved_token_id TEXT REFERENCES bpmn_tokens(token_id),
+    matched_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    matched_version INTEGER CHECK(matched_version IS NULL OR (typeof(matched_version)='integer' AND matched_version>0)),
+    matched_node_id TEXT,
+    matched_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    delivered_at_ms INTEGER,
+    source_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    source_definition_id TEXT,
+    source_version INTEGER,
+    source_node_id TEXT,
+    source_activation_id TEXT,
+    source_event_id TEXT REFERENCES bpmn_events(event_id),
+    PRIMARY KEY(org_id,sender_user_id,message_id),
+    UNIQUE(source_instance_id,source_activation_id,source_node_id),
+    CHECK((origin='api' AND source_instance_id IS NULL AND source_definition_id IS NULL AND source_version IS NULL AND source_node_id IS NULL AND source_activation_id IS NULL AND source_event_id IS NULL) OR (origin='process' AND source_instance_id IS NOT NULL AND source_definition_id IS NOT NULL AND source_version IS NOT NULL AND source_node_id IS NOT NULL AND source_activation_id IS NOT NULL AND source_event_id IS NOT NULL)),
+    CHECK((target_kind='start' AND target_instance_id IS NULL AND target_subscription_id IS NULL) OR (target_kind='catch' AND (target_subscription_id IS NULL OR target_instance_id IS NOT NULL))),
+    CHECK((resolved_instance_id IS NULL AND resolved_subscription_id IS NULL AND resolved_token_id IS NULL) OR (target_kind='catch' AND resolved_instance_id IS NOT NULL AND resolved_subscription_id IS NOT NULL AND resolved_token_id IS NOT NULL)),
+    CHECK((status='delivered' AND matched_instance_id IS NOT NULL AND matched_version IS NOT NULL AND matched_node_id IS NOT NULL AND delivered_at_ms IS NOT NULL) OR (status<>'delivered' AND matched_instance_id IS NULL AND matched_version IS NULL AND matched_node_id IS NULL AND matched_subscription_id IS NULL AND delivered_at_ms IS NULL)),
+    CHECK((payload_json IS NOT NULL AND payload_pruned_at_ms IS NULL) OR (payload_json IS NULL AND payload_pruned_at_ms IS NOT NULL AND status IN ('delivered','expired','cancelled','error')))
+);
+CREATE INDEX idx_bpmn_messages_due ON bpmn_messages(status,next_check_at_ms,received_at_ms,sender_user_id,message_id);
+CREATE INDEX idx_bpmn_messages_target ON bpmn_messages(org_id,definition_id,message_name,correlation_key,target_instance_id,status);
+CREATE INDEX idx_bpmn_messages_source ON bpmn_messages(source_instance_id,status,received_at_ms);
+CREATE INDEX idx_bpmn_messages_sender ON bpmn_messages(org_id,sender_user_id,received_at_ms,message_id);
+CREATE INDEX idx_bpmn_messages_prune ON bpmn_messages(status,payload_pruned_at_ms,updated_at_ms);
+CREATE TRIGGER bpmn_message_envelope_immutable BEFORE UPDATE ON bpmn_messages
+WHEN NEW.org_id IS NOT OLD.org_id OR NEW.sender_user_id IS NOT OLD.sender_user_id OR NEW.message_id IS NOT OLD.message_id OR NEW.request_hash IS NOT OLD.request_hash OR NEW.origin IS NOT OLD.origin OR NEW.target_kind IS NOT OLD.target_kind OR NEW.definition_id IS NOT OLD.definition_id OR NEW.target_instance_id IS NOT OLD.target_instance_id OR NEW.target_subscription_id IS NOT OLD.target_subscription_id OR NEW.message_name IS NOT OLD.message_name OR NEW.correlation_key IS NOT OLD.correlation_key OR NEW.payload_sha256 IS NOT OLD.payload_sha256 OR NEW.payload_bytes IS NOT OLD.payload_bytes OR NEW.ttl_seconds IS NOT OLD.ttl_seconds OR NEW.received_at_ms IS NOT OLD.received_at_ms OR NEW.expires_at_ms IS NOT OLD.expires_at_ms OR NEW.source_instance_id IS NOT OLD.source_instance_id OR NEW.source_definition_id IS NOT OLD.source_definition_id OR NEW.source_version IS NOT OLD.source_version OR NEW.source_node_id IS NOT OLD.source_node_id OR NEW.source_activation_id IS NOT OLD.source_activation_id OR NEW.source_event_id IS NOT OLD.source_event_id OR (NEW.payload_json IS NOT OLD.payload_json AND NOT (OLD.payload_json IS NOT NULL AND NEW.payload_json IS NULL AND NEW.payload_pruned_at_ms IS NOT NULL AND NEW.status IN ('delivered','expired','cancelled','error')))
+BEGIN SELECT RAISE(ABORT,'BPMN message envelope is immutable'); END;
+"#;
 
 const BPMN_PROCESSES: &str = r#"
 CREATE TABLE bpmn_definitions (
@@ -14967,7 +15071,7 @@ mod tests {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 183);
+        assert_eq!(version, 184);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -14975,6 +15079,34 @@ mod tests {
         assert_eq!((model.as_str(), hash.as_str(), start_timer, start_occurrence, event.as_str()),
             (old_model_json.as_str(), old_hash.as_str(), None, None, "{\"source_key\":1}"));
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_timers", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn bpmn_message_migration_preserves_pinned_model_hash_and_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 183);
+        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('message-owner','Message owner','x',1)", []).unwrap();
+        let model = crate::processes::model::starter_model();
+        let bytes = serde_json::to_string(&model).unwrap();
+        let hash = crate::processes::repository::request_hash(&model).unwrap();
+        assert!(!bytes.contains("\"messages\"") && !bytes.contains("\"target_namespace\""));
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('message-process','org-default','message-owner','Old','',1,?1,1,0,1,1)", [&bytes]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('message-process',1,?1,?2,'[]',1,'message-owner')", rusqlite::params![&bytes, &hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('message-instance','message-process',1,'org-default','message-owner',1,'completed','{}',1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('message-event','message-instance',1,1,'instance_started',NULL,'message-owner','{\"customer_ID\":\"kept\"}')", []).unwrap();
+        run(&conn).unwrap();
+        let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 184);
+        let retained: (String, String, String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(retained, (bytes, hash, "{\"customer_ID\":\"kept\"}".into()));
+        for table in ["bpmn_messages", "bpmn_event_subscriptions", "bpmn_event_races"] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+        assert!(column_exists(&conn, "bpmn_jobs", "result_origin").unwrap());
+        assert!(column_exists(&conn, "bpmn_timers", "race_id").unwrap());
     }
 
     fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, String) {
@@ -14999,6 +15131,7 @@ mod tests {
                 flow_id: "flow-pinned".into(), input_mapping: Default::default(),
                 output_mapping: Default::default(), verification: ActivityVerification::Human,
                 timeout_seconds: 60,
+                result_expression: None,
             },
         });
         model.nodes.push(ProcessNode {
@@ -15054,7 +15187,7 @@ mod tests {
         ).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 183);
+        assert_eq!(version, 184);
         let stored: (String, String, String) = conn.query_row(
             "SELECT model_json,model_sha256,(SELECT data_json FROM bpmn_events WHERE event_id='boundary-event') FROM bpmn_versions WHERE definition_id='boundary-process'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),

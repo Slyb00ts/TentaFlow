@@ -177,11 +177,12 @@ pub fn process_dispatch(
             }
         }
         P::DefinitionGetRequest { definition_id } => {
-            let (definition, timer_start) =
+            let (definition, timer_start, message_start) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             P::DefinitionGetResponse {
                 definition,
                 timer_start,
+                message_start,
             }
         }
         P::DefinitionSaveRequest {
@@ -220,7 +221,7 @@ pub fn process_dispatch(
                     version,
                 }));
             }
-            let (definition, _) =
+            let (definition, _, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
             let mut snapshots = Vec::new();
@@ -400,8 +401,9 @@ pub fn process_dispatch(
                 has_more,
             }
         }
-        P::InstanceGetRequest { instance_id } => P::InstanceGetResponse {
-            instance: repository::get_instance(pool, &actor, instance_id).map_err(error)?,
+        P::InstanceGetRequest { instance_id, pages } => P::InstanceGetResponse {
+            instance: repository::get_instance(pool, &actor, instance_id, pages.as_ref())
+                .map_err(error)?,
         },
         P::UserTaskGetRequest {
             instance_id,
@@ -507,7 +509,108 @@ pub fn process_dispatch(
                 has_more,
             }
         }
-        P::OptionsResponse { .. }
+        P::MessageSendRequest {
+            command_id,
+            message_id,
+            target,
+            message_name,
+            correlation_key,
+            payload: business_payload,
+            ttl_seconds,
+        } => {
+            let prepared = repository::PreparedMessage {
+                message_id: message_id.clone(),
+                target: target.clone(),
+                message_name: message_name.clone(),
+                correlation_key: correlation_key.clone(),
+                payload: business_payload.clone(),
+                ttl_seconds: *ttl_seconds,
+            };
+            let message = repository::send_message(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                &prepared,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::MessageSendResponse { message }
+        }
+        P::MessageGetRequest {
+            sender_user_id,
+            message_id,
+        } => P::MessageGetResponse {
+            message: repository::get_message(pool, &actor, sender_user_id, message_id)
+                .map_err(error)?,
+        },
+        P::MessageListRequest {
+            definition_id,
+            instance_id,
+            offset,
+            limit,
+        } => {
+            let (messages, total, has_more) = repository::list_messages(
+                pool,
+                &actor,
+                definition_id.as_deref(),
+                instance_id.as_deref(),
+                *offset,
+                *limit,
+            )
+            .map_err(error)?;
+            P::MessageListResponse {
+                messages,
+                total,
+                has_more,
+            }
+        }
+        P::MessageResolveRequest {
+            command_id,
+            message_id,
+            expected_revision,
+            instance_id,
+            subscription_id,
+        } => {
+            let message = repository::resolve_message(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                message_id,
+                *expected_revision,
+                instance_id,
+                subscription_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(error)?;
+            if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::wake(executor);
+            }
+            P::MessageResolveResponse { message }
+        }
+        P::MessageCancelRequest {
+            command_id,
+            message_id,
+            expected_revision,
+        } => P::MessageCancelResponse {
+            message: repository::cancel_message(
+                pool,
+                &actor,
+                &stamp(payload, command_id)?,
+                message_id,
+                *expected_revision,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(error)?,
+        },
+        P::MessageSendResponse { .. }
+        | P::MessageGetResponse { .. }
+        | P::MessageListResponse { .. }
+        | P::MessageResolveResponse { .. }
+        | P::MessageCancelResponse { .. }
+        | P::OptionsResponse { .. }
         | P::DefinitionListResponse { .. }
         | P::DefinitionGetResponse { .. }
         | P::DefinitionSaveResponse { .. }
@@ -567,12 +670,18 @@ register_request!("ProcessInstanceCancelRequest");
 register_request!("ProcessJobRetryRequest");
 register_request!("ProcessHistoryRequest");
 
+register_request!("ProcessMessageSendRequest");
+register_request!("ProcessMessageGetRequest");
+register_request!("ProcessMessageListRequest");
+register_request!("ProcessMessageResolveRequest");
+register_request!("ProcessMessageCancelRequest");
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dispatch::{AppState, RequestOrigin};
     use crate::processes::runtime::test_support;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::Arc;
     use tentaflow_protocol::processes::{
         ActivityVerification, ProcessDefinition, ProcessInstanceStatus, ProcessNode,
@@ -715,7 +824,8 @@ mod tests {
             refused(
                 &outsider_ctx,
                 P::InstanceGetRequest {
-                    instance_id: instance.instance_id.clone()
+                    instance_id: instance.instance_id.clone(),
+                    pages: None
                 }
             )
             .await
@@ -741,6 +851,7 @@ mod tests {
             &second_ctx,
             P::InstanceGetRequest {
                 instance_id: instance.instance_id.clone(),
+                pages: None,
             },
         )
         .await
@@ -803,7 +914,8 @@ mod tests {
         assert!(
             super::super::dispatch(
                 &MessageBody::ProcessBody(P::InstanceGetRequest {
-                    instance_id: instance.instance_id.clone()
+                    instance_id: instance.instance_id.clone(),
+                    pages: None
                 }),
                 &second_ctx
             )
@@ -824,7 +936,8 @@ mod tests {
             refused(
                 &second_ctx,
                 P::InstanceGetRequest {
-                    instance_id: instance.instance_id
+                    instance_id: instance.instance_id,
+                    pages: None
                 }
             )
             .await
@@ -1044,6 +1157,7 @@ mod tests {
         let P::DefinitionGetResponse {
             definition,
             timer_start: Some(summary),
+            message_start: _,
         } = request(
             &ctx,
             P::DefinitionGetRequest {
@@ -1254,7 +1368,8 @@ mod tests {
             refused(
                 &reviewer,
                 P::InstanceGetRequest {
-                    instance_id: instance.instance_id
+                    instance_id: instance.instance_id,
+                    pages: None
                 }
             )
             .await
@@ -1423,5 +1538,300 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+    #[tokio::test]
+    async fn typed_message_ingress_current_participant_payload_replay_and_selected_page_remain_authorized(
+    ) {
+        use tentaflow_protocol::processes::{
+            ProcessInstancePageRequest, ProcessMessageStatus, ProcessMessageTarget, ProcessPageSpec,
+        };
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "message-author");
+        let participant = test_support::actor(&state.db, "message-participant");
+        let outsider = test_support::actor(&state.db, "message-outsider");
+        let owner_ctx = context(&state, &owner);
+        let participant_ctx = context(&state, &participant);
+        let outsider_ctx = context(&state, &outsider);
+        let mut model = crate::processes::messages::test_support::receiving_model(false, true);
+        if let ProcessNodeKind::UserTask {
+            assignee_user_id, ..
+        } = &mut model.nodes[1].kind
+        {
+            *assignee_user_id = Some(participant.user_id.clone());
+        }
+        let definition = save(&owner_ctx, model).await;
+        request(
+            &owner_ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        let P::InstanceStartResponse { instance } = request(
+            &owner_ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                version: 1,
+                variables: json!({}),
+            },
+        )
+        .await
+        else {
+            panic!("instance expected")
+        };
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let send = P::MessageSendRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            message_id: message_id.clone(),
+            target: ProcessMessageTarget::Catch {
+                definition_id: definition.definition_id.clone(),
+                instance_id: Some(instance.instance_id.clone()),
+                subscription_id: None,
+            },
+            message_name: "EvidenceReady".into(),
+            correlation_key: "case-1".into(),
+            payload: Value::Null,
+            ttl_seconds: 120,
+        };
+        let P::MessageSendResponse { message } = request(&participant_ctx, send.clone()).await
+        else {
+            panic!("message expected")
+        };
+        assert_eq!(message.status, ProcessMessageStatus::Pending);
+        assert_eq!(message.sender_user_id, participant.user_id);
+        let P::MessageSendResponse { message: replayed } =
+            request(&participant_ctx, send.clone()).await
+        else {
+            panic!("replayed message expected")
+        };
+        assert_eq!(replayed.message_id, message_id);
+        let mut conflict = send.clone();
+        if let P::MessageSendRequest {
+            command_id,
+            payload,
+            ..
+        } = &mut conflict
+        {
+            *command_id = uuid::Uuid::new_v4().to_string();
+            *payload = json!({"customer_ID": 7});
+        }
+        refused(&participant_ctx, conflict).await;
+        refused(&outsider_ctx, send.clone()).await;
+        refused(
+            &participant_ctx,
+            P::DefinitionGetRequest {
+                definition_id: definition.definition_id.clone(),
+            },
+        )
+        .await;
+        let mut wide = send;
+        if let P::MessageSendRequest {
+            command_id,
+            message_id,
+            target,
+            ..
+        } = &mut wide
+        {
+            *command_id = uuid::Uuid::new_v4().to_string();
+            *message_id = uuid::Uuid::new_v4().to_string();
+            *target = ProcessMessageTarget::Catch {
+                definition_id: definition.definition_id.clone(),
+                instance_id: None,
+                subscription_id: None,
+            };
+        }
+        refused(&participant_ctx, wide).await;
+        let P::MessageGetResponse { message: detail } = request(
+            &participant_ctx,
+            P::MessageGetRequest {
+                sender_user_id: participant.user_id.clone(),
+                message_id: message_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("full message expected")
+        };
+        assert!(detail.message.payload_available);
+        assert_eq!(detail.payload, Some(Value::Null));
+        let frame =
+            tentaflow_protocol::cbor::encode(&MessageBody::ProcessBody(P::MessageGetResponse {
+                message: detail,
+            }))
+            .unwrap();
+        let MessageBody::ProcessBody(P::MessageGetResponse { message: decoded }) =
+            tentaflow_protocol::cbor::decode(&frame).unwrap()
+        else {
+            panic!("typed CBOR detail expected")
+        };
+        assert!(decoded.message.payload_available);
+        assert_eq!(decoded.payload, Some(Value::Null));
+        let maximum_payload = json!({"customer_ID": vec![0.1_f64; 65_526], "attached_to_id": null});
+        crate::processes::runtime::validate_output(&maximum_payload).unwrap();
+        let maximum_id = uuid::Uuid::new_v4().to_string();
+        request(
+            &participant_ctx,
+            P::MessageSendRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                message_id: maximum_id.clone(),
+                target: tentaflow_protocol::processes::ProcessMessageTarget::Catch {
+                    definition_id: definition.definition_id.clone(),
+                    instance_id: Some(instance.instance_id.clone()),
+                    subscription_id: None,
+                },
+                message_name: "界".repeat(85) + "x",
+                correlation_key: "界".repeat(85) + "x",
+                payload: maximum_payload.clone(),
+                ttl_seconds: 120,
+            },
+        )
+        .await;
+        let maximum = request(
+            &participant_ctx,
+            P::MessageGetRequest {
+                sender_user_id: participant.user_id.clone(),
+                message_id: maximum_id,
+            },
+        )
+        .await;
+        let frame = tentaflow_protocol::cbor::encode(&MessageBody::ProcessBody(maximum)).unwrap();
+        assert!(frame.len() > 580_000 && frame.len() < 900 * 1024);
+        let MessageBody::ProcessBody(P::MessageGetResponse { message: maximum }) =
+            tentaflow_protocol::cbor::decode(&frame).unwrap()
+        else {
+            panic!("full maximum payload expected")
+        };
+        assert_eq!(maximum.payload, Some(maximum_payload));
+        let task_id = instance.user_tasks[0].user_task_id.clone();
+        let pages = ProcessInstancePageRequest {
+            user_tasks: Some(ProcessPageSpec {
+                offset: 1,
+                limit: 20,
+            }),
+            incidents: None,
+            timers: None,
+            subscriptions: None,
+            event_races: None,
+            outgoing_messages: None,
+            selected_user_task_id: Some(task_id.clone()),
+            selected_incident_id: None,
+        };
+        let P::InstanceGetResponse { instance: selected } = request(
+            &participant_ctx,
+            P::InstanceGetRequest {
+                instance_id: instance.instance_id.clone(),
+                pages: Some(pages),
+            },
+        )
+        .await
+        else {
+            panic!("selected detail expected")
+        };
+        assert!(selected.user_tasks.is_empty());
+        assert_eq!(selected.pages.unwrap().user_tasks.total, 1);
+        assert_eq!(selected.selected_user_task.unwrap().user_task_id, task_id);
+        request(
+            &participant_ctx,
+            P::UserTaskCompleteRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                instance_id: instance.instance_id.clone(),
+                user_task_id: task_id,
+                expected_revision: instance.revision,
+                outputs: json!({}),
+                approved: None,
+            },
+        )
+        .await;
+        let drain = crate::processes::messages::drain_pending(
+            &state.db,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        drain.completion.unwrap();
+        assert_eq!(drain.delivered, 1);
+        let P::InstanceGetResponse { instance: finished } = request(
+            &participant_ctx,
+            P::InstanceGetRequest {
+                instance_id: instance.instance_id.clone(),
+                pages: None,
+            },
+        )
+        .await
+        else {
+            panic!("completed participant detail expected")
+        };
+        assert_eq!(finished.status, ProcessInstanceStatus::Completed);
+        assert_eq!(finished.can_send_message, Some(false));
+        let P::MessageGetResponse { message: receipt } = request(
+            &participant_ctx,
+            P::MessageGetRequest {
+                sender_user_id: participant.user_id.clone(),
+                message_id: message_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("receipt expected")
+        };
+        assert_eq!(receipt.message.status, ProcessMessageStatus::Delivered);
+        crate::db::repository::update_user_account(
+            &state.db,
+            &participant.user_id,
+            "message-participant",
+            "participant@example.test",
+            false,
+        )
+        .unwrap();
+        refused(
+            &participant_ctx,
+            P::MessageGetRequest {
+                sender_user_id: participant.user_id.clone(),
+                message_id,
+            },
+        )
+        .await;
+        let start_definition = save(
+            &owner_ctx,
+            crate::processes::messages::test_support::receiving_model(true, false),
+        )
+        .await;
+        request(
+            &owner_ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: start_definition.definition_id.clone(),
+                expected_revision: start_definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        let P::DefinitionGetResponse {
+            message_start: Some(start),
+            ..
+        } = request(
+            &owner_ctx,
+            P::DefinitionGetRequest {
+                definition_id: start_definition.definition_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("message start summary expected")
+        };
+        assert!(start.can_send);
+        assert_eq!(start.message_name, "EvidenceReady");
+        refused(
+            &owner_ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: start_definition.definition_id,
+                version: 1,
+                variables: json!({}),
+            },
+        )
+        .await;
     }
 }
