@@ -237,8 +237,15 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 
     // Native apps: run the enable/disable hook only when the flag actually
     // flipped — a no-op toggle (same value written twice) must not restart
-    // whatever the hook starts/stops.
+    // whatever the hook starts/stops. The same holds for a service-mode addon's
+    // background tick, started/stopped below.
+    let mut message = None;
     if prev != payload.enabled {
+        if let Some(mgr) = ctx.state.addon_manager.as_ref() {
+            if let Err(e) = mgr.apply_enabled(&payload.addon_id, payload.enabled) {
+                message = Some(format!("zapisano, ale usluga addonu nie ruszyla: {e}"));
+            }
+        }
         if let Ok(Some(addon)) = repository::get_addon(&ctx.state.db, &payload.addon_id) {
             if let Ok(manifest) = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json)
             {
@@ -267,7 +274,7 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     Ok(MessageBody::AddonToggleResponseBody(AddonToggleResponse {
         ok: true,
         enabled: payload.enabled,
-        message: None,
+        message,
     }))
 }
 
@@ -1310,9 +1317,9 @@ pub async fn addon_requirement_install(
             payload.addon_id, payload.engine_id
         )));
     }
-    if !gpu_vision_available() {
+    if !crate::vision::camera_cv_models::bundle_runs_on_this_host(&payload.engine_id) {
         return Err(ProtocolError::bad_request(
-            "this node cannot run the GPU vision path, installing the model would not help",
+            "this build cannot run the pipeline these models serve, installing them would not help",
         ));
     }
     let engine = crate::services::manifest::registry()
@@ -1348,7 +1355,7 @@ fn vision_engine_requirements(manifest_json: &str) -> Vec<tentaflow_protocol::Ad
     crate::addon::lifecycle::parse_required_vision_engines(manifest_json)
         .into_iter()
         .map(|engine_id| {
-            let status = if !gpu_vision_available() {
+            let status = if !crate::vision::camera_cv_models::bundle_runs_on_this_host(&engine_id) {
                 "unsupported_host"
             } else if vision_bundle_installed(&engine_id) {
                 "installed"
@@ -1361,16 +1368,6 @@ fn vision_engine_requirements(manifest_json: &str) -> Vec<tentaflow_protocol::Ad
             }
         })
         .collect()
-}
-
-/// True when this build runs the GPU vision path the camera-CV engines need.
-fn gpu_vision_available() -> bool {
-    cfg!(all(
-        any(target_os = "linux", target_os = "windows"),
-        feature = "inference-vision-gpu",
-        feature = "vision-ort",
-        feature = "vision-cuda-preprocess"
-    ))
 }
 
 /// True when every file of the engine's camera-CV bundle is present locally.

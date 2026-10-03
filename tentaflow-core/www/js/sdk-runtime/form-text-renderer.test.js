@@ -155,8 +155,9 @@ test('Input typing re-emits input+change with SDK { value, kind: tstr }', () => 
   }))));
   const input = el.querySelector('input');
   const evs = [];
-  el.addEventListener('input', (e) => evs.push(['input', e.detail]));
-  el.addEventListener('change', (e) => evs.push(['change', e.detail]));
+  const paths = [];
+  el.addEventListener('input', (e) => { evs.push(['input', e.detail]); paths.push(e.__tfBoundEdits[0].path); });
+  el.addEventListener('change', (e) => { evs.push(['change', e.detail]); paths.push(e.__tfBoundEdits[0].path); });
   input.value = 'abc';
   input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
   input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
@@ -164,6 +165,8 @@ test('Input typing re-emits input+change with SDK { value, kind: tstr }', () => 
     ['input', { value: 'abc', kind: 'tstr' }],
     ['change', { value: 'abc', kind: 'tstr' }],
   ]);
+  const bound = PATH('q');
+  assertEq(paths, [bound, bound]);
 });
 
 test('Input bubbled native events do not duplicate SDK input/change', () => {
@@ -518,7 +521,8 @@ test('Input Enter on host re-emits submit + preventDefault', () => {
     3: { kind: 'literal', value: 'L' },
   }))));
   let submit = null;
-  el.addEventListener('submit', (e) => { submit = e.detail; });
+  let edits = 'unset';
+  el.addEventListener('submit', (e) => { submit = e.detail; edits = e.__tfBoundEdits; });
   el.value = 'query';
   const ev = new (globalThis.KeyboardEvent || globalThis.Event)('keydown', {
     key: 'Enter', bubbles: false, cancelable: true,
@@ -526,6 +530,25 @@ test('Input Enter on host re-emits submit + preventDefault', () => {
   el.dispatchEvent(ev);
   assertEq(submit, { value: 'query', kind: 'tstr' });
   assertEq(ev.defaultPrevented, true);
+  // Submit is not an edit: an addon clearing the field must not be held back.
+  assertEq(edits, undefined);
+});
+
+test('Focused Input keeps typed text when a snapshot repeats the old value', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: 'old' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const input = el.querySelector('input');
+  input.focus();
+  input.value = 'typing in progress';
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: 'old' }], state_revision: 1, truncated: false });
+  assertEq(input.value, 'typing in progress', 'unchanged store value does not wipe typing');
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: '' }], state_revision: 2, truncated: false });
+  assertEq(input.value, '', 'a real change (addon clears the field) still applies');
 });
 
 test('Input Enter with Shift does NOT submit', () => {

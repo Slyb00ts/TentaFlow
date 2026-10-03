@@ -168,16 +168,57 @@ impl DetectionsMessage {
     }
 }
 
+/// One body or hand found by the gesture engine, for the camera overlay.
+/// `keypoints` are `[x, y, score]` normalized 0..1 to the frame, in the model's
+/// fixed order (17 COCO body points, 21 MediaPipe hand points); a point the model
+/// did not find has score 0. `label` names a recognized gesture.
+#[derive(Debug, Clone)]
+pub struct PoseItem {
+    pub klasa: &'static str,
+    pub bbox: [f32; 4],
+    pub score: f32,
+    pub keypoints: Vec<[f32; 3]>,
+    pub label: Option<String>,
+}
+
+/// One analyzed frame of the gesture engine. Rides its own channel next to the
+/// detections: the two producers run at different rates, and a shared channel
+/// would make the overlay alternate between their frames.
+#[derive(Debug, Clone)]
+pub struct PoseMessage {
+    pub camera_id: String,
+    /// Capture time of the analyzed frame, Unix ms.
+    pub ts_ms: u64,
+    /// Media-timeline PTS of the analyzed frame, so the overlay draws it on the
+    /// same video frame.
+    pub pts_ns: Option<u64>,
+    /// Time the analysis took, ms.
+    pub proc_ms: u32,
+    pub items: Vec<PoseItem>,
+}
+
 /// Rejestr nadawcow broadcast per camera_id. Proces-wide singleton.
 struct DetectionBus {
     senders: DashMap<String, broadcast::Sender<DetectionsMessage>>,
+    pose_senders: DashMap<String, broadcast::Sender<PoseMessage>>,
 }
 
 impl DetectionBus {
     fn new() -> Self {
         Self {
             senders: DashMap::new(),
+            pose_senders: DashMap::new(),
         }
+    }
+
+    fn pose_sender(&self, camera_id: &str) -> broadcast::Sender<PoseMessage> {
+        if let Some(tx) = self.pose_senders.get(camera_id) {
+            return tx.clone();
+        }
+        self.pose_senders
+            .entry(camera_id.to_string())
+            .or_insert_with(|| broadcast::channel(DETECTION_BROADCAST_CAPACITY).0)
+            .clone()
     }
 
     /// Zwraca istniejacego nadawce dla kamery albo tworzy nowego. Nadawca
@@ -202,6 +243,18 @@ fn detection_bus() -> &'static DetectionBus {
 /// upgrade i forwarduje kazda wiadomosc jako JSON do przegladarki.
 pub fn subscribe(camera_id: &str) -> broadcast::Receiver<DetectionsMessage> {
     detection_bus().sender(camera_id).subscribe()
+}
+
+/// Gesture-engine frames of a camera (body + hands + recognized gesture).
+pub fn subscribe_pose(camera_id: &str) -> broadcast::Receiver<PoseMessage> {
+    detection_bus().pose_sender(camera_id).subscribe()
+}
+
+/// Publish one analyzed frame of the gesture engine. Dropped silently when no
+/// overlay is watching the camera.
+pub fn publish_pose(msg: PoseMessage) {
+    let tx = detection_bus().pose_sender(&msg.camera_id);
+    let _ = tx.send(msg);
 }
 
 /// Czysty punkt wpiecia dla zrodla detekcji. Realna inferencja

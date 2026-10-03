@@ -151,6 +151,42 @@ test('handleSlotContent renders fragment into container', () => {
   sm.destroy();
 });
 
+test('slot re-push with a stale state_overlay keeps a pending user edit', () => {
+  setup();
+  const BOUND_TAG = 0xFFF1;
+  registerComponentRenderer(BOUND_TAG, (component, ctx) => {
+    // Mirrors a bound form control: reads its value from the store at mount.
+    const el = document.createElement('div');
+    el.textContent = String(ctx.readField(component.fields, 0));
+    el.setAttribute('data-on', String(ctx.store.read(PATH('on'))));
+    return el;
+  });
+  const { sm, store } = makeSlotManager();
+  store.applySnapshot({
+    entries: [{ path: PATH('on'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  sm.registerSlot('s', el);
+  const frag = (text) => ({ ...comp(text), tag: BOUND_TAG });
+
+  store.setLocalEdit(PATH('on'), true);
+  sm.handleSlotContent({
+    slot_id: 's', fragment: frag('v1'),
+    state_overlay: [{ path: PATH('on'), value: false }],
+  });
+  assertEq(el.children[0].getAttribute('data-on'), 'true', 'first mount sees the edit');
+  sm.handleSlotContent({
+    slot_id: 's', fragment: frag('v2'),
+    state_overlay: [{ path: PATH('on'), value: false }],
+  });
+  assertEq(el.children[0].textContent, 'v2', 'fragment re-rendered');
+  assertEq(el.children[0].getAttribute('data-on'), 'true', 'remount still sees the edit');
+  sm.destroy();
+  store.destroy();
+});
+
 test('handleSlotClear empties container', () => {
   setup();
   const { sm } = makeSlotManager();

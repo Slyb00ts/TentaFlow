@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use tentaflow_hardware::webrtc::{
-    ChannelState, DcMessage, KeepaliveConfig, WebRtcChannel, WebRtcConfig,
+    ChannelState, DcInbound, DcMessage, KeepaliveConfig, WebRtcChannel, WebRtcConfig,
 };
 use tentaflow_sdk_spec::{
     WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput,
@@ -119,15 +119,18 @@ fn audit(
     );
 }
 
-fn to_message(m: DcMessage) -> WebRtcMessage {
-    match m {
+fn to_message(m: DcInbound) -> WebRtcMessage {
+    let received_unix_ms = m.received_unix_ms;
+    match m.msg {
         DcMessage::Text(s) => WebRtcMessage {
             is_text: true,
             data_b64: B64.encode(s.as_bytes()),
+            received_unix_ms,
         },
         DcMessage::Binary(b) => WebRtcMessage {
             is_text: false,
             data_b64: B64.encode(b),
+            received_unix_ms,
         },
     }
 }
@@ -174,21 +177,30 @@ fn remove_bound_camera(addon_id: &str, entry: &ChannelEntry) {
 }
 
 /// Compute the local IPv4 addresses ICE is allowed to gather host candidates
-/// from, mirroring the mesh transport's interface selection so the offer only
-/// carries reachable candidates on a multi-homed host.
+/// from, so the offer only carries reachable candidates on a multi-homed host.
 ///
-/// Base set: host IPv4s kept by the mesh `AddrFilterSnapshot`
-/// (`keep_transport_ip`) — honors a pinned `mesh.bind_ipv4`, else hides
-/// docker/link-local/loopback. When the peer IP is known and
-/// `prefer_same_subnet` is on, narrow to the SAME /24 as the peer; if that
-/// narrowing is non-empty use it, else fall back to the full kept set so a
-/// usable IP is never dropped. Empty result = no usable IPv4 (create() then
+/// With a known peer (a device on the LAN) the one useful candidate is the
+/// address the kernel routes to that peer from. The routing table is exact
+/// where a subnet guess is not: two NICs can carry the peer's /24 at once (a
+/// cluster link and the robot's Wi-Fi). The mesh transport's interface policy
+/// (`mesh.bind_ipv4`, excluded interfaces) does not apply to that answer — it
+/// decides what the MESH advertises, and a link hidden from the mesh is often
+/// exactly the one a robot is reached over.
+///
+/// Without a routable peer: host IPv4s kept by the mesh `AddrFilterSnapshot`
+/// (`keep_transport_ip`), narrowed to the peer's /24 when `prefer_same_subnet`
+/// is on and that leaves anything. Empty result = no usable IPv4 (create() then
 /// keeps default gathering — fail open, never brick the connect).
 fn compute_ice_allowlist(
     db: &crate::db::DbPool,
     peer_ipv4: Option<&str>,
 ) -> Vec<std::net::Ipv4Addr> {
     use crate::mesh::network_interfaces;
+
+    let peer = peer_ipv4.and_then(|raw| raw.parse::<std::net::Ipv4Addr>().ok());
+    if let Some(src) = peer.and_then(route_source_ipv4) {
+        return vec![src];
+    }
 
     let snap = network_interfaces::build_addr_filter_snapshot(db);
     let kept: Vec<std::net::Ipv4Addr> = network_interfaces::list_interfaces()
@@ -198,7 +210,6 @@ fn compute_ice_allowlist(
         .filter(|ip| snap.keep_transport_ip(*ip))
         .collect();
 
-    let peer = peer_ipv4.and_then(|raw| raw.parse::<std::net::Ipv4Addr>().ok());
     if let Some(peer) = peer {
         if network_interfaces::load_prefer_same_subnet(db) {
             let po = peer.octets();
@@ -216,6 +227,18 @@ fn compute_ice_allowlist(
         }
     }
     kept
+}
+
+/// The local address the kernel would send from to reach `peer`. `connect()` on
+/// an unbound UDP socket only resolves the route and source address — nothing is
+/// sent. `None` when there is no route.
+fn route_source_ipv4(peer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    sock.connect((peer, 9)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(src) if !src.is_unspecified() => Some(src),
+        _ => None,
+    }
 }
 
 // =============================================================================
@@ -750,5 +773,17 @@ pub fn cleanup_addon_channels(addon_id: &str) {
                 let _ = entry.chan.close().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_source_ipv4;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn route_source_is_the_address_the_kernel_sends_from() {
+        // Loopback is always routable and is answered from itself.
+        assert_eq!(route_source_ipv4(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST));
     }
 }

@@ -57,6 +57,8 @@ module.exports = defineConfig({
     { name: 'tentavision-search', testMatch: 'tentavision-search.spec.js' },
     { name: 'tentavision-audit', testMatch: 'tentavision-audit.spec.js' },
     { name: 'tentavision-settings', testMatch: 'tentavision-settings.spec.js' },
+    { name: 'robots-detail', testMatch: 'robots-detail.spec.js' },
+    { name: 'addon-panel-flicker', testMatch: 'addon-panel-flicker.spec.js' },
     { name: 'tentavision-models', testMatch: 'tentavision-models.spec.js' },
     { name: 'tentavision-zones', testMatch: 'tentavision-zones.spec.js' },
     { name: 'tentavision-live', testMatch: 'tentavision-live.spec.js' },

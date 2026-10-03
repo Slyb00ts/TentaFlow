@@ -7,4 +7,6 @@
 
 pub mod channel;
 
-pub use channel::{ChannelState, DcMessage, KeepaliveConfig, WebRtcChannel, WebRtcConfig};
+pub use channel::{
+    ChannelState, DcInbound, DcMessage, KeepaliveConfig, WebRtcChannel, WebRtcConfig,
+};

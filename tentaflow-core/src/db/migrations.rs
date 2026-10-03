@@ -1106,6 +1106,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "topic_acl_addon_subjects",
             MigrationStep::Sql(TOPIC_ACL_ADDON_SUBJECTS),
         ),
+        (
+            178,
+            "cameras_depth_camera_offset",
+            MigrationStep::Rust(cameras_add_depth_offset_columns),
+        ),
     ]
 }
 
@@ -3215,6 +3220,27 @@ fn cameras_add_depth_fov_v_column(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE cameras ADD COLUMN depth_camera_fov_v_deg REAL NOT NULL DEFAULT 0.0;",
         )?;
+    }
+    Ok(())
+}
+
+/// Adds the camera mount offset (optical centre vs the robot body origin, metres,
+/// body frame x fwd / y left / z up). The depth cloud was projected from the body
+/// origin, so a head-mounted camera like the Go2's (0.33 m ahead of the body
+/// centre) landed that far behind the lidar map. `0.0` keeps a camera at the
+/// origin; the robot addon supplies its real mount at camera registration.
+/// Idempotent (column probes).
+fn cameras_add_depth_offset_columns(conn: &Connection) -> Result<()> {
+    for col in [
+        "depth_camera_offset_x_m",
+        "depth_camera_offset_y_m",
+        "depth_camera_offset_z_m",
+    ] {
+        if !column_exists(conn, "cameras", col)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE cameras ADD COLUMN {col} REAL NOT NULL DEFAULT 0.0;"
+            ))?;
+        }
     }
     Ok(())
 }

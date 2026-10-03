@@ -220,6 +220,24 @@ test('SearchBox re-emits input/change as {value, kind:tstr}', () => {
   assertEq(gotChange, { value: 'typed', kind: 'tstr' });
 });
 
+test('SearchBox tags input/change as edits of the bound path, not search', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SEARCHBOX_TAG, searchFields(), A11Y));
+  document.body.appendChild(el);
+  el.value = 'typed';
+  const tags = {};
+  for (const name of ['input', 'change', 'search']) {
+    el.addEventListener(name, (e) => { if (e.__tfReemit) tags[name] = e.__tfBoundEdits; });
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  el.dispatchEvent(new CustomEvent('search', { bubbles: true, detail: { value: 'typed' } }));
+  assertEq(tags.input, [{ path: PATH('q'), value: 'typed' }]);
+  assertEq(tags.change, [{ path: PATH('q'), value: 'typed' }]);
+  assertEq(tags.search, undefined);
+});
+
 // ============================================================================
 // SearchBox — validation
 // ============================================================================

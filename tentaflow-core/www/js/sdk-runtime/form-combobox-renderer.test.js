@@ -239,11 +239,13 @@ test('Combobox free_input=true Enter with non-option text emits change tstr', ()
     3: { kind: 'literal', value: 'L' },
   }))));
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let edits = null;
+  el.addEventListener('change', (e) => { got = e.detail; edits = e.__tfBoundEdits; });
   const input = el.querySelector('input');
   typeText(input, 'xyz');  // no option matches → no active option
   keydown(input, 'Enter');
   assertEq(got, { value: 'xyz', kind: 'tstr' });
+  assertEq(edits, [{ path: PATH('q'), value: 'xyz' }]);
 });
 
 test('Combobox free_input=false Enter with raw text does NOT commit', () => {
@@ -639,9 +641,12 @@ test('Autocomplete change re-emits SDK {value, kind:tstr}', () => {
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
   const input = el.querySelector('input');
+  let edits = null;
+  el.addEventListener('change', (e) => { edits = e.__tfBoundEdits; });
   input.value = 'final text';
   input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
   assertEq(got, { value: 'final text', kind: 'tstr' });
+  assertEq(edits, [{ path: PATH('q'), value: 'final text' }]);
 });
 
 test('Autocomplete focus/blur translated to SDK focus/blur events', () => {

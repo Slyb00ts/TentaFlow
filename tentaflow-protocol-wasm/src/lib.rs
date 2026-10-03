@@ -10687,6 +10687,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 // Klient renderuje jako badge opóźnienia.
                 set(&obj, "proc_ms", (frame.proc_ms as f64).into());
                 set(&obj, "procMs", (frame.proc_ms as f64).into());
+                // "" = object detections, "pose" = gesture engine (body + hands).
+                set(&obj, "source", frame.source.into());
                 let items = js_sys::Array::new();
                 for det in frame.items {
                     let item = js_sys::Object::new();
@@ -10711,6 +10713,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "track_id", (det.track_id as f64).into());
                     set(&item, "vx", (det.vx as f64).into());
                     set(&item, "vy", (det.vy as f64).into());
+                    // Flat [x0, y0, s0, x1, y1, s1, …], normalized 0..1.
+                    let keypoints = js_sys::Float32Array::new_with_length((det.keypoints.len() * 3) as u32);
+                    for (i, k) in det.keypoints.iter().enumerate() {
+                        for (j, v) in k.iter().enumerate() {
+                            keypoints.set_index((i * 3 + j) as u32, *v);
+                        }
+                    }
+                    set(&item, "keypoints", keypoints.into());
                     items.push(&item.into());
                 }
                 set(&obj, "items", items.into());
@@ -13168,6 +13178,8 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
         Some(t) => set(&obj, "telemetry", robot_telemetry_to_js(t)),
         None => set(&obj, "telemetry", JsValue::NULL),
     }
+    set(&obj, "gesturesEnabled", r.gestures_enabled.into());
+    set(&obj, "gestures_enabled", r.gestures_enabled.into());
     obj
 }
 

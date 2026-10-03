@@ -11986,5 +11986,9 @@
     "explain": "TentaFlow installiert auf diesem Node das AppArmor-Profil /etc/apparmor.d/bwrap, das bubblewrap User-Namespaces erlaubt, und lädt es sofort. Dafür wird einmalig das sudo-Passwort benötigt.",
     "done": "Die Agenten-Sandbox funktioniert.",
     "still_broken": "Das Profil wurde installiert, aber die Sandbox funktioniert weiterhin nicht: {reason}"
+  },
+  "gestures": {
+    "wave": "Winken",
+    "heart": "Herz"
   }
 }

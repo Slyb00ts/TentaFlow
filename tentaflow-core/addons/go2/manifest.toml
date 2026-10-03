@@ -36,6 +36,10 @@ tick_interval_ms = 100
 # publishes). 50M is generous headroom and still a hard anti-runaway bound
 # (a tick is a few ms even at this budget).
 tick_fuel_budget = 50000000
+# Connecting runs inside a tick: two signaling calls to the robot, each up to
+# ~27 s (connect 12 s + answer 15 s) when the robot is busy. The default 30 s
+# tick deadline would trap the second one mid-handshake.
+tick_timeout_ms = 60000
 
 # LAN signaling to the robot (con_notify / con_ing). `${ip}` is a per-install
 # placeholder: at install time the entered `ip` connection_param is substituted
@@ -100,6 +104,11 @@ provider = "unitree"
 [[requires.vision_engine]]
 engine = "privacy-cv"
 
+# Gesture reactions (wave → hello, heart → heart) read body pose and hand
+# keypoints with the models of this bundle.
+[[requires.vision_engine]]
+engine = "gesture-cv"
+
 [config.schema]
 ip = { type = "string", label = "Adres IP robota", required = true }
 serial = { type = "string", label = "Numer seryjny (opcjonalnie)", required = false }
@@ -160,8 +169,8 @@ risk = "medium"
 
 [[permission]]
 id = "lidar.publish"
-display_name = "Publikacja chmury punktów LiDAR"
-description = "Publikacja kanonicznej, niezależnej od producenta ramki chmury punktów (spakowane f32) robota do hosta na potrzeby podglądu 3D."
+display_name = "Publikacja chmury punktów LiDAR i pozycji robota"
+description = "Publikacja kanonicznej, niezależnej od producenta ramki chmury punktów (spakowane f32) oraz pozycji robota z odometrii do hosta — podgląd 3D i umieszczanie chmury głębi z kamery."
 risk = "low"
 
 [[permission]]

@@ -199,37 +199,15 @@ async fn central_worker() {
             // camera latency × angular velocity whenever the robot turns.
             // Depth needs the full-res crops frame; the detect frame (last) is
             // ignored — it is the small 560 detector input.
-            let Some((crops, w, h, captured_ms, _pts_ns, crops_format, _detect, crops_device)) =
-                crate::addon::host_functions::camera::latest_frame_global(cam).await
+            let Some(crate::addon::host_functions::camera::RgbFrame {
+                rgb,
+                width: w,
+                height: h,
+                captured_ms,
+                ..
+            }) = crate::addon::host_functions::camera::latest_rgb_frame_global(cam, 0).await
             else {
                 continue; // no frame yet
-            };
-            // Zero-copy crops: the crops bytes are empty (device-resident). Depth
-            // runs at a low cadence, so download the full NV12 on demand here.
-            let crops = if crops.is_empty() {
-                match crops_device.as_ref().and_then(|d| d.download_full_nv12()) {
-                    Some((nv12, _fmt)) => nv12,
-                    None => crops,
-                }
-            } else {
-                crops
-            };
-            // Depth back-projection assumes RGB24. On the GPU-resident NVDEC path
-            // the crops frame is NV12 — convert on demand (depth runs at a low
-            // cadence, so a per-pulled-frame convert here is acceptable).
-            let rgb: std::sync::Arc<[u8]> = match crops_format {
-                crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24 => crops,
-                crate::services::camera_ingest::fakefile::DetectFrameFormat::Nv12 { .. } => {
-                    match crate::services::camera_ingest::fakefile::nv12_frame_to_rgb24(
-                        &crops,
-                        w,
-                        h,
-                        &crops_format,
-                    ) {
-                        Some(v) => std::sync::Arc::from(v),
-                        None => continue,
-                    }
-                }
             };
             let Some(pose) = SlamSceneManager::global()
                 .scene_pose_at(&cfg.pose_robot_id, (captured_ms as i64) * 1000)
@@ -276,6 +254,7 @@ async fn central_worker() {
                 job.cfg.fov_v_deg,
                 job.cfg.pitch_deg,
                 job.cfg.scale,
+                job.cfg.offset_m,
                 &job.pose,
             );
             if points.is_empty() {
@@ -506,6 +485,9 @@ fn maybe_dump_calibration(depth: &DepthMap, job: &Job) {
     for v in [job.cfg.fov_deg, job.cfg.pitch_deg, job.cfg.scale] {
         d.extend_from_slice(&v.to_le_bytes());
     }
+    for v in job.cfg.offset_m {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
     for v in t {
         d.extend_from_slice(&v.to_le_bytes());
     }
@@ -540,13 +522,16 @@ fn maybe_dump_calibration(depth: &DepthMap, job: &Job) {
 /// body frame (FLU, Z-up) as `body = (z, -x, -y)`. Extrinsic calibration: `scale`
 /// corrects the monocular metric scale; `pitch_deg` rotates the camera frame about
 /// the body LEFT axis (a down-angled mount like the Go2's needs negative pitch) so
-/// the cloud lands on the lidar instead of floating off. Then the scene transform.
+/// the cloud lands on the lidar instead of floating off. `offset_m` moves the ray
+/// origin from the body origin to the camera's optical centre (body frame), since
+/// the pose describes the body, not the lens. Then the scene transform.
 fn backproject_to_scene(
     depth: &DepthMap,
     fov_deg: f32,
     fov_v_deg: f32,
     pitch_deg: f32,
     scale: f32,
+    offset_m: [f32; 3],
     pose: &Pose,
 ) -> Vec<f32> {
     let w = depth.width as usize;
@@ -586,8 +571,9 @@ fn backproject_to_scene(
                 let by = -x_opt;
                 let bz0 = -y_opt;
                 // apply mount pitch about +Y (left)
-                let bx = bx0 * cp + bz0 * sp;
-                let bz = -bx0 * sp + bz0 * cp;
+                let bx = bx0 * cp + bz0 * sp + offset_m[0];
+                let by = by + offset_m[1];
+                let bz = -bx0 * sp + bz0 * cp + offset_m[2];
                 let world = pose.transform_point([bx as f64, by as f64, bz as f64]);
                 out.push(world[0] as f32);
                 out.push(world[1] as f32);
@@ -651,7 +637,7 @@ mod tests {
         // x_opt=y_opt=(0-1.5)*2/1.5=-2, z_opt=2 → body (z,-x,-y)=(2,2,2) → world (2,2,2).
         // The key invariant: depth maps to +X (forward) in the Z-up body/scene frame.
         let dm = flat_depth(3, 3, 2.0);
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, [0.0; 3], &Pose::identity());
         assert_eq!(pts.len(), 3, "one sampled pixel → one point");
         assert!(
             (pts[0] - 2.0).abs() < 1e-4,
@@ -672,7 +658,7 @@ mod tests {
         // the loop below has nothing to assert on.
         let depth = MAX_DEPTH_M - 0.5;
         let dm = flat_depth(6, 6, depth);
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, [0.0; 3], &Pose::identity());
         // Find the on-axis point (the one with ~zero y and z).
         let mut found = false;
         for p in pts.chunks_exact(3) {
@@ -689,10 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn mount_offset_moves_ray_origin_and_turns_with_the_body() {
+        // On-axis pixel at depth d from a camera 0.33 m ahead / 0.04 m above the body
+        // origin: body point (d+0.33, 0, 0.04). With the robot yawed +90° the offset
+        // rotates with it, so the world point lies on +Y, not behind the robot.
+        let depth = MAX_DEPTH_M - 0.5;
+        let dm = flat_depth(6, 6, depth);
+        let h = std::f64::consts::FRAC_PI_4;
+        let pose = Pose::from_parts([1.0, 2.0, 0.0], [0.0, 0.0, h.sin(), h.cos()]);
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, [0.33, 0.0, 0.04], &pose);
+        let on_axis = pts
+            .chunks_exact(3)
+            .find(|p| (p[0] - 1.0).abs() < 1e-3 && (p[2] - 0.04).abs() < 1e-3)
+            .expect("on-axis point lands straight ahead of the yawed camera");
+        assert!(
+            (on_axis[1] - (2.0 + depth + 0.33)).abs() < 1e-3,
+            "forward distance includes the mount offset, got y={}",
+            on_axis[1]
+        );
+    }
+
+    #[test]
     fn out_of_range_and_nonfinite_depth_dropped() {
         let mut dm = flat_depth(3, 3, f32::NAN);
         dm.depth[4] = 0.0; // centre zero → dropped
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, [0.0; 3], &Pose::identity());
         assert!(pts.is_empty(), "no finite in-range samples → empty cloud");
     }
 

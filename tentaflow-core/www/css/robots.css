@@ -259,6 +259,16 @@
 
 .robots-detail-panel {
   margin-top: 14px;
+  /* Exactly the height left under the header (measured by robots.js), so the
+     page never scrolls; a tab taller than that scrolls inside the panel. */
+  height: var(--robots-media-h, auto);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Control/log tabs stack several sections. */
+.robots-detail-panel > .robots-section + .robots-section {
+  margin-top: 14px;
 }
 
 /* Sekcje (karty) w panelu szczegółów. */
@@ -290,12 +300,23 @@
   gap: 14px;
 }
 
-/* Kafelki kamera + LiDAR (przegląd) lub pełnoekranowe (zakładki). */
-.robots-tiles {
+/* Przegląd: kamera, widok 3D i kolumna telemetrii/sterowania obok siebie na
+   całą wysokość panelu; kolumna przewija się sama, gdy jest dłuższa. */
+.robots-overview {
   display: grid;
-  grid-template-columns: 1.35fr 1fr;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(260px, 320px);
+  grid-template-rows: minmax(0, 1fr);
   gap: 14px;
-  margin-bottom: 14px;
+  height: 100%;
+  min-height: 300px;
+}
+
+.robots-overview-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .robots-tile {
@@ -309,18 +330,10 @@
   overflow: hidden;
 }
 
-/* Full-screen Kamera / LiDAR tab: fill the remaining viewport height instead of a
-   fixed box. The toolbar + KPIs + action row + tabs take ~280px above. */
+/* Full-screen Kamera / LiDAR tab: the whole remaining viewport height. */
 .robots-tile-full {
-  height: calc(100vh - 280px);
-  min-height: 380px;
-}
-
-/* In a full tile the media (video / voxel canvas) flexes to fill the height. */
-.robots-tile-full tf-video-stream {
-  flex: 1;
-  min-height: 0;
-  --tf-video-stream-height: 100%;
+  height: 100%;
+  min-height: 300px;
 }
 
 .robots-tile-empty {
@@ -382,7 +395,11 @@
 .robots-tile tf-video-stream {
   display: block;
   width: 100%;
-  background: var(--bg);
+  /* The media flexes to the tile height (beats the component's own height). */
+  flex: 1 1 0;
+  min-height: 0;
+  border-radius: 0;
+  background: #000;
 }
 
 .robots-tile-bottom {
@@ -396,16 +413,12 @@
 .robots-voxel {
   position: relative;
   width: 100%;
-  min-height: 240px;
-  flex: 1;
+  min-height: 0;
+  flex: 1 1 0;
   background:
     radial-gradient(circle at 38% 62%, rgba(239, 68, 68, 0.18), transparent 42%),
     radial-gradient(circle at 66% 36%, rgba(59, 130, 246, 0.18), transparent 46%),
     var(--bg);
-}
-
-.robots-tile-full .robots-voxel {
-  min-height: 0;
 }
 
 .robots-voxel-canvas {
@@ -430,11 +443,31 @@
 
 .robots-lidar-bar {
   border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+/* Camera tile bar: the gesture toggle sits at the far right of the share button. */
+.robots-camera-bar {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.robots-camera-bar .robots-toggle-opt {
+  margin-left: auto;
+}
+
+/* A toggle and its label wrap as one unit in a narrow tile. */
+.robots-toggle-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .robots-lidar-label {
   font-size: 13px;
   color: var(--text-2);
+  white-space: nowrap;
 }
 
 .robots-lidar-status {
@@ -586,9 +619,18 @@
   .robots-detail-kpis {
     grid-template-columns: repeat(2, 1fr);
   }
-  .robots-tiles,
   .robots-panels {
     grid-template-columns: 1fr;
+  }
+  /* Narrow: the two previews share the panel height, the telemetry column
+     moves below them (reached by scrolling inside the panel). */
+  .robots-overview {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(260px, 1fr) auto;
+  }
+  .robots-overview-side {
+    grid-column: 1 / -1;
+    overflow-y: visible;
   }
 }
 
@@ -776,8 +818,7 @@
 .robots-map-legend { display: flex; flex-direction: column; gap: 8px; }
 .robots-map-leg { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2, #b6bccb); }
 .robots-map-leg .dot { width: 12px; height: 12px; border-radius: 3px; }
-.robots-map-leg .dot.lidar { background: linear-gradient(90deg, #ff3b3b, #3ddc84, #2f6bff); }
-.robots-map-leg .dot.depth { background: #ff00ff; }
+.robots-map-leg .dot.range { width: 48px; background: linear-gradient(90deg, #ff0d0d, #ffd60d, #0dff3a, #0dffff, #0d1aff); }
 .robots-map-scene {
   position: relative;
   min-height: 0;

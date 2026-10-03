@@ -3234,6 +3234,11 @@ pub struct RobotEntry {
     /// (`#[serde(default)]`, ciborium APPEND-AT-END rule).
     #[serde(default)]
     pub lidar: Option<RobotLidarStatus>,
+    /// Whether the robot reacts to people's gestures seen by its camera (an
+    /// operator setting). Appended last (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule): an old peer decodes it as off.
+    #[serde(default)]
+    pub gestures_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -10211,6 +10216,7 @@ mod tests {
                 frame_seq: 7,
                 last_update_ts: 1_700_000_000,
             }),
+            gestures_enabled: true,
         };
         let bytes = crate::cbor::encode(&entry).expect("encode");
         let back: RobotEntry = crate::cbor::decode(&bytes).expect("decode");

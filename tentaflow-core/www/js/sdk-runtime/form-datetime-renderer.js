@@ -12,7 +12,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit, tagBoundEdits } from './bind-resolver.js';
 
 const DATE_STYLES = new Set(['short', 'medium', 'long', 'full']);
 const TIME_STYLES = new Set(['short', 'medium', 'long']);
@@ -344,12 +344,13 @@ function renderDatePicker(component, ctx) {
         if (disabledSet && disabledSet.has(v)) return;
         picker.value = v;
         lastValid = v;
-        wrapper.dispatchEvent(
+        wrapper.dispatchEvent(tagBoundEdit(
           new (globalThis.CustomEvent || globalThis.Event)('change', {
             bubbles: false,
             detail: { value: v, kind: 'tstr', preset_id: p.id },
-          })
-        );
+          }),
+          bindPath
+        ));
       };
       btn.addEventListener('click', onClick);
       ctx.registerCleanup(() => btn.removeEventListener('click', onClick));
@@ -369,12 +370,13 @@ function renderDatePicker(component, ctx) {
       return;
     }
     lastValid = v;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: v || null, kind: v ? 'tstr' : null },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   picker.addEventListener('change', onChange);
   ctx.registerCleanup(() => picker.removeEventListener('change', onChange));
@@ -530,7 +532,7 @@ function renderDateRangePicker(component, ctx) {
         toPicker.value = r.to;
         lastFrom = r.from;
         lastTo = r.to;
-        wrapper.dispatchEvent(
+        wrapper.dispatchEvent(tagBoundEdits(
           new (globalThis.CustomEvent || globalThis.Event)('change', {
             bubbles: false,
             detail: {
@@ -538,8 +540,9 @@ function renderDateRangePicker(component, ctx) {
               kind: 'range',
               preset_id: p.id,
             },
-          })
-        );
+          }),
+          [[fromPath, r.from], [toPath, r.to]]
+        ));
       };
       btn.addEventListener('click', onClick);
       ctx.registerCleanup(() => btn.removeEventListener('click', onClick));
@@ -566,7 +569,7 @@ function renderDateRangePicker(component, ctx) {
       }
     }
     lastFrom = f; lastTo = t;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdits(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: {
@@ -574,8 +577,9 @@ function renderDateRangePicker(component, ctx) {
           kind: 'range',
           changed: changedKind,
         },
-      })
-    );
+      }),
+      [[fromPath, f || null], [toPath, t || null]]
+    ));
   };
   // Raw tf-datepicker change (detail { value, date }) bubbles past the
   // pickers; stop it so only the validated SDK range event reaches the wrapper.
@@ -654,12 +658,13 @@ function renderTimePicker(component, ctx) {
   // Native change bubbles; stop it so the wrapper only sees the SDK re-emit.
   const onChange = (e) => {
     e.stopImmediatePropagation();
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: input.value || null, kind: input.value ? 'tstr' : null },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   input.addEventListener('change', onChange);
   ctx.registerCleanup(() => input.removeEventListener('change', onChange));
@@ -750,7 +755,7 @@ function renderDateTimePicker(component, ctx) {
   // Native change bubbles; stop it so the wrapper only sees the SDK re-emit.
   const onChange = (e) => {
     e.stopImmediatePropagation();
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: {
@@ -758,8 +763,9 @@ function renderDateTimePicker(component, ctx) {
           kind: input.value ? 'tstr' : null,
           timezone,
         },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   input.addEventListener('change', onChange);
   ctx.registerCleanup(() => input.removeEventListener('change', onChange));

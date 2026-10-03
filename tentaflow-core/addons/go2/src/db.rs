@@ -168,6 +168,15 @@ pub fn set_now_secs(secs: i64) {
     }
 }
 
+/// Re-read the cached clock from the system clock. For a step that blocked for
+/// seconds inside one tick (robot signaling), after which the tick-start time
+/// would date the next state change in the past.
+pub fn resync_now_secs() {
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        set_now_secs(d.as_secs() as i64);
+    }
+}
+
 /// Current wall-clock seconds. The service instance seeds a cached tick time at
 /// the top of every `on_tick` (zero-cost atomic read on the hot path). Any
 /// instance that has NOT been tick-seeded — notably a pooled tool-call worker,
@@ -330,31 +339,6 @@ pub fn set_offline(status: &str, msg: &str) -> Result<(), AbiError> {
     Ok(())
 }
 
-/// One-time upgrade bridge: read the legacy operator LiDAR enable INTENT out of
-/// the vestigial `robot_live` table. Returns `Ok(Some(enabled))` when the table
-/// still exists with the singleton row, `Ok(None)` when the table is gone (a
-/// later migration dropped it), has no row, or the statement otherwise fails to
-/// run (a "no such table" after the later drop migration is reported by the host
-/// as an Operation error). The bridge is best-effort and idempotent — on the
-/// absent-table / failed-read case it simply leaves the durable store key as-is,
-/// to be reconsidered on the next start; only a permission failure propagates so
-/// a sandbox misconfiguration is surfaced loudly.
-pub fn legacy_lidar_enabled() -> Result<Option<bool>, AbiError> {
-    match query(
-        "SELECT lidar_enabled FROM robot_live WHERE id = ?1",
-        &[SqlValue::Text(ROBOT_ID.into())],
-    ) {
-        Ok(rows) => Ok(rows
-            .first()
-            .and_then(|r| r.first())
-            .map(|v| v.as_i64() != 0)),
-        Err(AbiError::Permission) => Err(AbiError::Permission),
-        // Table gone after the drop migration, or any other run failure: nothing
-        // to bridge this start (idempotent — re-evaluated next start).
-        Err(_) => Ok(None),
-    }
-}
-
 /// Increment the tick counter (UPDATE only — the caller already holds the prior
 /// count from get_robot(), so no read-back SELECT).
 pub fn bump_tick() {
@@ -364,48 +348,19 @@ pub fn bump_tick() {
     );
 }
 
-/// Test-only: seed the legacy `robot_live.lidar_enabled` the on_start bridge reads.
-/// `None` simulates the table already dropped (a later migration).
-#[cfg(test)]
-pub fn test_set_legacy_lidar(v: Option<bool>) {
-    test_backend::set_legacy_lidar(v);
-}
-
 #[cfg(test)]
 mod test_backend {
     use super::{SqlValue, AbiError};
-    use core::cell::Cell;
     use serde_json::{json, Value as JsonValue};
-
-    std::thread_local! {
-        // Simulates the legacy `robot_live.lidar_enabled` column for the on_start
-        // upgrade-bridge tests. `None` = the table is gone (later drop migration)
-        // → the SELECT errors (Operation), matching the live host's "no such table".
-        static LEGACY_LIDAR: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    /// Test hook: seed the legacy `robot_live.lidar_enabled` value the bridge reads.
-    pub fn set_legacy_lidar(v: Option<bool>) {
-        LEGACY_LIDAR.with(|c| c.set(v));
-    }
 
     /// The `robot` connection-state table uses an SQL CAS state machine that
     /// native tests do not exercise (the live-state tests target the shared store
     /// in `state.rs`). Every query is therefore an inert no-op: `unixepoch()`
     /// returns 0 (the tests seed the clock via `set_now_secs`), a SELECT returns
-    /// no rows and an exec reports zero rows affected. The one exception is the
-    /// legacy `robot_live` SELECT, served from the LEGACY_LIDAR test hook so the
-    /// on_start bridge can be exercised offline.
+    /// no rows and an exec reports zero rows affected.
     pub fn dispatch(is_query: bool, query: &str, _params: &[SqlValue]) -> Result<JsonValue, AbiError> {
         if query.contains("unixepoch()") {
             return Ok(json!({ "rows": [[0]] }));
-        }
-        if query.contains("FROM robot_live") {
-            return match LEGACY_LIDAR.with(Cell::get) {
-                Some(v) => Ok(json!({ "rows": [[i64::from(v)]] })),
-                // No legacy table → the host reports a run error (Operation).
-                None => Err(AbiError::Operation),
-            };
         }
         if is_query {
             return Ok(json!({ "rows": [] }));

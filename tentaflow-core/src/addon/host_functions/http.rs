@@ -321,7 +321,7 @@ fn url_path(url: &str) -> String {
 /// async scheduler. On a multi-thread runtime it hands the worker off via
 /// `block_in_place` (same pattern every other host fn uses for its `block_on`);
 /// off-runtime or on a current-thread runtime it just runs inline. Without this a
-/// blocking `raw_http10_post` (up to 8 s to a dead host) pins a tokio worker — in
+/// blocking `raw_http10_post` (up to 27 s to a dead host) pins a tokio worker — in
 /// the command path (`call_tool_inner`) the wasm call is NOT wrapped in
 /// `block_in_place`, so an addon hammering an offline endpoint could exhaust the
 /// pool and wedge the whole addon dispatcher.
@@ -353,13 +353,18 @@ fn raw_http10_post(
     body: &[u8],
 ) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(8))
-        .map_err(|e| format!("tcp connect: {e}"))?;
+    // Measured on a loaded Go2: its signaling server drops SYNs while busy, so a
+    // connect lands on the 3rd retransmit (~7 s), and the answer (RSA work on the
+    // robot) takes up to ~10 s more. 8 s cut both off, and every retry only added
+    // load. The bound still stops a dead host from holding the worker for long.
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(12))
+            .map_err(|e| format!("tcp connect: {e}"))?;
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+        .set_read_timeout(Some(std::time::Duration::from_secs(15)))
         .ok();
     stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(8)))
+        .set_write_timeout(Some(std::time::Duration::from_secs(15)))
         .ok();
     let mut head = format!("POST {path} HTTP/1.0\r\nHost: {host_header}\r\nConnection: close\r\n");
     if !content_type.is_empty() {

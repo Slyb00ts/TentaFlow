@@ -768,6 +768,9 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "lidar_publish_v1", lidar::lidar_publish_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja lidar_publish_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "robot_pose_publish_v1", sensors::robot_pose_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja robot_pose_publish_v1: {e}"))?;
     }
 
     // --- Positioning sensors (device addon → per-device fusion engine) ---

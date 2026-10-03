@@ -13221,5 +13221,9 @@
     "explain": "TentaFlow zainstaluje na tym nodzie profil AppArmor /etc/apparmor.d/bwrap, który zezwala bubblewrap na przestrzenie nazw użytkownika, i od razu go załaduje. Potrzebne jest jednorazowo hasło sudo.",
     "done": "Piaskownica agentów działa.",
     "still_broken": "Profil został zainstalowany, ale piaskownica nadal nie działa: {reason}"
+  },
+  "gestures": {
+    "wave": "machanie",
+    "heart": "serce"
   }
 }

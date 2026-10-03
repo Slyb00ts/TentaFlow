@@ -141,9 +141,11 @@ test('RadioGroup click emits change with SelectValue payload', () => {
     [2, 'horizontal'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
   ])));
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let bound = null;
+  el.addEventListener('change', (e) => { got = e.detail; bound = e.__tfBoundEdits[0].path; });
   el.querySelectorAll('tf-radio')[1].querySelector('.tf-radio-label').click();
   assertEq(got, { value: 'b', kind: 'tstr' });
+  assertEq(bound, PATH('r'));
 });
 
 test('RadioGroup disabled option does not emit change', () => {

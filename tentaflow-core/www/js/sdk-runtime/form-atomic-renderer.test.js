@@ -134,6 +134,47 @@ test('Toggle click re-emits change with SDK { value, kind: bool } payload', () =
   assertEq(events, [{ value: true, kind: 'bool' }]);
 });
 
+test('Toggle stays on through a stale snapshot after an optimistic edit', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('on'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  // Same optimistic write the addon-app dispatcher performs for a tagged edit.
+  const engine = new ComponentRenderer({
+    store,
+    eventDispatcher: {
+      emit({ dom_event }) {
+        for (const { path, value } of dom_event.__tfBoundEdits || []) store.setLocalEdit(path, value);
+      },
+    },
+    locale: 'en-US',
+  });
+  const el = mount(engine.render(
+    comp(TOGGLE_TAG, [
+      [0, PATH('on')],
+      [1, { kind: 'literal', value: 'X' }],
+      [3, 'sm'], [6, 'leading'],
+    ], { handlers: [['change', { kind: 'backend', action_id: 'set_on', params: {} }]] })
+  ));
+  const toggle = el.querySelector('tf-toggle');
+  toggle.querySelector('[role=switch]').click();
+  assertEq(toggle.hasAttribute('checked'), true, 'checked right after the click');
+  // The addon pushes its state before it handled the action: still the old value.
+  store.applySnapshot({
+    entries: [{ path: PATH('on'), value: false }],
+    state_revision: 1, truncated: false,
+  });
+  assertEq(toggle.hasAttribute('checked'), true, 'no bounce on a stale snapshot');
+  store.applySnapshot({
+    entries: [{ path: PATH('on'), value: true }],
+    state_revision: 2, truncated: false,
+  });
+  assertEq(store._pending.size, 0, 'echo settles the edit');
+  store.destroy();
+});
+
 test('Toggle disabled: raw component change never leaks to wrapper', () => {
   setup();
   const store = makeStore();
@@ -360,8 +401,11 @@ test('Checkbox click re-emits exactly ONE SDK change (no recursion)', () => {
   // exactly one SDK-shaped event per click.
   const events = [];
   el.addEventListener('change', (e) => events.push(e.detail));
+  let bound = null;
+  el.addEventListener('change', (e) => { bound = e.__tfBoundEdits[0].path; });
   el.querySelector('.tf-checkbox-label').click();
   assertEq(events, [{ value: true, kind: 'bool' }]);
+  assertEq(bound, PATH('chk'));
   el.querySelector('.tf-checkbox-label').click();
   assertEq(events, [
     { value: true, kind: 'bool' },
@@ -552,9 +596,11 @@ test('Radio click dispatches change with SelectValue payload (tstr)', () => {
     ])
   ));
   let received = null;
-  el.addEventListener('change', (e) => { received = e.detail; });
+  let bound = null;
+  el.addEventListener('change', (e) => { received = e.detail; bound = e.__tfBoundEdits[0].path; });
   el.querySelector('.tf-radio-label').click();
   assertEq(received, { value: 'list', kind: 'tstr' });
+  assertEq(bound, PATH('view'));
 });
 
 test('Radio u32 SelectValue accepts BigInt and emits Number value', () => {

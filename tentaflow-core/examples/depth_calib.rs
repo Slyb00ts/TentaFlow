@@ -25,6 +25,9 @@ struct Capture {
     cap_fov: f32,
     cap_pitch: f32,
     cap_scale: f32,
+    /// Camera optical centre vs the body origin (m, body FLU) — production applies it
+    /// after the mount rotation, so the fit must too or the scale absorbs the offset.
+    offset: [f32; 3],
     pose: Pose,
     depth: Vec<f32>,
     lidar: Vec<[f32; 3]>,
@@ -63,6 +66,7 @@ fn load_capture() -> Capture {
     let cap_fov = rd_f32(&d, &mut o);
     let cap_pitch = rd_f32(&d, &mut o);
     let cap_scale = rd_f32(&d, &mut o);
+    let offset = [rd_f32(&d, &mut o), rd_f32(&d, &mut o), rd_f32(&d, &mut o)];
     let t = [rd_f64(&d, &mut o), rd_f64(&d, &mut o), rd_f64(&d, &mut o)];
     let q = [
         rd_f64(&d, &mut o),
@@ -90,6 +94,7 @@ fn load_capture() -> Capture {
         cap_fov,
         cap_pitch,
         cap_scale,
+        offset,
         pose: Pose::from_parts(t, q),
         depth,
         lidar,
@@ -153,7 +158,8 @@ fn backproject(cap: &Capture, p: &Params, stride: usize) -> Vec<[f32; 3]> {
                 let y_opt = (v as f32 - cy) * d / fy;
                 let z_opt = d;
                 // optical → body (FLU, Z-up), then mount rotation
-                let body = rotate_body([z_opt, -x_opt, -y_opt], p.yaw, p.pitch, p.roll);
+                let r = rotate_body([z_opt, -x_opt, -y_opt], p.yaw, p.pitch, p.roll);
+                let body = [r[0] + cap.offset[0], r[1] + cap.offset[1], r[2] + cap.offset[2]];
                 let world =
                     cap.pose
                         .transform_point([body[0] as f64, body[1] as f64, body[2] as f64]);
@@ -378,7 +384,7 @@ fn main() {
     let mut best_cost = eval(&init);
     // PHYSICAL constraints (the depth values are metric-correct, p50≈1.9 m): scale is
     // pinned near 1.0 so the optimiser can't "win" by collapsing the cloud, and the
-    // camera is body-centred so yaw/roll stay small. The dominant unknown is the mount
+    // camera looks straight ahead from its mount offset so yaw/roll stay small. The dominant unknown is the mount
     // PITCH (the Go2 camera angles down), so multi-start over pitch seeds.
     for &pitch0 in &[-10.0f32, -25.0, -40.0, -55.0] {
         for &y0 in &[0.0f32, -20.0, 20.0] {

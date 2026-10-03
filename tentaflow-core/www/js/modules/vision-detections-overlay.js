@@ -37,6 +37,7 @@
 //     rAF, czyscimy bufory i ResizeObserver. Subskrybujemy tylko gdy dolaczeni.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { I18n } from '/js/i18n.js';
 
 // Kolory ramek per klasa detekcji. Klasy nieznane dostaja kolor domyslny.
 const KLASA_KOLORY = {
@@ -56,6 +57,27 @@ const KLASA_KOLORY = {
   person: '#a855f7',
 };
 const KOLOR_DOMYSLNY = '#e5e7eb';
+
+// Gesture-engine frames (source "pose"): body skeleton (17 COCO points), hands
+// (21 MediaPipe points) and the recognized gesture. The engine analyzes every
+// frame and stamps it like detections, so the overlay picks the analysis of the
+// frame the video shows; without playback timing it draws the newest one.
+const POSE_FADE_MS = 800;
+// Pose frames kept for matching against the playhead (video lags the analysis).
+const POSE_BUFFER_MS = 3000;
+const POSE_MIN_SCORE = 0.2;
+const POSE_COLOR = '#22d3ee';
+const HAND_COLOR = '#facc15';
+const GESTURE_COLOR = '#f472b6';
+const POSE_EDGES = [
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12],
+  [11, 13], [13, 15], [12, 14], [14, 16], [0, 1], [0, 2], [1, 3], [2, 4],
+];
+const HAND_EDGES = [
+  [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9],
+  [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16], [13, 17],
+  [0, 17], [17, 18], [18, 19], [19, 20],
+];
 
 // Czerwony tint dla detekcji w stanie "uszkodzona" (nadpisuje kolor klasy).
 const KOLOR_USZKODZONA = '#ef4444';
@@ -326,6 +348,8 @@ class DetectionsOverlay {
     // Kazdy element: { tsMs, ptsNs, items }. `ptsNs` (ns media-timeline lub null)
     // uzywany w trybie media-time; `tsMs` (wall-clock) w trybie awaryjnym.
     this.frames = [];
+    // Gesture-engine frames { at, tsMs, ptsNs, items } (source "pose"), oldest first.
+    this.poseFrames = [];
     // Kliencki cache OSTATNIEGO ZNANEGO niepustego `stan`/`tekst` (OCR) per
     // track_id. Serwer wzbogaca detekcje w fazie-2 z opoznieniem, wiec
     // najswiezsza ramka tracku (faza-1) miewa pusty stan; z cache uzupelniamy
@@ -572,6 +596,15 @@ class DetectionsOverlay {
     // ale strzezemy sie przed niespojnoscia po stronie backendu).
     const cam = body.cameraId ?? body.camera_id;
     if (cam != null && String(cam) !== this.cameraId) return;
+    if ((body.source ?? '') === 'pose') {
+      this.pushPoseFrame({
+        at: performance.now(),
+        tsMs: Number(body.tsMs ?? body.ts_ms ?? 0),
+        ptsNs: ptsToNumber(body.pts_ns ?? body.ptsNs),
+        items: Array.isArray(body.items) ? body.items : [],
+      });
+      return;
+    }
 
     const tsMs = Number(body.tsMs ?? body.ts_ms ?? 0);
     const ptsNs = ptsToNumber(body.pts_ns ?? body.ptsNs);
@@ -582,6 +615,35 @@ class DetectionsOverlay {
     const procMs = Number.isFinite(Number(rawProc)) ? Number(rawProc) : null;
     this.pushFrame(tsMs, ptsNs, items, procMs);
     this.lastMessageAt = performance.now();
+  }
+
+  pushPoseFrame(frame) {
+    const buf = this.poseFrames;
+    buf.push(frame);
+    while (buf.length > 0 && frame.tsMs - buf[0].tsMs > POSE_BUFFER_MS) buf.shift();
+  }
+
+  // The pose frame for the picture on screen: by media time when the stream has
+  // a PTS axis, by capture wall-clock for MSE without one, otherwise the newest
+  // frame (a live stream with no buffer to measure lag against). Returns
+  // { frame, ageMs } or null.
+  selectPoseFrame() {
+    const buf = this.poseFrames;
+    if (buf.length === 0) return null;
+    const base = this.mediaBasePtsNs();
+    const v = this.videoEl();
+    const ct = v ? v.currentTime : NaN;
+    if (base != null && Number.isFinite(ct) && ct > 0 && buf.some((f) => f.ptsNs != null)) {
+      const sel = this.wybierzNajlepszaRamke(buf, base, ct * 1000);
+      return sel ? { frame: sel.frame, ageMs: sel.wiekMs } : null;
+    }
+    const target = this.targetCaptureWallMs();
+    if (target != null) {
+      const frame = this.selectFrame(buf);
+      return frame ? { frame, ageMs: Math.max(0, target - frame.tsMs) } : null;
+    }
+    const last = buf[buf.length - 1];
+    return { frame: last, ageMs: performance.now() - last.at };
   }
 
   // Wstawia ramke do bufora utrzymujac porzadek rosnacy po tsMs. Ewikcja:
@@ -784,6 +846,7 @@ class DetectionsOverlay {
   // serwer zakonczy strumien — bez tego stare oznaczenia wisza kilka klatek.
   resetStanKamery() {
     this.frames.length = 0;
+    this.poseFrames.length = 0;
     this.trackMeta.clear();
     this.ocrGlosy.clear();
     this.klasaSeq.clear();
@@ -830,8 +893,7 @@ class DetectionsOverlay {
   // EPS_PRZOD_MS (zakaz ramek z przyszlosci) i wieku <= MAX_WIEK_RAMKI_MS
   // (zakaz przestarzalych) — te same bramki co w trybie PTS. Zwraca null gdy
   // brak playbacku/bufora albo zadna ramka nie pasuje.
-  selectFrame() {
-    const buf = this.frames;
+  selectFrame(buf = this.frames) {
     if (buf.length === 0) return null;
 
     const targetWallMs = this.targetCaptureWallMs();
@@ -1109,6 +1171,7 @@ class DetectionsOverlay {
 
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.drawPose(ctx);
 
     // Debug HUD (do tuningu synchronizacji) — rysowany zawsze gdy wlaczony,
     // PRZED bramkami wygaszania, zeby diagnozowac takze stan "nic nie rysuje"
@@ -1158,6 +1221,88 @@ class DetectionsOverlay {
 
     // Dwuliniowy pasek podsumowania u dolu obszaru wideo (nakladka na wideo).
     this.rysujPasek(ctx, lista, area, dpr);
+  }
+
+  // Body skeleton, hand keypoints and the recognized gesture of the analysis
+  // matching the picture on screen; fades out when the engine goes quiet.
+  drawPose(ctx) {
+    const sel = this.selectPoseFrame();
+    if (!sel || sel.ageMs > POSE_FADE_MS) return;
+    const f = sel.frame;
+    const age = sel.ageMs;
+    const area = this.videoContentRect();
+    const dpr = window.devicePixelRatio || 1;
+    const px = (kp, i) => ({
+      x: area.x + kp[i * 3] * area.width,
+      y: area.y + kp[i * 3 + 1] * area.height,
+      ok: kp[i * 3 + 2] >= POSE_MIN_SCORE,
+    });
+    ctx.save();
+    ctx.globalAlpha = Math.max(0.25, 1 - age / POSE_FADE_MS);
+    ctx.lineCap = 'round';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.6)';
+    ctx.shadowBlur = Math.round(2 * dpr);
+    for (const it of f.items) {
+      const kp = it.keypoints;
+      if (it.klasa === 'gesture') {
+        this.drawGestureLabel(ctx, it, area, dpr);
+        continue;
+      }
+      if (!kp || !kp.length) continue;
+      const hand = it.klasa === 'hand';
+      const edges = hand ? HAND_EDGES : POSE_EDGES;
+      const n = kp.length / 3;
+      ctx.strokeStyle = hand ? HAND_COLOR : POSE_COLOR;
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.lineWidth = Math.max(2, Math.round((hand ? 1.5 : 3) * dpr));
+      for (const [a, b] of edges) {
+        if (a >= n || b >= n) continue;
+        const p = px(kp, a);
+        const q = px(kp, b);
+        if (!p.ok || !q.ok) continue;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(q.x, q.y);
+        ctx.stroke();
+      }
+      const r = Math.max(2, Math.round((hand ? 2 : 3.5) * dpr));
+      for (let i = 0; i < n; i += 1) {
+        const p = px(kp, i);
+        if (!p.ok) continue;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  // Name of the recognized gesture in a pill above the person. The engine sends
+  // a gesture id; the name comes from the dashboard's translations.
+  drawGestureLabel(ctx, it, area, dpr) {
+    const text = it.tekst ? I18n.t(`gestures.${it.tekst}`) : '';
+    if (!text) return;
+    const [nx, ny] = Array.isArray(it.bbox) ? it.bbox : [0, 0];
+    const fontPx = Math.round(15 * dpr);
+    ctx.font = `600 ${fontPx}px system-ui, sans-serif`;
+    const padX = Math.round(10 * dpr);
+    const h = Math.round(fontPx * 1.7);
+    const w = ctx.measureText(text).width + padX * 2;
+    const x = Math.min(Math.max(area.x, area.x + nx * area.width), area.x + area.width - w);
+    const y = Math.max(area.y + 4 * dpr, area.y + ny * area.height - h - 6 * dpr);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = GESTURE_COLOR;
+    // A pill built from two arcs: `roundRect` is missing on older browsers, and a
+    // throw here would stop the whole overlay's animation loop.
+    const r = h / 2;
+    ctx.beginPath();
+    ctx.arc(x + r, y + r, r, Math.PI / 2, (3 * Math.PI) / 2);
+    ctx.arc(x + w - r, y + r, r, (3 * Math.PI) / 2, Math.PI / 2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#111827';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + padX, y + h / 2);
   }
 
   // Rysuje na canvasie dwuliniowy pasek u dolu obszaru wideo o STALYM ukladzie
@@ -1375,6 +1520,7 @@ class DetectionsOverlay {
   destroy() {
     if (this.disposed) return;
     this.disposed = true;
+    this.poseFrames.length = 0;
     this.pending.disposed = true;
     if (this.rafId != null) cancelAnimationFrame(this.rafId);
     this.rafId = null;

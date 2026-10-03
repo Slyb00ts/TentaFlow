@@ -11986,5 +11986,9 @@
     "explain": "TentaFlow va installer sur ce nœud le profil AppArmor /etc/apparmor.d/bwrap, qui autorise bubblewrap à utiliser les espaces de noms utilisateur, et le charger immédiatement. Le mot de passe sudo est nécessaire une seule fois.",
     "done": "Le bac à sable des agents fonctionne.",
     "still_broken": "Le profil a été installé, mais le bac à sable ne fonctionne toujours pas : {reason}"
+  },
+  "gestures": {
+    "wave": "salut de la main",
+    "heart": "cœur"
   }
 }

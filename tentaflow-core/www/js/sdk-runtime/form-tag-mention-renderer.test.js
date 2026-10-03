@@ -369,11 +369,14 @@ test('MentionInput change emits {value, kind: tstr}', () => {
   const engine = makeEngine(store);
   const el = mount(engine.render(comp(MENTIONINPUT_TAG, mentionFields({ 4: LIT('p') }))));
   const changes = capture(el, 'change');
+  let edits = null;
+  el.addEventListener('change', (e) => { if (e.__tfReemit) edits = e.__tfBoundEdits; });
   const area = el.querySelector('.tf-mention-input-area');
   area.value = 'plain text';
   area.selectionStart = 10;
   area.dispatchEvent(new (globalThis.Event)('input', { bubbles: true }));
   assertEq(changes, [{ value: 'plain text', kind: 'tstr' }]);
+  assertEq(edits, [{ path: PATH('text'), value: 'plain text' }]);
 });
 
 test('MentionInput without placeholder requires a11y.label', () => {

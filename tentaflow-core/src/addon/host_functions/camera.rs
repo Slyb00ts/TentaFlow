@@ -263,6 +263,9 @@ pub async fn remove_camera_global(camera_id: &str) -> Result<(), anyhow::Error> 
 /// the rest from coming online. Uses the global DB pool because the
 /// supervisor singleton has no caller context at first-init time.
 async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
+    // Robot cameras register later (on reconnect); the gesture worker idles until
+    // one of them has gestures on.
+    crate::services::camera_ingest::gesture::spawn_worker();
     let pool = match crate::db::global_pool() {
         Some(p) => p,
         None => {
@@ -550,6 +553,12 @@ pub fn camera_register_backed_v1(
         depth_camera_fov_deg: Some(input.camera_fov_deg.unwrap_or(120.0) as f64),
         depth_camera_fov_v_deg: input.camera_fov_v_deg.map(|v| v as f64),
         depth_scale: input.camera_depth_scale.map(|v| v as f64),
+        // A non-finite offset would bind as NULL into a NOT NULL column and fail the
+        // whole depth patch (FOV, scale, enable) — drop it instead.
+        depth_camera_offset_m: input
+            .camera_mount_offset_m
+            .filter(|o| o.iter().all(|v| v.is_finite()))
+            .map(|o| o.map(f64::from)),
         ..Default::default()
     };
     if let Err(e) = update_camera(
@@ -766,6 +775,64 @@ pub fn camera_register_pushed_v1(
 /// the host RGB or the device NV12 preprocess. Rides the same snapshot
 /// round-trip as the crops frame (no extra call). Consumers that only need crops
 /// (depth mapping) ignore it.
+/// A full-resolution camera frame as tightly packed RGB24.
+#[cfg(feature = "camera")]
+pub struct RgbFrame {
+    pub rgb: std::sync::Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+    /// Capture time, Unix ms.
+    pub captured_ms: u64,
+    /// Media-timeline PTS, when the source has one — what the overlay matches
+    /// against the playing video.
+    pub pts_ns: Option<u64>,
+}
+
+/// The freshest full-resolution frame of a camera as tightly packed RGB24, with
+/// its capture time. Downloads a device-resident frame and converts
+/// NV12 on demand — for low-rate consumers (depth, gestures) that analyze whole
+/// frames on the host. `None` until the camera has a frame, and `None` when the
+/// freshest frame is not newer than `newer_than_ms`: the download from the GPU is
+/// the expensive part, so a frame the caller already has is never fetched again.
+#[cfg(feature = "camera")]
+pub async fn latest_rgb_frame_global(
+    camera_id: &str,
+    newer_than_ms: u64,
+) -> Option<RgbFrame> {
+    use crate::services::camera_ingest::fakefile::{nv12_frame_to_rgb24, DetectFrameFormat};
+    let (crops, w, h, captured_ms, pts_ns, crops_format, _detect, crops_device) =
+        latest_frame_global(camera_id).await?;
+    if captured_ms <= newer_than_ms {
+        return None;
+    }
+    // The full-frame download and the NV12 → RGB conversion take milliseconds
+    // per frame at 1080p — off the async workers.
+    let rgb = tokio::task::spawn_blocking(move || {
+        // Zero-copy crops: the bytes are empty (device-resident). The download
+        // carries its OWN layout — the device frame's format has zero strides.
+        let (bytes, format) = if crops.is_empty() {
+            crops_device.as_ref()?.download_full_nv12()?
+        } else {
+            (crops, crops_format)
+        };
+        match format {
+            DetectFrameFormat::Rgb24 => Some(bytes),
+            DetectFrameFormat::Nv12 { .. } => {
+                nv12_frame_to_rgb24(&bytes, w, h, &format).map(std::sync::Arc::from)
+            }
+        }
+    })
+    .await
+    .ok()??;
+    Some(RgbFrame {
+        rgb,
+        width: w,
+        height: h,
+        captured_ms,
+        pts_ns,
+    })
+}
+
 #[cfg(feature = "camera")]
 pub async fn latest_frame_global(
     camera_id: &str,
@@ -3875,6 +3942,7 @@ pub fn camera_update_v1(
         depth_pose_robot_id: None,
         depth_camera_pitch_deg: None,
         depth_scale: None,
+        depth_camera_offset_m: None,
     };
 
     if update_camera(

@@ -6961,7 +6961,12 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         // wersja ma inny `bundle_hash` (zmiana tresci manifest/wasm/migracje bez
         // podbicia numeru — typowe dla addonow wbudowanych). Bez tego drugiego
         // warunku edycja addona pod tym samym numerem wersji bylaby niewidoczna.
-        let update_available = if a.package_id.is_empty() {
+        // A native app has no update of its own: its code is part of the core
+        // binary, so every core build moves the catalog entry and the instance
+        // already runs it — offering "Update" there only ends in a refusal.
+        let update_available = if a.package_id.is_empty()
+            || a.runtime == crate::addon::NATIVE_RUNTIME
+        {
             false
         } else {
             let newer_version = repository::list_package_versions(&ctx.state.db, &a.package_id)

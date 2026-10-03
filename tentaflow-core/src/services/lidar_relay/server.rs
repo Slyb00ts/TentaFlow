@@ -170,6 +170,7 @@ mod tests {
             actions_meta: Vec::new(),
             telemetry: None,
             lidar: None,
+            gestures_enabled: false,
         }
     }
 

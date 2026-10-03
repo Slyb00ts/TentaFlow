@@ -193,6 +193,7 @@ test('SegmentedControl click dispatches change z detail.value+kind', () => {
   assertEq(dispatched.length, 1);
   assertEq(dispatched[0].source_id, 'seg1');
   assertEq(dispatched[0].dom_event.detail, { value: 0, kind: 'u32' });
+  assertEq(dispatched[0].dom_event.__tfBoundEdits, [{ path: PATH('mode'), value: 0 }]);
 });
 
 test('SegmentedControl rejects empty options', () => {

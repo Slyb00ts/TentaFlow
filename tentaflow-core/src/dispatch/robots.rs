@@ -86,6 +86,7 @@ fn to_entry(r: AdvertisedRobot, local_node_id: &str) -> RobotEntry {
             .collect(),
         telemetry: r.telemetry.map(to_telemetry),
         lidar: r.lidar.map(to_lidar),
+        gestures_enabled: r.gestures_enabled,
     }
 }
 
@@ -217,6 +218,8 @@ pub async fn robots_control(
     )
     .ok_or_else(|| ProtocolError::bad_request("unknown robot action kind"))?;
 
+    let accepted_action = action.clone();
+
     let db = ctx.state.db.clone();
     let actor_user_id = org.user_id.clone();
     let caller_org = org.org_id.clone();
@@ -234,6 +237,11 @@ pub async fn robots_control(
         &db,
     )
     .await;
+
+
+    if resp.as_ref().is_some_and(|r| r.ok) {
+        robot_dispatch::apply_accepted_action(&robot_id, &accepted_action);
+    }
 
     let wire = match resp {
         Some(r) => RobotControlResponse {

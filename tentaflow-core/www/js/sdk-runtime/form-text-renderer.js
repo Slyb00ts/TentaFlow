@@ -10,7 +10,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 
 // =============================================================================
 // Walidatory enumow i tokenow
@@ -136,10 +136,18 @@ function applyBoolAttrReactive(el, bindRef, ctx, attrName) {
 }
 
 function applyValueReactive(el, bindPath, ctx) {
+  // While the field has focus, a notification that brings the same store
+  // value as last applied (a snapshot re-sending unrelated state) must not
+  // wipe what the user is typing; a real change of the value (the addon
+  // clearing the field after submit) still goes through.
+  let lastApplied;
   const apply = () => {
     let v;
     try { v = ctx.store.read(bindPath); } catch { v = undefined; }
     const next = v == null ? '' : String(v);
+    const focused = el.contains(document.activeElement) || document.activeElement === el;
+    if (focused && next === lastApplied) return;
+    lastApplied = next;
     if (el.value !== next) el.value = next;
   };
   apply();
@@ -307,7 +315,9 @@ function renderInput(component, ctx) {
       detail: { value: el.value, kind: 'tstr' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    // Submit is not an edit: the addon typically clears the field in answer,
+    // and an optimistic copy of the sent text would hold that clear back.
+    el.dispatchEvent(name === 'submit' ? ce : tagBoundEdit(ce, bindPath));
   };
 
   // Both the component CustomEvent ({ value }) and the inner native control's
@@ -468,7 +478,9 @@ function renderTextarea(component, ctx) {
       detail: { value: el.value, kind: 'tstr' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    // Submit is not an edit: the addon typically clears the field in answer,
+    // and an optimistic copy of the sent text would hold that clear back.
+    el.dispatchEvent(name === 'submit' ? ce : tagBoundEdit(ce, bindPath));
   };
 
   // Same dedupe as Input: only the component CustomEvent (string detail.value)

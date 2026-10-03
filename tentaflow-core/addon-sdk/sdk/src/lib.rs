@@ -2513,6 +2513,7 @@ pub fn webrtc_register_camera(
         camera_fov_deg: None,
         camera_fov_v_deg: None,
         camera_depth_scale: None,
+        camera_mount_offset_m: None,
     })?;
     let bytes = call_sql_with_one_input(webrtc_register_camera_v1, &payload)?;
     let out: tentaflow_sdk_spec::WebRtcRegisterCameraOutput = decode_cbor(&bytes)?;

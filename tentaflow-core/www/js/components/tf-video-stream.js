@@ -1,12 +1,14 @@
 // =============================================================================
 // Plik: tf-video-stream.js
-// Opis: Komponent <tf-video-stream stream-id="camera:cam_xxx" [label] [height-px]>
+// Opis: Komponent <tf-video-stream stream-id="camera:cam_xxx" [label] [height-px] [fit]>
 //       — kafelek live video oparty na MediaSource Extensions. Subskrybuje
 //       strumien w StreamHub przez binary WS (Chunk B protocol), karmi fMP4
 //       chunki do SourceBuffer dolaczonego do <video>. Cleanup w
 //       disconnectedCallback wysyla StreamCloseRequest i zwalnia blob URL.
 // Przyklad: <tf-video-stream stream-id="camera:cam_550e8400-e29b-41d4-a716-446655440000"
 //             label="Wejscie · online" height-px="320"></tf-video-stream>
+//       `fit="contain"` pokazuje cala klatke (pasy po bokach lub gora/dol),
+//       domyslnie `cover` wypelnia kafelek kosztem przyciecia krawedzi.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -56,7 +58,7 @@ const MAX_APPEND_QUEUE = 200;
 
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
-    return ['stream-id', 'label', 'height-px'];
+    return ['stream-id', 'label', 'height-px', 'fit'];
   }
 
   constructor() {
@@ -200,6 +202,7 @@ class TfVideoStream extends HTMLElement {
     const height =
       Number.isFinite(heightRaw) && heightRaw > 0 ? Math.floor(heightRaw) : DEFAULT_HEIGHT_PX;
     this.style.setProperty('--tf-video-stream-height', `${height}px`);
+    this._video.style.objectFit = this.getAttribute('fit') === 'contain' ? 'contain' : 'cover';
   }
 
   // Przelacza fullscreen dla kafelka kamery. Wchodzimy na kontenerze kafelka

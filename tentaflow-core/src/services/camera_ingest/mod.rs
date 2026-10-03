@@ -56,6 +56,8 @@ pub mod tracker;
 
 pub mod depth_mapping;
 
+pub mod gesture;
+
 pub mod cv_pipeline;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};

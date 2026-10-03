@@ -12,7 +12,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 import { BUTTON_TAG } from './action-button-renderer.js';
 
 const SEGMENT_SIZES = new Set(['sm', 'md', 'lg']);
@@ -317,7 +317,7 @@ function renderSegmentedControl(component, ctx) {
           detail: { value: parsedValue.value, kind: parsedValue.tag },
         });
         ce.__tfReemit = true;
-        seg.dispatchEvent(ce);
+        seg.dispatchEvent(tagBoundEdit(ce, bindPath));
         return;
       }
     }
