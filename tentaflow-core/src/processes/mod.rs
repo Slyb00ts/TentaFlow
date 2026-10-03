@@ -11,3 +11,12 @@ pub mod timers;
 
 #[cfg(test)]
 mod scope_tests;
+
+#[cfg(test)]
+mod call_pin_tests;
+
+#[cfg(test)]
+mod call_tests;
+
+#[cfg(test)]
+mod call_producer_tests;

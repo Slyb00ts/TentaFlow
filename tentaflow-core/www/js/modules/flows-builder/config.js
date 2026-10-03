@@ -18,6 +18,7 @@ import '/js/components/tf-keyvalue-editor.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import { processNodeKind, processBoundaryKind } from './bpmn.js';
+import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -309,7 +310,7 @@ export class FlowConfig {
     const model = this.opts.getCanvas().processModel;
     const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
     const boundary = () => {
-      const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process'].includes(candidate.type) && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task'));
+      const activities = this.opts.getCanvas().nodes.filter((candidate) => ['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type) && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task'));
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
       return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}">${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>`;
     };
@@ -338,6 +339,25 @@ export class FlowConfig {
       fields += `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
         <tf-button variant="secondary" data-process-enter>${escapeHtml(I18n.t('bpmn.enter_subprocess'))}</tf-button>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.subprocess_hint'))}</p>`;
+    } else if (kind === 'CallActivity') {
+      const target = config.calledElement || { namespaceUri: '', processId: '' };
+      fields += `<tf-select data-process="calledDefinitionChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.call_definition'))}" value="${escapeAttr(config.calledDefinitionId || '')}" ${disabled}>
+          <option value="">${escapeHtml(I18n.t('bpmn.call_choose_definition'))}</option>
+          ${config.calledDefinitionId ? `<option value="${escapeAttr(config.calledDefinitionId)}">${escapeHtml(config.calledDefinitionId)}</option>` : ''}
+        </tf-select>
+        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-calls>${escapeHtml(I18n.t('bpmn.call_load_definitions'))}</tf-button>`}
+        <tf-select data-process="calledVersionChoice" label="${escapeAttr(I18n.t('bpmn.call_version'))}" value="${escapeAttr(String(config.calledVersion || ''))}" ${disabled}>
+          <option value="">${escapeHtml(I18n.t('bpmn.call_choose_version'))}</option>
+          ${config.calledVersion ? `<option value="${escapeAttr(String(config.calledVersion))}">${escapeHtml(I18n.t('bpmn.version_number', { version: config.calledVersion }))}</option>` : ''}
+        </tf-select>
+        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
+        <tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea>
+        <p class="fb-field-hint" data-call-capability>${escapeHtml(I18n.t('bpmn.call_exact_hint'))}</p>
+        <tf-button variant="secondary" data-preview-called ${config.calledDefinitionId && config.calledVersion ? '' : 'disabled'}>${escapeHtml(I18n.t('bpmn.call_preview'))}</tf-button>
+        ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}`;
+    } else if (kind === 'ErrorEnd') {
+      fields += declaration('errorRef', 'error_reference', model.errors, 'errorId', config.errorRef)
+        + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.error_end_hint'))}</p>`;
     } else if (kind === 'TimerStart' || kind === 'TimerCatch' || kind === 'BoundaryTimer') {
       if (kind === 'BoundaryTimer') {
         fields += `${boundary()}
@@ -389,7 +409,7 @@ export class FlowConfig {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (kind !== 'End' && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    if (!['End', 'ErrorEnd'].includes(kind) && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
     fields += input('elementId', 'element_id', node.id, 'readonly');
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
@@ -439,6 +459,103 @@ export class FlowConfig {
         } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
       });
     }
+    const callChoice = this.root.querySelector('[data-process="calledDefinitionChoice"]');
+    if (callChoice) {
+      const versionChoice = this.root.querySelector('[data-process="calledVersionChoice"]');
+      const capability = this.root.querySelector('[data-call-capability]');
+      const preview = this.root.querySelector('[data-preview-called]');
+      const definitions = [{ value: '', label: I18n.t('bpmn.call_choose_definition') }];
+      if (node.config.calledDefinitionId) definitions.push({ value: node.config.calledDefinitionId, label: node.config.calledDefinitionId });
+      const versions = [{ value: '', label: I18n.t('bpmn.call_choose_version') }];
+      if (node.config.calledVersion) versions.push({ value: String(node.config.calledVersion), label: I18n.t('bpmn.version_number', { version: node.config.calledVersion }) });
+      let definitionOffset = 0, versionOffset = 0, generation = 0;
+      const loadDefinitions = this.root.querySelector('[data-load-calls]');
+      const loadVersions = this.root.querySelector('[data-load-call-versions]');
+      loadDefinitions?.addEventListener('click', async () => {
+        loadDefinitions.setAttribute('disabled', '');
+        try {
+          const response = await ApiBinary.one('processDefinitionListRequest', { offset: definitionOffset, limit: 100 });
+          if (!this.root.contains(callChoice)) return;
+          for (const definition of response.definitions) {
+            const item = definitions.find((row) => row.value === definition.definitionId);
+            if (item) item.label = `${definition.name} · ${definition.definitionId}`;
+            else definitions.push({ value: definition.definitionId,
+              label: `${definition.name} · ${definition.definitionId}` });
+          }
+          definitionOffset += response.definitions.length;
+          callChoice.setOptions(definitions, callChoice.value);
+          loadDefinitions.hidden = !response.hasMore;
+        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+        finally { loadDefinitions.removeAttribute('disabled'); }
+      });
+      callChoice.addEventListener('change', () => {
+        if (this.readOnly) return;
+        generation++;
+        versionOffset = 0;
+        versions.splice(1);
+        versionChoice.setOptions(versions, '');
+        preview.setAttribute('disabled', '');
+        const calledDefinitionId = callChoice.value;
+        loadVersions.hidden = !calledDefinitionId;
+        this.opts.onConfigChange(node.id, { calledDefinitionId, calledVersion: 0,
+          calledElement: { namespaceUri: '', processId: '' } });
+        this.root.querySelector('[data-process="calledElement"]').value = '';
+        capability.textContent = calledDefinitionId ? I18n.t('bpmn.call_choose_version') : I18n.t('bpmn.call_exact_hint');
+      });
+      loadVersions?.addEventListener('click', async () => {
+        const definitionId = callChoice.value;
+        if (!definitionId) return;
+        const request = generation;
+        loadVersions.setAttribute('disabled', '');
+        try {
+          const response = await ApiBinary.one('processVersionListRequest', { definitionId, offset: versionOffset, limit: 100 });
+          if (!this.root.contains(versionChoice) || request !== generation || callChoice.value !== definitionId) return;
+          for (const version of response.versions) {
+            const value = String(version.version);
+            if (!versions.some((item) => item.value === value)) versions.push({ value,
+              label: I18n.t('bpmn.version_number', { version: version.version }) });
+          }
+          versionOffset += response.versions.length;
+          versionChoice.setOptions(versions, versionChoice.value);
+          loadVersions.hidden = !response.hasMore;
+        } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
+        finally { loadVersions.removeAttribute('disabled'); }
+      });
+      versionChoice.addEventListener('change', async () => {
+        if (this.readOnly) return;
+        if (!versionChoice.value) {
+          generation++;
+          preview.setAttribute('disabled', '');
+          this.opts.onConfigChange(node.id, { calledVersion: 0,
+            calledElement: { namespaceUri: '', processId: '' } });
+          this.root.querySelector('[data-process="calledElement"]').value = '';
+          capability.textContent = I18n.t('bpmn.call_choose_version');
+          return;
+        }
+        if (!callChoice.value) return;
+        const request = ++generation;
+        const definitionId = callChoice.value, version = Number(versionChoice.value);
+        preview.setAttribute('disabled', '');
+        try {
+          const response = await ApiBinary.one('processVersionGetRequest', { definitionId, version });
+          if (!this.root.contains(versionChoice) || request !== generation || callChoice.value !== definitionId || Number(versionChoice.value) !== version) return;
+          const calledElement = { namespaceUri: response.version.model.targetNamespace || 'https://tentaflow.app/bpmn/1',
+            processId: response.version.model.processId };
+          this.opts.onConfigChange(node.id, { calledDefinitionId: definitionId, calledVersion: version, calledElement });
+          this.root.querySelector('[data-process="calledElement"]').value = `${calledElement.namespaceUri} · ${calledElement.processId}`;
+          capability.textContent = I18n.t('bpmn.call_exact_target', { version });
+          preview.removeAttribute('disabled');
+        } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
+      });
+      preview.addEventListener('click', async () => {
+        const { calledDefinitionId, calledVersion } = node.config;
+        if (!calledDefinitionId || !calledVersion) return;
+        try {
+          const response = await ApiBinary.one('processVersionGetRequest', { definitionId: calledDefinitionId, version: calledVersion });
+          if (this.root.contains(preview)) openProcessCallPreview(response.version);
+        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+      });
+    }
     const picker = this.root.querySelector('tf-person-picker');
     if (picker) {
       picker.items = this.opts.processOptions.assignees.map((user) => ({ id: user.userId, name: user.displayName }));
@@ -455,6 +572,7 @@ export class FlowConfig {
       const key = control.dataset.process;
       if (key === 'editSequence') { canvas.selectEdge(control.value); return; }
       if (this.readOnly) return;
+      if (key === 'calledDefinitionChoice' || key === 'calledVersionChoice' || key === 'calledElement') return;
       if (key === 'name') this.opts.onLabelChange(node.id, control.value);
       else if (key === 'cancelActivity') {
         this.opts.onConfigChange(node.id, { cancelActivity: event.detail?.checked ?? control.checked });

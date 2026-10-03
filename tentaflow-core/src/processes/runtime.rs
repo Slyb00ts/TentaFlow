@@ -129,6 +129,7 @@ struct Transition<'a> {
     now_ms: i64,
     current_scope: String,
     scopes: Vec<ProcessScopeSummary>,
+    retained_scope_count: usize,
     scope_variables: BTreeMap<String, Value>,
     tokens: Vec<ProcessToken>,
     jobs: Vec<ProcessJob>,
@@ -168,6 +169,7 @@ impl<'a> Transition<'a> {
                 parent_scope_id: None,
                 subprocess_node_id: None,
                 subprocess_node_name: None,
+                terminal_error: None,
                 parent_token_id: None,
                 revision: 1,
                 status: ProcessInstanceStatus::Running,
@@ -175,6 +177,7 @@ impl<'a> Transition<'a> {
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
             }],
+            retained_scope_count: 1,
             scope_variables: BTreeMap::new(),
             tokens: Vec::new(),
             jobs: Vec::new(),
@@ -202,6 +205,7 @@ impl<'a> Transition<'a> {
         )?;
         transition.tokens = snapshot.tokens.clone();
         transition.scopes = snapshot.scopes.clone();
+        transition.retained_scope_count = snapshot.retained_scope_count;
         transition.scope_variables = snapshot.scope_variables.clone();
         transition.jobs = snapshot.jobs.clone();
         transition.tasks = snapshot.user_tasks.clone();
@@ -719,7 +723,9 @@ impl<'a> Transition<'a> {
                 closure.contains(&scope.scope_id)
                     && !matches!(
                         scope.status,
-                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                        ProcessInstanceStatus::Completed
+                            | ProcessInstanceStatus::Cancelled
+                            | ProcessInstanceStatus::Error
                     )
             })
             .cloned()
@@ -876,11 +882,157 @@ impl<'a> Transition<'a> {
         }
         for scope in active {
             self.current_scope = scope.scope_id.clone();
+            if scope.parent_scope_id.is_none() {
+                continue;
+            }
             self.update_scope(&scope.scope_id, ProcessInstanceStatus::Cancelled, None)?;
             self.event("scope_cancelled", None,
                 json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,"subprocess_node_id":scope.subprocess_node_id,"reason":"scope_cancelled","boundary_id":boundary_id}));
         }
         self.current_scope = previous;
+        Ok(())
+    }
+
+    fn enter_call(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let ProcessNodeKind::CallActivity { input_mapping, .. } = &node.kind else {
+            anyhow::bail!("call entry requires a CallActivity");
+        };
+        let waiting = self.wait(token, "waiting");
+        self.arm_boundaries(node, &waiting)?;
+        match patch_variables(
+            input_mapping,
+            &json!({}),
+            &self.effective()?,
+            &Value::Null,
+            &[],
+        ) {
+            Ok(variables) => {
+                let request = super::repository::CallRequest {
+                    call_id: Uuid::new_v4().to_string(),
+                    parent_scope_id: self.current_scope.clone(),
+                    parent_token_id: waiting,
+                    call_node_id: node.id.clone(),
+                    child_instance_id: Uuid::new_v4().to_string(),
+                    variables,
+                };
+                self.event(
+                    "call_requested",
+                    Some(node.id.clone()),
+                    json!({"call_id":request.call_id,"parent_token_id":request.parent_token_id}),
+                );
+                self.plan.call_requests.push(request);
+            }
+            Err(error) => self.incident(
+                &node.id,
+                None,
+                "CALL_ADMISSION_ERROR",
+                super::repository::bounded_failure_message(&format!("{error:#}")),
+            ),
+        }
+        Ok(())
+    }
+
+    fn error_end(
+        &mut self,
+        node: &ProcessNode,
+        token: &ProcessToken,
+        error_ref: &str,
+    ) -> Result<()> {
+        let declaration = self
+            .model
+            .errors
+            .iter()
+            .find(|e| e.error_id == error_ref)
+            .context("ErrorEnd declaration missing")?;
+        let code = declaration.error_code.clone();
+        ensure!(!code.is_empty(), "ErrorEnd needs a declared error code");
+        let source_scope = self.current_scope.clone();
+        let outputs = self.effective()?;
+        let event_id = Uuid::new_v4().to_string();
+        let fact = tentaflow_protocol::processes::ProcessTerminalError {
+            error_ref: error_ref.to_owned(),
+            error_code: code.clone(),
+            source_event_id: event_id.clone(),
+            source_node_id: node.id.clone(),
+            source_scope_id: source_scope.clone(),
+        };
+        let envelope = json!({"kind":"ErrorEnd","error_ref":error_ref,"error_code":code,"source_instance_id":self.instance_id,"source_scope_id":source_scope,"source_node_id":node.id,"source_event_id":event_id,"source_token_id":token.token_id});
+        self.plan.event_ids.insert(self.plan.events.len(), event_id);
+        let mut factual_envelope = envelope.clone();
+        factual_envelope["outputs"] = outputs.clone();
+        self.event("error_end_reached", Some(node.id.clone()), factual_envelope);
+        self.consume(&token.token_id);
+        if let Some((subscription, attached, _hops)) = self.error_handler(token, Some(&code))? {
+            self.current_scope = subscription.scope_id.clone();
+            let handler = self.node(&subscription.node_id)?.clone();
+            let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
+                anyhow::bail!("error handler is not a BoundaryError")
+            };
+            self.map_outputs(
+                output_mapping,
+                &outputs,
+                &[("activity_result".into(), envelope)],
+            )?;
+            self.settle_subscription(
+                &subscription,
+                tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
+                None,
+            );
+            self.interrupt_activity(&attached, &subscription.subscription_id)?;
+            self.plan
+                .scope_terminal_errors
+                .insert(source_scope.clone(), fact.clone());
+            if source_scope != self.instance_id {
+                self.update_scope(&source_scope, ProcessInstanceStatus::Error, None)?;
+            }
+            self.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":attached.token_id,"error_code":code,"source_instance_id":self.instance_id,"source_event_id":fact.source_event_id,"source_scope_id":source_scope,"source_kind":"error_end"}));
+            for edge in self.outgoing(&handler.id) {
+                self.follow(&attached, &edge)?;
+            }
+        } else {
+            self.current_scope = self.instance_id.to_owned();
+            self.cancel_scope(self.instance_id, "error_end")?;
+            for id in self
+                .incidents
+                .iter()
+                .chain(self.plan.add_incidents.iter())
+                .map(|i| i.incident_id.clone())
+                .collect::<Vec<_>>()
+            {
+                self.resolve_incident(&id);
+            }
+            let source_scopes = self
+                .scopes
+                .clone()
+                .into_iter()
+                .filter(|s| {
+                    s.parent_scope_id.is_some()
+                        && super::repository::descendant_scope_ids(&self.scopes, &source_scope)
+                            .is_ok_and(|ids| ids.contains(&s.scope_id))
+                })
+                .collect::<Vec<_>>();
+            for scope in source_scopes {
+                if scope.scope_id == source_scope {
+                    self.plan
+                        .scope_terminal_errors
+                        .insert(scope.scope_id.clone(), fact.clone());
+                    self.update_scope(&scope.scope_id, ProcessInstanceStatus::Error, None)?;
+                }
+            }
+            self.plan.terminal_error = Some(fact.clone());
+            self.plan.business_error = Some(super::repository::BusinessErrorSource::ErrorEnd {
+                instance_id: self.instance_id.to_owned(),
+                token_id: token.token_id.clone(),
+                fact,
+                outputs,
+            });
+            self.current_scope = self.instance_id.to_owned();
+            self.event(
+                "instance_error",
+                None,
+                json!({"error_ref":error_ref,"error_code":code}),
+            );
+        }
         Ok(())
     }
 
@@ -896,7 +1048,7 @@ impl<'a> Transition<'a> {
         let parent_scope = self.current_scope.clone();
         let waiting = self.wait(token, "waiting");
         self.arm_boundaries(node, &waiting)?;
-        if self.scopes.len() >= 129 {
+        if self.retained_scope_count >= 129 {
             self.incident(
                 &node.id,
                 None,
@@ -942,11 +1094,13 @@ impl<'a> Transition<'a> {
             subprocess_node_id: node.id.clone(),
             variables: local.clone(),
         });
+        self.retained_scope_count += 1;
         self.scopes.push(ProcessScopeSummary {
             scope_id: scope_id.clone(),
             parent_scope_id: Some(parent_scope.clone()),
             subprocess_node_id: Some(node.id.clone()),
             subprocess_node_name: Some(node.name.clone()),
+            terminal_error: None,
             parent_token_id: Some(waiting.clone()),
             revision: 1,
             status: ProcessInstanceStatus::Running,
@@ -1393,6 +1547,10 @@ impl<'a> Transition<'a> {
                     self.consume(&id);
                     self.event("end_reached", Some(node.id), Value::Null);
                 }
+                ProcessNodeKind::CallActivity { .. } => self.enter_call(&node, &token)?,
+                ProcessNodeKind::ErrorEnd { error_ref } => {
+                    self.error_end(&node, &token, &error_ref)?
+                }
                 ProcessNodeKind::SubProcess { .. } => self.enter_scope(&node, &token)?,
                 ProcessNodeKind::UserTask {
                     assignee_user_id, ..
@@ -1569,7 +1727,9 @@ impl<'a> Transition<'a> {
                 scope.parent_scope_id.is_some()
                     && !matches!(
                         scope.status,
-                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                        ProcessInstanceStatus::Completed
+                            | ProcessInstanceStatus::Cancelled
+                            | ProcessInstanceStatus::Error
                     )
             })
             .cloned()
@@ -1611,7 +1771,9 @@ impl<'a> Transition<'a> {
                     child.parent_scope_id.as_deref() == Some(scope.scope_id.as_str())
                         && !matches!(
                             child.status,
-                            ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                            ProcessInstanceStatus::Completed
+                                | ProcessInstanceStatus::Cancelled
+                                | ProcessInstanceStatus::Error
                         )
                 })
             {
@@ -1745,7 +1907,9 @@ impl<'a> Transition<'a> {
     }
 
     fn finish(mut self) -> Result<RuntimePlan> {
-        self.plan.status = if self
+        self.plan.status = if self.plan.terminal_error.is_some() {
+            ProcessInstanceStatus::Error
+        } else if self
             .incidents
             .iter()
             .chain(self.plan.add_incidents.iter())
@@ -1761,7 +1925,9 @@ impl<'a> Transition<'a> {
                 scope.parent_scope_id.is_some()
                     && !matches!(
                         scope.status,
-                        ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                        ProcessInstanceStatus::Completed
+                            | ProcessInstanceStatus::Cancelled
+                            | ProcessInstanceStatus::Error
                     )
             })
         {
@@ -1782,7 +1948,9 @@ impl<'a> Transition<'a> {
             scope.parent_scope_id.is_some()
                 && !matches!(
                     scope.status,
-                    ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
+                    ProcessInstanceStatus::Completed
+                        | ProcessInstanceStatus::Cancelled
+                        | ProcessInstanceStatus::Error
                 )
         }) {
             let status = if self
@@ -1815,6 +1983,305 @@ impl<'a> Transition<'a> {
         }
         Ok(self.plan)
     }
+}
+
+pub(super) fn project_snapshot(
+    snapshot: &RuntimeSnapshot,
+    plan: &RuntimePlan,
+    now_ms: i64,
+) -> Result<RuntimeSnapshot> {
+    let mut next = snapshot.clone();
+    next.instance.revision = next
+        .instance
+        .revision
+        .checked_add(1)
+        .context("process revision overflow")?;
+    next.instance.variables = plan.variables.clone();
+    next.instance.status = plan.status.clone();
+    next.instance.terminal_error = plan.terminal_error.clone();
+    next.instance.updated_at_ms = now_ms;
+    next.tokens.extend(plan.create_tokens.clone());
+    next.tokens.retain(|t| {
+        !plan.consume_token_ids.contains(&t.token_id)
+            && !plan.cancel_token_ids.contains(&t.token_id)
+    });
+    next.receipts.extend(plan.add_receipts.clone());
+    next.receipts.retain(|r| {
+        !plan.remove_receipts.iter().any(|v| {
+            v.scope_id == r.scope_id
+                && v.activation_id == r.activation_id
+                && v.branch_edge_id == r.branch_edge_id
+        })
+    });
+    next.user_tasks.extend(plan.create_user_tasks.clone());
+    for task in &mut next.user_tasks {
+        if plan.complete_user_task_ids.contains(&task.user_task_id) {
+            task.status = ProcessUserTaskStatus::Completed;
+        }
+        if plan.cancel_user_task_ids.contains(&task.user_task_id) {
+            task.status = ProcessUserTaskStatus::Cancelled;
+        }
+    }
+    next.jobs.extend(plan.create_jobs.clone());
+    for job in &mut next.jobs {
+        if plan.complete_job_ids.contains(&job.job_id) {
+            job.status = "completed".into();
+        }
+        if plan.cancel_job_ids.contains(&job.job_id) {
+            job.status = "cancelled".into();
+        }
+    }
+    next.incidents
+        .retain(|i| !plan.resolve_incident_ids.contains(&i.incident_id));
+    next.incidents.extend(plan.add_incidents.clone());
+    for child in &plan.create_scopes {
+        let node = super::repository::scope_node(
+            &snapshot.model,
+            &next.scopes,
+            &snapshot.instance.instance_id,
+            &child.parent_scope_id,
+            &child.subprocess_node_id,
+        )?;
+        let depth = next
+            .scopes
+            .iter()
+            .find(|s| s.scope_id == child.parent_scope_id)
+            .context("planned child parent missing")?
+            .depth
+            + 1;
+        next.scopes.push(ProcessScopeSummary {
+            scope_id: child.scope_id.clone(),
+            parent_scope_id: Some(child.parent_scope_id.clone()),
+            subprocess_node_id: Some(child.subprocess_node_id.clone()),
+            subprocess_node_name: Some(node.name.clone()),
+            parent_token_id: Some(child.parent_token_id.clone()),
+            revision: 1,
+            status: ProcessInstanceStatus::Running,
+            depth,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            terminal_error: None,
+        });
+        next.scope_variables
+            .insert(child.scope_id.clone(), child.variables.clone());
+    }
+    for update in &plan.scope_updates {
+        let scope = next
+            .scopes
+            .iter_mut()
+            .find(|s| s.scope_id == update.scope_id)
+            .context("updated child missing")?;
+        scope.status = update.status.clone();
+        scope.revision += 1;
+        scope.updated_at_ms = now_ms;
+        scope.terminal_error = plan.scope_terminal_errors.get(&update.scope_id).cloned();
+        if let Some(vars) = &update.variables {
+            next.scope_variables
+                .insert(update.scope_id.clone(), vars.clone());
+        }
+    }
+    next.timers.extend(plan.create_timers.clone());
+    for update in &plan.timer_updates {
+        let timer = next
+            .timers
+            .iter_mut()
+            .find(|t| t.timer_id == update.timer_id)
+            .context("planned timer update missing")?;
+        timer.status = update.status.clone();
+        timer.revision += 1;
+        timer.occurrence = update.occurrence;
+        timer.due_at_ms = update.due_at_ms;
+        timer.last_reason = update.last_reason.clone();
+        timer.next_check_at_ms = update.next_check_at_ms;
+    }
+    next.subscriptions.extend(plan.create_subscriptions.clone());
+    for update in &plan.subscription_updates {
+        let sub = next
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.subscription_id == update.subscription_id)
+            .context("planned subscription missing")?;
+        sub.status = update.status.clone();
+        sub.revision += 1;
+        sub.last_reason = update.last_reason.clone();
+    }
+    next.event_races.extend(plan.create_event_races.clone());
+    for update in &plan.race_updates {
+        let race = next
+            .event_races
+            .iter_mut()
+            .find(|r| r.race_id == update.race_id)
+            .context("planned race missing")?;
+        race.status = update.status.clone();
+        race.revision += 1;
+        race.winner_node_id = update.winner_node_id.clone();
+        race.winner_timer_id = update.winner_timer_id.clone();
+        race.winner_subscription_id = update.winner_subscription_id.clone();
+    }
+    if let Some(root) = next
+        .scopes
+        .iter_mut()
+        .find(|s| s.scope_id == snapshot.instance.instance_id)
+    {
+        root.status = next.instance.status.clone();
+        root.revision = next.instance.revision;
+        root.terminal_error = next.instance.terminal_error.clone();
+    }
+    validate_variables(&next.instance.variables)?;
+    for scope in next.scopes.iter().filter(|scope| {
+        scope.parent_scope_id.is_some()
+            && !matches!(
+                scope.status,
+                ProcessInstanceStatus::Completed
+                    | ProcessInstanceStatus::Cancelled
+                    | ProcessInstanceStatus::Error
+            )
+    }) {
+        super::repository::effective_scope_variables(
+            &next.scopes,
+            &next.scope_variables,
+            &next.instance.instance_id,
+            &next.instance.variables,
+            &scope.scope_id,
+        )?;
+    }
+    next.instance.active_node_ids = next.tokens.iter().map(|t| t.node_id.clone()).collect();
+    next.instance.active_node_ids.sort();
+    next.instance.active_node_ids.dedup();
+    Ok(next)
+}
+
+pub(super) fn plan_call_incident(
+    snapshot: &RuntimeSnapshot,
+    call_node_id: &str,
+    scope_id: &str,
+    code: &str,
+    message: &str,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = scope_id.to_owned();
+    transition.node(call_node_id)?;
+    transition.incident(
+        call_node_id,
+        None,
+        code,
+        super::repository::bounded_failure_message(message),
+    );
+    transition.finish()
+}
+
+pub(super) fn plan_call_return(
+    snapshot: &RuntimeSnapshot,
+    call: &super::repository::CallActivation,
+    outputs: &Value,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = call.parent_scope_id.clone();
+    let token = transition
+        .tokens
+        .iter()
+        .find(|t| {
+            t.token_id == call.parent_token_id
+                && t.status == "waiting"
+                && t.scope_id == call.parent_scope_id
+                && t.node_id == call.call_node_id
+        })
+        .context("call return lost its exact waiting token")?
+        .clone();
+    let node = transition.node(&call.call_node_id)?.clone();
+    let ProcessNodeKind::CallActivity { output_mapping, .. } = &node.kind else {
+        anyhow::bail!("call return node is not CallActivity")
+    };
+    transition.map_outputs(output_mapping, outputs, &[])?;
+    transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+    transition.resolve_boundary_incidents(&token.token_id);
+    transition.consume(&token.token_id);
+    transition.event("call_returned",Some(node.id.clone()),json!({"call_id":call.call_id,"child_instance_id":call.child_instance_id,"parent_token_id":call.parent_token_id}));
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    transition.finish()
+}
+
+pub(super) fn plan_call_error(
+    snapshot: &RuntimeSnapshot,
+    call: &super::repository::CallActivation,
+    source: &super::repository::BusinessErrorSource,
+    now_ms: i64,
+) -> Result<Option<RuntimePlan>> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = call.parent_scope_id.clone();
+    let token = transition
+        .tokens
+        .iter()
+        .find(|t| {
+            t.token_id == call.parent_token_id
+                && t.status == "waiting"
+                && t.scope_id == call.parent_scope_id
+        })
+        .context("error propagation lost exact call activation")?
+        .clone();
+    let (outputs, activity_result, code, source_instance, source_scope, source_event, source_kind) =
+        match source {
+            super::repository::BusinessErrorSource::ErrorEnd {
+                instance_id,
+                fact,
+                outputs,
+                ..
+            } => (
+                outputs.clone(),
+                json!({"kind":"ErrorEnd","error_ref":fact.error_ref,"error_code":fact.error_code,"source_instance_id":instance_id,"source_scope_id":fact.source_scope_id,"source_node_id":fact.source_node_id,"source_event_id":fact.source_event_id}),
+                Some(fact.error_code.as_str()),
+                instance_id.as_str(),
+                fact.source_scope_id.as_str(),
+                fact.source_event_id.as_str(),
+                "error_end",
+            ),
+            super::repository::BusinessErrorSource::ServiceContract {
+                instance_id,
+                scope_id,
+                result_event_id,
+                result,
+                ..
+            } => (
+                result.outputs.clone(),
+                serde_json::to_value(result)?,
+                result.code.as_deref(),
+                instance_id.as_str(),
+                scope_id.as_str(),
+                result_event_id.as_str(),
+                "contract",
+            ),
+        };
+    let Some((subscription, attached, _hops)) = transition.error_handler(&token, code)? else {
+        return Ok(None);
+    };
+    transition.current_scope = subscription.scope_id.clone();
+    let handler = transition.node(&subscription.node_id)?.clone();
+    let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
+        anyhow::bail!("call error handler is not BoundaryError")
+    };
+    transition.map_outputs(
+        output_mapping,
+        &outputs,
+        &[("activity_result".into(), activity_result)],
+    )?;
+    transition.settle_subscription(
+        &subscription,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
+        None,
+    );
+    transition.interrupt_activity(&attached, &subscription.subscription_id)?;
+    transition.event("call_error_propagated",Some(handler.id.clone()),json!({"call_id":call.call_id,"source_instance_id":source_instance,"source_scope_id":source_scope,"source_event_id":source_event,"source_kind":source_kind,"handler_node_id":handler.id,"attached_token_id":attached.token_id,"error_code":code}));
+    transition.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":attached.token_id,"error_code":code,"source_event_id":source_event,"source_instance_id":source_instance,"source_kind":source_kind}));
+    for edge in transition.outgoing(&handler.id) {
+        transition.follow(&attached, &edge)?;
+    }
+    transition.advance()?;
+    Ok(Some(transition.finish()?))
 }
 
 pub enum StartCause {
@@ -2076,6 +2543,24 @@ pub fn plan_job_result(
             transition.advance()?;
             return transition.finish();
         }
+    }
+    if observed.origin == super::repository::ActivityResultOrigin::Contract
+        && result.outcome == ActivityOutcome::Error
+    {
+        let result_event_id = Uuid::new_v4().to_string();
+        transition.plan.event_ids.insert(0, result_event_id.clone());
+        transition.plan.business_error =
+            Some(super::repository::BusinessErrorSource::ServiceContract {
+                instance_id: snapshot.instance.instance_id.clone(),
+                scope_id: job.scope_id.clone(),
+                node_id: job.node_id.clone(),
+                token_id: job.token_id.clone(),
+                job_id: job.job_id.clone(),
+                attempt: job.attempt,
+                fence: job.fence,
+                result_event_id,
+                result: result.clone(),
+            });
     }
     if matches!(
         result.outcome,
@@ -3285,193 +3770,235 @@ mod tests {
 
     #[tokio::test]
     async fn boundary_claim_registration_race_never_enters_the_real_flow_executor() {
-        let fixture = Fixture::new();
-        let flow_id = flow(
-            &fixture.db,
-            &fixture.owner,
-            &graph("must not execute", None),
-        );
-        let model = with_boundaries(
-            embedded_model(
-                service_model(
-                    &flow_id,
-                    ActivityVerification::Condition {
-                        expression: "true".into(),
-                    },
-                ),
-                "Scope",
-            ),
-            "Scope",
-            &[("Limit", true, 1)],
-        );
-        let started = start_model(&fixture, &model);
-        let claim = repository::claim_job(
-            &fixture.db,
-            "registration-window",
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .unwrap()
-        .unwrap();
-        let due = claim.snapshot.timers[0].due_at_ms.unwrap();
-        let runtime = registry_runtime(&fixture, "registration-window");
-        let cancel = CancellationToken::new();
-        let before_registration = tokio::sync::Barrier::new(2);
-        let committed = tokio::sync::Barrier::new(2);
-        let firing = async {
-            before_registration.wait().await;
-            assert!(runtime.running.is_empty());
-            let drained = super::super::timers::drain_due(&fixture.db, due);
-            assert_eq!(drained.fired, 1);
-            assert!(drained.completion.is_ok());
-            assert_eq!(drained.cancelled_claims.len(), 1);
-            runtime.handle_timer_drain(drained);
-            committed.wait().await;
-        };
-        let registering = async {
-            before_registration.wait().await;
-            committed.wait().await;
-            register_claim(&runtime, &claim, &cancel);
-            assert!(!cancel.is_cancelled());
-            super::super::jobs::execute_claimed(
+        for called in [false, true] {
+            let fixture = Fixture::new();
+            let flow_id = flow(
                 &fixture.db,
-                fixture.dispatcher(),
-                "registration-window",
-                claim.clone(),
-                cancel.clone(),
-            )
-            .await
-            .unwrap();
-            runtime.remove_running_claim(
-                &claim.job.job_id,
-                claim.job.attempt,
-                claim.job.fence,
-                "registration-window",
+                &fixture.owner,
+                &graph("must not execute", None),
             );
-        };
-        tokio::join!(firing, registering);
-        assert!(runtime.running.is_empty());
-        let actual_effect_count =
-            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
-                .unwrap()
-                .len();
-        assert_eq!(actual_effect_count, 0);
-        let snapshot =
-            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+            let service = service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            );
+            let (activity, model) = if called {
+                let target = publish_model(&fixture, &service);
+                (
+                    "Call_1",
+                    super::super::call_tests::caller(&target, BTreeMap::new()),
+                )
+            } else {
+                ("Scope", embedded_model(service, "Scope"))
+            };
+            let model = with_boundaries(model, activity, &[("Limit", true, 1)]);
+            let started = start_model(&fixture, &model);
+            let claim = repository::claim_job(
+                &fixture.db,
+                "registration-window",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+            let due =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap()
+                    .timers[0]
+                    .due_at_ms
+                    .unwrap();
+            let runtime = registry_runtime(&fixture, "registration-window");
+            let cancel = CancellationToken::new();
+            let before_registration = tokio::sync::Barrier::new(2);
+            let committed = tokio::sync::Barrier::new(2);
+            let firing = async {
+                before_registration.wait().await;
+                assert!(runtime.running.is_empty());
+                let drained = super::super::timers::drain_due(&fixture.db, due);
+                assert_eq!(drained.fired, 1);
+                assert!(drained.completion.is_ok());
+                assert_eq!(drained.cancelled_claims.len(), 1);
+                runtime.handle_timer_drain(drained);
+                committed.wait().await;
+            };
+            let registering = async {
+                before_registration.wait().await;
+                committed.wait().await;
+                register_claim(&runtime, &claim, &cancel);
+                assert!(!cancel.is_cancelled());
+                super::super::jobs::execute_claimed(
+                    &fixture.db,
+                    fixture.dispatcher(),
+                    "registration-window",
+                    claim.clone(),
+                    cancel.clone(),
+                )
+                .await
                 .unwrap();
-        assert_eq!(snapshot.jobs[0].status, "cancelled");
-        assert_eq!(snapshot.jobs[0].fence, claim.job.fence + 1);
-        assert!(snapshot.jobs[0].result.is_none());
-        assert!(!snapshot.instance.can_retry);
+                runtime.remove_running_claim(
+                    &claim.job.job_id,
+                    claim.job.attempt,
+                    claim.job.fence,
+                    "registration-window",
+                );
+            };
+            tokio::join!(firing, registering);
+            assert!(runtime.running.is_empty());
+            let actual_effect_count =
+                crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                    .unwrap()
+                    .len();
+            assert_eq!(actual_effect_count, 0);
+            let snapshot =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &claim.job.instance_id)
+                    .unwrap();
+            assert_eq!(snapshot.jobs[0].status, "cancelled");
+            assert_eq!(snapshot.jobs[0].fence, claim.job.fence + 1);
+            assert!(snapshot.jobs[0].result.is_none());
+            assert!(!snapshot.instance.can_retry);
+            if called {
+                assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Cancelled);
+                assert_eq!(
+                    repository::get_instance(
+                        &fixture.db,
+                        &fixture.owner,
+                        &started.instance_id,
+                        None
+                    )
+                    .unwrap()
+                    .status,
+                    ProcessInstanceStatus::Completed
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn cancelled_generation_signal_and_old_cleanup_cannot_touch_an_actual_retried_claim() {
-        let fixture = Fixture::new();
-        let flow_id = flow(&fixture.db, &fixture.owner, &graph("new generation", None));
-        let started = start_model(
-            &fixture,
-            &embedded_model(
-                service_model(
-                    &flow_id,
-                    ActivityVerification::Condition {
-                        expression: "true".into(),
-                    },
-                ),
-                "Scope",
-            ),
-        );
-        let old = repository::claim_job(
-            &fixture.db,
-            "old-worker",
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(repository::fail_job(
-            &fixture.db,
-            &old.job.job_id,
-            old.job.attempt,
-            old.job.fence,
-            "old-worker",
-            "INTERRUPTED",
-            "controlled worker interruption",
-            chrono::Utc::now().timestamp_millis(),
-            None
-        )
-        .unwrap());
-        let incident =
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
-                .unwrap();
-        repository::retry_job(
-            &fixture.db,
-            &fixture.owner,
-            &stamp("retry real generation"),
-            &started.instance_id,
-            &old.job.job_id,
-            incident.revision,
-        )
-        .unwrap();
-        let new = repository::claim_job(
-            &fixture.db,
-            "new-worker",
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(old.job.job_id, new.job.job_id);
-        assert!(new.job.attempt > old.job.attempt && new.job.fence > old.job.fence);
-        let runtime = registry_runtime(&fixture, "new-worker");
-        let cancel = CancellationToken::new();
-        register_claim(&runtime, &new, &cancel);
-        runtime.signal_cancelled_claims(&[CancelledJobClaim {
-            job_id: old.job.job_id.clone(),
-            attempt: old.job.attempt,
-            fence: old.job.fence,
-            worker_id: "old-worker".into(),
-        }]);
-        assert!(!cancel.is_cancelled());
-        runtime.remove_running_claim(
-            &old.job.job_id,
-            old.job.attempt,
-            old.job.fence,
-            "old-worker",
-        );
-        assert_eq!(runtime.running.len(), 1);
-        super::super::jobs::execute_claimed(
-            &fixture.db,
-            fixture.dispatcher(),
-            "new-worker",
-            new.clone(),
-            cancel.clone(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
-                .unwrap()
-                .status,
-            ProcessInstanceStatus::Completed
-        );
-        runtime.remove_running_claim(
-            &new.job.job_id,
-            new.job.attempt,
-            new.job.fence,
-            "new-worker",
-        );
-        assert!(runtime.running.is_empty());
-        assert!(
-            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
-                .unwrap()
-                .scopes
-                .iter()
-                .all(|scope| scope.status == ProcessInstanceStatus::Completed)
-        );
+        for called in [false, true] {
+            let fixture = Fixture::new();
+            let flow_id = flow(&fixture.db, &fixture.owner, &graph("new generation", None));
+            let service = service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            );
+            let model = if called {
+                let version = publish_model(&fixture, &service);
+                super::super::call_tests::caller(&version, BTreeMap::new())
+            } else {
+                embedded_model(service, "Scope")
+            };
+            let started = start_model(&fixture, &model);
+            let old = repository::claim_job(
+                &fixture.db,
+                "old-worker",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(repository::fail_job(
+                &fixture.db,
+                &old.job.job_id,
+                old.job.attempt,
+                old.job.fence,
+                "old-worker",
+                "INTERRUPTED",
+                "controlled worker interruption",
+                chrono::Utc::now().timestamp_millis(),
+                None
+            )
+            .unwrap());
+            let incident =
+                repository::get_instance(&fixture.db, &fixture.owner, &old.job.instance_id, None)
+                    .unwrap();
+            repository::retry_job(
+                &fixture.db,
+                &fixture.owner,
+                &stamp("retry real generation"),
+                &old.job.instance_id,
+                &old.job.job_id,
+                incident.revision,
+            )
+            .unwrap();
+            let new = repository::claim_job(
+                &fixture.db,
+                "new-worker",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(old.job.job_id, new.job.job_id);
+            assert!(new.job.attempt > old.job.attempt && new.job.fence > old.job.fence);
+            let runtime = registry_runtime(&fixture, "new-worker");
+            let cancel = CancellationToken::new();
+            register_claim(&runtime, &new, &cancel);
+            runtime.signal_cancelled_claims(&[CancelledJobClaim {
+                job_id: old.job.job_id.clone(),
+                attempt: old.job.attempt,
+                fence: old.job.fence,
+                worker_id: "old-worker".into(),
+            }]);
+            assert!(!cancel.is_cancelled());
+            runtime.remove_running_claim(
+                &old.job.job_id,
+                old.job.attempt,
+                old.job.fence,
+                "old-worker",
+            );
+            assert_eq!(runtime.running.len(), 1);
+            super::super::jobs::execute_claimed(
+                &fixture.db,
+                fixture.dispatcher(),
+                "new-worker",
+                new.clone(),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
+                    .unwrap()
+                    .status,
+                ProcessInstanceStatus::Completed
+            );
+            runtime.remove_running_claim(
+                &new.job.job_id,
+                new.job.attempt,
+                new.job.fence,
+                "new-worker",
+            );
+            assert!(runtime.running.is_empty());
+            assert!(repository::runtime_snapshot(
+                &fixture.db,
+                &fixture.owner,
+                &started.instance_id
+            )
+            .unwrap()
+            .scopes
+            .iter()
+            .all(|scope| scope.status == ProcessInstanceStatus::Completed));
+            if called {
+                assert_eq!(
+                    repository::get_instance(
+                        &fixture.db,
+                        &fixture.owner,
+                        &new.job.instance_id,
+                        None
+                    )
+                    .unwrap()
+                    .status,
+                    ProcessInstanceStatus::Completed
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4610,5 +5137,122 @@ mod tests {
         );
         assert!(!actual.instance.can_retry);
         *fixture.dispatcher().process_runtime.lock() = None;
+    }
+    #[tokio::test]
+    async fn called_child_midbatch_storage_failure_preserves_committed_registry_cancellation() {
+        let fixture = Fixture::new();
+        let flow_id = flow(
+            &fixture.db,
+            &fixture.owner,
+            &graph("call batch must not execute", None),
+        );
+        let target = publish_model(
+            &fixture,
+            &service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            ),
+        );
+        let mut parents = Vec::new();
+        let mut timers = Vec::new();
+        let mut children = Vec::new();
+        for seconds in [1, 2] {
+            let model = with_boundaries(
+                super::super::call_tests::caller(&target, BTreeMap::new()),
+                "Call_1",
+                &[("Limit", true, seconds)],
+            );
+            let parent = start_model(&fixture, &model);
+            let snapshot =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &parent.instance_id)
+                    .unwrap();
+            children.push(snapshot.calls[0].child_instance_id.clone());
+            timers.push(snapshot.timers[0].clone());
+            parents.push(parent);
+        }
+        let runtime = registry_runtime(&fixture, "called-batch");
+        let mut running = Vec::new();
+        for _ in 0..2 {
+            let claim = repository::claim_job(
+                &fixture.db,
+                "called-batch",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap()
+            .unwrap();
+            let cancellation = CancellationToken::new();
+            register_claim(&runtime, &claim, &cancellation);
+            running.push((claim, cancellation));
+        }
+        let first = running
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == children[0])
+            .unwrap();
+        let second = running
+            .iter()
+            .find(|(claim, _)| claim.job.instance_id == children[1])
+            .unwrap();
+        fixture.db.write().unwrap().execute_batch(&format!(
+            "CREATE TRIGGER fail_call_batch BEFORE UPDATE ON bpmn_timers WHEN OLD.timer_id='{}' AND NEW.status IN ('fired','error') BEGIN SELECT RAISE(ABORT,'controlled called midbatch storage failure'); END;",
+            timers[1].timer_id)).unwrap();
+        let drained = super::super::timers::drain_due(&fixture.db, timers[1].due_at_ms.unwrap());
+        assert_eq!(drained.fired, 1);
+        assert!(format!("{:#}", drained.completion.as_ref().unwrap_err())
+            .contains("controlled called midbatch storage failure"));
+        assert_eq!(
+            drained.cancelled_claims,
+            vec![CancelledJobClaim {
+                job_id: first.0.job.job_id.clone(),
+                attempt: first.0.job.attempt,
+                fence: first.0.job.fence,
+                worker_id: "called-batch".into(),
+            }]
+        );
+        runtime.handle_timer_drain(drained);
+        assert!(first.1.is_cancelled());
+        assert!(!second.1.is_cancelled());
+        let first_child =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &children[0]).unwrap();
+        let second_child =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &children[1]).unwrap();
+        assert_eq!(
+            first_child.instance.status,
+            ProcessInstanceStatus::Cancelled
+        );
+        assert_eq!(first_child.jobs[0].status, "cancelled");
+        assert_eq!(first_child.jobs[0].fence, first.0.job.fence + 1);
+        assert_eq!(second_child.instance.status, ProcessInstanceStatus::Running);
+        assert_eq!(second_child.jobs[0].status, "running");
+        assert_eq!(second_child.jobs[0].fence, second.0.job.fence);
+        assert_eq!(
+            repository::get_instance(&fixture.db, &fixture.owner, &parents[0].instance_id, None)
+                .unwrap()
+                .status,
+            ProcessInstanceStatus::Completed
+        );
+        assert_eq!(
+            repository::get_instance(&fixture.db, &fixture.owner, &parents[1].instance_id, None)
+                .unwrap()
+                .status,
+            ProcessInstanceStatus::Waiting
+        );
+        for (claim, cancellation) in &running {
+            if cancellation.is_cancelled() {
+                runtime.remove_running_claim(
+                    &claim.job.job_id,
+                    claim.job.attempt,
+                    claim.job.fence,
+                    "called-batch",
+                );
+            }
+        }
+        assert_eq!(runtime.running.len(), 1);
+        assert!(
+            crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -1,13 +1,13 @@
 // ============ File: bpmn.rs — bounded BPMN B1 XML import and export ============
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{bail, ensure, Context, Result};
 use quick_xml::events::Event;
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
-    ActivityVerification, ProcessCalendarPin, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
+    ActivityVerification, ProcessCalendarPin, ProcessCallableReference, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
     ProcessErrorDeclaration, ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessNode,
     ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessTimerSpec,
     ProcessSubProcess, ProcessWorkCalendar,
@@ -21,11 +21,11 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
-const GRAPH_ELEMENTS: [(&str, &str); 13] = [
+const GRAPH_ELEMENTS: [(&str, &str); 14] = [
     (BPMN, "extensionElements"), (BPMN, "startEvent"),
     (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
     (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
-    (BPMN, "serviceTask"), (BPMN, "subProcess"),
+    (BPMN, "serviceTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
     (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
     (BPMN, "parallelGateway"), (BPMN, "sequenceFlow"),
 ];
@@ -171,7 +171,7 @@ fn parse_tree(xml: &str) -> Result<Element> {
                     let attr_ns = ns_text(attr_ns)?;
                     let attr_local = String::from_utf8(attr_local.as_ref().to_vec())?;
                     let value = attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
-                    if attr_ns.is_empty() && matches!(attr_local.as_str(), "messageRef" | "errorRef") {
+                    if attr_ns.is_empty() && matches!(attr_local.as_str(), "messageRef" | "errorRef" | "calledElement") {
                         let invalid_qname = |reason: &str| XmlElementError {
                             message: format!("{reason} at byte {offset}"),
                             element_id: stack.last().and_then(|parent| parent.attr("id")).map(str::to_string),
@@ -610,8 +610,15 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         "endEvent" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[])?;
-            ProcessNodeKind::End
+            element.children_only(&[(BPMN, "errorEventDefinition")])?;
+            if element.child(BPMN, "errorEventDefinition")?.is_some() {
+                ensure!(element.children.len() == 1, "error end requires one error definition");
+                ProcessNodeKind::ErrorEnd {
+                    error_ref: event_reference(element, "errorEventDefinition", target_namespace)?,
+                }
+            } else {
+                ProcessNodeKind::End
+            }
         }
         "parallelGateway" => {
             element.attrs_only(&["id", "name", "gatewayDirection"])?;
@@ -760,6 +767,51 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 body: ProcessSubProcess { nodes, sequence_flows, variables, diagram: ProcessDiagram::default() },
                 input_mapping: mapping(config, "inputMapping")?,
                 output_mapping: mapping(config, "outputMapping")?,
+            }
+        }
+        "callActivity" => {
+            element.attrs_only(&["id", "name", "calledElement"])?;
+            element.children_only(&[(BPMN, "extensionElements")])?;
+            ensure!(element.text.trim().is_empty(),
+                "call activity {} has unsupported text at byte {}", id, element.offset);
+            let (namespace_uri, process_id) = element.qnames.get("calledElement")
+                .ok_or_else(|| XmlElementError {
+                    message: format!("call activity requires a bound calledElement QName at byte {}", element.offset),
+                    element_id: Some(id.clone()), offset: element.offset,
+                })?;
+            ensure!(!namespace_uri.is_empty(),
+                "call activity {} has unbound calledElement at byte {}", id, element.offset);
+            let extension = element.child(BPMN, "extensionElements")?
+                .ok_or_else(|| XmlElementError {
+                    message: format!("call activity requires a private TentaFlow target binding at byte {}", element.offset),
+                    element_id: Some(id.clone()), offset: element.offset,
+                })?;
+            extension.attrs_only(&[])?;
+            extension.children_only(&[(TF, "callActivity")])?;
+            ensure!(extension.children.len() == 1,
+                "call activity {} requires exactly one private target binding", id);
+            let binding = extension.child(TF, "callActivity")?.expect("validated call binding");
+            binding.attrs_only(&["definitionId", "version"])?;
+            binding.children_only(&[(TF, "inputMapping"), (TF, "outputMapping")])?;
+            ensure!(binding.text.trim().is_empty(),
+                "call activity {} has unsupported binding text at byte {}", id, binding.offset);
+            let target_attribute = |name: &str| binding.attr(name).ok_or_else(|| XmlElementError {
+                message: format!("call activity requires {name} at byte {}", binding.offset),
+                element_id: Some(id.clone()), offset: binding.offset,
+            });
+            let called_definition_id = target_attribute("definitionId")?.to_string();
+            let called_version = target_attribute("version")?.parse().map_err(|error| XmlElementError {
+                message: format!("invalid call version at byte {}: {error}", binding.offset),
+                element_id: Some(id.clone()), offset: binding.offset,
+            })?;
+            ProcessNodeKind::CallActivity {
+                called_definition_id,
+                called_version,
+                called_element: ProcessCallableReference {
+                    namespace_uri: namespace_uri.clone(), process_id: process_id.clone(),
+                },
+                input_mapping: mapping(binding, "inputMapping")?,
+                output_mapping: mapping(binding, "outputMapping")?,
             }
         }
         other => bail!("unsupported BPMN node {other} at byte {}", element.offset),
@@ -950,6 +1002,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         };
         let error_ref = match &node.kind {
             ProcessNodeKind::BoundaryError { error_ref, .. } => error_ref.as_deref(),
+            ProcessNodeKind::ErrorEnd { error_ref } => Some(error_ref.as_str()),
             _ => None,
         };
         if message_ref.is_some_and(|reference| !messages.iter().any(|declaration| declaration.message_id == reference))
@@ -1062,7 +1115,8 @@ fn collect_diagram<'a>(
     }
 }
 
-fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<()> {
+fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequenceFlow],
+    call_prefixes: &BTreeMap<String, String>) -> Result<()> {
     for node in nodes {
         let (tag, extra) = match &node.kind {
             ProcessNodeKind::Start => ("startEvent", String::new()),
@@ -1085,6 +1139,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                 format!(" attachedToRef=\"{}\" cancelActivity=\"true\"", escaped(attached_to_id)),
             ),
             ProcessNodeKind::End => ("endEvent", String::new()),
+            ProcessNodeKind::ErrorEnd { .. } => ("endEvent", String::new()),
             ProcessNodeKind::ParallelGateway => ("parallelGateway", String::new()),
             ProcessNodeKind::EventBasedGateway => (
                 "eventBasedGateway", " gatewayDirection=\"Diverging\" eventGatewayType=\"Exclusive\" instantiate=\"false\"".into()),
@@ -1098,6 +1153,12 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ProcessNodeKind::UserTask { .. } => ("userTask", String::new()),
             ProcessNodeKind::ServiceTask { .. } => ("serviceTask", String::new()),
             ProcessNodeKind::SubProcess { .. } => ("subProcess", String::new()),
+            ProcessNodeKind::CallActivity { called_element, .. } => {
+                let prefix = call_prefixes.get(&called_element.namespace_uri)
+                    .context("validated call namespace lacks XML prefix")?;
+                ("callActivity", format!(" calledElement=\"{prefix}:{}\"",
+                    escaped(&called_element.process_id)))
+            }
         };
         xml.push_str(&format!(
             "<bpmn:{tag} id=\"{}\" name=\"{}\"{extra}",
@@ -1150,6 +1211,10 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
                 xml.push_str(&format!("</bpmn:{tag}>"));
+            }
+            ProcessNodeKind::ErrorEnd { error_ref } => {
+                xml.push_str(&format!("><bpmn:errorEventDefinition errorRef=\"tns:{}\"/></bpmn:{tag}>",
+                    escaped(error_ref)));
             }
             ProcessNodeKind::UserTask {
                 assignee_user_id,
@@ -1224,8 +1289,22 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
                 xml.push_str("</tentaflow:subProcess></bpmn:extensionElements>");
-                write_graph(xml, &body.nodes, &body.sequence_flows)?;
+                write_graph(xml, &body.nodes, &body.sequence_flows, call_prefixes)?;
                 xml.push_str(&format!("</bpmn:{tag}>"));
+            }
+            ProcessNodeKind::CallActivity { called_definition_id, called_version,
+                input_mapping, output_mapping, .. } => {
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:callActivity definitionId=\"{}\" version=\"{}\">",
+                    escaped(called_definition_id), called_version));
+                if !input_mapping.is_empty() {
+                    xml.push_str(&format!("<tentaflow:inputMapping>{}</tentaflow:inputMapping>",
+                        escaped(&serde_json::to_string(input_mapping)?)));
+                }
+                if !output_mapping.is_empty() {
+                    xml.push_str(&format!("<tentaflow:outputMapping>{}</tentaflow:outputMapping>",
+                        escaped(&serde_json::to_string(output_mapping)?)));
+                }
+                xml.push_str(&format!("</tentaflow:callActivity></bpmn:extensionElements></bpmn:{tag}>"));
             }
             _ => xml.push_str("/>"),
         }
@@ -1250,8 +1329,23 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     validate_model(model)?;
     let namespace = model.target_namespace.as_deref().unwrap_or(TF);
     let declarations = !model.messages.is_empty() || !model.errors.is_empty();
-    let tns = if declarations { format!(" xmlns:tns=\"{}\"", escaped(namespace)) } else { String::new() };
-    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns} targetNamespace=\"{}\">", escaped(namespace));
+    let call_namespaces: BTreeSet<_> = super::model::all_nodes(model).into_iter().filter_map(|node| {
+        if let ProcessNodeKind::CallActivity { called_element, .. } = &node.kind {
+            Some(called_element.namespace_uri.clone())
+        } else { None }
+    }).collect();
+    let mut call_prefixes = BTreeMap::new();
+    let tns = if declarations || call_namespaces.contains(namespace) {
+        call_prefixes.insert(namespace.to_string(), "tns".to_string());
+        format!(" xmlns:tns=\"{}\"", escaped(namespace))
+    } else { String::new() };
+    let mut call_namespaces_xml = String::new();
+    for (index, uri) in call_namespaces.into_iter().filter(|uri| uri.as_str() != namespace).enumerate() {
+        let prefix = format!("call{}", index + 1);
+        call_namespaces_xml.push_str(&format!(" xmlns:{prefix}=\"{}\"", escaped(&uri)));
+        call_prefixes.insert(uri, prefix);
+    }
+    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns}{call_namespaces_xml} targetNamespace=\"{}\">", escaped(namespace));
     for message in &model.messages {
         xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
     }
@@ -1273,7 +1367,7 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         xml.push_str(&format!("<tentaflow:calendarPin>{}</tentaflow:calendarPin>", escaped(&serde_json::to_string(pin)?)));
     }
     xml.push_str("</bpmn:extensionElements>");
-    write_graph(&mut xml, &model.nodes, &model.sequence_flows)?;
+    write_graph(&mut xml, &model.nodes, &model.sequence_flows, &call_prefixes)?;
     xml.push_str("</bpmn:process>");
     let mut used_ids = HashSet::from([model.process_id.clone()]);
     used_ids.extend(model.messages.iter().map(|declaration| declaration.message_id.clone()));
@@ -1284,7 +1378,7 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     collect_diagram(&model.nodes, &model.diagram, &mut shapes, &mut edges, &mut used_ids);
     if !shapes.is_empty() || !edges.is_empty() {
         let subprocess_ids: HashSet<&str> = super::model::all_nodes(model).into_iter()
-            .filter(|node| matches!(node.kind, ProcessNodeKind::SubProcess { .. }))
+            .filter(|node| matches!(node.kind, ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. }))
             .map(|node| node.id.as_str()).collect();
         let diagram_id = generated_xml_id("Diagram_1", &mut used_ids);
         let plane_id = generated_xml_id("Plane_1", &mut used_ids);
@@ -1322,6 +1416,58 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_activity_and_error_end_xml_preserve_cross_namespace_binding_and_mappings() {
+        let mut model = super::super::model::starter_model();
+        model.target_namespace = Some("urn:orders:caller".into());
+        model.errors.push(ProcessErrorDeclaration {
+            error_id: "Error_Business".into(), name: "Rejected & returned".into(),
+            error_code: "ORDER.REJECTED".into(),
+        });
+        model.nodes.insert(1, ProcessNode {
+            id: "Call_1".into(), name: "Call & review".into(),
+            kind: ProcessNodeKind::CallActivity {
+                called_definition_id: "91764f75-dadb-41aa-a252-a8a911fe7a94".into(),
+                called_version: 7,
+                called_element: ProcessCallableReference {
+                    namespace_uri: "urn:orders:callee".into(),
+                    process_id: "Review_Process".into(),
+                },
+                input_mapping: BTreeMap::from([("customer_ID".into(), "vars.customer_ID".into())]),
+                output_mapping: BTreeMap::from([("return_value".into(), "outputs.return_value".into())]),
+            },
+        });
+        model.nodes[2].kind = ProcessNodeKind::ErrorEnd { error_ref: "Error_Business".into() };
+        model.sequence_flows[0].target_id = "Call_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_2".into(), source_id: "Call_1".into(), target_id: "End_1".into(),
+            condition: None,
+        });
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "Call_1".into(), x: 180.0, y: 120.0, width: 160.0, height: 100.0,
+        });
+        let xml = export_xml(&model).expect("valid private call XML");
+        assert!(xml.contains("xmlns:call1=\"urn:orders:callee\""));
+        assert!(xml.contains("calledElement=\"call1:Review_Process\""));
+        assert!(xml.contains("isExpanded=\"false\""));
+        assert!(xml.contains("errorRef=\"tns:Error_Business\""));
+        let (restored, diagnostics) = import_xml(&xml);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(restored, Some(model));
+
+        let unbound = xml.replace("<tentaflow:callActivity definitionId=\"91764f75-dadb-41aa-a252-a8a911fe7a94\" version=\"7\">",
+            "<tentaflow:callActivity version=\"7\">");
+        let (unsupported, diagnostics) = import_xml(&unbound);
+        assert!(unsupported.is_none());
+        assert_eq!(diagnostics[0].element_id.as_deref(), Some("Call_1"));
+        assert!(diagnostics[0].offset.is_some());
+        let wrong_qname = xml.replace("calledElement=\"call1:Review_Process\"",
+            "calledElement=\"unknown:Review_Process\"");
+        let (unsupported, diagnostics) = import_xml(&wrong_qname);
+        assert!(unsupported.is_none());
+        assert!(diagnostics[0].fatal);
+    }
 
     #[test]
     fn message_and_error_xml_round_trip_preserves_custom_namespace_qnames_and_business_keys() {

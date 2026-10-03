@@ -5,6 +5,7 @@ import { I18n } from '/js/i18n.js';
 const ELEMENTS = [
   ['Start', 'start', 'play', 'events', 56, 56],
   ['End', 'end', 'stop', 'events', 56, 56],
+  ['ErrorEnd', 'error_end', 'alert-triangle', 'events', 56, 56],
   ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
   ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
   ['BoundaryTimer', 'boundary_timer', 'clock', 'events', 56, 56],
@@ -16,6 +17,7 @@ const ELEMENTS = [
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
+  ['CallActivity', 'call_activity', 'layers', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
   ['ParallelGateway', 'parallel_gateway', 'plus', 'gateways', 72, 72],
   ['EventBasedGateway', 'event_based_gateway', 'branch', 'gateways', 72, 72],
@@ -26,7 +28,7 @@ export function processTemplates() {
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
     input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind) ? [] : ['in'],
-    output_ports: kind === 'End' ? [] : ['full'],
+    output_ports: ['End', 'ErrorEnd'].includes(kind) ? [] : ['full'],
     width, height,
   }));
 }
@@ -59,6 +61,9 @@ export function processNodeConfig(kind) {
       variables: {}, diagram: { shapes: [], edges: [] },
     }, inputMapping: {}, outputMapping: {} };
   }
+  if (kind === 'CallActivity') return { calledDefinitionId: '', calledVersion: 0,
+    calledElement: { namespaceUri: '', processId: '' }, inputMapping: {}, outputMapping: {} };
+  if (kind === 'ErrorEnd') return { errorRef: '' };
   return {};
 }
 

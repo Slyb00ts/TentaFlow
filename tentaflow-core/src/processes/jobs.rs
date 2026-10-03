@@ -1893,6 +1893,7 @@ mod tests {
             event_races: None,
             outgoing_messages: None,
             scopes: None,
+            calls: None,
             selected_user_task_id: first_task.clone(),
             selected_incident_id: first_incident.clone(),
         };

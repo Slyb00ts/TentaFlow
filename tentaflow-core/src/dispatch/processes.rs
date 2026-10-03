@@ -1770,6 +1770,7 @@ mod tests {
             event_races: None,
             outgoing_messages: None,
             scopes: None,
+            calls: None,
             selected_user_task_id: Some(task_id.clone()),
             selected_incident_id: None,
         };

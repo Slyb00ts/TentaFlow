@@ -1118,6 +1118,7 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (184, "bpmn_messages_and_event_races", MigrationStep::Sql(BPMN_MESSAGES_AND_EVENT_RACES)),
         (185, "bpmn_scopes", MigrationStep::RustSelfManaged(bpmn_scopes)),
+        (186, "bpmn_calls_and_terminal_errors", MigrationStep::RustSelfManaged(bpmn_calls_and_terminal_errors)),
     ]
 }
 
@@ -1935,6 +1936,185 @@ fn bpmn_scopes(conn: &Connection, version: i64, name: &str) -> Result<()> {
         Ok(()) => {
             let enabled = restored?;
             anyhow::ensure!(enabled == 1, "scope migration could not restore foreign keys");
+            Ok(())
+        }
+    }
+}
+
+const BPMN_CALLS_AND_TERMINAL_ERRORS: &str = r#"
+-- File: bpmn-b2d-schema-186.sql — exact CallActivity and terminal Error rebuild.
+-- RustSelfManaged: foreign_keys OFF before BEGIN, checks before COMMIT, restore ON on every exit.
+DROP TRIGGER bpmn_instance_timer_pair_insert;
+DROP TRIGGER bpmn_instance_timer_pair_update;
+CREATE TABLE bpmn_instances_186 (
+ instance_id TEXT PRIMARY KEY,
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+ org_id TEXT NOT NULL REFERENCES organizations(org_id),
+ initiator_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+ revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','incident','cancelled','error')),
+ variables_json TEXT NOT NULL,
+ created_at_ms INTEGER NOT NULL,
+ updated_at_ms INTEGER NOT NULL,
+ start_timer_id TEXT REFERENCES bpmn_timers(timer_id),
+ start_occurrence INTEGER CHECK(start_occurrence IS NULL OR (typeof(start_occurrence)='integer' AND start_occurrence>0)),
+ terminal_error_json TEXT CHECK(terminal_error_json IS NULL OR (json_valid(terminal_error_json) AND json_type(terminal_error_json)='object' AND length(CAST(terminal_error_json AS BLOB))<=4096)),
+ error_event_id TEXT,
+ error_scope_id TEXT,
+ CHECK((status='error' AND terminal_error_json IS NOT NULL AND error_event_id IS NOT NULL AND error_scope_id IS NOT NULL) OR (status<>'error' AND terminal_error_json IS NULL AND error_event_id IS NULL AND error_scope_id IS NULL)),
+ FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+ FOREIGN KEY(instance_id,error_scope_id,error_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED
+);
+INSERT INTO bpmn_instances_186(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence)
+ SELECT instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence FROM bpmn_instances;
+CREATE TABLE bpmn_scopes_186 (
+ scope_id TEXT PRIMARY KEY,
+ instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+ parent_scope_id TEXT,
+ subprocess_node_id TEXT,
+ parent_token_id TEXT,
+ revision INTEGER,
+ status TEXT,
+ local_variables_json TEXT,
+ created_at_ms INTEGER,
+ updated_at_ms INTEGER,
+ terminal_error_json TEXT CHECK(terminal_error_json IS NULL OR (json_valid(terminal_error_json) AND json_type(terminal_error_json)='object' AND length(CAST(terminal_error_json AS BLOB))<=4096)),
+ error_event_id TEXT,
+ error_scope_id TEXT,
+ UNIQUE(instance_id,scope_id),
+ UNIQUE(instance_id,parent_token_id),
+ FOREIGN KEY(instance_id,parent_scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(instance_id,parent_scope_id,parent_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(instance_id,error_scope_id,error_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+ CHECK((scope_id=instance_id AND parent_scope_id IS NULL AND subprocess_node_id IS NULL AND parent_token_id IS NULL AND revision IS NULL AND status IS NULL AND local_variables_json IS NULL AND created_at_ms IS NULL AND updated_at_ms IS NULL AND terminal_error_json IS NULL AND error_event_id IS NULL AND error_scope_id IS NULL) OR
+ (scope_id<>instance_id AND parent_scope_id IS NOT NULL AND subprocess_node_id IS NOT NULL AND parent_token_id IS NOT NULL AND typeof(revision)='integer' AND revision>0 AND status IN ('running','waiting','completed','incident','cancelled','error') AND local_variables_json IS NOT NULL AND json_valid(local_variables_json) AND json_type(local_variables_json)='object' AND length(CAST(local_variables_json AS BLOB))<=262144 AND typeof(created_at_ms)='integer' AND typeof(updated_at_ms)='integer' AND
+ ((status='error' AND terminal_error_json IS NOT NULL AND error_event_id IS NOT NULL AND error_scope_id IS NOT NULL) OR (status<>'error' AND terminal_error_json IS NULL AND error_event_id IS NULL AND error_scope_id IS NULL))))
+);
+INSERT INTO bpmn_scopes_186(scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms)
+ SELECT scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms FROM bpmn_scopes;
+DROP TABLE bpmn_scopes;
+DROP TABLE bpmn_instances;
+ALTER TABLE bpmn_instances_186 RENAME TO bpmn_instances;
+ALTER TABLE bpmn_scopes_186 RENAME TO bpmn_scopes;
+CREATE INDEX idx_bpmn_instances_initiator ON bpmn_instances(org_id,initiator_user_id,updated_at_ms DESC);
+CREATE UNIQUE INDEX uq_bpmn_timer_start_slot ON bpmn_instances(start_timer_id,start_occurrence) WHERE start_timer_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_scope_root ON bpmn_scopes(instance_id) WHERE parent_scope_id IS NULL;
+CREATE INDEX idx_bpmn_scopes_instance ON bpmn_scopes(instance_id,status,scope_id);
+CREATE INDEX idx_bpmn_scopes_parent ON bpmn_scopes(instance_id,parent_scope_id,scope_id);
+CREATE TABLE bpmn_call_pins (
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ node_id TEXT NOT NULL,
+ called_definition_id TEXT NOT NULL,
+ called_version INTEGER NOT NULL CHECK(typeof(called_version)='integer' AND called_version>0),
+ called_element_json TEXT NOT NULL CHECK(json_valid(called_element_json)),
+ model_sha256 TEXT NOT NULL CHECK(length(model_sha256)=64),
+ PRIMARY KEY(definition_id,version,node_id),
+ FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT,
+ FOREIGN KEY(called_definition_id,called_version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT
+);
+CREATE TABLE bpmn_call_dependencies (
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ called_definition_id TEXT NOT NULL,
+ called_version INTEGER NOT NULL,
+ model_sha256 TEXT NOT NULL CHECK(length(model_sha256)=64),
+ PRIMARY KEY(definition_id,version,called_definition_id,called_version),
+ FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT,
+ FOREIGN KEY(called_definition_id,called_version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT
+);
+CREATE TRIGGER bpmn_call_pin_immutable BEFORE UPDATE ON bpmn_call_pins BEGIN SELECT RAISE(ABORT,'process call pin is immutable'); END;
+CREATE TRIGGER bpmn_call_dependency_immutable BEFORE UPDATE ON bpmn_call_dependencies BEGIN SELECT RAISE(ABORT,'process call dependency is immutable'); END;
+CREATE TABLE bpmn_calls (
+ call_id TEXT PRIMARY KEY,
+ parent_instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+ parent_scope_id TEXT NOT NULL,
+ parent_token_id TEXT NOT NULL,
+ call_node_id TEXT NOT NULL,
+ child_instance_id TEXT NOT NULL UNIQUE REFERENCES bpmn_instances(instance_id) DEFERRABLE INITIALLY DEFERRED,
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ called_definition_id TEXT NOT NULL,
+ called_version INTEGER NOT NULL,
+ model_sha256 TEXT NOT NULL CHECK(length(model_sha256)=64),
+ revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+ status TEXT NOT NULL CHECK(status IN ('waiting','returned','error','cancelled','return_incident')),
+ created_at_ms INTEGER NOT NULL,
+ updated_at_ms INTEGER NOT NULL,
+ UNIQUE(parent_instance_id,parent_token_id),
+ FOREIGN KEY(parent_instance_id,parent_scope_id,parent_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(definition_id,version,call_node_id) REFERENCES bpmn_call_pins(definition_id,version,node_id),
+ FOREIGN KEY(called_definition_id,called_version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT
+);
+CREATE INDEX idx_bpmn_calls_parent ON bpmn_calls(parent_instance_id,status,created_at_ms,call_id);
+CREATE INDEX idx_bpmn_calls_parent_scope ON bpmn_calls(parent_instance_id,parent_scope_id,status);
+CREATE TRIGGER bpmn_call_identity_immutable BEFORE UPDATE ON bpmn_calls
+ WHEN NEW.call_id IS NOT OLD.call_id OR NEW.parent_instance_id IS NOT OLD.parent_instance_id OR NEW.parent_scope_id IS NOT OLD.parent_scope_id OR NEW.parent_token_id IS NOT OLD.parent_token_id OR NEW.call_node_id IS NOT OLD.call_node_id OR NEW.child_instance_id IS NOT OLD.child_instance_id OR NEW.definition_id IS NOT OLD.definition_id OR NEW.version IS NOT OLD.version OR NEW.called_definition_id IS NOT OLD.called_definition_id OR NEW.called_version IS NOT OLD.called_version OR NEW.model_sha256 IS NOT OLD.model_sha256 OR NEW.created_at_ms IS NOT OLD.created_at_ms
+ BEGIN SELECT RAISE(ABORT,'process call identity is immutable'); END;
+CREATE TRIGGER bpmn_instance_timer_pair_insert BEFORE INSERT ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+
+CREATE TRIGGER bpmn_instance_timer_pair_update BEFORE UPDATE OF start_timer_id,start_occurrence ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+
+"#;
+
+fn bpmn_calls_and_terminal_errors(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        anyhow::ensure!(fk_disabled == 0, "call migration requires foreign keys disabled");
+        let tx = conn.unchecked_transaction()?;
+        let old_instances: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_instances", [], |row| row.get(0))?;
+        let old_scopes: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_scopes", [], |row| row.get(0))?;
+        tx.execute_batch(BPMN_CALLS_AND_TERMINAL_ERRORS)?;
+        let new_instances: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_instances", [], |row| row.get(0))?;
+        let new_scopes: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_scopes", [], |row| row.get(0))?;
+        anyhow::ensure!(old_instances == new_instances && old_scopes == new_scopes,
+            "call migration changed legacy instance or scope counts");
+        let invalid_roots: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_instances i WHERE NOT EXISTS (SELECT 1 FROM bpmn_scopes s WHERE s.instance_id=i.instance_id AND s.scope_id=i.instance_id AND s.parent_scope_id IS NULL AND s.revision IS NULL AND s.status IS NULL AND s.local_variables_json IS NULL AND s.terminal_error_json IS NULL AND s.error_event_id IS NULL AND s.error_scope_id IS NULL)",
+            [], |row| row.get(0),
+        )?;
+        let orphan_roots: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_scopes s WHERE s.parent_scope_id IS NULL AND NOT EXISTS (SELECT 1 FROM bpmn_instances i WHERE i.instance_id=s.instance_id AND i.instance_id=s.scope_id)",
+            [], |row| row.get(0),
+        )?;
+        anyhow::ensure!(invalid_roots == 0 && orphan_roots == 0,
+            "call migration root identity mismatch: {invalid_roots} invalid, {orphan_roots} orphaned");
+        let invalid_waits: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_scopes s WHERE s.parent_scope_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM bpmn_tokens t WHERE t.instance_id=s.instance_id AND t.scope_id=s.parent_scope_id AND t.token_id=s.parent_token_id)",
+            [], |row| row.get(0),
+        )?;
+        anyhow::ensure!(invalid_waits == 0, "call migration has {invalid_waits} invalid parent waits");
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(violations.is_empty(),
+            "call migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "call migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations (version,name) VALUES (?1,?2)", rusqlite::params![version,name])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.execute_batch("PRAGMA foreign_keys = ON;").and_then(|()| {
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+    });
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            let enabled = restored?;
+            anyhow::ensure!(enabled == 1, "call migration could not restore foreign keys");
             Ok(())
         }
     }
@@ -11367,50 +11547,112 @@ pub(crate) fn normalize_legacy_bus_topics_validation(conn: &Connection) -> Resul
     Ok(reset)
 }
 
+/// Walks the real ladder to `version` so an upgrade fixture runs each rung once.
+#[cfg(test)]
+pub(crate) fn run_ladder_up_to(conn: &Connection, version: i64) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .unwrap();
+    let current_version: i64 = conn
+        .query_row("SELECT COALESCE(MAX(version), 0) FROM _migrations", [], |row| row.get(0))
+        .unwrap();
+    for (rung, name, step) in get_migrations() {
+        if rung > version {
+            break;
+        }
+        if rung <= current_version {
+            continue;
+        }
+        apply_migration(conn, rung, name, &step)
+            .unwrap_or_else(|error| panic!("the ladder must reach {version}: {error}"));
+    }
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        version,
+        "the ladder must stop exactly at {version}"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, String) {
+    use tentaflow_protocol::processes::{
+        ActivityVerification, ProcessNode, ProcessNodeKind, ProcessSequenceFlow,
+    };
+
+    run_ladder_up_to(conn, 182);
+    conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('boundary-owner','Boundary owner','x',1)", []).unwrap();
+    let mut model = crate::processes::model::starter_model();
+    model.timer_timezone = Some("UTC".into());
+    model.nodes.push(ProcessNode {
+        id: "Review_1".into(), name: "Review".into(),
+        kind: ProcessNodeKind::UserTask {
+            assignee_user_id: Some("boundary-owner".into()),
+            output_mapping: Default::default(),
+        },
+    });
+    model.nodes.push(ProcessNode {
+        id: "Service_1".into(), name: "Service".into(),
+        kind: ProcessNodeKind::ServiceTask {
+            flow_id: "flow-pinned".into(), input_mapping: Default::default(),
+            output_mapping: Default::default(), verification: ActivityVerification::Human,
+            timeout_seconds: 60,
+            result_expression: None,
+        },
+    });
+    model.nodes.push(ProcessNode {
+        id: "Catch_1".into(), name: "Wait".into(),
+        kind: ProcessNodeKind::TimerCatch {
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
+        },
+    });
+    model.sequence_flows[0].target_id = "Review_1".into();
+    for (id, source, target) in [
+        ("Flow_2", "Review_1", "Service_1"),
+        ("Flow_3", "Service_1", "Catch_1"),
+        ("Flow_4", "Catch_1", "End_1"),
+    ] {
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: id.into(), source_id: source.into(), target_id: target.into(), condition: None,
+        });
+    }
+    crate::processes::model::validate_model(&model).unwrap();
+    let bytes = serde_json::to_string(&model).unwrap();
+    let hash = crate::processes::repository::request_hash(&model).unwrap();
+    conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('boundary-process','org-default','boundary-owner','Boundary','',1,?1,1,0,1,1)", [&bytes]).unwrap();
+    conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('boundary-process',1,?1,?2,'[]',1,'boundary-owner')", rusqlite::params![&bytes, &hash]).unwrap();
+    conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('boundary-instance','boundary-process',1,'org-default','boundary-owner',1,'running','{}',1,1)", []).unwrap();
+    for (id, node, status) in [
+        ("waiting-review", "Review_1", "waiting"),
+        ("waiting-service", "Service_1", "waiting"),
+        ("waiting-catch", "Catch_1", "waiting"),
+        ("historical-token", "Review_1", "consumed"),
+    ] {
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,node_id,fork_stack_json,status,created_at_ms) VALUES(?1,'boundary-instance',?2,'[]',?3,1)", rusqlite::params![id,node,status]).unwrap();
+    }
+    for (id, node, kind, status) in [
+        ("task-review", "Review_1", "work", "open"),
+        ("task-verification", "Service_1", "verification", "open"),
+        ("task-history", "Review_1", "work", "completed"),
+    ] {
+        conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms) VALUES(?1,'boundary-instance',?2,?2,'boundary-owner',?3,?4,'{}',1,1,1)", rusqlite::params![id,node,kind,status]).unwrap();
+    }
+    conn.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms) VALUES('job-verification','boundary-instance','Service_1','waiting-service','{}','completed',1,1)", []).unwrap();
+    conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) VALUES('timer-catch','org-default','boundary-process',1,'Catch_1','catch','boundary-instance','waiting-catch','{\"Duration\":{\"seconds\":90}}','UTC',1,90001,1,1,'pending',90001,1,1)", []).unwrap();
+    conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('boundary-event','boundary-instance',1,1,'instance_started',NULL,'boundary-owner','{\"business_key\":\"v_1\"}')", []).unwrap();
+    (bytes, hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
-
-    /// Walks the real ladder to `version` and stops, leaving a database a real
-    /// upgrade at that version would have produced.
-    ///
-    /// `run` applies a rung only when `version > current_version`, so a test
-    /// that needs a rung to RUN against a fixture it inserts cannot get there
-    /// by deleting that rung's `_migrations` row from an already-migrated
-    /// database: the recorded head is higher than the deleted one and the rung
-    /// is skipped in silence. It has to stop BELOW the rung and let `run` take
-    /// it from there.
-    fn run_ladder_up_to(conn: &Connection, version: i64) {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS _migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-        )
-        .unwrap();
-        let current_version: i64 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM _migrations", [], |row| row.get(0))
-            .unwrap();
-        for (rung, name, step) in get_migrations() {
-            if rung > version {
-                break;
-            }
-            if rung <= current_version {
-                continue;
-            }
-            apply_migration(conn, rung, name, &step)
-                .unwrap_or_else(|error| panic!("the ladder must reach {version}: {error}"));
-        }
-        assert_eq!(
-            conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            version,
-            "the ladder must stop exactly at {version}"
-        );
-    }
 
     /// Applies ONE rung's registered body again, the way `run` would when the
     /// recorded head is still below it. Once the ladder has moved past a rung
@@ -15508,7 +15750,7 @@ mod tests {
             assert!(table_exists(&conn, table).unwrap(), "missing {table}");
         }
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 185);
+        assert_eq!(version, 186);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -15533,7 +15775,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('message-event','message-instance',1,1,'instance_started',NULL,'message-owner','{\"customer_ID\":\"kept\"}')", []).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 185);
+        assert_eq!(version, 186);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -15544,74 +15786,6 @@ mod tests {
         }
         assert!(column_exists(&conn, "bpmn_jobs", "result_origin").unwrap());
         assert!(column_exists(&conn, "bpmn_timers", "race_id").unwrap());
-    }
-
-    fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, String) {
-        use tentaflow_protocol::processes::{
-            ActivityVerification, ProcessNode, ProcessNodeKind, ProcessSequenceFlow,
-        };
-
-        run_ladder_up_to(conn, 182);
-        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('boundary-owner','Boundary owner','x',1)", []).unwrap();
-        let mut model = crate::processes::model::starter_model();
-        model.timer_timezone = Some("UTC".into());
-        model.nodes.push(ProcessNode {
-            id: "Review_1".into(), name: "Review".into(),
-            kind: ProcessNodeKind::UserTask {
-                assignee_user_id: Some("boundary-owner".into()),
-                output_mapping: Default::default(),
-            },
-        });
-        model.nodes.push(ProcessNode {
-            id: "Service_1".into(), name: "Service".into(),
-            kind: ProcessNodeKind::ServiceTask {
-                flow_id: "flow-pinned".into(), input_mapping: Default::default(),
-                output_mapping: Default::default(), verification: ActivityVerification::Human,
-                timeout_seconds: 60,
-                result_expression: None,
-            },
-        });
-        model.nodes.push(ProcessNode {
-            id: "Catch_1".into(), name: "Wait".into(),
-            kind: ProcessNodeKind::TimerCatch {
-                timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
-            },
-        });
-        model.sequence_flows[0].target_id = "Review_1".into();
-        for (id, source, target) in [
-            ("Flow_2", "Review_1", "Service_1"),
-            ("Flow_3", "Service_1", "Catch_1"),
-            ("Flow_4", "Catch_1", "End_1"),
-        ] {
-            model.sequence_flows.push(ProcessSequenceFlow {
-                id: id.into(), source_id: source.into(), target_id: target.into(), condition: None,
-            });
-        }
-        crate::processes::model::validate_model(&model).unwrap();
-        let bytes = serde_json::to_string(&model).unwrap();
-        let hash = crate::processes::repository::request_hash(&model).unwrap();
-        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('boundary-process','org-default','boundary-owner','Boundary','',1,?1,1,0,1,1)", [&bytes]).unwrap();
-        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('boundary-process',1,?1,?2,'[]',1,'boundary-owner')", rusqlite::params![&bytes, &hash]).unwrap();
-        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('boundary-instance','boundary-process',1,'org-default','boundary-owner',1,'running','{}',1,1)", []).unwrap();
-        for (id, node, status) in [
-            ("waiting-review", "Review_1", "waiting"),
-            ("waiting-service", "Service_1", "waiting"),
-            ("waiting-catch", "Catch_1", "waiting"),
-            ("historical-token", "Review_1", "consumed"),
-        ] {
-            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,node_id,fork_stack_json,status,created_at_ms) VALUES(?1,'boundary-instance',?2,'[]',?3,1)", rusqlite::params![id,node,status]).unwrap();
-        }
-        for (id, node, kind, status) in [
-            ("task-review", "Review_1", "work", "open"),
-            ("task-verification", "Service_1", "verification", "open"),
-            ("task-history", "Review_1", "work", "completed"),
-        ] {
-            conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms) VALUES(?1,'boundary-instance',?2,?2,'boundary-owner',?3,?4,'{}',1,1,1)", rusqlite::params![id,node,kind,status]).unwrap();
-        }
-        conn.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms) VALUES('job-verification','boundary-instance','Service_1','waiting-service','{}','completed',1,1)", []).unwrap();
-        conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) VALUES('timer-catch','org-default','boundary-process',1,'Catch_1','catch','boundary-instance','waiting-catch','{\"Duration\":{\"seconds\":90}}','UTC',1,90001,1,1,'pending',90001,1,1)", []).unwrap();
-        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('boundary-event','boundary-instance',1,1,'instance_started',NULL,'boundary-owner','{\"business_key\":\"v_1\"}')", []).unwrap();
-        (bytes, hash)
     }
 
     #[test]
@@ -15703,7 +15877,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_commands(org_id,actor_user_id,command_id,request_hash,result_json,created_at_ms) VALUES('org-default','boundary-owner','old-command','old-hash','{\"instance_id\":\"boundary-instance\",\"opaque_ID\":true}',1)", []).unwrap();
         run(&conn).unwrap();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, 185);
+        assert_eq!(version, 186);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(String, String, Option<String>, String, i64, String, Option<String>, Option<String>)> = {

@@ -406,6 +406,27 @@ fn validate_draft_body<'a>(
                 validate_draft_body(&body.nodes, &body.sequence_flows, &body.variables,
                     &body.diagram, depth + 1, all_ids, node_count, flow_count)?;
             }
+            ProcessNodeKind::CallActivity { called_definition_id, called_version,
+                called_element, input_mapping, output_mapping } => {
+                if !called_definition_id.is_empty() {
+                    uuid::Uuid::parse_str(called_definition_id)
+                        .with_context(|| format!("call activity {} has invalid target definition", node.id))?;
+                }
+                ensure!(*called_version == 0 || !called_definition_id.is_empty(),
+                    "call activity {} has a version without a target", node.id);
+                if !called_element.namespace_uri.is_empty() {
+                    ensure!(called_element.namespace_uri.len() <= 1024
+                        && !called_element.namespace_uri.chars().any(char::is_whitespace)
+                        && !called_element.namespace_uri.chars().any(char::is_control),
+                        "call activity {} has invalid namespace", node.id);
+                    url::Url::parse(&called_element.namespace_uri)
+                        .with_context(|| format!("call activity {} has invalid namespace", node.id))?;
+                }
+                ensure!(called_element.process_id.is_empty() || valid_id(&called_element.process_id),
+                    "call activity {} has invalid process ID", node.id);
+                validate_mapping(input_mapping)?;
+                validate_mapping(output_mapping)?;
+            }
             _ => {}
         }
         if depth > 0 {
@@ -545,6 +566,21 @@ fn validate_body<'a>(
                     depth + 1, message_ids, error_ids, used_messages, used_errors)
                     .with_context(|| format!("embedded subprocess {}", node.id))?;
             }
+            ProcessNodeKind::CallActivity { called_definition_id, called_version,
+                called_element, input_mapping, output_mapping } => {
+                uuid::Uuid::parse_str(called_definition_id)
+                    .with_context(|| format!("call activity {} has invalid target definition", node.id))?;
+                ensure!(*called_version > 0 && valid_id(&called_element.process_id)
+                    && !called_element.namespace_uri.is_empty(),
+                    "call activity {} requires an exact published target QName and version", node.id);
+                validate_mapping(input_mapping)?;
+                validate_mapping(output_mapping)?;
+            }
+            ProcessNodeKind::ErrorEnd { error_ref } => {
+                ensure!(error_ids.contains(error_ref.as_str()),
+                    "error end {} references an unknown declaration", node.id);
+                used_errors.insert(error_ref.as_str());
+            }
             _ => {}
         }
     }
@@ -596,7 +632,7 @@ fn validate_body<'a>(
     );
     ensure!(
         graph_nodes.iter()
-            .any(|node| matches!(node.kind, ProcessNodeKind::End)),
+        .any(|node| matches!(node.kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })),
         "process requires an end event"
     );
     for node in graph_nodes {
@@ -617,7 +653,7 @@ fn validate_body<'a>(
                 );
                 ensure!(
                     matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                        Some(ProcessNodeKind::ServiceTask { .. } | ProcessNodeKind::SubProcess { .. }))
+                Some(ProcessNodeKind::ServiceTask { .. } | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. }))
                         || (!matches!(node.kind, ProcessNodeKind::BoundaryError { .. })
                             && matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                                 Some(ProcessNodeKind::UserTask { .. }))),
@@ -643,7 +679,7 @@ fn validate_body<'a>(
                     );
                 }
             }
-            ProcessNodeKind::End => ensure!(
+            ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } => ensure!(
                 out_count == 0 && in_count >= 1,
                 "end event must have incoming flow and no outgoing flow"
             ),
@@ -723,7 +759,7 @@ fn validate_body<'a>(
     );
     let mut can_end = HashSet::new();
     for node_id in order.iter().rev() {
-        if matches!(nodes[node_id].kind, ProcessNodeKind::End)
+        if matches!(nodes[node_id].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })
             || graph_outgoing
                 .get(node_id)
                 .into_iter()
@@ -757,11 +793,11 @@ fn validate_body<'a>(
                 );
             }
         }
-        if matches!(node.kind, ProcessNodeKind::End) {
+        if matches!(node.kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
             ensure!(stack.is_empty(), "end event has an open parallel activation");
         }
         for target in outgoing.get(node_id).into_iter().flatten() {
-            if matches!(nodes[target].kind, ProcessNodeKind::End) {
+            if matches!(nodes[target].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
                 ensure!(stack.is_empty(), "boundary or main path ends inside a parallel fork");
                 states.entry(*target).or_insert_with(|| (region.clone(), stack.clone()));
             } else if let Some(existing) = states.get(target) {
@@ -818,7 +854,7 @@ fn validate_event_gateway_regions<'a>(
             branch_reach.iter().all(|reach| reach.contains(node_id))
         }).with_context(|| format!("event gateway {} has no common exclusive merge or end", gateway.id))?;
         ensure!(
-            matches!(nodes[common].kind, ProcessNodeKind::End)
+            matches!(nodes[common].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })
                 || matches!(&nodes[common].kind, ProcessNodeKind::ExclusiveGateway { default_flow_id: None }
                     if outgoing.get(common).map_or(0, Vec::len) == 1
                         && graph_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
@@ -834,7 +870,7 @@ fn validate_event_gateway_regions<'a>(
                 if current == common || !reached.insert(current) {
                     continue;
                 }
-                ensure!(!matches!(nodes[current].kind, ProcessNodeKind::End),
+                ensure!(!matches!(nodes[current].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }),
                     "event gateway {} branch ends before common merge {}", gateway.id, common);
                 ensure!(!matches!(nodes[current].kind, ProcessNodeKind::EventBasedGateway),
                     "event gateway {} has a nested event race", gateway.id);
@@ -1002,6 +1038,73 @@ pub fn and_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_activity_and_error_end_require_exact_binding_and_closed_parallel_path() {
+        use tentaflow_protocol::processes::{
+            ProcessCallableReference, ProcessErrorDeclaration, ProcessNode, ProcessSequenceFlow,
+        };
+
+        let mut model = starter_model();
+        model.errors.push(ProcessErrorDeclaration {
+            error_id: "Error_Business".into(), name: "Rejected".into(),
+            error_code: "BUSINESS.REJECTED".into(),
+        });
+        model.nodes.insert(1, ProcessNode {
+            id: "Call_1".into(), name: "Review".into(),
+            kind: ProcessNodeKind::CallActivity {
+                called_definition_id: "91764f75-dadb-41aa-a252-a8a911fe7a94".into(),
+                called_version: 2,
+                called_element: ProcessCallableReference {
+                    namespace_uri: "urn:example:review".into(),
+                    process_id: "Review_Process".into(),
+                },
+                input_mapping: Default::default(), output_mapping: Default::default(),
+            },
+        });
+        model.nodes[2].kind = ProcessNodeKind::ErrorEnd { error_ref: "Error_Business".into() };
+        model.sequence_flows[0].target_id = "Call_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow {
+            id: "Flow_2".into(), source_id: "Call_1".into(), target_id: "End_1".into(),
+            condition: None,
+        });
+        validate_model(&model).unwrap();
+
+        if let ProcessNodeKind::CallActivity { called_version, .. } = &mut model.nodes[1].kind {
+            *called_version = 0;
+        }
+        assert!(validate_model(&model).is_err(), "a call cannot choose latest at execution time");
+        if let ProcessNodeKind::CallActivity { called_version, .. } = &mut model.nodes[1].kind {
+            *called_version = 2;
+        }
+        model.nodes[2].kind = ProcessNodeKind::ErrorEnd { error_ref: "Missing".into() };
+        assert!(validate_model(&model).is_err(), "an error end requires a declared business error");
+        model.nodes[2].kind = ProcessNodeKind::ErrorEnd { error_ref: "Error_Business".into() };
+
+        model.nodes.extend([
+            ProcessNode { id: "Split_1".into(), name: "Split".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Join_1".into(), name: "Join".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Branch_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None, output_mapping: Default::default(),
+            } },
+            ProcessNode { id: "Branch_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None, output_mapping: Default::default(),
+            } },
+        ]);
+        model.sequence_flows[0].target_id = "Split_1".into();
+        for (id, source_id, target_id) in [
+            ("Flow_3", "Split_1", "Branch_A"), ("Flow_4", "Split_1", "Branch_B"),
+            ("Flow_5", "Branch_A", "Join_1"), ("Flow_6", "Branch_B", "Join_1"),
+            ("Flow_7", "Join_1", "Call_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source_id.into(), target_id: target_id.into(), condition: None,
+            });
+        }
+        validate_model(&model).unwrap();
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_5").unwrap().target_id = "End_1".into();
+        assert!(validate_model(&model).is_err(), "an error end cannot silently consume an open parallel activation");
+    }
 
     #[test]
     fn message_declarations_keep_incomplete_drafts_but_publication_requires_real_references() {

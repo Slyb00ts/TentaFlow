@@ -15,7 +15,7 @@ import '/js/components/tf-toggle.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
-const tone = (status) => status === 'Completed' ? 'ok' : status === 'Incident' ? 'err' : status === 'Cancelled' ? 'neutral' : 'info';
+const tone = (status) => status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(status) ? 'err' : status === 'Cancelled' ? 'neutral' : 'info';
 
 function workingDate(ms, summary, zone) {
   if (summary?.dueOffsetSeconds == null) return new Date(ms).toISOString();
@@ -60,6 +60,15 @@ function jsonSection(label, value, editable = true) {
   editor.labels = processEditorLabels();
   editor.value = JSON.stringify(value, null, 2);
   return section;
+}
+
+export function openProcessCallPreview(version) {
+  const win = readWindow(text('call_preview'), 'layers', 940);
+  const host = win.querySelector('[data-content]');
+  host.innerHTML = `<h2>${escapeHtml(text('version_number', { version: version.version }))}</h2>
+    <p>${escapeHtml(text('call_preview_readonly'))}</p>`;
+  host.append(jsonSection(text('call_published_model'), version.model, false));
+  return win;
 }
 
 function validateJson(section, object = false) {
@@ -123,6 +132,21 @@ export function processEventText(event) {
   if (event.kind === 'scope_error_propagated') return text('event_scope_error_propagated', {
     node, code: event.data.code || '',
   });
+  if (['call_requested', 'call_entered', 'call_returned', 'call_cancelled'].includes(event.kind)) {
+    return text(`event_${event.kind}`, { node, reason: processLifecycleReasonText(event.data.reason || ''),
+      version: event.data.called_version || '', child: event.data.child_instance_id || '' });
+  }
+  if (event.kind === 'call_error_propagated') {
+    const source = event.data.source_kind === 'error_end' ? text('node_error_end')
+      : event.data.source_kind === 'contract' ? text('node_service_task') : event.data.source_kind;
+    return text('event_call_error_propagated', { node, code: event.data.error_code, source });
+  }
+  if (event.kind === 'error_end_reached') return text('event_error_end_reached', {
+    node, code: event.data.error_code, source: event.data.source_node_id,
+  });
+  if (event.kind === 'instance_error') return text('event_instance_error', {
+    node, code: event.data.error_code,
+  });
   if (['incident', 'job_denied', 'job_failed'].includes(event.kind)) return text(`event_${event.kind}`, { node, message: processIncidentText(event.data) });
   return text(`event_${event.kind}`, { node });
 }
@@ -141,6 +165,9 @@ export function processLifecycleReasonText(reason) {
     case 'sibling_interrupted': return text('timer_reason_sibling_interrupted');
     case 'event_race_lost': return text('timer_reason_event_race_lost');
     case 'scope_cancelled': return text('reason_scope_cancelled');
+    case 'call_interrupted': return text('reason_call_interrupted');
+    case 'error_end': return text('reason_error_end');
+    case 'child_cancelled': return text('reason_child_cancelled');
     case 'scope_limit': return text('reason_scope_limit');
     case 'definition_archived': return text('timer_reason_definition_archived');
     case 'missed_during_archive': return text('timer_reason_missed_during_archive');
@@ -257,6 +284,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   const win = readWindow(text('instance'), 'play', 940);
   const host = win.querySelector('[data-content]');
   host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
+    <section data-calls><h3>${escapeHtml(text('calls'))}</h3><div data-call-rows></div></section>
     <section data-scopes><h3>${escapeHtml(text('scopes'))}</h3><div data-scope-rows></div><div data-scope-detail></div></section>
     <section data-subscriptions><h3>${escapeHtml(text('message_subscriptions'))}</h3><div data-subscription-rows></div></section>
     <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
@@ -276,7 +304,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   const retryCommand = processCommand();
   const events = host.querySelector('[data-events]');
   const workWindows = new Set();
-  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes'];
+  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls'];
   const pageSpecs = Object.fromEntries(collectionNames.map((name) => [name, { offset: 0, limit: 20 }]));
   let selectedUserTaskId = null;
   let selectedIncidentId = null;
@@ -412,6 +440,15 @@ export async function openProcessInstance(instanceId, initial = null) {
       ${instance.canSendMessage && instance.messageNames.length ? `<tf-button variant="secondary" icon="mail" data-send-instance>${escapeHtml(text('send_message'))}</tf-button>` : ''}
       ${instance.canCancel ? `<tf-button variant="danger" icon="x" data-cancel>${escapeHtml(text('cancel_instance'))}</tf-button>` : ''}</div>`;
     host.querySelector('[data-send-instance]')?.addEventListener('click', () => openProcessMessageSend({ Catch: { definitionId: instance.definitionId, instanceId, subscriptionId: null } }, instance.messageNames, () => refresh()));
+    if (instance.terminalError) {
+      const detail = document.createElement('section');
+      detail.className = 'fb-process-work';
+      detail.dataset.terminalError = '';
+      detail.innerHTML = `<div><strong>${escapeHtml(text('terminal_business_error'))}</strong>
+        <p>${escapeHtml(instance.terminalError.errorCode)} · ${escapeHtml(instance.terminalError.errorRef)}</p>
+        <p>${escapeHtml(text('call_error_source'))}: ${escapeHtml(instance.terminalError.sourceNodeId)} · ${escapeHtml(instance.terminalError.sourceScopeId)}</p></div>`;
+      host.querySelector('[data-summary]').append(detail);
+    }
     host.querySelector('[data-cancel]')?.addEventListener('click', async () => {
       const approved = await customElements.get('tf-window').confirm({ title: text('cancel_instance'), message: text('cancel_hint'), danger: true, confirmLabel: text('cancel_instance') });
       if (approved && win.isConnected) await applyMutation('processInstanceCancelRequest', { instanceId, expectedRevision: instance.revision }, cancelCommand);
@@ -501,6 +538,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.innerHTML = `<div><strong>${escapeHtml(scope.subprocessNodeName || text('root_scope'))}</strong>
         <p>${escapeHtml(processStatusLabel(scope.status))} · ${escapeHtml(text('scope_depth', { depth: scope.depth }))}</p>
         <p>${escapeHtml(text('scope_id'))}: ${escapeHtml(scope.scopeId)}</p>
+        ${scope.terminalError ? `<p>${escapeHtml(text('terminal_business_error'))}: ${escapeHtml(scope.terminalError.errorCode)}</p>` : ''}
         ${scope.parentScopeId ? `<p>${escapeHtml(text('parent_scope_id'))}: ${escapeHtml(scope.parentScopeId)}</p>` : ''}</div>
         <tf-button variant="secondary" data-scope-inspect>${escapeHtml(text('scope_inspect'))}</tf-button>`;
       row.querySelector('[data-scope-inspect]').addEventListener('click', async () => {
@@ -519,6 +557,29 @@ export async function openProcessInstance(instanceId, initial = null) {
       scopeRows.append(row);
     }
     renderPageControls(host.querySelector('[data-scopes]'), 'scopes');
+    const callRows = host.querySelector('[data-call-rows]');
+    callRows.replaceChildren();
+    for (const call of instance.calls) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      if (call.Outgoing) {
+        const { callNodeId, callNodeName, status, child } = call.Outgoing;
+        row.innerHTML = `<div><strong>${escapeHtml(callNodeName)}</strong>
+          <p>${escapeHtml(text('call_element_id'))}: ${escapeHtml(callNodeId)}</p>
+          <p>${escapeHtml(text(`call_status_${status.toLowerCase()}`))}</p>
+          ${child ? `<p>${escapeHtml(child.definitionName)} · ${escapeHtml(processStatusLabel(child.status))}</p>` : `<p>${escapeHtml(text('call_related_unavailable'))}</p>`}</div>
+          ${child?.canOpen ? `<tf-button variant="secondary" data-open-related>${escapeHtml(text('call_open_child'))}</tf-button>` : ''}`;
+        row.querySelector('[data-open-related]')?.addEventListener('click', () => openProcessInstance(child.instanceId));
+      } else {
+        const { parent } = call.Incoming;
+        row.innerHTML = `<div><strong>${escapeHtml(text('call_incoming'))}</strong>
+          ${parent ? `<p>${escapeHtml(parent.definitionName)} · ${escapeHtml(processStatusLabel(parent.status))}</p>` : `<p>${escapeHtml(text('call_related_unavailable'))}</p>`}</div>
+          ${parent?.canOpen ? `<tf-button variant="secondary" data-open-related>${escapeHtml(text('call_open_parent'))}</tf-button>` : ''}`;
+        row.querySelector('[data-open-related]')?.addEventListener('click', () => openProcessInstance(parent.instanceId));
+      }
+      callRows.append(row);
+    }
+    renderPageControls(host.querySelector('[data-calls]'), 'calls');
   }
 
   async function refresh() {

@@ -26027,4 +26027,46 @@ mod process_wire_tests {
             tentaflow_protocol::processes::ProcessPayload::DefinitionPublishRequest { repin_calendar: Some(true), .. }
         )));
     }
+
+    #[test]
+    fn process_request_encoder_preserves_exact_call_binding_error_end_and_calls_page() {
+        use tentaflow_protocol::processes::{ProcessCallableReference, ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Caller","description":"",
+            "model":{"schema_version":1,"process_id":"Caller_1",
+                "nodes":[
+                    {"id":"Call_1","name":"Review","kind":{"CallActivity":{
+                        "called_definition_id":"definition-1","called_version":7,
+                        "called_element":{"namespace_uri":"urn:example:approval","process_id":"Approval_1"},
+                        "input_mapping":{"customer_ID":"vars.customer_ID"},
+                        "output_mapping":{"approved_value":"outputs.business_key"}}}},
+                    {"id":"ErrorEnd_1","name":"Rejected","kind":{"ErrorEnd":{"error_ref":"Error_1"}}}
+                ],"sequence_flows":[],"variables":{"customer_ID":{"inner_value":7}},
+                "diagram":{"shapes":[],"edges":[]},
+                "errors":[{"error_id":"Error_1","name":"Rejected","error_code":"BUSINESS.REJECTED"}]}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.variables["customer_ID"]["inner_value"], 7);
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::CallActivity {
+            called_definition_id: "definition-1".into(), called_version: 7,
+            called_element: ProcessCallableReference {
+                namespace_uri: "urn:example:approval".into(), process_id: "Approval_1".into(),
+            },
+            input_mapping: std::collections::BTreeMap::from([("customer_ID".into(), "vars.customer_ID".into())]),
+            output_mapping: std::collections::BTreeMap::from([("approved_value".into(), "outputs.business_key".into())]),
+        });
+        assert_eq!(model.nodes[1].kind, ProcessNodeKind::ErrorEnd { error_ref: "Error_1".into() });
+        let bytes = encode_process_request("InstanceGetRequest".into(), serde_json::json!({
+            "instance_id":"instance-1", "pages":{"calls":{"offset":20,"limit":20}}
+        }).to_string()).unwrap();
+        assert!(matches!(tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).unwrap(),
+            MessageBody::ProcessBody(ProcessPayload::InstanceGetRequest { pages: Some(pages), .. })
+                if pages.calls.as_ref().is_some_and(|page| page.offset == 20 && page.limit == 20)));
+    }
 }

@@ -132,15 +132,75 @@ test('message model and send wire keep typed structure and opaque business keys'
   /unsupported message start field/);
 });
 
+test('call activity wire preserves exact QName binding, direct pins and terminal error', { skip }, () => {
+  const model = { schemaVersion: 1, processId: 'Caller_1', targetNamespace: 'urn:example:caller',
+    errors: [{ errorId: 'Error_1', name: 'Rejected', errorCode: 'BUSINESS.REJECTED' }],
+    nodes: [
+      { id: 'Start_1', name: 'Start', kind: 'Start' },
+      { id: 'Call_1', name: 'Approval', kind: { CallActivity: {
+        calledDefinitionId: 'definition-1', calledVersion: 7,
+        calledElement: { namespaceUri: 'urn:example:approval', processId: 'Approval_1' },
+        inputMapping: { customer_ID: 'vars.customer_ID' },
+        outputMapping: { returned_value: 'outputs.business_key' },
+      } } },
+      { id: 'ErrorEnd_1', name: 'Rejected', kind: { ErrorEnd: { errorRef: 'Error_1' } } },
+    ], sequenceFlows: [], variables: { customer_ID: { inner_value: 7 } },
+    diagram: { shapes: [], edges: [] } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Caller', description: '', model });
+  const call = saved.model.nodes[1].kind.CallActivity;
+  assert.equal(call.calledVersion, 7);
+  assert.equal(call.calledElement.namespaceUri, 'urn:example:approval');
+  assert.equal(call.calledElement.processId, 'Approval_1');
+  assert.deepEqual(call.inputMapping, { customer_ID: 'vars.customer_ID' });
+  assert.deepEqual(call.outputMapping, { returned_value: 'outputs.business_key' });
+  assert.equal(saved.model.nodes[2].kind.ErrorEnd.errorRef, 'Error_1');
+  assert.deepEqual(saved.model.variables, model.variables);
+  for (const invalid of [
+    { ...call, calledVersion: '7' },
+    { ...call, calledElement: { namespaceUri: 'urn:example:approval', processId: 'Approval_1', extra: true } },
+  ]) {
+    const wrong = structuredClone(model);
+    wrong.nodes[1].kind.CallActivity = invalid;
+    assert.throws(() => codec.encode.processDefinitionSaveRequest(17, { commandId: 'cmd', definitionId: null,
+      expectedRevision: 0, name: 'Caller', description: '', model: wrong }), TypeError);
+  }
+  const pinnedModel = { schema_version: 1, process_id: 'Caller_1', nodes: [], sequence_flows: [],
+    variables: {}, diagram: { shapes: [], edges: [] } };
+  const version = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    VersionGetResponse: { version: { definition_id: 'definition-1', version: 1, model: pinnedModel,
+      published_at_ms: 1, published_by: 'owner', model_sha256: 'sha', service_flows: [],
+      call_activities: [{ node_id: 'Call_1', called_definition_id: 'definition-2', called_version: 7,
+        called_element: { namespace_uri: 'urn:example:approval', process_id: 'Approval_1' },
+        model_sha256: 'target-sha' }] } },
+  } })));
+  assert.equal(version.version.callActivities[0].calledElement.namespaceUri, 'urn:example:approval');
+  assert.equal(version.version.callActivities[0].calledVersion, 7);
+  const terminal = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance: { instance_id: 'child-1', definition_id: 'definition-2',
+      definition_name: 'Child', initiator_user_id: 'owner', version: 7, revision: 2,
+      status: 'Error', variables: {}, active_node_ids: [], user_tasks: [], incidents: [],
+      created_at_ms: 1, updated_at_ms: 2, can_cancel: false, can_retry: false,
+      calls: [{ Incoming: { parent: null } }],
+      terminal_error: { error_ref: 'Error_1', error_code: 'BUSINESS.REJECTED',
+        source_event_id: 'event-1', source_node_id: 'ErrorEnd_1', source_scope_id: 'child-1' } } },
+  } })));
+  assert.equal(terminal.instance.status, 'Error');
+  assert.deepEqual(terminal.instance.calls, [{ Incoming: { parent: null } }]);
+  assert.equal(terminal.instance.terminalError.errorCode, 'BUSINESS.REJECTED');
+  assert.equal(Object.hasOwn(terminal.instance.calls[0].Incoming, 'callNodeId'), false);
+});
+
 test('instance pages encode exact selectors and message detail preserves null availability', { skip }, () => {
   const body = request('processInstanceGetRequest', { instanceId: 'instance', pages: {
     userTasks: { offset: 20, limit: 20 }, subscriptions: { offset: 0, limit: 2 },
-    scopes: { offset: 0, limit: 20 },
+    scopes: { offset: 0, limit: 20 }, calls: { offset: 20, limit: 20 },
     selectedUserTaskId: 'task-1', selectedIncidentId: 'incident-1',
   } });
   assert.equal(body.pages.userTasks.offset, 20);
   assert.equal(body.pages.subscriptions.limit, 2);
   assert.equal(body.pages.scopes.limit, 20);
+  assert.equal(body.pages.calls.offset, 20);
   assert.equal(body.pages.selectedUserTaskId, 'task-1');
   assert.equal(body.pages.selectedIncidentId, 'incident-1');
   const scope = request('processScopeGetRequest', { instanceId: 'instance', scopeId: 'child-scope' });
@@ -174,7 +234,7 @@ test('instance response decodes required empty and populated message collections
     initiator_user_id: 'u1', version: 1, revision: 1, status: 'Running',
     variables: { business_key: 'kept' }, active_node_ids: [], user_tasks: [], incidents: [],
     created_at_ms: 1, updated_at_ms: 1, can_cancel: true, can_retry: false,
-    can_send_message: true,
+    can_send_message: true, calls: [],
   };
   const decode = (instance) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance },
@@ -195,6 +255,9 @@ test('instance response decodes required empty and populated message collections
       source_node_id: 'Throw_1', last_reason: null, payload_sha256: 'sha', payload_bytes: 4,
       payload_available: false, can_resolve: false, can_cancel: false }],
     message_names: ['order.received'],
+    calls: [{ Outgoing: { call_node_id: 'Call_1', call_node_name: 'Approval', status: 'Waiting',
+      child: { instance_id: 'child-1', definition_name: 'Child', version: 7,
+        status: 'Waiting', can_open: true } } }],
     scopes: [{ scope_id: 'child-scope', parent_scope_id: 'i1', subprocess_node_id: 'Sub_1',
       subprocess_node_name: 'Review', parent_token_id: 'wait-1', revision: 1, status: 'Running',
       depth: 1, created_at_ms: 1, updated_at_ms: 1 }],
@@ -204,9 +267,11 @@ test('instance response decodes required empty and populated message collections
   assert.equal(populated.instance.outgoingMessages[0].messageId, 'm1');
   assert.deepEqual(populated.instance.messageNames, ['order.received']);
   assert.equal(populated.instance.scopes[0].subprocessNodeName, 'Review');
+  assert.equal(populated.instance.calls[0].Outgoing.child.instanceId, 'child-1');
+  assert.equal(populated.instance.calls[0].Outgoing.child.canOpen, true);
   assert.deepEqual(populated.instance.variables, { business_key: 'kept' });
   const empty = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [], message_names: [], scopes: [] });
-  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames', 'scopes']) {
+  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames', 'scopes', 'calls']) {
     assert.deepEqual(empty.instance[field], [], `${field} remains an array on an empty page`);
   }
   assert.equal(empty.instance.canSendMessage, true);
@@ -336,6 +401,7 @@ test('boundary timer and full task scope identity decode with nullable timer fie
       variables: { attached_to_id: 'business' }, active_node_ids: ['Review_1'],
       user_tasks: [], incidents: [], created_at_ms: 1, updated_at_ms: 1,
       can_cancel: true, can_retry: false, timers: [timerFields],
+      calls: [],
     } },
   } })));
   assert.equal(timer.instance.timers[0].attachedToId, 'Review_1');

@@ -181,6 +181,13 @@ pub struct ProcessSubProcess {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProcessCallableReference {
+    pub namespace_uri: String,
+    pub process_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProcessNodeKind {
     Start,
     End,
@@ -245,6 +252,16 @@ pub enum ProcessNodeKind {
         body: ProcessSubProcess,
         input_mapping: BTreeMap<String, String>,
         output_mapping: BTreeMap<String, String>,
+    },
+    CallActivity {
+        called_definition_id: String,
+        called_version: u32,
+        called_element: ProcessCallableReference,
+        input_mapping: BTreeMap<String, String>,
+        output_mapping: BTreeMap<String, String>,
+    },
+    ErrorEnd {
+        error_ref: String,
     },
 }
 
@@ -411,6 +428,16 @@ pub struct PinnedFlowInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCallPinInfo {
+    pub node_id: String,
+    pub called_definition_id: String,
+    pub called_version: u32,
+    pub called_element: ProcessCallableReference,
+    pub model_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessVersion {
     pub definition_id: String,
     pub version: u32,
@@ -419,6 +446,7 @@ pub struct ProcessVersion {
     pub published_by: String,
     pub model_sha256: String,
     pub service_flows: Vec<PinnedFlowInfo>,
+    pub call_activities: Vec<ProcessCallPinInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -449,6 +477,50 @@ pub enum ProcessInstanceStatus {
     Completed,
     Incident,
     Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTerminalError {
+    pub error_ref: String,
+    pub error_code: String,
+    pub source_event_id: String,
+    pub source_node_id: String,
+    pub source_scope_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessCallStatus {
+    Waiting,
+    Returned,
+    Error,
+    Cancelled,
+    ReturnIncident,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRelatedInstance {
+    pub instance_id: String,
+    pub definition_name: String,
+    pub version: u32,
+    pub status: ProcessInstanceStatus,
+    pub can_open: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessCallSummary {
+    Outgoing {
+        call_node_id: String,
+        call_node_name: String,
+        status: ProcessCallStatus,
+        child: Option<ProcessRelatedInstance>,
+    },
+    Incoming {
+        parent: Option<ProcessRelatedInstance>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -656,6 +728,8 @@ pub struct ProcessInstancePageRequest {
     pub selected_incident_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<ProcessPageSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -668,6 +742,7 @@ pub struct ProcessInstancePageInfo {
     pub event_races: ProcessPageInfo,
     pub outgoing_messages: ProcessPageInfo,
     pub scopes: ProcessPageInfo,
+    pub calls: ProcessPageInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -683,6 +758,8 @@ pub struct ProcessScopeSummary {
     pub depth: u32,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<ProcessTerminalError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -772,6 +849,9 @@ pub struct ProcessInstance {
     pub selected_incident: Option<ProcessIncidentSelection>,
     #[serde(default)]
     pub scopes: Vec<ProcessScopeSummary>,
+    pub calls: Vec<ProcessCallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<ProcessTerminalError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1151,7 +1231,7 @@ mod tests {
             "status": "Running", "variables": {}, "active_node_ids": [],
             "user_tasks": [], "incidents": [], "created_at_ms": 1,
             "updated_at_ms": 1, "can_cancel": true, "can_retry": false,
-            "can_send_message": true
+            "can_send_message": true, "calls": []
         })).unwrap();
         let body = crate::message_body::MessageBody::ProcessBody(
             ProcessPayload::InstanceGetResponse { instance },
@@ -1160,7 +1240,7 @@ mod tests {
             crate::cbor::decode(&crate::cbor::encode(&body).unwrap()).unwrap();
         let json = serde_json::to_value(decoded).unwrap();
         let instance = &json["ProcessBody"]["InstanceGetResponse"]["instance"];
-        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names", "scopes"] {
+        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names", "scopes", "calls"] {
             assert_eq!(instance[field], serde_json::json!([]), "{field} must be an array");
         }
         assert_eq!(instance["can_send_message"], true);
@@ -1394,11 +1474,93 @@ mod tests {
         let scope = ProcessScopeSummary { scope_id: "child-1".into(), parent_scope_id: Some("instance-1".into()),
             subprocess_node_id: Some("Child_1".into()), subprocess_node_name: Some("Review".into()),
             parent_token_id: Some("wait-1".into()), revision: 2, status: ProcessInstanceStatus::Running,
-            depth: 1, created_at_ms: 100, updated_at_ms: 200 };
+            depth: 1, created_at_ms: 100, updated_at_ms: 200, terminal_error: None };
         let payload = ProcessPayload::ScopeGetResponse { scope: scope.clone(),
             variables: serde_json::json!({"customer_ID":{"original_key":7}}),
             active_node_ids: vec!["Child_Start".into()] };
         assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&payload).unwrap()).unwrap(), payload);
         assert_eq!(serde_json::to_value(scope).unwrap()["scope_id"], "child-1");
+    }
+
+    #[test]
+    fn call_activity_and_error_end_keep_opaque_mappings_and_exact_target_identity() {
+        let reference = ProcessCallableReference {
+            namespace_uri: "urn:example:approval:v1".into(),
+            process_id: "Approval_1".into(),
+        };
+        let call = ProcessNodeKind::CallActivity {
+            called_definition_id: "da53c1fd-c235-40ec-bde1-44cf57bb620d".into(),
+            called_version: 7,
+            called_element: reference.clone(),
+            input_mapping: BTreeMap::from([("customer_ID".into(), "vars.customer_ID".into())]),
+            output_mapping: BTreeMap::from([("approved_value".into(), "outputs.business_key".into())]),
+        };
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&call).unwrap()).unwrap(), call);
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["CallActivity"]["called_element"]["namespace_uri"], "urn:example:approval:v1");
+        assert_eq!(json["CallActivity"]["input_mapping"]["customer_ID"], "vars.customer_ID");
+        assert_eq!(json["CallActivity"]["output_mapping"]["approved_value"], "outputs.business_key");
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "CallActivity": {"called_definition_id": "d", "called_version": 1,
+                "called_element": {"namespace_uri": "urn:test", "process_id": "P", "unknown": true},
+                "input_mapping": {}, "output_mapping": {}}
+        })).is_err());
+        let error_end = ProcessNodeKind::ErrorEnd { error_ref: "Error_1".into() };
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&error_end).unwrap()).unwrap(), error_end);
+        assert_eq!(reference.process_id, "Approval_1");
+    }
+
+    #[test]
+    fn call_response_arrays_and_terminal_error_are_typed_without_link_disclosure() {
+        let model = ProcessModel {
+            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
+            sequence_flows: Vec::new(), variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+            timer_timezone: None, work_calendar: None, calendar_pin: None,
+            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
+        };
+        let version = ProcessVersion {
+            definition_id: "definition".into(), version: 1, model,
+            published_at_ms: 1, published_by: "owner".into(), model_sha256: "sha".into(),
+            service_flows: Vec::new(), call_activities: Vec::new(),
+        };
+        let json = serde_json::to_value(&version).unwrap();
+        assert_eq!(json["call_activities"], serde_json::json!([]));
+        assert_eq!(crate::cbor::decode::<ProcessVersion>(&crate::cbor::encode(&version).unwrap()).unwrap(), version);
+
+        let page = ProcessPageInfo { offset: 0, total: 0, next_offset: None, has_more: false };
+        let pages = ProcessInstancePageInfo {
+            user_tasks: page.clone(), incidents: page.clone(), timers: page.clone(),
+            subscriptions: page.clone(), event_races: page.clone(), outgoing_messages: page.clone(),
+            scopes: page.clone(), calls: page,
+        };
+        let terminal_error = ProcessTerminalError {
+            error_ref: "Error_1".into(), error_code: "BUSINESS.INVALID".into(),
+            source_event_id: "event-1".into(), source_node_id: "ErrorEnd_1".into(),
+            source_scope_id: "instance".into(),
+        };
+        let instance = ProcessInstance {
+            instance_id: "instance".into(), definition_id: "definition".into(),
+            definition_name: "Approval".into(), initiator_user_id: "owner".into(),
+            version: 1, revision: 2, status: ProcessInstanceStatus::Error,
+            variables: serde_json::json!({"business_key": {"inner_value": 7}}),
+            active_node_ids: Vec::new(), user_tasks: Vec::new(), incidents: Vec::new(),
+            created_at_ms: 1, updated_at_ms: 2, can_cancel: false, can_retry: false,
+            timers: Vec::new(), subscriptions: Vec::new(), event_races: Vec::new(),
+            outgoing_messages: Vec::new(), message_names: Vec::new(), can_send_message: None,
+            pages: Some(pages), selected_user_task: None, selected_incident: None,
+            scopes: Vec::new(), calls: vec![ProcessCallSummary::Incoming { parent: None }],
+            terminal_error: Some(terminal_error),
+        };
+        let encoded = crate::cbor::encode(&instance).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessInstance>(&encoded).unwrap(), instance);
+        let json = serde_json::to_value(&instance).unwrap();
+        assert_eq!(json["pages"]["calls"]["total"], 0);
+        assert_eq!(json["calls"][0], serde_json::json!({"Incoming":{"parent":null}}));
+        assert!(json["calls"][0].get("call_node_id").is_none());
+        assert_eq!(json["terminal_error"]["source_event_id"], "event-1");
+        let empty = ProcessInstance { calls: Vec::new(), terminal_error: None, ..instance };
+        let json = serde_json::to_value(empty).unwrap();
+        assert_eq!(json["calls"], serde_json::json!([]));
+        assert!(json.get("terminal_error").is_none());
     }
 }

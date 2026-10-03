@@ -421,9 +421,9 @@ function processMessageTarget(target, expressionTarget = false) {
 function processInstancePages(pages) {
   if (pages == null) return null;
   processKnownFields(pages, ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces',
-    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId', 'scopes'], 'process detail pages');
+    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId', 'scopes', 'calls'], 'process detail pages');
   const mapped = {};
-  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes']) {
+  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls']) {
     if (pages[name] == null) continue;
     processKnownFields(pages[name], ['offset', 'limit'], 'process page');
     mapped[name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)] = {
@@ -500,6 +500,21 @@ function processModel(model, nested = false) {
       processKnownFields(body, ['body', 'inputMapping', 'outputMapping'], 'subprocess');
       fields = { body: processModel(body.body, true), input_mapping: body.inputMapping ?? {},
         output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'CallActivity') {
+      processKnownFields(body, ['calledDefinitionId', 'calledVersion', 'calledElement', 'inputMapping', 'outputMapping'], 'call activity');
+      processKnownFields(body.calledElement, ['namespaceUri', 'processId'], 'called element');
+      if (typeof body.calledDefinitionId !== 'string' || !Number.isInteger(body.calledVersion) ||
+          body.calledVersion < 1 || body.calledVersion > 4294967295 ||
+          typeof body.calledElement.namespaceUri !== 'string' || typeof body.calledElement.processId !== 'string') {
+        throw new TypeError('call activity requires an exact target definition, version and callable reference');
+      }
+      fields = { called_definition_id: body.calledDefinitionId, called_version: body.calledVersion,
+        called_element: { namespace_uri: body.calledElement.namespaceUri, process_id: body.calledElement.processId },
+        input_mapping: body.inputMapping ?? {}, output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'ErrorEnd') {
+      processKnownFields(body, ['errorRef'], 'error end');
+      if (typeof body.errorRef !== 'string') throw new TypeError('error end requires a declaration');
+      fields = { error_ref: body.errorRef };
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }

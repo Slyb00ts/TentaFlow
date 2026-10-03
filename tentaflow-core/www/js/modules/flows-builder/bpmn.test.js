@@ -23,7 +23,7 @@ const { codecReady, encode } = await import('../../protocol/codec.js');
 const wasm = await codecReady;
 const { Router } = await import('../../router.js');
 const { TfWindow } = await import('../../components/tf-window.js');
-const { emptyProcessModel, processToCanvas, canvasToProcess, processBoundaryKind, processCommand, processJson, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
+const { emptyProcessModel, processToCanvas, canvasToProcess, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
@@ -69,9 +69,9 @@ function definition(id = 'definition-one', overrides = {}) {
 function instance(id = 'instance-one', overrides = {}) {
   const value = { instanceId: id, definitionId: 'definition-one', definitionName: 'Document approval', initiatorUserId: 'owner', version: 2, revision: 11,
     status: 'Waiting', variables: { Purchase_ID: 'PO-7' }, activeNodeIds: ['Review'], userTasks: [], incidents: [], timers: [],
-    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], scopes: [], canSendMessage: false,
+    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], scopes: [], calls: [], canSendMessage: false,
     createdAtMs: 1000, updatedAtMs: 2000, canCancel: false, canRetry: false, ...overrides };
-  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes'].map((name) =>
+  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls'].map((name) =>
     [name, { offset: 0, total: value[name].length, nextOffset: null, hasMore: false }]));
   return value;
 }
@@ -468,6 +468,141 @@ test('message and error elements retain declarations, target expressions, attach
   graph.destroy();
 });
 
+test('call picker binds an exact published version and previews it without replacing the unsaved caller', async () => {
+  const model = emptyProcessModel();
+  const called = emptyProcessModel();
+  called.processId = 'Called_Process';
+  called.targetNamespace = 'urn:example:called';
+  const second = emptyProcessModel();
+  second.processId = 'Second_Process';
+  second.targetNamespace = 'urn:example:second';
+  model.nodes.splice(1, 0, { id: 'Call_1', name: 'Request review', kind: { CallActivity: {
+    calledDefinitionId: '', calledVersion: 0, calledElement: { namespaceUri: '', processId: '' },
+    inputMapping: { customer_ID: 'vars.customer_ID' }, outputMapping: { return_value: 'outputs.return_value' },
+  } } });
+  model.sequenceFlows = [
+    { id: 'Flow_1', sourceId: 'Start', targetId: 'Call_1', condition: null },
+    { id: 'Flow_2', sourceId: 'Call_1', targetId: 'End', condition: null },
+  ];
+  const graph = canvas(model);
+  const config = inspector(graph);
+  const call = graph.nodes.find((node) => node.id === 'Call_1');
+  config.show(call, graph.templates.get(call.type));
+  const before = structuredClone(graph.getData());
+  const definitionId = '91764f75-dadb-41aa-a252-a8a911fe7a94';
+  const secondDefinitionId = 'f020336c-5ae2-4b7d-b7ef-c71497b192db';
+  fixtures({
+    processDefinitionListRequest: { definitions: [{ definitionId, name: 'Published review' },
+      { definitionId: secondDefinitionId, name: 'Second published process' }], hasMore: false },
+    processVersionListRequest: ({ definitionId: selected }) => ({ versions: [{ definitionId: selected,
+      version: selected === definitionId ? 7 : 3 }], hasMore: false }),
+    processVersionGetRequest: ({ definitionId: selected, version }) => ({ version: { definitionId: selected,
+      version, model: selected === definitionId ? called : second } }),
+  });
+  click(config.root.querySelector('[data-load-calls]'));
+  await flush(2);
+  change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), definitionId);
+  assert.match(config.root.querySelector('[data-process="calledDefinitionChoice"] .tf-select-selected').textContent,
+    /Published review/, 'the selected call uses the published name rather than only its UUID');
+  click(config.root.querySelector('[data-load-call-versions]'));
+  await flush(2);
+  change(config.root.querySelector('[data-process="calledVersionChoice"]'), '7');
+  await flush(2);
+  assert.deepEqual(call.config.calledElement, { namespaceUri: 'urn:example:called', processId: 'Called_Process' });
+  assert.equal(call.config.calledVersion, 7);
+  assert.equal(call.config.calledDefinitionId, definitionId);
+  assert.deepEqual(call.config.inputMapping, before.nodes[1].kind.CallActivity.inputMapping);
+  assert.ok(config.root.querySelector('[data-process="calledDefinitionChoice"]').hasAttribute('wrap-selected'));
+  click(config.root.querySelector('[data-preview-called]'));
+  await flush(2);
+  const preview = [...document.querySelectorAll('tf-window')].at(-1);
+  assert.equal(preview.querySelector('tf-code-editor').hasAttribute('readonly'), true);
+  assert.deepEqual(JSON.parse(preview.querySelector('tf-code-editor').value), called);
+  assert.deepEqual(graph.getData().nodes[0], before.nodes[0]);
+  assert.equal(graph.getData().nodes.find((node) => node.id === 'Call_1').kind.CallActivity.calledVersion, 7);
+  change(config.root.querySelector('[data-process="calledVersionChoice"]'), '');
+  assert.equal(call.config.calledVersion, 0, 'clearing the selected version clears the actual draft binding');
+  assert.deepEqual(call.config.calledElement, { namespaceUri: '', processId: '' });
+  assert.equal(config.root.querySelector('[data-preview-called]').hasAttribute('disabled'), true);
+  const loader = config.root.querySelector('[data-load-call-versions]');
+  assert.equal(loader.hidden, true, 'one exhausted page hides the first target loader');
+  change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), secondDefinitionId);
+  assert.equal(loader.hidden, false, 'switching targets permits an exact version load in the same inspector');
+  click(loader);
+  await flush(2);
+  change(config.root.querySelector('[data-process="calledVersionChoice"]'), '3');
+  await flush(2);
+  assert.equal(call.config.calledDefinitionId, secondDefinitionId);
+  assert.equal(call.config.calledVersion, 3);
+  assert.deepEqual(call.config.calledElement, { namespaceUri: 'urn:example:second', processId: 'Second_Process' });
+  assert.deepEqual(graph.getData().nodes[0], before.nodes[0], 'switching exact targets retains the unsaved caller');
+  config.destroy(); graph.destroy();
+});
+
+test('error end remains terminal and called process links disclose only authorized related instances', async () => {
+  const model = emptyProcessModel();
+  model.errors = [{ errorId: 'Error_Business', name: 'Business rejection', errorCode: 'BUSINESS.REJECTED' }];
+  model.nodes[1].kind = { ErrorEnd: { errorRef: 'Error_Business' } };
+  const graph = canvas(model);
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="End"] .fb-port-out'), null);
+  assert.equal(graph.connectNodes('End', 'Start'), false);
+  graph.destroy();
+  const current = instance('caller', { status: 'Error', terminalError: { errorRef: 'Error_Business', errorCode: 'BUSINESS.REJECTED',
+    sourceEventId: 'source-event', sourceNodeId: 'End', sourceScopeId: 'caller' },
+  calls: [
+    { Outgoing: { callNodeId: 'Call_1', callNodeName: 'Review order', status: 'Returned', child: {
+      instanceId: 'child', definitionName: 'Published review', version: 7, status: 'Completed', canOpen: true,
+    } } },
+    { Incoming: { parent: null } },
+  ] });
+  const win = await monitor(current);
+  assert.equal(win.querySelectorAll('[data-call-rows] .fb-process-work').length, 2);
+  assert.match(win.querySelector('[data-terminal-error]').textContent, /BUSINESS\.REJECTED/);
+  assert.equal(win.querySelectorAll('[data-open-related]').length, 1);
+  assert.doesNotMatch(win.querySelector('[data-call-rows] .fb-process-work:last-child').textContent, /Call_1|caller/);
+  click(win.querySelector('[data-open-related]'));
+  await flush(2);
+  assert.ok(calls.some((entry) => entry.kind === 'processInstanceGetRequest' && entry.payload.instanceId === 'child'));
+});
+
+test('all five locales render factual call and error history without exposing translation keys', async () => {
+  const events = [
+    { kind: 'call_requested', nodeName: 'Review', data: { call_id: 'call-1', parent_token_id: 'wait-1' } },
+    { kind: 'call_entered', nodeName: 'Review', data: { call_id: 'call-1', child_instance_id: 'child-1', called_version: 7 } },
+    { kind: 'call_returned', nodeName: 'Review', data: { call_id: 'call-1', child_instance_id: 'child-1' } },
+    { kind: 'call_cancelled', nodeName: 'Review', data: { call_id: 'call-1', reason: 'call_interrupted' } },
+    { kind: 'call_error_propagated', nodeName: 'Review', data: { error_code: 'ORDER.REJECTED', source_kind: 'error_end' } },
+    { kind: 'call_error_propagated', nodeName: 'Review', data: { error_code: 'ORDER.REJECTED', source_kind: 'contract' } },
+    { kind: 'error_end_reached', nodeName: 'Rejected', data: { error_code: 'ORDER.REJECTED', source_node_id: 'ErrorEnd_1' } },
+    { kind: 'instance_error', nodeName: 'Rejected', data: { error_code: 'ORDER.REJECTED' } },
+  ];
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    assert.doesNotMatch(processStatusLabel('Error'), /bpmn\.status_error/);
+    assert.notEqual(processStatusLabel('Error'), processStatusLabel('Completed'));
+    for (const event of events) {
+      const rendered = processEventText(event);
+      assert.doesNotMatch(rendered, /bpmn\.event_|\{(?:node|reason|version|child|code|source)\}/);
+      assert.match(rendered, /Review|Rejected/);
+    }
+    const history = events.map((event, index) => ({ ...event, seq: index + 1, atMs: 1000 + index }));
+    const win = await monitor(instance(`call-history-${language}`), {
+      processHistoryRequest: { events: history, nextSeq: history.length, hasMore: false },
+    });
+    const descriptions = [...win.querySelectorAll('[data-process-seq] > div')].map((element) => element.textContent);
+    assert.match(descriptions[4], new RegExp(I18n.t('bpmn.node_error_end')));
+    assert.match(descriptions[5], new RegExp(I18n.t('bpmn.node_service_task')));
+    for (const description of descriptions.slice(4, 6)) {
+      assert.match(description, /ORDER\.REJECTED/);
+      assert.doesNotMatch(description, /error_end|\bcontract\b/);
+    }
+    win.remove();
+    assert.notEqual(processLifecycleReasonText('child_cancelled'), 'child_cancelled');
+    assert.equal(processLifecycleReasonText('CUSTOM_ERROR_<raw>'), 'CUSTOM_ERROR_<raw>');
+  }
+  await I18n.setLanguage('en');
+});
+
 test('sequential message target and TTL edits survive Save and the official process encoder', async () => {
   const model = emptyProcessModel();
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
@@ -614,7 +749,7 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 16);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 18);
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1179,7 +1314,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 16);
+    assert.equal(processTemplates().length, 18);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid' } });
