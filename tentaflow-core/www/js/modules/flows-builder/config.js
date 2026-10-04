@@ -17,7 +17,7 @@ import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
-import { processNodeKind, processBoundaryKind } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBody } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -419,6 +419,39 @@ export class FlowConfig {
     } else {
       fields += `<p class="fb-field-hint">${escapeHtml(getNodeName(node.type))}: ${escapeHtml(I18n.t(`bpmn.node_${node.type.slice(5)}_hint`))}</p>`;
     }
+    if (kind === 'UserTask' || kind === 'ServiceTask') {
+      const repeat = node.repeat;
+      const mode = repeat?.MultiInstance
+        ? `mi_${repeat.MultiInstance.mode.toLowerCase()}` : repeat?.StructuredLoop ? 'loop' : 'off';
+      const output = repeat?.MultiInstance?.outputCollectionVariable
+        ?? repeat?.StructuredLoop?.outputCollectionVariable ?? '';
+      const variables = Object.keys(processBody(model, this.opts.getCanvas().processPath).variables);
+      fields += `<section class="fb-repeat-fields" data-repeat-fields>
+        <tf-select data-process="repeatMode" label="${escapeAttr(I18n.t('bpmn.repeat_mode'))}" value="${mode}" ${disabled}>
+          ${['off', 'mi_sequential', 'mi_parallel', 'loop'].map((value) => `<option value="${value}">${escapeHtml(I18n.t(`bpmn.repeat_${value}`))}</option>`).join('')}
+        </tf-select>`;
+      if (repeat) {
+        fields += `<tf-select data-process="repeatOutput" wrap-selected label="${escapeAttr(I18n.t('bpmn.repeat_output'))}" value="${escapeAttr(output)}" ${disabled}>
+          <option value="">${escapeHtml(I18n.t('bpmn.repeat_choose_output'))}</option>
+          ${variables.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join('')}
+        </tf-select>`;
+      }
+      if (repeat?.MultiInstance) {
+        const repeatInput = repeat.MultiInstance.input;
+        const source = repeatInput.Cardinality ? 'cardinality' : 'collection';
+        fields += `<tf-select data-process="repeatInputMode" label="${escapeAttr(I18n.t('bpmn.repeat_input'))}" value="${source}" ${disabled}>
+          <option value="cardinality">${escapeHtml(I18n.t('bpmn.repeat_cardinality'))}</option>
+          <option value="collection">${escapeHtml(I18n.t('bpmn.repeat_collection'))}</option>
+        </tf-select>${source === 'cardinality'
+    ? input('repeatCount', 'repeat_count', repeatInput.Cardinality.count, 'type="number" min="0" max="16" step="1"')
+    : textarea('repeatCollection', 'repeat_collection_expression', repeatInput.CollectionExpression.expression, 4)}`;
+      } else if (repeat?.StructuredLoop) {
+        fields += `${textarea('repeatCondition', 'repeat_condition', repeat.StructuredLoop.condition, 4)}
+          <tf-toggle data-process="repeatTestBefore" label="${escapeAttr(I18n.t('bpmn.repeat_test_before'))}" ${repeat.StructuredLoop.testBefore ? 'checked' : ''} ${disabled}></tf-toggle>
+          ${input('repeatMaximum', 'repeat_maximum', repeat.StructuredLoop.maxIterations, 'type="number" min="1" max="32" step="1"')}`;
+      }
+      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.repeat_hint'))}</p></section>`;
+    }
     const canvas = this.opts.getCanvas();
     const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
     if (outgoing.length) fields += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => {
@@ -603,6 +636,43 @@ export class FlowConfig {
       } else if (key === 'verification') {
         this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
         this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';
+      } else if (key === 'repeatMode' || key === 'repeatInputMode') {
+        const current = node.repeat;
+        const currentMode = current?.MultiInstance
+          ? `mi_${current.MultiInstance.mode.toLowerCase()}` : current?.StructuredLoop ? 'loop' : 'off';
+        if (key === 'repeatMode' && control.value === currentMode) return;
+        if (key === 'repeatInputMode'
+          && control.value === (current?.MultiInstance?.input?.Cardinality ? 'cardinality' : 'collection')) return;
+        const outputCollectionVariable = current?.MultiInstance?.outputCollectionVariable
+          ?? current?.StructuredLoop?.outputCollectionVariable ?? '';
+        let next = null;
+        if (key === 'repeatInputMode') {
+          const prior = current.MultiInstance;
+          next = { MultiInstance: { ...prior, input: control.value === 'cardinality'
+            ? { Cardinality: { count: 1 } } : { CollectionExpression: { expression: '' } } } };
+        } else if (control.value === 'loop') {
+          next = { StructuredLoop: { condition: '', testBefore: false, maxIterations: 1, outputCollectionVariable } };
+        } else if (control.value.startsWith('mi_')) {
+          next = { MultiInstance: { mode: control.value === 'mi_sequential' ? 'Sequential' : 'Parallel',
+            input: current?.MultiInstance?.input ?? { Cardinality: { count: 1 } }, outputCollectionVariable } };
+        }
+        this.opts.onConfigChange(node.id, { repeat: next });
+        this._renderProcess();
+        this.root.querySelector(`[data-process="${key}"]`)?.focus();
+      } else if (key.startsWith('repeat')) {
+        const next = structuredClone(node.repeat);
+        if ((key === 'repeatCount' || key === 'repeatMaximum') && control.value.trim() === '') {
+          control.value = String(key === 'repeatCount'
+            ? next.MultiInstance.input.Cardinality.count : next.StructuredLoop.maxIterations);
+          return;
+        }
+        if (key === 'repeatOutput') (next.MultiInstance ?? next.StructuredLoop).outputCollectionVariable = control.value;
+        else if (key === 'repeatCount') next.MultiInstance.input.Cardinality.count = Number(control.value);
+        else if (key === 'repeatCollection') next.MultiInstance.input.CollectionExpression.expression = control.value;
+        else if (key === 'repeatCondition') next.StructuredLoop.condition = control.value;
+        else if (key === 'repeatMaximum') next.StructuredLoop.maxIterations = Number(control.value);
+        else if (key === 'repeatTestBefore') next.StructuredLoop.testBefore = event.detail?.checked ?? control.checked;
+        this.opts.onConfigChange(node.id, { repeat: next });
       } else if (key === 'timerType') {
         const values = { Date: { at: '' }, Duration: { seconds: 60 }, Cycle: { seconds: 300, totalFirings: null }, Daily: { hour: 9, minute: 0, totalFirings: null }, WorkingDuration: { seconds: 3600 } };
         this.opts.onConfigChange(node.id, { timer: { [control.value]: values[control.value] } });

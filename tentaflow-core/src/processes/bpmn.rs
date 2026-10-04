@@ -9,9 +9,9 @@ use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessCalendarPin, ProcessCallableReference, ProcessDiagnostic,
     ProcessDiagram, ProcessEdgeDiagram, ProcessErrorDeclaration, ProcessEscalationDeclaration,
-    ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessModel, ProcessNode,
-    ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessSubProcess,
-    ProcessTimerSpec, ProcessWorkCalendar,
+    ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessModel, ProcessMultiInstanceInput,
+    ProcessMultiInstanceMode, ProcessNode, ProcessNodeKind, ProcessPoint, ProcessRepeatSpec,
+    ProcessSequenceFlow, ProcessShape, ProcessSubProcess, ProcessTimerSpec, ProcessWorkCalendar,
 };
 
 use super::model::{
@@ -102,7 +102,8 @@ impl Element {
         for (ns, name) in self.attrs.keys() {
             ensure!(
                 (ns.is_empty() && allowed.contains(&name.as_str()))
-                    || (self.is(BPMN, "conditionExpression") && ns == XSI && name == "type"),
+                    || (matches!(self.local.as_str(), "conditionExpression" | "loopCardinality" | "loopCondition" | "from")
+                        && self.ns == BPMN && ns == XSI && name == "type"),
                 "unsupported {} attribute {{{}}}{} at byte {}",
                 self.local,
                 ns,
@@ -257,6 +258,27 @@ fn parse_tree(xml: &str) -> Result<Element> {
                 }
             }
             Event::End(_) => {
+                if stack.last().is_some_and(|element| element.is(BPMN, "loopDataInputRef")) {
+                    let reference = stack.last().expect("open loopDataInputRef");
+                    let value = reference.text.trim();
+                    let reference_offset = reference.offset;
+                    let activity_id = stack.iter().rev().find_map(|element| element.attr("id"))
+                        .map(str::to_string);
+                    let (resolved, local) = reader.resolver().resolve_element(QName(value.as_bytes()));
+                    let uri = ns_text(resolved).map_err(|error| XmlElementError {
+                        message: format!("invalid loop data input QName at byte {reference_offset}: {error}"),
+                        element_id: activity_id.clone(), offset: reference_offset,
+                    })?;
+                    let local = String::from_utf8(local.as_ref().to_vec())?;
+                    if value.is_empty() || !local.bytes().next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                        || !local.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')) {
+                        return Err(XmlElementError {
+                            message: format!("invalid loop data input QName at byte {reference_offset}"),
+                            element_id: activity_id, offset: reference_offset,
+                        }.into());
+                    }
+                    stack.last_mut().expect("open loopDataInputRef").qnames.insert("text".into(), (uri, local));
+                }
                 let element = stack.pop().context("unexpected XML closing tag")?;
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(element);
@@ -381,6 +403,177 @@ fn event_reference(element: &Element, kind: &str, namespace: &str) -> Result<Str
         definition.offset
     );
     definition.reference(attribute, namespace)
+}
+
+fn xml_boolean(value: Option<&str>, default: bool, element: &Element, name: &str) -> Result<bool> {
+    match value {
+        None => Ok(default),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(_) => bail!("invalid {name} at byte {}", element.offset),
+    }
+}
+
+fn repeat_expression(element: &Element) -> Result<String> {
+    element.attrs_only(&["language"])?;
+    ensure!(element.attrs.contains_key(&(XSI.to_string(), "type".to_string()))
+        && element.attr("language") == Some("https://cel.dev/spec")
+        && element.children.is_empty(),
+        "unsupported {} expression at byte {}", element.local, element.offset);
+    Ok(element.text.clone())
+}
+
+fn repeat_from_xml(element: &Element, target_namespace: &str) -> Result<Option<ProcessRepeatSpec>> {
+    let mi = element.child(BPMN, "multiInstanceLoopCharacteristics")?;
+    let standard = element.child(BPMN, "standardLoopCharacteristics")?;
+    if let (Some(mi), Some(standard)) = (mi, standard) {
+        let offending = if mi.offset > standard.offset { mi } else { standard };
+        return Err(XmlElementError { message: format!("mixed repeat characteristics at byte {}", offending.offset),
+            element_id: element.attr("id").map(str::to_string), offset: offending.offset }.into());
+    }
+    let extension = element.child(BPMN, "extensionElements")?;
+    let binding = extension.map(|ext| ext.child(TF, "repeat")).transpose()?.flatten();
+    if mi.is_none() && standard.is_none() {
+        ensure!(binding.is_none(), "repeat extension lacks loop characteristics at byte {}", element.offset);
+        ensure!(element.children.iter().all(|child| child.is(BPMN, "extensionElements")),
+            "activity IO requires loop characteristics at byte {}", element.offset);
+        return Ok(None);
+    }
+    ensure!(element.text.trim().is_empty(), "activity repeat has unsupported text at byte {}", element.offset);
+    let binding = binding.context("loop characteristics require TentaFlow repeat binding")?;
+    binding.attrs_only(&["outputCollectionVariable"])?;
+    ensure!(binding.children.is_empty() && binding.text.trim().is_empty(),
+        "repeat binding must be empty at byte {}", binding.offset);
+    let output_collection_variable = binding.required("outputCollectionVariable")?;
+    let mut previous_rank = 0;
+    for child in &element.children {
+        let rank = match child.local.as_str() {
+            "extensionElements" if child.ns == BPMN => 1,
+            "ioSpecification" if child.ns == BPMN => 2,
+            "dataInputAssociation" if child.ns == BPMN => 3,
+            "multiInstanceLoopCharacteristics" | "standardLoopCharacteristics" if child.ns == BPMN => 4,
+            _ => 5,
+        };
+        ensure!(rank > previous_rank && rank < 5,
+            "unsupported activity repeat child order at byte {}", child.offset);
+        previous_rank = rank;
+    }
+    if let Some(mi) = mi {
+        mi.attrs_only(&["isSequential", "behavior"])?;
+        ensure!(mi.text.trim().is_empty(), "multi-instance characteristic has unsupported text at byte {}", mi.offset);
+        ensure!(mi.attr("behavior").is_none_or(|value| value == "All"),
+            "unsupported multi-instance behavior at byte {}", mi.offset);
+        mi.children_only(&[(BPMN, "loopCardinality"), (BPMN, "loopDataInputRef"), (BPMN, "inputDataItem")])?;
+        let mode = if xml_boolean(mi.attr("isSequential"), false, mi, "isSequential")? {
+            ProcessMultiInstanceMode::Sequential
+        } else { ProcessMultiInstanceMode::Parallel };
+        let input = if let Some(cardinality) = mi.child(BPMN, "loopCardinality")? {
+            ensure!(mi.children.len() == 1, "cardinality repeat has unsupported children at byte {}", mi.offset);
+            let literal = repeat_expression(cardinality)?;
+            ensure!(!literal.is_empty() && literal.bytes().all(|byte| byte.is_ascii_digit()),
+                "repeat cardinality must be a bounded integer at byte {}", cardinality.offset);
+            let count = literal.parse().map_err(|error| XmlElementError {
+                message: format!("invalid repeat cardinality at byte {}: {error}", cardinality.offset),
+                element_id: element.attr("id").map(str::to_string), offset: cardinality.offset,
+            })?;
+            if count > 16 {
+                return Err(XmlElementError {
+                    message: format!("repeat cardinality exceeds 16 at byte {}", cardinality.offset),
+                    element_id: element.attr("id").map(str::to_string), offset: cardinality.offset,
+                }.into());
+            }
+            ProcessMultiInstanceInput::Cardinality { count }
+        } else {
+            ensure!(mi.children.len() == 2, "collection repeat requires an input ref and item at byte {}", mi.offset);
+            ensure!(mi.children[0].is(BPMN, "loopDataInputRef")
+                && mi.children[1].is(BPMN, "inputDataItem"),
+                "collection repeat children are out of order at byte {}", mi.offset);
+            let reference = mi.child(BPMN, "loopDataInputRef")?.context("collection repeat lacks loopDataInputRef")?;
+            reference.attrs_only(&[])?;
+            ensure!(reference.children.is_empty(), "loopDataInputRef must be QName text");
+            let (uri, data_id) = reference.qnames.get("text").context("loopDataInputRef requires a QName")?;
+            ensure!(uri == target_namespace, "foreign loopDataInputRef QName at byte {}", reference.offset);
+            let item = mi.child(BPMN, "inputDataItem")?.context("collection repeat lacks inputDataItem")?;
+            item.attrs_only(&["id", "isCollection"])?;
+            ensure!(item.attr("id").is_some() && !xml_boolean(item.attr("isCollection"), false, item, "isCollection")?,
+                "invalid repeat inputDataItem at byte {}", item.offset);
+            ensure!(item.children.is_empty() && item.text.trim().is_empty(),
+                "repeat inputDataItem must be empty at byte {}", item.offset);
+            let io = element.child(BPMN, "ioSpecification")?.context("collection repeat requires ioSpecification")?;
+            io.attrs_only(&[])?;
+            ensure!(io.text.trim().is_empty(), "repeat ioSpecification has unsupported text at byte {}", io.offset);
+            io.children_only(&[(BPMN, "dataInput"), (BPMN, "inputSet"), (BPMN, "outputSet")])?;
+            ensure!(io.children.len() == 3, "collection repeat requires one input and two sets");
+            ensure!(io.children[0].is(BPMN, "dataInput")
+                && io.children[1].is(BPMN, "inputSet")
+                && io.children[2].is(BPMN, "outputSet"),
+                "collection ioSpecification children are out of order at byte {}", io.offset);
+            let data = io.child(BPMN, "dataInput")?.context("collection input is missing")?;
+            data.attrs_only(&["id", "isCollection"])?;
+            ensure!(data.attr("id") == Some(data_id.as_str())
+                && xml_boolean(data.attr("isCollection"), false, data, "isCollection")?
+                && data.children.is_empty() && data.text.trim().is_empty(),
+                "collection dataInput does not match QName at byte {}", data.offset);
+            let set = io.child(BPMN, "inputSet")?.context("repeat inputSet is missing")?;
+            set.attrs_only(&["id"])?;
+            set.children_only(&[(BPMN, "dataInputRefs")])?;
+            ensure!(set.text.trim().is_empty() && set.children.len() == 1
+                && set.children[0].text.trim() == data_id.as_str(),
+                "repeat inputSet does not select collection input at byte {}", set.offset);
+            let output_set = io.child(BPMN, "outputSet")?.context("repeat outputSet is missing")?;
+            output_set.attrs_only(&["id"])?;
+            ensure!(output_set.children.is_empty() && output_set.text.trim().is_empty(),
+                "repeat outputSet must be empty at byte {}", output_set.offset);
+            let association = element.child(BPMN, "dataInputAssociation")?.context("repeat input association is missing")?;
+            association.attrs_only(&["id"])?;
+            ensure!(association.text.trim().is_empty(),
+                "repeat association has unsupported text at byte {}", association.offset);
+            association.children_only(&[(BPMN, "targetRef"), (BPMN, "assignment")])?;
+            ensure!(association.children.len() == 2
+                && association.children[0].is(BPMN, "targetRef")
+                && association.children[1].is(BPMN, "assignment")
+                && association.child(BPMN, "targetRef")?.is_some_and(|target| target.children.is_empty() && target.text.trim() == data_id.as_str()),
+                "repeat association target differs from collection input at byte {}", association.offset);
+            let assignment = association.child(BPMN, "assignment")?.context("repeat assignment is missing")?;
+            assignment.attrs_only(&["id"])?;
+            ensure!(assignment.text.trim().is_empty(), "repeat assignment has unsupported text at byte {}", assignment.offset);
+            assignment.children_only(&[(BPMN, "from"), (BPMN, "to")])?;
+            ensure!(assignment.children.len() == 2
+                && assignment.children[0].is(BPMN, "from")
+                && assignment.children[1].is(BPMN, "to")
+                && assignment.child(BPMN, "to")?.is_some_and(|to| to.children.is_empty() && to.text.trim() == data_id.as_str()),
+                "repeat assignment does not target collection input at byte {}", assignment.offset);
+            let from = assignment.child(BPMN, "from")?.context("repeat collection expression is missing")?;
+            ProcessMultiInstanceInput::CollectionExpression { expression: repeat_expression(from)? }
+        };
+        ensure!(matches!(input, ProcessMultiInstanceInput::CollectionExpression { .. })
+            || (element.child(BPMN, "ioSpecification")?.is_none()
+                && element.child(BPMN, "dataInputAssociation")?.is_none()),
+            "cardinality repeat cannot define collection IO at byte {}", element.offset);
+        Ok(Some(ProcessRepeatSpec::MultiInstance { mode, input, output_collection_variable }))
+    } else {
+        let standard = standard.context("structured loop characteristic is missing")?;
+        standard.attrs_only(&["testBefore", "loopMaximum"])?;
+        ensure!(standard.text.trim().is_empty(), "structured loop has unsupported text at byte {}", standard.offset);
+        standard.children_only(&[(BPMN, "loopCondition")])?;
+        ensure!(standard.children.len() == 1
+            && element.child(BPMN, "ioSpecification")?.is_none()
+            && element.child(BPMN, "dataInputAssociation")?.is_none(),
+            "structured loop has unsupported IO or child at byte {}", standard.offset);
+        let condition = repeat_expression(standard.child(BPMN, "loopCondition")?.context("loop condition is missing")?)?;
+        let max_iterations = standard.required("loopMaximum")?.parse().map_err(|error| XmlElementError {
+            message: format!("invalid loop maximum at byte {}: {error}", standard.offset),
+            element_id: element.attr("id").map(str::to_string), offset: standard.offset,
+        })?;
+        if !(1..=32).contains(&max_iterations) {
+            return Err(XmlElementError {
+                message: format!("loop maximum outside 1..=32 at byte {}", standard.offset),
+                element_id: element.attr("id").map(str::to_string), offset: standard.offset,
+            }.into());
+        }
+        let test_before = xml_boolean(standard.attr("testBefore"), false, standard, "testBefore")?;
+        Ok(Some(ProcessRepeatSpec::StructuredLoop { condition, test_before, max_iterations, output_collection_variable }))
+    }
 }
 
 fn process_configuration(
@@ -771,15 +964,16 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         "userTask" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[(BPMN, "extensionElements")])?;
+            element.children_only(&[(BPMN, "extensionElements"), (BPMN, "ioSpecification"),
+                (BPMN, "dataInputAssociation"), (BPMN, "multiInstanceLoopCharacteristics"),
+                (BPMN, "standardLoopCharacteristics")])?;
             let ext = element.child(BPMN, "extensionElements")?;
             let user = if let Some(ext) = ext {
                 ext.attrs_only(&[])?;
-                ext.children_only(&[(TF, "user")])?;
-                ensure!(
-                    ext.children.len() == 1,
-                    "user task requires one TentaFlow extension"
-                );
+                ext.children_only(&[(TF, "user"), (TF, "repeat")])?;
+                ensure!(ext.children.len() == usize::from(ext.child(TF, "user")?.is_some())
+                    + usize::from(ext.child(TF, "repeat")?.is_some()),
+                    "user task has unsupported TentaFlow extensions");
                 ext.child(TF, "user")?
             } else {
                 None
@@ -803,14 +997,16 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         "serviceTask" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[(BPMN, "extensionElements")])?;
+            element.children_only(&[(BPMN, "extensionElements"), (BPMN, "ioSpecification"),
+                (BPMN, "dataInputAssociation"), (BPMN, "multiInstanceLoopCharacteristics"),
+                (BPMN, "standardLoopCharacteristics")])?;
             let ext = element
                 .child(BPMN, "extensionElements")?
                 .context("service task requires TentaFlow extension")?;
             ext.attrs_only(&[])?;
-            ext.children_only(&[(TF, "service")])?;
+            ext.children_only(&[(TF, "service"), (TF, "repeat")])?;
             ensure!(
-                ext.children.len() == 1,
+                ext.children.len() == 1 + usize::from(ext.child(TF, "repeat")?.is_some()),
                 "service task requires exactly one TentaFlow service extension"
             );
             let service = ext
@@ -956,7 +1152,23 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         _ => {}
     }
-    Ok(ProcessNode { id, name, kind })
+    let repeat = if matches!(kind, ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }) {
+        repeat_from_xml(element, target_namespace).map_err(|error| {
+            if error.downcast_ref::<XmlElementError>().is_some() { return error; }
+            let message = error.to_string();
+            let mentioned_offset = message.rsplit_once("at byte ")
+                .and_then(|(_, suffix)| suffix.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<usize>().ok());
+            let contains_offset = |offset: usize| {
+                fn visit(element: &Element, offset: usize) -> bool {
+                    element.offset == offset || element.children.iter().any(|child| visit(child, offset))
+                }
+                visit(element, offset)
+            };
+            let offset = mentioned_offset.filter(|offset| contains_offset(*offset)).unwrap_or(element.offset);
+            XmlElementError { message, element_id: Some(id.clone()), offset }.into()
+        })?
+    } else { None };
+    Ok(ProcessNode { repeat, id, name, kind })
 }
 
 fn diagram_from_xml(element: &Element, process_id: &str) -> Result<ProcessDiagram> {
@@ -1333,8 +1545,33 @@ fn collect_diagram<'a>(
     }
 }
 
+fn write_repeat_xml(xml: &mut String, node: &ProcessNode, used_ids: &mut HashSet<String>) -> Result<()> {
+    let Some(repeat) = &node.repeat else { return Ok(()); };
+    match repeat {
+        ProcessRepeatSpec::MultiInstance { mode, input, .. } => {
+            let sequential = matches!(mode, ProcessMultiInstanceMode::Sequential);
+            if let ProcessMultiInstanceInput::CollectionExpression { expression } = input {
+                let data_id = generated_xml_id(&format!("{}_Collection", node.id), used_ids);
+                let item_id = generated_xml_id(&format!("{}_Item", node.id), used_ids);
+                xml.push_str(&format!("<bpmn:ioSpecification><bpmn:dataInput id=\"{}\" isCollection=\"true\"/><bpmn:inputSet><bpmn:dataInputRefs>{}</bpmn:dataInputRefs></bpmn:inputSet><bpmn:outputSet/></bpmn:ioSpecification>",
+                    escaped(&data_id), escaped(&data_id)));
+                xml.push_str(&format!("<bpmn:dataInputAssociation><bpmn:targetRef>{}</bpmn:targetRef><bpmn:assignment><bpmn:from xsi:type=\"bpmn:tFormalExpression\" language=\"https://cel.dev/spec\">{}</bpmn:from><bpmn:to>{}</bpmn:to></bpmn:assignment></bpmn:dataInputAssociation>",
+                    escaped(&data_id), escaped(expression), escaped(&data_id)));
+                xml.push_str(&format!("<bpmn:multiInstanceLoopCharacteristics isSequential=\"{sequential}\"><bpmn:loopDataInputRef>tns:{}</bpmn:loopDataInputRef><bpmn:inputDataItem id=\"{}\"/></bpmn:multiInstanceLoopCharacteristics>",
+                    escaped(&data_id), escaped(&item_id)));
+            } else if let ProcessMultiInstanceInput::Cardinality { count } = input {
+                xml.push_str(&format!("<bpmn:multiInstanceLoopCharacteristics isSequential=\"{sequential}\"><bpmn:loopCardinality xsi:type=\"bpmn:tFormalExpression\" language=\"https://cel.dev/spec\">{count}</bpmn:loopCardinality></bpmn:multiInstanceLoopCharacteristics>"));
+            }
+        }
+        ProcessRepeatSpec::StructuredLoop { condition, test_before, max_iterations, .. } => {
+            xml.push_str(&format!("<bpmn:standardLoopCharacteristics testBefore=\"{test_before}\" loopMaximum=\"{max_iterations}\"><bpmn:loopCondition xsi:type=\"bpmn:tFormalExpression\" language=\"https://cel.dev/spec\">{}</bpmn:loopCondition></bpmn:standardLoopCharacteristics>", escaped(condition)));
+        }
+    }
+    Ok(())
+}
+
 fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequenceFlow],
-    call_prefixes: &BTreeMap<String, String>) -> Result<()> {
+    call_prefixes: &BTreeMap<String, String>, used_ids: &mut HashSet<String>) -> Result<()> {
     for node in nodes {
         let (tag, extra) = match &node.kind {
             ProcessNodeKind::Start => ("startEvent", String::new()),
@@ -1476,21 +1713,33 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                 assignee_user_id,
                 output_mapping,
             } => {
-                if assignee_user_id.is_none() && output_mapping.is_empty() {
+                if assignee_user_id.is_none() && output_mapping.is_empty() && node.repeat.is_none() {
                     xml.push_str("/>");
                 } else {
-                    xml.push_str("><bpmn:extensionElements><tentaflow:user");
-                    if let Some(id) = assignee_user_id {
-                        xml.push_str(&format!(" assigneeUserId=\"{}\"", escaped(id)));
+                    xml.push_str("><bpmn:extensionElements>");
+                    if assignee_user_id.is_some() || !output_mapping.is_empty() {
+                        xml.push_str("<tentaflow:user");
+                        if let Some(id) = assignee_user_id {
+                            xml.push_str(&format!(" assigneeUserId=\"{}\"", escaped(id)));
+                        }
+                        xml.push('>');
+                        if !output_mapping.is_empty() {
+                            xml.push_str(&format!(
+                                "<tentaflow:outputMapping>{}</tentaflow:outputMapping>",
+                                escaped(&serde_json::to_string(output_mapping)?)
+                            ));
+                        }
+                        xml.push_str("</tentaflow:user>");
                     }
-                    xml.push('>');
-                    if !output_mapping.is_empty() {
-                        xml.push_str(&format!(
-                            "<tentaflow:outputMapping>{}</tentaflow:outputMapping>",
-                            escaped(&serde_json::to_string(output_mapping)?)
-                        ));
+                    if let Some(repeat) = &node.repeat {
+                        let output = match repeat {
+                            ProcessRepeatSpec::MultiInstance { output_collection_variable, .. }
+                            | ProcessRepeatSpec::StructuredLoop { output_collection_variable, .. } => output_collection_variable,
+                        };
+                        xml.push_str(&format!("<tentaflow:repeat outputCollectionVariable=\"{}\"/>", escaped(output)));
                     }
-                    xml.push_str("</tentaflow:user></bpmn:extensionElements>");
+                    xml.push_str("</bpmn:extensionElements>");
+                    write_repeat_xml(xml, node, used_ids)?;
                     xml.push_str(&format!("</bpmn:{tag}>"));
                 }
             }
@@ -1529,7 +1778,16 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                 if let Some(expression) = result_expression {
                     xml.push_str(&format!("<tentaflow:resultExpression>{}</tentaflow:resultExpression>", escaped(expression)));
                 }
-                xml.push_str("</tentaflow:service></bpmn:extensionElements>");
+                xml.push_str("</tentaflow:service>");
+                if let Some(repeat) = &node.repeat {
+                    let output = match repeat {
+                        ProcessRepeatSpec::MultiInstance { output_collection_variable, .. }
+                        | ProcessRepeatSpec::StructuredLoop { output_collection_variable, .. } => output_collection_variable,
+                    };
+                    xml.push_str(&format!("<tentaflow:repeat outputCollectionVariable=\"{}\"/>", escaped(output)));
+                }
+                xml.push_str("</bpmn:extensionElements>");
+                write_repeat_xml(xml, node, used_ids)?;
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
             ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
@@ -1545,7 +1803,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
                 xml.push_str("</tentaflow:subProcess></bpmn:extensionElements>");
-                write_graph(xml, &body.nodes, &body.sequence_flows, call_prefixes)?;
+                write_graph(xml, &body.nodes, &body.sequence_flows, call_prefixes, used_ids)?;
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
             ProcessNodeKind::CallActivity { called_definition_id, called_version,
@@ -1584,6 +1842,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
 pub fn export_xml(model: &ProcessModel) -> Result<String> {
     validate_model(model)?;
     let namespace = model.target_namespace.as_deref().unwrap_or(TF);
+    let has_repeat = super::model::all_nodes(model).iter().any(|node| node.repeat.is_some());
     let declarations =
         !model.messages.is_empty() || !model.errors.is_empty() || !model.escalations.is_empty();
     let call_namespaces: BTreeSet<_> = super::model::all_nodes(model)
@@ -1597,7 +1856,7 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         })
         .collect();
     let mut call_prefixes = BTreeMap::new();
-    let tns = if declarations || call_namespaces.contains(namespace) {
+    let tns = if declarations || has_repeat || call_namespaces.contains(namespace) {
         call_prefixes.insert(namespace.to_string(), "tns".to_string());
         format!(" xmlns:tns=\"{}\"", escaped(namespace))
     } else { String::new() };
@@ -1607,7 +1866,8 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         call_namespaces_xml.push_str(&format!(" xmlns:{prefix}=\"{}\"", escaped(&uri)));
         call_prefixes.insert(uri, prefix);
     }
-    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns}{call_namespaces_xml} targetNamespace=\"{}\">", escaped(namespace));
+    let xsi = if has_repeat { format!(" xmlns:xsi=\"{XSI}\"") } else { String::new() };
+    let mut xml=format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><bpmn:definitions xmlns:bpmn=\"{BPMN}\" xmlns:bpmndi=\"{BPMNDI}\" xmlns:dc=\"{DC}\" xmlns:di=\"{DI}\" xmlns:tentaflow=\"{TF}\"{tns}{call_namespaces_xml}{xsi} targetNamespace=\"{}\">", escaped(namespace));
     for message in &model.messages {
         xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
     }
@@ -1645,8 +1905,6 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         xml.push_str(&format!("<tentaflow:calendarPin>{}</tentaflow:calendarPin>", escaped(&serde_json::to_string(pin)?)));
     }
     xml.push_str("</bpmn:extensionElements>");
-    write_graph(&mut xml, &model.nodes, &model.sequence_flows, &call_prefixes)?;
-    xml.push_str("</bpmn:process>");
     let mut used_ids = HashSet::from([model.process_id.clone()]);
     used_ids.extend(
         model
@@ -1676,6 +1934,8 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         &mut edges,
         &mut used_ids,
     );
+    write_graph(&mut xml, &model.nodes, &model.sequence_flows, &call_prefixes, &mut used_ids)?;
+    xml.push_str("</bpmn:process>");
     if !shapes.is_empty() || !edges.is_empty() {
         let subprocess_ids: HashSet<&str> = super::model::all_nodes(model).into_iter()
             .filter(|node| matches!(node.kind, ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. }))
@@ -1725,7 +1985,7 @@ mod tests {
             error_id: "Error_Business".into(), name: "Rejected & returned".into(),
             error_code: "ORDER.REJECTED".into(),
         });
-        model.nodes.insert(1, ProcessNode {
+        model.nodes.insert(1, ProcessNode { repeat: None,
             id: "Call_1".into(), name: "Call & review".into(),
             kind: ProcessNodeKind::CallActivity {
                 called_definition_id: "91764f75-dadb-41aa-a252-a8a911fe7a94".into(),
@@ -1780,18 +2040,18 @@ mod tests {
         model.errors = vec![ProcessErrorDeclaration { error_id: "Error_Validation".into(), name: "Bad & <order>".into(), error_code: "BUSINESS.INVALID".into() }];
         model.nodes[0].kind = ProcessNodeKind::MessageStart { message_ref: "Message_Start".into(),
             output_mapping: BTreeMap::from([("customer_ID".into(), "outputs.customer_ID".into())]) };
-        model.nodes.push(ProcessNode { id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
+        model.nodes.push(ProcessNode { repeat: None, id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
             flow_id: "flow-123".into(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
             verification: ActivityVerification::Human, timeout_seconds: 60,
             result_expression: Some("vars.business_result".into()),
         } });
-        model.nodes.push(ProcessNode { id: "Throw_1".into(), name: "Send".into(), kind: ProcessNodeKind::MessageThrow {
+        model.nodes.push(ProcessNode { repeat: None, id: "Throw_1".into(), name: "Send".into(), kind: ProcessNodeKind::MessageThrow {
             message_ref: "Message_Throw".into(), target: ProcessMessageTargetSpec::Catch {
                 definition_id: "7c865aaa-febd-4621-9ae6-35977200a0fd".into(),
                 instance_id_expression: Some("vars.instance_ID".into()), subscription_id_expression: None,
             }, correlation_expression: "vars.customer_ID".into(), payload_expression: "vars.payload".into(), ttl_seconds: 60,
         } });
-        model.nodes.push(ProcessNode { id: "Boundary_Error".into(), name: "Error".into(), kind: ProcessNodeKind::BoundaryError {
+        model.nodes.push(ProcessNode { repeat: None, id: "Boundary_Error".into(), name: "Error".into(), kind: ProcessNodeKind::BoundaryError {
             attached_to_id: "Service_1".into(), error_ref: Some("Error_Validation".into()), output_mapping: BTreeMap::new(),
         } });
         model.sequence_flows[0].target_id = "Service_1".into();
@@ -1841,7 +2101,7 @@ mod tests {
             escalation_code: "NEEDS.HUMAN".into(),
         });
         model.nodes.extend([
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
@@ -1853,7 +2113,7 @@ mod tests {
                     result_expression: Some("outputs.result".into()),
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Boundary_1".into(),
                 name: "Escalate".into(),
                 kind: ProcessNodeKind::BoundaryEscalation {
@@ -1866,7 +2126,7 @@ mod tests {
                     )]),
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Wait_1".into(),
                 name: "Review".into(),
                 kind: ProcessNodeKind::UserTask {
@@ -1991,18 +2251,18 @@ mod tests {
         let mut model = super::super::model::starter_model();
         model.messages = vec![ProcessMessageDeclaration { message_id: "Message_1".into(), name: "order.received".into() }];
         model.nodes.extend([
-            ProcessNode { id: "Race_1".into(), name: "First arrival".into(), kind: ProcessNodeKind::EventBasedGateway },
-            ProcessNode { id: "Catch_A".into(), name: "First".into(), kind: ProcessNodeKind::MessageCatch {
+            ProcessNode { repeat: None, id: "Race_1".into(), name: "First arrival".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { repeat: None, id: "Catch_A".into(), name: "First".into(), kind: ProcessNodeKind::MessageCatch {
                 message_ref: "Message_1".into(), correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
             } },
-            ProcessNode { id: "Catch_B".into(), name: "Second".into(), kind: ProcessNodeKind::MessageCatch {
+            ProcessNode { repeat: None, id: "Catch_B".into(), name: "Second".into(), kind: ProcessNodeKind::MessageCatch {
                 message_ref: "Message_1".into(), correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
             } },
-            ProcessNode { id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
+            ProcessNode { repeat: None, id: "Service_1".into(), name: "Check".into(), kind: ProcessNodeKind::ServiceTask {
                 flow_id: "flow-123".into(), input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
                 verification: ActivityVerification::Human, timeout_seconds: 60, result_expression: None,
             } },
-            ProcessNode { id: "Boundary_1".into(), name: "Reminder".into(), kind: ProcessNodeKind::BoundaryMessage {
+            ProcessNode { repeat: None, id: "Boundary_1".into(), name: "Reminder".into(), kind: ProcessNodeKind::BoundaryMessage {
                 attached_to_id: "Service_1".into(), cancel_activity: false, message_ref: "Message_1".into(),
                 correlation_expression: "vars.case_ID".into(), output_mapping: BTreeMap::new(),
             } },
@@ -2108,20 +2368,20 @@ mod tests {
         let mut model = super::super::model::starter_model();
         model.timer_timezone = Some("Europe/Warsaw".into());
         model.variables.insert("business_key".into(), serde_json::json!({"label": "R&D Łódź"}));
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Review_1".into(), name: "Review & approve".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: None, output_mapping: BTreeMap::new(),
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Boundary_A".into(), name: "Deadline".into(),
             kind: ProcessNodeKind::BoundaryTimer {
                 attached_to_id: "Review_1".into(), cancel_activity: true,
                 timer: ProcessTimerSpec::Date { at: "2027-01-02T03:04:05+01:00".into() },
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Boundary_B".into(), name: "Reminder".into(),
             kind: ProcessNodeKind::BoundaryTimer {
                 attached_to_id: "Review_1".into(), cancel_activity: false,
@@ -2183,7 +2443,7 @@ mod tests {
             model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: rule.clone() };
             model.diagram.shapes.push(ProcessShape { element_id: "Start_1".into(), x: 12.0, y: 18.0, width: 36.0, height: 36.0 });
             if index < 2 {
-                model.nodes.push(ProcessNode { id: "Wait_1".into(), name: "Wait & resume".into(), kind: ProcessNodeKind::TimerCatch { timer: rule } });
+                model.nodes.push(ProcessNode { repeat: None, id: "Wait_1".into(), name: "Wait & resume".into(), kind: ProcessNodeKind::TimerCatch { timer: rule } });
                 model.sequence_flows[0].target_id = "Wait_1".into();
                 model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(), source_id: "Wait_1".into(), target_id: "End_1".into(), condition: None });
             }
@@ -2241,7 +2501,7 @@ mod tests {
         model
             .variables
             .insert("xml_text".into(), serde_json::json!("<tag attr=\"&\">"));
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Review_1".into(),
             name: "R&D \"Łódź\"".into(),
             kind: ProcessNodeKind::UserTask {
@@ -2249,14 +2509,14 @@ mod tests {
                 output_mapping: BTreeMap::new(),
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Route_1".into(),
             name: "Route".into(),
             kind: ProcessNodeKind::ExclusiveGateway {
                 default_flow_id: Some("Flow_4".into()),
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Service_1".into(),
             name: "Check".into(),
             kind: ProcessNodeKind::ServiceTask {
@@ -2400,7 +2660,7 @@ mod tests {
     #[test]
     fn duplicate_executable_extensions_fail_with_element_and_byte_diagnostics() {
         let mut model = super::super::model::starter_model();
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Service_1".into(),
             name: "Check".into(),
             kind: ProcessNodeKind::ServiceTask {
@@ -2515,13 +2775,13 @@ mod tests {
     #[test]
     fn embedded_subprocess_xml_round_trip_partitions_di_and_rejects_expansion() {
         let mut model = super::super::model::starter_model();
-        model.nodes.insert(1, ProcessNode {
+        model.nodes.insert(1, ProcessNode { repeat: None,
             id: "Sub_1".into(), name: "Review & scope".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
-                        ProcessNode { id: "LocalStart".into(), name: "Local start".into(), kind: ProcessNodeKind::Start },
-                        ProcessNode { id: "LocalEnd".into(), name: "Local end".into(), kind: ProcessNodeKind::End },
+                        ProcessNode { repeat: None, id: "LocalStart".into(), name: "Local start".into(), kind: ProcessNodeKind::Start },
+                        ProcessNode { repeat: None, id: "LocalEnd".into(), name: "Local end".into(), kind: ProcessNodeKind::End },
                     ],
                     sequence_flows: vec![ProcessSequenceFlow {
                         id: "LocalFlow".into(), source_id: "LocalStart".into(),
@@ -2569,13 +2829,13 @@ mod tests {
         let mut model = super::super::model::starter_model();
         model.variables.insert("approval_ID".into(), serde_json::json!("A&B"));
         model.nodes.extend([
-            ProcessNode { id: "OR_Split".into(), name: "Select & notify".into(),
+            ProcessNode { repeat: None, id: "OR_Split".into(), name: "Select & notify".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Flow_Default".into()) } },
-            ProcessNode { id: "Task_A".into(), name: "Review A".into(),
+            ProcessNode { repeat: None, id: "Task_A".into(), name: "Review A".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "Task_B".into(), name: "Review B".into(),
+            ProcessNode { repeat: None, id: "Task_B".into(), name: "Review B".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "OR_Join".into(), name: "All selected".into(),
+            ProcessNode { repeat: None, id: "OR_Join".into(), name: "All selected".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
         ]);
         model.sequence_flows[0].target_id = "OR_Split".into();
@@ -2670,6 +2930,109 @@ mod tests {
             assert!(invalid[..expected_offset].contains("Zażółć"),
                 "{label} must measure UTF-8 bytes after a non-ASCII process name");
         }
+    }
+
+    #[test]
+    fn repetition_xml_round_trips_cardinality_collection_and_structured_loop() {
+        let mut model = super::super::model::starter_model();
+        model.process_id = "Collection_Review".into();
+        model.variables.insert("results".into(), serde_json::json!([]));
+        model.variables.insert("items".into(), serde_json::json!([{"case": "A"}]));
+        model.nodes.insert(1, ProcessNode { id: "Review".into(), name: "Zażółć review".into(),
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+            repeat: Some(ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 16 },
+                output_collection_variable: "results".into() }) });
+        model.sequence_flows[0].target_id = "Review".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Next".into(), source_id: "Review".into(), target_id: "End_1".into(), condition: None });
+        for repeat in [
+            ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 16 }, output_collection_variable: "results".into() },
+            ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() },
+                output_collection_variable: "results".into() },
+            ProcessRepeatSpec::StructuredLoop { condition: "vars.keep_going".into(), test_before: true,
+                max_iterations: 32, output_collection_variable: "results".into() },
+        ] {
+            model.nodes[1].repeat = Some(repeat);
+            let xml = export_xml(&model).unwrap();
+            let (restored, diagnostics) = import_xml(&xml);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(restored.unwrap(), model);
+            assert!(xml.contains("outputCollectionVariable=\"results\""));
+            if xml.contains("loopDataInputRef") {
+                assert!(xml.contains("<bpmn:dataInput ") && xml.contains("isCollection=\"true\""));
+                assert!(xml.contains("<bpmn:assignment><bpmn:from xsi:type="));
+                assert!(xml.contains("<bpmn:loopDataInputRef>tns:"));
+                let encoded_ref = xml.replacen("<bpmn:loopDataInputRef>tns:Review_Collection",
+                    "<bpmn:loopDataInputRef>tns:Review_&#67;ollection", 1);
+                assert_ne!(encoded_ref, xml);
+                assert_eq!(import_xml(&encoded_ref).0, Some(model.clone()));
+            }
+            if xml.contains("isSequential=\"true\"") {
+                let lexical = xml.replacen("isSequential=\"true\"", "isSequential=\"1\"", 1)
+                    .replacen("isCollection=\"true\"", "isCollection=\"1\"", 1);
+                assert_eq!(import_xml(&lexical).0, Some(model.clone()));
+            }
+            if xml.contains("testBefore=\"true\"") {
+                let lexical = xml.replacen("testBefore=\"true\"", "testBefore=\"1\"", 1);
+                assert_eq!(import_xml(&lexical).0, Some(model.clone()));
+            }
+        }
+        model.nodes[1].kind = ProcessNodeKind::ServiceTask {
+            flow_id: "flow-review".into(), input_mapping: BTreeMap::new(),
+            output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
+            timeout_seconds: 60, result_expression: None,
+        };
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() },
+            output_collection_variable: "results".into(),
+        });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:serviceTask id=\"Review\""));
+        assert_eq!(import_xml(&xml).0, Some(model));
+    }
+
+    #[test]
+    fn repetition_xml_rejects_wrong_qname_and_duplicate_loop_with_utf8_child_offset() {
+        let mut model = super::super::model::starter_model();
+        model.variables.insert("results".into(), serde_json::json!([]));
+        model.variables.insert("items".into(), serde_json::json!([1]));
+        model.nodes.insert(1, ProcessNode { id: "Review".into(), name: "Zażółć review".into(),
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+            repeat: Some(ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() },
+                output_collection_variable: "results".into() }) });
+        model.sequence_flows[0].target_id = "Review".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Next".into(), source_id: "Review".into(), target_id: "End_1".into(), condition: None });
+        let xml = export_xml(&model).unwrap();
+        let wrong_qname = xml.replacen("<bpmn:loopDataInputRef>tns:", "<bpmn:loopDataInputRef>bpmn:", 1);
+        let duplicate = xml.replacen("</bpmn:multiInstanceLoopCharacteristics>",
+            "</bpmn:multiInstanceLoopCharacteristics><bpmn:standardLoopCharacteristics loopMaximum=\"2\" testBefore=\"true\"><bpmn:loopCondition xsi:type=\"bpmn:tFormalExpression\" language=\"https://cel.dev/spec\">true</bpmn:loopCondition></bpmn:standardLoopCharacteristics>", 1);
+        for (invalid, marker) in [(wrong_qname, "<bpmn:loopDataInputRef>"),
+            (duplicate, "<bpmn:standardLoopCharacteristics")] {
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none());
+            let offset = invalid.find(marker).unwrap();
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some("Review")
+                && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+            assert!(invalid[..offset].contains("Zażółć"));
+        }
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Parallel,
+            input: ProcessMultiInstanceInput::Cardinality { count: 16 },
+            output_collection_variable: "results".into(),
+        });
+        let xml = export_xml(&model).unwrap();
+        let invalid = xml.replacen(">16</bpmn:loopCardinality>", ">256</bpmn:loopCardinality>", 1);
+        let offset = invalid.find("<bpmn:loopCardinality").unwrap();
+        let (restored, diagnostics) = import_xml(&invalid);
+        assert!(restored.is_none());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+            && diagnostic.element_id.as_deref() == Some("Review")
+            && diagnostic.offset == Some(offset)), "{diagnostics:?}");
     }
 
 }

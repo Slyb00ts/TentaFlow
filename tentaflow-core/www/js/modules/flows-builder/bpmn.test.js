@@ -69,9 +69,10 @@ function definition(id = 'definition-one', overrides = {}) {
 function instance(id = 'instance-one', overrides = {}) {
   const value = { instanceId: id, definitionId: 'definition-one', definitionName: 'Document approval', initiatorUserId: 'owner', version: 2, revision: 11,
     status: 'Waiting', variables: { Purchase_ID: 'PO-7' }, activeNodeIds: ['Review'], userTasks: [], incidents: [], timers: [],
-    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], scopes: [], calls: [], canSendMessage: false,
+    subscriptions: [], eventRaces: [], outgoingMessages: [], messageNames: [], scopes: [], calls: [],
+    repetitionGroups: [], repetitionOccurrences: [], selectedRepetitionOccurrence: null, canSendMessage: false,
     createdAtMs: 1000, updatedAtMs: 2000, canCancel: false, canRetry: false, ...overrides };
-  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls'].map((name) =>
+  value.pages ??= Object.fromEntries(['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls', 'repetitionGroups', 'repetitionOccurrences'].map((name) =>
     [name, { offset: 0, total: value[name].length, nextOffset: null, hasMore: false }]));
   return value;
 }
@@ -1003,6 +1004,81 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
+test('repeat inspector persists MI and loop metadata outside task config and renders the standard marker', async () => {
+  const graph = canvas();
+  graph.processModel.variables.results = [];
+  graph.processModel.variables.items = [{ case_ID: 'A' }];
+  const node = userNode(graph);
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  assert.equal(node.repeat, undefined);
+  change(config.root.querySelector('[data-process="repeatMode"]'), 'mi_sequential');
+  await flush(2);
+  assert.deepEqual(node.repeat, { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 1 } }, outputCollectionVariable: '' } });
+  change(config.root.querySelector('[data-process="repeatCount"]'), '16');
+  change(config.root.querySelector('[data-process="repeatCount"]'), '');
+  assert.equal(config.root.querySelector('[data-process="repeatCount"]').value, '16');
+  change(config.root.querySelector('[data-process="repeatOutput"]'), 'results');
+  assert.equal(node.repeat.MultiInstance.input.Cardinality.count, 16);
+  assert.equal(node.config.repeat, undefined);
+  assert.ok(graph.root.querySelector('.fb-repeat-marker-sequential'));
+  const saved = canvasToProcess(graph.processModel, graph.nodes, graph.edges, (edge) => edge.waypoints);
+  assert.deepEqual(saved.nodes.find((entry) => entry.id === node.id).repeat, node.repeat);
+  change(config.root.querySelector('[data-process="repeatInputMode"]'), 'collection');
+  await flush(2);
+  change(config.root.querySelector('[data-process="repeatCollection"]'), 'vars.items');
+  assert.equal(node.repeat.MultiInstance.input.CollectionExpression.expression, 'vars.items');
+  change(config.root.querySelector('[data-process="repeatMode"]'), 'mi_parallel');
+  await flush(2);
+  assert.equal(node.repeat.MultiInstance.mode, 'Parallel');
+  assert.ok(graph.root.querySelector('.fb-repeat-marker-parallel'));
+  change(config.root.querySelector('[data-process="repeatMode"]'), 'loop');
+  await flush(2);
+  assert.equal(node.repeat.StructuredLoop.testBefore, false);
+  change(config.root.querySelector('[data-process="repeatCondition"]'), 'vars.again');
+  change(config.root.querySelector('[data-process="repeatMaximum"]'), '32');
+  change(config.root.querySelector('[data-process="repeatMaximum"]'), '');
+  assert.equal(config.root.querySelector('[data-process="repeatMaximum"]').value, '32');
+  change(config.root.querySelector('[data-process="repeatOutput"]'), 'results');
+  assert.equal(node.repeat.StructuredLoop.maxIterations, 32);
+  assert.ok(graph.root.querySelector('.fb-repeat-marker-loop'));
+  const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
+  for (const field of ['repeatMode', 'repeatCondition', 'repeatMaximum', 'repeatOutput']) {
+    assert.ok(readonly.root.querySelector(`[data-process="${field}"]`).hasAttribute('disabled'));
+  }
+  change(config.root.querySelector('[data-process="repeatMode"]'), 'off');
+  assert.equal(node.repeat, undefined);
+  assert.equal(graph.root.querySelector('.fb-repeat-marker'), null);
+  graph.destroy(); config.destroy(); readonly.destroy();
+});
+
+test('repeat inspector changes survive the mounted draft save and undo/redo snapshots', async () => {
+  const model = emptyProcessModel();
+  model.variables.results = [];
+  model.nodes.splice(1, 0, { id: 'RepeatWork', name: 'Review',
+    kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
+  model.sequenceFlows[0].targetId = 'RepeatWork';
+  model.sequenceFlows.push({ id: 'RepeatExit', sourceId: 'RepeatWork', targetId: 'End', condition: null });
+  const state = await mount(definition('repeat-draft', { model }), {
+    processDefinitionSaveRequest: (payload) => ({ definition: definition('repeat-draft', { model: payload.model, draftRevision: 5 }) }),
+  });
+  state.canvas.selectNode('RepeatWork');
+  await flush(2);
+  change(state.root.querySelector('[data-process="repeatMode"]'), 'mi_parallel');
+  await flush(2);
+  change(state.root.querySelector('[data-process="repeatCount"]'), '0');
+  change(state.root.querySelector('[data-process="repeatOutput"]'), 'results');
+  const expected = { MultiInstance: { mode: 'Parallel', input: { Cardinality: { count: 0 } }, outputCollectionVariable: 'results' } };
+  assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'RepeatWork').repeat, expected);
+  state.canvas.undo();
+  assert.notDeepEqual(state.canvas.getData().nodes.find((node) => node.id === 'RepeatWork').repeat, expected);
+  state.canvas.redo();
+  assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'RepeatWork').repeat, expected);
+  assert.equal(await builder._save(), true);
+  const request = calls.find((row) => row.kind === 'processDefinitionSaveRequest');
+  assert.deepEqual(request.payload.model.nodes.find((node) => node.id === 'RepeatWork').repeat, expected);
+});
+
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
@@ -1520,6 +1596,99 @@ test('empty required message collections render each page for an active instance
   assert.equal(win.querySelector('[data-race-rows]').children.length, 0);
   assert.equal(win.querySelector('[data-outgoing-rows]').children.length, 0);
   assert.equal(win.querySelector('[data-summary]').textContent.includes('undefined'), false);
+});
+
+test('repeat monitor pages and one selected value preserve actual null availability in five locales', async () => {
+  const group = { groupId: 'group-1', nodeId: 'RepeatWork', nodeName: 'Review <&> order', scopeId: 'scope-1',
+    parentTokenId: 'wait-1', mode: 'structured_loop', status: 'open', total: null,
+    createdCount: 1, completed: 0, maxIterations: 32, revision: 1, createdAtMs: 1, updatedAtMs: 1 };
+  const occurrence = { occurrenceId: 'occurrence-1', groupId: group.groupId, ordinal: 0,
+    status: 'awaiting_verification', tokenId: 'token-1', userTaskId: null, jobId: 'job-1',
+    verificationUserTaskId: 'verify-1', acceptedSourceEventId: null, approvalEventId: null,
+    createdAtMs: 1, updatedAtMs: 1 };
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const current = instance(`repeat-${language}`, { repetitionGroups: [group] });
+      const win = await monitor(current, { processInstanceGetRequest: ({ pages }) => ({ instance: instance(current.instanceId, {
+        repetitionGroups: [group], repetitionOccurrences: pages.selectedRepetitionGroupId ? [occurrence] : [],
+        selectedRepetitionOccurrence: pages.selectedRepetitionOccurrenceId ? {
+          summary: occurrence, valueKind: pages.selectedRepetitionValue,
+          valueAvailable: pages.selectedRepetitionValue === 'item',
+          value: pages.selectedRepetitionValue === 'item' ? { business_key: { Inner_ID: 'kept' } } : null,
+          acceptedOrigin: null,
+        } : null,
+      }) }) });
+      assert.ok(win.querySelector('[data-page-controls="repetitionGroups"]'));
+      assert.ok(win.querySelector('[data-page-controls="repetitionOccurrences"]'));
+      assert.match(win.querySelector('[data-repetition-group-rows]').textContent, /Review <&> order/);
+      assert.match(win.querySelector('[data-repetition-group-rows]').textContent, new RegExp(I18n.t('bpmn.repeat_total_unknown')));
+      click(win.querySelector('[data-repeat-inspect]')); await flush();
+      assert.equal(calls.filter((entry) => entry.kind === 'processInstanceGetRequest').at(-1).payload.pages.selectedRepetitionGroupId, group.groupId);
+      assert.match(win.querySelector('[data-repetition-occurrence-rows]').textContent,
+        new RegExp(I18n.t('bpmn.repeat_occurrence_status_awaiting_verification')));
+      click(win.querySelector('[data-repeat-item]')); await flush();
+      assert.deepEqual(calls.filter((entry) => entry.kind === 'processInstanceGetRequest').at(-1).payload.pages.selectedRepetitionValue, 'item');
+      assert.deepEqual(JSON.parse(win.querySelector('[data-repetition-detail] tf-code-editor').value),
+        { business_key: { Inner_ID: 'kept' } });
+      click(win.querySelector('[data-repeat-aggregate]')); await flush();
+      assert.equal(win.querySelector('[data-repetition-detail] tf-code-editor'), null);
+      assert.match(win.querySelector('[data-repetition-detail]').textContent, new RegExp(I18n.t('bpmn.repeat_value_unavailable')));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('repeat history kind labels are localized without rewriting factual payloads', async () => {
+  const kinds = ['repetition_group_started', 'repetition_occurrence_started',
+    'repetition_occurrence_completed', 'repetition_condition_checked', 'repetition_completed'];
+  const capacityReasons = ['active_occurrences', 'active_service_jobs', 'group_lifetime',
+    'occurrence_lifetime', 'repetition_bytes'];
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const events = kinds.map((kind, index) => ({ seq: index + 1, atMs: 1000 + index,
+        kind, nodeName: 'Review <&> order', data: { group_id: 'group-1', business_key: 'kept' } }));
+      for (const [index, reason] of capacityReasons.entries()) events.push({
+        seq: events.length + 1, atMs: 2000 + index, kind: 'repetition_group_blocked',
+        nodeName: 'Review <&> order', data: { group_id: 'group-1', last_completed_ordinal: null,
+          last_source_event_id: null, incident_id: `incident-${index}`, phase: 'capacity',
+          code: 'REPETITION_LIMIT', reason },
+      });
+      for (const code of ['REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED']) events.push({
+        seq: events.length + 1, atMs: 3000 + events.length, kind: 'repetition_group_blocked',
+        nodeName: 'Review <&> order', data: { group_id: 'group-1', last_completed_ordinal: 2,
+          last_source_event_id: 'source-event-2', incident_id: 'incident-aggregate',
+          phase: 'aggregate', code, reason: null },
+      });
+      events.push({ seq: events.length + 1, atMs: 4000, kind: 'repetition_entry_failed',
+        nodeName: 'Review <&> order', data: { group_id: 'group-denied', source_token_id: 'source-token-1',
+          parent_token_id: 'parent-token-1', incident_id: 'incident-entry', code: 'REPETITION_INPUT_ERROR' } });
+      const factualData = structuredClone(events.map((event) => event.data));
+      for (const event of events) {
+        const label = processEventText(event);
+        assert.ok(label.includes('Review <&> order'));
+        assert.doesNotMatch(label, /bpmn\.event_|\{node\}/);
+      }
+      for (const [index, reason] of capacityReasons.entries()) {
+        const label = processEventText(events[kinds.length + index]);
+        assert.ok(label.includes(I18n.t(`bpmn.repeat_reason_${reason}`)));
+        assert.ok(label.includes(I18n.t('bpmn.incident_repetition_limit')));
+      }
+      assert.ok(processEventText(events.at(-3)).includes(I18n.t('bpmn.incident_repetition_aggregate_limit')));
+      assert.ok(processEventText(events.at(-2)).includes(I18n.t('bpmn.incident_repetition_mapping_failed')));
+      assert.ok(processEventText(events.at(-1)).includes(I18n.t('bpmn.incident_repetition_input_error')));
+      assert.deepEqual(events.map((event) => event.data), factualData);
+      const win = await monitor(instance(`repeat-history-${language}`), {
+        processHistoryRequest: { events, nextSeq: events.length, hasMore: false },
+      });
+      assert.equal(win.querySelectorAll('[data-process-seq]').length, events.length);
+      assert.match(win.querySelector('[data-process-seq="1"] tf-code-editor').value, /business_key/);
+      assert.match(win.querySelector('[data-process-seq="6"] tf-code-editor').value, /incident_id/);
+      assert.match(win.querySelector(`[data-process-seq="${events.length}"] tf-code-editor`).value, /parent_token_id/);
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
 });
 
 test('instance window keeps its localized title while the full long definition name remains visible in the summary', async () => {

@@ -12968,7 +12968,7 @@ fn process_json_to_js(value: &serde_json::Value, opaque: bool) -> JsValue {
             for (key, value) in values {
                 let dynamic = matches!(
                     key.as_str(),
-                    "variables" | "outputs" | "data" | "payload" | "input_mapping" | "output_mapping"
+                    "variables" | "outputs" | "data" | "payload" | "value" | "input_mapping" | "output_mapping"
                 );
                 let out_key = if opaque {
                     key.clone()
@@ -26150,5 +26150,50 @@ mod process_wire_tests {
         };
         assert_eq!(model.nodes[0].kind, ProcessNodeKind::TerminateEnd);
         assert_eq!(model.variables["terminate_end"]["inner_key"], 7);
+    }
+
+    #[test]
+    fn process_request_encoder_keeps_repeat_variants_and_selected_value_selector() {
+        use tentaflow_protocol::processes::{ProcessMultiInstanceInput, ProcessMultiInstanceMode,
+            ProcessPayload, ProcessRepeatSpec, ProcessRepetitionValueKind};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Repeat","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Review","name":"Review","kind":{"UserTask":{
+                    "assignee_user_id":null,"output_mapping":{}}},
+                    "repeat":{"MultiInstance":{"mode":"Parallel",
+                        "input":{"CollectionExpression":{"expression":"vars.items"}},
+                        "output_collection_variable":"results"}}}],
+                "sequence_flows":[],"variables":{"items":[{"business_key":7}],"results":[]},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.nodes[0].repeat, Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Parallel,
+            input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() },
+            output_collection_variable: "results".into(),
+        }));
+        assert_eq!(model.variables["items"][0]["business_key"], 7);
+        let bytes = encode_process_request("InstanceGetRequest".into(), serde_json::json!({
+            "instance_id":"instance-1","pages":{
+                "repetition_groups":{"offset":20,"limit":20},
+                "repetition_occurrences":{"offset":0,"limit":20},
+                "selected_repetition_group_id":"group-1",
+                "selected_repetition_occurrence_id":"occurrence-1",
+                "selected_repetition_value":"aggregate"
+            }
+        }).to_string()).unwrap();
+        assert!(matches!(tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).unwrap(),
+            MessageBody::ProcessBody(ProcessPayload::InstanceGetRequest { pages: Some(pages), .. })
+                if pages.repetition_groups.as_ref().is_some_and(|page| page.offset == 20)
+                && pages.selected_repetition_group_id.as_deref() == Some("group-1")
+                && pages.selected_repetition_occurrence_id.as_deref() == Some("occurrence-1")
+                && pages.selected_repetition_value == Some(ProcessRepetitionValueKind::Aggregate)));
     }
 }

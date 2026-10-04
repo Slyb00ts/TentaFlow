@@ -32,6 +32,7 @@ pub(super) fn caller(
                 input_mapping: BTreeMap::new(),
                 output_mapping,
             },
+            repeat: None,
         },
     );
     model.sequence_flows = vec![
@@ -95,7 +96,8 @@ fn returned_call_cannot_replay_its_factual_termination_as_a_standalone_entry() {
     model.nodes.iter_mut().find(|node| node.id == "RootEnd_Scope").unwrap().kind =
         ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() };
     model.nodes.push(ProcessNode { id: "FinalEnd".into(), name: "Finish parent".into(),
-        kind: ProcessNodeKind::End });
+        kind: ProcessNodeKind::End,
+        repeat: None, });
     model.sequence_flows.push(edge("AfterScopeWork", "RootEnd_Scope", "FinalEnd"));
     let version = publish_model(&fixture, &model);
     let parent = messages::test_support::start_version(&fixture, &version);
@@ -163,6 +165,8 @@ pub(super) fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value
         "bpmn_calls",
         "bpmn_events",
         "bpmn_commands",
+        "bpmn_repetition_groups",
+        "bpmn_repetition_occurrences",
     ]
     .iter()
     .map(|table| super::call_pin_tests::table_rows(&conn, table, "rowid"))
@@ -189,6 +193,7 @@ fn parallel_caller(target: &ProcessVersion) -> ProcessModel {
             id: id.into(),
             name: id.into(),
             kind,
+            repeat: None,
         });
     }
     model.sequence_flows = vec![
@@ -237,6 +242,7 @@ fn with_error_handler(mut model: ProcessModel, reference: Option<&str>) -> Proce
                 ("evidence".into(), "outputs".into()),
             ]),
         },
+        repeat: None,
     });
     model
         .sequence_flows
@@ -1146,12 +1152,14 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
                     name: "Split child".into(),
                     kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                         else { ProcessNodeKind::ParallelGateway },
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "ChildJoin".into(),
                     name: "Join child".into(),
                     kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                         else { ProcessNodeKind::ParallelGateway },
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "OtherWork".into(),
@@ -1160,6 +1168,7 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
                         assignee_user_id: None,
                         output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
                     },
+                    repeat: None,
                 },
             ]);
             inner.sequence_flows = vec![
@@ -1274,6 +1283,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
                     payload_expression: "{'real': 42}".into(),
                     ttl_seconds: 120,
                 },
+                repeat: None,
             },
         );
         source.nodes.insert(
@@ -1290,6 +1300,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
                     payload_expression: "{'delivered': 42}".into(),
                     ttl_seconds: 120,
                 },
+                repeat: None,
             },
         );
         source.sequence_flows = vec![
@@ -1308,6 +1319,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
         );
         middle.sequence_flows = vec![
@@ -1712,11 +1724,13 @@ fn actual_call_tree_lifetime_and_active_variable_caps_leave_only_exact_waiting_i
             id: "Split".into(),
             name: "Split independent calls".into(),
             kind: ProcessNodeKind::ParallelGateway,
+            repeat: None,
         },
         ProcessNode {
             id: "Join".into(),
             name: "Join independent calls".into(),
             kind: ProcessNodeKind::ParallelGateway,
+            repeat: None,
         },
     ]);
     model.sequence_flows = vec![

@@ -1312,7 +1312,7 @@
 
 /* Process notation shares the editor shell and retains the model's DI bounds. */
 .fb-process-shell { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
-.fb-process-shell .fb-topbar { flex-wrap: wrap; align-content: flex-start; max-height: 180px; padding-block: 8px; overflow-x: hidden; overflow-y: auto; gap: 8px; }
+.fb-process-shell .fb-topbar { flex-wrap: wrap; align-content: flex-start; padding-block: 8px; overflow-x: hidden; overflow-y: auto; gap: 8px; }
 .fb-process-shell .fb-topbar > tf-button { flex-shrink: 0; }
 .fb-process-shell .fb-topbar-separator { display: none; }
 .fb-process-shell .fb-topbar-spacer { flex-basis: 20px; }
@@ -1356,6 +1356,9 @@
 .fb-process-node.bpmn_inclusive_gateway .fb-process-symbol svg { display: none; }
 .fb-process-node.bpmn_inclusive_gateway .fb-process-symbol::after { content: 'O'; font-size: 24px; font-weight: 700; line-height: 1; }
 .fb-process-node .fb-process-symbol { position: relative; }
+.fb-repeat-marker { position: absolute; bottom: 2px; left: 50%; transform: translateX(-50%); width: 18px; height: 14px; pointer-events: none; font-style: normal; font-size: 21px; font-weight: 700; line-height: 14px; text-align: center; color: var(--tf-text); }
+.fb-repeat-marker-sequential { background: repeating-linear-gradient(to bottom, var(--tf-text) 0 2px, transparent 2px 5px); height: 12px; }
+.fb-repeat-marker-parallel { background: repeating-linear-gradient(to right, var(--tf-text) 0 2px, transparent 2px 6px); height: 12px; }
 .fb-process-node:focus-visible { outline: 3px solid var(--tf-accent-1); outline-offset: 5px; }
 .fb-process-label { position: absolute; width: max-content; max-width: 200px; padding: 4px 6px; box-sizing: border-box; line-height: 1.4; text-align: center; overflow-wrap: anywhere; white-space: normal; background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: 6px; z-index: 2; }
 .fb-process-label[hidden], .fb-process-label-leader[hidden] { display: none; }

@@ -123,6 +123,13 @@ export function processEventText(event) {
     default: event.data.default_selected ? text('inclusive_default_selected') : '' });
   if (event.kind === 'inclusive_joined') return text('event_inclusive_joined', { node,
     count: event.data.selected_branch_edge_ids.length });
+  if (event.kind === 'repetition_group_blocked') return text(
+    event.data.phase === 'capacity' ? 'event_repetition_group_blocked_capacity' : 'event_repetition_group_blocked_aggregate',
+    { node, code: processIncidentText(event.data), reason: processLifecycleReasonText(event.data.reason || '') },
+  );
+  if (event.kind === 'repetition_entry_failed') return text('event_repetition_entry_failed', {
+    node, code: processIncidentText(event.data),
+  });
   if (event.kind.startsWith('message_')) return text(`event_${event.kind}`, {
     node, message: event.data.message_name || event.data.message_id || '',
     reason: processLifecycleReasonText(event.data.reason || ''), key: event.data.correlation_key || '',
@@ -199,6 +206,11 @@ export function processLifecycleReasonText(reason) {
     case 'ttl_expired': return text('reason_ttl_expired');
     case 'activation_closed': return text('reason_activation_closed');
     case 'target_instance_closed': return text('reason_target_instance_closed');
+    case 'active_occurrences': return text('repeat_reason_active_occurrences');
+    case 'active_service_jobs': return text('repeat_reason_active_service_jobs');
+    case 'group_lifetime': return text('repeat_reason_group_lifetime');
+    case 'occurrence_lifetime': return text('repeat_reason_occurrence_lifetime');
+    case 'repetition_bytes': return text('repeat_reason_repetition_bytes');
     default: return reason;
   }
 }
@@ -262,7 +274,7 @@ function processIncidentText(incident) {
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
   if (incident.code === 'ESCALATION_HANDLER_FAILED') return `${text('incident_escalation_handler_failed')} ${text('incident_escalation_guidance')}`;
-  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT'];
+  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 
@@ -310,6 +322,8 @@ export async function openProcessInstance(instanceId, initial = null) {
   host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
     <section data-calls><h3>${escapeHtml(text('calls'))}</h3><div data-call-rows></div></section>
     <section data-scopes><h3>${escapeHtml(text('scopes'))}</h3><div data-scope-rows></div><div data-scope-detail></div></section>
+    <section data-repetition-groups><h3>${escapeHtml(text('repeat_groups'))}</h3><div data-repetition-group-rows></div></section>
+    <section data-repetition-occurrences><h3>${escapeHtml(text('repeat_occurrences'))}</h3><div data-repetition-occurrence-rows></div><div data-repetition-detail></div></section>
     <section data-subscriptions><h3>${escapeHtml(text('event_subscriptions'))}</h3><div data-subscription-rows></div></section>
     <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
     <section data-outgoing><h3>${escapeHtml(text('outgoing_messages'))}</h3><div data-outgoing-rows></div></section>
@@ -328,13 +342,17 @@ export async function openProcessInstance(instanceId, initial = null) {
   const retryCommand = processCommand();
   const events = host.querySelector('[data-events]');
   const workWindows = new Set();
-  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls'];
+  const collectionNames = ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls', 'repetitionGroups', 'repetitionOccurrences'];
   const pageSpecs = Object.fromEntries(collectionNames.map((name) => [name, { offset: 0, limit: 20 }]));
   let selectedUserTaskId = null;
   let selectedIncidentId = null;
   let selectedScopeId = null;
+  let selectedRepetitionGroupId = null;
+  let selectedRepetitionOccurrenceId = null;
+  let selectedRepetitionValue = null;
   let scopeReadGeneration = 0;
-  const requestPages = () => ({ ...pageSpecs, selectedUserTaskId, selectedIncidentId });
+  const requestPages = () => ({ ...pageSpecs, selectedUserTaskId, selectedIncidentId,
+    selectedRepetitionGroupId, selectedRepetitionOccurrenceId, selectedRepetitionValue });
   const requestInstance = () => ApiBinary.one('processInstanceGetRequest', { instanceId, pages: requestPages() });
 
   function syncWorkWindows() {
@@ -370,6 +388,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         at.textContent = date(event.atMs);
         item.append(description, at);
         if (event.kind === 'service_result') item.append(jsonSection(text('actual_outputs'), event.data, false));
+        if (event.kind.startsWith('repetition_')) item.append(jsonSection(text('repeat_facts'), event.data, false));
         if (event.kind === 'terminate_end_reached') item.append(jsonSection(text('terminate_facts'), event.data, false));
         if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
@@ -608,6 +627,68 @@ export async function openProcessInstance(instanceId, initial = null) {
       callRows.append(row);
     }
     renderPageControls(host.querySelector('[data-calls]'), 'calls');
+    const groups = host.querySelector('[data-repetition-group-rows]');
+    groups.replaceChildren();
+    for (const group of instance.repetitionGroups) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.dataset.repetitionGroupId = group.groupId;
+      const count = group.total == null ? text('repeat_total_unknown') : String(group.total);
+      row.innerHTML = `<div><strong>${escapeHtml(group.nodeName)}</strong>
+        <p>${escapeHtml(text(`repeat_mode_${group.mode}`))} · ${escapeHtml(text(`repeat_status_${group.status}`))}</p>
+        <p>${escapeHtml(text('repeat_progress', { completed: group.completed, created: group.createdCount, total: count }))}</p>
+        <p>${escapeHtml(text('scope_id'))}: ${escapeHtml(group.scopeId)}</p></div>
+        <tf-button variant="secondary" data-repeat-inspect>${escapeHtml(text('repeat_inspect'))}</tf-button>`;
+      row.querySelector('[data-repeat-inspect]').addEventListener('click', () => {
+        selectedRepetitionGroupId = group.groupId;
+        selectedRepetitionOccurrenceId = null;
+        selectedRepetitionValue = null;
+        pageSpecs.repetitionOccurrences.offset = 0;
+        refresh();
+      });
+      groups.append(row);
+    }
+    renderPageControls(host.querySelector('[data-repetition-groups]'), 'repetitionGroups');
+    const occurrences = host.querySelector('[data-repetition-occurrence-rows]');
+    occurrences.replaceChildren();
+    for (const occurrence of instance.repetitionOccurrences) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      row.dataset.repetitionOccurrenceId = occurrence.occurrenceId;
+      row.innerHTML = `<div><strong>${escapeHtml(text('repeat_ordinal', { ordinal: occurrence.ordinal + 1 }))}</strong>
+        <p>${escapeHtml(text(`repeat_occurrence_status_${occurrence.status}`))}</p>
+        <p>${escapeHtml(occurrence.occurrenceId)}</p></div>
+        <tf-button variant="secondary" data-repeat-item>${escapeHtml(text('repeat_item'))}</tf-button>
+        <tf-button variant="secondary" data-repeat-aggregate>${escapeHtml(text('repeat_aggregate'))}</tf-button>`;
+      for (const [selector, kind] of [['[data-repeat-item]', 'item'], ['[data-repeat-aggregate]', 'aggregate']]) {
+        row.querySelector(selector).addEventListener('click', () => {
+          selectedRepetitionOccurrenceId = occurrence.occurrenceId;
+          selectedRepetitionValue = kind;
+          refresh();
+        });
+      }
+      occurrences.append(row);
+    }
+    renderPageControls(host.querySelector('[data-repetition-occurrences]'), 'repetitionOccurrences');
+    const detail = host.querySelector('[data-repetition-detail]');
+    detail.replaceChildren();
+    if (instance.selectedRepetitionOccurrence) {
+      const selected = instance.selectedRepetitionOccurrence;
+      const heading = document.createElement('p');
+      heading.textContent = `${text('repeat_ordinal', { ordinal: selected.summary.ordinal + 1 })} · ${text(`repeat_${selected.valueKind}`)}`;
+      detail.append(heading);
+      if (selected.valueAvailable) detail.append(jsonSection(text(`repeat_${selected.valueKind}`), selected.value, false));
+      else {
+        const unavailable = document.createElement('p');
+        unavailable.textContent = text('repeat_value_unavailable');
+        detail.append(unavailable);
+      }
+      if (selected.acceptedOrigin) {
+        const origin = document.createElement('p');
+        origin.textContent = `${text('repeat_result_origin')}: ${text(`repeat_origin_${selected.acceptedOrigin.toLowerCase()}`)}`;
+        detail.append(origin);
+      }
+    }
   }
 
   async function refresh() {

@@ -31,6 +31,7 @@ fn child_timer_catch_fires_and_returns_parent_once() {
             kind: ProcessNodeKind::TimerCatch {
                 timer: ProcessTimerSpec::Duration { seconds: 1 },
             },
+            repeat: None,
         },
     );
     child_model.sequence_flows = vec![
@@ -238,6 +239,7 @@ fn human_error_end_crosses_pinned_call_boundary_before_root_termination_once() {
                 ("error_source".into(), "activity_result".into()),
             ]),
         },
+        repeat: None,
     });
     parent_model.sequence_flows.push(edge("CaughtToTerminate", "CatchCalledError", "End_1"));
     let caller = publish_model(&fixture, &parent_model);
@@ -336,7 +338,7 @@ fn terminate_caller(
             output_mapping: BTreeMap::new(),
         }),
     ] {
-        model.nodes.push(ProcessNode { id: id.into(), name: id.into(), kind });
+        model.nodes.push(ProcessNode { id: id.into(), name: id.into(), kind, repeat: None, });
     }
     model.sequence_flows = vec![
         edge("StartSplit", "Start_1", "Split"),

@@ -8,7 +8,9 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ActivityVerification, ProcessIncident, ProcessInstanceStatus,
-    ProcessModel, ProcessNode, ProcessNodeKind, ProcessScopeSummary, ProcessTimerKind,
+    ProcessModel, ProcessMultiInstanceInput, ProcessMultiInstanceMode, ProcessNode,
+    ProcessNodeKind, ProcessRepeatSpec, ProcessRepetitionGroupMode,
+    ProcessRepetitionGroupStatus, ProcessRepetitionOccurrenceStatus, ProcessScopeSummary, ProcessTimerKind,
     ProcessTimerStatus, ProcessUserTask, ProcessUserTaskKind, ProcessUserTaskStatus,
 };
 use tokio_util::sync::CancellationToken;
@@ -19,6 +21,7 @@ use super::repository::{
     AcceptedInputRef, StartInputRef, TerminationAttempt, TerminationSource, TerminationReturnFailure,
     GatewayReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
     ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
+    RepetitionCapacitySource, RepetitionDeniedBytes, RepetitionGroup, RepetitionOccurrence,
     ScopeUpdate, VariableEffect,
 };
 use crate::db::DbPool;
@@ -82,11 +85,12 @@ pub(super) fn condition(expression: &str, variables: &Value, outputs: &Value) ->
 pub fn prepare_service_input(
     mapping: &BTreeMap<String, String>,
     variables: &Value,
+    extra: &[(String, Value)],
 ) -> Result<Value> {
     let mut payload = variables.clone();
     let mut activity_vars = serde_json::Map::new();
     for (key, expression) in mapping {
-        let value = evaluate(expression, variables, &Value::Null, &[])?;
+        let value = evaluate(expression, variables, &Value::Null, extra)?;
         if key == "payload" {
             payload = value;
         } else {
@@ -96,6 +100,38 @@ pub fn prepare_service_input(
     let input = json!({"payload": payload, "variables": activity_vars});
     validate_output(&input)?;
     Ok(input)
+}
+
+pub(super) fn repetition_immediate_reservation(
+    node: &ProcessNode, group_id: &str, ordinal: u32, item: &Value,
+    input_variables: &Value,
+) -> Result<u64> {
+    match &node.kind {
+        ProcessNodeKind::UserTask { .. } => Ok(4),
+        ProcessNodeKind::ServiceTask { input_mapping, .. } => {
+            let input = match prepare_service_input(input_mapping, input_variables,
+                &[("repeat".to_owned(), json!({
+                    "group_id":group_id,"index":ordinal,"item":item
+                }))]) {
+                Ok(input) => input,
+                Err(_) => return Ok(0),
+            };
+            u64::try_from(serde_json::to_vec(&input)?.len())?
+                .checked_add(repetition_claim_reservation()?)
+                .context("repetition immediate Service reservation overflow")
+        }
+        _ => anyhow::bail!("repetition immediate reservation is not an activity"),
+    }
+}
+
+pub(super) fn repetition_claim_reservation() -> Result<u64> {
+    let claim = json!({
+        "job_id":"00000000-0000-0000-0000-000000000000",
+        "attempt":u64::MAX,"fence":u64::MAX,
+        "repeat_context_sha256":"0".repeat(64),
+        "expression_variables_sha256":"0".repeat(64)
+    });
+    Ok(u64::try_from(serde_json::to_vec(&claim)?.len())?)
 }
 
 pub(super) fn patch_variables(
@@ -120,6 +156,7 @@ pub(super) fn patch_variables(
     Ok(value)
 }
 
+#[derive(Clone)]
 struct Transition<'a> {
     model: &'a ProcessModel,
     instance_id: &'a str,
@@ -141,6 +178,14 @@ struct Transition<'a> {
     boundary_incidents: Vec<BoundaryEventIncident>,
     subscriptions: Vec<super::repository::EventSubscription>,
     event_races: Vec<super::repository::EventRace>,
+    repetition_groups: Vec<RepetitionGroup>,
+    repetition_occurrences: Vec<RepetitionOccurrence>,
+    initial_repetition_groups: Vec<RepetitionGroup>,
+    initial_repetition_occurrences: Vec<RepetitionOccurrence>,
+    initial_jobs: Vec<ProcessJob>,
+    initial_tasks: Vec<ProcessUserTask>,
+    accepted_repetition_result: Option<(String, ActivityResult)>,
+    accepted_repetition_task: Option<(String, Value)>,
     escalation_continuation: bool,
     accepted_input: Option<AcceptedInputRef>,
     token_inputs: HashMap<String, AcceptedInputRef>,
@@ -193,6 +238,14 @@ impl<'a> Transition<'a> {
             boundary_incidents: Vec::new(),
             subscriptions: Vec::new(),
             event_races: Vec::new(),
+            repetition_groups: Vec::new(),
+            repetition_occurrences: Vec::new(),
+            initial_repetition_groups: Vec::new(),
+            initial_repetition_occurrences: Vec::new(),
+            initial_jobs: Vec::new(),
+            initial_tasks: Vec::new(),
+            accepted_repetition_result: None,
+            accepted_repetition_task: None,
             escalation_continuation: false,
             accepted_input: None,
             token_inputs: HashMap::new(),
@@ -224,6 +277,12 @@ impl<'a> Transition<'a> {
         transition.boundary_incidents = snapshot.boundary_incidents.clone();
         transition.subscriptions = snapshot.subscriptions.clone();
         transition.event_races = snapshot.event_races.clone();
+        transition.repetition_groups = snapshot.repetition_groups.clone();
+        transition.repetition_occurrences = snapshot.repetition_occurrences.clone();
+        transition.initial_repetition_groups = snapshot.repetition_groups.clone();
+        transition.initial_repetition_occurrences = snapshot.repetition_occurrences.clone();
+        transition.initial_jobs = snapshot.jobs.clone();
+        transition.initial_tasks = snapshot.user_tasks.clone();
         transition.expected_instance_revision = snapshot.instance.revision;
         Ok(transition)
     }
@@ -466,6 +525,716 @@ impl<'a> Transition<'a> {
         self.plan.create_user_tasks.push(task);
     }
 
+    fn write_repetition_group(&mut self, mut group: RepetitionGroup) -> Result<()> {
+        if let Some(existing) = self.repetition_groups.iter_mut().find(|row| row.group_id == group.group_id) {
+            group.revision = if let Some(planned) = self.plan.repetition_groups.iter().find(|row| row.group_id == group.group_id) {
+                planned.revision
+            } else {
+                existing.revision.checked_add(1).context("repetition group revision overflow")?
+            };
+            *existing = group.clone();
+        } else {
+            ensure!(group.revision == 1, "new repetition group must begin at revision one");
+            self.repetition_groups.push(group.clone());
+        }
+        if let Some(planned) = self.plan.repetition_groups.iter_mut().find(|row| row.group_id == group.group_id) {
+            *planned = group;
+        } else {
+            self.plan.repetition_groups.push(group);
+        }
+        Ok(())
+    }
+
+    fn write_repetition_occurrence(&mut self, mut occurrence: RepetitionOccurrence) -> Result<()> {
+        if let Some(existing) = self.repetition_occurrences.iter_mut().find(|row| row.occurrence_id == occurrence.occurrence_id) {
+            occurrence.revision = if let Some(planned) = self.plan.repetition_occurrences.iter().find(|row| row.occurrence_id == occurrence.occurrence_id) {
+                planned.revision
+            } else {
+                existing.revision.checked_add(1).context("repetition occurrence revision overflow")?
+            };
+            *existing = occurrence.clone();
+        } else {
+            ensure!(occurrence.revision == 1, "new repetition occurrence must begin at revision one");
+            self.repetition_occurrences.push(occurrence.clone());
+        }
+        if let Some(planned) = self.plan.repetition_occurrences.iter_mut().find(|row| row.occurrence_id == occurrence.occurrence_id) {
+            *planned = occurrence;
+        } else {
+            self.plan.repetition_occurrences.push(occurrence);
+        }
+        Ok(())
+    }
+
+    fn repeat_extra(group_id: &str, ordinal: u32, item: Value) -> Vec<(String, Value)> {
+        vec![("repeat".into(), json!({"group_id":group_id,"index":ordinal,"item":item}))]
+    }
+
+    fn repetition_for_token(&self, token_id: &str) -> Option<(RepetitionGroup, RepetitionOccurrence)> {
+        let occurrence = self.repetition_occurrences.iter().find(|row| row.token_id == token_id)?;
+        let group = self.repetition_groups.iter().find(|row| row.group_id == occurrence.group_id)?;
+        Some((group.clone(), occurrence.clone()))
+    }
+
+    fn projected_repetition_retained_bytes(&self) -> Result<u64> {
+        let size = |value: &Value| -> Result<i128> {
+            Ok(i128::try_from(serde_json::to_vec(value)?.len())?)
+        };
+        let optional_size = |value: Option<&Value>| -> Result<i128> {
+            value.map(&size).transpose().map(|size| size.unwrap_or(0))
+        };
+        let mut bytes = self.initial_repetition_groups.iter().try_fold(0_i128, |sum, group|
+            sum.checked_add(i128::from(group.retained_bytes))
+                .context("repetition retained byte count overflow"))?;
+        for group in &self.repetition_groups {
+            let old = self.initial_repetition_groups.iter().find(|row| row.group_id == group.group_id);
+            let current = size(&group.entry_variables)?
+                + optional_size(group.frozen_collection.as_ref())?
+                + optional_size(group.loop_state.as_ref())?;
+            let previous = if let Some(old) = old {
+                size(&old.entry_variables)? + optional_size(old.frozen_collection.as_ref())?
+                    + optional_size(old.loop_state.as_ref())?
+            } else { 0 };
+            bytes += current - previous;
+        }
+        for occurrence in &self.repetition_occurrences {
+            let old = self.initial_repetition_occurrences.iter()
+                .find(|row| row.occurrence_id == occurrence.occurrence_id);
+            let current = size(&occurrence.item)? + size(&occurrence.input_variables)?
+                + optional_size(occurrence.aggregate_item.as_ref())?
+                + optional_size(occurrence.state_patch.as_ref())?
+                + optional_size(occurrence.state_after.as_ref())?;
+            let previous = if let Some(old) = old {
+                size(&old.item)? + size(&old.input_variables)?
+                    + optional_size(old.aggregate_item.as_ref())?
+                    + optional_size(old.state_patch.as_ref())?
+                    + optional_size(old.state_after.as_ref())?
+            } else { 0 };
+            bytes += current - previous;
+        }
+        for job in &self.plan.create_jobs {
+            if self.repetition_occurrences.iter().any(|row|
+                row.job_id.as_deref() == Some(job.job_id.as_str())) {
+                bytes += size(&job.input)?;
+                if let Some(result) = &job.result {
+                    bytes += i128::try_from(serde_json::to_vec(result)?.len())?;
+                }
+            }
+        }
+        if let Some((job_id, result)) = &self.accepted_repetition_result {
+            let prior = self.initial_jobs.iter().find(|job| job.job_id == *job_id)
+                .context("accepted repeated Service job has no prior row")?;
+            let prior_bytes = prior.result.as_ref().map(|value|
+                serde_json::to_vec(value).map(|bytes| bytes.len())).transpose()?.unwrap_or(0);
+            bytes += i128::try_from(serde_json::to_vec(result)?.len())?
+                - i128::try_from(prior_bytes)?;
+        }
+        for task in &self.plan.create_user_tasks {
+            if self.repetition_occurrences.iter().any(|row|
+                row.user_task_id.as_deref() == Some(task.user_task_id.as_str())
+                    || row.verification_user_task_id.as_deref() == Some(task.user_task_id.as_str())) {
+                bytes += size(&task.outputs)?;
+            }
+        }
+        if let Some((task_id, outputs)) = &self.accepted_repetition_task {
+            let prior = self.initial_tasks.iter().find(|task| task.user_task_id == *task_id)
+                .context("accepted repeated Work task has no prior row")?;
+            bytes += size(outputs)? - size(&prior.outputs)?;
+        }
+        for (index, event) in self.plan.events.iter().enumerate() {
+            let direct_group = event.data.get("group_id").and_then(Value::as_str)
+                .is_some_and(|id| self.repetition_groups.iter().any(|row| row.group_id == id));
+            let source_group = self.plan.event_ids.get(&index).is_some_and(|id|
+                self.repetition_occurrences.iter().any(|row|
+                    row.accepted_source_event_id.as_deref() == Some(id.as_str())
+                        || row.approval_event_id.as_deref() == Some(id.as_str())));
+            if direct_group || source_group {
+                bytes += size(&event.data)?;
+            }
+        }
+        for incident in &self.plan.add_incidents {
+            if self.repetition_groups.iter().any(|group|
+                group.terminal_incident_id.as_deref() == Some(incident.incident_id.as_str()))
+                || self.repetition_occurrences.iter().any(|row|
+                    row.job_id.as_deref() == incident.job_id.as_deref() && row.job_id.is_some()) {
+                bytes += i128::try_from(incident.message.len())?;
+            }
+        }
+        ensure!(bytes >= 0, "repetition retained bytes became negative");
+        Ok(u64::try_from(bytes)?)
+    }
+
+    fn projected_repetition_admission_bytes(&self) -> Result<u64> {
+        let mut bytes = self.projected_repetition_retained_bytes()?;
+        for occurrence in &self.repetition_occurrences {
+            if occurrence.status == ProcessRepetitionOccurrenceStatus::Pending {
+                let group = self.repetition_groups.iter().find(|row|
+                    row.group_id == occurrence.group_id)
+                    .context("pending ordinal has no durable group")?;
+                let node = super::repository::scope_node(self.model, &self.scopes,
+                    self.instance_id, &group.scope_id, &group.node_id)?;
+                bytes = bytes.checked_add(repetition_immediate_reservation(node,
+                    &group.group_id, occurrence.ordinal, &occurrence.item,
+                    &occurrence.input_variables)?)
+                    .context("pending repetition admission byte count overflow")?;
+            } else if let Some(job_id) = &occurrence.job_id {
+                if self.jobs.iter().any(|job| job.job_id == *job_id
+                    && matches!(job.status.as_str(), "queued" | "error")) {
+                    bytes = bytes.checked_add(repetition_claim_reservation()?)
+                        .context("queued repetition claim byte count overflow")?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn active_repetition_service_jobs(&self) -> usize {
+        self.jobs.iter().filter(|job|
+            matches!(job.status.as_str(), "queued" | "running" | "error")
+                && self.repetition_occurrences.iter().any(|row|
+                    row.job_id.as_deref() == Some(job.job_id.as_str()))).count()
+    }
+
+    fn spawn_repetition_occurrence(&mut self, group: RepetitionGroup, item: Value) -> Result<()> {
+        let mut group = self.repetition_groups.iter().find(|row| row.group_id == group.group_id)
+            .context("repetition group disappeared before occurrence spawn")?.clone();
+        ensure!(group.status == ProcessRepetitionGroupStatus::Open,
+            "cannot spawn an occurrence in a closed repetition group");
+        let active_occurrences = self.repetition_occurrences.iter().filter(|row| matches!(row.status,
+            ProcessRepetitionOccurrenceStatus::Pending | ProcessRepetitionOccurrenceStatus::Active
+                | ProcessRepetitionOccurrenceStatus::AwaitingVerification
+                | ProcessRepetitionOccurrenceStatus::RetryableError)).count();
+        let active_service_jobs = self.active_repetition_service_jobs();
+        let retained_bytes = self.projected_repetition_retained_bytes()?;
+        let reason = if group.created_count == 0 && self.repetition_groups.len() > 127 {
+            Some("group_lifetime")
+        } else if self.repetition_occurrences.len() >= 1024 {
+            Some("occurrence_lifetime")
+        } else if active_occurrences >= 64 {
+            Some("active_occurrences")
+        } else if matches!(&self.node(&group.node_id)?.kind, ProcessNodeKind::ServiceTask { .. })
+            && active_service_jobs >= 32 {
+            Some("active_service_jobs")
+        } else if retained_bytes > 64 * 1024 * 1024 {
+            Some("repetition_bytes")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return self.latch_repetition_capacity(&group.group_id, reason, retained_bytes, None);
+        }
+        let parent = self.tokens.iter().find(|token| token.token_id == group.parent_token_id
+            && token.scope_id == group.scope_id && token.node_id == group.node_id
+            && token.status == "waiting")
+            .context("repetition group lost its parked parent")?.clone();
+        let ordinal = group.next_ordinal;
+        let input_variables = if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+            group.loop_state.clone().context("structured loop state is missing")?
+        } else {
+            group.entry_variables.clone()
+        };
+        validate_output(&item)?;
+        validate_variables(&input_variables)?;
+        let before_spawn = self.clone();
+        let token_id = self.create_token(ProcessToken {
+            token_id: String::new(), status: "ready".into(), ..parent.clone()
+        }, Some(&parent.token_id));
+        let occurrence = RepetitionOccurrence {
+            occurrence_id: Uuid::new_v4().to_string(), instance_id: self.instance_id.to_owned(),
+            scope_id: group.scope_id.clone(), group_id: group.group_id.clone(), ordinal,
+            status: ProcessRepetitionOccurrenceStatus::Pending, token_id,
+            user_task_id: None, job_id: None, verification_user_task_id: None,
+            item, input_variables, accepted_source_event_id: None, approval_event_id: None,
+            aggregate_item: None, state_patch: None, state_after: None, accepted_origin: None,
+            revision: 1, created_at_ms: self.now_ms, updated_at_ms: self.now_ms,
+        };
+        self.event("repetition_occurrence_started", Some(group.node_id.clone()),
+            json!({"group_id":group.group_id,"occurrence_id":occurrence.occurrence_id,
+                "ordinal":ordinal,"token_id":occurrence.token_id}));
+        self.write_repetition_occurrence(occurrence)?;
+        group.created_count = group.created_count.checked_add(1).context("repetition count overflow")?;
+        group.next_ordinal = group.created_count;
+        group.updated_at_ms = self.now_ms;
+        self.write_repetition_group(group.clone())?;
+        let candidate_bytes = self.projected_repetition_admission_bytes()?;
+        if candidate_bytes > 64 * 1024 * 1024 {
+            *self = before_spawn;
+            return self.latch_repetition_capacity(&group.group_id, "repetition_bytes",
+                retained_bytes, Some((RepetitionDeniedBytes::Occurrence { ordinal }, candidate_bytes)));
+        }
+        Ok(())
+    }
+
+    fn latch_repetition_capacity(&mut self, group_id: &str, reason: &str,
+        retained_before_closure_bytes: u64,
+        denied_candidate: Option<(RepetitionDeniedBytes, u64)>) -> Result<()> {
+        ensure!(self.plan.repetition_capacity.is_none()
+            && !self.repetition_groups.iter().any(|group| group.terminal_capacity),
+            "repetition capacity already has a terminal latch");
+        let mut group = self.repetition_groups.iter().find(|row| row.group_id == group_id)
+            .context("capacity latch has no triggering group")?.clone();
+        let reserved_before_candidate_bytes = self.projected_repetition_admission_bytes()?
+            .checked_sub(self.projected_repetition_retained_bytes()?)
+            .context("repetition admission reserve fell below physical retention")?;
+        let accepted_input = self.accepted_input.clone()
+            .context("capacity latch has no factual accepted entry")?;
+        self.current_scope = group.scope_id.clone();
+        self.incident(&group.node_id, None, "REPETITION_LIMIT", reason.to_owned());
+        let incident_id = self.plan.add_incidents.last()
+            .context("capacity latch has no incident")?.incident_id.clone();
+        let event_index = self.plan.events.len();
+        let event_id = Uuid::new_v4().to_string();
+        let last_source = self.repetition_occurrences.iter()
+            .filter(|row| row.group_id == group_id)
+            .max_by_key(|row| row.ordinal)
+            .and_then(|row| row.accepted_source_event_id.clone());
+        self.plan.event_ids.insert(event_index, event_id.clone());
+        self.event("repetition_group_blocked", Some(group.node_id.clone()), json!({
+            "group_id":group.group_id,
+            "last_completed_ordinal":group.completed_count.checked_sub(1),
+            "last_source_event_id":last_source,
+            "incident_id":incident_id,
+            "phase":"capacity",
+            "code":"REPETITION_LIMIT",
+            "reason":reason
+        }));
+        self.plan.repetition_capacity = Some(RepetitionCapacitySource {
+            instance_id:self.instance_id.to_owned(), group_id:group.group_id.clone(), scope_id:group.scope_id.clone(),
+            source_token_id:group.source_token_id.clone(),
+            parent_token_id:group.parent_token_id.clone(), accepted_input,
+            incident_id:incident_id.clone(), event_index, event_id:event_id.clone(),
+            reason:reason.to_owned(), before_group_count:self.repetition_groups.len(),
+            before_occurrence_count:self.repetition_occurrences.len(),
+            before_retained_bytes:self.initial_repetition_groups.iter().try_fold(0_u64, |sum, row|
+                sum.checked_add(row.retained_bytes).context("repetition retained byte count overflow"))?,
+            retained_before_closure_bytes, reserved_before_candidate_bytes,
+            denied_candidate: denied_candidate.as_ref().map(|(candidate, _)| candidate.clone()),
+            denied_candidate_bytes: denied_candidate.map(|(_, bytes)| bytes),
+        });
+        group.status = ProcessRepetitionGroupStatus::Incident;
+        group.terminal_capacity = true;
+        group.terminal_incident_id = Some(incident_id);
+        group.terminal_event_id = Some(event_id);
+        group.updated_at_ms = self.now_ms;
+        self.write_repetition_group(group)?;
+        self.cancel_scope(self.instance_id, "repetition_limit", None, true)
+    }
+
+    fn fail_repetition_entry(
+        &mut self,
+        node: &ProcessNode,
+        token: &ProcessToken,
+        mode: ProcessRepetitionGroupMode,
+        output_collection_variable: &str,
+        max_iterations: Option<u8>,
+        entry_variables: Value,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let parent_token_id = self.wait(token, "waiting");
+        let group_id = Uuid::new_v4().to_string();
+        let message = super::repository::bounded_failure_message(&format!("{error:#}"));
+        self.incident(&node.id, None, "REPETITION_INPUT_ERROR", message);
+        let incident_id = self.plan.add_incidents.last()
+            .context("repetition entry failure has no factual incident")?.incident_id.clone();
+        self.plan.variable_effects.push(VariableEffect::RepetitionEntry {
+            event_index: self.plan.events.len(), scope_id: self.current_scope.clone(),
+            group_id: group_id.clone(), source_token_id: token.token_id.clone(),
+            parent_token_id: parent_token_id.clone(), accepted_input: self.accepted_input.clone(),
+            entry_variables: entry_variables.clone(),
+        });
+        self.event("repetition_entry_failed", Some(node.id.clone()), json!({
+            "group_id":group_id,"source_token_id":token.token_id,
+            "parent_token_id":parent_token_id,"incident_id":incident_id,
+            "code":"REPETITION_INPUT_ERROR"
+        }));
+        self.write_repetition_group(RepetitionGroup {
+            group_id, instance_id: self.instance_id.to_owned(),
+            scope_id: self.current_scope.clone(), definition_id: self.definition_id.to_owned(),
+            version: self.version, node_id: node.id.clone(), mode,
+            status: ProcessRepetitionGroupStatus::Incident,
+            source_token_id: token.token_id.clone(), parent_token_id,
+            entry_source_event_id: None, output_collection_variable: output_collection_variable.to_owned(),
+            entry_variables: entry_variables.clone(), frozen_collection: None,
+            total_count: None, created_count: 0, completed_count: 0, max_iterations,
+            loop_state: (mode == ProcessRepetitionGroupMode::StructuredLoop).then_some(entry_variables),
+            loop_state_revision: 0, next_ordinal: 0, retained_bytes: 0,
+            terminal_capacity: false, terminal_incident_id: Some(incident_id),
+            terminal_event_id: None, revision: 1, created_at_ms: self.now_ms,
+            updated_at_ms: self.now_ms,
+        })
+    }
+
+    fn block_repetition_group(
+        &mut self,
+        group_id: &str,
+        code: &str,
+        message: String,
+        last_source_event_id: Option<&str>,
+    ) -> Result<()> {
+        let mut group = self.repetition_groups.iter().find(|row| row.group_id == group_id)
+            .context("blocked repetition group is missing")?.clone();
+        self.current_scope = group.scope_id.clone();
+        self.incident(&group.node_id, None, code, message);
+        let incident_id = self.plan.add_incidents.last()
+            .context("blocked repetition group has no incident")?.incident_id.clone();
+        self.event("repetition_group_blocked", Some(group.node_id.clone()), json!({
+            "group_id":group.group_id,
+            "last_completed_ordinal":group.completed_count.checked_sub(1),
+            "last_source_event_id":last_source_event_id,
+            "incident_id":incident_id,
+            "phase":"aggregate",
+            "code":code,
+            "reason":Value::Null
+        }));
+        group.status = ProcessRepetitionGroupStatus::Incident;
+        group.terminal_incident_id = Some(incident_id);
+        group.updated_at_ms = self.now_ms;
+        self.write_repetition_group(group)
+    }
+
+    fn enter_repetition(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let repeat = node.repeat.as_ref().context("repetition configuration missing")?;
+        ensure!(matches!(node.kind, ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }),
+            "only activities can be repeated");
+        let entry_variables = self.effective()?;
+        let (mode, items, total_count, max_iterations, loop_state, output_collection_variable) = match repeat {
+            ProcessRepeatSpec::MultiInstance { mode, input, output_collection_variable } => {
+                let items = match input {
+                    ProcessMultiInstanceInput::Cardinality { count } => {
+                        vec![Value::Null; usize::from(*count)]
+                    }
+                    ProcessMultiInstanceInput::CollectionExpression { expression } => {
+                        match evaluate(expression, &entry_variables, &Value::Null, &[])
+                            .and_then(|value| value.as_array().cloned()
+                                .context("repetition collection must evaluate to an array")) {
+                            Ok(items) => items,
+                            Err(error) => return self.fail_repetition_entry(node, token,
+                                match mode {
+                                    ProcessMultiInstanceMode::Sequential => ProcessRepetitionGroupMode::MultiInstanceSequential,
+                                    ProcessMultiInstanceMode::Parallel => ProcessRepetitionGroupMode::MultiInstanceParallel,
+                                }, output_collection_variable, None, entry_variables, &error),
+                        }
+                    }
+                };
+                if items.len() > 16 {
+                    return self.fail_repetition_entry(node, token,
+                        match mode {
+                            ProcessMultiInstanceMode::Sequential => ProcessRepetitionGroupMode::MultiInstanceSequential,
+                            ProcessMultiInstanceMode::Parallel => ProcessRepetitionGroupMode::MultiInstanceParallel,
+                        }, output_collection_variable, None, entry_variables,
+                        &anyhow::anyhow!("multi-instance collection exceeds sixteen items"));
+                }
+                let mode = match mode {
+                    ProcessMultiInstanceMode::Sequential => ProcessRepetitionGroupMode::MultiInstanceSequential,
+                    ProcessMultiInstanceMode::Parallel => ProcessRepetitionGroupMode::MultiInstanceParallel,
+                };
+                (mode, items.clone(), Some(u32::try_from(items.len())?), None, None, output_collection_variable.clone())
+            }
+            ProcessRepeatSpec::StructuredLoop { max_iterations, output_collection_variable, .. } => {
+                ensure!((1..=32).contains(max_iterations), "structured loop maximum is invalid");
+                (ProcessRepetitionGroupMode::StructuredLoop, Vec::new(), None,
+                    Some(*max_iterations), Some(entry_variables.clone()), output_collection_variable.clone())
+            }
+        };
+        let parked_id = self.wait(token, "waiting");
+        let mut group = RepetitionGroup {
+            group_id: Uuid::new_v4().to_string(), instance_id: self.instance_id.to_owned(),
+            scope_id: self.current_scope.clone(), definition_id: self.definition_id.to_owned(),
+            version: self.version, node_id: node.id.clone(), mode,
+            status: ProcessRepetitionGroupStatus::Open,
+            source_token_id: token.token_id.clone(), parent_token_id: parked_id,
+            entry_source_event_id: None, output_collection_variable, entry_variables,
+            frozen_collection: if matches!(repeat, ProcessRepeatSpec::MultiInstance { input: ProcessMultiInstanceInput::CollectionExpression { .. }, .. }) {
+                Some(Value::Array(items.clone()))
+            } else { None },
+            total_count, created_count: 0, completed_count: 0, max_iterations,
+            loop_state, loop_state_revision: 0, next_ordinal: 0,
+            retained_bytes: 0, terminal_capacity: false, terminal_incident_id: None,
+            terminal_event_id: None, revision: 1,
+            created_at_ms: self.now_ms, updated_at_ms: self.now_ms,
+        };
+        let lifetime_limit = self.repetition_groups.len() >= 127;
+        if lifetime_limit {
+            group.total_count = None;
+            group.frozen_collection = None;
+        }
+        self.plan.variable_effects.push(VariableEffect::RepetitionEntry {
+            event_index: self.plan.events.len(), scope_id: group.scope_id.clone(),
+            group_id: group.group_id.clone(), source_token_id: group.source_token_id.clone(),
+            parent_token_id: group.parent_token_id.clone(), accepted_input: self.accepted_input.clone(),
+            entry_variables: group.entry_variables.clone(),
+        });
+        self.event("repetition_group_started", Some(node.id.clone()),
+            json!({"group_id":group.group_id,"source_token_id":group.source_token_id,
+                "parent_token_id":group.parent_token_id,"mode":group.mode,"total":group.total_count}));
+        self.write_repetition_group(group.clone())?;
+        if lifetime_limit {
+            let retained_bytes = self.projected_repetition_retained_bytes()?;
+            return self.latch_repetition_capacity(&group.group_id, "group_lifetime", retained_bytes, None);
+        }
+        match repeat {
+            ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Parallel, .. } => {
+                for item in items {
+                    self.spawn_repetition_occurrence(group.clone(), item)?;
+                    if self.plan.repetition_capacity.is_some() { break; }
+                }
+            }
+            ProcessRepeatSpec::MultiInstance { .. } => {
+                if let Some(item) = items.into_iter().next() {
+                    self.spawn_repetition_occurrence(group.clone(), item)?;
+                }
+            }
+            ProcessRepeatSpec::StructuredLoop { condition, test_before, .. } => {
+                let matched = if *test_before {
+                    match evaluate(condition,
+                        group.loop_state.as_ref().context("loop state missing")?, &Value::Null,
+                        &Self::repeat_extra(&group.group_id, 0, Value::Null))
+                        .and_then(|value| value.as_bool()
+                            .context("loop condition must evaluate to a boolean")) {
+                        Ok(matched) => matched,
+                        Err(error) => {
+                            self.incident(&node.id, None, "REPETITION_INPUT_ERROR",
+                                super::repository::bounded_failure_message(&format!("{error:#}")));
+                            let incident_id = self.plan.add_incidents.last()
+                                .context("loop entry failure lost its incident")?.incident_id.clone();
+                            self.event("repetition_entry_failed", Some(node.id.clone()), json!({
+                                "group_id":group.group_id,"source_token_id":group.source_token_id,
+                                "parent_token_id":group.parent_token_id,"incident_id":incident_id,
+                                "code":"REPETITION_INPUT_ERROR"
+                            }));
+                            let mut failed = group.clone();
+                            failed.status = ProcessRepetitionGroupStatus::Incident;
+                            failed.terminal_incident_id = Some(incident_id);
+                            self.write_repetition_group(failed)?;
+                            return Ok(());
+                        }
+                    }
+                } else { true };
+                if *test_before {
+                    self.event("repetition_condition_checked", Some(node.id.clone()),
+                        json!({"group_id":group.group_id,"candidate_ordinal":0,"phase":"before_first",
+                            "previous_source_event_id":Value::Null,"matched":matched}));
+                }
+                if matched { self.spawn_repetition_occurrence(group.clone(), Value::Null)?; }
+            }
+        }
+        if self.plan.repetition_capacity.is_some() { return Ok(()); }
+        if self.repetition_groups.iter().find(|row| row.group_id == group.group_id)
+            .is_some_and(|row| row.created_count == 0) {
+            self.finish_repetition_group(&group.group_id)?;
+        }
+        Ok(())
+    }
+
+    fn finish_repetition_group(&mut self, group_id: &str) -> Result<()> {
+        let mut group = self.repetition_groups.iter().find(|row| row.group_id == group_id)
+            .context("completed repetition group is missing")?.clone();
+        ensure!(group.status == ProcessRepetitionGroupStatus::Open,
+            "repetition group completed from a non-open status");
+        let mut completed = self.repetition_occurrences.iter()
+            .filter(|row| row.group_id == group_id).cloned().collect::<Vec<_>>();
+        completed.sort_by_key(|row| row.ordinal);
+        ensure!(completed.len() == usize::try_from(group.completed_count)?
+            && completed.iter().enumerate().all(|(ordinal, row)|
+                row.ordinal == ordinal as u32 && row.status == ProcessRepetitionOccurrenceStatus::Completed),
+            "repetition aggregate is missing an accepted ordinal");
+        let aggregate = Value::Array(completed.iter().map(|row|
+            row.aggregate_item.clone().context("completed occurrence has no aggregate item")
+        ).collect::<Result<Vec<_>>>()?);
+        let last_source = completed.last().and_then(|row| row.accepted_source_event_id.clone());
+        if let Err(error) = validate_output(&aggregate) {
+            return self.block_repetition_group(group_id, "REPETITION_AGGREGATE_LIMIT",
+                super::repository::bounded_failure_message(&error.to_string()),
+                last_source.as_deref());
+        }
+        let parent = self.tokens.iter().find(|token| token.token_id == group.parent_token_id
+            && token.scope_id == group.scope_id && token.status == "waiting")
+            .context("completed repetition group lost its parked parent")?.clone();
+        self.current_scope = group.scope_id.clone();
+        let mut variables = self.local()?.as_object()
+            .context("repetition parent variables are not an object")?.clone();
+        if !variables.contains_key(&group.output_collection_variable) {
+            return self.block_repetition_group(group_id, "REPETITION_MAPPING_FAILED",
+                "repetition output target is absent from the parent variables".into(),
+                last_source.as_deref());
+        }
+        variables.insert(group.output_collection_variable.clone(), aggregate.clone());
+        let patched = Value::Object(variables);
+        if let Err(error) = validate_variables(&patched) {
+            return self.block_repetition_group(group_id, "REPETITION_AGGREGATE_LIMIT",
+                super::repository::bounded_failure_message(&error.to_string()),
+                last_source.as_deref());
+        }
+        let retained_bytes = self.projected_repetition_admission_bytes()?;
+        let completion = json!({"group_id":group.group_id,"completed":group.completed_count,
+            "parent_token_id":group.parent_token_id});
+        let candidate_bytes = retained_bytes
+            .checked_add(u64::try_from(serde_json::to_vec(&completion)?.len())?)
+            .context("repetition parent completion byte count overflow")?;
+        if candidate_bytes > 64 * 1024 * 1024 {
+            return self.latch_repetition_capacity(group_id, "repetition_bytes",
+                self.projected_repetition_retained_bytes()?,
+                Some((RepetitionDeniedBytes::ParentAggregate {
+                    final_ordinal:group.completed_count.checked_sub(1),
+                    source_event_id:last_source,
+                }, candidate_bytes)));
+        }
+        self.plan.variable_effects.push(VariableEffect::RepetitionAggregate {
+            event_index: self.plan.events.len(), scope_id: group.scope_id.clone(),
+            group_id: group.group_id.clone(), parent_token_id: group.parent_token_id.clone(),
+            output_target: group.output_collection_variable.clone(),
+            accepted_input: self.accepted_input.clone(), aggregate, result: patched.clone(),
+        });
+        self.set_variables(patched)?;
+        self.disarm_boundaries(&parent.token_id, "activity_completed", None)?;
+        self.resolve_boundary_incidents(&parent.token_id);
+        self.consume(&parent.token_id);
+        group.status = ProcessRepetitionGroupStatus::Completed;
+        if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+            group.total_count = Some(group.completed_count);
+        }
+        group.updated_at_ms = self.now_ms;
+        self.event("repetition_completed", Some(group.node_id.clone()),
+            json!({"group_id":group.group_id,"completed":group.completed_count,
+                "parent_token_id":group.parent_token_id}));
+        self.write_repetition_group(group.clone())?;
+        for edge in self.outgoing(&group.node_id) {
+            self.follow(&parent, &edge)?;
+        }
+        Ok(())
+    }
+
+    fn complete_repetition_occurrence(
+        &mut self,
+        token: &ProcessToken,
+        outputs: &Value,
+        source_event_id: String,
+        approval_event_id: Option<String>,
+        origin: Option<super::repository::ActivityResultOrigin>,
+    ) -> Result<()> {
+        let (mut group, mut occurrence) = self.repetition_for_token(&token.token_id)
+            .context("accepted repetition result has no active occurrence")?;
+        ensure!(matches!(group.status,
+                ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
+            && !group.terminal_capacity
+            && matches!(occurrence.status,
+                ProcessRepetitionOccurrenceStatus::Active | ProcessRepetitionOccurrenceStatus::AwaitingVerification),
+            "accepted repetition result is not waiting for its ordinal");
+        occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+        occurrence.accepted_source_event_id = Some(source_event_id.clone());
+        occurrence.approval_event_id = approval_event_id.clone();
+        occurrence.accepted_origin = origin.clone();
+        occurrence.updated_at_ms = self.now_ms;
+        self.write_repetition_occurrence(occurrence.clone())?;
+        let retained_bytes = self.projected_repetition_retained_bytes()?;
+        if retained_bytes > 64 * 1024 * 1024 {
+            return self.latch_repetition_capacity(&group.group_id,
+                "repetition_bytes", retained_bytes, None);
+        }
+        let accepted_state = self.clone();
+        let node = self.node(&group.node_id)?.clone();
+        if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+            let mapping = match &node.kind {
+                ProcessNodeKind::UserTask { output_mapping, .. }
+                | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
+                _ => anyhow::bail!("repeated node is not an activity"),
+            };
+            let prior = group.loop_state.as_ref().context("structured loop state is missing")?;
+            let next = match patch_variables(mapping, prior, prior, outputs,
+                &Self::repeat_extra(&group.group_id, occurrence.ordinal, Value::Null)) {
+                Ok(next) => next,
+                Err(error) => {
+                    return self.block_repetition_group(&group.group_id,
+                        "REPETITION_MAPPING_FAILED",
+                        super::repository::bounded_failure_message(&error.to_string()),
+                        Some(&source_event_id));
+                }
+            };
+            let mut patch = serde_json::Map::new();
+            for key in mapping.keys() {
+                patch.insert(key.clone(), next[key].clone());
+            }
+            occurrence.state_patch = Some(Value::Object(patch));
+            occurrence.state_after = Some(next.clone());
+            group.loop_state = Some(next);
+            group.loop_state_revision = group.loop_state_revision.checked_add(1)
+                .context("structured loop state revision overflow")?;
+        }
+        occurrence.status = ProcessRepetitionOccurrenceStatus::Completed;
+        occurrence.aggregate_item = Some(outputs.clone());
+        occurrence.accepted_source_event_id = Some(source_event_id.clone());
+        occurrence.approval_event_id = approval_event_id;
+        occurrence.accepted_origin = origin;
+        occurrence.updated_at_ms = self.now_ms;
+        self.write_repetition_occurrence(occurrence.clone())?;
+        group.completed_count = group.completed_count.checked_add(1)
+            .context("repetition completed count overflow")?;
+        group.updated_at_ms = self.now_ms;
+        self.write_repetition_group(group.clone())?;
+        self.event("repetition_occurrence_completed", Some(group.node_id.clone()),
+            json!({"group_id":group.group_id,"occurrence_id":occurrence.occurrence_id,
+                "ordinal":occurrence.ordinal,"source_event_id":source_event_id}));
+        let retained_bytes = self.projected_repetition_admission_bytes()?;
+        if retained_bytes > 64 * 1024 * 1024 {
+            *self = accepted_state;
+            let accepted_bytes = self.projected_repetition_retained_bytes()?;
+            return self.latch_repetition_capacity(&group.group_id,
+                "repetition_bytes", accepted_bytes,
+                Some((RepetitionDeniedBytes::AcceptedMapping {
+                    occurrence_id: occurrence.occurrence_id.clone(),
+                    accepted_source_event_id: source_event_id.clone(),
+                }, retained_bytes)));
+        }
+        let node = self.node(&group.node_id)?.clone();
+        match node.repeat.as_ref().context("pinned repetition configuration missing")? {
+            ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Sequential, .. }
+                if group.created_count < group.total_count.context("multi-instance total missing")? => {
+                let item = if let Some(collection) = &group.frozen_collection {
+                    collection.as_array().and_then(|items| items.get(usize::try_from(group.next_ordinal).ok()?))
+                        .context("next repetition ordinal is absent from its frozen collection")?.clone()
+                } else {
+                    Value::Null
+                };
+                self.spawn_repetition_occurrence(group, item)?;
+            }
+            ProcessRepeatSpec::MultiInstance { .. } => {
+                if group.completed_count == group.total_count.context("multi-instance total missing")? {
+                    self.finish_repetition_group(&group.group_id)?;
+                }
+            }
+            ProcessRepeatSpec::StructuredLoop { condition, max_iterations, .. } => {
+                if group.completed_count >= u32::from(*max_iterations) {
+                    self.finish_repetition_group(&group.group_id)?;
+                } else {
+                    let matched = evaluate(condition,
+                        group.loop_state.as_ref().context("loop state missing")?, &Value::Null,
+                        &Self::repeat_extra(&group.group_id, group.next_ordinal, Value::Null))
+                        .and_then(|value| value.as_bool()
+                            .context("loop condition must evaluate to a boolean"));
+                    let matched = match matched {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.block_repetition_group(&group.group_id,
+                                "REPETITION_MAPPING_FAILED",
+                                super::repository::bounded_failure_message(&error.to_string()),
+                                Some(&source_event_id))?;
+                            return Ok(());
+                        }
+                    };
+                    self.event("repetition_condition_checked", Some(group.node_id.clone()),
+                        json!({"group_id":group.group_id,"candidate_ordinal":group.next_ordinal,
+                            "phase":"after_accepted",
+                            "previous_source_event_id":source_event_id,"matched":matched}));
+                    if matched {
+                        self.spawn_repetition_occurrence(group, Value::Null)?;
+                    } else {
+                        self.finish_repetition_group(&group.group_id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn arm_timer(
         &mut self,
         node: &ProcessNode,
@@ -695,7 +1464,7 @@ impl<'a> Transition<'a> {
             .find(|scope| scope.parent_token_id.as_deref() == Some(token.token_id.as_str()))
             .cloned()
         {
-            self.cancel_scope(&child.scope_id, winning_timer_id, None)?;
+            self.cancel_scope(&child.scope_id, winning_timer_id, None, false)?;
         }
         let job_ids = self
             .jobs
@@ -753,8 +1522,9 @@ impl<'a> Transition<'a> {
         Ok(())
     }
 
-    fn cancel_scope(&mut self, root: &str, boundary_id: &str, termination: Option<&super::repository::TerminationSource>) -> Result<()> {
-        let reason = if termination.is_some() { "terminate_end" } else { "scope_cancelled" };
+    fn cancel_scope(&mut self, root: &str, boundary_id: &str, termination: Option<&super::repository::TerminationSource>, capacity: bool) -> Result<()> {
+        let reason = if termination.is_some() { "terminate_end" } else if capacity { "repetition_limit" } else { "scope_cancelled" };
+        let first_cancellation_event = self.plan.events.len();
         let closure = super::repository::descendant_scope_ids(&self.scopes, root)?;
         let active = self
             .scopes
@@ -819,6 +1589,28 @@ impl<'a> Transition<'a> {
         );
         self.jobs
             .retain(|job| !self.plan.cancel_job_ids.contains(&job.job_id));
+        for mut occurrence in self.repetition_occurrences.iter()
+            .filter(|row| active_ids.contains(&row.scope_id)
+                && matches!(row.status,
+                    ProcessRepetitionOccurrenceStatus::Pending
+                    | ProcessRepetitionOccurrenceStatus::Active
+                    | ProcessRepetitionOccurrenceStatus::AwaitingVerification
+                    | ProcessRepetitionOccurrenceStatus::RetryableError))
+            .cloned().collect::<Vec<_>>() {
+            occurrence.status = ProcessRepetitionOccurrenceStatus::Cancelled;
+            occurrence.updated_at_ms = self.now_ms;
+            self.write_repetition_occurrence(occurrence)?;
+        }
+        for mut group in self.repetition_groups.iter()
+            .filter(|row| active_ids.contains(&row.scope_id)
+                && matches!(row.status,
+                    ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
+                && !row.terminal_capacity)
+            .cloned().collect::<Vec<_>>() {
+            group.status = ProcessRepetitionGroupStatus::Cancelled;
+            group.updated_at_ms = self.now_ms;
+            self.write_repetition_group(group)?;
+        }
         let previous = self.current_scope.clone();
         for timer in self
             .timers
@@ -861,6 +1653,14 @@ impl<'a> Transition<'a> {
                 json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_to_id":attached_to_id,
                     "attached_token_id":timer.token_id,"reason":reason,
                     "source_instance_id":source.source_instance_id,"source_event_id":source.source_event_id})
+            } else if capacity {
+                let attached_to_id = match &self.node(&timer.node_id)?.kind {
+                    ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.clone()),
+                    ProcessNodeKind::TimerCatch { .. } => Some(timer.node_id.clone()),
+                    _ => anyhow::bail!("capacity timer is outside its pinned catch or boundary node"),
+                };
+                json!({"timer_id":timer.timer_id,"kind":timer.kind,
+                    "attached_to_id":attached_to_id,"attached_token_id":timer.token_id,"reason":reason})
             } else {
                 json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_token_id":timer.token_id,"reason":reason})
             };
@@ -925,7 +1725,9 @@ impl<'a> Transition<'a> {
             .incidents
             .iter()
             .chain(self.plan.add_incidents.iter())
-            .filter(|incident| active_ids.contains(&incident.scope_id))
+            .filter(|incident| active_ids.contains(&incident.scope_id)
+                && self.plan.repetition_capacity.as_ref().is_none_or(|source|
+                    source.incident_id != incident.incident_id))
             .map(|incident| incident.incident_id.clone())
             .collect::<Vec<_>>()
         {
@@ -945,6 +1747,20 @@ impl<'a> Transition<'a> {
                 json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,
                     "subprocess_node_id":scope.subprocess_node_id,"reason":reason,"boundary_id":boundary_id})
             });
+        }
+        if capacity {
+            let source = self.plan.repetition_capacity.as_ref()
+                .context("capacity closure has no source fact")?;
+            for event in &mut self.plan.events[first_cancellation_event..] {
+                if matches!(event.kind.as_str(), "timer_cancelled" | "subscription_cancelled"
+                    | "event_race_cancelled" | "scope_cancelled") {
+                    let data = event.data.as_object_mut()
+                        .context("capacity cancellation fact is not an object")?;
+                    data.remove("boundary_id");
+                    data.insert("source_instance_id".into(), json!(self.instance_id));
+                    data.insert("source_event_id".into(), json!(source.event_id));
+                }
+            }
         }
         self.current_scope = previous;
         Ok(())
@@ -1051,7 +1867,7 @@ impl<'a> Transition<'a> {
             }
         } else {
             self.current_scope = self.instance_id.to_owned();
-            self.cancel_scope(self.instance_id, "error_end", None)?;
+            self.cancel_scope(self.instance_id, "error_end", None, false)?;
             for id in self
                 .incidents
                 .iter()
@@ -1729,7 +2545,7 @@ impl<'a> Transition<'a> {
         }));
         self.plan.termination_attempts.push(TerminationAttempt::Success(source.clone()));
         self.consume(&token.token_id);
-        self.cancel_scope(&token.scope_id, &node.id, Some(&source))?;
+        self.cancel_scope(&token.scope_id, &node.id, Some(&source), false)?;
         if let Some((parent_scope_id, parent_wait, parent_node, child_locals, _patch)) = return_patch {
             self.update_scope(&token.scope_id, ProcessInstanceStatus::Completed, Some(child_locals.clone()))?;
             self.event("scope_completed", None, json!({
@@ -1761,6 +2577,9 @@ impl<'a> Transition<'a> {
             .find(|token| token.status == "ready")
             .cloned()
         {
+            if self.plan.repetition_capacity.is_some() {
+                break;
+            }
             self.accepted_input = Some(if let Some(input) = self.token_inputs.get(&token.token_id) {
                 input.clone()
             } else {
@@ -1774,6 +2593,10 @@ impl<'a> Transition<'a> {
             self.current_scope = token.scope_id.clone();
             let id = token.token_id.clone();
             let node = self.node(&token.node_id)?.clone();
+            if node.repeat.is_some() && self.repetition_for_token(&id).is_none() {
+                self.enter_repetition(&node, &token)?;
+                continue;
+            }
             let outgoing = self.outgoing(&node.id);
             match node.kind.clone() {
                 ProcessNodeKind::Start
@@ -1808,6 +2631,13 @@ impl<'a> Transition<'a> {
                         Value::Null,
                         &token_id,
                     );
+                    if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                        occurrence.token_id = token_id.clone();
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                        occurrence.user_task_id = self.plan.create_user_tasks.last().map(|task| task.user_task_id.clone());
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence)?;
+                    }
                     self.arm_boundaries(&node, &token_id)?;
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
@@ -1839,7 +2669,22 @@ impl<'a> Transition<'a> {
                     anyhow::bail!("boundary events are entered only by their attached timer")
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
-                    match prepare_service_input(&input_mapping, &self.effective()?) {
+                    let repeated = self.repetition_for_token(&id);
+                    if let Some((group, _)) = &repeated {
+                        if self.active_repetition_service_jobs() >= 32 {
+                            let retained_bytes = self.projected_repetition_retained_bytes()?;
+                            self.latch_repetition_capacity(&group.group_id,
+                                "active_service_jobs", retained_bytes, None)?;
+                            break;
+                        }
+                    }
+                    let (variables, extra) = if let Some((group, occurrence)) = &repeated {
+                        (occurrence.input_variables.clone(),
+                            Self::repeat_extra(&group.group_id, occurrence.ordinal, occurrence.item.clone()))
+                    } else {
+                        (self.effective()?, Vec::new())
+                    };
+                    match prepare_service_input(&input_mapping, &variables, &extra) {
                         Ok(input) => {
                             let token_id = self.wait(&token, "waiting");
                             let job = ProcessJob {
@@ -1865,6 +2710,13 @@ impl<'a> Transition<'a> {
                             );
                             self.jobs.push(job.clone());
                             self.plan.create_jobs.push(job);
+                            if let Some((_, mut occurrence)) = repeated {
+                                occurrence.token_id = token_id.clone();
+                                occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                                occurrence.job_id = self.plan.create_jobs.last().map(|job| job.job_id.clone());
+                                occurrence.updated_at_ms = self.now_ms;
+                                self.write_repetition_occurrence(occurrence)?;
+                            }
                             self.arm_boundaries(&node, &token_id)?;
                         }
                         Err(error) => {
@@ -2211,6 +3063,8 @@ impl<'a> Transition<'a> {
     fn finish(mut self) -> Result<RuntimePlan> {
         self.plan.status = if self.plan.terminal_error.is_some() {
             ProcessInstanceStatus::Error
+        } else if self.plan.repetition_capacity.is_some() {
+            ProcessInstanceStatus::Cancelled
         } else if self
             .incidents
             .iter()
@@ -2430,6 +3284,20 @@ pub(super) fn project_snapshot(
         race.winner_node_id = update.winner_node_id.clone();
         race.winner_timer_id = update.winner_timer_id.clone();
         race.winner_subscription_id = update.winner_subscription_id.clone();
+    }
+    for group in &plan.repetition_groups {
+        if let Some(current) = next.repetition_groups.iter_mut().find(|row| row.group_id == group.group_id) {
+            *current = group.clone();
+        } else {
+            next.repetition_groups.push(group.clone());
+        }
+    }
+    for occurrence in &plan.repetition_occurrences {
+        if let Some(current) = next.repetition_occurrences.iter_mut().find(|row| row.occurrence_id == occurrence.occurrence_id) {
+            *current = occurrence.clone();
+        } else {
+            next.repetition_occurrences.push(occurrence.clone());
+        }
     }
     if let Some(root) = next
         .scopes
@@ -2771,6 +3639,14 @@ pub fn plan_user_completion(
                     "HUMAN_REJECTED",
                     "the activity result was rejected by its verifier".into(),
                 );
+                if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+                    occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                    occurrence.updated_at_ms = now_ms;
+                    transition.write_repetition_occurrence(occurrence)?;
+                    group.status = ProcessRepetitionGroupStatus::Incident;
+                    group.updated_at_ms = now_ms;
+                    transition.write_repetition_group(group)?;
+                }
                 transition.event(
                     "verification_rejected",
                     Some(node.id),
@@ -2788,6 +3664,48 @@ pub fn plan_user_completion(
         | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
         _ => anyhow::bail!("user task node is not an activity"),
     };
+    if let Some((_, occurrence)) = transition.repetition_for_token(&token.token_id) {
+        if task.kind == ProcessUserTaskKind::Work {
+            transition.accepted_repetition_task = Some((task_id.to_owned(), outputs.clone()));
+        }
+        transition.plan.complete_user_task_ids.push(task_id.to_owned());
+        transition.tasks.retain(|existing| existing.user_task_id != task_id);
+        transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+        transition.resolve_boundary_incidents(&token.token_id);
+        transition.consume(&token.token_id);
+        let event_index = transition.plan.events.len();
+        let event_id = Uuid::new_v4().to_string();
+        transition.plan.event_ids.insert(event_index, event_id.clone());
+        transition.event(
+            if task.kind == ProcessUserTaskKind::Work { "user_task_completed" } else { "verification_approved" },
+            Some(node.id), json!({"user_task_id":task_id,"outputs":outputs}),
+        );
+        let source_id = if task.kind == ProcessUserTaskKind::Work {
+            event_id.clone()
+        } else {
+            occurrence.accepted_source_event_id.context("verification lost its accepted Service source")?
+        };
+        let accepted = transition.clone();
+        if let Err(error) = transition.complete_repetition_occurrence(&token, &effective_outputs, source_id.clone(),
+            (task.kind == ProcessUserTaskKind::Verification).then_some(event_id.clone()),
+            occurrence.accepted_origin.clone()) {
+            transition = accepted;
+            let (group, mut current) = transition.repetition_for_token(&token.token_id)
+                .context("repeated Human source disappeared after mapping failure")?;
+            current.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+            current.accepted_source_event_id = Some(source_id);
+            if task.kind == ProcessUserTaskKind::Verification {
+                current.approval_event_id = Some(event_id.clone());
+            }
+            current.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(current)?;
+            transition.block_repetition_group(&group.group_id, "REPETITION_MAPPING_FAILED",
+                super::repository::bounded_failure_message(&error.to_string()), Some(&event_id))?;
+            return transition.finish();
+        }
+        transition.advance()?;
+        return transition.finish();
+    }
     transition.map_outputs(&node.id, &token.token_id, mapping, &effective_outputs, &[])?;
     transition
         .plan
@@ -2851,6 +3769,88 @@ pub fn plan_job_result(
         data["result_origin"] = json!(super::repository::result_origin_text(&observed.origin));
         data
     });
+    if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+        transition.accepted_repetition_result = Some((job.job_id.clone(), result.clone()));
+        let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
+            .context("repeated Service lost its fenced source")? else {
+            anyhow::bail!("repeated Service has no fenced source");
+        };
+        let result_event_id = result_event_id.clone();
+        transition.plan.event_ids.insert(0, result_event_id.clone());
+        occurrence.accepted_source_event_id = Some(result_event_id.clone());
+        occurrence.accepted_origin = Some(observed.origin.clone());
+        if matches!(result.outcome, ActivityOutcome::Error | ActivityOutcome::Cancelled) {
+            occurrence.status = if result.outcome == ActivityOutcome::Error {
+                ProcessRepetitionOccurrenceStatus::RetryableError
+            } else {
+                ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+            };
+            occurrence.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(occurrence)?;
+            group.status = ProcessRepetitionGroupStatus::Incident;
+            group.updated_at_ms = now_ms;
+            transition.write_repetition_group(group)?;
+            transition.incident(&node.id, Some(job.job_id.clone()),
+                result.code.as_deref().unwrap_or("SERVICE_ERROR"), result.summary.clone());
+            return transition.finish();
+        }
+        if result.outcome == ActivityOutcome::NeedsHuman
+            || matches!(verification, ActivityVerification::Human)
+        {
+            transition.user_task(&node, ProcessUserTaskKind::Verification,
+                transition.initiator.to_owned(), serde_json::to_value(result)?, &token.token_id);
+            occurrence.status = ProcessRepetitionOccurrenceStatus::AwaitingVerification;
+            occurrence.verification_user_task_id = transition.plan.create_user_tasks.last()
+                .map(|task| task.user_task_id.clone());
+            occurrence.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(occurrence)?;
+            return transition.finish();
+        }
+        let ActivityVerification::Condition { expression } = verification else {
+            anyhow::bail!("repeated Service verification mode is invalid");
+        };
+        let approved = evaluate(expression, &occurrence.input_variables, &result.outputs,
+            &Transition::repeat_extra(&group.group_id, occurrence.ordinal, occurrence.item.clone()))
+            .and_then(|value| value.as_bool().context("process condition must evaluate to a boolean"));
+        let failure = match approved {
+            Ok(true) => None,
+            Ok(false) => Some(("VERIFICATION_FAILED", "the configured condition did not accept the activity result".to_owned())),
+            Err(error) => Some(("EXPRESSION_ERROR", error.to_string())),
+        };
+        if let Some((code, message)) = failure {
+            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+            occurrence.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(occurrence)?;
+            group.status = ProcessRepetitionGroupStatus::Incident;
+            group.updated_at_ms = now_ms;
+            transition.write_repetition_group(group)?;
+            transition.incident(&node.id, Some(job.job_id.clone()), code, message);
+            return transition.finish();
+        }
+        transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+        transition.resolve_boundary_incidents(&token.token_id);
+        transition.consume(&token.token_id);
+        transition.event("verification_passed", Some(node.id.clone()),
+            json!({"expression":expression}));
+        let before_mapping = transition.clone();
+        if let Err(error) = transition.complete_repetition_occurrence(&token, &result.outputs,
+            result_event_id, None, Some(observed.origin.clone())) {
+            transition = before_mapping;
+            let (group, mut occurrence) = transition.repetition_for_token(&token.token_id)
+                .context("repeated Service source disappeared after mapping failure")?;
+            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+            occurrence.accepted_source_event_id = transition.plan.event_ids.get(&0).cloned();
+            occurrence.accepted_origin = Some(observed.origin.clone());
+            occurrence.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(occurrence)?;
+            transition.block_repetition_group(&group.group_id, "REPETITION_MAPPING_FAILED",
+                super::repository::bounded_failure_message(&error.to_string()),
+                transition.plan.event_ids.get(&0).cloned().as_deref())?;
+            return transition.finish();
+        }
+        transition.advance()?;
+        return transition.finish();
+    }
     if observed.origin == super::repository::ActivityResultOrigin::Contract
         && result.outcome == ActivityOutcome::NeedsHuman
     {
@@ -3659,6 +4659,7 @@ pub(crate) mod test_support {
                     assignee_user_id: assignee.map(str::to_owned),
                     output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -3687,6 +4688,7 @@ pub(crate) mod test_support {
 
                     result_expression: None,
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -3710,6 +4712,7 @@ pub(crate) mod test_support {
                 id: start_id.clone(),
                 name: "Enter embedded work".into(),
                 kind: ProcessNodeKind::Start,
+                repeat: None,
             },
             ProcessNode {
                 id: scope_id.into(),
@@ -3719,11 +4722,13 @@ pub(crate) mod test_support {
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: end_id.clone(),
                 name: "Finish embedded work".into(),
                 kind: ProcessNodeKind::End,
+                repeat: None,
             },
         ];
         model.sequence_flows = vec![
@@ -3757,6 +4762,7 @@ pub(crate) mod test_support {
                         seconds: *seconds,
                     },
                 },
+                repeat: None,
             });
             model
                 .sequence_flows
@@ -4052,9 +5058,11 @@ mod tests {
                     body: ProcessSubProcess {
                         nodes: vec![
                             ProcessNode { id: "ChildStart".into(), name: "Child start".into(),
-                                kind: ProcessNodeKind::Start },
+                                kind: ProcessNodeKind::Start,
+                                repeat: None, },
                             ProcessNode { id: "ChildTerminate".into(), name: "Child termination".into(),
-                                kind: ProcessNodeKind::TerminateEnd },
+                                kind: ProcessNodeKind::TerminateEnd,
+                                repeat: None, },
                         ],
                         sequence_flows: vec![edge("ChildFlow", "ChildStart", "ChildTerminate")],
                         variables: BTreeMap::from([("child_value".into(), json!(41))]),
@@ -4063,9 +5071,11 @@ mod tests {
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::from([("received".into(),
                         "outputs.child_value".into())]),
-                } },
+                },
+                repeat: None, },
             ProcessNode { id: "RootTerminate".into(), name: "Root termination".into(),
-                kind: ProcessNodeKind::TerminateEnd },
+                kind: ProcessNodeKind::TerminateEnd,
+                repeat: None, },
         ]);
         model.sequence_flows = vec![edge("RootChild", "Start_1", "Scope"),
             edge("ChildRootTerminate", "Scope", "RootTerminate")];
@@ -4242,6 +5252,7 @@ mod tests {
                     id: "Split".into(),
                     name: "Parallel".into(),
                     kind: ProcessNodeKind::ParallelGateway,
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "Left".into(),
@@ -4250,6 +5261,7 @@ mod tests {
                         assignee_user_id: None,
                         output_mapping: BTreeMap::new(),
                     },
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "Right".into(),
@@ -4258,11 +5270,13 @@ mod tests {
                         assignee_user_id: Some(fixture.participant.user_id.clone()),
                         output_mapping: BTreeMap::new(),
                     },
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "Join".into(),
                     name: "All reviews".into(),
                     kind: ProcessNodeKind::ParallelGateway,
+                    repeat: None,
                 },
             ],
         );
@@ -4401,23 +5415,29 @@ mod tests {
             };
             model.nodes.splice(1..1, [
                 ProcessNode { id: "Split".into(), name: "Run selected branches".into(),
-                    kind: gateway() },
+                    kind: gateway(),
+                    repeat: None, },
                 ProcessNode { id: "LeftWork".into(), name: "First join arrival".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
-                        output_mapping: BTreeMap::new() } },
+                        output_mapping: BTreeMap::new() },
+                    repeat: None, },
                 ProcessNode { id: "RightWork".into(), name: "Outstanding join branch".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
-                        output_mapping: BTreeMap::new() } },
+                        output_mapping: BTreeMap::new() },
+                    repeat: None, },
                 ProcessNode { id: "TerminateWork".into(), name: "Factual terminating input".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
-                        output_mapping: BTreeMap::new() } },
+                        output_mapping: BTreeMap::new() },
+                    repeat: None, },
                 ProcessNode { id: "Join".into(), name: "Join normal branches".into(),
-                    kind: gateway() },
+                    kind: gateway(),
+                    repeat: None, },
                 ProcessNode { id: "Terminate".into(), name: "Stop this instance".into(),
-                    kind: ProcessNodeKind::TerminateEnd },
+                    kind: ProcessNodeKind::TerminateEnd,
+                    repeat: None, },
             ]);
             model.sequence_flows = vec![
                 edge("StartSplit", "Start_1", "Split"),
@@ -4568,12 +5588,14 @@ mod tests {
                     kind: ProcessNodeKind::ExclusiveGateway {
                         default_flow_id: default.map(str::to_owned),
                     },
+                    repeat: None,
                 },
             );
             model.nodes.push(ProcessNode {
                 id: "OtherEnd".into(),
                 name: "Alternative".into(),
                 kind: ProcessNodeKind::End,
+                repeat: None,
             });
             model.sequence_flows = vec![
                 edge("ToChoice", "Start_1", "Choice"),
@@ -4614,15 +5636,20 @@ mod tests {
         model.variables.insert("b".into(), json!(b));
         model.nodes.splice(1..1, [
             ProcessNode { id: "Split".into(), name: "Choose reviews".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: default.map(str::to_owned) } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: default.map(str::to_owned) },
+                repeat: None, },
             ProcessNode { id: "A".into(), name: "Review A".into(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "B".into(), name: "Review B".into(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "C".into(), name: "Review C".into(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "Join".into(), name: "Selected reviews".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"), edge("To_A", "Split", "A"),
@@ -4718,19 +5745,24 @@ mod tests {
             let mut model = super::super::model::starter_model();
             model.nodes.insert(1, ProcessNode { id: "OuterSplit".into(), name: "Choose".into(),
                 kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
-                    else { ProcessNodeKind::ParallelGateway } });
+                    else { ProcessNodeKind::ParallelGateway },
+                repeat: None, });
             model.nodes.insert(2, ProcessNode { id: "InnerSplit".into(), name: "Nested choice".into(),
                 kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
-                    else { ProcessNodeKind::ParallelGateway } });
+                    else { ProcessNodeKind::ParallelGateway },
+                repeat: None, });
             model.nodes.insert(3, ProcessNode { id: "InnerJoin".into(), name: "Nested done".into(),
                 kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
-                    else { ProcessNodeKind::ParallelGateway } });
+                    else { ProcessNodeKind::ParallelGateway },
+                repeat: None, });
             model.nodes.insert(4, ProcessNode { id: "OuterJoin".into(), name: "Selected done".into(),
                 kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
-                    else { ProcessNodeKind::ParallelGateway } });
+                    else { ProcessNodeKind::ParallelGateway },
+                repeat: None, });
             for id in ["A", "B", "C"] {
                 model.nodes.push(ProcessNode { id: id.into(), name: id.into(),
-                    kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+                    kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                    repeat: None, });
             }
             model.sequence_flows = vec![
                 edge("StartOuter", "Start_1", "OuterSplit"),
@@ -4787,14 +5819,17 @@ mod tests {
         let fixture = Fixture::new();
         let mut model = super::super::model::starter_model();
         model.nodes.insert(1, ProcessNode { id: "Split".into(), name: "Parallel".into(),
-            kind: ProcessNodeKind::ParallelGateway });
+            kind: ProcessNodeKind::ParallelGateway,
+            repeat: None, });
         model.nodes.insert(2, ProcessNode { id: "Join".into(), name: "All branches".into(),
-            kind: ProcessNodeKind::ParallelGateway });
+            kind: ProcessNodeKind::ParallelGateway,
+            repeat: None, });
         model.sequence_flows = vec![edge("StartSplit", "Start_1", "Split")];
         for index in 0..9 {
             let node_id = format!("Branch_{index}");
             model.nodes.push(ProcessNode { id: node_id.clone(), name: node_id.clone(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, });
             model.sequence_flows.push(edge(&format!("To_{index}"), "Split", &node_id));
             model.sequence_flows.push(edge(&format!("From_{index}"), &node_id, "Join"));
         }
@@ -5770,6 +6805,7 @@ mod tests {
                         id: "ChildSplit".into(),
                         name: "Start local parallel work".into(),
                         kind: ProcessNodeKind::ParallelGateway,
+                        repeat: None,
                     },
                     ProcessNode {
                         id: "ChildA".into(),
@@ -5778,6 +6814,7 @@ mod tests {
                             assignee_user_id: None,
                             output_mapping: BTreeMap::new(),
                         },
+                        repeat: None,
                     },
                     ProcessNode {
                         id: "ChildB".into(),
@@ -5786,11 +6823,13 @@ mod tests {
                             assignee_user_id: None,
                             output_mapping: BTreeMap::new(),
                         },
+                        repeat: None,
                     },
                     ProcessNode {
                         id: "ChildJoin".into(),
                         name: "Finish local parallel work".into(),
                         kind: ProcessNodeKind::ParallelGateway,
+                        repeat: None,
                     },
                 ],
             );
@@ -5808,6 +6847,7 @@ mod tests {
                     id: "ParentSplit".into(),
                     name: "Start parent parallel work".into(),
                     kind: ProcessNodeKind::ParallelGateway,
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "Peer".into(),
@@ -5816,11 +6856,13 @@ mod tests {
                         assignee_user_id: None,
                         output_mapping: BTreeMap::new(),
                     },
+                    repeat: None,
                 },
                 ProcessNode {
                     id: "ParentJoin".into(),
                     name: "Finish parent parallel work".into(),
                     kind: ProcessNodeKind::ParallelGateway,
+                    repeat: None,
                 },
             ]);
             model.sequence_flows = vec![
@@ -6229,12 +7271,14 @@ mod tests {
                 id: "LocalSplit".into(),
                 name: "Start child branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
             other,
             ProcessNode {
                 id: "LocalJoin".into(),
                 name: "Finish child branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
         ]);
         child.sequence_flows = vec![
@@ -6263,6 +7307,7 @@ mod tests {
                         ("customer".into(), "outputs.customer_ID".into()),
                     ]),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "NearWork".into(),
@@ -6271,6 +7316,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
         ]);
         inner.sequence_flows.extend([
@@ -6287,6 +7333,7 @@ mod tests {
                     error_ref: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "FarWork".into(),
@@ -6295,6 +7342,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
         ]);
         model.sequence_flows.extend([

@@ -151,6 +151,7 @@ export function processToCanvas(model, path = []) {
     const shape = shapes.get(node.id);
     return { id: node.id, type: `bpmn_${element[1]}`, label: node.name,
       config: typeof node.kind === 'string' ? {} : structuredClone(node.kind[kind]),
+      ...(node.repeat == null ? {} : { repeat: structuredClone(node.repeat) }),
       x: shape?.x ?? index * 280, y: shape?.y ?? 160,
       width: shape?.width ?? element[4], height: shape?.height ?? element[5] };
   });
@@ -179,7 +180,8 @@ export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
-        kind: ['Start', 'End', 'TerminateEnd', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) } };
+        kind: ['Start', 'End', 'TerminateEnd', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) },
+        ...(node.repeat == null ? {} : { repeat: structuredClone(node.repeat) }) };
     }),
     sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null })),
     diagram: { shapes: nodes.map((node) => ({ elementId: node.id, x: node.x, y: node.y, width: node.width, height: node.height })),

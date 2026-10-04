@@ -501,7 +501,9 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
         for effect in &mut plan.variable_effects {
             match effect {
                 repository::VariableEffect::Mapped { event_index, .. }
-                | repository::VariableEffect::ScopeEntry { event_index, .. } => *event_index += 1,
+                | repository::VariableEffect::ScopeEntry { event_index, .. }
+                | repository::VariableEffect::RepetitionEntry { event_index, .. }
+                | repository::VariableEffect::RepetitionAggregate { event_index, .. } => *event_index += 1,
             }
         }
         for message in &mut plan.create_messages {
@@ -649,6 +651,7 @@ mod tests {
                 id: "Wait".into(),
                 name: "Wait for the due instant".into(),
                 kind: ProcessNodeKind::TimerCatch { timer: rule },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -682,13 +685,16 @@ mod tests {
                 payload_expression: "{'customer_ID': 23}".into(),
                 ttl_seconds: 120,
             },
+            repeat: None,
         });
         let body = tentaflow_protocol::processes::ProcessSubProcess {
             nodes: vec![
                 ProcessNode { id: "ChildStart".into(), name: "Enter child".into(),
-                    kind: ProcessNodeKind::Start },
+                    kind: ProcessNodeKind::Start,
+                    repeat: None, },
                 ProcessNode { id: "ChildTerminate".into(), name: "Terminate child".into(),
-                    kind: ProcessNodeKind::TerminateEnd },
+                    kind: ProcessNodeKind::TerminateEnd,
+                    repeat: None, },
             ],
             sequence_flows: vec![edge("ChildToTerminate", "ChildStart", "ChildTerminate")],
             variables: BTreeMap::new(),
@@ -696,7 +702,8 @@ mod tests {
         };
         model.nodes.push(ProcessNode { id: "Scope".into(), name: "Timer child".into(),
             kind: ProcessNodeKind::SubProcess { body,
-                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new() } });
+                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new() },
+            repeat: None, });
         model.sequence_flows.iter_mut().find(|flow| flow.id == "From_Limit")
             .unwrap().target_id = "Throw".into();
         model.sequence_flows.push(edge("ThrowScope", "Throw", "Scope"));
@@ -724,7 +731,9 @@ mod tests {
                 event.node_id.is_some() && !token_id.is_empty())));
         assert!(plan.variable_effects.iter().any(|effect| match effect {
             repository::VariableEffect::Mapped { event_index, .. }
-            | repository::VariableEffect::ScopeEntry { event_index, .. } => *event_index > 0,
+            | repository::VariableEffect::ScopeEntry { event_index, .. }
+            | repository::VariableEffect::RepetitionEntry { event_index, .. }
+            | repository::VariableEffect::RepetitionAggregate { event_index, .. } => *event_index > 0,
         }));
         let committed = repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
             Some(before.instance.revision), &plan, due).unwrap().unwrap().instance;
@@ -850,10 +859,12 @@ mod tests {
             ProcessNodeKind::TerminateEnd;
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Concurrent paths".into(),
-                kind: ProcessNodeKind::ParallelGateway },
+                kind: ProcessNodeKind::ParallelGateway,
+                repeat: None, },
             ProcessNode { id: "SideWork".into(), name: "Independent open work".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
-                    output_mapping: BTreeMap::new() } },
+                    output_mapping: BTreeMap::new() },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"),
@@ -1445,6 +1456,7 @@ mod tests {
                 id: "Split".into(),
                 name: "Parallel wait".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
             ProcessNode {
                 id: "Review".into(),
@@ -1453,11 +1465,13 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Join".into(),
                 name: "Wait for both branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -1584,6 +1598,7 @@ mod tests {
                 kind: ProcessNodeKind::TimerCatch {
                     timer: ProcessTimerSpec::Duration { seconds: 60 },
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -1805,6 +1820,7 @@ mod tests {
                 id: "Split".into(),
                 name: "Parallel".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
             ProcessNode {
                 id: "Review".into(),
@@ -1813,11 +1829,13 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Join".into(),
                 name: "Join both".into(),
                 kind: ProcessNodeKind::ParallelGateway,
+                repeat: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -1936,6 +1954,7 @@ mod tests {
                 kind: ProcessNodeKind::TimerCatch {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "After".into(),
@@ -1943,6 +1962,7 @@ mod tests {
                 kind: ProcessNodeKind::TimerCatch {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
+                repeat: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -2051,6 +2071,7 @@ mod tests {
                 kind: ProcessNodeKind::TimerCatch {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -2445,6 +2466,7 @@ mod tests {
                 assignee_user_id: None,
                 output_mapping: BTreeMap::new(),
             },
+            repeat: None,
         });
         model
             .sequence_flows
@@ -2693,6 +2715,7 @@ mod tests {
                     kind: ProcessNodeKind::ExclusiveGateway {
                         default_flow_id: None,
                     },
+                    repeat: None,
                 });
                 model
                     .sequence_flows
@@ -2947,11 +2970,14 @@ mod tests {
         let mut model = catch_model(ProcessTimerSpec::Duration { seconds: 60 });
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Select waits".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
             ProcessNode { id: "Review".into(), name: "Independent review".into(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "Join".into(), name: "Selected waits done".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("ToSplit", "Start_1", "Split"),
@@ -2992,6 +3018,7 @@ mod tests {
                 name: id.into(),
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
+                repeat: None,
             });
         }
         for id in ["Main_A", "Main_B", "Side_A", "Side_B"] {
@@ -3002,6 +3029,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
         }
         model
@@ -3266,6 +3294,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model
                 .sequence_flows
@@ -3675,6 +3704,7 @@ mod tests {
             kind: ProcessNodeKind::ExclusiveGateway {
                 default_flow_id: None,
             },
+            repeat: None,
         });
         model
             .sequence_flows

@@ -20,3 +20,15 @@ mod call_tests;
 
 #[cfg(test)]
 mod call_producer_tests;
+
+#[cfg(test)]
+mod repetition_tests;
+#[cfg(test)]
+mod repetition_service_tests;
+#[cfg(test)]
+mod repetition_loop_tests;
+
+#[cfg(test)]
+mod repetition_projection_tests;
+#[cfg(test)]
+mod repetition_capacity_tests;

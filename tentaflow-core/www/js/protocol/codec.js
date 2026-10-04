@@ -421,9 +421,11 @@ function processMessageTarget(target, expressionTarget = false) {
 function processInstancePages(pages) {
   if (pages == null) return null;
   processKnownFields(pages, ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces',
-    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId', 'scopes', 'calls'], 'process detail pages');
+    'outgoingMessages', 'selectedUserTaskId', 'selectedIncidentId', 'scopes', 'calls',
+    'repetitionGroups', 'repetitionOccurrences', 'selectedRepetitionGroupId',
+    'selectedRepetitionOccurrenceId', 'selectedRepetitionValue'], 'process detail pages');
   const mapped = {};
-  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls']) {
+  for (const name of ['userTasks', 'incidents', 'timers', 'subscriptions', 'eventRaces', 'outgoingMessages', 'scopes', 'calls', 'repetitionGroups', 'repetitionOccurrences']) {
     if (pages[name] == null) continue;
     processKnownFields(pages[name], ['offset', 'limit'], 'process page');
     mapped[name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)] = {
@@ -432,14 +434,53 @@ function processInstancePages(pages) {
   }
   if (pages.selectedUserTaskId != null) mapped.selected_user_task_id = pages.selectedUserTaskId;
   if (pages.selectedIncidentId != null) mapped.selected_incident_id = pages.selectedIncidentId;
+  if (pages.selectedRepetitionGroupId != null) mapped.selected_repetition_group_id = pages.selectedRepetitionGroupId;
+  if (pages.selectedRepetitionOccurrenceId != null) mapped.selected_repetition_occurrence_id = pages.selectedRepetitionOccurrenceId;
+  if (pages.selectedRepetitionValue != null) mapped.selected_repetition_value = pages.selectedRepetitionValue;
   return mapped;
+}
+
+function processRepeatSpec(repeat) {
+  if (repeat == null) return undefined;
+  if (typeof repeat !== 'object' || Array.isArray(repeat) || Object.keys(repeat).length !== 1) {
+    throw new TypeError('process repeat requires one variant');
+  }
+  if (repeat.MultiInstance) {
+    const body = repeat.MultiInstance;
+    processKnownFields(body, ['mode', 'input', 'outputCollectionVariable'], 'multi-instance repeat');
+    const input = body.input;
+    if (!input || typeof input !== 'object' || Object.keys(input).length !== 1) {
+      throw new TypeError('multi-instance repeat requires one input');
+    }
+    let encodedInput;
+    if (input.Cardinality) {
+      processKnownFields(input.Cardinality, ['count'], 'repeat cardinality');
+      encodedInput = { Cardinality: { count: input.Cardinality.count } };
+    } else if (input.CollectionExpression) {
+      processKnownFields(input.CollectionExpression, ['expression'], 'repeat collection');
+      encodedInput = { CollectionExpression: { expression: input.CollectionExpression.expression } };
+    } else {
+      throw new TypeError('unsupported repeat input');
+    }
+    return { MultiInstance: { mode: body.mode, input: encodedInput,
+      output_collection_variable: body.outputCollectionVariable } };
+  }
+  if (repeat.StructuredLoop) {
+    const body = repeat.StructuredLoop;
+    processKnownFields(body, ['condition', 'testBefore', 'maxIterations', 'outputCollectionVariable'], 'structured loop');
+    return { StructuredLoop: { condition: body.condition, test_before: body.testBefore,
+      max_iterations: body.maxIterations, output_collection_variable: body.outputCollectionVariable } };
+  }
+  throw new TypeError('unsupported process repeat variant');
 }
 
 function processModel(model, nested = false) {
   if (!model || typeof model !== 'object') throw new TypeError('process model is required');
   const nodes = (model.nodes ?? []).map((node) => {
     const kind = node.kind;
-    if (typeof kind === 'string') return { id: String(node.id), name: String(node.name ?? ''), kind };
+    const repeat = processRepeatSpec(node.repeat);
+    if (typeof kind === 'string') return { id: String(node.id), name: String(node.name ?? ''), kind,
+      ...(repeat === undefined ? {} : { repeat }) };
     if (!kind || typeof kind !== 'object') throw new TypeError('process node kind is required');
     const [tag, body] = Object.entries(kind)[0] ?? [];
     if (!tag || !body) throw new TypeError('process node kind is invalid');
@@ -526,7 +567,8 @@ function processModel(model, nested = false) {
     } else {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }
-    return { id: String(node.id), name: String(node.name ?? ''), kind: { [tag]: fields } };
+    return { id: String(node.id), name: String(node.name ?? ''), kind: { [tag]: fields },
+      ...(repeat === undefined ? {} : { repeat }) };
   });
   const diagram = model.diagram ?? {};
   const graph = {

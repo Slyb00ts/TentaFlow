@@ -991,21 +991,21 @@ mod tests {
         let participant_ctx = context(&state, &participant);
         let mut model = crate::processes::model::starter_model();
         model.nodes.splice(1..1, [
-            ProcessNode { id: "Split".into(), name: "Run three branches".into(),
+            ProcessNode { repeat: None, id: "Split".into(), name: "Run three branches".into(),
                 kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "LeftWork".into(), name: "Reach the join first".into(),
+            ProcessNode { repeat: None, id: "LeftWork".into(), name: "Reach the join first".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
                     output_mapping: Default::default() } },
-            ProcessNode { id: "RightWork".into(), name: "Remain at the join".into(),
+            ProcessNode { repeat: None, id: "RightWork".into(), name: "Remain at the join".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
                     output_mapping: Default::default() } },
-            ProcessNode { id: "TerminateWork".into(), name: "Terminate after the join arrival".into(),
+            ProcessNode { repeat: None, id: "TerminateWork".into(), name: "Terminate after the join arrival".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(participant.user_id.clone()),
                     output_mapping: std::collections::BTreeMap::from([
                         ("decision".into(), "outputs.decision".into())]) } },
-            ProcessNode { id: "Join".into(), name: "Join ordinary branches".into(),
+            ProcessNode { repeat: None, id: "Join".into(), name: "Join ordinary branches".into(),
                 kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Terminate".into(), name: "Stop the process".into(),
+            ProcessNode { repeat: None, id: "Terminate".into(), name: "Stop the process".into(),
                 kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows = vec![
@@ -1433,7 +1433,7 @@ mod tests {
         let reviewer = context(&state, &participant);
         let mut model = test_support::user_model(Some(&participant.user_id));
         model.timer_timezone = Some("UTC".into());
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Wait".into(),
             name: "Wait after human work".into(),
             kind: ProcessNodeKind::TimerCatch {
@@ -1947,8 +1947,13 @@ mod tests {
             outgoing_messages: None,
             scopes: None,
             calls: None,
+            repetition_groups: None,
+            repetition_occurrences: None,
             selected_user_task_id: Some(task_id.clone()),
             selected_incident_id: None,
+            selected_repetition_group_id: None,
+            selected_repetition_occurrence_id: None,
+            selected_repetition_value: None,
         };
         let P::InstanceGetResponse { instance: selected } = request(
             &participant_ctx,

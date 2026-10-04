@@ -178,6 +178,37 @@ pub struct ProcessNode {
     pub id: String,
     pub name: String,
     pub kind: ProcessNodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<ProcessRepeatSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessRepeatSpec {
+    MultiInstance {
+        mode: ProcessMultiInstanceMode,
+        input: ProcessMultiInstanceInput,
+        output_collection_variable: String,
+    },
+    StructuredLoop {
+        condition: String,
+        test_before: bool,
+        max_iterations: u8,
+        output_collection_variable: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessMultiInstanceMode {
+    Sequential,
+    Parallel,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessMultiInstanceInput {
+    Cardinality { count: u8 },
+    CollectionExpression { expression: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -751,6 +782,16 @@ pub struct ProcessInstancePageRequest {
     pub scopes: Option<ProcessPageSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calls: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_groups: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_occurrences: Option<ProcessPageSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_repetition_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_repetition_occurrence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_repetition_value: Option<ProcessRepetitionValueKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -764,6 +805,98 @@ pub struct ProcessInstancePageInfo {
     pub outgoing_messages: ProcessPageInfo,
     pub scopes: ProcessPageInfo,
     pub calls: ProcessPageInfo,
+    pub repetition_groups: ProcessPageInfo,
+    pub repetition_occurrences: ProcessPageInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRepetitionGroupMode {
+    MultiInstanceSequential,
+    MultiInstanceParallel,
+    StructuredLoop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRepetitionGroupStatus {
+    Open,
+    Incident,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRepetitionOccurrenceStatus {
+    Pending,
+    Active,
+    AwaitingVerification,
+    RetryableError,
+    AcceptedBlocked,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRepetitionValueKind {
+    Item,
+    Aggregate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessActivityResultOrigin {
+    Envelope,
+    Contract,
+    Platform,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRepetitionGroupSummary {
+    pub group_id: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub scope_id: String,
+    pub parent_token_id: String,
+    pub mode: ProcessRepetitionGroupMode,
+    pub status: ProcessRepetitionGroupStatus,
+    pub total: Option<u32>,
+    pub created_count: u32,
+    pub completed: u32,
+    pub max_iterations: Option<u8>,
+    pub revision: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRepetitionOccurrenceSummary {
+    pub occurrence_id: String,
+    pub group_id: String,
+    pub ordinal: u32,
+    pub status: ProcessRepetitionOccurrenceStatus,
+    pub token_id: String,
+    pub user_task_id: Option<String>,
+    pub job_id: Option<String>,
+    pub verification_user_task_id: Option<String>,
+    pub accepted_source_event_id: Option<String>,
+    pub approval_event_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRepetitionOccurrenceDetail {
+    pub summary: ProcessRepetitionOccurrenceSummary,
+    pub value_kind: ProcessRepetitionValueKind,
+    pub value_available: bool,
+    pub value: Value,
+    pub accepted_origin: Option<ProcessActivityResultOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -875,6 +1008,9 @@ pub struct ProcessInstance {
     pub calls: Vec<ProcessCallSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_error: Option<ProcessTerminalError>,
+    pub repetition_groups: Vec<ProcessRepetitionGroupSummary>,
+    pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
+    pub selected_repetition_occurrence: Option<ProcessRepetitionOccurrenceDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1205,6 +1341,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeat_model_and_public_summary_round_trip_without_changing_absent_nodes() {
+        let old = serde_json::json!({"id":"Review_1","name":"Review","kind":{"UserTask":{
+            "assignee_user_id":null,"output_mapping":{}}}});
+        let mut node: ProcessNode = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&node).unwrap(), old);
+        node.repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() },
+            output_collection_variable: "results".into(),
+        });
+        let bytes = crate::cbor::encode(&node).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessNode>(&bytes).unwrap(), node);
+        assert_eq!(serde_json::to_value(&node).unwrap()["repeat"]["MultiInstance"]["input"]
+            ["CollectionExpression"]["expression"], "vars.items");
+        node.repeat = Some(ProcessRepeatSpec::StructuredLoop {
+            condition: "vars.again".into(), test_before: false, max_iterations: 32,
+            output_collection_variable: "results".into(),
+        });
+        assert_eq!(crate::cbor::decode::<ProcessNode>(&crate::cbor::encode(&node).unwrap()).unwrap(), node);
+        assert!(serde_json::from_value::<ProcessRepeatSpec>(serde_json::json!({"StructuredLoop":{
+            "condition":"true","test_before":true,"max_iterations":2,
+            "output_collection_variable":"results","unexpected":true}})).is_err());
+
+        let group = ProcessRepetitionGroupSummary { group_id: "g".into(), node_id: "Review_1".into(),
+            node_name: "Review".into(), scope_id: "s".into(), parent_token_id: "t".into(),
+            mode: ProcessRepetitionGroupMode::StructuredLoop, status: ProcessRepetitionGroupStatus::Open,
+            total: None, created_count: 1, completed: 0, max_iterations: Some(32), revision: 1,
+            created_at_ms: 1, updated_at_ms: 1 };
+        assert_eq!(serde_json::to_value(&group).unwrap()["total"], serde_json::Value::Null);
+        assert_eq!(crate::cbor::decode::<ProcessRepetitionGroupSummary>(&crate::cbor::encode(&group).unwrap()).unwrap(), group);
+        let detail = ProcessRepetitionOccurrenceDetail { summary: ProcessRepetitionOccurrenceSummary {
+            occurrence_id: "o".into(), group_id: "g".into(), ordinal: 0,
+            status: ProcessRepetitionOccurrenceStatus::Completed, token_id: "t".into(),
+            user_task_id: None, job_id: None, verification_user_task_id: None,
+            accepted_source_event_id: Some("e".into()), approval_event_id: None,
+            created_at_ms: 1, updated_at_ms: 2 },
+            value_kind: ProcessRepetitionValueKind::Aggregate, value_available: true,
+            value: serde_json::Value::Null, accepted_origin: Some(ProcessActivityResultOrigin::Envelope),
+        };
+        assert_eq!(crate::cbor::decode::<ProcessRepetitionOccurrenceDetail>(&crate::cbor::encode(&detail).unwrap()).unwrap(), detail);
+        assert!(detail.value_available && detail.value.is_null());
+    }
+
+    #[test]
     fn escalation_fields_round_trip_without_changing_absent_model_or_diagnostic_bytes() {
         let old = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],
             "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
@@ -1215,7 +1395,7 @@ mod tests {
             name: "Review & approve".into(),
             escalation_code: "NEEDS.HUMAN".into(),
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Boundary_1".into(),
             name: "Review".into(),
             kind: ProcessNodeKind::BoundaryEscalation {
@@ -1326,7 +1506,7 @@ mod tests {
         model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "order.received".into() });
         model.errors.push(ProcessErrorDeclaration { error_id: "Error_1".into(), name: "Validation".into(), error_code: "BUSINESS.INVALID".into() });
         model.target_namespace = Some("urn:example:orders".into());
-        model.nodes.push(ProcessNode { id: "Start_1".into(), name: "Start".into(), kind: ProcessNodeKind::MessageStart {
+        model.nodes.push(ProcessNode { repeat: None, id: "Start_1".into(), name: "Start".into(), kind: ProcessNodeKind::MessageStart {
             message_ref: "Message_1".into(), output_mapping: BTreeMap::from([("business_key".into(), "outputs.customer_ID".into())]),
         } });
         for kind in [
@@ -1338,7 +1518,7 @@ mod tests {
             ProcessNodeKind::EventBasedGateway,
             ProcessNodeKind::BoundaryError { attached_to_id: "Task_1".into(), error_ref: Some("Error_1".into()), output_mapping: BTreeMap::new() },
         ] {
-            model.nodes.push(ProcessNode { id: format!("Node_{}", model.nodes.len()), name: String::new(), kind });
+            model.nodes.push(ProcessNode { repeat: None, id: format!("Node_{}", model.nodes.len()), name: String::new(), kind });
         }
         assert_eq!(crate::cbor::decode::<ProcessModel>(&crate::cbor::encode(&model).unwrap()).unwrap(), model);
         let request = ProcessPayload::MessageSendRequest { command_id: "cmd".into(), message_id: "msg".into(),
@@ -1382,7 +1562,9 @@ mod tests {
             "status": "Running", "variables": {}, "active_node_ids": [],
             "user_tasks": [], "incidents": [], "created_at_ms": 1,
             "updated_at_ms": 1, "can_cancel": true, "can_retry": false,
-            "can_send_message": true, "calls": []
+            "can_send_message": true, "calls": [],
+            "repetition_groups": [], "repetition_occurrences": [],
+            "selected_repetition_occurrence": null
         })).unwrap();
         let body = crate::message_body::MessageBody::ProcessBody(
             ProcessPayload::InstanceGetResponse { instance },
@@ -1391,9 +1573,10 @@ mod tests {
             crate::cbor::decode(&crate::cbor::encode(&body).unwrap()).unwrap();
         let json = serde_json::to_value(decoded).unwrap();
         let instance = &json["ProcessBody"]["InstanceGetResponse"]["instance"];
-        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names", "scopes", "calls"] {
+        for field in ["subscriptions", "event_races", "outgoing_messages", "message_names", "scopes", "calls", "repetition_groups", "repetition_occurrences"] {
             assert_eq!(instance[field], serde_json::json!([]), "{field} must be an array");
         }
+        assert!(instance["selected_repetition_occurrence"].is_null());
         assert_eq!(instance["can_send_message"], true);
     }
 
@@ -1427,7 +1610,7 @@ mod tests {
             let node_kind = if kind == "TimerCatch" { ProcessNodeKind::TimerCatch { timer } } else { ProcessNodeKind::TimerStart { timer } };
             let mut model = timerless.clone();
             model.timer_timezone = Some("Europe/Warsaw".into());
-            model.nodes.push(ProcessNode { id: "Start_1".into(), name: "Start".into(), kind: node_kind });
+            model.nodes.push(ProcessNode { repeat: None, id: "Start_1".into(), name: "Start".into(), kind: node_kind });
             let bytes = crate::cbor::encode(&model).unwrap();
             let decoded: ProcessModel = crate::cbor::decode(&bytes).unwrap();
             assert_eq!(decoded, model);
@@ -1475,7 +1658,7 @@ mod tests {
             model: ProcessModel {
                 schema_version: 1,
                 process_id: "Process_1".into(),
-                nodes: vec![ProcessNode {
+                nodes: vec![ProcessNode { repeat: None,
                     id: "Start_1".into(),
                     name: "Start".into(),
                     kind: ProcessNodeKind::Start,
@@ -1612,8 +1795,8 @@ mod tests {
     fn embedded_scope_body_and_detail_round_trip_without_rewriting_opaque_variables() {
         let body = ProcessSubProcess {
             nodes: vec![
-                ProcessNode { id: "Child_Start".into(), name: "Enter".into(), kind: ProcessNodeKind::Start },
-                ProcessNode { id: "Child_End".into(), name: "Leave".into(), kind: ProcessNodeKind::End },
+                ProcessNode { repeat: None, id: "Child_Start".into(), name: "Enter".into(), kind: ProcessNodeKind::Start },
+                ProcessNode { repeat: None, id: "Child_End".into(), name: "Leave".into(), kind: ProcessNodeKind::End },
             ],
             sequence_flows: vec![ProcessSequenceFlow { id: "Child_Flow".into(),
                 source_id: "Child_Start".into(), target_id: "Child_End".into(), condition: None }],
@@ -1705,7 +1888,8 @@ mod tests {
         let pages = ProcessInstancePageInfo {
             user_tasks: page.clone(), incidents: page.clone(), timers: page.clone(),
             subscriptions: page.clone(), event_races: page.clone(), outgoing_messages: page.clone(),
-            scopes: page.clone(), calls: page,
+            scopes: page.clone(), calls: page.clone(), repetition_groups: page.clone(),
+            repetition_occurrences: page,
         };
         let terminal_error = ProcessTerminalError {
             error_ref: "Error_1".into(), error_code: "BUSINESS.INVALID".into(),
@@ -1724,11 +1908,15 @@ mod tests {
             pages: Some(pages), selected_user_task: None, selected_incident: None,
             scopes: Vec::new(), calls: vec![ProcessCallSummary::Incoming { parent: None }],
             terminal_error: Some(terminal_error),
+            repetition_groups: Vec::new(), repetition_occurrences: Vec::new(),
+            selected_repetition_occurrence: None,
         };
         let encoded = crate::cbor::encode(&instance).unwrap();
         assert_eq!(crate::cbor::decode::<ProcessInstance>(&encoded).unwrap(), instance);
         let json = serde_json::to_value(&instance).unwrap();
         assert_eq!(json["pages"]["calls"]["total"], 0);
+        assert_eq!(json["pages"]["repetition_groups"]["total"], 0);
+        assert_eq!(json["repetition_groups"], serde_json::json!([]));
         assert_eq!(json["calls"][0], serde_json::json!({"Incoming":{"parent":null}}));
         assert!(json["calls"][0].get("call_node_id").is_none());
         assert_eq!(json["terminal_error"]["source_event_id"], "event-1");

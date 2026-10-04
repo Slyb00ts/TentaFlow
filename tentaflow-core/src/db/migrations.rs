@@ -1141,6 +1141,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_boundary_escalation_subscriptions",
             MigrationStep::RustSelfManaged(bpmn_boundary_escalation_subscriptions),
         ),
+        (
+            189,
+            "process_activity_repetition",
+            MigrationStep::Rust(process_activity_repetition),
+        ),
     ]
 }
 
@@ -2280,6 +2285,109 @@ fn bpmn_boundary_escalation_subscriptions(
             "escalation migration could not restore foreign keys: {restore}"
         ))),
     }
+}
+
+const BPMN_PROCESS_ACTIVITY_REPETITION: &str = r#"
+CREATE TABLE bpmn_repetition_groups (
+    group_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    node_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('mi_sequential','mi_parallel','structured_loop')),
+    status TEXT NOT NULL CHECK(status IN ('open','incident','completed','cancelled')),
+    source_token_id TEXT NOT NULL,
+    parent_token_id TEXT NOT NULL,
+    entry_source_event_id TEXT,
+    output_collection_variable TEXT NOT NULL CHECK(length(CAST(output_collection_variable AS BLOB)) BETWEEN 1 AND 128),
+    entry_variables_json TEXT NOT NULL CHECK(json_valid(entry_variables_json) AND json_type(entry_variables_json)='object' AND length(CAST(entry_variables_json AS BLOB))<=262144),
+    frozen_collection_json TEXT CHECK(frozen_collection_json IS NULL OR (json_valid(frozen_collection_json) AND json_type(frozen_collection_json)='array' AND length(CAST(frozen_collection_json AS BLOB))<=262144)),
+    total_count INTEGER CHECK(total_count IS NULL OR (typeof(total_count)='integer' AND total_count BETWEEN 0 AND 4294967295)),
+    created_count INTEGER NOT NULL CHECK(typeof(created_count)='integer' AND created_count BETWEEN 0 AND 4294967295),
+    completed_count INTEGER NOT NULL CHECK(typeof(completed_count)='integer' AND completed_count BETWEEN 0 AND 4294967295),
+    max_iterations INTEGER CHECK(max_iterations IS NULL OR (typeof(max_iterations)='integer' AND max_iterations BETWEEN 1 AND 255)),
+    loop_state_json TEXT CHECK(loop_state_json IS NULL OR (json_valid(loop_state_json) AND json_type(loop_state_json)='object' AND length(CAST(loop_state_json AS BLOB))<=262144)),
+    loop_state_revision INTEGER NOT NULL CHECK(typeof(loop_state_revision)='integer' AND loop_state_revision>=0),
+    next_ordinal INTEGER NOT NULL CHECK(typeof(next_ordinal)='integer' AND next_ordinal BETWEEN 0 AND 4294967295),
+    retained_bytes INTEGER NOT NULL CHECK(typeof(retained_bytes)='integer' AND retained_bytes>=0),
+    terminal_capacity INTEGER NOT NULL DEFAULT 0 CHECK(terminal_capacity IN (0,1)),
+    terminal_incident_id TEXT REFERENCES bpmn_incidents(incident_id) DEFERRABLE INITIALLY DEFERRED,
+    terminal_event_id TEXT,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer'),
+    updated_at_ms INTEGER NOT NULL CHECK(typeof(updated_at_ms)='integer'),
+    UNIQUE(instance_id,scope_id,group_id),
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT,
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,source_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,parent_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,entry_source_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,terminal_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(source_token_id<>parent_token_id),
+    CHECK(completed_count<=created_count AND next_ordinal=created_count),
+    CHECK((mode='structured_loop' AND max_iterations IS NOT NULL) OR (mode<>'structured_loop' AND max_iterations IS NULL AND loop_state_json IS NULL AND loop_state_revision=0)),
+    CHECK(status<>'completed' OR (total_count IS NOT NULL AND total_count=completed_count)),
+    CHECK(terminal_capacity=0 OR (status='incident' AND terminal_incident_id IS NOT NULL AND terminal_event_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_bpmn_repetition_terminal_instance
+    ON bpmn_repetition_groups(instance_id) WHERE terminal_capacity=1;
+CREATE INDEX idx_bpmn_repetition_groups_page
+    ON bpmn_repetition_groups(instance_id,created_at_ms DESC,group_id ASC);
+CREATE INDEX idx_bpmn_repetition_groups_status
+    ON bpmn_repetition_groups(instance_id,status,updated_at_ms DESC,group_id DESC);
+
+CREATE TABLE bpmn_repetition_occurrences (
+    occurrence_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal BETWEEN 0 AND 4294967295),
+    status TEXT NOT NULL CHECK(status IN ('pending','active','awaiting_verification','retryable_error','accepted_blocked','completed','cancelled')),
+    token_id TEXT NOT NULL,
+    user_task_id TEXT REFERENCES bpmn_user_tasks(user_task_id) DEFERRABLE INITIALLY DEFERRED,
+    job_id TEXT,
+    verification_user_task_id TEXT REFERENCES bpmn_user_tasks(user_task_id) DEFERRABLE INITIALLY DEFERRED,
+    item_json TEXT NOT NULL CHECK(json_valid(item_json) AND length(CAST(item_json AS BLOB))<=262144),
+    input_variables_json TEXT NOT NULL CHECK(json_valid(input_variables_json) AND json_type(input_variables_json)='object' AND length(CAST(input_variables_json AS BLOB))<=262144),
+    accepted_source_event_id TEXT,
+    approval_event_id TEXT,
+    aggregate_item_json TEXT CHECK(aggregate_item_json IS NULL OR (json_valid(aggregate_item_json) AND length(CAST(aggregate_item_json AS BLOB))<=262144)),
+    state_patch_json TEXT CHECK(state_patch_json IS NULL OR (json_valid(state_patch_json) AND json_type(state_patch_json)='object' AND length(CAST(state_patch_json AS BLOB))<=262144)),
+    state_after_json TEXT CHECK(state_after_json IS NULL OR (json_valid(state_after_json) AND json_type(state_after_json)='object' AND length(CAST(state_after_json AS BLOB))<=262144)),
+    accepted_origin TEXT CHECK(accepted_origin IS NULL OR accepted_origin IN ('envelope','contract','platform')),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer'),
+    updated_at_ms INTEGER NOT NULL CHECK(typeof(updated_at_ms)='integer'),
+    UNIQUE(group_id,ordinal),
+    UNIQUE(instance_id,scope_id,token_id),
+    FOREIGN KEY(instance_id,scope_id,group_id) REFERENCES bpmn_repetition_groups(instance_id,scope_id,group_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,job_id) REFERENCES bpmn_jobs(instance_id,scope_id,job_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,accepted_source_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,approval_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(user_task_id IS NULL OR verification_user_task_id IS NULL OR user_task_id<>verification_user_task_id),
+    CHECK((state_patch_json IS NULL AND state_after_json IS NULL) OR (state_patch_json IS NOT NULL AND state_after_json IS NOT NULL)),
+    CHECK(approval_event_id IS NULL OR accepted_source_event_id IS NOT NULL)
+);
+CREATE INDEX idx_bpmn_repetition_occurrences_page
+    ON bpmn_repetition_occurrences(instance_id,group_id,ordinal ASC);
+CREATE INDEX idx_bpmn_repetition_occurrences_status
+    ON bpmn_repetition_occurrences(instance_id,status,group_id,ordinal);
+"#;
+
+fn process_activity_repetition(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(BPMN_PROCESS_ACTIVITY_REPETITION)?;
+    let group_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_groups", [], |row| row.get(0))?;
+    let occurrence_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_occurrences", [], |row| row.get(0))?;
+    anyhow::ensure!(group_count == 0 && occurrence_count == 0,
+        "repetition migration unexpectedly contains rows");
+    let violations = foreign_key_check(conn)?;
+    anyhow::ensure!(violations.is_empty(), "repetition migration foreign key violations: {}",
+        violations.join("; "));
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    anyhow::ensure!(integrity == "ok", "repetition migration integrity: {integrity}");
+    Ok(())
 }
 
 fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
@@ -11897,14 +12005,14 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
     conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('boundary-owner','Boundary owner','x',1)", []).unwrap();
     let mut model = crate::processes::model::starter_model();
     model.timer_timezone = Some("UTC".into());
-    model.nodes.push(ProcessNode {
+    model.nodes.push(ProcessNode { repeat: None,
         id: "Review_1".into(), name: "Review".into(),
         kind: ProcessNodeKind::UserTask {
             assignee_user_id: Some("boundary-owner".into()),
             output_mapping: Default::default(),
         },
     });
-    model.nodes.push(ProcessNode {
+    model.nodes.push(ProcessNode { repeat: None,
         id: "Service_1".into(), name: "Service".into(),
         kind: ProcessNodeKind::ServiceTask {
             flow_id: "flow-pinned".into(), input_mapping: Default::default(),
@@ -11913,7 +12021,7 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
             result_expression: None,
         },
     });
-    model.nodes.push(ProcessNode {
+    model.nodes.push(ProcessNode { repeat: None,
         id: "Catch_1".into(), name: "Wait".into(),
         kind: ProcessNodeKind::TimerCatch {
             timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
@@ -16070,7 +16178,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 188);
+        assert_eq!(version, 189);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -16097,7 +16205,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 188);
+        assert_eq!(version, 189);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -16201,7 +16309,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 188);
+        assert_eq!(version, 189);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(
@@ -16253,13 +16361,13 @@ mod tests {
         run_ladder_up_to(conn, 186);
         let mut model = crate::processes::model::starter_model();
         model.nodes.extend([
-            ProcessNode { id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
         ]);
         model.sequence_flows[0].target_id = "Split".into();
         for branch in 0..9 {
             let node_id = format!("Branch_{branch}");
-            model.nodes.push(ProcessNode { id: node_id.clone(), name: node_id.clone(),
+            model.nodes.push(ProcessNode { repeat: None, id: node_id.clone(), name: node_id.clone(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
             model.sequence_flows.push(ProcessSequenceFlow {
                 id: format!("To_{branch}"), source_id: "Split".into(), target_id: node_id.clone(), condition: None,
@@ -16306,7 +16414,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            188
+            189
         );
         assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
         let receipt: (String, String, String) = conn
@@ -16485,15 +16593,15 @@ mod tests {
         let original: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get(0)).unwrap();
         let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&original).unwrap();
         let child_nodes = vec![
-            ProcessNode { id: "Child_Start".into(), name: String::new(), kind: ProcessNodeKind::Start },
-            ProcessNode { id: "Child_Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Child_A".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Child_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { id: "Nested_A".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { id: "Nested_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { id: "Nested_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Child_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Child_End".into(), name: String::new(), kind: ProcessNodeKind::End },
+            ProcessNode { repeat: None, id: "Child_Start".into(), name: String::new(), kind: ProcessNodeKind::Start },
+            ProcessNode { repeat: None, id: "Child_Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Child_A".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Child_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { repeat: None, id: "Nested_A".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { repeat: None, id: "Nested_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { repeat: None, id: "Nested_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Child_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Child_End".into(), name: String::new(), kind: ProcessNodeKind::End },
         ];
         let child_flows = [
             ("Child_Entry", "Child_Start", "Child_Split"),
@@ -16564,7 +16672,7 @@ mod tests {
         let parent_hash = crate::processes::repository::request_hash(&parent).unwrap();
         let mut child = crate::processes::model::starter_model();
         child.process_id = "Called_Process".into();
-        child.nodes.insert(1, ProcessNode { id: "Child_Work".into(), name: "Child work".into(),
+        child.nodes.insert(1, ProcessNode { repeat: None, id: "Child_Work".into(), name: "Child work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
         child.sequence_flows[0].target_id = "Child_Work".into();
         child.sequence_flows.push(ProcessSequenceFlow { id: "Child_Exit".into(), source_id: "Child_Work".into(), target_id: "End_1".into(), condition: None });
@@ -16628,7 +16736,7 @@ mod tests {
         });
         model.nodes.insert(
             1,
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Catch_1".into(),
                 name: "Wait".into(),
                 kind: ProcessNodeKind::MessageCatch {
@@ -16695,7 +16803,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            188
+            189
         );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(
@@ -16733,5 +16841,54 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn repetition_migration_adds_only_empty_scoped_tables_after_populated_legacy_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("repeat-upgrade.db")).unwrap();
+        let (model_json, model_hash) = escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 188);
+        let old_facts: (String, String, String, String, String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json,c.result_json,s.kind FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='escalation-instance' JOIN bpmn_commands c ON c.command_id='legacy-command' JOIN bpmn_event_subscriptions s ON s.instance_id=e.instance_id WHERE v.definition_id='escalation-legacy'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(old_facts.0, model_json);
+        assert_eq!(old_facts.1, model_hash);
+        let old_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
+            .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 189);
+        let new_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
+            .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(new_tables.len(), old_tables.len() + 2);
+        assert!(new_tables.contains(&"bpmn_repetition_groups".to_string()));
+        assert!(new_tables.contains(&"bpmn_repetition_occurrences".to_string()));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_groups", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_occurrences", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        let retained: (String, String, String, String, String) = conn.query_row(
+            "SELECT v.model_json,v.model_sha256,e.data_json,c.result_json,s.kind FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='escalation-instance' JOIN bpmn_commands c ON c.command_id='legacy-command' JOIN bpmn_event_subscriptions s ON s.instance_id=e.instance_id WHERE v.definition_id='escalation-legacy'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(retained, old_facts);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM _migrations WHERE version=189", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn repetition_migration_rolls_back_invalid_legacy_reference_without_partial_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("repeat-corrupt.db")).unwrap();
+        escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 188);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE bpmn_event_subscriptions SET token_id='missing-token' WHERE subscription_id='legacy-subscription'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 188);
+        assert!(!table_exists(&conn, "bpmn_repetition_groups").unwrap());
+        assert!(!table_exists(&conn, "bpmn_repetition_occurrences").unwrap());
+        assert_eq!(conn.query_row("SELECT token_id FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'", [], |row| row.get::<_, String>(0)).unwrap(), "missing-token");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
     }
 }

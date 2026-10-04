@@ -324,6 +324,7 @@ pub(crate) mod test_support {
                         correlation_expression: "'case-1'".into(),
                         output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
                     },
+                    repeat: None,
                 },
             );
             model.sequence_flows = vec![
@@ -340,6 +341,7 @@ pub(crate) mod test_support {
                             assignee_user_id: None,
                             output_mapping: BTreeMap::new(),
                         },
+                        repeat: None,
                     },
                 );
                 model.sequence_flows = vec![
@@ -471,6 +473,7 @@ pub(crate) mod test_support {
                     correlation_expression: "'case-1'".into(),
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model.nodes.push(ProcessNode {
                 id: format!("Side_{id}"),
@@ -479,6 +482,7 @@ pub(crate) mod test_support {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model.sequence_flows.extend([
                 edge(&format!("BoundaryPath_{id}"), id, &format!("Side_{id}")),
@@ -494,6 +498,7 @@ pub(crate) mod test_support {
             id: "Race_1".into(),
             name: "First signal".into(),
             kind: ProcessNodeKind::EventBasedGateway,
+            repeat: None,
         });
         model.nodes.push(ProcessNode {
             id: "Timer_1".into(),
@@ -501,6 +506,7 @@ pub(crate) mod test_support {
             kind: ProcessNodeKind::TimerCatch {
                 timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 2 },
             },
+            repeat: None,
         });
         model.sequence_flows = vec![
             edge("ToRace", "Start_1", "Race_1"),
@@ -521,19 +527,23 @@ pub(crate) mod test_support {
         });
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Independent races".into(),
-                kind: ProcessNodeKind::ParallelGateway },
+                kind: ProcessNodeKind::ParallelGateway,
+                repeat: None, },
             ProcessNode { id: "OtherRace".into(), name: "Other first signal".into(),
-                kind: ProcessNodeKind::EventBasedGateway },
+                kind: ProcessNodeKind::EventBasedGateway,
+                repeat: None, },
             ProcessNode { id: "OtherCatch".into(), name: "Other message".into(),
                 kind: ProcessNodeKind::MessageCatch {
                     message_ref: "OtherMessage".into(),
                     correlation_expression: "'case-1'".into(),
                     output_mapping: BTreeMap::new(),
-                } },
+                },
+                repeat: None, },
             ProcessNode { id: "OtherTimer".into(), name: "Other deadline".into(),
                 kind: ProcessNodeKind::TimerCatch {
                     timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 120 },
-                } },
+                },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"),
@@ -1020,6 +1030,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: std::collections::BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Throw_1".into(),
@@ -1037,6 +1048,7 @@ mod tests {
                     payload_expression: "{'customer_ID': 17}".into(),
                     ttl_seconds: 120,
                 },
+                repeat: None,
             },
         ]);
         source_model.sequence_flows = vec![
@@ -1294,6 +1306,7 @@ mod tests {
                     assignee_user_id: Some(f.participant.user_id.clone()),
                     output_mapping: std::collections::BTreeMap::new(),
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -1665,10 +1678,12 @@ mod tests {
             ProcessNodeKind::TerminateEnd;
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Concurrent paths".into(),
-                kind: ProcessNodeKind::ParallelGateway },
+                kind: ProcessNodeKind::ParallelGateway,
+                repeat: None, },
             ProcessNode { id: "SideWork".into(), name: "Independent open work".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
-                    output_mapping: BTreeMap::new() } },
+                    output_mapping: BTreeMap::new() },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             runtime::test_support::edge("StartSplit", "Start_1", "Split"),
@@ -1875,6 +1890,7 @@ mod tests {
                     payload_expression: "{'customer_ID': 23}".into(),
                     ttl_seconds: 120,
                 },
+                repeat: None,
             },
         );
         model.sequence_flows = vec![
@@ -2166,6 +2182,7 @@ mod tests {
                 name: "Selected start".into(),
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
+                repeat: None,
             },
             ProcessNode {
                 id: "Merge_1".into(),
@@ -2173,6 +2190,7 @@ mod tests {
                 kind: ProcessNodeKind::ExclusiveGateway {
                     default_flow_id: None,
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Other_1".into(),
@@ -2181,12 +2199,14 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: std::collections::BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Join_1".into(),
                 name: "Join work".into(),
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
+                repeat: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -2269,6 +2289,7 @@ mod tests {
                     payload_expression: "null".into(),
                     ttl_seconds: 120,
                 },
+                repeat: None,
             },
         );
         throw.sequence_flows = vec![

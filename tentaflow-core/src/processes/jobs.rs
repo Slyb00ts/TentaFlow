@@ -76,6 +76,7 @@ fn observed_result(
     outcome: FlowExecutionOutcome,
     expression: Option<&str>,
     variables: &Value,
+    extra: &[(String, Value)],
 ) -> ObservedActivityResult {
     let platform_error = outcome.error.is_some();
     match normalize_outcome(outcome) {
@@ -100,7 +101,7 @@ fn observed_result(
                     normalized_outputs: result.outputs.clone(),
                     evaluation_variables: variables.clone(),
                 };
-                match super::runtime::evaluate(expression, variables, &result.outputs, &[])
+                match super::runtime::evaluate(expression, variables, &result.outputs, extra)
                     .and_then(parse_contract_result)
                 {
                     Ok(result) => ObservedActivityResult {
@@ -199,6 +200,23 @@ pub async fn execute_claimed(
         &claimed.snapshot.instance.variables,
         &claimed.job.scope_id,
     )?;
+    let repeated = claimed.snapshot.repetition_occurrences.iter()
+        .find(|row| row.job_id.as_deref() == Some(claimed.job.job_id.as_str()));
+    let (effective, repeat_extra) = if let Some(occurrence) = repeated {
+        let group = claimed.snapshot.repetition_groups.iter()
+            .find(|row| row.group_id == occurrence.group_id)
+            .context("repeated Service has no durable group")?;
+        let variables = if group.mode == tentaflow_protocol::processes::ProcessRepetitionGroupMode::StructuredLoop {
+            occurrence.input_variables.clone()
+        } else {
+            group.entry_variables.clone()
+        };
+        (variables, vec![("repeat".to_owned(), json!({
+            "group_id":group.group_id,"index":occurrence.ordinal,"item":occurrence.item
+        }))])
+    } else {
+        (effective, Vec::new())
+    };
     let ProcessNodeKind::ServiceTask {
         flow_id,
         timeout_seconds,
@@ -351,7 +369,7 @@ pub async fn execute_claimed(
             }
             outcome = &mut execution => {
                 break match outcome {
-                    Ok(outcome) => observed_result(outcome,result_expression.as_deref(),&effective),
+                    Ok(outcome) => observed_result(outcome,result_expression.as_deref(),&effective,&repeat_extra),
                     Err(error) => ObservedActivityResult{result:failure("FLOW_ERROR", error.to_string()),origin:ActivityResultOrigin::Platform,expression_observation:None},
                 };
             }
@@ -771,11 +789,14 @@ mod tests {
         });
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Select service".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
             ProcessNode { id: "Sibling".into(), name: "Independent review".into(),
-                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "Join".into(), name: "Selected work done".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"),
@@ -1752,6 +1773,7 @@ mod tests {
                         "activity_result.evidence".into(),
                     )]),
                 },
+                repeat: None,
             });
             model.nodes.push(ProcessNode {
                 id: format!("Work_{id}"),
@@ -1760,6 +1782,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model.sequence_flows.extend([
                 edge(&format!("ErrorPath_{id}"), id, &format!("Work_{id}")),
@@ -1791,6 +1814,7 @@ mod tests {
                     cancel_activity,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model.nodes.push(ProcessNode {
                 id: format!("Work_{id}"),
@@ -1799,6 +1823,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             });
             model.sequence_flows.extend([
                 edge(&format!("EscalationPath_{id}"), id, &format!("Work_{id}")),
@@ -2021,6 +2046,7 @@ mod tests {
             kind: ProcessNodeKind::ExclusiveGateway {
                 default_flow_id: Some("ChoiceDefault".into()),
             },
+            repeat: None,
         });
         model.nodes.push(ProcessNode {
             id: "Work_Fallback".into(),
@@ -2029,6 +2055,7 @@ mod tests {
                 assignee_user_id: None,
                 output_mapping: BTreeMap::new(),
             },
+            repeat: None,
         });
         let mut invalid = edge("ChoiceCondition", "Choice", "Work_Exact");
         invalid.condition = Some("1".into());
@@ -2120,6 +2147,7 @@ mod tests {
                     cancel_activity: false,
                     timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 1 },
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "IndependentChoice".into(),
@@ -2127,6 +2155,7 @@ mod tests {
                 kind: ProcessNodeKind::ExclusiveGateway {
                     default_flow_id: Some("IndependentDefault".into()),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "IndependentWork".into(),
@@ -2135,6 +2164,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "IndependentFallback".into(),
@@ -2143,6 +2173,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
         ]);
         let mut invalid = edge("IndependentInvalid", "IndependentChoice", "IndependentWork");
@@ -2312,6 +2343,7 @@ mod tests {
             kind: ProcessNodeKind::ExclusiveGateway {
                 default_flow_id: Some("ChoiceDefault".into()),
             },
+            repeat: None,
         });
         model.nodes.push(ProcessNode {
             id: "Work_Fallback".into(),
@@ -2320,6 +2352,7 @@ mod tests {
                 assignee_user_id: None,
                 output_mapping: BTreeMap::new(),
             },
+            repeat: None,
         });
         let mut selected = edge("ChoiceSelected", "Choice", "Work_Exact");
         selected.condition = Some("vars.review_route == 17".into());
@@ -2637,10 +2670,12 @@ mod tests {
                     ProcessNode { id: "RaceMessage".into(), name: "Review message".into(),
                         kind: ProcessNodeKind::MessageCatch { message_ref: "ReviewMessage".into(),
                             correlation_expression: "vars.case_key".into(),
-                            output_mapping: BTreeMap::new() } },
+                            output_mapping: BTreeMap::new() },
+                        repeat: None, },
                     ProcessNode { id: "RaceTimer".into(), name: "Review timeout".into(),
                         kind: ProcessNodeKind::TimerCatch {
-                            timer: ProcessTimerSpec::Duration { seconds: 30 } } },
+                            timer: ProcessTimerSpec::Duration { seconds: 30 } },
+                        repeat: None, },
                 ]);
                 model.sequence_flows.retain(|edge| edge.id != "EscalationEnd_Exact");
                 model.sequence_flows.extend([
@@ -2737,7 +2772,8 @@ mod tests {
                 payload_expression: "vars.case_key".into(), ttl_seconds: 60 };
         model.nodes.push(ProcessNode { id: "AfterThrowTimer".into(),
             name: "Await review follow-up".into(),
-            kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 30 } } });
+            kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 30 } },
+            repeat: None, });
         model.sequence_flows.iter_mut().find(|edge| edge.id == "EscalationEnd_Exact")
             .unwrap().target_id = "AfterThrowTimer".into();
         model.sequence_flows.push(edge("AfterThrowEnd", "AfterThrowTimer", "End_1"));
@@ -2832,6 +2868,7 @@ mod tests {
                 kind: ProcessNodeKind::InclusiveGateway {
                     default_flow_id: None,
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Work_Fallback".into(),
@@ -2840,6 +2877,7 @@ mod tests {
                     assignee_user_id: None,
                     output_mapping: BTreeMap::new(),
                 },
+                repeat: None,
             },
             ProcessNode {
                 id: "Join".into(),
@@ -2847,6 +2885,7 @@ mod tests {
                 kind: ProcessNodeKind::InclusiveGateway {
                     default_flow_id: None,
                 },
+                repeat: None,
             },
         ]);
         let mut first = edge("ChoiceFirst", "Split", "Work_Exact");
@@ -3021,12 +3060,15 @@ mod tests {
             .unwrap().target_id = "Split".into();
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Select review branch".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
             ProcessNode { id: "Join".into(), name: "Join selected review".into(),
-                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
+                repeat: None, },
             ProcessNode { id: "OtherWork".into(), name: "Other review".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
-                    output_mapping: BTreeMap::new() } },
+                    output_mapping: BTreeMap::new() },
+                repeat: None, },
         ]);
         let mut direct = edge("ChoiceDirect", "Split", "Join");
         direct.condition = Some("true".into());
@@ -3085,12 +3127,15 @@ mod tests {
         let mut model = runtime::test_support::embedded_model(model, "Scope");
         model.nodes.extend([
             ProcessNode { id: "RootSplit".into(), name: "Open independent work".into(),
-                kind: ProcessNodeKind::ParallelGateway },
+                kind: ProcessNodeKind::ParallelGateway,
+                repeat: None, },
             ProcessNode { id: "RootSibling".into(), name: "Independent human review".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
-                    output_mapping: BTreeMap::new() } },
+                    output_mapping: BTreeMap::new() },
+                repeat: None, },
             ProcessNode { id: "RootJoin".into(), name: "Join independent work".into(),
-                kind: ProcessNodeKind::ParallelGateway },
+                kind: ProcessNodeKind::ParallelGateway,
+                repeat: None, },
         ]);
         model.sequence_flows = vec![
             edge("RootStartSplit", "RootStart_Scope", "RootSplit"),
@@ -3741,6 +3786,11 @@ mod tests {
             subscriptions: None,
             event_races: None,
             outgoing_messages: None,
+            repetition_groups: None,
+            repetition_occurrences: None,
+            selected_repetition_group_id: None,
+            selected_repetition_occurrence_id: None,
+            selected_repetition_value: None,
             scopes: None,
             calls: None,
             selected_user_task_id: first_task.clone(),

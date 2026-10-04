@@ -107,6 +107,33 @@ test('terminate end save keeps a unit node kind and opaque business keys', { ski
   assert.deepEqual(saved.model.variables, model.variables);
 });
 
+test('repeated task save preserves typed input, loop metadata, and opaque variables', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [],
+    variables: { results: [], items: [{ business_key: 'Łódź & <ok>' }] }, diagram: { shapes: [], edges: [] } };
+  const kinds = [
+    { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 0 } }, outputCollectionVariable: 'results' } },
+    { MultiInstance: { mode: 'Parallel', input: { CollectionExpression: { expression: 'vars.items' } }, outputCollectionVariable: 'results' } },
+    { StructuredLoop: { condition: 'vars.again', testBefore: true, maxIterations: 32, outputCollectionVariable: 'results' } },
+  ];
+  for (const repeat of kinds) {
+    const model = { ...base, nodes: [{ id: 'Review', name: 'Review', kind: { UserTask: {
+      assigneeUserId: null, outputMapping: {} } }, repeat }] };
+    const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+      expectedRevision: 0, name: 'Repeat', description: '', model });
+    assert.deepEqual(saved.model.nodes[0].repeat, repeat);
+    assert.deepEqual(saved.model.variables, base.variables);
+  }
+  const noRepeat = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Plain', description: '', model: { ...base, nodes: [
+      { id: 'Review', name: '', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } }] } });
+  assert.equal(Object.hasOwn(noRepeat.model.nodes[0], 'repeat'), false);
+  assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Bad', description: '', model: { ...base, nodes: [{ id: 'Review', name: '',
+      kind: { UserTask: { assigneeUserId: null, outputMapping: {} } },
+      repeat: { StructuredLoop: { condition: 'true', testBefore: true, maxIterations: 1,
+        outputCollectionVariable: 'results', unexpected: true } } }] } }), /unknown field|unsupported/i);
+});
+
 test('BPMN typed save retains mapping and variable business keys', { skip }, () => {
   const model = {
     schemaVersion: 1, processId: 'P_1', variables: { user_id: 'u1', nested_value: { inner_key: 4 } },
@@ -251,6 +278,7 @@ test('call activity wire preserves exact QName binding, direct pins and terminal
       status: 'Error', variables: {}, active_node_ids: [], user_tasks: [], incidents: [],
       created_at_ms: 1, updated_at_ms: 2, can_cancel: false, can_retry: false,
       calls: [{ Incoming: { parent: null } }],
+      repetition_groups: [], repetition_occurrences: [], selected_repetition_occurrence: null,
       terminal_error: { error_ref: 'Error_1', error_code: 'BUSINESS.REJECTED',
         source_event_id: 'event-1', source_node_id: 'ErrorEnd_1', source_scope_id: 'child-1' } } },
   } })));
@@ -264,12 +292,20 @@ test('instance pages encode exact selectors and message detail preserves null av
   const body = request('processInstanceGetRequest', { instanceId: 'instance', pages: {
     userTasks: { offset: 20, limit: 20 }, subscriptions: { offset: 0, limit: 2 },
     scopes: { offset: 0, limit: 20 }, calls: { offset: 20, limit: 20 },
+    repetitionGroups: { offset: 40, limit: 20 }, repetitionOccurrences: { offset: 20, limit: 20 },
     selectedUserTaskId: 'task-1', selectedIncidentId: 'incident-1',
+    selectedRepetitionGroupId: 'group-1', selectedRepetitionOccurrenceId: 'occurrence-2',
+    selectedRepetitionValue: 'aggregate',
   } });
   assert.equal(body.pages.userTasks.offset, 20);
   assert.equal(body.pages.subscriptions.limit, 2);
   assert.equal(body.pages.scopes.limit, 20);
   assert.equal(body.pages.calls.offset, 20);
+  assert.equal(body.pages.repetitionGroups.offset, 40);
+  assert.equal(body.pages.repetitionOccurrences.offset, 20);
+  assert.equal(body.pages.selectedRepetitionGroupId, 'group-1');
+  assert.equal(body.pages.selectedRepetitionOccurrenceId, 'occurrence-2');
+  assert.equal(body.pages.selectedRepetitionValue, 'aggregate');
   assert.equal(body.pages.selectedUserTaskId, 'task-1');
   assert.equal(body.pages.selectedIncidentId, 'incident-1');
   const scope = request('processScopeGetRequest', { instanceId: 'instance', scopeId: 'child-scope' });
@@ -303,7 +339,8 @@ test('instance response decodes required empty and populated message collections
     initiator_user_id: 'u1', version: 1, revision: 1, status: 'Running',
     variables: { business_key: 'kept' }, active_node_ids: [], user_tasks: [], incidents: [],
     created_at_ms: 1, updated_at_ms: 1, can_cancel: true, can_retry: false,
-    can_send_message: true, calls: [],
+    can_send_message: true, calls: [], repetition_groups: [], repetition_occurrences: [],
+    selected_repetition_occurrence: null,
   };
   const decode = (instance) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance },
@@ -340,10 +377,37 @@ test('instance response decodes required empty and populated message collections
   assert.equal(populated.instance.calls[0].Outgoing.child.canOpen, true);
   assert.deepEqual(populated.instance.variables, { business_key: 'kept' });
   const empty = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [], message_names: [], scopes: [] });
-  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames', 'scopes', 'calls']) {
+  for (const field of ['subscriptions', 'eventRaces', 'outgoingMessages', 'messageNames', 'scopes', 'calls',
+    'repetitionGroups', 'repetitionOccurrences']) {
     assert.deepEqual(empty.instance[field], [], `${field} remains an array on an empty page`);
   }
   assert.equal(empty.instance.canSendMessage, true);
+  const summary = { occurrence_id: 'o1', group_id: 'g1', ordinal: 0, status: 'completed', token_id: 't1',
+    user_task_id: null, job_id: null, verification_user_task_id: null,
+    accepted_source_event_id: 'event-1', approval_event_id: null,
+    created_at_ms: 1, updated_at_ms: 2 };
+  const repeated = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [],
+    message_names: [], scopes: [],
+    repetition_groups: [{ group_id: 'g1', node_id: 'Review', node_name: 'Review', scope_id: 'i1',
+      parent_token_id: 't0', mode: 'structured_loop', status: 'open', total: null,
+      created_count: 1, completed: 1, max_iterations: 32, revision: 2,
+      created_at_ms: 1, updated_at_ms: 2 }],
+    repetition_occurrences: [summary],
+    selected_repetition_occurrence: { summary, value_kind: 'aggregate', value_available: true,
+      value: { business_key: { inner_value: 'kept' } }, accepted_origin: 'envelope' },
+  });
+  assert.equal(repeated.instance.repetitionGroups[0].total, null);
+  assert.equal(repeated.instance.repetitionOccurrences[0].tokenId, 't1');
+  assert.equal(repeated.instance.selectedRepetitionOccurrence.valueAvailable, true);
+  assert.equal(repeated.instance.selectedRepetitionOccurrence.acceptedOrigin, 'envelope');
+  assert.deepEqual(repeated.instance.selectedRepetitionOccurrence.value,
+    { business_key: { inner_value: 'kept' } });
+  const missingAggregate = decode({ ...base, subscriptions: [], event_races: [], outgoing_messages: [],
+    message_names: [], scopes: [], repetition_groups: [], repetition_occurrences: [summary],
+    selected_repetition_occurrence: { summary, value_kind: 'aggregate', value_available: false,
+      value: null, accepted_origin: null } });
+  assert.equal(missingAggregate.instance.selectedRepetitionOccurrence.valueAvailable, false);
+  assert.equal(missingAggregate.instance.selectedRepetitionOccurrence.value, null);
 });
 
 test('timer model wire preserves each typed rule and opaque variables', { skip }, () => {
@@ -470,7 +534,7 @@ test('boundary timer and full task scope identity decode with nullable timer fie
       variables: { attached_to_id: 'business' }, active_node_ids: ['Review_1'],
       user_tasks: [], incidents: [], created_at_ms: 1, updated_at_ms: 1,
       can_cancel: true, can_retry: false, timers: [timerFields],
-      calls: [],
+      calls: [], repetition_groups: [], repetition_occurrences: [], selected_repetition_occurrence: null,
     } },
   } })));
   assert.equal(timer.instance.timers[0].attachedToId, 'Review_1');

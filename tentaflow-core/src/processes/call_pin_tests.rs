@@ -27,6 +27,7 @@ fn call_node(id: &str, target: &ProcessVersion) -> ProcessNode {
             input_mapping: BTreeMap::new(),
             output_mapping: BTreeMap::new(),
         },
+        repeat: None,
     }
 }
 
@@ -592,7 +593,7 @@ fn migration_preserves_populated_legacy_call_free_rows_and_foreign_keys() {
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        188
+        189
     );
     let after = [
         table_rows(&conn, "bpmn_versions", "definition_id,version"),

@@ -778,10 +778,15 @@ export class FlowCanvas {
     // odbudowywaly DOM node'a i zrywaly selection ~sekunde po kliknieciu.
     let changed = false;
     for (const k of Object.keys(patch)) {
-      if (n.config?.[k] !== patch[k]) { changed = true; break; }
+      if ((k === 'repeat' ? n.repeat : n.config?.[k]) !== patch[k]) { changed = true; break; }
     }
     if (!changed) return;
-    n.config = { ...n.config, ...patch };
+    if (Object.hasOwn(patch, 'repeat')) {
+      if (patch.repeat == null) delete n.repeat;
+      else n.repeat = structuredClone(patch.repeat);
+    }
+    const configPatch = Object.fromEntries(Object.entries(patch).filter(([key]) => key !== 'repeat'));
+    n.config = { ...n.config, ...configPatch };
     if (this.mode === 'bpmn' && processBoundaryKind(n.type) && Object.hasOwn(patch, 'attachedToId')) {
       this._positionBoundary(n);
     }
@@ -884,6 +889,7 @@ export class FlowCanvas {
         x: n.x + 30,
         y: n.y + 30,
         config: structuredClone(n.config),
+        ...(n.repeat == null ? {} : { repeat: structuredClone(n.repeat) }),
       };
       idMap.set(n.id, clone.id);
       if (this.mode === 'bpmn' && ['bpmn_exclusive_gateway', 'bpmn_inclusive_gateway'].includes(clone.type)) clone.config.defaultFlowId = null;
@@ -1185,9 +1191,13 @@ export class FlowCanvas {
         div.classList.add(n.type === 'bpmn_boundary_error' || n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
       }
       const gateway = n.type.endsWith('_gateway');
+      const repeatMarker = n.repeat?.StructuredLoop ? 'loop'
+        : n.repeat?.MultiInstance?.mode === 'Sequential' ? 'sequential'
+          : n.repeat?.MultiInstance?.mode === 'Parallel' ? 'parallel' : null;
       div.innerHTML = `
         <div class="fb-process-symbol"><svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>
-          ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}</div>
+          ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}
+          ${repeatMarker ? `<i class="fb-repeat-marker fb-repeat-marker-${repeatMarker}" aria-hidden="true">${repeatMarker === 'loop' ? '↻' : ''}</i>` : ''}</div>
         <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
         <span class="fb-process-label-leader" aria-hidden="true"></span>
         ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}

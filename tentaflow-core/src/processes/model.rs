@@ -6,7 +6,8 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::processes::{
     ProcessDiagram, ProcessEscalationPathReason, ProcessMessageTargetSpec, ProcessModel,
-    ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessTimerSpec,
+    ProcessMultiInstanceInput, ProcessNode, ProcessNodeKind, ProcessRepeatSpec,
+    ProcessSequenceFlow, ProcessTimerSpec,
 };
 
 use crate::flow_engine::expr;
@@ -80,12 +81,12 @@ pub fn starter_model() -> ProcessModel {
         schema_version: 1,
         process_id: "Process_1".into(),
         nodes: vec![
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Start_1".into(),
                 name: "Start".into(),
                 kind: ProcessNodeKind::Start,
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "End_1".into(),
                 name: "End".into(),
                 kind: ProcessNodeKind::End,
@@ -381,6 +382,41 @@ pub fn validate_variables(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_repeat(node: &ProcessNode, variables: &BTreeMap<String, serde_json::Value>, complete: bool) -> Result<()> {
+    let Some(spec) = &node.repeat else { return Ok(()); };
+    let output_mapping = match &node.kind {
+        ProcessNodeKind::UserTask { output_mapping, .. }
+        | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
+        _ => bail!("repeat on {} requires a UserTask or ServiceTask", node.id),
+    };
+    let output_variable = match spec {
+        ProcessRepeatSpec::MultiInstance { input, output_collection_variable, .. } => {
+            match input {
+                ProcessMultiInstanceInput::Cardinality { count } => {
+                    ensure!(*count <= 16, "repeat {} cardinality exceeds 16", node.id);
+                }
+                ProcessMultiInstanceInput::CollectionExpression { expression } => {
+                    validate_expression(expression, &format!("repeat {} collection expression", node.id), complete)?;
+                }
+            }
+            output_collection_variable
+        }
+        ProcessRepeatSpec::StructuredLoop { condition, max_iterations, output_collection_variable, .. } => {
+            ensure!((1..=32).contains(max_iterations), "repeat {} loop maximum outside 1..=32", node.id);
+            validate_expression(condition, &format!("repeat {} loop condition", node.id), complete)?;
+            output_collection_variable
+        }
+    };
+    if complete || !output_variable.is_empty() {
+        ensure!(valid_id(output_variable), "repeat {} has invalid output collection variable", node.id);
+        ensure!(!output_mapping.contains_key(output_variable), "repeat {} output collection conflicts with task mapping", node.id);
+        if complete {
+            ensure!(variables.contains_key(output_variable), "repeat {} output collection variable is undeclared", node.id);
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_draft(model: &ProcessModel) -> Result<()> {
     ensure!(
         model.schema_version == 1 && valid_id(&model.process_id),
@@ -430,6 +466,7 @@ fn validate_draft_body<'a>(
             "invalid or duplicate BPMN ID: {}", node.id);
         ensure!(node.name.len() <= 256 && !node.name.chars().any(char::is_control),
             "invalid node name");
+        validate_repeat(node, variables, false)?;
         match &node.kind {
             ProcessNodeKind::ServiceTask { input_mapping, output_mapping, verification,
                 timeout_seconds, result_expression, .. } => {
@@ -510,6 +547,18 @@ fn validate_draft_body<'a>(
                 "timer and message starts are root-only: {}", node.id);
         }
     }
+    for node in nodes {
+        if let Some(attached_to_id) = match &node.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => Some(attached_to_id),
+            _ => None,
+        } {
+            ensure!(!nodes.iter().any(|attached| attached.id == *attached_to_id && attached.repeat.is_some()),
+                "repeat {} cannot have a boundary event", attached_to_id);
+        }
+    }
     let mut flow_ids = HashSet::new();
     for flow in flows {
         ensure!(valid_id(&flow.id) && flow_ids.insert(flow.id.as_str())
@@ -547,6 +596,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         &model.nodes,
         &model.sequence_flows,
         &model.diagram,
+        &model.variables,
         0,
         &message_ids,
         &error_ids,
@@ -571,6 +621,7 @@ fn validate_body<'a>(
     graph_nodes: &'a [ProcessNode],
     graph_flows: &'a [ProcessSequenceFlow],
     diagram: &ProcessDiagram,
+    variables: &BTreeMap<String, serde_json::Value>,
     depth: usize,
     message_ids: &HashSet<&str>,
     error_ids: &HashSet<&str>,
@@ -598,6 +649,7 @@ fn validate_body<'a>(
             "duplicate node ID: {}",
             node.id
         );
+        validate_repeat(node, variables, true)?;
         match &node.kind {
             ProcessNodeKind::ServiceTask {
                 flow_id,
@@ -705,6 +757,7 @@ fn validate_body<'a>(
                     &body.nodes,
                     &body.sequence_flows,
                     &body.diagram,
+                    &body.variables,
                     depth + 1,
                     message_ids,
                     error_ids,
@@ -1543,7 +1596,7 @@ mod tests {
             escalation_code: "NEEDS.HUMAN".into(),
         });
         model.nodes.extend([
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Service_1".into(),
                 name: "Check".into(),
                 kind: ProcessNodeKind::ServiceTask {
@@ -1555,7 +1608,7 @@ mod tests {
                     result_expression: Some("outputs.result".into()),
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Boundary_1".into(),
                 name: "Escalate".into(),
                 kind: ProcessNodeKind::BoundaryEscalation {
@@ -1568,7 +1621,7 @@ mod tests {
                     )]),
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Wait_1".into(),
                 name: "Review".into(),
                 kind: ProcessNodeKind::UserTask {
@@ -1658,21 +1711,21 @@ mod tests {
     fn escalation_prefix_distinguishes_or_singleton_from_and_waiting_branch() {
         let mut model = escalation_model();
         model.nodes.extend([
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Split_1".into(),
                 name: "Split".into(),
                 kind: ProcessNodeKind::InclusiveGateway {
                     default_flow_id: Some("To_Sync".into()),
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Join_1".into(),
                 name: "Join".into(),
                 kind: ProcessNodeKind::InclusiveGateway {
                     default_flow_id: None,
                 },
             },
-            ProcessNode {
+            ProcessNode { repeat: None,
                 id: "Xor_1".into(),
                 name: "Immediate".into(),
                 kind: ProcessNodeKind::ExclusiveGateway {
@@ -1731,13 +1784,13 @@ mod tests {
     fn inclusive_pair_maps_selected_edges_and_rejects_invalid_conditions_and_crossing() {
         let mut model = starter_model();
         model.nodes.extend([
-            ProcessNode { id: "Split".into(), name: "Select".into(),
+            ProcessNode { repeat: None, id: "Split".into(), name: "Select".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("To_C".into()) } },
-            ProcessNode { id: "Join".into(), name: "Synchronize".into(),
+            ProcessNode { repeat: None, id: "Join".into(), name: "Synchronize".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
         ]);
         for id in ["A", "B", "C"] {
-            model.nodes.push(ProcessNode { id: id.into(), name: id.into(),
+            model.nodes.push(ProcessNode { repeat: None, id: id.into(), name: id.into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
         }
         model.sequence_flows[0].target_id = "Split".into();
@@ -1778,13 +1831,13 @@ mod tests {
     fn parallel_pair_keeps_nine_branches_without_the_inclusive_limit() {
         let mut model = starter_model();
         model.nodes.extend([
-            ProcessNode { id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
         ]);
         model.sequence_flows[0].target_id = "Split".into();
         for branch in 0..9 {
             let id = format!("Branch_{branch}");
-            model.nodes.push(ProcessNode { id: id.clone(), name: id.clone(),
+            model.nodes.push(ProcessNode { repeat: None, id: id.clone(), name: id.clone(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
             model.sequence_flows.push(ProcessSequenceFlow {
                 id: format!("To_{branch}"), source_id: "Split".into(), target_id: id.clone(), condition: None,
@@ -1809,9 +1862,9 @@ mod tests {
     fn terminate_end_closes_open_gateway_branches_without_inventing_a_join() {
         let mut model = starter_model();
         model.nodes.extend([
-            ProcessNode { id: "Split".into(), name: "Parallel".into(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Terminate_A".into(), name: "Stop A".into(), kind: ProcessNodeKind::TerminateEnd },
-            ProcessNode { id: "Terminate_B".into(), name: "Stop B".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "Split".into(), name: "Parallel".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Terminate_A".into(), name: "Stop A".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "Terminate_B".into(), name: "Stop B".into(), kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows[0].target_id = "Split".into();
         model.sequence_flows.extend([
@@ -1835,11 +1888,11 @@ mod tests {
     fn mixed_terminal_and_join_branches_keep_exact_join_capability() {
         let mut model = starter_model();
         model.nodes.extend([
-            ProcessNode { id: "Split".into(), name: "Select".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("To_Stop".into()) } },
-            ProcessNode { id: "Join".into(), name: "Join".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
-            ProcessNode { id: "Wait_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "Wait_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "Stop".into(), name: "Stop".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "Split".into(), name: "Select".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("To_Stop".into()) } },
+            ProcessNode { repeat: None, id: "Join".into(), name: "Join".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { repeat: None, id: "Wait_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { repeat: None, id: "Wait_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { repeat: None, id: "Stop".into(), name: "Stop".into(), kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows[0].target_id = "Split".into();
         for (id, source, target, condition) in [
@@ -1865,19 +1918,19 @@ mod tests {
     fn nested_mixed_gateways_keep_lifo_joins_and_shared_terminal_frontiers() {
         let mut model = starter_model();
         model.nodes.extend([
-            ProcessNode { id: "OuterSplit".into(), name: "Outer OR".into(),
+            ProcessNode { repeat: None, id: "OuterSplit".into(), name: "Outer OR".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Outer_Stop".into()) } },
-            ProcessNode { id: "OuterLeft".into(), name: "Outer left".into(),
+            ProcessNode { repeat: None, id: "OuterLeft".into(), name: "Outer left".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "InnerSplit".into(), name: "Inner AND".into(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "InnerLeft".into(), name: "Inner left".into(),
+            ProcessNode { repeat: None, id: "InnerSplit".into(), name: "Inner AND".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "InnerLeft".into(), name: "Inner left".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "InnerRight".into(), name: "Inner right".into(),
+            ProcessNode { repeat: None, id: "InnerRight".into(), name: "Inner right".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-            ProcessNode { id: "InnerJoin".into(), name: "Inner join".into(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "OuterJoin".into(), name: "Outer join".into(),
+            ProcessNode { repeat: None, id: "InnerJoin".into(), name: "Inner join".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "OuterJoin".into(), name: "Outer join".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
-            ProcessNode { id: "SharedStop".into(), name: "Shared terminal".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "SharedStop".into(), name: "Shared terminal".into(), kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows[0].target_id = "OuterSplit".into();
         for (id, source, target, condition) in [
@@ -1912,7 +1965,7 @@ mod tests {
         assert_eq!(inner.branches["Inner_Stop"].terminate_end_node_ids, BTreeSet::from(["SharedStop".into()]));
 
         let mut shared_work = model.clone();
-        shared_work.nodes.push(ProcessNode { id: "SharedWork".into(), name: "Invalid shared work".into(),
+        shared_work.nodes.push(ProcessNode { repeat: None, id: "SharedWork".into(), name: "Invalid shared work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
         for edge in &mut shared_work.sequence_flows {
             if edge.id == "Outer_Stop" || edge.id == "Inner_Stop" { edge.target_id = "SharedWork".into(); }
@@ -1937,11 +1990,11 @@ mod tests {
         let mut model = starter_model();
         model.timer_timezone = Some("UTC".into());
         model.nodes.extend([
-            ProcessNode { id: "Race".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
-            ProcessNode { id: "Timer_A".into(), name: "First".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 1 } } },
-            ProcessNode { id: "Timer_B".into(), name: "Second".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 2 } } },
-            ProcessNode { id: "Stop_A".into(), name: "Stop first".into(), kind: ProcessNodeKind::TerminateEnd },
-            ProcessNode { id: "Stop_B".into(), name: "Stop second".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "Race".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { repeat: None, id: "Timer_A".into(), name: "First".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 1 } } },
+            ProcessNode { repeat: None, id: "Timer_B".into(), name: "Second".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 2 } } },
+            ProcessNode { repeat: None, id: "Stop_A".into(), name: "Stop first".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { repeat: None, id: "Stop_B".into(), name: "Stop second".into(), kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows[0].target_id = "Race".into();
         for (id, source, target) in [
@@ -1966,7 +2019,7 @@ mod tests {
             error_id: "Error_Business".into(), name: "Rejected".into(),
             error_code: "BUSINESS.REJECTED".into(),
         });
-        model.nodes.insert(1, ProcessNode {
+        model.nodes.insert(1, ProcessNode { repeat: None,
             id: "Call_1".into(), name: "Review".into(),
             kind: ProcessNodeKind::CallActivity {
                 called_definition_id: "91764f75-dadb-41aa-a252-a8a911fe7a94".into(),
@@ -1998,12 +2051,12 @@ mod tests {
         model.nodes[2].kind = ProcessNodeKind::ErrorEnd { error_ref: "Error_Business".into() };
 
         model.nodes.extend([
-            ProcessNode { id: "Split_1".into(), name: "Split".into(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Join_1".into(), name: "Join".into(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { id: "Branch_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask {
+            ProcessNode { repeat: None, id: "Split_1".into(), name: "Split".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Join_1".into(), name: "Join".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { repeat: None, id: "Branch_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask {
                 assignee_user_id: None, output_mapping: Default::default(),
             } },
-            ProcessNode { id: "Branch_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask {
+            ProcessNode { repeat: None, id: "Branch_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask {
                 assignee_user_id: None, output_mapping: Default::default(),
             } },
         ]);
@@ -2049,11 +2102,11 @@ mod tests {
         model.timer_timezone = Some("UTC".into());
         model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "signal".into() });
         model.nodes.extend([
-            ProcessNode { id: "Race_1".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
-            ProcessNode { id: "Catch_Message".into(), name: "Message".into(), kind: ProcessNodeKind::MessageCatch {
+            ProcessNode { repeat: None, id: "Race_1".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { repeat: None, id: "Catch_Message".into(), name: "Message".into(), kind: ProcessNodeKind::MessageCatch {
                 message_ref: "Message_1".into(), correlation_expression: "vars.case_id".into(), output_mapping: Default::default(),
             } },
-            ProcessNode { id: "Catch_Timer".into(), name: "Timeout".into(), kind: ProcessNodeKind::TimerCatch {
+            ProcessNode { repeat: None, id: "Catch_Timer".into(), name: "Timeout".into(), kind: ProcessNodeKind::TimerCatch {
                 timer: ProcessTimerSpec::Duration { seconds: 60 },
             } },
         ]);
@@ -2099,7 +2152,7 @@ mod tests {
 
         let mut model = starter_model();
         model.timer_timezone = Some("UTC".into());
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Review_1".into(),
             name: "Review".into(),
             kind: ProcessNodeKind::UserTask {
@@ -2107,7 +2160,7 @@ mod tests {
                 output_mapping: Default::default(),
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Boundary_A".into(),
             name: "Time limit".into(),
             kind: ProcessNodeKind::BoundaryTimer {
@@ -2116,7 +2169,7 @@ mod tests {
                 timer: ProcessTimerSpec::Duration { seconds: 90 },
             },
         });
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Boundary_B".into(),
             name: "Reminder".into(),
             kind: ProcessNodeKind::BoundaryTimer {
@@ -2161,7 +2214,7 @@ mod tests {
         });
         assert!(validate_model(&model).is_err());
         model = boundary_model();
-        model.nodes.push(ProcessNode {
+        model.nodes.push(ProcessNode { repeat: None,
             id: "Shared_1".into(), name: "Shared".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: None, output_mapping: Default::default(),
@@ -2182,12 +2235,12 @@ mod tests {
 
         let mut model = boundary_model();
         for id in ["Split_1", "Join_1", "SideSplit_1", "SideJoin_1"] {
-            model.nodes.push(ProcessNode {
+            model.nodes.push(ProcessNode { repeat: None,
                 id: id.into(), name: id.into(), kind: ProcessNodeKind::ParallelGateway,
             });
         }
         for id in ["Branch_A", "Branch_B", "Side_A", "Side_B"] {
-            model.nodes.push(ProcessNode {
+            model.nodes.push(ProcessNode { repeat: None,
                 id: id.into(), name: id.into(),
                 kind: ProcessNodeKind::UserTask {
                     assignee_user_id: None, output_mapping: Default::default(),
@@ -2234,7 +2287,7 @@ mod tests {
         assert!(validate_model(&model).is_err());
         model.nodes[0].kind = ProcessNodeKind::TimerStart { timer: ProcessTimerSpec::Date { at: "2027-01-02T03:04:05.123Z".into() } };
         validate_model(&model).unwrap();
-        model.nodes.insert(1, tentaflow_protocol::processes::ProcessNode { id: "Wait_1".into(), name: "Wait".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: None } } });
+        model.nodes.insert(1, tentaflow_protocol::processes::ProcessNode { repeat: None, id: "Wait_1".into(), name: "Wait".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Cycle { seconds: 300, total_firings: None } } });
         model.sequence_flows[0].target_id = "Wait_1".into();
         model.sequence_flows.push(tentaflow_protocol::processes::ProcessSequenceFlow { id: "Flow_2".into(), source_id: "Wait_1".into(), target_id: "End_1".into(), condition: None });
         assert!(validate_model(&model).is_err());
@@ -2288,15 +2341,15 @@ mod tests {
     fn embedded_model() -> ProcessModel {
         use tentaflow_protocol::processes::ProcessSubProcess;
         let mut model = starter_model();
-        model.nodes.insert(1, ProcessNode {
+        model.nodes.insert(1, ProcessNode { repeat: None,
             id: "Sub_1".into(), name: "Review scope".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
-                        ProcessNode { id: "LocalStart".into(), name: "Start".into(), kind: ProcessNodeKind::Start },
-                        ProcessNode { id: "LocalTask".into(), name: "Approve".into(),
+                        ProcessNode { repeat: None, id: "LocalStart".into(), name: "Start".into(), kind: ProcessNodeKind::Start },
+                        ProcessNode { repeat: None, id: "LocalTask".into(), name: "Approve".into(),
                             kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
-                        ProcessNode { id: "LocalEnd".into(), name: "End".into(), kind: ProcessNodeKind::End },
+                        ProcessNode { repeat: None, id: "LocalEnd".into(), name: "End".into(), kind: ProcessNodeKind::End },
                     ],
                     sequence_flows: vec![
                         ProcessSequenceFlow { id: "LocalFlow1".into(), source_id: "LocalStart".into(), target_id: "LocalTask".into(), condition: None },
@@ -2350,5 +2403,109 @@ mod tests {
         }
         model.timer_timezone = Some("UTC".into());
         assert!(validate_model(&model).is_err());
+    }
+
+    #[test]
+    fn repeated_tasks_require_bounded_input_and_a_declared_local_output() {
+        use tentaflow_protocol::processes::{ActivityVerification, ProcessMultiInstanceMode};
+        let mut model = starter_model();
+        model.variables.insert("results".into(), serde_json::json!([]));
+        model.variables.insert("items".into(), serde_json::json!([{"id": 1}]));
+        model.nodes.insert(1, ProcessNode {
+            id: "Review_1".into(), name: "Review".into(),
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
+            repeat: Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 16 },
+                output_collection_variable: "results".into(),
+            }),
+        });
+        model.sequence_flows[0].target_id = "Review_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(), source_id: "Review_1".into(), target_id: "End_1".into(), condition: None });
+        validate_model(&model).unwrap();
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 0 }, output_collection_variable: "results".into() });
+        validate_model(&model).unwrap();
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Parallel,
+            input: ProcessMultiInstanceInput::CollectionExpression { expression: "vars.items".into() }, output_collection_variable: "results".into() });
+        validate_model(&model).unwrap();
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::StructuredLoop { condition: "vars.keep_going".into(), test_before: true,
+            max_iterations: 32, output_collection_variable: "results".into() });
+        validate_model(&model).unwrap();
+        let old = model.nodes[1].repeat.clone();
+        for invalid in [ProcessRepeatSpec::MultiInstance { mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 17 }, output_collection_variable: "results".into() },
+            ProcessRepeatSpec::StructuredLoop { condition: "vars.keep_going".into(), test_before: true,
+                max_iterations: 0, output_collection_variable: "results".into() },
+            ProcessRepeatSpec::StructuredLoop { condition: "vars.keep_going".into(), test_before: true,
+                max_iterations: 33, output_collection_variable: "results".into() },
+            ProcessRepeatSpec::StructuredLoop { condition: "vars.keep_going".into(), test_before: true,
+                max_iterations: 2, output_collection_variable: "missing".into() }] {
+            model.nodes[1].repeat = Some(invalid);
+            assert!(validate_model(&model).is_err());
+        }
+        model.nodes[1].repeat = old;
+        if let ProcessNodeKind::UserTask { output_mapping, .. } = &mut model.nodes[1].kind {
+            output_mapping.insert("results".into(), "outputs.value".into());
+        }
+        assert!(validate_model(&model).is_err());
+        model.nodes[1].kind = ProcessNodeKind::ParallelGateway;
+        assert!(validate_model(&model).is_err());
+        model.nodes[1].kind = ProcessNodeKind::UserTask {
+            assignee_user_id: None, output_mapping: BTreeMap::new(),
+        };
+        model.timer_timezone = Some("UTC".into());
+        model.nodes.push(ProcessNode {
+            id: "ReviewDeadline".into(), name: "Deadline".into(), repeat: None,
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Review_1".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 60 },
+            },
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("cannot have a boundary event"));
+
+        let mut service = starter_model();
+        service.variables.insert("results".into(), serde_json::json!([]));
+        service.nodes.insert(1, ProcessNode {
+            id: "ServiceReview".into(), name: "Review".into(),
+            kind: ProcessNodeKind::ServiceTask {
+                flow_id: "flow-review".into(), input_mapping: BTreeMap::new(),
+                output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
+                timeout_seconds: 60, result_expression: None,
+            },
+            repeat: Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::Cardinality { count: 1 },
+                output_collection_variable: "results".into(),
+            }),
+        });
+        service.sequence_flows[0].target_id = "ServiceReview".into();
+        service.sequence_flows.push(ProcessSequenceFlow {
+            id: "ServiceExit".into(), source_id: "ServiceReview".into(),
+            target_id: "End_1".into(), condition: None,
+        });
+        validate_model(&service).unwrap();
+
+        let mut embedded = embedded_model();
+        embedded.variables.insert("root_only".into(), serde_json::json!([]));
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
+            body.variables.insert("local_results".into(), serde_json::json!([]));
+            body.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "local_results".into(),
+            });
+        }
+        validate_model(&embedded).unwrap();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
+            body.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "root_only".into(),
+            });
+        }
+        let error = validate_model(&embedded).unwrap_err();
+        assert!(error.to_string().contains("embedded subprocess"));
+        assert!(format!("{error:#}").contains("output collection variable is undeclared"));
     }
 }
