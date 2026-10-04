@@ -26130,4 +26130,25 @@ mod process_wire_tests {
         assert_eq!(model.sequence_flows[0].condition.as_deref(), Some("vars.business_key == 1"));
         assert_eq!(model.variables["business_key"]["inner_value"], 7);
     }
+
+    #[test]
+    fn process_request_encoder_keeps_terminate_end_and_opaque_variables() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Stop","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Stop_1","name":"Stop","kind":"TerminateEnd"}],
+                "sequence_flows":[],"variables":{"terminate_end":{"inner_key":7}},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::TerminateEnd);
+        assert_eq!(model.variables["terminate_end"]["inner_key"], 7);
+    }
 }

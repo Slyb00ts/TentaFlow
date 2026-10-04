@@ -407,14 +407,29 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
                     occurrence: advance.selected_occurrence,
                 },
                 at_ms,
+                repository::StartInputRef::Timer {
+                    timer_id: timer.timer_id.clone(),
+                    expected_timer_revision: timer.revision,
+                    fired_occurrence: advance.selected_occurrence,
+                },
             )?
         }
         TimerSnapshot::Catch {
             timer, snapshot, ..
-        } => runtime::plan_timer_catch(snapshot, timer, at_ms)?,
+        } => runtime::plan_timer_catch(snapshot, timer, at_ms,
+            repository::AcceptedInputRef::Timer {
+                timer_id: timer.timer_id.clone(),
+                expected_timer_revision: timer.revision,
+                fired_occurrence: advance.selected_occurrence,
+            })?,
         TimerSnapshot::Boundary {
             timer, snapshot, ..
-        } => runtime::plan_timer_boundary(snapshot, timer, at_ms)?,
+        } => runtime::plan_timer_boundary(snapshot, timer, at_ms,
+            repository::AcceptedInputRef::Timer {
+                timer_id: timer.timer_id.clone(),
+                expected_timer_revision: timer.revision,
+                fired_occurrence: advance.selected_occurrence,
+            })?,
     };
     let skipped_from = (advance.skipped_count > 0).then_some(timer.occurrence);
     let skipped_through = (advance.skipped_count > 0).then(|| advance.selected_occurrence - 1);
@@ -470,6 +485,28 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
         );
         fields.insert("cancelled_job_ids".into(), json!(plan.cancel_job_ids));
         plan.events.insert(0, event);
+        plan.event_sources = std::mem::take(&mut plan.event_sources).into_iter()
+            .map(|(index, token_id)| (index + 1, token_id)).collect();
+        for index in plan.event_ids.keys().rev().cloned().collect::<Vec<_>>() {
+            if let Some(event_id) = plan.event_ids.remove(&index) {
+                plan.event_ids.insert(index + 1, event_id);
+            }
+        }
+        for attempt in &mut plan.termination_attempts {
+            match attempt {
+                repository::TerminationAttempt::Success(source) => source.source_event_index += 1,
+                repository::TerminationAttempt::ReturnFailure(failure) => failure.source_event_index += 1,
+            }
+        }
+        for effect in &mut plan.variable_effects {
+            match effect {
+                repository::VariableEffect::Mapped { event_index, .. }
+                | repository::VariableEffect::ScopeEntry { event_index, .. } => *event_index += 1,
+            }
+        }
+        for message in &mut plan.create_messages {
+            message.source_event_index += 1;
+        }
     } else {
         plan.events.push(event);
     }
@@ -559,7 +596,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use tentaflow_protocol::processes::{
-        ActivityVerification, ProcessInstance, ProcessInstanceStatus, ProcessModel, ProcessNode,
+        ActivityVerification, ProcessInstance, ProcessInstanceStatus, ProcessMessageDeclaration,
+        ProcessMessageStatus, ProcessMessageTargetSpec, ProcessModel, ProcessNode,
         ProcessNodeKind, ProcessUserTaskStatus,
     };
 
@@ -620,10 +658,102 @@ mod tests {
         model
     }
 
+    #[test]
+    fn boundary_timer_termination_preserves_local_event_and_mapping_indices() {
+        let fixture = Fixture::new();
+        let receiver = super::super::messages::test_support::published(
+            &fixture,
+            &super::super::messages::test_support::receiving_model(true, false),
+        );
+        let mut model = with_boundaries(user_model(None), "Work", &[("Limit", true, 1)]);
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "ThrowDecl".into(),
+            name: "EvidenceReady".into(),
+        });
+        model.nodes.push(ProcessNode {
+            id: "Throw".into(),
+            name: "Queue evidence".into(),
+            kind: ProcessNodeKind::MessageThrow {
+                message_ref: "ThrowDecl".into(),
+                target: ProcessMessageTargetSpec::Start {
+                    definition_id: receiver.definition_id,
+                },
+                correlation_expression: "'case-1'".into(),
+                payload_expression: "{'customer_ID': 23}".into(),
+                ttl_seconds: 120,
+            },
+        });
+        let body = tentaflow_protocol::processes::ProcessSubProcess {
+            nodes: vec![
+                ProcessNode { id: "ChildStart".into(), name: "Enter child".into(),
+                    kind: ProcessNodeKind::Start },
+                ProcessNode { id: "ChildTerminate".into(), name: "Terminate child".into(),
+                    kind: ProcessNodeKind::TerminateEnd },
+            ],
+            sequence_flows: vec![edge("ChildToTerminate", "ChildStart", "ChildTerminate")],
+            variables: BTreeMap::new(),
+            diagram: Default::default(),
+        };
+        model.nodes.push(ProcessNode { id: "Scope".into(), name: "Timer child".into(),
+            kind: ProcessNodeKind::SubProcess { body,
+                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new() } });
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "From_Limit")
+            .unwrap().target_id = "Throw".into();
+        model.sequence_flows.push(edge("ThrowScope", "Throw", "Scope"));
+        model.sequence_flows.push(edge("ScopeToEnd", "Scope", "End_1"));
+        let anchor = Utc::now().timestamp_millis();
+        let started = start_at(&fixture, &model, anchor);
+        let before = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let due = before.timers.iter().find(|timer| timer.node_id == "Limit")
+            .unwrap().due_at_ms.unwrap();
+        let candidate = repository::due_timers(&fixture.db, due, 32).unwrap()
+            .into_iter().find(|timer| timer.timer_id == before.timers[0].timer_id).unwrap();
+        let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        assert_eq!(plan.events[0].kind, "timer_fired");
+        assert_eq!(plan.create_messages.len(), 1);
+        let queued_index = plan.create_messages[0].source_event_index;
+        assert!(queued_index > 0);
+        assert_eq!(plan.events[queued_index].kind, "message_queued");
+        assert!(plan.event_sources.contains_key(&queued_index));
+        assert!(!plan.event_ids.contains_key(&queued_index));
+        assert!(plan.events.iter().any(|event| event.kind == "terminate_end_reached"));
+        assert!(plan.event_sources.iter().all(|(index, token_id)|
+            *index > 0 && plan.events.get(*index).is_some_and(|event|
+                event.node_id.is_some() && !token_id.is_empty())));
+        assert!(plan.variable_effects.iter().any(|effect| match effect {
+            repository::VariableEffect::Mapped { event_index, .. }
+            | repository::VariableEffect::ScopeEntry { event_index, .. } => *event_index > 0,
+        }));
+        let committed = repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(before.instance.revision), &plan, due).unwrap().unwrap().instance;
+        assert_eq!(committed.status, ProcessInstanceStatus::Completed);
+        assert_eq!(committed.outgoing_messages.len(), 1);
+        assert_eq!(committed.outgoing_messages[0].status, ProcessMessageStatus::Pending);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(persisted.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(persisted.instance.variables, committed.variables);
+        let events = repository::list_events(&reopened, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        let queued_event = events.iter().find(|event| event.kind == "message_queued").unwrap();
+        let source_event_id: String = reopened.read().unwrap().query_row(
+            "SELECT source_event_id FROM bpmn_messages WHERE message_id=?1",
+            [committed.outgoing_messages[0].message_id.as_str()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(source_event_id, queued_event.event_id);
+        assert_eq!(events.iter()
+            .filter(|event| event.kind == "terminate_end_reached").count(), 1);
+    }
+
     fn start_at(fixture: &Fixture, model: &ProcessModel, at_ms: i64) -> ProcessInstance {
         let version = publish_model(fixture, model);
         let id = Uuid::new_v4().to_string();
         let variables = serde_json::to_value(&model.variables).unwrap();
+        let command = stamp("timed manual start");
         let plan = runtime::plan_start(
             &version.model,
             &id,
@@ -633,12 +763,13 @@ mod tests {
             variables.clone(),
             StartCause::Manual,
             at_ms,
+            runtime::test_support::manual_input(&command),
         )
         .unwrap();
         repository::start_instance(
             &fixture.db,
             &fixture.owner,
-            &stamp("timed manual start"),
+            &command,
             &id,
             &version.definition_id,
             version.version,
@@ -647,6 +778,177 @@ mod tests {
             at_ms,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn timer_race_winner_reaching_terminate_closes_only_losing_catch() {
+        let fixture = Fixture::new();
+        let mut model = super::super::messages::test_support::race_model();
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+            ProcessNodeKind::TerminateEnd;
+        let anchor = Utc::now().timestamp_millis() - 3_000;
+        let started = start_at(&fixture, &model, anchor);
+        let other = start_at(&fixture, &model, anchor + 60_000);
+        let due = started.timers[0].due_at_ms.unwrap();
+        let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
+            .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
+        let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        use tentaflow_protocol::processes::{ProcessEventRaceStatus as R, ProcessSubscriptionStatus as S};
+        assert_eq!(plan.race_updates.len(), 1);
+        assert_eq!(plan.race_updates[0].status, R::Won);
+        assert_eq!(plan.events.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+        assert_eq!(plan.events.iter().filter(|event| event.kind == "event_race_cancelled").count(), 0);
+        assert_eq!(plan.subscription_updates.iter().filter(|update| update.status == S::Cancelled).count(), 1);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut duplicate = plan.clone();
+        let mut extra = duplicate.race_updates[0].clone();
+        extra.status = R::Cancelled;
+        extra.winner_node_id = None;
+        extra.winner_subscription_id = None;
+        extra.winner_timer_id = None;
+        duplicate.race_updates.push(extra);
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &duplicate, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut wrong_winner = plan.clone();
+        wrong_winner.race_updates[0].winner_node_id = Some("Catch_1".into());
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &wrong_winner, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut foreign = plan.clone();
+        let other_tokens = repository::runtime_snapshot(&fixture.db, &fixture.owner, &other.instance_id).unwrap().tokens;
+        foreign.cancel_token_ids.push(other_tokens[0].token_id.clone());
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &foreign, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let drained = drain_due(&fixture.db, due);
+        drained.completion.unwrap();
+        assert_eq!(drained.fired, 1);
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.event_races[0].status, R::Won);
+        assert_eq!(after.timers[0].status, ProcessTimerStatus::Fired);
+        assert_eq!(after.subscriptions[0].status, S::Cancelled);
+        let events = repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "event_race_cancelled").count(), 0);
+        assert_eq!(events.iter().filter(|event| event.kind == "subscription_cancelled").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::runtime_snapshot(&reopened, &fixture.owner, &started.instance_id).unwrap().event_races[0].status, R::Won);
+        let replay = drain_due(&reopened, due + 1);
+        replay.completion.unwrap();
+        assert_eq!(replay.fired, 0);
+    }
+
+    #[test]
+    fn timer_race_termination_closes_unrelated_waiting_user_task() {
+        let fixture = Fixture::new();
+        let mut model = super::super::messages::test_support::race_model();
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+            ProcessNodeKind::TerminateEnd;
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Concurrent paths".into(),
+                kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "SideWork".into(), name: "Independent open work".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None,
+                    output_mapping: BTreeMap::new() } },
+        ]);
+        model.sequence_flows = vec![
+            edge("StartSplit", "Start_1", "Split"),
+            edge("SplitRace", "Split", "Race_1"),
+            edge("SplitSide", "Split", "SideWork"),
+            edge("RaceMessage", "Race_1", "Catch_1"),
+            edge("RaceTimer", "Race_1", "Timer_1"),
+            edge("MessageEnd", "Catch_1", "End_1"),
+            edge("TimerEnd", "Timer_1", "End_1"),
+            edge("SideEnd", "SideWork", "End_1"),
+        ];
+        let anchor = Utc::now().timestamp_millis() - 3_000;
+        let started = start_at(&fixture, &model, anchor);
+        assert_eq!(started.user_tasks.len(), 1);
+        assert_eq!(started.user_tasks[0].status, ProcessUserTaskStatus::Open);
+        let due = started.timers[0].due_at_ms.unwrap();
+        let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
+            .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
+        let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &plan, due).unwrap().is_some());
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.event_races[0].status, tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+        assert_eq!(after.user_tasks[0].status, ProcessUserTaskStatus::Cancelled);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::runtime_snapshot(&reopened, &fixture.owner, &started.instance_id).unwrap().user_tasks[0].status,
+            ProcessUserTaskStatus::Cancelled);
+        let replay = drain_due(&reopened, due + 1);
+        replay.completion.unwrap();
+        assert_eq!(replay.fired, 0);
+    }
+
+    #[test]
+    fn timer_race_termination_closes_a_distinct_open_race_with_source_proof() {
+        let fixture = Fixture::new();
+        let model = super::super::messages::test_support::parallel_races_reaching_terminate();
+        let anchor = Utc::now().timestamp_millis() - 3_000;
+        let started = start_at(&fixture, &model, anchor);
+        assert_eq!(started.event_races.len(), 2);
+        let first = started.event_races.iter().find(|race| race.gateway_node_id == "Race_1").unwrap();
+        let other = started.event_races.iter().find(|race| race.gateway_node_id == "OtherRace").unwrap();
+        let due = started.timers.iter().find(|timer| timer.node_id == "Timer_1").unwrap().due_at_ms.unwrap();
+        let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
+            .find(|candidate| candidate.timer_id == started.timers.iter()
+                .find(|timer| timer.node_id == "Timer_1").unwrap().timer_id).unwrap();
+        let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        use tentaflow_protocol::processes::ProcessEventRaceStatus as R;
+        assert_eq!(plan.race_updates.len(), 2);
+        assert!(plan.race_updates.iter().any(|update| update.race_id == first.race_id && update.status == R::Won));
+        assert!(plan.race_updates.iter().any(|update| update.race_id == other.race_id && update.status == R::Cancelled));
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let loser = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap()
+            .subscriptions.into_iter().find(|sub| sub.node_id == "Catch_1").unwrap().token_id;
+        let mut missing_loser = plan.clone();
+        missing_loser.cancel_token_ids.retain(|id| id != &loser);
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &missing_loser, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut duplicate_loser = plan.clone();
+        duplicate_loser.cancel_token_ids.push(loser);
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &duplicate_loser, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut wrong_scope = plan.clone();
+        wrong_scope.events.iter_mut().find(|event| event.kind == "event_race_cancelled"
+            && event.data["race_id"].as_str() == Some(other.race_id.as_str())).unwrap().scope_id =
+            Uuid::new_v4().to_string();
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &wrong_scope, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut extra_winner = plan.clone();
+        let other_update = extra_winner.race_updates.iter_mut().find(|update| update.race_id == other.race_id).unwrap();
+        other_update.status = R::Won;
+        other_update.winner_node_id = Some("OtherCatch".into());
+        other_update.winner_subscription_id = started.subscriptions.iter().find(|sub| sub.node_id == "OtherCatch")
+            .map(|sub| sub.subscription_id.clone());
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &extra_winner, due).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(started.revision), &plan, due).unwrap().is_some());
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.event_races.iter().find(|race| race.race_id == first.race_id).unwrap().status, R::Won);
+        assert_eq!(after.event_races.iter().find(|race| race.race_id == other.race_id).unwrap().status, R::Cancelled);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let history = repository::list_events(&reopened, &fixture.owner, &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(history.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+        assert_eq!(history.iter().filter(|event| event.kind == "event_race_cancelled").count(), 1);
+        let replay = drain_due(&reopened, due + 1);
+        replay.completion.unwrap();
+        assert_eq!(replay.fired, 0);
     }
 
     #[test]
@@ -1205,18 +1507,20 @@ mod tests {
             .iter()
             .find(|task| task.status == ProcessUserTaskStatus::Open)
             .unwrap();
+        let command = stamp("review after due");
         let plan = runtime::plan_user_completion(
             &snapshot,
             &task.user_task_id,
             &json!({}),
             None,
             at_ms + 61_000,
+            runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
         )
         .unwrap();
         let completed = repository::complete_user_task(
             &reopened,
             &owner,
-            &stamp("review after due"),
+            &command,
             &waiting.instance_id,
             &task.user_task_id,
             partial.revision,
@@ -1562,18 +1866,20 @@ mod tests {
             .iter()
             .find(|task| task.status == ProcessUserTaskStatus::Open)
             .unwrap();
+        let command = stamp("finish unaffected branch");
         let plan = runtime::plan_user_completion(
             &snapshot,
             &task.user_task_id,
             &json!({}),
             None,
             at_ms + 61_000,
+            runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
         )
         .unwrap();
         let still_incident = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("finish unaffected branch"),
+            &command,
             &waiting.instance_id,
             &task.user_task_id,
             snapshot.instance.revision,
@@ -1810,6 +2116,7 @@ mod tests {
         let at_ms = at("2026-01-01T00:00:00Z");
         for _ in 0..33 {
             let id = Uuid::new_v4().to_string();
+            let command = stamp("bounded timer start");
             let plan = runtime::plan_start(
                 &model,
                 &id,
@@ -1819,12 +2126,13 @@ mod tests {
                 json!({}),
                 StartCause::Manual,
                 at_ms,
+                runtime::test_support::manual_input(&command),
             )
             .unwrap();
             repository::start_instance(
                 &fixture.db,
                 &fixture.owner,
-                &stamp("bounded timer start"),
+                &command,
                 &id,
                 &version.definition_id,
                 version.version,
@@ -1924,12 +2232,14 @@ mod tests {
             &fixture.participant
         };
         let outputs = json!({"answer":"accepted"});
+        let command = stamp("complete exact work");
         let plan =
-            runtime::plan_user_completion(&snapshot, task_id, &outputs, None, at_ms).unwrap();
+            runtime::plan_user_completion(&snapshot, task_id, &outputs, None, at_ms,
+                runtime::test_support::human_input(&snapshot, task_id, &command)).unwrap();
         repository::complete_user_task(
             &fixture.db,
             actor,
-            &stamp("complete exact work"),
+            &command,
             instance_id,
             task_id,
             snapshot.instance.revision,
@@ -2028,12 +2338,14 @@ mod tests {
         let snapshot =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                 .unwrap();
+        let command = stamp("late completion");
         let completion = runtime::plan_user_completion(
             &snapshot,
             &snapshot.user_tasks[0].user_task_id,
             &json!({"answer":"late"}),
             None,
             2_000,
+            runtime::test_support::human_input(&snapshot, &snapshot.user_tasks[0].user_task_id, &command),
         )
         .unwrap();
         let first = current_boundary(&fixture, &started.instance_id, "Limit_A", 2_000);
@@ -2095,7 +2407,7 @@ mod tests {
         assert!(repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("late completion"),
+            &command,
             &started.instance_id,
             &snapshot.user_tasks[0].user_task_id,
             started.revision,
@@ -2509,10 +2821,9 @@ mod tests {
                 error.data["attached_token_id"],
                 timer.token_id.clone().unwrap()
             );
-            assert!(error.data["reason"]
-                .as_str()
-                .unwrap()
-                .contains("controlled boundary storage failure"));
+            let reason = error.data["reason"].as_str().unwrap();
+            assert!(reason.contains("controlled boundary storage failure"),
+                "timer error reason: {reason}");
         }
     }
 
@@ -2873,18 +3184,20 @@ mod tests {
                 assert_eq!(snapshot.timers[0].status, ProcessTimerStatus::Pending);
                 let task = &snapshot.user_tasks[0];
                 let at_ms = Utc::now().timestamp_millis();
+                let command = stamp("approve immutable service result");
                 let plan = runtime::plan_user_completion(
                     &snapshot,
                     &task.user_task_id,
                     &json!({}),
                     Some(true),
                     at_ms,
+                    runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
                 )
                 .unwrap();
                 repository::complete_user_task(
                     &fixture.db,
                     &fixture.owner,
-                    &stamp("approve immutable service result"),
+                    &command,
                     &started.instance_id,
                     &task.user_task_id,
                     snapshot.instance.revision,
@@ -2965,6 +3278,7 @@ mod tests {
             let version = publish_model(&fixture, &model);
             let id = Uuid::new_v4().to_string();
             let anchor = at("2026-11-09T13:00:00Z");
+            let command = stamp("V1 waits before future activation");
             let plan = runtime::plan_start(
                 &version.model,
                 &id,
@@ -2974,12 +3288,13 @@ mod tests {
                 json!({}),
                 StartCause::Manual,
                 anchor,
+                runtime::test_support::manual_input(&command),
             )
             .unwrap();
             let waiting = repository::start_instance(
                 &fixture.db,
                 &fixture.owner,
-                &stamp("V1 waits before future activation"),
+                &command,
                 &id,
                 &version.definition_id,
                 version.version,
@@ -3031,18 +3346,20 @@ mod tests {
             let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &id).unwrap();
             let task = &snapshot.user_tasks[0];
             let activation = at("2026-11-09T14:00:00Z");
+            let command = stamp("activate old pinned V1 after V2");
             let completion = runtime::plan_user_completion(
                 &snapshot,
                 &task.user_task_id,
                 &json!({}),
                 None,
                 activation,
+                runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
             )
             .unwrap();
             let opened = repository::complete_user_task(
                 &fixture.db,
                 &fixture.owner,
-                &stamp("activate old pinned V1 after V2"),
+                &command,
                 &id,
                 &task.user_task_id,
                 snapshot.instance.revision,
@@ -3239,12 +3556,14 @@ mod tests {
                 repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                     .unwrap();
             let task = &before.user_tasks[0];
+            let command = stamp("completion wins working boundary");
             let completion = runtime::plan_user_completion(
                 &before,
                 &task.user_task_id,
                 &json!({"answer":"completed"}),
                 None,
                 anchor + 1000,
+                runtime::test_support::human_input(&before, &task.user_task_id, &command),
             )
             .unwrap();
             let candidate = repository::due_timers(&fixture.db, anchor + 1000, 32)
@@ -3256,7 +3575,7 @@ mod tests {
                 repository::complete_user_task(
                     &fixture.db,
                     &fixture.owner,
-                    &stamp("completion wins working boundary"),
+                    &command,
                     &started.instance_id,
                     &task.user_task_id,
                     before.instance.revision,
@@ -3292,7 +3611,7 @@ mod tests {
                 assert!(repository::complete_user_task(
                     &fixture.db,
                     &fixture.owner,
-                    &stamp("late working completion"),
+                    &command,
                     &started.instance_id,
                     &task.user_task_id,
                     before.instance.revision,
@@ -3445,6 +3764,7 @@ mod tests {
         let version = publish_model(&fixture, &catch_model);
         let id = Uuid::new_v4().to_string();
         let variables = serde_json::to_value(&catch_model.variables).unwrap();
+        let command = stamp("start due evaluation");
         let plan = runtime::plan_start(
             &version.model,
             &id,
@@ -3454,6 +3774,7 @@ mod tests {
             variables.clone(),
             StartCause::Manual,
             anchor,
+            runtime::test_support::manual_input(&command),
         )
         .unwrap();
         assert_eq!(plan.create_timers.len(), 1);
@@ -3525,7 +3846,7 @@ mod tests {
         let catch = repository::start_instance(
             &fixture.db,
             &fixture.owner,
-            &stamp("errored working catch"),
+            &command,
             &id,
             &version.definition_id,
             version.version,

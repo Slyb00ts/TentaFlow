@@ -282,6 +282,7 @@ pub enum ProcessNodeKind {
         cancel_activity: bool,
         output_mapping: BTreeMap<String, String>,
     },
+    TerminateEnd,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1289,6 +1290,17 @@ mod tests {
         assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
             "InclusiveGateway": { "default_flow_id": null, "unknown": true }
         })).is_err());
+    }
+
+    #[test]
+    fn terminate_end_appends_a_unit_variant_without_changing_old_terminal_bytes() {
+        let old_end = serde_json::to_vec(&ProcessNodeKind::End).unwrap();
+        let old_error = serde_json::to_vec(&ProcessNodeKind::ErrorEnd { error_ref: "Error_1".into() }).unwrap();
+        assert_eq!(old_end, br#""End""#);
+        assert_eq!(old_error, br#"{"ErrorEnd":{"error_ref":"Error_1"}}"#);
+        let terminate = ProcessNodeKind::TerminateEnd;
+        assert_eq!(serde_json::to_vec(&terminate).unwrap(), br#""TerminateEnd""#);
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&terminate).unwrap()).unwrap(), terminate);
     }
 
     #[test]

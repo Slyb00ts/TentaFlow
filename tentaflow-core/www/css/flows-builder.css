@@ -1342,12 +1342,13 @@
 .fb-process-symbol > span { min-width: 0; line-height: 1.4; font-weight: 600; max-height: 100%; overflow-y: auto; }
 .fb-process-node.fb-external-label .fb-process-symbol > span { display: none; }
 .fb-process-symbol svg { width: 24px; height: 24px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; }
-.fb-process-node.bpmn_start, .fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_timer_start, .fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_boundary_timer, .fb-process-node.bpmn_message_start, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw, .fb-process-node.bpmn_boundary_message, .fb-process-node.bpmn_boundary_error, .fb-process-node.bpmn_boundary_escalation { border-radius: 50%; }
+.fb-process-node.bpmn_start, .fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_terminate_end, .fb-process-node.bpmn_timer_start, .fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_boundary_timer, .fb-process-node.bpmn_message_start, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw, .fb-process-node.bpmn_boundary_message, .fb-process-node.bpmn_boundary_error, .fb-process-node.bpmn_boundary_escalation { border-radius: 50%; }
 .fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw { border-style: double; border-width: 5px; }
 .fb-process-node.bpmn_boundary_timer.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_message.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_escalation.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_error { border-style: solid; border-width: 4px; }
 .fb-process-node.bpmn_boundary_timer.fb-boundary-noninterrupting, .fb-process-node.bpmn_boundary_message.fb-boundary-noninterrupting, .fb-process-node.bpmn_boundary_escalation.fb-boundary-noninterrupting { border-style: dashed; border-width: 3px; }
-.fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end { border-width: 4px; }
+.fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_terminate_end { border-width: 4px; }
 .fb-process-node.bpmn_error_end { border-color: var(--tf-danger, #ef4444); }
+.fb-process-node.bpmn_terminate_end { border-color: var(--tf-danger, #ef4444); }
 .fb-process-node.bpmn_call_activity { border-width: 4px; }
 .fb-process-node.bpmn_call_activity::after { content: '+'; position: absolute; left: 50%; bottom: 3px; transform: translateX(-50%); font-size: 16px; font-weight: 700; line-height: 1; pointer-events: none; }
 .fb-process-node.bpmn_exclusive_gateway, .fb-process-node.bpmn_parallel_gateway, .fb-process-node.bpmn_inclusive_gateway, .fb-process-node.bpmn_event_based_gateway { background: transparent; border: none; box-shadow: none; }

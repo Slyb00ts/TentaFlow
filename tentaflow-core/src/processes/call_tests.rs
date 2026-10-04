@@ -65,12 +65,14 @@ fn complete(
         .find(|task| task.status == ProcessUserTaskStatus::Open)
         .unwrap();
     let at = chrono::Utc::now().timestamp_millis();
+    let command = stamp("complete called work");
     let plan =
-        runtime::plan_user_completion(&snapshot, &task.user_task_id, &output, None, at).unwrap();
+        runtime::plan_user_completion(&snapshot, &task.user_task_id, &output, None, at,
+            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
     repository::complete_user_task(
         &f.db,
         actor,
-        &stamp("complete called work"),
+        &command,
         id,
         &task.user_task_id,
         snapshot.instance.revision,
@@ -82,13 +84,69 @@ fn complete(
     .unwrap()
 }
 
+#[test]
+fn returned_call_cannot_replay_its_factual_termination_as_a_standalone_entry() {
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &user_model(None));
+    let mut called_body = caller(&target, BTreeMap::new());
+    called_body.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+        ProcessNodeKind::TerminateEnd;
+    let mut model = embedded_model(called_body, "Scope");
+    model.nodes.iter_mut().find(|node| node.id == "RootEnd_Scope").unwrap().kind =
+        ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() };
+    model.nodes.push(ProcessNode { id: "FinalEnd".into(), name: "Finish parent".into(),
+        kind: ProcessNodeKind::End });
+    model.sequence_flows.push(edge("AfterScopeWork", "RootEnd_Scope", "FinalEnd"));
+    let version = publish_model(&fixture, &model);
+    let parent = messages::test_support::start_version(&fixture, &version);
+    let child = child_id(&fixture, &parent.instance_id);
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let capture = captured.clone();
+    repository::CALL_PLAN_TEST_MUTATOR.with(|mutator| {
+        *mutator.borrow_mut() = Some(Box::new(move |composite| {
+            let returned = composite.call_steps.iter().find_map(|step| match step {
+                repository::CallStep::Return { plan, .. } => Some((**plan).clone()),
+                _ => None,
+            }).expect("real completed child must produce one boxed return");
+            *capture.borrow_mut() = Some(returned);
+        }));
+    });
+    let outcome = complete(&fixture, &fixture.owner, &child, json!({"answer": 42}));
+    repository::CALL_PLAN_TEST_MUTATOR.with(|mutator| *mutator.borrow_mut() = None);
+    assert_eq!(outcome.instance.status, ProcessInstanceStatus::Completed);
+    let returned_plan: repository::RuntimePlan = captured.borrow_mut().take().unwrap();
+    assert!(returned_plan.termination_attempts.iter().any(|attempt| match attempt {
+        repository::TerminationAttempt::Success(source) => matches!(
+            &source.accepted_input, repository::AcceptedInputRef::CallReturn { .. }),
+        repository::TerminationAttempt::ReturnFailure(_) => false,
+    }));
+    let before = transition_rows(&fixture);
+    let current = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &parent.instance_id).unwrap();
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
+    assert_eq!(current.user_tasks.iter().filter(|task|
+        task.status == ProcessUserTaskStatus::Open).count(), 1);
+    let failure = repository::apply_transition(&fixture.db, &fixture.owner,
+        &parent.instance_id, current.instance.revision, &returned_plan,
+        chrono::Utc::now().timestamp_millis()).unwrap_err();
+    assert!(format!("{failure:#}").contains("ordinary advancement cannot invent another terminating entry"));
+    assert_eq!(transition_rows(&fixture), before);
+    let finished = complete(&fixture, &fixture.owner, &parent.instance_id, json!({}));
+    assert_eq!(finished.instance.status, ProcessInstanceStatus::Completed);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &parent.instance_id).unwrap();
+    assert_eq!(persisted.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(persisted.instance.revision, finished.instance.revision);
+}
+
 fn events(f: &Fixture, id: &str) -> Vec<ProcessEvent> {
     repository::list_events(&f.db, &f.owner, id, 0, 200)
         .unwrap()
         .0
 }
 
-fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+pub(super) fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     let conn = f.db.read().unwrap();
     [
         "bpmn_instances",
@@ -194,6 +252,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
     let outer = publish_model(&f, &caller(&middle, BTreeMap::new()));
     let id = Uuid::new_v4().to_string();
     let at = chrono::Utc::now().timestamp_millis();
+    let command = stamp("start exact call tree");
     let plan = runtime::plan_start(
         &outer.model,
         &id,
@@ -203,9 +262,9 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         json!({}),
         runtime::StartCause::Manual,
         at,
+        manual_input(&command),
     )
     .unwrap();
-    let command = stamp("start exact call tree");
     let first = repository::start_instance(
         &f.db,
         &f.owner,
@@ -314,8 +373,9 @@ fn child_assignee_reopen_returns_without_parent_read_grant_or_private_relation()
     let snapshot = repository::runtime_snapshot(&reopened, &participant, &child).unwrap();
     let at = chrono::Utc::now().timestamp_millis();
     let output = json!({"answer":"verified"});
-    let plan = runtime::plan_user_completion(&snapshot, &task, &output, None, at).unwrap();
     let command = stamp("return after restart");
+    let plan = runtime::plan_user_completion(&snapshot, &task, &output, None, at,
+        human_input(&snapshot, &task, &command)).unwrap();
     let result = repository::complete_user_task(
         &reopened,
         &participant,
@@ -809,8 +869,10 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
     let task = &snapshot.user_tasks[0];
     let at = chrono::Utc::now().timestamp_millis();
     let outputs = json!({"answer":42});
+    let command = stamp("forged error source");
     let plan =
-        runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at).unwrap();
+        runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at,
+            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
     for mutation in 0..4 {
         let mut forged = plan.clone();
         let event = forged
@@ -829,7 +891,7 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
         assert!(repository::complete_user_task(
             &f.db,
             &f.owner,
-            &stamp("forged ErrorEnd"),
+            &command,
             &child,
             &task.user_task_id,
             snapshot.instance.revision,
@@ -848,7 +910,7 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
     let committed = repository::complete_user_task(
         &f.db,
         &f.owner,
-        &stamp("genuine downstream ErrorEnd"),
+        &command,
         &child,
         &task.user_task_id,
         snapshot.instance.revision,
@@ -878,6 +940,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
     let version = publish_model(&f, &caller(&target, BTreeMap::new()));
     let id = Uuid::new_v4().to_string();
     let at = chrono::Utc::now().timestamp_millis();
+    let command = stamp("atomic fast child");
     let plan = runtime::plan_start(
         &version.model,
         &id,
@@ -887,9 +950,9 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         json!({}),
         runtime::StartCause::Manual,
         at,
+        manual_input(&command),
     )
     .unwrap();
-    let command = stamp("atomic fast child");
     f.db.write().unwrap().execute_batch("CREATE TRIGGER fail_call_entered BEFORE INSERT ON bpmn_events WHEN NEW.kind='call_entered' BEGIN SELECT RAISE(ABORT,'controlled call storage failure'); END;").unwrap();
     let before = transition_rows(&f);
     let failure = repository::start_instance(
@@ -968,8 +1031,9 @@ fn parent_sibling_revision_race_replans_return_without_incident_and_interruption
         let task = snapshot.user_tasks[0].user_task_id.clone();
         let at = chrono::Utc::now().timestamp_millis();
         let outputs = json!({"answer":42});
-        let plan = runtime::plan_user_completion(&snapshot, &task, &outputs, None, at).unwrap();
-        let command = stamp("complete after parent changes");
+    let command = stamp("complete after parent changes");
+    let plan = runtime::plan_user_completion(&snapshot, &task, &outputs, None, at,
+        human_input(&snapshot, &task, &command)).unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
         let actual = std::thread::scope(|scope| {

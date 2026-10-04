@@ -542,6 +542,92 @@ mod tests {
         ProcessUserTaskKind, ProcessUserTaskStatus,
     };
 
+    #[tokio::test]
+    async fn actual_service_result_reaches_terminate_once_with_fenced_job_history() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("terminate service", None));
+        let mut model = service_model(&flow_id, ActivityVerification::Condition {
+            expression: "true".into(),
+        });
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+            ProcessNodeKind::TerminateEnd;
+        let started = start_model(&fixture, &model);
+        assert_eq!(started.status, ProcessInstanceStatus::Running);
+        let claim = execute(&fixture, "terminate-service-worker").await;
+        let actual = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(actual.instance.status, ProcessInstanceStatus::Completed);
+        let job = actual.jobs.iter().find(|job| job.job_id == claim.job.job_id)
+            .expect("actual fenced service job remains in history");
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.attempt, claim.job.attempt);
+        assert_eq!(job.fence, claim.job.fence);
+        let history = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 100).unwrap().0;
+        assert_eq!(history.iter().filter(|event| event.kind == "service_result").count(), 1);
+        let source = history.iter().find(|event| event.kind == "terminate_end_reached")
+            .expect("real service continuation reached TerminateEnd");
+        assert_eq!(source.data["source_instance_id"], started.instance_id);
+        assert_eq!(history.iter().filter(|event| event.kind == "instance_completed"
+            && event.data["source_event_id"] == source.data["source_event_id"]).count(), 1);
+        assert!(actual.tokens.iter().all(|token|
+            !matches!(token.status.as_str(), "ready" | "waiting" | "joining")));
+    }
+
+    #[tokio::test]
+    async fn waiting_service_cannot_be_claimed_as_a_ready_termination_source() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("terminate service", None));
+        let mut model = service_model(&flow_id, ActivityVerification::Condition {
+            expression: "true".into(),
+        });
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+            ProcessNodeKind::TerminateEnd;
+        let started = start_model(&fixture, &model);
+        let worker = "waiting-source-worker";
+        let claim = repository::claim_job(&fixture.db, worker, now_ms()).unwrap().unwrap();
+        let observed = ObservedActivityResult {
+            result: observe_effect(&fixture, &claim).await,
+            origin: ActivityResultOrigin::Envelope,
+            expression_observation: None,
+        };
+        let at = now_ms();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert!(plan.termination_attempts.iter().any(|attempt|
+            matches!(attempt, repository::TerminationAttempt::Success(_))));
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut missing_source = plan.clone();
+        let result_index = missing_source.events.iter().position(|event|
+            event.kind == "service_result").unwrap();
+        assert!(missing_source.event_ids.remove(&result_index).is_some());
+        let missing = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &missing_source, at).unwrap_err();
+        assert!(format!("{missing:#}").contains(
+            "accepted service result lacks its required source identity"));
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut forged = plan.clone();
+        let repository::TerminationAttempt::Success(source) = &mut forged.termination_attempts[0]
+            else { panic!("real service result did not reach TerminateEnd") };
+        source.accepted_input = repository::AcceptedInputRef::PersistedReady {
+            token_id: claim.job.token_id.clone(),
+            expected_instance_revision: claim.snapshot.instance.revision,
+        };
+        assert!(repository::accept_job_result(&fixture.db, &fixture.owner, &claim.job.job_id,
+            claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &forged, at).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let accepted = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &plan, at).unwrap().instance;
+        assert_eq!(accepted.status, ProcessInstanceStatus::Completed);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(persisted.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(persisted.instance.variables, accepted.variables);
+    }
+
     async fn execute(fixture: &Fixture, worker: &str) -> ClaimedProcessJob {
         let claimed = repository::claim_job(&fixture.db, worker, now_ms())
             .unwrap()
@@ -722,10 +808,12 @@ mod tests {
         let sibling = partial.instance.user_tasks.iter().find(|task| task.node_id == "Sibling"
             && task.status == ProcessUserTaskStatus::Open).unwrap();
         let at_ms = now_ms();
+        let command = stamp("complete sibling after service retry");
         let plan = runtime::plan_user_completion(&partial, &sibling.user_task_id,
-            &Value::Null, None, at_ms).unwrap();
+            &Value::Null, None, at_ms,
+            runtime::test_support::human_input(&partial, &sibling.user_task_id, &command)).unwrap();
         let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("complete sibling after service retry"), &started.instance_id,
+            &command, &started.instance_id,
             &sibling.user_task_id, partial.instance.revision, &Value::Null, None, &plan, at_ms)
             .unwrap().instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -764,12 +852,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detail.outputs["outputs"]["variables"]["marker"], "evidence");
+        let reject_command = stamp("reject result");
         assert!(runtime::plan_user_completion(
             &waiting,
             &task.user_task_id,
             &Value::Null,
             None,
-            at_ms
+            at_ms,
+            runtime::test_support::human_input(&waiting, &task.user_task_id, &reject_command),
         )
         .is_err());
         let rejection = runtime::plan_user_completion(
@@ -778,12 +868,13 @@ mod tests {
             &json!("insufficient"),
             Some(false),
             at_ms,
+            runtime::test_support::human_input(&waiting, &task.user_task_id, &reject_command),
         )
         .unwrap();
         let rejected = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("reject result"),
+            &reject_command,
             &started.instance_id,
             &task.user_task_id,
             waiting.instance.revision,
@@ -820,18 +911,20 @@ mod tests {
             .iter()
             .find(|task| task.status == ProcessUserTaskStatus::Open)
             .unwrap();
+        let approve_command = stamp("approve observed result");
         let approval = runtime::plan_user_completion(
             &waiting,
             &task.user_task_id,
             &json!({"answer":"client cannot replace service output"}),
             Some(true),
             at_ms,
+            runtime::test_support::human_input(&waiting, &task.user_task_id, &approve_command),
         )
         .unwrap();
         let completed = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("approve observed result"),
+            &approve_command,
             &started.instance_id,
             &task.user_task_id,
             waiting.instance.revision,
@@ -1860,18 +1953,20 @@ mod tests {
                     })
                     .unwrap();
                 let at = now_ms();
+                let command = stamp("reject accepted escalation verification");
                 let rejection = runtime::plan_user_completion(
                     &current,
                     &verification.user_task_id,
                     &json!("declined"),
                     Some(false),
                     at,
+                    runtime::test_support::human_input(&current, &verification.user_task_id, &command),
                 )
                 .unwrap();
                 let rejected = repository::complete_user_task(
                     &fixture.db,
                     &fixture.owner,
-                    &stamp("reject accepted escalation verification"),
+                    &command,
                     &started.instance_id,
                     &verification.user_task_id,
                     current.instance.revision,
@@ -3388,6 +3483,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unselected_escalation_cannot_retain_a_forged_handler_failure() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":null,
+            "summary":"Review the actual result","outputs":{"answer":17},
+            "evidence":["observed"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body));
+        let mut model = service_model(&flow_id, ActivityVerification::Human);
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+        let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut service.kind
+            else { panic!("fixture service node changed kind") };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let started = start_model(&fixture, &model);
+        let worker = "unselected-escalation-worker";
+        let claim = repository::claim_job(&fixture.db, worker, now_ms()).unwrap().unwrap();
+        let outputs = observe_effect(&fixture, &claim).await.outputs;
+        let variables = claim.snapshot.instance.variables.clone();
+        let observed = ObservedActivityResult {
+            result: parse_contract_result(runtime::evaluate(
+                "outputs.variables.actual_result", &variables, &outputs, &[]).unwrap()).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: outputs,
+                evaluation_variables: variables,
+            }),
+        };
+        let at = now_ms();
+        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert!(canonical.event_ids.is_empty());
+        assert!(canonical.create_user_tasks.iter().any(|task|
+            task.kind == ProcessUserTaskKind::Verification));
+        let mut forged = runtime::plan_retained_escalation_incident(&claim.snapshot,
+            &claim.job, &observed, "AbsentEscalation", "invented handler failure", at).unwrap();
+        forged.add_incidents[0].code = "OTHER_HANDLER_FAILURE".into();
+        forged.events[1].data["code"] = json!("OTHER_HANDLER_FAILURE");
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let error = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision, &forged, at).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "unselected NeedsHuman result differs from its factual Verification wait"));
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut missing_verification = canonical.clone();
+        missing_verification.create_user_tasks.clear();
+        let error = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision, &missing_verification, at).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "unselected NeedsHuman result differs from its factual Verification wait"));
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let committed = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision, &canonical, at).unwrap().instance;
+        assert!(committed.user_tasks.iter().any(|task|
+            task.kind == ProcessUserTaskKind::Verification
+                && task.status == ProcessUserTaskStatus::Open));
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(persisted.instance.revision, committed.revision);
+        assert!(persisted.user_tasks.iter().any(|task|
+            task.kind == ProcessUserTaskKind::Verification
+                && task.status == ProcessUserTaskStatus::Open));
+    }
+
+    #[tokio::test]
     async fn explicit_needs_human_keeps_message_boundary_live_until_actual_verification_completion()
     {
         use crate::processes::messages::test_support::{
@@ -3450,18 +3610,20 @@ mod tests {
             |t| t.user_task_id == task.user_task_id && t.status == ProcessUserTaskStatus::Open
         ));
         let at = now_ms();
+        let command = stamp("approve actual persisted result");
         let plan = crate::processes::runtime::plan_user_completion(
             &current,
             &task.user_task_id,
             &json!({}),
             Some(true),
             at,
+            runtime::test_support::human_input(&current, &task.user_task_id, &command),
         )
         .unwrap();
         repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("approve actual persisted result"),
+            &command,
             &started.instance_id,
             &task.user_task_id,
             current.instance.revision,
@@ -3518,18 +3680,20 @@ mod tests {
                 .unwrap();
             first_task.get_or_insert_with(|| task.user_task_id.clone());
             let at = now_ms();
+            let command = stamp("reject persisted verification");
             let plan = crate::processes::runtime::plan_user_completion(
                 &snapshot,
                 &task.user_task_id,
                 &json!({}),
                 Some(false),
                 at,
+                runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
             )
             .unwrap();
             let rejected = repository::complete_user_task(
                 &fixture.db,
                 &fixture.owner,
-                &stamp("reject persisted verification"),
+                &command,
                 &started.instance_id,
                 &task.user_task_id,
                 snapshot.instance.revision,

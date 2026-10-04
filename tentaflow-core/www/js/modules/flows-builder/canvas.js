@@ -100,7 +100,7 @@ function markUnsupported(node, ports, side) {
 function portsForNode(node, template) {
   if (node.type.startsWith('bpmn_')) {
     return { inputs: (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(node.type) || processBoundaryKind(node.type)) ? [] : [{ name: 'in', type: 'any' }],
-      outputs: ['bpmn_end', 'bpmn_error_end'].includes(node.type) ? [] : [{ name: 'full', type: 'any' }] };
+      outputs: ['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(node.type) ? [] : [{ name: 'full', type: 'any' }] };
   }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
   // so it needs the literal fallback; every other entry-style node — trigger,
@@ -1038,7 +1038,7 @@ export class FlowCanvas {
     const source = this.nodes.find((node) => node.id === sourceId);
     const target = this.nodes.find((node) => node.id === targetId);
     if (!source || !target) return false;
-    if (this.mode === 'bpmn' && (['bpmn_end', 'bpmn_error_end'].includes(source.type) || (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) || processBoundaryKind(target.type)))) return false;
+    if (this.mode === 'bpmn' && (['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(source.type) || (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) || processBoundaryKind(target.type)))) return false;
     if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
     const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
     if (this.mode === 'bpmn') edge.condition = null;
@@ -1180,7 +1180,7 @@ export class FlowCanvas {
       div.style.width = `${n.width}px`;
       div.style.height = `${n.height}px`;
       const title = n.label || tmpl.label;
-      const event = (['bpmn_start', 'bpmn_end', 'bpmn_error_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_message_start', 'bpmn_message_catch', 'bpmn_message_throw'].includes(n.type) || processBoundaryKind(n.type));
+      const event = (['bpmn_start', 'bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_message_start', 'bpmn_message_catch', 'bpmn_message_throw'].includes(n.type) || processBoundaryKind(n.type));
       if (processBoundaryKind(n.type)) {
         div.classList.add(n.type === 'bpmn_boundary_error' || n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
       }
@@ -1191,7 +1191,7 @@ export class FlowCanvas {
         <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
         <span class="fb-process-label-leader" aria-hidden="true"></span>
         ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
-        ${['bpmn_end', 'bpmn_error_end'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
+        ${['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
       div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
       div.setAttribute('aria-label', title);
       return div;

@@ -700,8 +700,39 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         "endEvent" => {
             element.attrs_only(&["id", "name"])?;
-            element.children_only(&[(BPMN, "errorEventDefinition")])?;
-            if element.child(BPMN, "errorEventDefinition")?.is_some() {
+            if let Some(child) = element.children.iter().find(|child|
+                !child.is(BPMN, "errorEventDefinition") && !child.is(BPMN, "terminateEventDefinition")) {
+                return Err(XmlElementError {
+                    message: format!("unsupported end event definition {{{}}}{} at byte {}",
+                        child.ns, child.local, child.offset),
+                    element_id: Some(id.clone()), offset: child.offset,
+                }.into());
+            }
+            let terminate_definitions = element.children.iter()
+                .filter(|child| child.ns == BPMN && child.local == "terminateEventDefinition")
+                .collect::<Vec<_>>();
+            if let Some(definition) = terminate_definitions.first() {
+                if element.children.len() != 1 || terminate_definitions.len() != 1 {
+                    let offending = element.children.get(1).unwrap_or(*definition);
+                    return Err(XmlElementError {
+                        message: format!("terminate end {} requires exactly one event definition at byte {}", id, offending.offset),
+                        element_id: Some(id.clone()), offset: offending.offset,
+                    }.into());
+                }
+                if let Err(error) = definition.attrs_only(&[]) {
+                    return Err(XmlElementError {
+                        message: format!("invalid terminate definition for {} at byte {}: {error}", id, definition.offset),
+                        element_id: Some(id.clone()), offset: definition.offset,
+                    }.into());
+                }
+                if !definition.children.is_empty() || !definition.text.trim().is_empty() {
+                    return Err(XmlElementError {
+                        message: format!("terminate definition for {} must be empty at byte {}", id, definition.offset),
+                        element_id: Some(id.clone()), offset: definition.offset,
+                    }.into());
+                }
+                ProcessNodeKind::TerminateEnd
+            } else if element.child(BPMN, "errorEventDefinition")?.is_some() {
                 ensure!(element.children.len() == 1, "error end requires one error definition");
                 ProcessNodeKind::ErrorEnd {
                     error_ref: event_reference(element, "errorEventDefinition", target_namespace)?,
@@ -1331,6 +1362,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ),
             ProcessNodeKind::End => ("endEvent", String::new()),
             ProcessNodeKind::ErrorEnd { .. } => ("endEvent", String::new()),
+            ProcessNodeKind::TerminateEnd => ("endEvent", String::new()),
             ProcessNodeKind::ParallelGateway => ("parallelGateway", String::new()),
             ProcessNodeKind::EventBasedGateway => (
                 "eventBasedGateway", " gatewayDirection=\"Diverging\" eventGatewayType=\"Exclusive\" instantiate=\"false\"".into()),
@@ -1436,6 +1468,9 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ProcessNodeKind::ErrorEnd { error_ref } => {
                 xml.push_str(&format!("><bpmn:errorEventDefinition errorRef=\"tns:{}\"/></bpmn:{tag}>",
                     escaped(error_ref)));
+            }
+            ProcessNodeKind::TerminateEnd => {
+                xml.push_str(&format!("><bpmn:terminateEventDefinition/></bpmn:{tag}>"));
             }
             ProcessNodeKind::UserTask {
                 assignee_user_id,
@@ -2578,6 +2613,63 @@ mod tests {
         assert!(diagnostics[0].offset.is_some());
         let invalid = xml.replacen("<bpmn:inclusiveGateway", "<bpmn:foreignGateway", 1);
         assert!(import_xml(&invalid).0.is_none());
+    }
+
+    #[test]
+    fn terminate_end_xml_round_trip_and_rejects_mixed_definitions() {
+        let mut model = super::super::model::starter_model();
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind = ProcessNodeKind::TerminateEnd;
+        model.nodes[0].name = "Zażółć — source before the terminal".into();
+        model.diagram.shapes.push(ProcessShape {
+            element_id: "End_1".into(), x: 260.0, y: 80.0, width: 56.0, height: 56.0,
+        });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:endEvent id=\"End_1\""));
+        assert!(xml.contains("<bpmn:terminateEventDefinition/>"));
+        assert!(xml.contains("bpmnElement=\"End_1\""), "the terminal retains its BPMN DI shape");
+        assert_eq!(import_xml(&xml).0, Some(model.clone()));
+        let alternate_prefix = xml.replacen(&format!("xmlns:bpmn=\"{BPMN}\""),
+            &format!("xmlns:bpmn=\"{BPMN}\" xmlns:alternate=\"{BPMN}\""), 1)
+            .replace("<bpmn:terminateEventDefinition/>", "<alternate:terminateEventDefinition/>");
+        assert_eq!(import_xml(&alternate_prefix).0, Some(model.clone()));
+
+        for (label, invalid, offending_child) in [
+            ("unsupported id", xml.replacen("<bpmn:terminateEventDefinition/>",
+                "<bpmn:terminateEventDefinition id=\"UnsupportedDefinition\"/>", 1),
+                "<bpmn:terminateEventDefinition id=\"UnsupportedDefinition\""),
+            ("duplicate", xml.replacen("<bpmn:terminateEventDefinition/>",
+                "<bpmn:terminateEventDefinition/><bpmn:terminateEventDefinition/>", 1),
+                "<bpmn:terminateEventDefinition/><bpmn:terminateEventDefinition/>"),
+            ("mixed", xml.replacen("<bpmn:terminateEventDefinition/>",
+                "<bpmn:terminateEventDefinition/><bpmn:errorEventDefinition errorRef=\"tns:Missing\"/>", 1),
+                "<bpmn:errorEventDefinition"),
+            ("plain global", xml.replacen("<bpmn:terminateEventDefinition/>",
+                "<bpmn:terminateEventDefinition terminateAll=\"true\"/>", 1),
+                "<bpmn:terminateEventDefinition terminateAll="),
+            ("foreign global", xml.replacen(&format!("xmlns:bpmn=\"{BPMN}\""),
+                &format!("xmlns:bpmn=\"{BPMN}\" xmlns:camunda=\"http://camunda.org/schema/1.0/bpmn\""), 1)
+                .replacen("<bpmn:terminateEventDefinition/>",
+                    "<bpmn:terminateEventDefinition camunda:terminateAll=\"true\"/>", 1),
+                "<bpmn:terminateEventDefinition camunda:terminateAll="),
+            ("foreign namespace", xml.replacen(&format!("xmlns:bpmn=\"{BPMN}\""),
+                &format!("xmlns:bpmn=\"{BPMN}\" xmlns:foreign=\"urn:foreign:events\""), 1)
+                .replacen("<bpmn:terminateEventDefinition/>", "<foreign:terminateEventDefinition/>", 1),
+                "<foreign:terminateEventDefinition"),
+            ("nested content", xml.replacen("<bpmn:terminateEventDefinition/>",
+                "<bpmn:terminateEventDefinition><bpmn:extensionElements/></bpmn:terminateEventDefinition>", 1),
+                "<bpmn:terminateEventDefinition>"),
+        ] {
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none(), "{label}");
+            let expected_offset = if label == "duplicate" {
+                invalid.find(offending_child).unwrap() + "<bpmn:terminateEventDefinition/>".len()
+            } else { invalid.find(offending_child).unwrap() };
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some("End_1")
+                && diagnostic.offset == Some(expected_offset)), "{label}: {diagnostics:?}");
+            assert!(invalid[..expected_offset].contains("Zażółć"),
+                "{label} must measure UTF-8 bytes after a non-ASCII process name");
+        }
     }
 
 }

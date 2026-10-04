@@ -88,6 +88,15 @@ function validateJson(section, object = false) {
 
 export function processEventText(event) {
   const node = event.nodeName || text('element_unavailable');
+  if (event.kind === 'terminate_end_reached') return text('event_terminate_end_reached', { node });
+  if (event.kind === 'instance_completed' && event.data?.reason === 'terminate_end') return text('event_instance_terminated');
+  if (event.kind === 'cancelled' && event.data?.reason === 'terminate_end') return text('event_instance_cancelled_terminate');
+  if (event.kind === 'scope_completed' && event.data?.reason === 'terminate_end') return text('event_scope_terminated', {
+    element: event.data.subprocess_node_id || '',
+  });
+  if (event.kind === 'call_request_cancelled') return text('event_call_request_cancelled', {
+    node, reason: processLifecycleReasonText(event.data.reason || ''),
+  });
   if (event.kind === 'timer_armed') return text('event_timer_armed', { node,
     due: event.data.working_time ? workingDate(event.data.due_at_ms, {
       dueOffsetSeconds: event.data.working_time.due_offset_seconds,
@@ -179,6 +188,7 @@ export function processLifecycleReasonText(reason) {
     case 'scope_cancelled': return text('reason_scope_cancelled');
     case 'call_interrupted': return text('reason_call_interrupted');
     case 'error_end': return text('reason_error_end');
+    case 'terminate_end': return text('reason_terminate_end');
     case 'child_cancelled': return text('reason_child_cancelled');
     case 'scope_limit': return text('reason_scope_limit');
     case 'definition_archived': return text('timer_reason_definition_archived');
@@ -360,6 +370,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         at.textContent = date(event.atMs);
         item.append(description, at);
         if (event.kind === 'service_result') item.append(jsonSection(text('actual_outputs'), event.data, false));
+        if (event.kind === 'terminate_end_reached') item.append(jsonSection(text('terminate_facts'), event.data, false));
         if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
       }

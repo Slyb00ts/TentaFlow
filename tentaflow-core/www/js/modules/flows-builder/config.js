@@ -367,6 +367,8 @@ export class FlowConfig {
     } else if (kind === 'ErrorEnd') {
       fields += declaration('errorRef', 'error_reference', model.errors, 'errorId', config.errorRef)
         + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.error_end_hint'))}</p>`;
+    } else if (kind === 'TerminateEnd') {
+      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.node_terminate_end_hint'))}</p>`;
     } else if (kind === 'TimerStart' || kind === 'TimerCatch' || kind === 'BoundaryTimer') {
       if (kind === 'BoundaryTimer') {
         fields += `${boundary()}
@@ -423,7 +425,7 @@ export class FlowConfig {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (!['End', 'ErrorEnd'].includes(kind) && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    if (!['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
     fields += `<tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(node.id)}"></tf-textarea>`;
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>

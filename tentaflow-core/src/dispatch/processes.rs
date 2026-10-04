@@ -367,6 +367,10 @@ pub fn process_dispatch(
                     merged,
                     runtime::StartCause::Manual,
                     at_ms,
+                    repository::StartInputRef::Manual {
+                        command_id: stamp.command_id.clone(),
+                        request_hash: stamp.request_hash.clone(),
+                    },
                 )
                 .map_err(error)?;
                 repository::start_instance(
@@ -441,6 +445,11 @@ pub fn process_dispatch(
             } else {
                 let snapshot =
                     repository::runtime_snapshot(pool, &actor, instance_id).map_err(error)?;
+                let task_revision = snapshot.user_tasks.iter()
+                    .find(|task| task.user_task_id == *user_task_id
+                        && task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open)
+                    .map(|task| task.revision)
+                    .ok_or_else(|| error(anyhow::anyhow!("open process user task not found")))?;
                 let at_ms = chrono::Utc::now().timestamp_millis();
                 let plan = runtime::plan_user_completion(
                     &snapshot,
@@ -448,6 +457,13 @@ pub fn process_dispatch(
                     outputs,
                     *approved,
                     at_ms,
+                    repository::AcceptedInputRef::Human {
+                        task_id: user_task_id.clone(),
+                        expected_task_revision: task_revision,
+                        expected_instance_revision: snapshot.instance.revision,
+                        command_id: stamp.command_id.clone(),
+                        request_hash: stamp.request_hash.clone(),
+                    },
                 )
                 .map_err(error)?;
                 let outcome = repository::complete_user_task(
@@ -964,6 +980,166 @@ mod tests {
             .code,
             ProtocolErrorCode::PolicyDenied
         );
+    }
+
+    #[tokio::test]
+    async fn participant_terminates_after_another_branch_advances_the_instance_revision() {
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "parallel-termination-owner");
+        let participant = test_support::actor(&state.db, "parallel-termination-participant");
+        let owner_ctx = context(&state, &owner);
+        let participant_ctx = context(&state, &participant);
+        let mut model = crate::processes::model::starter_model();
+        model.nodes.splice(1..1, [
+            ProcessNode { id: "Split".into(), name: "Run three branches".into(),
+                kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "LeftWork".into(), name: "Reach the join first".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
+                    output_mapping: Default::default() } },
+            ProcessNode { id: "RightWork".into(), name: "Remain at the join".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
+                    output_mapping: Default::default() } },
+            ProcessNode { id: "TerminateWork".into(), name: "Terminate after the join arrival".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: Some(participant.user_id.clone()),
+                    output_mapping: std::collections::BTreeMap::from([
+                        ("decision".into(), "outputs.decision".into())]) } },
+            ProcessNode { id: "Join".into(), name: "Join ordinary branches".into(),
+                kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Terminate".into(), name: "Stop the process".into(),
+                kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows = vec![
+            test_support::edge("StartSplit", "Start_1", "Split"),
+            test_support::edge("SplitLeft", "Split", "LeftWork"),
+            test_support::edge("SplitRight", "Split", "RightWork"),
+            test_support::edge("SplitTerminate", "Split", "TerminateWork"),
+            test_support::edge("LeftJoin", "LeftWork", "Join"),
+            test_support::edge("RightJoin", "RightWork", "Join"),
+            test_support::edge("JoinEnd", "Join", "End_1"),
+            test_support::edge("TerminateEnd", "TerminateWork", "Terminate"),
+        ];
+        let definition = save(&owner_ctx, model).await;
+        request(&owner_ctx, P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: definition.definition_id.clone(),
+            expected_revision: definition.draft_revision,
+            repin_calendar: None,
+        }).await;
+        let P::InstanceStartResponse { instance: started } = request(&owner_ctx,
+            P::InstanceStartRequest { command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id, version: 1, variables: json!({}) }).await
+        else { panic!("three actual waiting branches expected") };
+        assert_eq!(started.status, ProcessInstanceStatus::Waiting);
+        assert_eq!(started.user_tasks.len(), 3);
+        let left = started.user_tasks.iter().find(|task| task.node_id == "LeftWork").unwrap();
+        let target = started.user_tasks.iter().find(|task| task.node_id == "TerminateWork").unwrap();
+        assert_eq!(target.revision, 1);
+        let P::UserTaskCompleteResponse { instance: after_left } = request(&owner_ctx,
+            P::UserTaskCompleteRequest { command_id: uuid::Uuid::new_v4().to_string(),
+                instance_id: started.instance_id.clone(), user_task_id: left.user_task_id.clone(),
+                expected_revision: started.revision, outputs: json!({}), approved: None }).await
+        else { panic!("first join arrival expected") };
+        assert_eq!(after_left.status, ProcessInstanceStatus::Waiting);
+        assert!(after_left.revision > started.revision);
+        assert!(after_left.revision > target.revision);
+        let selected = repository::get_user_task(&state.db, &participant,
+            &started.instance_id, &target.user_task_id).unwrap();
+        assert_eq!(selected.revision, target.revision);
+        assert_eq!(selected.status, tentaflow_protocol::processes::ProcessUserTaskStatus::Open);
+        assert_eq!(selected.assignee_user_id, participant.user_id);
+        assert!(selected.can_complete);
+        let receipt_count: u32 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id=?1",
+            [&started.instance_id], |row| row.get(0)).unwrap();
+        assert_eq!(receipt_count, 1);
+
+        let persisted_rows = || {
+            let conn = state.db.read().unwrap();
+            ["bpmn_instances", "bpmn_scopes", "bpmn_tokens", "bpmn_gateway_receipts",
+                "bpmn_user_tasks", "bpmn_jobs", "bpmn_incidents", "bpmn_timers",
+                "bpmn_event_subscriptions", "bpmn_event_races", "bpmn_messages",
+                "bpmn_calls", "bpmn_events", "bpmn_commands"]
+                .iter().map(|table| {
+                    let mut query = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = query.column_count();
+                    query.query_map([], |row| (0..columns)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>())
+                        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+                }).collect::<Vec<Vec<Vec<rusqlite::types::Value>>>>()
+        };
+        let before = persisted_rows();
+        let complete = P::UserTaskCompleteRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: started.instance_id.clone(), user_task_id: target.user_task_id.clone(),
+            expected_revision: after_left.revision, outputs: json!({"decision":"finish"}),
+            approved: None,
+        };
+        let mut stale = complete.clone();
+        if let P::UserTaskCompleteRequest { command_id, expected_revision, .. } = &mut stale {
+            *command_id = uuid::Uuid::new_v4().to_string();
+            *expected_revision = started.revision;
+        }
+        refused(&participant_ctx, stale).await;
+        assert_eq!(persisted_rows(), before, "stale instance revision changed process rows");
+        let mut wrong_actor = complete.clone();
+        if let P::UserTaskCompleteRequest { command_id, .. } = &mut wrong_actor {
+            *command_id = uuid::Uuid::new_v4().to_string();
+        }
+        refused(&owner_ctx, wrong_actor).await;
+        assert_eq!(persisted_rows(), before, "unassigned actor changed process rows");
+        let mut forged_task = complete.clone();
+        if let P::UserTaskCompleteRequest { command_id, user_task_id, .. } = &mut forged_task {
+            *command_id = uuid::Uuid::new_v4().to_string();
+            *user_task_id = uuid::Uuid::new_v4().to_string();
+        }
+        refused(&participant_ctx, forged_task).await;
+        assert_eq!(persisted_rows(), before, "forged task identity changed process rows");
+
+        let P::UserTaskCompleteResponse { instance: completed } =
+            request(&participant_ctx, complete.clone()).await
+        else { panic!("factual participant termination expected") };
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        assert_eq!(completed.variables["decision"], "finish");
+        assert!(completed.active_node_ids.is_empty());
+        let active_controls: u32 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')",
+            [&started.instance_id], |row| row.get(0)).unwrap();
+        assert_eq!(active_controls, 0);
+        let open_tasks: u32 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open'",
+            [&started.instance_id], |row| row.get(0)).unwrap();
+        assert_eq!(open_tasks, 0);
+        let closed_receipts: u32 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id=?1",
+            [&started.instance_id], |row| row.get(0)).unwrap();
+        assert_eq!(closed_receipts, 0);
+        let P::HistoryResponse { events, .. } = request(&participant_ctx,
+            P::HistoryRequest { instance_id: started.instance_id.clone(), after_seq: 0, limit: 200 })
+            .await else { panic!("factual termination history expected") };
+        assert_eq!(events.iter().filter(|event| event.kind == "user_task_completed").count(), 2);
+        assert_eq!(events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
+        let committed = persisted_rows();
+        let P::UserTaskCompleteResponse { instance: replayed } =
+            request(&participant_ctx, complete).await
+        else { panic!("same command replay expected") };
+        assert_eq!(replayed, completed);
+        assert_eq!(persisted_rows(), committed);
+        let path: String = state.db.read().unwrap().query_row("PRAGMA database_list", [],
+            |row| row.get(2)).unwrap();
+        let reopened = crate::db::init(std::path::Path::new(&path)).unwrap();
+        assert_eq!(repository::get_instance(&reopened, &owner, &started.instance_id, None)
+            .unwrap().status, ProcessInstanceStatus::Completed);
+        let reopened_receipts: u32 = reopened.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id=?1",
+            [&started.instance_id], |row| row.get(0)).unwrap();
+        assert_eq!(reopened_receipts, 0);
+        let reopened_events = repository::list_events(&reopened, &owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(reopened_events.iter().filter(|event| event.kind == "terminate_end_reached")
+            .count(), 1);
+        assert_eq!(persisted_rows(), committed);
     }
 
     #[tokio::test]

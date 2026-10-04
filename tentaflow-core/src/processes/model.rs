@@ -1,6 +1,6 @@
 // ============ File: model.rs — Process graph validation and structured gateway joins ============
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,11 +27,17 @@ pub enum GatewayKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayBranchExits {
+    pub join_incoming_edge_id: Option<String>,
+    pub terminate_end_node_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayPair {
     pub kind: GatewayKind,
     pub split_node_id: String,
-    pub join_node_id: String,
-    pub branch_to_incoming_edge: BTreeMap<String, String>,
+    pub join_node_id: Option<String>,
+    pub branches: BTreeMap<String, GatewayBranchExits>,
 }
 
 pub fn scope_body<'a>(
@@ -785,7 +791,7 @@ fn validate_body<'a>(
     );
     ensure!(
         graph_nodes.iter()
-        .any(|node| matches!(node.kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })),
+        .any(|node| matches!(node.kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd)),
         "process requires an end event"
     );
     for node in graph_nodes {
@@ -856,7 +862,7 @@ fn validate_body<'a>(
                     );
                 }
             }
-            ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } => ensure!(
+            ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd => ensure!(
                 out_count == 0 && in_count >= 1,
                 "end event must have incoming flow and no outgoing flow"
             ),
@@ -930,7 +936,7 @@ fn validate_body<'a>(
     let pairs = gateway_pairs(graph_nodes, graph_flows)?;
     let joins: HashMap<&str, &str> = pairs
         .iter()
-        .map(|(split, pair)| (pair.join_node_id.as_str(), split.as_str()))
+        .filter_map(|(split, pair)| pair.join_node_id.as_deref().map(|join| (join, split.as_str())))
         .collect();
     let mut graph_outgoing = outgoing.clone();
     let mut degree: HashMap<&str, usize> = nodes
@@ -968,7 +974,7 @@ fn validate_body<'a>(
     );
     let mut can_end = HashSet::new();
     for node_id in order.iter().rev() {
-        if matches!(nodes[node_id].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })
+        if matches!(nodes[node_id].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd)
             || graph_outgoing
                 .get(node_id)
                 .into_iter()
@@ -1006,8 +1012,10 @@ fn validate_body<'a>(
             ensure!(stack.is_empty(), "end event has an open gateway activation");
         }
         for target in outgoing.get(node_id).into_iter().flatten() {
-            if matches!(nodes[target].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
-                ensure!(stack.is_empty(), "boundary or main path ends inside a gateway fork");
+            if matches!(nodes[target].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd) {
+                if !matches!(nodes[target].kind, ProcessNodeKind::TerminateEnd) {
+                    ensure!(stack.is_empty(), "boundary or main path ends inside a gateway fork");
+                }
                 states.entry(*target).or_insert_with(|| (region.clone(), stack.clone()));
             } else if let Some(existing) = states.get(target) {
                 ensure!(
@@ -1188,7 +1196,7 @@ impl EscalationPrefixProof<'_> {
                         for edge in branches {
                             arrivals.push(self.visit(
                                 &edge.target_id,
-                                Some(&pair.join_node_id),
+                                pair.join_node_id.as_deref(),
                                 Some(&edge.id),
                             )?);
                         }
@@ -1197,7 +1205,11 @@ impl EscalationPrefixProof<'_> {
                             GatewayKind::Inclusive => arrivals.iter().any(|arrival| *arrival),
                         };
                         if may_join {
-                            self.follow_one(&pair.join_node_id, stop_join)
+                            if let Some(join_id) = pair.join_node_id.as_deref() {
+                                self.follow_one(join_id, stop_join)
+                            } else {
+                                Ok(false)
+                            }
                         } else {
                             Ok(false)
                         }
@@ -1211,7 +1223,7 @@ impl EscalationPrefixProof<'_> {
                         ))
                     }
                 }
-                ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } => Err(self.failure(
+                ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd => Err(self.failure(
                     incoming_flow,
                     Some(node_id),
                     ProcessEscalationPathReason::TerminalBeforeWait,
@@ -1329,26 +1341,36 @@ fn validate_event_gateway_regions<'a>(
         }
         let common = order.iter().copied().find(|node_id| {
             branch_reach.iter().all(|reach| reach.contains(node_id))
-        }).with_context(|| format!("event gateway {} has no common exclusive merge or end", gateway.id))?;
-        ensure!(
-            matches!(nodes[common].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. })
-                || matches!(&nodes[common].kind, ProcessNodeKind::ExclusiveGateway { default_flow_id: None }
-                    if outgoing.get(common).map_or(0, Vec::len) == 1
-                        && graph_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
-            "event gateway {} branches merge at unsupported node {}",
-            gateway.id,
-            common
-        );
+        });
+        if let Some(common) = common {
+            ensure!(
+                matches!(nodes[common].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd)
+                    || matches!(&nodes[common].kind, ProcessNodeKind::ExclusiveGateway { default_flow_id: None }
+                        if outgoing.get(common).map_or(0, Vec::len) == 1
+                            && graph_flows.iter().filter(|flow| flow.source_id == common).all(|flow| flow.condition.is_none())),
+                "event gateway {} branches merge at unsupported node {}",
+                gateway.id,
+                common
+            );
+        } else {
+            ensure!(branch_reach.iter().any(|reach| reach.iter().any(|id|
+                matches!(nodes[*id].kind, ProcessNodeKind::TerminateEnd))),
+                "event gateway {} has no common exclusive merge or terminal escape", gateway.id);
+        }
         let mut visited_regions = HashSet::new();
         for branch in branches {
             let mut reached = HashSet::new();
             let mut queue = VecDeque::from([*branch]);
             while let Some(current) = queue.pop_front() {
-                if current == common || !reached.insert(current) {
+                if common == Some(current) || !reached.insert(current) {
                     continue;
                 }
-                ensure!(!matches!(nodes[current].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }),
-                    "event gateway {} branch ends before common merge {}", gateway.id, common);
+                if matches!(nodes[current].kind, ProcessNodeKind::TerminateEnd) { continue; }
+                if matches!(nodes[current].kind, ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. }) {
+                    ensure!(common.is_none(),
+                        "event gateway {} branch ends before common merge {}", gateway.id, common.unwrap_or_default());
+                    continue;
+                }
                 ensure!(!matches!(nodes[current].kind, ProcessNodeKind::EventBasedGateway),
                     "event gateway {} has a nested event race", gateway.id);
                 ensure!(visited_regions.insert(current),
@@ -1422,7 +1444,7 @@ fn validate_diagram(
     Ok(())
 }
 
-/// Finds closed split/join regions and their exact branch arrival edges.
+/// Finds structured gateway regions and their exact join or terminal exits.
 pub fn gateway_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Result<HashMap<String, GatewayPair>> {
     let kind = |node: &ProcessNode| match node.kind {
         ProcessNodeKind::ParallelGateway => Some(GatewayKind::Parallel),
@@ -1431,65 +1453,77 @@ pub fn gateway_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Re
     };
     let outgoing = |id: &str| flows.iter().filter(|flow| flow.source_id == id).collect::<Vec<_>>();
     let incoming = |id: &str| flows.iter().filter(|flow| flow.target_id == id).collect::<Vec<_>>();
+    let by_id = nodes.iter().map(|node| (node.id.as_str(), node)).collect::<HashMap<_, _>>();
     let joins: Vec<_> = nodes.iter().filter(|node| kind(node).is_some() && incoming(&node.id).len() >= 2).collect();
     let splits: Vec<_> = nodes.iter().filter(|node| kind(node).is_some() && outgoing(&node.id).len() >= 2).collect();
-    ensure!(joins.len() == splits.len(), "structured gateways require paired splits and joins");
+    let trace = |split: &ProcessNode, join: Option<&ProcessNode>| {
+        let mut branches = BTreeMap::new();
+        let mut branch_paths = Vec::new();
+        for branch in outgoing(&split.id) {
+            let mut seen = HashSet::new();
+            let mut arrivals = BTreeSet::new();
+            let mut terminals = BTreeSet::new();
+            let mut pending = vec![(branch.target_id.as_str(), branch.id.as_str())];
+            while let Some((node_id, arrival_id)) = pending.pop() {
+                if join.is_some_and(|candidate| candidate.id == node_id) {
+                    arrivals.insert(arrival_id.to_string());
+                    continue;
+                }
+                let node = by_id.get(node_id)?;
+                if matches!(node.kind, ProcessNodeKind::TerminateEnd) {
+                    terminals.insert(node_id.to_string());
+                    continue;
+                }
+                if !seen.insert(node_id) { continue; }
+                let next = outgoing(node_id);
+                if next.is_empty() { return None; }
+                pending.extend(next.iter().map(|edge| (edge.target_id.as_str(), edge.id.as_str())));
+            }
+            if arrivals.len() > 1 || arrivals.is_empty() && terminals.is_empty() { return None; }
+            branch_paths.push(seen);
+            branches.insert(branch.id.clone(), GatewayBranchExits {
+                join_incoming_edge_id: arrivals.into_iter().next(),
+                terminate_end_node_ids: terminals,
+            });
+        }
+        if branch_paths.iter().enumerate().any(|(index, path)|
+            branch_paths.iter().skip(index + 1).any(|other| !path.is_disjoint(other))) {
+            return None;
+        }
+        if let Some(join) = join {
+            let arrivals = branches.values().filter_map(|exit| exit.join_incoming_edge_id.as_ref()).collect::<Vec<_>>();
+            if arrivals.len() != incoming(&join.id).len()
+                || arrivals.iter().collect::<HashSet<_>>().len() != arrivals.len() {
+                return None;
+            }
+        }
+        Some(branches)
+    };
     let mut pairs = HashMap::new();
     let mut used_joins = HashSet::new();
     for split in splits {
-        let branches = outgoing(&split.id);
         let mut candidates = Vec::new();
         for join in &joins {
-            if kind(split) != kind(join) || incoming(&join.id).len() != branches.len() {
-                continue;
+            if kind(split) == kind(join) {
+                if let Some(branches) = trace(split, Some(join)) {
+                    candidates.push((Some(join.id.clone()), branches));
+                }
             }
-            let mut branch_paths = Vec::new();
-            let mut branch_to_incoming_edge = BTreeMap::new();
-            let mut valid = true;
-            for branch in &branches {
-                let mut seen = HashSet::new();
-                let mut arrivals = HashSet::new();
-                let mut stack = vec![branch.target_id.as_str()];
-                if branch.target_id == join.id {
-                    arrivals.insert(branch.id.as_str());
-                }
-                while let Some(id) = stack.pop() {
-                    if id == join.id || !seen.insert(id) {
-                        continue;
-                    }
-                    let next = outgoing(id);
-                    if next.is_empty() {
-                        valid = false;
-                        break;
-                    }
-                    for edge in next {
-                        if edge.target_id == join.id {
-                            arrivals.insert(edge.id.as_str());
-                        } else {
-                            stack.push(edge.target_id.as_str());
-                        }
-                    }
-                }
-                if !valid || arrivals.len() != 1 {
-                    valid = false;
-                    break;
-                }
-                branch_paths.push(seen);
-                branch_to_incoming_edge.insert(branch.id.clone(), arrivals.into_iter().next().expect("one arrival checked").to_string());
-            }
-            if valid && branch_paths.iter().enumerate().all(|(i, path)| {
-                branch_paths.iter().skip(i + 1).all(|other| path.is_disjoint(other))
-            }) && branch_to_incoming_edge.values().collect::<HashSet<_>>().len() == branches.len() {
-                candidates.push((join.id.clone(), branch_to_incoming_edge));
+        }
+        if candidates.is_empty() {
+            if let Some(branches) = trace(split, None) {
+                candidates.push((None, branches));
             }
         }
         ensure!(candidates.len() == 1,
-            "gateway split {} requires one closed, disjoint paired join with unique incoming edges", split.id);
-        let (join_node_id, branch_to_incoming_edge) = candidates.pop().expect("one candidate checked");
-        ensure!(used_joins.insert(join_node_id.clone()), "gateway join {} is paired twice", join_node_id);
+            "gateway split {} requires one disjoint paired join or terminal escape with unique incoming edges", split.id);
+        let (join_node_id, branches) = candidates.pop().expect("one candidate checked");
+        if let Some(join_id) = &join_node_id {
+            ensure!(used_joins.insert(join_id.clone()), "gateway join {} is paired twice", join_id);
+        }
         pairs.insert(split.id.clone(), GatewayPair {
             kind: kind(split).expect("split kind checked"),
-            split_node_id: split.id.clone(), join_node_id, branch_to_incoming_edge,
+            split_node_id: split.id.clone(), join_node_id, branches,
         });
     }
     ensure!(used_joins.len() == joins.len(), "unpaired structured gateway join");
@@ -1578,6 +1612,9 @@ mod tests {
         assert_eq!(path.boundary_id, "Boundary_1");
         assert_eq!(path.flow_id.as_deref(), Some("Flow_Escalation"));
         assert_eq!(path.reason, ProcessEscalationPathReason::TerminalBeforeWait);
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind = ProcessNodeKind::TerminateEnd;
+        assert_eq!(validate_model(&model).unwrap_err().downcast_ref::<EscalationPathError>().unwrap().reason,
+            ProcessEscalationPathReason::TerminalBeforeWait);
         model = escalation_model();
         model.escalations[0].escalation_code = "invalid code".into();
         assert!(validate_draft(&model).is_err());
@@ -1721,12 +1758,11 @@ mod tests {
         validate_model(&model).unwrap();
         let pair = gateway_pairs(&model.nodes, &model.sequence_flows).unwrap().remove("Split").unwrap();
         assert_eq!(pair.kind, GatewayKind::Inclusive);
-        assert_eq!(pair.join_node_id, "Join");
-        assert_eq!(pair.branch_to_incoming_edge, BTreeMap::from([
-            ("To_A".into(), "From_A".into()),
-            ("To_B".into(), "From_B".into()),
-            ("To_C".into(), "From_C".into()),
-        ]));
+        assert_eq!(pair.join_node_id.as_deref(), Some("Join"));
+        for (branch, arrival) in [("To_A", "From_A"), ("To_B", "From_B"), ("To_C", "From_C")] {
+            assert_eq!(pair.branches[branch].join_incoming_edge_id.as_deref(), Some(arrival));
+            assert!(pair.branches[branch].terminate_end_node_ids.is_empty());
+        }
 
         model.sequence_flows.iter_mut().find(|flow| flow.id == "To_B").unwrap().condition = None;
         assert!(validate_model(&model).unwrap_err().to_string().contains("To_B"));
@@ -1761,12 +1797,162 @@ mod tests {
             id: "After_Join".into(), source_id: "Join".into(), target_id: "End_1".into(), condition: None,
         });
         validate_model(&model).unwrap();
-        assert_eq!(gateway_pairs(&model.nodes, &model.sequence_flows).unwrap()["Split"].branch_to_incoming_edge.len(), 9);
+        assert_eq!(gateway_pairs(&model.nodes, &model.sequence_flows).unwrap()["Split"].branches.len(), 9);
         model.nodes.iter_mut().find(|node| node.id == "Split").unwrap().kind =
             ProcessNodeKind::InclusiveGateway { default_flow_id: None };
         model.nodes.iter_mut().find(|node| node.id == "Join").unwrap().kind =
             ProcessNodeKind::InclusiveGateway { default_flow_id: None };
         assert!(validate_model(&model).unwrap_err().to_string().contains("Split"));
+    }
+
+    #[test]
+    fn terminate_end_closes_open_gateway_branches_without_inventing_a_join() {
+        let mut model = starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Parallel".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "Terminate_A".into(), name: "Stop A".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { id: "Terminate_B".into(), name: "Stop B".into(), kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows[0].target_id = "Split".into();
+        model.sequence_flows.extend([
+            ProcessSequenceFlow { id: "To_A".into(), source_id: "Split".into(), target_id: "Terminate_A".into(), condition: None },
+            ProcessSequenceFlow { id: "To_B".into(), source_id: "Split".into(), target_id: "Terminate_B".into(), condition: None },
+        ]);
+        model.nodes.retain(|node| node.id != "End_1");
+        model.diagram.shapes.retain(|shape| shape.element_id != "End_1");
+        validate_model(&model).unwrap();
+        let pair = &gateway_pairs(&model.nodes, &model.sequence_flows).unwrap()["Split"];
+        assert_eq!(pair.join_node_id, None);
+        assert_eq!(pair.branches["To_A"].terminate_end_node_ids, BTreeSet::from(["Terminate_A".into()]));
+        assert_eq!(pair.branches["To_B"].terminate_end_node_ids, BTreeSet::from(["Terminate_B".into()]));
+        assert!(pair.branches.values().all(|branch| branch.join_incoming_edge_id.is_none()));
+
+        model.nodes.iter_mut().find(|node| node.id == "Terminate_B").unwrap().kind = ProcessNodeKind::End;
+        assert!(validate_model(&model).is_err(), "ordinary End cannot close an active fork");
+    }
+
+    #[test]
+    fn mixed_terminal_and_join_branches_keep_exact_join_capability() {
+        let mut model = starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Select".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("To_Stop".into()) } },
+            ProcessNode { id: "Join".into(), name: "Join".into(), kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "Wait_A".into(), name: "A".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Wait_B".into(), name: "B".into(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Stop".into(), name: "Stop".into(), kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows[0].target_id = "Split".into();
+        for (id, source, target, condition) in [
+            ("To_A", "Split", "Wait_A", Some("true")),
+            ("To_B", "Split", "Wait_B", Some("true")),
+            ("To_Stop", "Split", "Stop", None),
+            ("From_A", "Wait_A", "Join", None),
+            ("From_B", "Wait_B", "Join", None),
+            ("From_Join", "Join", "End_1", None),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source.into(), target_id: target.into(), condition: condition.map(str::to_string) });
+        }
+        validate_model(&model).unwrap();
+        let pair = &gateway_pairs(&model.nodes, &model.sequence_flows).unwrap()["Split"];
+        assert_eq!(pair.join_node_id.as_deref(), Some("Join"));
+        assert_eq!(pair.branches["To_A"].join_incoming_edge_id.as_deref(), Some("From_A"));
+        assert_eq!(pair.branches["To_B"].join_incoming_edge_id.as_deref(), Some("From_B"));
+        assert_eq!(pair.branches["To_Stop"].terminate_end_node_ids, BTreeSet::from(["Stop".into()]));
+        assert_eq!(pair.branches["To_Stop"].join_incoming_edge_id, None);
+    }
+
+    #[test]
+    fn nested_mixed_gateways_keep_lifo_joins_and_shared_terminal_frontiers() {
+        let mut model = starter_model();
+        model.nodes.extend([
+            ProcessNode { id: "OuterSplit".into(), name: "Outer OR".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Outer_Stop".into()) } },
+            ProcessNode { id: "OuterLeft".into(), name: "Outer left".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "InnerSplit".into(), name: "Inner AND".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "InnerLeft".into(), name: "Inner left".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "InnerRight".into(), name: "Inner right".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "InnerJoin".into(), name: "Inner join".into(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "OuterJoin".into(), name: "Outer join".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "SharedStop".into(), name: "Shared terminal".into(), kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows[0].target_id = "OuterSplit".into();
+        for (id, source, target, condition) in [
+            ("Outer_Left", "OuterSplit", "OuterLeft", Some("true")),
+            ("Outer_Inner", "OuterSplit", "InnerSplit", Some("true")),
+            ("Outer_Stop", "OuterSplit", "SharedStop", None),
+            ("OuterLeft_Join", "OuterLeft", "OuterJoin", None),
+            ("Inner_Left", "InnerSplit", "InnerLeft", None),
+            ("Inner_Right", "InnerSplit", "InnerRight", None),
+            ("Inner_Stop", "InnerSplit", "SharedStop", None),
+            ("InnerLeft_Join", "InnerLeft", "InnerJoin", None),
+            ("InnerRight_Join", "InnerRight", "InnerJoin", None),
+            ("Inner_Outer", "InnerJoin", "OuterJoin", None),
+            ("Outer_End", "OuterJoin", "End_1", None),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(), source_id: source.into(), target_id: target.into(),
+                condition: condition.map(str::to_string),
+            });
+        }
+        validate_model(&model).unwrap();
+        let pairs = gateway_pairs(&model.nodes, &model.sequence_flows).unwrap();
+        let outer = &pairs["OuterSplit"];
+        assert_eq!(outer.join_node_id.as_deref(), Some("OuterJoin"));
+        assert_eq!(outer.branches["Outer_Left"].join_incoming_edge_id.as_deref(), Some("OuterLeft_Join"));
+        assert_eq!(outer.branches["Outer_Inner"].join_incoming_edge_id.as_deref(), Some("Inner_Outer"));
+        assert_eq!(outer.branches["Outer_Inner"].terminate_end_node_ids, BTreeSet::from(["SharedStop".into()]));
+        assert_eq!(outer.branches["Outer_Stop"].join_incoming_edge_id, None);
+        assert_eq!(outer.branches["Outer_Stop"].terminate_end_node_ids, BTreeSet::from(["SharedStop".into()]));
+        let inner = &pairs["InnerSplit"];
+        assert_eq!(inner.join_node_id.as_deref(), Some("InnerJoin"));
+        assert_eq!(inner.branches["Inner_Stop"].terminate_end_node_ids, BTreeSet::from(["SharedStop".into()]));
+
+        let mut shared_work = model.clone();
+        shared_work.nodes.push(ProcessNode { id: "SharedWork".into(), name: "Invalid shared work".into(),
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+        for edge in &mut shared_work.sequence_flows {
+            if edge.id == "Outer_Stop" || edge.id == "Inner_Stop" { edge.target_id = "SharedWork".into(); }
+        }
+        shared_work.sequence_flows.push(ProcessSequenceFlow {
+            id: "Shared_Stop".into(), source_id: "SharedWork".into(),
+            target_id: "SharedStop".into(), condition: None,
+        });
+        assert!(validate_model(&shared_work).is_err(), "branches may share the terminal, not prior work");
+
+        let mut one_input_join = model.clone();
+        one_input_join.sequence_flows.iter_mut().find(|edge| edge.id == "OuterLeft_Join").unwrap().target_id = "SharedStop".into();
+        assert!(validate_model(&one_input_join).is_err(), "a one-input gateway cannot silently act as a join");
+
+        let mut orphan_inner_join = model;
+        orphan_inner_join.sequence_flows.iter_mut().find(|edge| edge.id == "InnerRight_Join").unwrap().target_id = "SharedStop".into();
+        assert!(validate_model(&orphan_inner_join).is_err(), "the inner split needs its full paired join");
+    }
+
+    #[test]
+    fn event_race_accepts_disjoint_terminate_frontiers_after_one_shot_catches() {
+        let mut model = starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.nodes.extend([
+            ProcessNode { id: "Race".into(), name: "First event".into(), kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { id: "Timer_A".into(), name: "First".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 1 } } },
+            ProcessNode { id: "Timer_B".into(), name: "Second".into(), kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 2 } } },
+            ProcessNode { id: "Stop_A".into(), name: "Stop first".into(), kind: ProcessNodeKind::TerminateEnd },
+            ProcessNode { id: "Stop_B".into(), name: "Stop second".into(), kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows[0].target_id = "Race".into();
+        for (id, source, target) in [
+            ("To_A", "Race", "Timer_A"), ("To_B", "Race", "Timer_B"),
+            ("From_A", "Timer_A", "Stop_A"), ("From_B", "Timer_B", "Stop_B"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        model.nodes.retain(|node| node.id != "End_1");
+        model.diagram.shapes.retain(|shape| shape.element_id != "End_1");
+        validate_model(&model).unwrap();
     }
 
     #[test]
@@ -2127,6 +2313,18 @@ mod tests {
             id: "Flow_2".into(), source_id: "Sub_1".into(), target_id: "End_1".into(), condition: None,
         });
         model
+    }
+
+    #[test]
+    fn embedded_terminate_end_is_local_to_its_own_body() {
+        let mut model = embedded_model();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes[1].kind {
+            body.nodes[2].kind = ProcessNodeKind::TerminateEnd;
+        }
+        validate_model(&model).unwrap();
+        assert!(matches!(scope_body(&model, &["Sub_1".into()]).unwrap().0[2].kind,
+            ProcessNodeKind::TerminateEnd));
+        assert!(matches!(model.nodes[2].kind, ProcessNodeKind::End));
     }
 
     #[test]

@@ -667,6 +667,55 @@ test('error end remains terminal and called process links disclose only authoriz
   assert.ok(calls.some((entry) => entry.kind === 'processInstanceGetRequest' && entry.payload.instanceId === 'child'));
 });
 
+test('terminate end is a unit terminal in the canvas and preserves the full model', () => {
+  const model = emptyProcessModel();
+  model.nodes[1].kind = 'TerminateEnd';
+  model.nodes[1].name = 'Stop all active work';
+  const graph = canvas(model);
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="End"] .fb-port-out'), null);
+  assert.equal(graph.connectNodes('End', 'Start'), false);
+  const config = inspector(graph);
+  config.show(graph.nodes.find((node) => node.id === 'End'), graph.templates.get('bpmn_terminate_end'));
+  assert.equal(config.root.querySelector('[data-connect]'), null);
+  assert.match(config.root.textContent, new RegExp(I18n.t('bpmn.node_terminate_end_hint')));
+  const saved = canvasToProcess(model, graph.nodes, graph.edges, () => [], []);
+  assert.equal(saved.nodes[1].kind, 'TerminateEnd');
+  assert.equal(saved.nodes[1].name, 'Stop all active work');
+  graph.destroy(); config.destroy();
+});
+
+test('all five locales distinguish termination facts from ordinary completion', async () => {
+  const events = [
+    { kind: 'terminate_end_reached', nodeName: 'Stop work', data: {
+      source_instance_id: 'instance-1', source_event_id: 'event-1', source_token_id: 'token-1',
+      source_scope_id: 'instance-1', source_node_id: 'Stop_1', terminated_scope_id: 'instance-1',
+    } },
+    { kind: 'instance_completed', nodeName: 'Stop work', data: { reason: 'terminate_end' } },
+    { kind: 'cancelled', nodeName: 'Called review', data: { reason: 'terminate_end' } },
+    { kind: 'scope_completed', nodeName: 'Stop work', data: { reason: 'terminate_end', subprocess_node_id: 'Sub_1' } },
+    { kind: 'call_request_cancelled', nodeName: 'Review', data: { reason: 'terminate_end' } },
+    { kind: 'subscription_cancelled', nodeName: 'Wait', data: { reason: 'terminate_end' } },
+  ];
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    assert.notEqual(processLifecycleReasonText('terminate_end'), 'terminate_end');
+    for (const event of events) {
+      const rendered = processEventText(event);
+      assert.doesNotMatch(rendered, /bpmn\.event_|bpmn\.reason_|\{(?:node|reason|element)\}/);
+      assert.ok(rendered.length > 12);
+    }
+    assert.notEqual(processEventText(events[1]), processEventText({ kind: 'instance_completed', nodeName: 'Stop work', data: {} }));
+    const history = events.map((event, index) => ({ ...event, seq: index + 1, atMs: 1000 + index }));
+    const win = await monitor(instance(`terminate-${language}`), {
+      processHistoryRequest: { events: history, nextSeq: history.length, hasMore: false },
+    });
+    assert.match(win.querySelector('[data-process-seq="1"] tf-code-editor').value, /event-1/);
+    assert.match(win.querySelector('[data-process-seq="5"]').textContent, new RegExp(I18n.t('bpmn.reason_terminate_end')));
+    win.remove();
+  }
+  await I18n.setLanguage('en');
+});
+
 test('all five locales render factual call and error history without exposing translation keys', async () => {
   const events = [
     { kind: 'call_requested', nodeName: 'Review', data: { call_id: 'call-1', parent_token_id: 'wait-1' } },
@@ -957,7 +1006,7 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 20);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 21);
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
@@ -1602,7 +1651,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 20);
+    assert.equal(processTemplates().length, 21);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });

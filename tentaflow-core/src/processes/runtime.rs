@@ -16,9 +16,10 @@ use uuid::Uuid;
 
 use super::model::{gateway_pairs, validate_variables, GatewayKind, MAX_VARIABLE_BYTES, MAX_VARIABLE_KEYS};
 use super::repository::{
+    AcceptedInputRef, StartInputRef, TerminationAttempt, TerminationSource, TerminationReturnFailure,
     GatewayReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
     ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
-    ScopeUpdate,
+    ScopeUpdate, VariableEffect,
 };
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -72,7 +73,7 @@ pub(super) fn evaluate(
     )?)
 }
 
-fn condition(expression: &str, variables: &Value, outputs: &Value) -> Result<bool> {
+pub(super) fn condition(expression: &str, variables: &Value, outputs: &Value) -> Result<bool> {
     evaluate(expression, variables, outputs, &[])?
         .as_bool()
         .context("process condition must evaluate to a boolean")
@@ -141,6 +142,9 @@ struct Transition<'a> {
     subscriptions: Vec<super::repository::EventSubscription>,
     event_races: Vec<super::repository::EventRace>,
     escalation_continuation: bool,
+    accepted_input: Option<AcceptedInputRef>,
+    token_inputs: HashMap<String, AcceptedInputRef>,
+    expected_instance_revision: u64,
     plan: RuntimePlan,
 }
 
@@ -190,6 +194,9 @@ impl<'a> Transition<'a> {
             subscriptions: Vec::new(),
             event_races: Vec::new(),
             escalation_continuation: false,
+            accepted_input: None,
+            token_inputs: HashMap::new(),
+            expected_instance_revision: 1,
             plan: RuntimePlan::initial(variables),
         })
     }
@@ -217,6 +224,7 @@ impl<'a> Transition<'a> {
         transition.boundary_incidents = snapshot.boundary_incidents.clone();
         transition.subscriptions = snapshot.subscriptions.clone();
         transition.event_races = snapshot.event_races.clone();
+        transition.expected_instance_revision = snapshot.instance.revision;
         Ok(transition)
     }
 
@@ -315,17 +323,35 @@ impl<'a> Transition<'a> {
 
     fn map_outputs(
         &mut self,
+        node_id: &str,
+        source_token_id: &str,
         mapping: &BTreeMap<String, String>,
         outputs: &Value,
         extra: &[(String, Value)],
     ) -> Result<()> {
-        self.set_variables(patch_variables(
+        let result = patch_variables(
             mapping,
             self.local()?,
             &self.effective()?,
             outputs,
             extra,
-        )?)
+        )?;
+        let scope = self.scopes.iter().find(|scope| scope.scope_id == self.current_scope)
+            .context("mapped scope is missing")?;
+        let effect = VariableEffect::Mapped {
+            event_index: self.plan.events.len(),
+            scope_id: self.current_scope.clone(),
+            parent_token_id: scope.parent_token_id.clone(),
+            node_id: node_id.to_owned(),
+            source_token_id: source_token_id.to_owned(),
+            accepted_input: self.accepted_input.clone(),
+            outputs: outputs.clone(),
+            extra: extra.to_vec(),
+            result: result.clone(),
+        };
+        self.set_variables(result)?;
+        self.plan.variable_effects.push(effect);
+        Ok(())
     }
 
     fn event(&mut self, kind: &str, node_id: Option<String>, data: Value) {
@@ -337,10 +363,16 @@ impl<'a> Transition<'a> {
         });
     }
 
-    fn create_token(&mut self, mut token: ProcessToken) -> String {
+    fn create_token(&mut self, mut token: ProcessToken, predecessor: Option<&str>) -> String {
         token.token_id = Uuid::new_v4().to_string();
         let id = token.token_id.clone();
+        if let Some(predecessor) = predecessor {
+            self.plan.token_sources.insert(id.clone(), predecessor.to_owned());
+        }
         self.tokens.push(token.clone());
+        if let Some(input) = &self.accepted_input {
+            self.token_inputs.insert(id.clone(), input.clone());
+        }
         self.plan.create_tokens.push(token);
         id
     }
@@ -357,7 +389,7 @@ impl<'a> Transition<'a> {
         self.create_token(ProcessToken {
             status: status.into(),
             ..token.clone()
-        })
+        }, Some(&token.token_id))
     }
 
     fn follow(&mut self, token: &ProcessToken, edge_id: &str) -> Result<()> {
@@ -374,7 +406,7 @@ impl<'a> Transition<'a> {
             arrival_edge_id: Some(edge.id.clone()),
             fork_stack: token.fork_stack.clone(),
             status: "ready".into(),
-        });
+        }, Some(&token.token_id));
         Ok(())
     }
 
@@ -588,6 +620,10 @@ impl<'a> Transition<'a> {
             let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &node.kind else {
                 anyhow::bail!("boundary timer references a different node kind");
             };
+            if let Some(current) = self.timers.iter_mut()
+                .find(|current| current.timer_id == timer.timer_id) {
+                current.status = ProcessTimerStatus::Cancelled;
+            }
             self.plan
                 .timer_updates
                 .push(super::repository::TimerUpdate {
@@ -659,7 +695,7 @@ impl<'a> Transition<'a> {
             .find(|scope| scope.parent_token_id.as_deref() == Some(token.token_id.as_str()))
             .cloned()
         {
-            self.cancel_scope(&child.scope_id, winning_timer_id)?;
+            self.cancel_scope(&child.scope_id, winning_timer_id, None)?;
         }
         let job_ids = self
             .jobs
@@ -717,7 +753,8 @@ impl<'a> Transition<'a> {
         Ok(())
     }
 
-    fn cancel_scope(&mut self, root: &str, boundary_id: &str) -> Result<()> {
+    fn cancel_scope(&mut self, root: &str, boundary_id: &str, termination: Option<&super::repository::TerminationSource>) -> Result<()> {
+        let reason = if termination.is_some() { "terminate_end" } else { "scope_cancelled" };
         let closure = super::repository::descendant_scope_ids(&self.scopes, root)?;
         let active = self
             .scopes
@@ -758,18 +795,7 @@ impl<'a> Transition<'a> {
         {
             self.receipts
                 .retain(|actual| actual.token_id != receipt.token_id);
-            if self
-                .plan
-                .add_gateway_receipts
-                .iter()
-                .any(|actual| actual.token_id == receipt.token_id)
-            {
-                self.plan
-                    .add_gateway_receipts
-                    .retain(|actual| actual.token_id != receipt.token_id);
-            } else {
-                self.plan.remove_gateway_receipts.push(receipt);
-            }
+            self.plan.remove_gateway_receipts.push(receipt);
         }
         self.plan.cancel_user_task_ids.extend(
             self.tasks
@@ -823,10 +849,22 @@ impl<'a> Transition<'a> {
                     occurrence: timer.occurrence,
                     due_at_ms: None,
                     status: ProcessTimerStatus::Cancelled,
-                    last_reason: Some("scope_cancelled".into()),
+                    last_reason: Some(reason.into()),
                     next_check_at_ms: self.now_ms,
                 });
-            self.event("timer_cancelled", Some(timer.node_id.clone()), json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_token_id":timer.token_id,"reason":"scope_cancelled"}));
+            let data = if let Some(source) = termination {
+                let attached_to_id = match &self.node(&timer.node_id)?.kind {
+                    ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.clone()),
+                    ProcessNodeKind::TimerCatch { .. } => Some(timer.node_id.clone()),
+                    _ => anyhow::bail!("terminating timer is outside its pinned catch or boundary node"),
+                };
+                json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_to_id":attached_to_id,
+                    "attached_token_id":timer.token_id,"reason":reason,
+                    "source_instance_id":source.source_instance_id,"source_event_id":source.source_event_id})
+            } else {
+                json!({"timer_id":timer.timer_id,"kind":timer.kind,"attached_token_id":timer.token_id,"reason":reason})
+            };
+            self.event("timer_cancelled", Some(timer.node_id.clone()), data);
         }
         for subscription in self
             .subscriptions
@@ -843,8 +881,14 @@ impl<'a> Transition<'a> {
             self.settle_subscription(
                 &subscription,
                 tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled,
-                Some("scope_cancelled"),
+                Some(reason),
             );
+            if let Some(source) = termination {
+                let event = self.plan.events.last_mut().context("termination subscription cancellation event missing")?;
+                ensure!(event.kind == "subscription_cancelled", "termination subscription cancellation changed kind");
+                event.data["source_instance_id"] = json!(source.source_instance_id);
+                event.data["source_event_id"] = json!(source.source_event_id);
+            }
         }
         for race in self
             .event_races
@@ -870,7 +914,11 @@ impl<'a> Transition<'a> {
             self.event(
                 "event_race_cancelled",
                 Some(race.gateway_node_id.clone()),
-                json!({"race_id":race.race_id,"reason":"scope_cancelled"}),
+                if let Some(source) = termination {
+                    json!({"race_id":race.race_id,"reason":reason,"source_instance_id":source.source_instance_id,"source_event_id":source.source_event_id})
+                } else {
+                    json!({"race_id":race.race_id,"reason":reason})
+                },
             );
         }
         for id in self
@@ -885,12 +933,18 @@ impl<'a> Transition<'a> {
         }
         for scope in active {
             self.current_scope = scope.scope_id.clone();
-            if scope.parent_scope_id.is_none() {
+            if scope.parent_scope_id.is_none() || termination.is_some_and(|source| source.source_scope_id == scope.scope_id) {
                 continue;
             }
             self.update_scope(&scope.scope_id, ProcessInstanceStatus::Cancelled, None)?;
-            self.event("scope_cancelled", None,
-                json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,"subprocess_node_id":scope.subprocess_node_id,"reason":"scope_cancelled","boundary_id":boundary_id}));
+            self.event("scope_cancelled", None, if let Some(source) = termination {
+                json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,
+                    "subprocess_node_id":scope.subprocess_node_id,"reason":reason,
+                    "source_instance_id":source.source_instance_id,"source_event_id":source.source_event_id})
+            } else {
+                json!({"scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,
+                    "subprocess_node_id":scope.subprocess_node_id,"reason":reason,"boundary_id":boundary_id})
+            });
         }
         self.current_scope = previous;
         Ok(())
@@ -960,6 +1014,7 @@ impl<'a> Transition<'a> {
             source_scope_id: source_scope.clone(),
         };
         let envelope = json!({"kind":"ErrorEnd","error_ref":error_ref,"error_code":code,"source_instance_id":self.instance_id,"source_scope_id":source_scope,"source_node_id":node.id,"source_event_id":event_id,"source_token_id":token.token_id});
+        self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
         self.plan.event_ids.insert(self.plan.events.len(), event_id);
         let mut factual_envelope = envelope.clone();
         factual_envelope["outputs"] = outputs.clone();
@@ -972,6 +1027,8 @@ impl<'a> Transition<'a> {
                 anyhow::bail!("error handler is not a BoundaryError")
             };
             self.map_outputs(
+                &handler.id,
+                &attached.token_id,
                 output_mapping,
                 &outputs,
                 &[("activity_result".into(), envelope)],
@@ -994,7 +1051,7 @@ impl<'a> Transition<'a> {
             }
         } else {
             self.current_scope = self.instance_id.to_owned();
-            self.cancel_scope(self.instance_id, "error_end")?;
+            self.cancel_scope(self.instance_id, "error_end", None)?;
             for id in self
                 .incidents
                 .iter()
@@ -1097,6 +1154,15 @@ impl<'a> Transition<'a> {
             subprocess_node_id: node.id.clone(),
             variables: local.clone(),
         });
+        self.plan.variable_effects.push(VariableEffect::ScopeEntry {
+            event_index: self.plan.events.len(),
+            scope_id: scope_id.clone(),
+            parent_scope_id: parent_scope.clone(),
+            parent_token_id: waiting.clone(),
+            subprocess_node_id: node.id.clone(),
+            accepted_input: self.accepted_input.clone(),
+            result: local.clone(),
+        });
         self.retained_scope_count += 1;
         self.scopes.push(ProcessScopeSummary {
             scope_id: scope_id.clone(),
@@ -1121,7 +1187,7 @@ impl<'a> Transition<'a> {
             arrival_edge_id: None,
             fork_stack: Vec::new(),
             status: "ready".into(),
-        });
+        }, Some(&waiting));
         self.current_scope = parent_scope;
         Ok(())
     }
@@ -1336,6 +1402,11 @@ impl<'a> Transition<'a> {
                 winner_subscription_id: subscription_id.map(str::to_owned),
                 winner_timer_id: timer_id.map(str::to_owned),
             });
+        self.event_races
+            .iter_mut()
+            .find(|current| current.race_id == race.race_id)
+            .context("winning event race disappeared")?
+            .status = R::Won;
         for s in self
             .subscriptions
             .iter()
@@ -1384,6 +1455,11 @@ impl<'a> Transition<'a> {
                         last_reason: Some("event_race_lost".into()),
                         next_check_at_ms: self.now_ms,
                     });
+                self.timers
+                    .iter_mut()
+                    .find(|current| current.timer_id == t.timer_id)
+                    .context("losing race timer disappeared")?
+                    .status = ProcessTimerStatus::Cancelled;
             }
             let id = t.token_id.context("race timer lacks activation")?;
             self.resolve_boundary_incidents(&id);
@@ -1440,7 +1516,7 @@ impl<'a> Transition<'a> {
                 arrival_edge_id: Some(edge),
                 fork_stack: token.fork_stack.clone(),
                 status: "waiting".into(),
-            });
+            }, Some(&token.token_id));
             match &child.kind {
                 ProcessNodeKind::MessageCatch { .. } => {
                     self.arm_subscription(&child, &waiting, Some(id.clone()))?
@@ -1465,6 +1541,7 @@ impl<'a> Transition<'a> {
     fn throw_message(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
         let prepared = super::messages::prepare_throw(self.model, node, &self.effective()?)?;
         let event_index = self.plan.events.len();
+        self.plan.event_sources.insert(event_index, token.token_id.clone());
         self.event("message_queued",Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
         self.plan
             .create_messages
@@ -1484,18 +1561,18 @@ impl<'a> Transition<'a> {
 
     fn join(&mut self, token: &ProcessToken) -> Result<()> {
         let frame = token.fork_stack.last().context("gateway join has no fork activation")?.clone();
-        ensure!(frame.join_node_id == token.node_id, "gateway join differs from its fork activation");
+        ensure!(frame.join_node_id.as_deref() == Some(token.node_id.as_str()), "gateway join differs from its fork activation");
         let pair = gateway_pairs(self.body()?.0, self.body()?.1)?
             .remove(&frame.split_node_id)
             .context("gateway fork pair is missing")?;
-        ensure!(pair.kind == frame.gateway_kind && pair.join_node_id == token.node_id,
+        ensure!(pair.kind == frame.gateway_kind && pair.join_node_id.as_deref() == Some(token.node_id.as_str()),
             "gateway join differs from the paired model");
-        ensure!(pair.branch_to_incoming_edge.get(&frame.branch_edge_id) == token.arrival_edge_id.as_ref(),
+        ensure!(pair.branches.get(&frame.branch_edge_id).and_then(|branch| branch.join_incoming_edge_id.as_ref()) == token.arrival_edge_id.as_ref(),
             "gateway branch arrived through another join edge");
         ensure!(frame.selected_branch_edge_ids.binary_search(&frame.branch_edge_id).is_ok(),
             "gateway branch was not selected");
         ensure!(!self.receipts.iter().any(|receipt| receipt.scope_id == self.current_scope
-            && receipt.join_node_id == frame.join_node_id
+            && Some(receipt.join_node_id.as_str()) == frame.join_node_id.as_deref()
             && receipt.activation_id == frame.activation_id
             && receipt.branch_edge_id == frame.branch_edge_id), "gateway branch arrived twice");
         let token_id = self.wait(token, "joining");
@@ -1507,20 +1584,20 @@ impl<'a> Transition<'a> {
         self.receipts.push(receipt.clone());
         self.plan.add_gateway_receipts.push(receipt);
         let arrivals = self.receipts.iter().filter(|receipt| receipt.scope_id == self.current_scope
-            && receipt.join_node_id == frame.join_node_id && receipt.activation_id == frame.activation_id)
+            && Some(receipt.join_node_id.as_str()) == frame.join_node_id.as_deref() && receipt.activation_id == frame.activation_id)
             .cloned().collect::<Vec<_>>();
         ensure!(arrivals.iter().all(|receipt| {
             let Some(joining) = self.tokens.iter().find(|candidate| candidate.token_id == receipt.token_id) else { return false; };
             receipt.gateway_kind == frame.gateway_kind
                 && frame.selected_branch_edge_ids.binary_search(&receipt.branch_edge_id).is_ok()
                 && joining.status == "joining" && joining.scope_id == self.current_scope
-                && joining.node_id == frame.join_node_id
+                && Some(joining.node_id.as_str()) == frame.join_node_id.as_deref()
                 && joining.fork_stack.last().is_some_and(|sibling| sibling.gateway_kind == frame.gateway_kind
                     && sibling.activation_id == frame.activation_id
                     && sibling.join_node_id == frame.join_node_id
                     && sibling.branch_edge_id == receipt.branch_edge_id
                     && sibling.selected_branch_edge_ids == frame.selected_branch_edge_ids
-                    && pair.branch_to_incoming_edge.get(&sibling.branch_edge_id) == joining.arrival_edge_id.as_ref())
+                    && pair.branches.get(&sibling.branch_edge_id).and_then(|branch| branch.join_incoming_edge_id.as_ref()) == joining.arrival_edge_id.as_ref())
         }), "gateway receipts differ from their selected joining tokens");
         if arrivals.len() != frame.selected_branch_edge_ids.len() { return Ok(()); }
         ensure!(frame.selected_branch_edge_ids.iter().all(|edge| arrivals.iter().any(|receipt| &receipt.branch_edge_id == edge)),
@@ -1542,8 +1619,138 @@ impl<'a> Transition<'a> {
             GatewayKind::Inclusive => json!({"activation_id": frame.activation_id,
                 "selected_branch_edge_ids": frame.selected_branch_edge_ids}),
         };
+        self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
         self.event(kind, Some(token.node_id.clone()), data);
         for edge in self.outgoing(&token.node_id) { self.follow(&next, &edge)?; }
+        Ok(())
+    }
+
+    fn terminate(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let pairs = gateway_pairs(self.body()?.0, self.body()?.1)?;
+        for frame in &token.fork_stack {
+            let pair = pairs.get(&frame.split_node_id)
+                .context("terminating source fork is absent from its pinned body")?;
+            ensure!(pair.kind == frame.gateway_kind && pair.join_node_id == frame.join_node_id
+                && frame.selected_branch_edge_ids.binary_search(&frame.branch_edge_id).is_ok()
+                && pair.branches.get(&frame.branch_edge_id)
+                    .is_some_and(|branch| branch.terminate_end_node_ids.contains(&node.id)),
+                "terminating source did not follow its selected fork branch");
+        }
+        let accepted_input = self.accepted_input.clone()
+            .context("terminating source lacks an accepted entry identity")?;
+        if let AcceptedInputRef::Service { result_event_id, .. } = &accepted_input {
+            let result_index = self.plan.events.iter().position(|event| event.kind == "service_result")
+                .context("terminating service input lacks its accepted result event")?;
+            if let Some(existing) = self.plan.event_ids.insert(result_index, result_event_id.clone()) {
+                ensure!(existing == *result_event_id, "terminating service result event ID changed");
+            }
+        }
+        let parent = self.scopes.iter().find(|scope| scope.scope_id == token.scope_id)
+            .context("terminating source scope is missing")?.clone();
+        let source_event_id = Uuid::new_v4().to_string();
+        let event_index = self.plan.events.len();
+        let source = TerminationSource {
+            source_instance_id: self.instance_id.to_owned(),
+            source_scope_id: token.scope_id.clone(),
+            source_node_id: node.id.clone(),
+            source_token_id: token.token_id.clone(),
+            source_arrival_edge_id: token.arrival_edge_id.clone(),
+            parent_token_id: parent.parent_token_id.clone(),
+            source_event_index: event_index,
+            source_event_id: source_event_id.clone(),
+            accepted_input: accepted_input.clone(),
+            variable_effect_count: self.plan.variable_effects.len(),
+        };
+        let mut return_patch = None;
+        if let Some(parent_scope_id) = &parent.parent_scope_id {
+            let parent_token_id = parent.parent_token_id.as_deref()
+                .context("terminating child has no parent waiting token")?;
+            let parent_wait = self.tokens.iter().find(|candidate| candidate.token_id == parent_token_id
+                && candidate.scope_id == *parent_scope_id && candidate.status == "waiting")
+                .context("terminating child lost its parent waiting activation")?.clone();
+            let child_locals = self.scope_variables.get(&token.scope_id)
+                .context("terminating child local variables are missing")?.clone();
+            self.current_scope = parent_scope_id.clone();
+            let parent_node = self.node(&parent_wait.node_id)?.clone();
+            let ProcessNodeKind::SubProcess { output_mapping, .. } = &parent_node.kind else {
+                anyhow::bail!("terminating child parent activation is not a subprocess");
+            };
+            let parent_local = self.local()?.clone();
+            let parent_effective = self.effective()?;
+            let mapped = patch_variables(output_mapping, &parent_local, &parent_effective, &child_locals, &[]);
+            self.current_scope = token.scope_id.clone();
+            match mapped {
+                Ok(patch) => return_patch = Some((parent_scope_id.clone(), parent_wait, parent_node, child_locals, patch)),
+                Err(error) => {
+                    let message = super::repository::bounded_failure_message(&format!("{error:#}"));
+                    let waiting_token_id = self.wait(token, "waiting");
+                    let incident_id = Uuid::new_v4().to_string();
+                    self.plan.add_incidents.push(ProcessIncident {
+                        incident_id: incident_id.clone(), scope_id: token.scope_id.clone(),
+                        node_id: Some(node.id.clone()), node_name: Some(node.name.clone()), job_id: None,
+                        code: "SCOPE_RETURN_ERROR".into(), message: message.clone(), at_ms: self.now_ms,
+                        can_retry: false,
+                    });
+                    self.plan.event_ids.insert(event_index, source_event_id.clone());
+                    self.plan.event_sources.insert(event_index, token.token_id.clone());
+                    self.event("incident", Some(node.id.clone()), json!({
+                        "incident_id":incident_id,"code":"SCOPE_RETURN_ERROR","message":message,
+                        "source_kind":"terminate_end_return_failure","source_instance_id":self.instance_id,
+                        "source_event_id":source_event_id,"source_scope_id":token.scope_id,
+                        "source_node_id":node.id,"source_token_id":token.token_id,
+                        "waiting_token_id":waiting_token_id,"parent_token_id":parent_token_id,
+                    }));
+                    self.plan.termination_attempts.push(TerminationAttempt::ReturnFailure(TerminationReturnFailure {
+                        source_instance_id: self.instance_id.to_owned(), source_scope_id: token.scope_id.clone(),
+                        source_node_id: node.id.clone(), source_token_id: token.token_id.clone(),
+                        source_arrival_edge_id: token.arrival_edge_id.clone(), parent_token_id: parent_token_id.to_owned(),
+                        source_event_index: event_index, source_event_id, accepted_input,
+                        variable_effect_count: self.plan.variable_effects.len(),
+                        waiting_token_id, incident_id, pre_return_child_locals: child_locals,
+                        pre_return_parent_effective: parent_effective, child_scope_revision: parent.revision,
+                        parent_scope_revision: if parent_scope_id == self.instance_id {
+                            self.expected_instance_revision
+                        } else {
+                            self.scopes.iter().find(|scope| scope.scope_id == *parent_scope_id)
+                                .context("terminating child parent scope disappeared")?.revision
+                        },
+                    }));
+                    self.update_scope(&token.scope_id, ProcessInstanceStatus::Incident, None)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.plan.event_ids.insert(event_index, source_event_id.clone());
+        self.plan.event_sources.insert(event_index, token.token_id.clone());
+        self.event("terminate_end_reached", Some(node.id.clone()), json!({
+            "source_instance_id":self.instance_id,"source_event_id":source_event_id,
+            "source_token_id":token.token_id,"source_scope_id":token.scope_id,
+            "source_node_id":node.id,"terminated_scope_id":token.scope_id,
+        }));
+        self.plan.termination_attempts.push(TerminationAttempt::Success(source.clone()));
+        self.consume(&token.token_id);
+        self.cancel_scope(&token.scope_id, &node.id, Some(&source))?;
+        if let Some((parent_scope_id, parent_wait, parent_node, child_locals, _patch)) = return_patch {
+            self.update_scope(&token.scope_id, ProcessInstanceStatus::Completed, Some(child_locals.clone()))?;
+            self.event("scope_completed", None, json!({
+                "scope_id":token.scope_id,"parent_scope_id":parent_scope_id,
+                "parent_token_id":parent_wait.token_id,"subprocess_node_id":parent_node.id,
+                "reason":"terminate_end","source_instance_id":self.instance_id,
+                "source_event_id":source_event_id,
+            }));
+            self.current_scope = parent_scope_id;
+            self.map_outputs(&parent_node.id, &parent_wait.token_id,
+                match &parent_node.kind {
+                    ProcessNodeKind::SubProcess { output_mapping, .. } => output_mapping,
+                    _ => anyhow::bail!("termination parent is not a subprocess"),
+                }, &child_locals, &[])?;
+            self.disarm_boundaries(&parent_wait.token_id, "activity_completed", None)?;
+            self.resolve_boundary_incidents(&parent_wait.token_id);
+            self.consume(&parent_wait.token_id);
+            for edge in self.outgoing(&parent_node.id) {
+                self.follow(&parent_wait, &edge)?;
+            }
+        }
         Ok(())
     }
 
@@ -1554,6 +1761,16 @@ impl<'a> Transition<'a> {
             .find(|token| token.status == "ready")
             .cloned()
         {
+            self.accepted_input = Some(if let Some(input) = self.token_inputs.get(&token.token_id) {
+                input.clone()
+            } else {
+                ensure!(!self.plan.create_tokens.iter().any(|created| created.token_id == token.token_id),
+                    "same-plan ready token has no accepted input lineage");
+                AcceptedInputRef::PersistedReady {
+                    token_id: token.token_id.clone(),
+                    expected_instance_revision: self.expected_instance_revision,
+                }
+            });
             self.current_scope = token.scope_id.clone();
             let id = token.token_id.clone();
             let node = self.node(&token.node_id)?.clone();
@@ -1563,6 +1780,7 @@ impl<'a> Transition<'a> {
                 | ProcessNodeKind::TimerStart { .. }
                 | ProcessNodeKind::MessageStart { .. } => {
                     self.consume(&id);
+                    self.plan.event_sources.insert(self.plan.events.len(), id.clone());
                     self.event("node_completed", Some(node.id.clone()), Value::Null);
                     for edge in outgoing {
                         self.follow(&token, &edge)?;
@@ -1570,8 +1788,10 @@ impl<'a> Transition<'a> {
                 }
                 ProcessNodeKind::End => {
                     self.consume(&id);
+                    self.plan.event_sources.insert(self.plan.events.len(), id.clone());
                     self.event("end_reached", Some(node.id), Value::Null);
                 }
+                ProcessNodeKind::TerminateEnd => self.terminate(&node, &token)?,
                 ProcessNodeKind::CallActivity { .. } => self.enter_call(&node, &token)?,
                 ProcessNodeKind::ErrorEnd { error_ref } => {
                     self.error_end(&node, &token, &error_ref)?
@@ -1709,6 +1929,7 @@ impl<'a> Transition<'a> {
                         data["source_token_id"] = json!(id);
                         data["activation_id"] = json!(id);
                     }
+                    self.plan.event_sources.insert(self.plan.events.len(), id.clone());
                     self.event("exclusive_selected", Some(node.id), data);
                     self.follow(&token, &edge)?;
                 }
@@ -1721,7 +1942,7 @@ impl<'a> Transition<'a> {
                     let pairs = gateway_pairs(self.body()?.0, self.body()?.1)?;
                     if let Some(pair) = pairs.get(&node.id) {
                         ensure!(pair.kind == gateway_kind, "gateway kind differs from paired body");
-                        let all_edges = pair.branch_to_incoming_edge.keys().cloned().collect::<Vec<_>>();
+                        let all_edges = pair.branches.keys().cloned().collect::<Vec<_>>();
                         let (selected, default_selected) = match &node.kind {
                             ProcessNodeKind::ParallelGateway => (all_edges.clone(), false),
                             ProcessNodeKind::InclusiveGateway { default_flow_id } => {
@@ -1777,6 +1998,7 @@ impl<'a> Transition<'a> {
                         if self.escalation_continuation && gateway_kind == GatewayKind::Inclusive {
                             data["source_token_id"] = json!(id);
                         }
+                        self.plan.event_sources.insert(self.plan.events.len(), id.clone());
                         self.event(kind, Some(node.id.clone()), data);
                         for edge in &selected {
                             let mut branch = token.clone();
@@ -1887,7 +2109,7 @@ impl<'a> Transition<'a> {
                 .get(&scope.scope_id)
                 .context("completing child local variables missing")?
                 .clone();
-            if let Err(error) = self.map_outputs(output_mapping, &outputs, &[]) {
+            if let Err(error) = self.map_outputs(&node.id, &token.token_id, output_mapping, &outputs, &[]) {
                 self.current_scope = scope.scope_id.clone();
                 let incident_id = Uuid::new_v4().to_string();
                 let message = super::repository::bounded_failure_message(&format!("{error:#}"));
@@ -2012,7 +2234,18 @@ impl<'a> Transition<'a> {
             })
         {
             self.current_scope = self.instance_id.to_owned();
-            self.event("instance_completed", None, Value::Null);
+            let completed = self.plan.termination_attempts.iter().rev().find_map(|attempt| {
+                match attempt {
+                    TerminationAttempt::Success(source) if source.source_scope_id == self.instance_id => Some(source),
+                    _ => None,
+                }
+            });
+            let data = completed.map_or(Value::Null, |source| json!({
+                "reason":"terminate_end","source_instance_id":source.source_instance_id,
+                "source_event_id":source.source_event_id,"source_scope_id":source.source_scope_id,
+                "source_node_id":source.source_node_id,"source_token_id":source.source_token_id,
+            }));
+            self.event("instance_completed", None, data);
             ProcessInstanceStatus::Completed
         } else if self
             .jobs
@@ -2256,8 +2489,15 @@ pub(super) fn plan_call_return(
     call: &super::repository::CallActivation,
     outputs: &Value,
     now_ms: i64,
+    expected_child_revision: u64,
 ) -> Result<RuntimePlan> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(AcceptedInputRef::CallReturn {
+        call_id: call.call_id.clone(),
+        child_instance_id: call.child_instance_id.clone(),
+        expected_child_revision,
+        parent_token_id: call.parent_token_id.clone(),
+    });
     transition.current_scope = call.parent_scope_id.clone();
     let token = transition
         .tokens
@@ -2274,7 +2514,7 @@ pub(super) fn plan_call_return(
     let ProcessNodeKind::CallActivity { output_mapping, .. } = &node.kind else {
         anyhow::bail!("call return node is not CallActivity")
     };
-    transition.map_outputs(output_mapping, outputs, &[])?;
+    transition.map_outputs(&node.id, &token.token_id, output_mapping, outputs, &[])?;
     transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
     transition.resolve_boundary_incidents(&token.token_id);
     transition.consume(&token.token_id);
@@ -2291,8 +2531,15 @@ pub(super) fn plan_call_error(
     call: &super::repository::CallActivation,
     source: &super::repository::BusinessErrorSource,
     now_ms: i64,
+    expected_child_revision: u64,
 ) -> Result<Option<RuntimePlan>> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(AcceptedInputRef::CallReturn {
+        call_id: call.call_id.clone(),
+        child_instance_id: call.child_instance_id.clone(),
+        expected_child_revision,
+        parent_token_id: call.parent_token_id.clone(),
+    });
     transition.current_scope = call.parent_scope_id.clone();
     let token = transition
         .tokens
@@ -2345,6 +2592,8 @@ pub(super) fn plan_call_error(
         anyhow::bail!("call error handler is not BoundaryError")
     };
     transition.map_outputs(
+        &handler.id,
+        &attached.token_id,
         output_mapping,
         &outputs,
         &[("activity_result".into(), activity_result)],
@@ -2379,7 +2628,17 @@ pub fn plan_start(
     variables: Value,
     cause: StartCause,
     now_ms: i64,
+    start_input: StartInputRef,
 ) -> Result<RuntimePlan> {
+    let source_matches = match (&cause, &start_input) {
+        (StartCause::Manual, StartInputRef::Manual { .. } | StartInputRef::CallStart { .. }) => true,
+        (StartCause::Timer { timer_id, occurrence }, StartInputRef::Timer { timer_id: selected, fired_occurrence, .. }) =>
+            timer_id == selected && occurrence == fired_occurrence,
+        (StartCause::Message { message_id }, StartInputRef::Message { message_id: selected, .. }) =>
+            message_id == selected,
+        _ => false,
+    };
+    ensure!(source_matches, "process start accepted input differs from its start cause");
     let mut transition = Transition::new(
         model,
         instance_id,
@@ -2390,6 +2649,10 @@ pub fn plan_start(
         variables,
         now_ms,
     )?;
+    transition.accepted_input = Some(AcceptedInputRef::Start {
+        instance_id: instance_id.to_owned(),
+        cause: start_input,
+    });
     let start = model
         .nodes
         .iter()
@@ -2439,7 +2702,7 @@ pub fn plan_start(
         arrival_edge_id: None,
         fork_stack: Vec::new(),
         status: "ready".into(),
-    });
+    }, None);
     transition.event("instance_started", None, facts);
     transition.advance()?;
     transition.finish()
@@ -2457,9 +2720,13 @@ pub fn plan_user_completion(
     outputs: &Value,
     approved: Option<bool>,
     now_ms: i64,
+    accepted_input: AcceptedInputRef,
 ) -> Result<RuntimePlan> {
     validate_output(outputs)?;
+    ensure!(matches!(&accepted_input, AcceptedInputRef::Human { task_id: selected, .. } if selected == task_id),
+        "human completion input differs from its task");
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(accepted_input);
     let task = snapshot
         .user_tasks
         .iter()
@@ -2521,7 +2788,7 @@ pub fn plan_user_completion(
         | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
         _ => anyhow::bail!("user task node is not an activity"),
     };
-    transition.map_outputs(mapping, &effective_outputs, &[])?;
+    transition.map_outputs(&node.id, &token.token_id, mapping, &effective_outputs, &[])?;
     transition
         .plan
         .complete_user_task_ids
@@ -2555,6 +2822,10 @@ pub fn plan_job_result(
     let result = &observed.result;
     validate_output(&result.outputs)?;
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(AcceptedInputRef::Service {
+        job_id: job.job_id.clone(), attempt: job.attempt, fence: job.fence,
+        result_event_id: Uuid::new_v4().to_string(),
+    });
     transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
     let token = transition
@@ -2622,11 +2893,17 @@ pub fn plan_job_result(
                     anyhow::bail!("selected escalation subscription is not a boundary");
                 };
                 transition.map_outputs(
+                    &handler.id,
+                    &token.token_id,
                     output_mapping,
                     &result.outputs,
                     &[("activity_result".into(), serde_json::to_value(result)?)],
                 )?;
-                let result_event_id = Uuid::new_v4().to_string();
+                let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
+                    .context("accepted service result has no fenced source identity")? else {
+                    anyhow::bail!("escalation result lost its accepted service identity")
+                };
+                let result_event_id = result_event_id.clone();
                 transition.plan.event_ids.insert(0, result_event_id.clone());
                 transition.settle_subscription(&subscription, S::Consumed, None);
                 if *cancel_activity {
@@ -2699,12 +2976,23 @@ pub fn plan_job_result(
         {
             let source_scope = transition.current_scope.clone();
             let result_index = transition.plan.events.len() - 1;
+            let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
+                .context("accepted service error has no fenced source identity")? else {
+                anyhow::bail!("service error lost its accepted source identity")
+            };
+            if let Some(existing) = transition.plan.event_ids.insert(result_index,
+                result_event_id.clone()) {
+                ensure!(existing == *result_event_id,
+                    "accepted service error source identity conflicts with its result event");
+            }
             transition.current_scope = subscription.scope_id.clone();
             let handler = transition.node(&subscription.node_id)?.clone();
             let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
                 anyhow::bail!("error subscription is not a boundary");
             };
             transition.map_outputs(
+                &handler.id,
+                &attached.token_id,
                 output_mapping,
                 &result.outputs,
                 &[("activity_result".into(), serde_json::to_value(result)?)],
@@ -2738,7 +3026,11 @@ pub fn plan_job_result(
     if observed.origin == super::repository::ActivityResultOrigin::Contract
         && result.outcome == ActivityOutcome::Error
     {
-        let result_event_id = Uuid::new_v4().to_string();
+        let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
+            .context("accepted service error has no fenced source identity")? else {
+            anyhow::bail!("service error lost its accepted source identity")
+        };
+        let result_event_id = result_event_id.clone();
         transition.plan.event_ids.insert(0, result_event_id.clone());
         transition.plan.business_error =
             Some(super::repository::BusinessErrorSource::ServiceContract {
@@ -2793,8 +3085,9 @@ pub fn plan_job_result(
                     &result.outputs,
                     &[],
                 ) {
-                    Ok(variables) => {
-                        transition.set_variables(variables)?;
+                    Ok(_) => {
+                        transition.map_outputs(&node.id, &token.token_id, output_mapping,
+                            &result.outputs, &[])?;
                         transition.disarm_boundaries(
                             &token.token_id,
                             "activity_completed",
@@ -2887,8 +3180,10 @@ pub(super) fn plan_message_catch(
     payload: &Value,
     metadata: Value,
     now_ms: i64,
+    accepted_input: AcceptedInputRef,
 ) -> Result<RuntimePlan> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(accepted_input);
     transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();
     let (mapping, interrupt) = match &node.kind {
@@ -2906,7 +3201,8 @@ pub(super) fn plan_message_catch(
         .find(|t| t.token_id == subscription.token_id && t.status == "waiting")
         .context("subscription activation is closed")?
         .clone();
-    transition.map_outputs(mapping, payload, &[("message".into(), metadata.clone())])?;
+    transition.map_outputs(&node.id, &token.token_id, mapping, payload,
+        &[("message".into(), metadata.clone())])?;
     transition.settle_subscription(
         subscription,
         tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
@@ -2933,6 +3229,7 @@ pub(super) fn plan_timer_catch(
     snapshot: &RuntimeSnapshot,
     timer: &ProcessTimer,
     now_ms: i64,
+    accepted_input: AcceptedInputRef,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Catch
@@ -2943,6 +3240,7 @@ pub(super) fn plan_timer_catch(
         "catch timer does not match its pinned instance"
     );
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer.scope_id.clone().context("catch timer lacks scope")?;
     let token_id = timer
         .token_id
@@ -2965,6 +3263,10 @@ pub(super) fn plan_timer_catch(
     if let Some(race_id) = &timer.race_id {
         transition.win_race(race_id, &timer.node_id, None, Some(&timer.timer_id))?;
     }
+    if let Some(current) = transition.timers.iter_mut().find(|current|
+        current.timer_id == timer.timer_id) {
+        current.status = ProcessTimerStatus::Fired;
+    }
     transition.consume(token_id);
     for edge in transition.outgoing(&timer.node_id) {
         transition.follow(&token, &edge)?;
@@ -2977,6 +3279,7 @@ pub(super) fn plan_timer_boundary(
     snapshot: &RuntimeSnapshot,
     timer: &ProcessTimer,
     now_ms: i64,
+    accepted_input: AcceptedInputRef,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Boundary
@@ -2987,6 +3290,7 @@ pub(super) fn plan_timer_boundary(
         "boundary timer does not match its pinned instance"
     );
     let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer
         .scope_id
         .clone()
@@ -3018,6 +3322,10 @@ pub(super) fn plan_timer_boundary(
         token.fork_stack.is_empty(),
         "boundary attachment has an active parallel fork frame"
     );
+    if let Some(current) = transition.timers.iter_mut().find(|current|
+        current.timer_id == timer.timer_id) {
+        current.status = ProcessTimerStatus::Fired;
+    }
     if *cancel_activity {
         transition.interrupt_activity(&token, &timer.timer_id)?;
     }
@@ -3308,6 +3616,29 @@ pub(crate) mod test_support {
         }
     }
 
+    pub fn manual_input(stamp: &super::super::repository::CommandStamp) -> super::super::repository::StartInputRef {
+        super::super::repository::StartInputRef::Manual {
+            command_id: stamp.command_id.clone(),
+            request_hash: stamp.request_hash.clone(),
+        }
+    }
+
+    pub fn human_input(
+        snapshot: &super::super::repository::RuntimeSnapshot,
+        task_id: &str,
+        stamp: &super::super::repository::CommandStamp,
+    ) -> super::super::repository::AcceptedInputRef {
+        let task = snapshot.user_tasks.iter().find(|task| task.user_task_id == task_id)
+            .expect("factual user task for completion");
+        super::super::repository::AcceptedInputRef::Human {
+            task_id: task_id.to_owned(),
+            expected_task_revision: task.revision,
+            expected_instance_revision: snapshot.instance.revision,
+            command_id: stamp.command_id.clone(),
+            request_hash: stamp.request_hash.clone(),
+        }
+    }
+
     pub fn edge(id: &str, source: &str, target: &str) -> ProcessSequenceFlow {
         ProcessSequenceFlow {
             id: id.into(),
@@ -3556,6 +3887,7 @@ pub(crate) mod test_support {
         let id = Uuid::new_v4().to_string();
         let variables = serde_json::to_value(&model.variables).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start");
         let plan = super::plan_start(
             &version.model,
             &id,
@@ -3565,12 +3897,13 @@ pub(crate) mod test_support {
             variables.clone(),
             StartCause::Manual,
             at_ms,
+            manual_input(&command),
         )
         .expect("plan actual start");
         super::super::repository::start_instance(
             &fixture.db,
             actor,
-            &stamp("start"),
+            &command,
             &id,
             &version.definition_id,
             version.version,
@@ -3609,6 +3942,193 @@ mod tests {
     use super::*;
     use test_support::*;
 
+    #[test]
+    fn root_terminate_commits_one_source_and_rejects_unclosed_same_plan_token_atomically() {
+        let fixture = Fixture::new();
+        let mut model = super::super::model::starter_model();
+        let end = model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap();
+        end.kind = ProcessNodeKind::TerminateEnd;
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("terminate root");
+        let valid = plan_start(&version.model, &instance_id, &fixture.owner,
+            &version.definition_id, version.version, variables.clone(), StartCause::Manual,
+            at_ms, manual_input(&command)).unwrap();
+        let source = valid.termination_attempts.iter().find_map(|attempt| match attempt {
+            TerminationAttempt::Success(source) => Some(source),
+            TerminationAttempt::ReturnFailure(_) => None,
+        }).expect("real root TerminateEnd source");
+        assert_eq!(valid.status, ProcessInstanceStatus::Completed);
+        assert_eq!(valid.events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
+        assert_eq!(valid.events.iter().filter(|event| event.kind == "instance_completed").count(), 1);
+        assert_eq!(valid.events.last().unwrap().data["source_event_id"], source.source_event_id);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = valid.clone();
+        let mut extra = forged.create_tokens.iter().find(|token|
+            token.token_id == source.source_token_id)
+            .expect("same-plan ready termination token").clone();
+        extra.token_id = Uuid::new_v4().to_string();
+        forged.create_tokens.push(extra);
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables,
+            &forged, at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables,
+            &valid, at_ms).unwrap();
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        let events = repository::list_events(&fixture.db, &fixture.owner, &instance_id, 0, 32).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "instance_completed").count(), 1);
+    }
+
+    #[test]
+    fn termination_replays_accepted_human_mapping_and_rejects_mutated_effects_atomically() {
+        let fixture = Fixture::new();
+        let mut model = user_model(Some(&fixture.participant.user_id));
+        model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+            ProcessNodeKind::TerminateEnd;
+        let waiting = start_model(&fixture, &model);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.participant,
+            &waiting.instance_id).unwrap();
+        let task = snapshot.user_tasks.iter().find(|task| task.status == ProcessUserTaskStatus::Open)
+            .unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("complete real human input before termination");
+        let output = json!({"answer":"accepted"});
+        let valid = plan_user_completion(&snapshot, &task.user_task_id, &output, None,
+            at_ms, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        assert_eq!(valid.variable_effects.len(), 1);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut missing = valid.clone();
+        missing.variable_effects.clear();
+        let mut changed = valid.clone();
+        let VariableEffect::Mapped { outputs, .. } = &mut changed.variable_effects[0] else {
+            panic!("actual human completion must map its output")
+        };
+        *outputs = json!({"answer":"forged"});
+        let mut changed_event = valid.clone();
+        changed_event.events.iter_mut().find(|event| event.kind == "user_task_completed")
+            .expect("actual human completion event").data["outputs"] =
+            json!({"answer":"forged"});
+        let mut duplicate = valid.clone();
+        duplicate.variable_effects.push(duplicate.variable_effects[0].clone());
+        let mut wrong_cutoff = valid.clone();
+        let TerminationAttempt::Success(source) = &mut wrong_cutoff.termination_attempts[0] else {
+            panic!("actual human completion must reach TerminateEnd")
+        };
+        source.variable_effect_count = 0;
+        for (case, forged) in [("omitted effect", missing), ("forged output", changed),
+            ("forged completion event", changed_event),
+            ("duplicated effect", duplicate), ("wrong source-time cutoff", wrong_cutoff)] {
+            assert!(repository::complete_user_task(&fixture.db, &fixture.participant, &command,
+                &waiting.instance_id, &task.user_task_id, waiting.revision, &output, None,
+                &forged, at_ms).is_err(), "{case} must roll back");
+            assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
+                "{case} changed one of the durable process tables");
+        }
+        let completed = repository::complete_user_task(&fixture.db, &fixture.participant,
+            &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
+            &output, None, &valid, at_ms).unwrap();
+        assert_eq!(completed.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(completed.instance.variables["answer"], "accepted");
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::get_instance(&reopened, &fixture.participant,
+            &waiting.instance_id, None).unwrap();
+        assert_eq!(persisted.variables, completed.instance.variables);
+    }
+
+    #[test]
+    fn termination_rejects_reordered_child_and_parent_variable_effects_atomically() {
+        use tentaflow_protocol::processes::{ProcessDiagram, ProcessSubProcess};
+        let fixture = Fixture::new();
+        let mut model = super::super::model::starter_model();
+        model.nodes.retain(|node| node.id != "End_1");
+        model.nodes.extend([
+            ProcessNode { id: "Scope".into(), name: "Mapped child".into(),
+                kind: ProcessNodeKind::SubProcess {
+                    body: ProcessSubProcess {
+                        nodes: vec![
+                            ProcessNode { id: "ChildStart".into(), name: "Child start".into(),
+                                kind: ProcessNodeKind::Start },
+                            ProcessNode { id: "ChildTerminate".into(), name: "Child termination".into(),
+                                kind: ProcessNodeKind::TerminateEnd },
+                        ],
+                        sequence_flows: vec![edge("ChildFlow", "ChildStart", "ChildTerminate")],
+                        variables: BTreeMap::from([("child_value".into(), json!(41))]),
+                        diagram: ProcessDiagram::default(),
+                    },
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::from([("received".into(),
+                        "outputs.child_value".into())]),
+                } },
+            ProcessNode { id: "RootTerminate".into(), name: "Root termination".into(),
+                kind: ProcessNodeKind::TerminateEnd },
+        ]);
+        model.sequence_flows = vec![edge("RootChild", "Start_1", "Scope"),
+            edge("ChildRootTerminate", "Scope", "RootTerminate")];
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let command = stamp("start child then root TerminateEnd with ordered variables");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let valid = plan_start(&version.model, &instance_id, &fixture.owner,
+            &version.definition_id, version.version, variables.clone(), StartCause::Manual,
+            at_ms, manual_input(&command)).unwrap();
+        assert_eq!(valid.termination_attempts.len(), 2);
+        assert_eq!(valid.variable_effects.len(), 2);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut reordered = valid.clone();
+        reordered.variable_effects.swap(0, 1);
+        let mut missing_entry = valid.clone();
+        missing_entry.variable_effects.remove(0);
+        let mut duplicate_entry = valid.clone();
+        let repeated_entry = duplicate_entry.variable_effects[0].clone();
+        duplicate_entry.variable_effects.insert(1, repeated_entry);
+        let mut extra_entry = valid.clone();
+        let mut unrelated_entry = extra_entry.variable_effects[0].clone();
+        let VariableEffect::ScopeEntry { scope_id, .. } = &mut unrelated_entry else {
+            panic!("actual child entry must have a scope effect")
+        };
+        *scope_id = Uuid::new_v4().to_string();
+        extra_entry.variable_effects.push(unrelated_entry);
+        let mut extra_mapping = valid.clone();
+        let mut unrelated = extra_mapping.variable_effects[1].clone();
+        let VariableEffect::Mapped { source_token_id, .. } = &mut unrelated else {
+            panic!("actual child return must map its parent")
+        };
+        *source_token_id = Uuid::new_v4().to_string();
+        extra_mapping.variable_effects.push(unrelated);
+        let mut wrong_activation = valid.clone();
+        let VariableEffect::Mapped { parent_token_id, .. } = &mut wrong_activation.variable_effects[1]
+            else { panic!("actual child return must map its parent") };
+        *parent_token_id = Some(Uuid::new_v4().to_string());
+        let mut changed_result = valid.clone();
+        let VariableEffect::Mapped { result, .. } = &mut changed_result.variable_effects[1]
+            else { panic!("actual child return must map its parent") };
+        result["received"] = json!(99);
+        for (case, forged) in [("reordered effects", reordered),
+            ("omitted scope entry", missing_entry),
+            ("duplicated scope entry", duplicate_entry),
+            ("extra unrelated scope entry", extra_entry),
+            ("extra unrelated mapping", extra_mapping),
+            ("different parent activation", wrong_activation),
+            ("changed mapped result", changed_result)] {
+            assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+                &instance_id, &version.definition_id, version.version, &variables,
+                &forged, at_ms).is_err(), "{case} must fail closed");
+            assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
+                "{case} changed durable process rows");
+        }
+        let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables,
+            &valid, at_ms).unwrap();
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        assert_eq!(completed.variables["received"], 41);
+    }
+
     #[tokio::test]
     async fn user_wait_survives_reopen_and_completion_is_idempotent() {
         let at_ms = chrono::Utc::now().timestamp_millis();
@@ -3639,8 +4159,9 @@ mod tests {
         assert!(snapshot.instance.user_tasks[0].can_complete);
         assert!(!snapshot.instance.can_cancel);
         let output = json!({"answer":"reviewed"});
-        let plan = plan_user_completion(&snapshot, &task_id, &output, None, at_ms).unwrap();
         let completion = stamp("complete evidence");
+        let plan = plan_user_completion(&snapshot, &task_id, &output, None, at_ms,
+            human_input(&snapshot, &task_id, &completion)).unwrap();
         let completed = repository::complete_user_task(
             &reopened,
             &participant,
@@ -3763,12 +4284,14 @@ mod tests {
         let snapshot =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id)
                 .unwrap();
+        let left_command = stamp("left done");
         let plan =
-            plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None, at_ms).unwrap();
+            plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None, at_ms,
+                human_input(&snapshot, &left.user_task_id, &left_command)).unwrap();
         let partial = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
-            &stamp("left done"),
+            &left_command,
             &waiting.instance_id,
             &left.user_task_id,
             waiting.revision,
@@ -3802,15 +4325,16 @@ mod tests {
             .iter()
             .find(|task| task.node_id == "Right" && task.status == ProcessUserTaskStatus::Open)
             .unwrap();
+        let completion = stamp("right done");
         let plan = plan_user_completion(
             &snapshot,
             &right.user_task_id,
             &json!(["checked"]),
             None,
             at_ms,
+            human_input(&snapshot, &right.user_task_id, &completion),
         )
         .unwrap();
-        let completion = stamp("right done");
         let completed = repository::complete_user_task(
             &reopened,
             &participant,
@@ -3863,6 +4387,167 @@ mod tests {
         );
         drop(reopened);
         drop(directory);
+    }
+
+    #[test]
+    fn mixed_gateway_retains_join_arrival_until_selected_terminate_closes_it() {
+        for inclusive in [false, true] {
+            let fixture = Fixture::new();
+            let mut model = super::super::model::starter_model();
+            let gateway = || if inclusive {
+                ProcessNodeKind::InclusiveGateway { default_flow_id: None }
+            } else {
+                ProcessNodeKind::ParallelGateway
+            };
+            model.nodes.splice(1..1, [
+                ProcessNode { id: "Split".into(), name: "Run selected branches".into(),
+                    kind: gateway() },
+                ProcessNode { id: "LeftWork".into(), name: "First join arrival".into(),
+                    kind: ProcessNodeKind::UserTask {
+                        assignee_user_id: Some(fixture.owner.user_id.clone()),
+                        output_mapping: BTreeMap::new() } },
+                ProcessNode { id: "RightWork".into(), name: "Outstanding join branch".into(),
+                    kind: ProcessNodeKind::UserTask {
+                        assignee_user_id: Some(fixture.owner.user_id.clone()),
+                        output_mapping: BTreeMap::new() } },
+                ProcessNode { id: "TerminateWork".into(), name: "Factual terminating input".into(),
+                    kind: ProcessNodeKind::UserTask {
+                        assignee_user_id: Some(fixture.owner.user_id.clone()),
+                        output_mapping: BTreeMap::new() } },
+                ProcessNode { id: "Join".into(), name: "Join normal branches".into(),
+                    kind: gateway() },
+                ProcessNode { id: "Terminate".into(), name: "Stop this instance".into(),
+                    kind: ProcessNodeKind::TerminateEnd },
+            ]);
+            model.sequence_flows = vec![
+                edge("StartSplit", "Start_1", "Split"),
+                edge("SplitLeft", "Split", "LeftWork"),
+                edge("SplitRight", "Split", "RightWork"),
+                edge("SplitTerm", "Split", "TerminateWork"),
+                edge("LeftJoin", "LeftWork", "Join"),
+                edge("RightJoin", "RightWork", "Join"),
+                edge("TermEnd", "TerminateWork", "Terminate"),
+                edge("JoinEnd", "Join", "End_1"),
+            ];
+            if inclusive {
+                for flow in model.sequence_flows.iter_mut().filter(|flow| flow.source_id == "Split") {
+                    flow.condition = Some("true".into());
+                }
+            }
+            let waiting = start_model(&fixture, &model);
+            assert_eq!(waiting.user_tasks.len(), 3);
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &waiting.instance_id).unwrap();
+            let left = snapshot.user_tasks.iter().find(|task| task.node_id == "LeftWork").unwrap();
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            let left_command = stamp("first mixed gateway arrival");
+            let valid = plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None,
+                at_ms, human_input(&snapshot, &left.user_task_id, &left_command)).unwrap();
+            assert_eq!(valid.add_gateway_receipts.len(), 1);
+            let joining = valid.create_tokens.iter().find(|token| token.node_id == "Join"
+                && token.status == "joining").unwrap();
+            let frame = joining.fork_stack.last().unwrap();
+            assert_eq!(frame.branch_edge_id, "SplitLeft");
+            assert_eq!(frame.selected_branch_edge_ids,
+                vec!["SplitLeft".to_owned(), "SplitRight".to_owned(), "SplitTerm".to_owned()]);
+            let mut terminal_receipt = valid.clone();
+            terminal_receipt.add_gateway_receipts[0].branch_edge_id = "SplitTerm".into();
+            terminal_receipt.create_tokens.iter_mut().find(|token|
+                token.token_id == joining.token_id).unwrap()
+                .fork_stack.last_mut().unwrap().branch_edge_id = "SplitTerm".into();
+            let mut wrong_arrival = valid.clone();
+            wrong_arrival.create_tokens.iter_mut().find(|token|
+                token.token_id == joining.token_id).unwrap()
+                .arrival_edge_id = Some("RightJoin".into());
+            let mut wrong_selection = valid.clone();
+            wrong_selection.create_tokens.iter_mut().find(|token|
+                token.token_id == joining.token_id).unwrap()
+                .fork_stack.last_mut().unwrap().selected_branch_edge_ids =
+                    vec!["SplitLeft".into(), "SplitRight".into()];
+            let mut fake_join = valid.clone();
+            fake_join.add_gateway_receipts.clear();
+            fake_join.consume_token_ids.push(joining.token_id.clone());
+            let source_id = valid.token_sources.get(&joining.token_id).unwrap().clone();
+            fake_join.event_sources.insert(fake_join.events.len(), source_id.clone());
+            fake_join.events.push(repository::PlannedEvent {
+                scope_id: joining.scope_id.clone(),
+                kind: if inclusive { "inclusive_joined" } else { "parallel_joined" }.into(),
+                node_id: Some("Join".into()),
+                data: if inclusive {
+                    json!({"activation_id":frame.activation_id,
+                        "selected_branch_edge_ids":frame.selected_branch_edge_ids})
+                } else { json!({"activation_id":frame.activation_id}) },
+            });
+            let continuation = repository::ProcessToken {
+                token_id: Uuid::new_v4().to_string(), scope_id: joining.scope_id.clone(),
+                node_id: "End_1".into(), arrival_edge_id: Some("JoinEnd".into()),
+                fork_stack: Vec::new(), status: "ready".into(),
+            };
+            fake_join.token_sources.insert(continuation.token_id.clone(), source_id);
+            fake_join.create_tokens.push(continuation);
+            let before = super::super::call_tests::transition_rows(&fixture);
+            for (case, forged) in [
+                ("terminal branch receipt", terminal_receipt),
+                ("wrong actual join arrival", wrong_arrival),
+                ("changed selected subset", wrong_selection),
+                ("invented completed join", fake_join),
+            ] {
+                assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+                    &left_command, &waiting.instance_id, &left.user_task_id,
+                    waiting.revision, &Value::Null, None, &forged, at_ms).is_err(),
+                    "{case} was accepted");
+                assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
+                    "{case} changed persisted process rows");
+            }
+            let partial = repository::complete_user_task(&fixture.db, &fixture.owner,
+                &left_command, &waiting.instance_id, &left.user_task_id,
+                waiting.revision, &Value::Null, None, &valid, at_ms).unwrap().instance;
+            assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
+            let path = fixture.directory.path().join("processes.db");
+            let owner = fixture.owner.clone();
+            let Fixture { directory, db, router, .. } = fixture;
+            drop(router);
+            drop(db);
+            let reopened = crate::db::init(&path).unwrap();
+            let resumed = repository::runtime_snapshot(&reopened, &owner,
+                &waiting.instance_id).unwrap();
+            assert_eq!(resumed.receipts.len(), 1);
+            assert_eq!(resumed.receipts[0].branch_edge_id, "SplitLeft");
+            assert_eq!(resumed.tokens.iter().filter(|token|
+                token.node_id == "Join" && token.status == "joining").count(), 1);
+            assert_eq!(resumed.user_tasks.iter().filter(|task|
+                task.status == ProcessUserTaskStatus::Open).count(), 2);
+            let term = resumed.user_tasks.iter().find(|task|
+                task.node_id == "TerminateWork").unwrap();
+            let term_command = stamp("terminate mixed gateway activation");
+            let term_plan = plan_user_completion(&resumed, &term.user_task_id,
+                &Value::Null, None, at_ms + 1,
+                human_input(&resumed, &term.user_task_id, &term_command)).unwrap();
+            let completed = repository::complete_user_task(&reopened, &owner,
+                &term_command, &waiting.instance_id, &term.user_task_id,
+                partial.revision, &Value::Null, None, &term_plan, at_ms + 1)
+                .unwrap().instance;
+            assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+            let replay = repository::complete_user_task(&reopened, &owner,
+                &term_command, &waiting.instance_id, &term.user_task_id,
+                partial.revision, &Value::Null, None, &term_plan, at_ms + 1)
+                .unwrap().instance;
+            assert_eq!(replay.revision, completed.revision);
+            let closed = repository::runtime_snapshot(&reopened, &owner,
+                &waiting.instance_id).unwrap();
+            assert!(closed.receipts.is_empty());
+            assert!(closed.tokens.iter().all(|token|
+                !matches!(token.status.as_str(), "ready" | "waiting" | "joining")));
+            assert!(closed.user_tasks.iter().all(|task|
+                task.status != ProcessUserTaskStatus::Open));
+            let events = repository::list_events(&reopened, &owner,
+                &waiting.instance_id, 0, 200).unwrap().0;
+            assert_eq!(events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
+            assert_eq!(events.iter().filter(|event| matches!(event.kind.as_str(),
+                "parallel_joined" | "inclusive_joined")).count(), 0);
+            drop(reopened);
+            drop(directory);
+        }
     }
 
     #[tokio::test]
@@ -3951,6 +4636,33 @@ mod tests {
         model
     }
 
+    #[test]
+    fn inclusive_terminate_branch_closes_selected_siblings_without_join_receipts() {
+        for selected_b in [false, true] {
+            let fixture = Fixture::new();
+            let mut model = inclusive_model(None, true, selected_b);
+            model.nodes.iter_mut().find(|node| node.id == "A").unwrap().kind =
+                ProcessNodeKind::TerminateEnd;
+            model.sequence_flows.retain(|flow| flow.id != "From_A");
+            let completed = start_model(&fixture, &model);
+            assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+            assert!(completed.user_tasks.is_empty());
+            assert!(completed.active_node_ids.is_empty());
+            let history = repository::list_events(&fixture.db, &fixture.owner,
+                &completed.instance_id, 0, 100).unwrap().0;
+            let source = history.iter().find(|event| event.kind == "terminate_end_reached")
+                .expect("selected branch reached its real TerminateEnd");
+            assert_eq!(source.node_id.as_deref(), Some("A"));
+            assert_eq!(history.iter().filter(|event| event.kind == "instance_completed"
+                && event.data["source_event_id"] == source.data["source_event_id"]).count(), 1);
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &completed.instance_id).unwrap();
+            assert!(snapshot.receipts.is_empty());
+            assert!(snapshot.tokens.iter().all(|token|
+                !matches!(token.status.as_str(), "ready" | "waiting" | "joining")));
+        }
+    }
+
     #[tokio::test]
     async fn inclusive_selected_pair_reopens_after_one_arrival_and_joins_once() {
         let fixture = Fixture::new();
@@ -3961,8 +4673,10 @@ mod tests {
         let first = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
-        let plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms).unwrap();
-        let partial = repository::complete_user_task(&fixture.db, &fixture.owner, &stamp("inclusive first"),
+        let first_command = stamp("inclusive first");
+        let plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &first.user_task_id, &first_command)).unwrap();
+        let partial = repository::complete_user_task(&fixture.db, &fixture.owner, &first_command,
             &waiting.instance_id, &first.user_task_id, waiting.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
         let path = fixture.directory.path().join("processes.db");
@@ -3975,8 +4689,9 @@ mod tests {
         assert_eq!(snapshot.receipts[0].branch_edge_id, "To_B");
         assert_eq!(snapshot.receipts[0].gateway_kind, GatewayKind::Inclusive);
         let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
-        let plan = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms).unwrap();
         let command = stamp("inclusive second");
+        let plan = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &second.user_task_id, &command)).unwrap();
         let completed = repository::complete_user_task(&reopened, &owner, &command,
             &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -4043,9 +4758,11 @@ mod tests {
                 let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance.instance_id).unwrap();
                 let task = snapshot.instance.user_tasks.iter().find(|task| task.node_id == *node_id).unwrap();
                 let at_ms = chrono::Utc::now().timestamp_millis();
-                let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+                let command = stamp(&format!("nested {node_id}"));
+                let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
+                    human_input(&snapshot, &task.user_task_id, &command)).unwrap();
                 instance = repository::complete_user_task(&fixture.db, &fixture.owner,
-                    &stamp(&format!("nested {node_id}")), &instance.instance_id, &task.user_task_id,
+                    &command, &instance.instance_id, &task.user_task_id,
                     instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
             }
             assert_eq!(instance.status, ProcessInstanceStatus::Completed);
@@ -4088,9 +4805,11 @@ mod tests {
             let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance.instance_id).unwrap();
             let task = snapshot.instance.user_tasks.iter().find(|task| task.status == ProcessUserTaskStatus::Open).unwrap();
             let at_ms = chrono::Utc::now().timestamp_millis();
-            let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+            let command = stamp(&format!("parallel nine branch {index}"));
+            let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
+                human_input(&snapshot, &task.user_task_id, &command)).unwrap();
             instance = repository::complete_user_task(&fixture.db, &fixture.owner,
-                &stamp(&format!("parallel nine branch {index}")), &instance.instance_id,
+                &command, &instance.instance_id,
                 &task.user_task_id, instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
         }
         assert_eq!(instance.status, ProcessInstanceStatus::Completed);
@@ -4105,11 +4824,13 @@ mod tests {
         let task = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
         let before = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
-        let mut plan = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let forged_command = stamp("forged selected set");
+        let mut plan = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms,
+            human_input(&before, &task.user_task_id, &forged_command)).unwrap();
         let joining = plan.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
         joining.fork_stack.last_mut().unwrap().selected_branch_edge_ids = vec!["To_B".into()];
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("forged selected set"), &waiting.instance_id, &task.user_task_id,
+            &forged_command, &waiting.instance_id, &task.user_task_id,
             waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(after.instance.revision, before.instance.revision);
@@ -4118,11 +4839,13 @@ mod tests {
         assert_eq!(after.instance.user_tasks.len(), before.instance.user_tasks.len());
         let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
         assert!(events.iter().all(|event| event.kind != "inclusive_joined"));
-        let mut wrong_arrival = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let wrong_command = stamp("wrong join incoming edge");
+        let mut wrong_arrival = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms,
+            human_input(&before, &task.user_task_id, &wrong_command)).unwrap();
         let joining = wrong_arrival.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
         joining.arrival_edge_id = Some("From_A".into());
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("wrong join incoming edge"), &waiting.instance_id, &task.user_task_id,
+            &wrong_command, &waiting.instance_id, &task.user_task_id,
             waiting.revision, &Value::Null, None, &wrong_arrival, at_ms).is_err());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(after.instance.revision, before.instance.revision);
@@ -4136,15 +4859,19 @@ mod tests {
         let first = waiting.user_tasks.iter().find(|task| task.node_id == "B").unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
-        let first_plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let first_command = stamp("first selected branch");
+        let first_plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &first.user_task_id, &first_command)).unwrap();
         let partial = repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("first selected branch"), &waiting.instance_id, &first.user_task_id,
+            &first_command, &waiting.instance_id, &first.user_task_id,
             waiting.revision, &Value::Null, None, &first_plan, at_ms).unwrap().instance;
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(snapshot.receipts.len(), 1);
         let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
-        let valid = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let command = stamp("valid final selected join");
+        let valid = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &second.user_task_id, &command)).unwrap();
         assert_eq!(valid.remove_gateway_receipts.len(), 1);
         assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
         let rows = || {
@@ -4171,7 +4898,6 @@ mod tests {
             &stamp("forged final join event"), &waiting.instance_id, &second.user_task_id,
             partial.revision, &Value::Null, None, &forged_event, at_ms).is_err());
         assert_eq!(rows(), before);
-        let command = stamp("valid final selected join");
         let complete = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &second.user_task_id, partial.revision,
             &Value::Null, None, &valid, at_ms).unwrap().instance;
@@ -4196,7 +4922,9 @@ mod tests {
         assert_eq!(task.node_id, "A");
         let at_ms = chrono::Utc::now().timestamp_millis();
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
-        let valid = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let command = stamp("singleton factual join");
+        let valid = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
         assert!(valid.remove_gateway_receipts.is_empty());
         assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
         let rows = || {
@@ -4240,7 +4968,6 @@ mod tests {
             at_ms).err().unwrap();
         assert!(format!("{error:#}").contains("planned gateway frame changed"));
         assert_eq!(rows(), before);
-        let command = stamp("singleton factual join");
         let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
             &Value::Null, None, &valid, at_ms).unwrap().instance;
@@ -4263,7 +4990,9 @@ mod tests {
         let task = waiting.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
-        let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms).unwrap();
+        let command = stamp("malformed frame");
+        let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
+            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
         let token_id = snapshot.tokens.iter().find(|token| token.node_id == "A").unwrap().token_id.clone();
         let original: String = fixture.db.read().unwrap().query_row(
             "SELECT fork_stack_json FROM bpmn_tokens WHERE token_id=?1", [&token_id], |row| row.get(0)).unwrap();
@@ -4281,7 +5010,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("malformed frame"), &waiting.instance_id, &task.user_task_id,
+            &command, &waiting.instance_id, &task.user_task_id,
             waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
         let after = {
             let conn = fixture.db.read().unwrap();
@@ -5162,7 +5891,8 @@ mod tests {
             let at = chrono::Utc::now().timestamp_millis();
             let command = stamp("finish scoped and joins");
             let plan =
-                plan_user_completion(&snapshot, &task_id("ChildB"), &json!({}), None, at).unwrap();
+                plan_user_completion(&snapshot, &task_id("ChildB"), &json!({}), None, at,
+                    human_input(&snapshot, &task_id("ChildB"), &command)).unwrap();
             let outcome = repository::complete_user_task(
                 &reopened,
                 &fixture.owner,
@@ -5431,12 +6161,14 @@ mod tests {
                     Some("activation_closed")
                 );
             }
+            let command = stamp("stale child completion");
             let stale =
-                plan_user_completion(&before, &work.user_task_id, &json!({}), None, due).unwrap();
+                plan_user_completion(&before, &work.user_task_id, &json!({}), None, due,
+                    human_input(&before, &work.user_task_id, &command)).unwrap();
             assert!(repository::complete_user_task(
                 &fixture.db,
                 &fixture.owner,
-                &stamp("stale child completion"),
+                &command,
                 &started.instance_id,
                 &work.user_task_id,
                 before.instance.revision,
@@ -5606,37 +6338,50 @@ mod tests {
             origin: ActivityResultOrigin::Contract,
             expression_observation: None,
         };
-        let mut forged = plan_job_result(
+        let canonical = plan_job_result(
             &snapshot,
             &source.job,
             &observed,
             chrono::Utc::now().timestamp_millis(),
         )
         .unwrap();
+        let mut forged = canonical.clone();
         forged.cancel_job_ids.clear();
+        let mut missing_result_id = canonical.clone();
+        missing_result_id.event_ids.remove(&0);
+        let mut wrong_source = canonical.clone();
+        wrong_source.events.iter_mut().find(|event| event.kind == "service_result")
+            .unwrap().scope_id = started.instance_id.clone();
+        let mut wrong_job = canonical.clone();
+        wrong_job.events.iter_mut().find(|event| event.kind == "business_error_caught")
+            .unwrap().data["job_id"] = json!(sibling.job.job_id);
+        let far = snapshot.subscriptions.iter().find(|sub| sub.node_id == "Far").unwrap();
+        let mut wrong_handler = canonical.clone();
+        wrong_handler.events.iter_mut().find(|event| event.kind == "business_error_caught")
+            .unwrap().data["subscription_id"] = json!(far.subscription_id);
         let events_before =
             repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
                 .unwrap()
                 .0;
-        assert!(repository::accept_job_result(
-            &fixture.db,
-            &fixture.owner,
-            &source.job.job_id,
-            source.job.attempt,
-            source.job.fence,
-            "scoped-error-worker",
-            &observed,
-            snapshot.instance.revision,
-            &forged,
-            chrono::Utc::now().timestamp_millis()
-        )
-        .is_err());
-        assert_eq!(
-            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
-                .unwrap()
-                .0,
-            events_before
-        );
+        let rows_before = super::super::call_tests::transition_rows(&fixture);
+        for (case, forged) in [
+            ("missing sibling cancellation", forged),
+            ("missing accepted result event ID", missing_result_id),
+            ("foreign service result scope", wrong_source),
+            ("wrong accepted job", wrong_job),
+            ("unselected enclosing handler", wrong_handler),
+        ] {
+            assert!(repository::accept_job_result(
+                &fixture.db, &fixture.owner, &source.job.job_id,
+                source.job.attempt, source.job.fence, "scoped-error-worker",
+                &observed, snapshot.instance.revision, &forged,
+                chrono::Utc::now().timestamp_millis(),
+            ).is_err(), "{case} was accepted");
+            assert_eq!(super::super::call_tests::transition_rows(&fixture), rows_before,
+                "{case} changed persisted process rows");
+            assert_eq!(repository::list_events(&fixture.db, &fixture.owner,
+                &started.instance_id, 0, 200).unwrap().0, events_before);
+        }
         assert!(!sibling_cancel.is_cancelled());
         super::super::jobs::execute_claimed(
             &fixture.db,
@@ -5647,11 +6392,30 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(sibling_cancel.is_cancelled());
-        assert!(!source_cancel.is_cancelled());
         let actual =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                 .unwrap();
+        let source_state = actual.jobs.iter().find(|job| job.job_id == source.job.job_id)
+            .map(|job| (&job.status, job.attempt, job.fence, &job.result,
+                &job.result_origin));
+        let sibling_state = actual.jobs.iter().find(|job| job.job_id == sibling.job.job_id)
+            .map(|job| (&job.status, job.attempt, job.fence, &job.result,
+                &job.result_origin));
+        let near_state = actual.subscriptions.iter().find(|sub| sub.node_id == "Near")
+            .map(|sub| (&sub.status, &sub.subscription_id, &sub.token_id));
+        let history = repository::list_events(
+            &fixture.db, &fixture.owner, &started.instance_id, 0, 200,
+        ).unwrap().0.into_iter().filter(|event| matches!(event.kind.as_str(),
+            "service_result" | "scope_error_propagated" | "business_error_caught"))
+            .map(|event| (event.kind, event.scope_id, event.data)).collect::<Vec<_>>();
+        let facts = format!(
+            "instance={:?}, incidents={:?}, source={:?}, sibling={:?}, Near={:?}, history={:?}, canonical_attempts={:?}, canonical_event_ids={:?}",
+            actual.instance.status, actual.incidents, source_state, sibling_state,
+            near_state, history, canonical.termination_attempts, canonical.event_ids,
+        );
+        assert!(actual.incidents.is_empty(), "accepted Contract Error left an incident: {facts}");
+        assert!(sibling_cancel.is_cancelled(), "sibling cancellation was not signalled: {facts}");
+        assert!(!source_cancel.is_cancelled());
         let inner_scope = actual
             .scopes
             .iter()

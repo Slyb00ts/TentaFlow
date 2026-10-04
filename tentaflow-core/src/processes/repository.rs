@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
-    ActivityResult, PinnedFlowInfo, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
+    ActivityOutcome, ActivityResult, PinnedFlowInfo, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
     ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
     ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection, ProcessInstance,
     ProcessInstancePageInfo, ProcessInstancePageRequest, ProcessInstanceStatus,
@@ -32,6 +32,7 @@ thread_local! {
     pub(super) static PUBLICATION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     pub(super) static CALL_VERSION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static CALL_TRANSITION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    pub(super) static CALL_PLAN_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnOnce(&mut RuntimePlan)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone)]
@@ -171,10 +172,18 @@ pub enum BusinessErrorSource {
 pub struct ForkFrame {
     pub activation_id: String,
     pub split_node_id: String,
-    pub join_node_id: String,
+    #[serde(deserialize_with = "deserialize_join_node_id")]
+    pub join_node_id: Option<String>,
     pub branch_edge_id: String,
     pub gateway_kind: GatewayKind,
     pub selected_branch_edge_ids: Vec<String>,
+}
+
+fn deserialize_join_node_id<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,8 +505,107 @@ pub struct PlannedEvent {
     pub data: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartInputRef {
+    Manual { command_id: String, request_hash: String },
+    Timer { timer_id: String, expected_timer_revision: u64, fired_occurrence: u64 },
+    Message { org_id: String, sender_user_id: String, message_id: String, expected_message_revision: u64 },
+    CallStart {
+        call_id: String,
+        parent_instance_id: String,
+        parent_scope_id: String,
+        parent_token_id: String,
+        call_node_id: String,
+        parent_instance_revision_at_step: u64,
+        call_step_index: usize,
+        child_instance_id: String,
+        child_definition_id: String,
+        child_version: u32,
+        child_model_sha256: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcceptedInputRef {
+    Start { instance_id: String, cause: StartInputRef },
+    PersistedReady { token_id: String, expected_instance_revision: u64 },
+    Human { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
+    Timer { timer_id: String, expected_timer_revision: u64, fired_occurrence: u64 },
+    Message { org_id: String, sender_user_id: String, message_id: String, expected_message_revision: u64, target_subscription_id: Option<String>, expected_subscription_revision: Option<u64> },
+    Service { job_id: String, attempt: u32, fence: u64, result_event_id: String },
+    CallReturn { call_id: String, child_instance_id: String, expected_child_revision: u64, parent_token_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminationSource {
+    pub source_instance_id: String,
+    pub source_scope_id: String,
+    pub source_node_id: String,
+    pub source_token_id: String,
+    pub source_arrival_edge_id: Option<String>,
+    pub parent_token_id: Option<String>,
+    pub source_event_index: usize,
+    pub source_event_id: String,
+    pub accepted_input: AcceptedInputRef,
+    pub variable_effect_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminationReturnFailure {
+    pub source_instance_id: String,
+    pub source_scope_id: String,
+    pub source_node_id: String,
+    pub source_token_id: String,
+    pub source_arrival_edge_id: Option<String>,
+    pub parent_token_id: String,
+    pub source_event_index: usize,
+    pub source_event_id: String,
+    pub accepted_input: AcceptedInputRef,
+    pub variable_effect_count: usize,
+    pub waiting_token_id: String,
+    pub incident_id: String,
+    pub pre_return_child_locals: Value,
+    pub pre_return_parent_effective: Value,
+    pub child_scope_revision: u64,
+    pub parent_scope_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TerminationAttempt {
+    Success(TerminationSource),
+    ReturnFailure(TerminationReturnFailure),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VariableEffect {
+    Mapped {
+        event_index: usize,
+        scope_id: String,
+        parent_token_id: Option<String>,
+        node_id: String,
+        source_token_id: String,
+        accepted_input: Option<AcceptedInputRef>,
+        outputs: Value,
+        extra: Vec<(String, Value)>,
+        result: Value,
+    },
+    ScopeEntry {
+        event_index: usize,
+        scope_id: String,
+        parent_scope_id: String,
+        parent_token_id: String,
+        subprocess_node_id: String,
+        accepted_input: Option<AcceptedInputRef>,
+        result: Value,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePlan {
+    pub termination_attempts: Vec<TerminationAttempt>,
+    pub variable_effects: Vec<VariableEffect>,
+    pub event_sources: BTreeMap<usize, String>,
+    pub token_sources: BTreeMap<String, String>,
     pub start_instance_id: Option<String>,
     pub start_variables: Option<Value>,
     pub consume_token_ids: Vec<String>,
@@ -554,6 +662,10 @@ pub struct ScopeUpdate {
 impl RuntimePlan {
     pub fn initial(variables: Value) -> Self {
         Self {
+            termination_attempts: Vec::new(),
+            variable_effects: Vec::new(),
+            event_sources: BTreeMap::new(),
+            token_sources: BTreeMap::new(),
             start_instance_id: None,
             start_variables: None,
             consume_token_ids: Vec::new(),
@@ -1424,7 +1536,7 @@ fn validate_boundary_plan_on(
             "boundary firing lacks its actual attachment facts"
         );
     }
-    if reaches_error_end(plan) {
+    if reaches_error_end(plan) || reaches_terminate_end(plan) {
         return Ok(());
     }
     let equal_ids = |actual: &[String], expected: &[String]| {
@@ -1914,7 +2026,7 @@ pub fn fire_timer(
             "timer fire cannot update an unrelated timer"
         );
         ensure!(
-            reaches_error_end(plan)
+            reaches_error_end(plan) || reaches_terminate_end(plan)
                 || (plan.cancel_token_ids.is_empty()
                     && plan.cancel_user_task_ids.is_empty()
                     && plan.cancel_job_ids.is_empty()
@@ -1924,18 +2036,21 @@ pub fn fire_timer(
     }
     if let Some(race_id) = &timer.race_id {
         ensure!(
-            (reaches_error_end(plan)
+            (reaches_error_end(plan) || reaches_terminate_end(plan)
                 || (plan.cancel_user_task_ids.is_empty()
                     && plan.cancel_job_ids.is_empty()
                     && plan.cancel_scope_roots.is_empty())),
             "event race cannot cancel another activity"
         );
+        let winners = plan.race_updates.iter().filter(|update|
+            update.status == ProcessEventRaceStatus::Won).collect::<Vec<_>>();
         ensure!(
-            plan.race_updates.len() == 1
-                && plan.race_updates[0].race_id == *race_id
-                && plan.race_updates[0].status == ProcessEventRaceStatus::Won
-                && plan.race_updates[0].winner_timer_id.as_deref() == Some(timer.timer_id.as_str())
-                && plan.race_updates[0].winner_subscription_id.is_none(),
+            winners.len() == 1
+                && winners[0].race_id == *race_id
+                && winners[0].winner_timer_id.as_deref() == Some(timer.timer_id.as_str())
+                && winners[0].winner_subscription_id.is_none()
+                && plan.race_updates.iter().all(|update| update.race_id == *race_id
+                    || update.status == ProcessEventRaceStatus::Cancelled),
             "timer firing does not win its actual event race"
         );
     }
@@ -1957,6 +2072,26 @@ pub fn fire_timer(
             && update.next_check_at_ms == advance.next_due_at_ms.unwrap_or(at_ms),
         "timer transition does not match its persisted schedule"
     );
+    for attempt in &plan.termination_attempts {
+        let accepted = match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        let matches_timer = match accepted {
+            AcceptedInputRef::Timer { timer_id, expected_timer_revision, fired_occurrence } =>
+                timer.kind != ProcessTimerKind::Start && timer_id == &timer.timer_id
+                    && *expected_timer_revision == timer.revision
+                    && *fired_occurrence == advance.selected_occurrence,
+            AcceptedInputRef::Start { instance_id: started,
+                cause: StartInputRef::Timer { timer_id, expected_timer_revision, fired_occurrence } } =>
+                timer.kind == ProcessTimerKind::Start && Some(started.as_str()) == plan.start_instance_id.as_deref()
+                    && timer_id == &timer.timer_id && *expected_timer_revision == timer.revision
+                    && *fired_occurrence == advance.selected_occurrence,
+            AcceptedInputRef::PersistedReady { .. } => true,
+            _ => false,
+        };
+        ensure!(matches_timer, "terminating timer input differs from its factual due slot");
+    }
     ensure!(
         plan.events.iter().any(|event| event.kind == "timer_fired"
             && event.node_id.as_deref() == Some(timer.node_id.as_str())
@@ -1990,11 +2125,16 @@ pub fn fire_timer(
         instance_plan
             .timer_updates
             .retain(|update| update.timer_id != timer.timer_id);
+        let entry = AcceptedInputRef::Start { instance_id: instance_id.to_owned(),
+            cause: StartInputRef::Timer { timer_id: timer.timer_id.clone(),
+                expected_timer_revision: timer.revision,
+                fired_occurrence: advance.selected_occurrence } };
         start_instance_on(
             &tx, actor, instance_id, &timer.definition_id, timer.version,
             &serde_json::json!({}), &instance_plan, at_ms,
             Some((&timer.timer_id, advance.selected_occurrence)),
             None,
+            &entry,
         )?
     } else {
         ensure!(plan.start_instance_id.is_none(), "activity timer cannot start another instance");
@@ -2008,7 +2148,11 @@ pub fn fire_timer(
         for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
             require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
         }
-        cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id, expected, plan, at_ms)?;
+        let entry = AcceptedInputRef::Timer { timer_id: timer.timer_id.clone(),
+            expected_timer_revision: timer.revision,
+            fired_occurrence: advance.selected_occurrence };
+        cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id, expected,
+            plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
         instance_on(&tx, actor, instance_id, None)?
     };
     tx.commit()?;
@@ -3271,6 +3415,7 @@ pub fn archive_definition(
                     Some("definition_archived"),
                     now,
                     now,
+                    None,
                 )?;
             }
         }
@@ -4952,9 +5097,9 @@ fn validate_scope_plan_on(
                 && !selected.is_empty()
                 && selected.windows(2).all(|window| window[0] < window[1])
                 && selected.binary_search(&frame.branch_edge_id).is_ok()
-                && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+                && selected.iter().all(|edge| pair.branches.contains_key(edge))
                 && (frame.gateway_kind == GatewayKind::Inclusive
-                    || selected.iter().map(String::as_str).eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+                    || selected.iter().map(String::as_str).eq(pair.branches.keys().map(String::as_str))),
                 "token fork frame differs from selected branches of its paired body");
         }
     }
@@ -4972,7 +5117,7 @@ fn validate_scope_plan_on(
                 .context("parallel split event has no paired model")?;
             ensure!(pair.kind == GatewayKind::Parallel,
                 "parallel split event refers to another gateway kind");
-            let expected = pair.branch_to_incoming_edge.keys().map(String::as_str).collect::<HashSet<_>>();
+            let expected = pair.branches.keys().map(String::as_str).collect::<HashSet<_>>();
             let frames = plan.create_tokens.iter().filter(|token| token.scope_id == event.scope_id)
                 .flat_map(|token| token.fork_stack.iter().filter(|frame|
                     frame.activation_id == activation && frame.split_node_id == node_id))
@@ -5231,6 +5376,10 @@ fn reaches_error_end(plan: &RuntimePlan) -> bool {
         .any(|event| event.kind == "error_end_reached")
 }
 
+fn reaches_terminate_end(plan: &RuntimePlan) -> bool {
+    plan.termination_attempts.iter().any(|attempt| matches!(attempt, TerminationAttempt::Success(_)))
+}
+
 fn validate_call_tree_budget_on(conn: &Connection, instance_id: &str) -> Result<()> {
     let mut scopes = 0u64;
     let mut active = 0u64;
@@ -5324,6 +5473,7 @@ fn retract_call_outbox_on(
     instance_id: &str,
     reason: &str,
     at_ms: i64,
+    termination: Option<&TerminationSource>,
 ) -> Result<()> {
     let mut q=tx.prepare("SELECT org_id,sender_user_id,message_id FROM bpmn_messages WHERE source_instance_id=?1 AND status IN ('pending','blocked','ambiguous') ORDER BY sender_user_id,message_id")?;
     let keys = q
@@ -5343,9 +5493,10 @@ fn retract_call_outbox_on(
                 tx,
                 &message,
                 ProcessMessageStatus::Cancelled,
-                Some(reason),
+                Some(if termination.is_some() { "terminate_end" } else { reason }),
                 at_ms,
-                at_ms
+                at_ms,
+                termination,
             )?,
             "call outgoing receipt changed during closure"
         );
@@ -5361,7 +5512,16 @@ fn cancel_call_children_on(
     actor_id: &str,
     reason: &str,
     at_ms: i64,
+    termination: Option<&TerminationSource>,
 ) -> Result<Vec<CancelledJobClaim>> {
+    if let Some(source) = termination {
+        let found: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND event_id=?2 AND kind='terminate_end_reached')",
+            params![source.source_instance_id, source.source_event_id],
+            |row| row.get(0),
+        )?;
+        ensure!(found, "call closure has no persisted termination source");
+    }
     let (definition, version): (String, u32) = tx.query_row(
         "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
@@ -5388,11 +5548,12 @@ fn cancel_call_children_on(
             call.status,
             ProcessCallStatus::Waiting | ProcessCallStatus::ReturnIncident
         );
-        if matches!(
-            call.status,
-            ProcessCallStatus::Waiting | ProcessCallStatus::ReturnIncident
-        ) {
-            tx.execute("UPDATE bpmn_calls SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE call_id=?2 AND revision=?3",params![at_ms,call.call_id,sql_incrementable(call.revision)?])?;
+        if was_active {
+            let changed = tx.execute(
+                "UPDATE bpmn_calls SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE call_id=?2 AND revision=?3 AND status IN ('waiting','return_incident')",
+                params![at_ms,call.call_id,sql_incrementable(call.revision)?],
+            )?;
+            ensure!(changed == 1, "active call changed during cancellation");
         }
         let child_id = &call.child_instance_id;
         let (revision, status): (u64, String) = tx.query_row(
@@ -5400,11 +5561,11 @@ fn cancel_call_children_on(
             [child_id],
             |r| Ok((row_u64(r, 0)?, r.get(1)?)),
         )?;
-        retract_call_outbox_on(tx, child_id, reason, at_ms)?;
         if !matches!(status.as_str(), "completed" | "cancelled" | "error") {
             let actor = call_initiator_on(tx, child_id)?;
-            claims.extend(cancel_instance_on(tx, &actor, child_id, revision, at_ms)?);
+            claims.extend(cancel_instance_on(tx, &actor, child_id, revision, at_ms, termination)?);
         } else {
+            retract_call_outbox_on(tx, child_id, reason, at_ms, termination)?;
             claims.extend(cancel_call_children_on(
                 tx,
                 child_id,
@@ -5413,6 +5574,7 @@ fn cancel_call_children_on(
                 actor_id,
                 reason,
                 at_ms,
+                termination,
             )?);
         }
         if was_active {
@@ -5430,7 +5592,15 @@ fn cancel_call_children_on(
                     scope_id: call.parent_scope_id.clone(),
                     kind: "call_cancelled".into(),
                     node_id: Some(call.call_node_id.clone()),
-                    data: serde_json::json!({"call_id":call.call_id,"child_instance_id":call.child_instance_id,"reason":reason}),
+                    data: {
+                        let mut data = serde_json::json!({"call_id":call.call_id,"child_instance_id":call.child_instance_id,
+                            "reason":if termination.is_some() { "terminate_end" } else { reason }});
+                        if let Some(source) = termination {
+                            data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+                            data["source_event_id"] = serde_json::json!(source.source_event_id);
+                        }
+                        data
+                    },
                 },
                 at_ms,
                 None,
@@ -5578,6 +5748,69 @@ fn apply_call_steps_on(
                     );
                     let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",params![actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.call_node_id],|r|r.get(0))?;
                     ensure!(waiting, "call parent NEW waiting control is missing");
+                    let parent_revision: u64 = tx.query_row(
+                        "SELECT revision FROM bpmn_instances WHERE instance_id=?1",
+                        [&actual.parent_instance_id], |row| row_u64(row, 0),
+                    )?;
+                    let ProcessNodeKind::CallActivity { input_mapping, .. } = &node.kind else {
+                        bail!("call start node changed from its pinned kind")
+                    };
+                    let parent_scopes = scopes_on(tx, &actual.parent_instance_id, &parent_model)?;
+                    let mut locals = BTreeMap::new();
+                    for scope in &parent_scopes {
+                        locals.insert(scope.scope_id.clone(), scope_variables_on(tx,
+                            &actual.parent_instance_id, &scope.scope_id)?);
+                    }
+                    let root_variables = locals.get(&actual.parent_instance_id)
+                        .context("call parent root variables are missing")?;
+                    let effective = effective_scope_variables(&parent_scopes, &locals,
+                        &actual.parent_instance_id, root_variables, &actual.parent_scope_id)?;
+                    let expected_variables = super::runtime::patch_variables(input_mapping,
+                        &serde_json::json!({}), &effective, &Value::Null, &[])?;
+                    ensure!(call.variables == expected_variables,
+                        "called child input differs from its pinned parent mapping");
+                    if !plan.termination_attempts.is_empty() {
+                        ensure!(plan.termination_attempts.iter().all(|attempt| {
+                            let accepted = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(accepted, AcceptedInputRef::Start { instance_id, cause:
+                                StartInputRef::CallStart { call_id, parent_instance_id,
+                                    parent_scope_id, parent_token_id, call_node_id,
+                                    parent_instance_revision_at_step, call_step_index,
+                                    child_instance_id, child_definition_id, child_version,
+                                    child_model_sha256 } }
+                                if instance_id == &actual.child_instance_id
+                                    && call_id == &actual.call_id
+                                    && parent_instance_id == &actual.parent_instance_id
+                                    && parent_scope_id == &actual.parent_scope_id
+                                    && parent_token_id == &actual.parent_token_id
+                                    && call_node_id == &actual.call_node_id
+                                    && *parent_instance_revision_at_step == parent_revision
+                                    && *call_step_index == index
+                                    && child_instance_id == &actual.child_instance_id
+                                    && child_definition_id == &actual.called_definition_id
+                                    && *child_version == actual.called_version
+                                    && child_model_sha256 == &actual.model_sha256)
+                        }), "called child termination has no genuine ordered call start");
+                    }
+                    let entry = AcceptedInputRef::Start {
+                        instance_id: actual.child_instance_id.clone(),
+                        cause: StartInputRef::CallStart {
+                            call_id: actual.call_id.clone(),
+                            parent_instance_id: actual.parent_instance_id.clone(),
+                            parent_scope_id: actual.parent_scope_id.clone(),
+                            parent_token_id: actual.parent_token_id.clone(),
+                            call_node_id: actual.call_node_id.clone(),
+                            parent_instance_revision_at_step: parent_revision,
+                            call_step_index: index,
+                            child_instance_id: actual.child_instance_id.clone(),
+                            child_definition_id: actual.called_definition_id.clone(),
+                            child_version: actual.called_version,
+                            child_model_sha256: actual.model_sha256.clone(),
+                        },
+                    };
                     tx.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,'waiting',?12,?12)",params![actual.call_id,actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.call_node_id,actual.child_instance_id,actual.definition_id,actual.version,actual.called_definition_id,actual.called_version,actual.model_sha256,at_ms])?;
                     start_instance_on(
                         tx,
@@ -5590,6 +5823,7 @@ fn apply_call_steps_on(
                         at_ms,
                         None,
                         None,
+                        &entry,
                     )?;
                     validate_call_tree_budget_on(tx, &actual.parent_instance_id)?;
                     let seq = tx.query_row(
@@ -5630,6 +5864,15 @@ fn apply_call_steps_on(
                             && actual.child_instance_id == call.child_instance_id,
                         "call return revision conflict"
                     );
+                    let child_revision: u64 = tx.query_row(
+                        "SELECT revision FROM bpmn_instances WHERE instance_id=?1",
+                        [&actual.child_instance_id], |row| row_u64(row, 0))?;
+                    let entry = AcceptedInputRef::CallReturn {
+                        call_id: actual.call_id.clone(),
+                        child_instance_id: actual.child_instance_id.clone(),
+                        expected_child_revision: child_revision,
+                        parent_token_id: actual.parent_token_id.clone(),
+                    };
                     if let Some(source) = source {
                         validate_business_source_on(tx, source, &actual)?;
                         let (source_id, source_scope, source_event, source_kind, code) =
@@ -5713,6 +5956,8 @@ fn apply_call_steps_on(
                         *expected_revision,
                         plan,
                         at_ms,
+                        source.as_ref(),
+                        EntryAuthority::Accepted(&entry),
                     )?;
                     validate_call_tree_budget_on(tx, &actual.parent_instance_id)?;
                     Ok(claims)
@@ -5721,7 +5966,8 @@ fn apply_call_steps_on(
                     instance_id,
                     expected_revision,
                     plan,
-                } => apply_plan_on(tx, instance_id, actor_id, *expected_revision, plan, at_ms),
+                } => apply_plan_on(tx, instance_id, actor_id, *expected_revision,
+                    plan, at_ms, None, EntryAuthority::CallAdmission),
             }
         })();
         match applied {
@@ -5773,7 +6019,7 @@ fn validate_gateway_join_plan_on(
     drop(stmt);
     for (token_id, scope_id, stack_json) in prior {
         for frame in parse::<Vec<ForkFrame>>(stack_json)? {
-            let key = (scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            let key = (scope_id.clone(), frame.split_node_id.clone(), frame.activation_id.clone());
             let survives = !plan.consume_token_ids.contains(&token_id)
                 && !plan.cancel_token_ids.contains(&token_id);
             match affected.get_mut(&key) {
@@ -5793,7 +6039,7 @@ fn validate_gateway_join_plan_on(
     let prior_keys = affected.keys().cloned().collect::<HashSet<_>>();
     for token in &plan.create_tokens {
         for frame in &token.fork_stack {
-            let key = (token.scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            let key = (token.scope_id.clone(), frame.split_node_id.clone(), frame.activation_id.clone());
             if !prior_keys.contains(&key) {
                 let split_kind = if frame.gateway_kind == GatewayKind::Inclusive {
                     "inclusive_split"
@@ -5835,7 +6081,7 @@ fn validate_gateway_join_plan_on(
         let path = scope_path(scopes, instance_id, &event.scope_id)?;
         let (nodes, flows, _) = super::model::scope_body(model, &path)?;
         let pair = super::model::gateway_pairs(nodes, flows)?
-            .into_values().find(|pair| pair.join_node_id == join_id)
+            .into_values().find(|pair| pair.join_node_id.as_deref() == Some(join_id))
             .context("gateway join event has no paired model")?;
         let kind = if event.kind == "inclusive_joined" {
             GatewayKind::Inclusive
@@ -5849,7 +6095,7 @@ fn validate_gateway_join_plan_on(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for stack in stacks {
             for frame in parse::<Vec<ForkFrame>>(stack)? {
-                if frame.join_node_id == join_id && frame.activation_id == activation_id {
+                if frame.join_node_id.as_deref() == Some(join_id) && frame.activation_id == activation_id {
                     ensure!(frame.split_node_id == pair.split_node_id && frame.gateway_kind == kind,
                         "gateway join activation differs from its pinned pair");
                     if let Some(previous) = &selected_from_state {
@@ -5877,15 +6123,17 @@ fn validate_gateway_join_plan_on(
             if kind == GatewayKind::Inclusive {
                 serde_json::from_value::<Vec<String>>(split.data["selected_branch_edge_ids"].clone())?
             } else {
-                pair.branch_to_incoming_edge.keys().cloned().collect()
+                pair.branches.keys().cloned().collect()
             }
         };
         ensure!(!selected.is_empty()
             && selected.windows(2).all(|window| window[0] < window[1])
-            && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+            && selected.iter().all(|edge| pair.branches.contains_key(edge))
+            && selected.iter().all(|edge| pair.branches.get(edge)
+                .is_some_and(|branch| branch.join_incoming_edge_id.is_some()))
             && (kind == GatewayKind::Inclusive
                 || selected.iter().map(String::as_str)
-                    .eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+                    .eq(pair.branches.keys().map(String::as_str))),
             "gateway join selection differs from pinned pair");
         if kind == GatewayKind::Inclusive {
             ensure!(event.data["selected_branch_edge_ids"] == serde_json::to_value(&selected)?,
@@ -5931,9 +6179,9 @@ fn validate_gateway_join_plan_on(
         for (branch, (token_id, stack, arrival)) in arrivals {
             let frame = stack.last().context("gateway arrival has no top frame")?;
             ensure!(frame.gateway_kind == kind && frame.split_node_id == pair.split_node_id
-                && frame.join_node_id == join_id && frame.activation_id == activation_id
+                && frame.join_node_id.as_deref() == Some(join_id) && frame.activation_id == activation_id
                 && frame.branch_edge_id == branch && frame.selected_branch_edge_ids == selected
-                && pair.branch_to_incoming_edge.get(&branch) == arrival.as_ref()
+                && pair.branches.get(&branch).and_then(|branch| branch.join_incoming_edge_id.as_ref()) == arrival.as_ref()
                 && consumed.insert(token_id.clone())
                 && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1,
                 "gateway join consumed a mismatched or unselected arrival");
@@ -5966,8 +6214,9 @@ fn validate_gateway_join_plan_on(
     for root in &plan.cancel_scope_roots {
         cancelled.extend(descendant_scope_ids(scopes, root)?);
     }
-    for ((scope_id, join_id, activation_id), (original, survivors)) in affected {
-        if joined.contains(&(scope_id.clone(), join_id.clone(), activation_id.clone())) {
+    for ((scope_id, split_id, activation_id), (original, survivors)) in affected {
+        if original.join_node_id.as_ref().is_some_and(|join_id|
+            joined.contains(&(scope_id.clone(), join_id.clone(), activation_id.clone()))) {
             ensure!(survivors == 0, "joined gateway activation still has an active frame");
             continue;
         }
@@ -5985,7 +6234,7 @@ fn validate_gateway_join_plan_on(
                         params![instance_id,scope_id.as_str(),source], |row| row.get::<_, String>(0))
                         .ok().and_then(|json| parse::<Vec<ForkFrame>>(json).ok()))
                     .is_some_and(|frames| frames.iter().any(|frame|
-                        frame.join_node_id == join_id && frame.activation_id == activation_id
+                        frame.split_node_id == split_id && frame.activation_id == activation_id
                         && frame.split_node_id == original.split_node_id))
             }));
         ensure!(cancelled.contains(&scope_id) || factual_error,
@@ -6014,11 +6263,11 @@ fn validate_gateway_state_on(
             ensure!(pair.join_node_id == frame.join_node_id && pair.kind == frame.gateway_kind
                 && !selected.is_empty() && selected.windows(2).all(|window| window[0] < window[1])
                 && selected.binary_search(&frame.branch_edge_id).is_ok()
-                && selected.iter().all(|edge| pair.branch_to_incoming_edge.contains_key(edge))
+                && selected.iter().all(|edge| pair.branches.contains_key(edge))
                 && (frame.gateway_kind == GatewayKind::Inclusive
-                    || selected.iter().map(String::as_str).eq(pair.branch_to_incoming_edge.keys().map(String::as_str))),
+                    || selected.iter().map(String::as_str).eq(pair.branches.keys().map(String::as_str))),
                 "active fork frame differs from pinned gateway pair");
-            let key = (scope_id.clone(), frame.join_node_id.clone(), frame.activation_id.clone());
+            let key = (scope_id.clone(), frame.split_node_id.clone(), frame.activation_id.clone());
             if let Some((kind, branches)) = groups.get(&key) {
                 ensure!(*kind == frame.gateway_kind && branches == selected,
                     "gateway activation has conflicting selected branches");
@@ -6039,10 +6288,10 @@ fn validate_gateway_state_on(
         let frame = frames.last().context("gateway receipt token lacks top fork frame")?;
         let kind = match kind_text.as_str() { "parallel" => GatewayKind::Parallel,
             "inclusive" => GatewayKind::Inclusive, _ => bail!("invalid gateway receipt kind") };
-        let key = (scope_id.clone(), join_id.clone(), activation_id.clone());
+        let key = (scope_id.clone(), frame.split_node_id.clone(), activation_id.clone());
         let (group_kind, selected) = groups.get(&key).context("gateway receipt has no active activation")?;
         ensure!(token_scope == &scope_id && token_node == &join_id && status == "joining"
-            && frame.join_node_id == join_id && frame.activation_id == activation_id
+            && frame.join_node_id.as_deref() == Some(join_id.as_str()) && frame.activation_id == activation_id
             && frame.branch_edge_id == branch_id && frame.gateway_kind == kind
             && group_kind == &kind && &frame.selected_branch_edge_ids == selected
             && selected.binary_search(&branch_id).is_ok(),
@@ -6051,14 +6300,2905 @@ fn validate_gateway_state_on(
         let (nodes, flows, _) = super::model::scope_body(model, &path)?;
         let pairs = super::model::gateway_pairs(nodes, flows)?;
         let pair = pairs.get(&frame.split_node_id).context("gateway receipt pair missing")?;
-        ensure!(pair.kind == kind && pair.join_node_id == join_id
-            && pair.branch_to_incoming_edge.get(&branch_id) == arrival.as_ref(),
+        ensure!(pair.kind == kind && pair.join_node_id.as_deref() == Some(join_id.as_str())
+            && pair.branches.get(&branch_id).and_then(|branch| branch.join_incoming_edge_id.as_ref()) == arrival.as_ref(),
             "gateway receipt arrived through another paired edge");
     }
     ensure!(tokens.iter().filter(|(_, (_, _, _, status, _))| status.as_str() == "joining")
         .all(|(token_id, _)| receipt_tokens.contains(token_id)),
         "joining token lacks a gateway receipt");
     Ok(())
+}
+
+fn termination_token_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    token_id: &str,
+) -> Result<ProcessToken> {
+    let stored: Option<(String, String, Option<String>, String, String)> = tx.query_row(
+        "SELECT scope_id,node_id,arrival_edge_id,fork_stack_json,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+        params![instance_id, token_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    if let Some((scope_id, node_id, arrival_edge_id, stack, status)) = stored {
+        ensure!(!plan.create_tokens.iter().any(|token| token.token_id == token_id),
+            "termination token duplicates a persisted identity");
+        return Ok(ProcessToken {
+            token_id: token_id.to_owned(), scope_id, node_id, arrival_edge_id,
+            fork_stack: parse(stack)?, status,
+        });
+    }
+    let created = plan.create_tokens.iter().filter(|token| token.token_id == token_id)
+        .collect::<Vec<_>>();
+    ensure!(created.len() == 1, "termination source token is neither uniquely planned nor persisted");
+    Ok(created[0].clone())
+}
+
+fn validate_termination_variables_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    plan: &RuntimePlan,
+    call_source: Option<&BusinessErrorSource>,
+) -> Result<Vec<BTreeMap<String, Value>>> {
+    let root = scope_variables_on(tx, instance_id, instance_id)?;
+    if let Some(start) = &plan.start_variables {
+        ensure!(plan.start_instance_id.as_deref() == Some(instance_id) && start == &root,
+            "termination variable replay cannot use caller-claimed initial state");
+    }
+    let mut locals = BTreeMap::from([(instance_id.to_owned(), root)]);
+    for scope in scopes.iter().filter(|scope|
+        scope.scope_id != instance_id && !plan.create_scopes.iter().any(|created|
+            created.scope_id == scope.scope_id)) {
+        locals.insert(scope.scope_id.clone(), scope_variables_on(tx, instance_id, &scope.scope_id)?);
+    }
+    let mut states = vec![locals.clone()];
+    let mut prior_event_index = 0;
+    let mut mapped_activations = HashSet::new();
+    for effect in &plan.variable_effects {
+        let (event_index, accepted) = match effect {
+            VariableEffect::Mapped { event_index, accepted_input, .. }
+            | VariableEffect::ScopeEntry { event_index, accepted_input, .. } =>
+                (*event_index, accepted_input),
+        };
+        ensure!(event_index >= prior_event_index && event_index <= plan.events.len(),
+            "termination variable effects are not in local event order");
+        prior_event_index = event_index;
+        let accepted = accepted.as_ref().context("termination variable effect lacks an accepted input")?;
+        ensure!(plan.termination_attempts.iter().any(|attempt| match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input == accepted,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input == accepted,
+        }), "termination variable effect belongs to another accepted input");
+        match effect {
+            VariableEffect::ScopeEntry { scope_id, parent_scope_id, parent_token_id,
+                subprocess_node_id, result, .. } => {
+                let created = plan.create_scopes.iter().find(|created|
+                    created.scope_id == *scope_id && created.parent_scope_id == *parent_scope_id
+                        && created.parent_token_id == *parent_token_id
+                        && created.subprocess_node_id == *subprocess_node_id)
+                    .context("variable scope entry lacks its unique planned scope")?;
+                ensure!(!locals.contains_key(scope_id) && created.variables == *result,
+                    "variable scope entry changed its local variables");
+                ensure!(plan.events.get(event_index).is_some_and(|event|
+                    event.kind == "scope_entered"
+                    && event.scope_id == *scope_id
+                    && event.node_id.is_none()
+                    && event.data == serde_json::json!({"scope_id":scope_id,
+                        "parent_scope_id":parent_scope_id,
+                        "parent_token_id":parent_token_id,
+                        "subprocess_node_id":subprocess_node_id}))
+                    && plan.events.iter().filter(|event| event.kind == "scope_entered"
+                    && event.scope_id == *scope_id
+                    && event.data["parent_scope_id"].as_str() == Some(parent_scope_id.as_str())
+                    && event.data["parent_token_id"].as_str() == Some(parent_token_id.as_str())
+                    && event.data["subprocess_node_id"].as_str() == Some(subprocess_node_id.as_str()))
+                    .count() == 1,
+                    "variable scope entry lacks one factual entry event");
+                let parent_token = termination_token_on(tx, instance_id, plan, parent_token_id)?;
+                ensure!(parent_token.scope_id == *parent_scope_id
+                    && parent_token.node_id == *subprocess_node_id
+                    && plan.create_tokens.iter().any(|token|
+                        token.token_id == *parent_token_id && token.status == "waiting"),
+                    "variable scope entry is not attached to its accepted parent wait");
+                let node = scope_node(model, scopes, instance_id, parent_scope_id, subprocess_node_id)?;
+                let ProcessNodeKind::SubProcess { body, input_mapping, .. } = &node.kind else {
+                    bail!("variable scope entry has no pinned subprocess mapping")
+                };
+                let parent_local = locals.get(parent_scope_id)
+                    .context("variable scope entry parent locals are missing")?;
+                let effective = effective_scope_variables(scopes, &locals, instance_id,
+                    locals.get(instance_id).context("root variables are missing")?, parent_scope_id)?;
+                let expected = super::runtime::patch_variables(input_mapping,
+                    &serde_json::to_value(&body.variables)?, &effective, &Value::Null, &[])?;
+                ensure!(*result == expected && parent_local.is_object(),
+                    "variable scope entry differs from its pinned mapping");
+                locals.insert(scope_id.clone(), expected);
+            }
+            VariableEffect::Mapped { event_index, scope_id, parent_token_id, node_id,
+                source_token_id, outputs, extra, result, .. } => {
+                ensure!(mapped_activations.insert((scope_id.clone(), node_id.clone(),
+                    source_token_id.clone())),
+                    "termination variable effect duplicates a mapped activation");
+                let scope = scopes.iter().find(|scope| scope.scope_id == *scope_id)
+                    .context("mapped scope is not retained")?;
+                ensure!(scope.parent_token_id == *parent_token_id,
+                    "mapped variables changed their scope activation");
+                let source = termination_token_on(tx, instance_id, plan, source_token_id)?;
+                ensure!(source.scope_id == *scope_id,
+                    "mapped variables changed their source scope");
+                let node = scope_node(model, scopes, instance_id, scope_id, node_id)?;
+                let mapping = match &node.kind {
+                    ProcessNodeKind::UserTask { output_mapping, .. }
+                    | ProcessNodeKind::ServiceTask { output_mapping, .. }
+                    | ProcessNodeKind::SubProcess { output_mapping, .. }
+                    | ProcessNodeKind::CallActivity { output_mapping, .. }
+                    | ProcessNodeKind::BoundaryError { output_mapping, .. }
+                    | ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
+                    | ProcessNodeKind::MessageCatch { output_mapping, .. }
+                    | ProcessNodeKind::BoundaryMessage { output_mapping, .. } => output_mapping,
+                    _ => bail!("mapped variable effect has no pinned output mapping"),
+                };
+                let boundary_attachment = match &node.kind {
+                    ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                    | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }
+                    | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } =>
+                        Some(attached_to_id.as_str()),
+                    _ => None,
+                };
+                ensure!((source.node_id == *node_id
+                    && plan.consume_token_ids.contains(source_token_id))
+                    || boundary_attachment.is_some_and(|attached|
+                        attached == source.node_id && source.status == "waiting"),
+                    "mapped variables lack their factual local activity or boundary activation");
+                let (actual_outputs, actual_extra) = match (&node.kind, accepted) {
+                    (ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. },
+                        AcceptedInputRef::Human { task_id, .. }) => {
+                        let (task_node, task_token, task_kind, stored):
+                            (String, String, String, String) = tx.query_row(
+                            "SELECT node_id,token_id,kind,outputs_json FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                            params![instance_id, task_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )?;
+                        ensure!(task_node == *node_id && task_token == *source_token_id
+                            && plan.complete_user_task_ids.contains(task_id),
+                            "mapped human output is not the actual completed task");
+                        let stored: Value = parse(stored)?;
+                        let actual = if task_kind == "verification" {
+                            serde_json::from_value::<ActivityResult>(stored)?.outputs
+                        } else {
+                            ensure!(task_kind == "work", "mapped human task has an unknown kind");
+                            stored
+                        };
+                        let kind = if task_kind == "verification" {
+                            "verification_approved"
+                        } else { "user_task_completed" };
+                        ensure!(plan.events.iter().filter(|event| event.kind == kind
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["user_task_id"].as_str() == Some(task_id.as_str())
+                            && (task_kind == "verification" || event.data["outputs"] == actual))
+                            .count() == 1,
+                            "mapped human output lacks one accepted completion event");
+                        (actual, Vec::new())
+                    }
+                    (ProcessNodeKind::ServiceTask { .. }
+                        | ProcessNodeKind::BoundaryEscalation { .. }
+                        | ProcessNodeKind::BoundaryError { .. },
+                        AcceptedInputRef::Service { job_id, result_event_id, .. }) => {
+                        let (job_scope, job_token, stored): (String, String, String) = tx.query_row(
+                            "SELECT scope_id,token_id,result_json FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                            params![instance_id, job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
+                        ensure!(plan.complete_job_ids.contains(job_id)
+                            && (job_token == *source_token_id
+                                || matches!(&node.kind, ProcessNodeKind::BoundaryError { .. })
+                                    && matches!(&plan.business_error,
+                                        Some(BusinessErrorSource::ServiceContract { job_id: source_job, .. })
+                                            if source_job == job_id)),
+                            "mapped service output is not the accepted fenced job or propagated error");
+                        let result: ActivityResult = parse(stored)?;
+                        ensure!(plan.events.iter().enumerate().filter(|(index,event)|
+                            event.kind == "service_result"
+                            && event.scope_id == job_scope
+                            && plan.event_ids.get(index) == Some(result_event_id)
+                            && event.data["outputs"] == result.outputs)
+                            .count() == 1,
+                            "mapped service output lacks one accepted result event");
+                        let extra = if matches!(&node.kind,
+                            ProcessNodeKind::BoundaryEscalation { .. }
+                            | ProcessNodeKind::BoundaryError { .. }) {
+                            vec![("activity_result".to_owned(), serde_json::to_value(&result)?)]
+                        } else { Vec::new() };
+                        (result.outputs, extra)
+                    }
+                    (ProcessNodeKind::BoundaryError { .. },
+                        AcceptedInputRef::CallReturn { call_id, child_instance_id,
+                            parent_token_id, .. }) if call_source.is_some() => {
+                        ensure!(parent_token_id == source_token_id,
+                            "mapped called error changed its attached parent wait");
+                        let source = call_source.context("called error source is missing")?;
+                        let call = calls_on(tx, instance_id)?.into_iter()
+                            .find(|call| call.call_id == *call_id)
+                            .context("mapped called error lost its exact call activation")?;
+                        ensure!(call.parent_instance_id == instance_id
+                            && call.child_instance_id == *child_instance_id
+                            && call.parent_token_id == *parent_token_id,
+                            "mapped called error changed its child or attached wait");
+                        validate_business_source_on(tx, source, &call)?;
+                        let (actual_outputs, activity_result, source_instance_id,
+                            source_event_id, source_kind, code) = match source {
+                            BusinessErrorSource::ErrorEnd { instance_id, fact, outputs, .. } => (
+                                outputs.clone(), serde_json::json!({"kind":"ErrorEnd",
+                                    "error_ref":fact.error_ref,"error_code":fact.error_code,
+                                    "source_instance_id":instance_id,"source_scope_id":fact.source_scope_id,
+                                    "source_node_id":fact.source_node_id,
+                                    "source_event_id":fact.source_event_id}),
+                                instance_id.as_str(), fact.source_event_id.as_str(),
+                                "error_end", Some(fact.error_code.as_str())),
+                            BusinessErrorSource::ServiceContract { instance_id,
+                                result_event_id, result, .. } => (
+                                result.outputs.clone(), serde_json::to_value(result)?,
+                                instance_id.as_str(), result_event_id.as_str(),
+                                "contract", result.code.as_deref()),
+                        };
+                        let code_json = serde_json::to_value(code)?;
+                        ensure!(plan.events.iter().filter(|event| event.kind == "call_error_propagated"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["call_id"].as_str() == Some(call_id.as_str())
+                            && event.data["source_instance_id"].as_str() == Some(source_instance_id)
+                            && event.data["source_event_id"].as_str() == Some(source_event_id)
+                            && event.data["source_kind"].as_str() == Some(source_kind)
+                            && event.data["attached_token_id"].as_str() == Some(parent_token_id.as_str())
+                            && event.data["error_code"] == code_json)
+                            .count() == 1
+                            && plan.events.iter().any(|event| event.kind == "business_error_caught"
+                                && event.scope_id == *scope_id
+                                && event.node_id.as_deref() == Some(node_id.as_str())
+                                && event.data["source_instance_id"].as_str() == Some(source_instance_id)
+                                && event.data["source_event_id"].as_str() == Some(source_event_id)),
+                            "mapped called error lacks its authenticated propagation facts");
+                        (actual_outputs, vec![("activity_result".to_owned(), activity_result)])
+                    }
+                    (ProcessNodeKind::BoundaryError { .. }, _) => {
+                        ensure!(extra.len() == 1 && extra[0].0 == "activity_result"
+                            && extra[0].1["kind"] == "ErrorEnd",
+                            "mapped error boundary lacks its factual ErrorEnd envelope");
+                        let envelope = &extra[0].1;
+                        let error_scope_id = envelope["source_scope_id"].as_str()
+                            .context("mapped ErrorEnd lost its source scope")?;
+                        let error_node_id = envelope["source_node_id"].as_str()
+                            .context("mapped ErrorEnd lost its source node")?;
+                        let error_event_id = envelope["source_event_id"].as_str()
+                            .context("mapped ErrorEnd lost its source event")?;
+                        let error_token_id = envelope["source_token_id"].as_str()
+                            .context("mapped ErrorEnd lost its source token")?;
+                        let error_node = scope_node(model, scopes, instance_id,
+                            error_scope_id, error_node_id)?;
+                        let ProcessNodeKind::ErrorEnd { error_ref } = &error_node.kind else {
+                            bail!("mapped error boundary source is not a pinned ErrorEnd")
+                        };
+                        let declaration = model.errors.iter().find(|error|
+                            error.error_id == error_ref.as_str())
+                            .context("mapped ErrorEnd declaration is missing")?;
+                        let error_effective = effective_scope_variables(scopes, &locals, instance_id,
+                            locals.get(instance_id).context("root variables are missing")?,
+                            error_scope_id)?;
+                        let expected_envelope = serde_json::json!({"kind":"ErrorEnd",
+                            "error_ref":error_ref,"error_code":declaration.error_code.as_str(),
+                            "source_instance_id":instance_id,"source_scope_id":error_scope_id,
+                            "source_node_id":error_node_id,"source_event_id":error_event_id,
+                            "source_token_id":error_token_id});
+                        let expected_event = plan.events.iter().enumerate().find(|(index,event)|
+                            *index < *event_index && event.kind == "error_end_reached"
+                                && event.scope_id == error_scope_id
+                                && event.node_id.as_deref() == Some(error_node_id)
+                                && plan.event_ids.get(index).is_some_and(|id| id == error_event_id))
+                            .context("mapped ErrorEnd has no earlier factual source event")?;
+                        let mut expected_data = expected_envelope.clone();
+                        expected_data["outputs"] = error_effective.clone();
+                        ensure!(expected_event.1.data == expected_data
+                            && *envelope == expected_envelope,
+                            "mapped ErrorEnd differs from its pinned source-time variables");
+                        ensure!(plan.events.iter().filter(|event| event.kind == "business_error_caught"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str()))
+                            .count() == 1,
+                            "mapped ErrorEnd lacks one caught boundary fact");
+                        (error_effective, extra.clone())
+                    }
+                    (ProcessNodeKind::MessageCatch { .. }
+                        | ProcessNodeKind::BoundaryMessage { .. },
+                        AcceptedInputRef::Message { org_id, sender_user_id, message_id, .. }) => {
+                        let message = message_on(tx, &MessageKey {org_id:org_id.clone(),
+                            sender_user_id:sender_user_id.clone(), message_id:message_id.clone()}, true)?;
+                        let payload = message.payload.context("mapped message payload was pruned")?;
+                        let metadata = serde_json::json!({"message_id":message.key.message_id,
+                            "sender_user_id":message.key.sender_user_id,
+                            "message_name":message.message_name,"correlation_key":message.correlation_key,
+                            "received_at_ms":message.received_at_ms,"expires_at_ms":message.expires_at_ms,
+                            "payload_sha256":message.payload_sha256});
+                        ensure!(plan.events.iter().filter(|event| event.kind == "message_delivered"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["message_id"].as_str() == Some(message_id.as_str())
+                            && event.data["payload"] == payload
+                            && event.data["message"] == metadata).count() == 1,
+                            "mapped message output lacks one exact delivered envelope");
+                        (payload, vec![("message".to_owned(), metadata)])
+                    }
+                    (ProcessNodeKind::CallActivity { .. },
+                        AcceptedInputRef::CallReturn { call_id, child_instance_id,
+                            parent_token_id, .. }) => {
+                        ensure!(parent_token_id == source_token_id,
+                            "mapped call output changed its parent waiting token");
+                        let (actual_child, stored, call_status): (String, String, String) = tx.query_row(
+                            "SELECT child_instance_id,(SELECT variables_json FROM bpmn_instances WHERE instance_id=child_instance_id),status FROM bpmn_calls WHERE call_id=?1 AND parent_instance_id=?2",
+                            params![call_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
+                        ensure!(actual_child == *child_instance_id
+                            && (call_source.is_none() && call_status == "returned"
+                                || call_source.is_some() && matches!(call_status.as_str(), "error" | "cancelled")),
+                            "mapped call output changed its completed child");
+                        ensure!(plan.events.iter().filter(|event| event.kind == "call_returned"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["call_id"].as_str() == Some(call_id.as_str())
+                            && event.data["child_instance_id"].as_str() == Some(child_instance_id.as_str())
+                            && event.data["parent_token_id"].as_str() == Some(parent_token_id.as_str()))
+                            .count() == 1,
+                            "mapped call output lacks one factual return event");
+                        (parse(stored)?, Vec::new())
+                    }
+                    (ProcessNodeKind::SubProcess { .. }, _) => {
+                        let children = scopes.iter().filter(|child|
+                            child.parent_scope_id.as_deref() == Some(scope_id.as_str())
+                                && child.parent_token_id.as_deref() == Some(source_token_id.as_str()))
+                            .collect::<Vec<_>>();
+                        ensure!(children.len() == 1,
+                            "mapped embedded return has no unique child activation");
+                        ensure!(plan.events.iter().filter(|event| event.kind == "scope_completed"
+                            && event.scope_id == children[0].scope_id
+                            && event.data["parent_token_id"].as_str() == Some(source_token_id.as_str()))
+                            .count() == 1,
+                            "mapped embedded return lacks one exact child completion fact");
+                        (locals.get(&children[0].scope_id)
+                            .context("mapped embedded child source locals are missing")?.clone(),
+                            Vec::new())
+                    }
+                    _ => bail!("termination variable effect has no authenticated input output"),
+                };
+                ensure!(outputs == &actual_outputs && extra == &actual_extra,
+                    "termination mapping used caller-claimed outputs instead of accepted input");
+                let local = locals.get(scope_id).context("mapped scope locals are missing")?;
+                let effective = effective_scope_variables(scopes, &locals, instance_id,
+                    locals.get(instance_id).context("root variables are missing")?, scope_id)?;
+                if let (ProcessNodeKind::ServiceTask { verification:
+                    tentaflow_protocol::processes::ActivityVerification::Condition { expression }, .. },
+                    AcceptedInputRef::Service { .. }) = (&node.kind, accepted) {
+                    ensure!(super::runtime::condition(expression, &effective, &actual_outputs)?
+                        && plan.events.iter().any(|event| event.kind == "verification_passed"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["expression"].as_str() == Some(expression.as_str())),
+                        "mapped service result did not pass its pinned condition");
+                }
+                let expected = super::runtime::patch_variables(mapping, local, &effective, outputs, extra)?;
+                ensure!(&expected == result,
+                    "mapped variable effect differs from its pinned expression");
+                locals.insert(scope_id.clone(), expected);
+            }
+        }
+        states.push(locals.clone());
+    }
+    ensure!(plan.events.iter().all(|event| match event.kind.as_str() {
+        "scope_entered" => plan.variable_effects.iter().any(|effect| matches!(effect,
+            VariableEffect::ScopeEntry { scope_id, parent_token_id, .. }
+                if scope_id == &event.scope_id
+                    && event.data["parent_token_id"].as_str() == Some(parent_token_id.as_str()))),
+        "scope_completed" => plan.variable_effects.iter().any(|effect| matches!(effect,
+            VariableEffect::Mapped { scope_id, source_token_id, .. }
+                if event.data["parent_scope_id"].as_str() == Some(scope_id.as_str())
+                    && event.data["parent_token_id"].as_str() == Some(source_token_id.as_str()))),
+        "message_delivered" if event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::MessageStart { .. }))) => true,
+        "user_task_completed" | "verification_approved" | "verification_passed"
+        | "call_returned" | "message_delivered" | "business_error_caught"
+        | "escalation_caught" => plan.variable_effects.iter().any(|effect| matches!(effect,
+            VariableEffect::Mapped { scope_id, node_id, .. }
+                if scope_id == &event.scope_id
+                    && event.node_id.as_deref() == Some(node_id.as_str()))),
+        _ => true,
+    }), "termination omitted a mapped variable effect for a factual transition");
+    ensure!(locals.get(instance_id) == Some(&plan.variables),
+        "termination variable effects do not produce the final root variables");
+    for scope in scopes.iter().filter(|scope| scope.scope_id != instance_id) {
+        let original = if let Some(created) = plan.create_scopes.iter()
+            .find(|created| created.scope_id == scope.scope_id) {
+            created.variables.clone()
+        } else {
+            scope_variables_on(tx, instance_id, &scope.scope_id)?
+        };
+        let planned = plan.scope_updates.iter().find(|update|
+            update.scope_id == scope.scope_id)
+            .and_then(|update| update.variables.as_ref())
+            .unwrap_or(&original);
+        ensure!(locals.get(&scope.scope_id) == Some(planned),
+            "termination variable effects do not produce the exact written scope locals");
+    }
+    Ok(states)
+}
+
+fn trace_termination_source_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    plan: &RuntimePlan,
+    token_id: &str,
+    seed_token_id: Option<&str>,
+    accepted_input: &AcceptedInputRef,
+    visiting: &mut HashSet<String>,
+) -> Result<()> {
+    ensure!(visiting.insert(token_id.to_owned()) && visiting.len() <= 256,
+        "termination input lineage contains a cycle or exceeds its pinned body");
+    let token = termination_token_on(tx, instance_id, plan, token_id)?;
+    if seed_token_id == Some(token_id) {
+        let expected_status = if matches!(accepted_input, AcceptedInputRef::PersistedReady { .. }) {
+            "ready"
+        } else {
+            "waiting"
+        };
+        ensure!(token.status == expected_status
+            && !plan.create_tokens.iter().any(|created| created.token_id == token_id),
+            "termination accepted input is not a persisted live activation");
+        return Ok(());
+    }
+    if token.status == "waiting" && !plan.create_tokens.iter().any(|created|
+        created.token_id == token_id) {
+        let node = scope_node(model, scopes, instance_id, &token.scope_id, &token.node_id)?;
+        if matches!(&node.kind, ProcessNodeKind::SubProcess { .. }) {
+            let children = scopes.iter().filter(|child|
+                child.parent_scope_id.as_deref() == Some(token.scope_id.as_str())
+                    && child.parent_token_id.as_deref() == Some(token_id)
+                    && child.subprocess_node_id.as_deref() == Some(token.node_id.as_str()))
+                .collect::<Vec<_>>();
+            let completed = plan.events.iter().enumerate().filter(|(_, event)|
+                event.kind == "scope_completed"
+                    && event.data["parent_token_id"].as_str() == Some(token_id))
+                .collect::<Vec<_>>();
+            if !completed.is_empty() {
+                ensure!(children.len() == 1 && completed.len() == 1
+                    && plan.consume_token_ids.iter().filter(|id| id.as_str() == token_id).count() == 1
+                    && !plan.cancel_token_ids.iter().any(|id| id == token_id),
+                    "termination completed child return has no unique persisted parent wait");
+                let child = children[0];
+                let (completed_index, completed_event) = completed[0];
+                let sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
+                    TerminationAttempt::Success(source)
+                        if source.source_scope_id == child.scope_id
+                            && source.parent_token_id.as_deref() == Some(token_id)
+                            && &source.accepted_input == accepted_input => Some(source),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                ensure!(sources.len() == 1,
+                    "termination completed child return has no unique accepted source");
+                let source = sources[0];
+                let later = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
+                    TerminationAttempt::Success(later)
+                        if visiting.contains(&later.source_token_id)
+                            && later.source_event_index > source.source_event_index
+                            && &later.accepted_input == accepted_input =>
+                        Some(later.source_event_index),
+                    _ => None,
+                }).min();
+                let expected = serde_json::json!({
+                    "scope_id":child.scope_id,"parent_scope_id":token.scope_id,
+                    "parent_token_id":token_id,"subprocess_node_id":token.node_id,
+                    "reason":"terminate_end","source_instance_id":instance_id,
+                    "source_event_id":source.source_event_id,
+                });
+                ensure!(child.status == ProcessInstanceStatus::Completed
+                    && plan.scope_updates.iter().filter(|update|
+                        update.scope_id == child.scope_id
+                            && update.status == ProcessInstanceStatus::Completed).count() == 1
+                    && plan.event_ids.get(&source.source_event_index) == Some(&source.source_event_id)
+                    && plan.events.get(source.source_event_index).is_some_and(|event|
+                        event.kind == "terminate_end_reached"
+                            && event.scope_id == child.scope_id
+                            && event.data["source_token_id"].as_str()
+                                == Some(source.source_token_id.as_str()))
+                    && later.is_some_and(|index| source.source_event_index < completed_index
+                        && completed_index < index)
+                    && completed_event.scope_id == child.scope_id
+                    && completed_event.node_id.is_none()
+                    && completed_event.data == expected,
+                    "termination completed child return differs from its ordered source fact");
+                let child_locals = plan.scope_updates.iter().find(|update|
+                    update.scope_id == child.scope_id
+                        && update.status == ProcessInstanceStatus::Completed)
+                    .and_then(|update| update.variables.as_ref())
+                    .context("termination completed child has no mapped local variables")?;
+                ensure!(plan.variable_effects.iter().filter(|effect| matches!(effect,
+                    VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, accepted_input: Some(input), outputs, .. }
+                        if *event_index == completed_index + 1
+                            && scope_id == &token.scope_id && node_id == &token.node_id
+                            && source_token_id == token_id && input == accepted_input
+                            && outputs == child_locals)).count() == 1,
+                    "termination completed child return lacks its actual parent mapping");
+                return trace_termination_source_on(tx, instance_id, model, scopes, plan,
+                    &source.source_token_id, seed_token_id, accepted_input, visiting);
+            }
+        }
+    }
+    ensure!(plan.create_tokens.iter().any(|created| created.token_id == token_id),
+        "termination source is not descended from its accepted input");
+    let path = scope_path(scopes, instance_id, &token.scope_id)?;
+    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    if token.status == "waiting" {
+        if let Some(source_id) = plan.token_sources.get(token_id) {
+            let predecessor = termination_token_on(tx, instance_id, plan, source_id)?;
+            if predecessor.scope_id == token.scope_id && predecessor.node_id == token.node_id
+                && predecessor.arrival_edge_id == token.arrival_edge_id {
+                let node = nodes.iter().find(|node| node.id == token.node_id)
+                    .context("termination parent wait is outside its pinned body")?;
+                let entered = match &node.kind {
+                    ProcessNodeKind::SubProcess { .. } => plan.create_scopes.iter().any(|scope|
+                        scope.parent_scope_id == token.scope_id
+                            && scope.parent_token_id == token.token_id
+                            && scope.subprocess_node_id == token.node_id),
+                    ProcessNodeKind::CallActivity { .. } => plan.call_requests.iter().any(|call|
+                        call.parent_scope_id == token.scope_id
+                            && call.parent_token_id == token.token_id
+                            && call.call_node_id == token.node_id),
+                    _ => false,
+                };
+                ensure!(entered && predecessor.status == "ready"
+                    && predecessor.fork_stack == token.fork_stack
+                    && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                    "termination parent wait lacks its exact entered activation");
+                return trace_termination_source_on(tx, instance_id, model, scopes, plan,
+                    source_id, seed_token_id, accepted_input, visiting);
+            }
+        }
+    }
+    let Some(arrival) = token.arrival_edge_id.as_deref() else {
+        let node = nodes.iter().find(|node| node.id == token.node_id)
+            .context("termination input origin is outside its pinned body")?;
+        ensure!(matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+            | ProcessNodeKind::MessageStart { .. }),
+            "termination lineage has an unlinked origin token");
+        if token.scope_id == instance_id {
+            ensure!(matches!(accepted_input, AcceptedInputRef::Start { instance_id: started, .. }
+                if started == instance_id)
+                && plan.start_instance_id.as_deref() == Some(instance_id),
+                "root termination origin differs from its accepted start");
+            return Ok(());
+        }
+        let created_scope = plan.create_scopes.iter().find(|scope| scope.scope_id == token.scope_id)
+            .context("local termination origin lacks an accepted subprocess entry")?;
+        ensure!(plan.token_sources.get(token_id) == Some(&created_scope.parent_token_id),
+            "local termination origin changed its exact parent activation");
+        ensure!(plan.events.iter().any(|event| event.kind == "scope_entered"
+            && event.scope_id == token.scope_id
+            && event.data["parent_token_id"].as_str() == Some(created_scope.parent_token_id.as_str())),
+            "local termination origin lacks its factual scope entry");
+        return trace_termination_source_on(tx, instance_id, model, scopes, plan,
+            &created_scope.parent_token_id, seed_token_id, accepted_input, visiting);
+    };
+    let edge = flows.iter().find(|flow| flow.id == arrival && flow.target_id == token.node_id)
+        .context("termination source incoming edge is outside its pinned body")?;
+    let mut candidates = plan.create_tokens.iter().filter(|candidate|
+        candidate.scope_id == token.scope_id && candidate.node_id == edge.source_id
+            && plan.consume_token_ids.contains(&candidate.token_id)).cloned().collect::<Vec<_>>();
+    let mut stmt = tx.prepare("SELECT token_id,arrival_edge_id,fork_stack_json,status FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND status IN ('ready','waiting','joining')")?;
+    let prior = stmt.query_map(params![instance_id,token.scope_id,edge.source_id], |row| {
+        Ok((row.get::<_, String>(0)?,row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,row.get::<_, String>(3)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (id, arrival_edge_id, stack, status) in prior {
+        if plan.consume_token_ids.contains(&id) {
+            candidates.push(ProcessToken {
+                token_id:id, scope_id:token.scope_id.clone(), node_id:edge.source_id.clone(),
+                arrival_edge_id, fork_stack:parse(stack)?, status,
+            });
+        }
+    }
+    let predecessor = nodes.iter().find(|node| node.id == edge.source_id)
+        .context("termination predecessor is outside its pinned body")?;
+    let pair = super::model::gateway_pairs(nodes, flows)?.get(&predecessor.id).cloned();
+    let mut matched = Vec::new();
+    for candidate in candidates {
+        if plan.token_sources.get(token_id) != Some(&candidate.token_id) {
+            continue;
+        }
+        let frame_matches = if let Some(pair) = &pair {
+            token.fork_stack.len() == candidate.fork_stack.len() + 1
+                && token.fork_stack[..candidate.fork_stack.len()] == candidate.fork_stack
+                && token.fork_stack.last().is_some_and(|frame|
+                    frame.split_node_id == pair.split_node_id && frame.join_node_id == pair.join_node_id
+                        && frame.branch_edge_id == edge.id)
+        } else if matches!(predecessor.kind,
+            ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. })
+            && candidate.fork_stack.last().is_some_and(|frame| frame.join_node_id.as_deref()
+                == Some(predecessor.id.as_str())) {
+            candidate.fork_stack.len() == token.fork_stack.len() + 1
+                && candidate.fork_stack[..token.fork_stack.len()] == token.fork_stack
+        } else {
+            candidate.fork_stack == token.fork_stack
+        };
+        if frame_matches {
+            matched.push(candidate);
+        }
+    }
+    if matched.is_empty() {
+        let boundary = nodes.iter().find(|node| node.id == edge.source_id)
+            .context("termination boundary source is missing")?;
+        let attachment = match &boundary.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                if matches!(accepted_input, AcceptedInputRef::Timer { .. }) => Some(attached_to_id),
+            ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                if matches!(accepted_input, AcceptedInputRef::Message { .. }) => Some(attached_to_id),
+            ProcessNodeKind::BoundaryError { attached_to_id, .. } => Some(attached_to_id),
+            ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }
+                if matches!(accepted_input, AcceptedInputRef::Service { .. }) => Some(attached_to_id),
+            _ => None,
+        };
+        if let Some(attached_to_id) = attachment {
+            let persisted: Option<String> = tx.query_row(
+                "SELECT token_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND status='waiting'",
+                params![instance_id,token.scope_id,attached_to_id], |row| row.get(0)).optional()?;
+            let planned = plan.create_tokens.iter().filter(|created|
+                created.scope_id == token.scope_id && created.node_id == *attached_to_id
+                    && created.status == "waiting").collect::<Vec<_>>();
+            ensure!(planned.len() <= 1 && !(persisted.is_some() && !planned.is_empty()),
+                "boundary termination has ambiguous attached activations");
+            let attached = persisted.or_else(|| planned.first().map(|created| created.token_id.clone()));
+            if let Some(attached) = attached {
+                ensure!(plan.token_sources.get(token_id) == Some(&attached),
+                    "boundary termination changed its attached predecessor");
+                ensure!(token.fork_stack.is_empty(),
+                    "boundary termination has an open fork activation");
+                if matches!(&boundary.kind, ProcessNodeKind::BoundaryError { .. }) {
+                    let caught = plan.events.iter().find(|event| event.kind == "business_error_caught"
+                        && event.scope_id == token.scope_id
+                        && event.node_id.as_deref() == Some(boundary.id.as_str())
+                        && event.data["attached_token_id"].as_str() == Some(attached.as_str()))
+                        .context("boundary termination has no factual caught error")?;
+                    match accepted_input {
+                        AcceptedInputRef::CallReturn { parent_token_id, .. } => {
+                            ensure!(parent_token_id == &attached,
+                                "called error boundary changed its parent wait");
+                        }
+                        AcceptedInputRef::Service { job_id, .. } => {
+                            ensure!(caught.data["job_id"].as_str() == Some(job_id.as_str()),
+                                "service error boundary changed its accepted job");
+                            let source_id = seed_token_id.context("service error has no job activation")?;
+                            return trace_termination_source_on(tx,instance_id,model,scopes,plan,
+                                source_id,seed_token_id,accepted_input,visiting);
+                        }
+                        _ => {
+                            let source_event_id = caught.data["source_event_id"].as_str()
+                                .context("caught ErrorEnd has no source event identity")?;
+                            let error = plan.events.iter().enumerate().find(|(index,event)|
+                                event.kind == "error_end_reached"
+                                    && plan.event_ids.get(index).is_some_and(|id|
+                                        id == source_event_id))
+                                .context("caught ErrorEnd has no factual local source")?;
+                            let source_id = error.1.data["source_token_id"].as_str()
+                                .context("caught ErrorEnd has no source token identity")?;
+                            return trace_termination_source_on(tx,instance_id,model,scopes,plan,
+                                source_id,seed_token_id,accepted_input,visiting);
+                        }
+                    }
+                }
+                if matches!(&boundary.kind, ProcessNodeKind::BoundaryEscalation { .. }) {
+                    let AcceptedInputRef::Service { job_id, .. } = accepted_input else {
+                        bail!("escalation termination has no accepted fenced service result")
+                    };
+                    ensure!(plan.events.iter().any(|event|
+                        event.kind == "escalation_caught"
+                            && event.scope_id == token.scope_id
+                            && event.node_id.as_deref() == Some(boundary.id.as_str())
+                            && event.data["attached_token_id"].as_str() == Some(attached.as_str())
+                            && event.data["job_id"].as_str() == Some(job_id.as_str())),
+                        "escalation termination has no factual caught service result");
+                }
+                return trace_termination_source_on(tx,instance_id,model,scopes,plan,
+                    &attached,seed_token_id,accepted_input,visiting);
+            }
+        }
+    }
+    for candidate in matched {
+        let mut branch = visiting.clone();
+        if trace_termination_source_on(tx,instance_id,model,scopes,plan,
+            &candidate.token_id,seed_token_id,accepted_input,&mut branch).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("termination source is not linked to its accepted input through pinned sequence flows")
+}
+
+fn validate_termination_immediate_failure_on(
+    instance_id: &str, model: &ProcessModel, scopes: &[ProcessScopeSummary],
+    plan: &RuntimePlan, variable_states: &[BTreeMap<String, Value>],
+    source: &ProcessToken, waiting: &ProcessToken,
+) -> Result<()> {
+    ensure!(source.status == "ready" && waiting.status == "waiting"
+        && plan.token_sources.get(&waiting.token_id) == Some(&source.token_id)
+        && plan.consume_token_ids.iter().filter(|id| *id == &source.token_id).count() == 1
+        && !plan.event_sources.values().any(|id| id == &source.token_id),
+        "termination immediate failure lacks its exact consumed source and parked wait");
+    let incidents = plan.add_incidents.iter().filter(|incident|
+        incident.scope_id == source.scope_id
+            && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+        .collect::<Vec<_>>();
+    let events = plan.events.iter().enumerate().filter(|(_,event)|
+        event.kind == "incident" && event.scope_id == source.scope_id
+            && event.node_id.as_deref() == Some(source.node_id.as_str()))
+        .collect::<Vec<_>>();
+    ensure!(incidents.len() == 1 && events.len() == 1
+        && incidents[0].job_id.is_none() && !incidents[0].can_retry,
+        "termination immediate failure has no unique nonretryable incident");
+    let (event_index, event) = events[0];
+    let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+        VariableEffect::Mapped { event_index: effect_index, .. }
+        | VariableEffect::ScopeEntry { event_index: effect_index, .. } =>
+            *effect_index <= event_index,
+    }).count();
+    let locals = variable_states.get(effect_count)
+        .context("termination failure source-time variables are missing")?;
+    let effective = effective_scope_variables(scopes, locals, instance_id,
+        locals.get(instance_id).context("termination failure root variables are missing")?,
+        &source.scope_id)?;
+    let path = scope_path(scopes, instance_id, &source.scope_id)?;
+    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    let node = nodes.iter().find(|node| node.id == source.node_id)
+        .context("termination failure node is outside its pinned body")?;
+    let (code, message, expected) = match &node.kind {
+        ProcessNodeKind::ExclusiveGateway { default_flow_id } => {
+            let mut matches = Vec::new();
+            let mut error = None;
+            for edge in flows.iter().filter(|flow| flow.source_id == node.id) {
+                if default_flow_id.as_ref() == Some(&edge.id) { continue; }
+                match edge.condition.as_ref().map_or(Ok(true), |expression|
+                    super::runtime::condition(expression, &effective, &Value::Null)) {
+                    Ok(true) => matches.push(edge.id.as_str()),
+                    Ok(false) => {},
+                    Err(failure) => { error = Some(failure.to_string()); break; }
+                }
+            }
+            let (code, message) = if let Some(error) = error {
+                ("EXPRESSION_ERROR", error)
+            } else if matches.len() > 1 {
+                ("AMBIGUOUS_GATEWAY",
+                    "exclusive gateway has no unique matching sequence flow".to_owned())
+            } else if matches.is_empty() && default_flow_id.is_none() {
+                ("NO_MATCHING_FLOW",
+                    "exclusive gateway has no unique matching sequence flow".to_owned())
+            } else {
+                bail!("termination XOR has a selected pinned flow, not a failure wait")
+            };
+            (code.to_owned(), message.clone(), serde_json::json!({
+                "code":code,"message":message}))
+        }
+        ProcessNodeKind::InclusiveGateway { default_flow_id } => {
+            let pair = super::model::gateway_pairs(nodes, flows)?.remove(&node.id)
+                .context("termination inclusive failure has no pinned split")?;
+            let mut selected = Vec::new();
+            let mut failure = None;
+            for edge_id in pair.branches.keys() {
+                if default_flow_id.as_ref() == Some(edge_id) { continue; }
+                let edge = flows.iter().find(|edge| &edge.id == edge_id)
+                    .context("termination inclusive condition edge is missing")?;
+                let expression = edge.condition.as_deref()
+                    .context("termination inclusive condition is missing")?;
+                match super::runtime::evaluate(expression, &effective, &Value::Null, &[]) {
+                    Ok(Value::Bool(true)) => selected.push(edge_id.as_str()),
+                    Ok(Value::Bool(false)) => {},
+                    Ok(_) if failure.is_none() => failure = Some(("non_boolean_condition",
+                        Some(edge_id.clone()),
+                        format!("condition on flow {edge_id} is not boolean"))),
+                    Err(error) if failure.is_none() => failure = Some(("condition_evaluation_failed",
+                        Some(edge_id.clone()), format!("condition on flow {edge_id}: {error}"))),
+                    _ => {},
+                }
+            }
+            if failure.is_none() && selected.is_empty() && default_flow_id.is_none() {
+                failure = Some(("no_matching_flow", None,
+                    format!("inclusive gateway {} has no matching flow", node.id)));
+            }
+            let (reason, condition_edge_id, message) = failure
+                .context("termination inclusive gateway has selected pinned flows")?;
+            let message = message.chars().take(512).collect::<String>();
+            ("INCLUSIVE_GATEWAY_ERROR".to_owned(), message.clone(), serde_json::json!({
+                "code":"INCLUSIVE_GATEWAY_ERROR","message":message,
+                "reason":reason,"condition_edge_id":condition_edge_id,
+                "source_token_id":source.token_id,"waiting_token_id":waiting.token_id}))
+        }
+        ProcessNodeKind::MessageThrow { .. } => {
+            let error = match super::messages::prepare_throw(model, node, &effective) {
+                Ok(_) => bail!("termination message throw has a prepared message, not a failure wait"),
+                Err(error) => error,
+            };
+            let message = bounded_failure_message(&error.to_string());
+            ("MESSAGE_EXPRESSION_ERROR".to_owned(), message.clone(), serde_json::json!({
+                "code":"MESSAGE_EXPRESSION_ERROR","message":message}))
+        }
+        _ => bail!("termination no-action wait is not a pinned immediate failure"),
+    };
+    ensure!(incidents[0].code == code && incidents[0].message == message
+        && event.data == expected,
+        "termination incident differs from its independently recomputed pinned failure");
+    Ok(())
+}
+
+fn validate_termination_action_provenance_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>],
+    call_source: Option<&BusinessErrorSource>, entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let mut unparented = 0;
+    let mut selected_transient_join_arrivals = HashSet::new();
+    for token in &plan.create_tokens {
+        let Some(source_id) = plan.token_sources.get(&token.token_id) else {
+            let path = scope_path(scopes, instance_id, &token.scope_id)?;
+            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            ensure!(plan.start_instance_id.as_deref() == Some(instance_id)
+                && token.scope_id == instance_id && token.arrival_edge_id.is_none()
+                && token.status == "ready"
+                && nodes.iter().any(|node| node.id == token.node_id
+                    && matches!(node.kind, ProcessNodeKind::Start
+                        | ProcessNodeKind::TimerStart { .. }
+                        | ProcessNodeKind::MessageStart { .. })),
+                "termination plan has an unauthenticated token origin");
+            unparented += 1;
+            continue;
+        };
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        let source_live = plan.consume_token_ids.contains(source_id)
+            || plan.cancel_token_ids.contains(source_id);
+        if token.scope_id != source.scope_id {
+            let child = plan.create_scopes.iter().find(|child|
+                child.scope_id == token.scope_id && child.parent_scope_id == source.scope_id
+                    && child.parent_token_id == *source_id)
+                .context("termination child start has no factual enclosing activation")?;
+            let path = scope_path(scopes, instance_id, &token.scope_id)?;
+            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            ensure!(source.node_id == child.subprocess_node_id
+                && source.status == "waiting" && token.status == "ready"
+                && token.arrival_edge_id.is_none() && token.fork_stack.is_empty()
+                && nodes.iter().any(|node| node.id == token.node_id
+                    && node.kind == ProcessNodeKind::Start),
+                "termination child token differs from its pinned subprocess entry");
+            continue;
+        }
+        if token.node_id == source.node_id && token.arrival_edge_id == source.arrival_edge_id {
+            let path = scope_path(scopes, instance_id, &source.scope_id)?;
+            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            let pinned = nodes.iter().find(|node| node.id == source.node_id)
+                .context("termination wait source is outside its pinned body")?;
+            let immediate_wait = matches!(&pinned.kind,
+                ProcessNodeKind::ExclusiveGateway { .. }
+                | ProcessNodeKind::InclusiveGateway { .. }
+                | ProcessNodeKind::MessageThrow { .. });
+            if token.status == "waiting" && immediate_wait {
+                validate_termination_immediate_failure_on(instance_id, model, scopes,
+                    plan, variable_states, &source, token)?;
+            }
+            let waiting = token.status == "waiting" && (matches!(&pinned.kind,
+                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+                | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
+                || immediate_wait
+                || pinned.kind == ProcessNodeKind::TerminateEnd
+                    && plan.termination_attempts.iter().any(|attempt| matches!(attempt,
+                        TerminationAttempt::ReturnFailure(failure)
+                            if failure.source_token_id.as_str() == source_id.as_str()
+                                && failure.waiting_token_id == token.token_id)));
+            let joining = token.status == "joining"
+                && matches!(&pinned.kind, ProcessNodeKind::ParallelGateway
+                    | ProcessNodeKind::InclusiveGateway { .. })
+                && source.fork_stack.last().is_some_and(|frame|
+                    frame.join_node_id.as_deref() == Some(source.node_id.as_str()))
+                && (plan.add_gateway_receipts.iter().any(|receipt|
+                    receipt.token_id == token.token_id && receipt.scope_id == token.scope_id)
+                    || plan.consume_token_ids.contains(&token.token_id)
+                        && source.fork_stack.last().is_some_and(|frame|
+                            plan.events.iter().enumerate().any(|(index,event)|
+                                matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined")
+                                    && event.scope_id == token.scope_id
+                                    && event.node_id.as_deref() == Some(token.node_id.as_str())
+                                    && event.data["activation_id"].as_str()
+                                        == Some(frame.activation_id.as_str())
+                                    && plan.event_sources.get(&index).is_some_and(|final_id|
+                                        termination_token_on(tx, instance_id, plan, final_id)
+                                            .is_ok_and(|final_token| final_token.status == "ready"
+                                                && final_token.scope_id == token.scope_id
+                                                && final_token.node_id == token.node_id
+                                                && final_token.fork_stack.last().is_some_and(|last|
+                                                    last.activation_id == frame.activation_id
+                                                        && last.selected_branch_edge_ids
+                                                            == frame.selected_branch_edge_ids))))));
+            ensure!(source.status == "ready" && source_live
+                && (waiting || joining)
+                && token.fork_stack == source.fork_stack,
+                "termination wait token lacks one factual ready predecessor");
+            if joining && plan.consume_token_ids.contains(&token.token_id)
+                && !plan.add_gateway_receipts.iter().any(|receipt|
+                    receipt.token_id == token.token_id) {
+                selected_transient_join_arrivals.insert(token.token_id.clone());
+            }
+            continue;
+        }
+        let path = scope_path(scopes, instance_id, &token.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let edge = flows.iter().find(|edge|
+            token.arrival_edge_id.as_deref() == Some(edge.id.as_str())
+                && edge.target_id == token.node_id)
+            .context("termination successor is outside its pinned body")?;
+        let pinned = nodes.iter().find(|node| node.id == edge.source_id)
+            .context("termination successor source node is absent")?;
+        let boundary_attachment = match &pinned.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => Some(attached_to_id),
+            _ => None,
+        };
+        let ordinary = source.node_id == edge.source_id && source.status == "ready" && source_live;
+        let returned = source.node_id == edge.source_id && source.status == "waiting"
+            && source_live && plan.events.iter().any(|event|
+                event.data["parent_token_id"].as_str() == Some(source_id.as_str())
+                    && ((event.kind == "call_returned"
+                        && event.scope_id == token.scope_id
+                        && event.node_id.as_deref() == Some(edge.source_id.as_str()))
+                        || (event.kind == "scope_completed"
+                            && event.data["parent_scope_id"].as_str()
+                                == Some(token.scope_id.as_str()))))
+            && (matches!(&pinned.kind, ProcessNodeKind::CallActivity { .. })
+                && plan.termination_attempts.iter().any(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    matches!(input, AcceptedInputRef::CallReturn { parent_token_id, .. }
+                        if parent_token_id == source_id)
+                })
+                || matches!(&pinned.kind, ProcessNodeKind::SubProcess { .. })
+                    && plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { source_token_id, node_id, .. }
+                            if source_token_id == source_id && node_id == &pinned.id)));
+        let completed_wait = source.node_id == edge.source_id
+            && source.status == "waiting" && source_live
+            && match &pinned.kind {
+                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. } => {
+                    let human = plan.complete_user_task_ids.iter().any(|id|
+                        plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::Human { task_id, .. } if task_id == id)
+                        })
+                        &&
+                        tx.query_row("SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                            params![instance_id,id], |row| row.get::<_,Option<String>>(0))
+                            .ok().flatten().as_deref() == Some(source_id.as_str()))
+                        && plan.events.iter().any(|event|
+                            event.scope_id == source.scope_id
+                                && event.node_id.as_deref() == Some(source.node_id.as_str())
+                                && matches!(event.kind.as_str(),
+                                    "user_task_completed" | "verification_approved"));
+                    let service = plan.complete_job_ids.iter().any(|id|
+                        plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::Service { job_id, .. } if job_id == id)
+                        })
+                        &&
+                        tx.query_row("SELECT token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                            params![instance_id,id], |row| row.get::<_,String>(0))
+                            .ok().as_deref() == Some(source_id.as_str()))
+                        && plan.events.iter().any(|event| event.kind == "service_result"
+                            && event.scope_id == source.scope_id
+                            && event.node_id.as_deref() == Some(source.node_id.as_str()));
+                    human || service
+                }
+                ProcessNodeKind::TimerCatch { .. } => plan.timer_updates.iter().any(|update|
+                    update.status == ProcessTimerStatus::Fired
+                        && plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::Timer { timer_id, .. }
+                                if timer_id == &update.timer_id)
+                        })
+                        && timer_on(tx, &update.timer_id).is_ok_and(|timer|
+                            timer.instance_id.as_deref() == Some(instance_id)
+                                && timer.scope_id.as_deref() == Some(source.scope_id.as_str())
+                                && timer.token_id.as_deref() == Some(source_id.as_str())
+                                && timer.node_id == source.node_id)),
+                ProcessNodeKind::MessageCatch { .. } => plan.subscription_updates.iter().any(|update|
+                    update.status == ProcessSubscriptionStatus::Consumed
+                        && plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::Message {
+                                target_subscription_id: Some(id), .. }
+                                if id == &update.subscription_id)
+                        })
+                        && subscription_on(tx, &update.subscription_id).is_ok_and(|subscription|
+                            subscription.instance_id == instance_id
+                                && subscription.scope_id == source.scope_id
+                                && subscription.token_id == *source_id
+                                && subscription.node_id == source.node_id)),
+                _ => false,
+            };
+        let boundary = boundary_attachment == Some(&source.node_id)
+            && source.status == "waiting"
+            && plan.events.iter().any(|event|
+                event.scope_id == token.scope_id
+                    && event.node_id.as_deref() == Some(edge.source_id.as_str())
+                    && event.data["attached_token_id"].as_str() == Some(source_id.as_str())
+                    && matches!(event.kind.as_str(), "timer_fired" | "message_delivered"
+                        | "business_error_caught" | "escalation_caught"));
+        ensure!(ordinary || returned || completed_wait || boundary,
+            "termination successor has no authenticated predecessor transition");
+        ensure!(token.status == "ready" || pinned.kind == ProcessNodeKind::EventBasedGateway
+            && token.status == "waiting", "termination successor has an invalid status");
+        let stack_matches = if let Some(pair) = super::model::gateway_pairs(nodes, flows)?
+            .get(&source.node_id) {
+            token.fork_stack.len() == source.fork_stack.len() + 1
+                && token.fork_stack[..source.fork_stack.len()] == source.fork_stack
+                && token.fork_stack.last().is_some_and(|frame|
+                    frame.split_node_id == pair.split_node_id
+                        && frame.join_node_id == pair.join_node_id
+                        && frame.branch_edge_id == edge.id)
+        } else if matches!(&pinned.kind,
+            ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. })
+            && source.fork_stack.last().is_some_and(|frame|
+                frame.join_node_id.as_deref() == Some(pinned.id.as_str())) {
+            source.fork_stack.len() == token.fork_stack.len() + 1
+                && source.fork_stack[..token.fork_stack.len()] == token.fork_stack
+        } else {
+            source.fork_stack == token.fork_stack
+        };
+        ensure!(stack_matches, "termination successor changed its selected fork ancestry");
+    }
+    ensure!(plan.token_sources.len() + unparented == plan.create_tokens.len()
+        && unparented <= 1
+        && plan.token_sources.keys().all(|id|
+            plan.create_tokens.iter().any(|token| &token.token_id == id)),
+        "termination token provenance has an extra or missing source");
+    ensure!(plan.consume_token_ids.iter().all(|id|
+        plan.token_sources.values().any(|source| source == id)
+            || plan.event_sources.values().any(|source| source == id)
+            || plan.remove_gateway_receipts.iter().any(|receipt| &receipt.token_id == id)
+            || plan.add_gateway_receipts.iter().any(|receipt| &receipt.token_id == id)
+            || selected_transient_join_arrivals.contains(id)),
+        "termination consumed a token outside its factual selected prefix");
+    for source_id in plan.token_sources.values().collect::<HashSet<_>>() {
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        if source.status == "ready"
+            && !plan.create_tokens.iter().any(|created| created.token_id == source.token_id) {
+            ensure!(plan.termination_attempts.iter().any(|attempt| {
+                let input = match attempt {
+                    TerminationAttempt::Success(source) => &source.accepted_input,
+                    TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                };
+                matches!(input, AcceptedInputRef::PersistedReady { token_id, .. }
+                    if token_id == &source.token_id)
+            }), "termination advanced an unrelated retained ready token");
+        }
+        let path = scope_path(scopes, instance_id, &source.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let node = nodes.iter().find(|node| node.id == source.node_id)
+            .context("termination token source is outside its pinned body")?;
+        let children = plan.create_tokens.iter().filter(|child|
+            plan.token_sources.get(&child.token_id) == Some(source_id)).collect::<Vec<_>>();
+        if source.status == "ready" {
+            let waits = children.iter().filter(|child| child.scope_id == source.scope_id
+                && child.node_id == source.node_id
+                && child.arrival_edge_id == source.arrival_edge_id
+                && child.status == "waiting").count();
+            let joins = children.iter().filter(|child| child.scope_id == source.scope_id
+                && child.node_id == source.node_id
+                && child.arrival_edge_id == source.arrival_edge_id
+                && child.status == "joining").count();
+            match &node.kind {
+                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+                | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. } =>
+                    ensure!(waits == 1 && joins == 0,
+                        "termination activity has no unique factual durable wait"),
+                ProcessNodeKind::EventBasedGateway => {
+                    let outgoing = flows.iter().filter(|flow| flow.source_id == source.node_id)
+                        .collect::<Vec<_>>();
+                    ensure!(waits == 0 && joins == 0 && children.len() == outgoing.len()
+                        && outgoing.iter().all(|edge| children.iter().filter(|child|
+                            child.scope_id == source.scope_id
+                                && child.arrival_edge_id.as_deref() == Some(edge.id.as_str())
+                                && child.node_id == edge.target_id
+                                && child.status == "waiting").count() == 1),
+                        "termination race lacks its exact selected waiting branches");
+                }
+                ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
+                    let is_join = source.fork_stack.last().is_some_and(|frame|
+                        frame.join_node_id.as_deref() == Some(source.node_id.as_str()));
+                    let incident_count = plan.add_incidents.iter().filter(|incident|
+                        incident.scope_id == source.scope_id
+                            && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+                        .count();
+                    ensure!(joins == usize::from(is_join) && waits <= 1
+                        && incident_count == waits && (!is_join || waits == 0),
+                        "termination gateway added an unauthenticated wait or join");
+                }
+                ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. } => {
+                    let incident_count = plan.add_incidents.iter().filter(|incident|
+                        incident.scope_id == source.scope_id
+                            && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+                        .count();
+                    ensure!(waits <= 1 && incident_count == waits && joins == 0,
+                        "termination immediate action added an unauthenticated wait");
+                }
+                ProcessNodeKind::TerminateEnd => {
+                    let failed = plan.termination_attempts.iter().any(|attempt| matches!(attempt,
+                        TerminationAttempt::ReturnFailure(failure)
+                            if failure.source_token_id.as_str() == source_id.as_str()));
+                    ensure!(waits == usize::from(failed) && joins == 0,
+                        "termination source parked a token without a factual return failure");
+                }
+                _ => ensure!(waits == 0 && joins == 0,
+                    "termination immediate action added an unauthenticated wait"),
+            }
+        }
+        if source.status == "waiting" {
+            let outgoing = flows.iter().filter(|flow| flow.source_id == source.node_id)
+                .collect::<Vec<_>>();
+            let direct = children.iter().filter(|child| child.scope_id == source.scope_id
+                && child.arrival_edge_id.as_deref().is_some_and(|edge|
+                    outgoing.iter().any(|flow| flow.id == edge))).collect::<Vec<_>>();
+            if !direct.is_empty() {
+                ensure!(direct.len() == outgoing.len()
+                    && outgoing.iter().all(|edge| direct.iter().filter(|child|
+                        child.arrival_edge_id.as_deref() == Some(edge.id.as_str())).count() == 1),
+                    "termination completed wait changed its exact outgoing successor set");
+            }
+            let boundary_children = children.iter().filter(|child| child.scope_id == source.scope_id
+                && child.arrival_edge_id.as_deref().is_some_and(|edge_id|
+                    flows.iter().any(|flow| flow.id == edge_id
+                        && nodes.iter().any(|node| node.id == flow.source_id
+                            && matches!(&node.kind,
+                                ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                                | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                                | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                                | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }
+                                    if attached_to_id == &source.node_id)))))
+                .collect::<Vec<_>>();
+            ensure!(boundary_children.iter().all(|child|
+                boundary_children.iter().filter(|other|
+                    other.arrival_edge_id == child.arrival_edge_id).count() == 1),
+                "termination boundary activation created a duplicate selected successor");
+        }
+    }
+
+    let mandatory = |event: &PlannedEvent| matches!(event.kind.as_str(),
+        "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
+        | "parallel_joined" | "inclusive_joined" | "end_reached"
+        | "error_end_reached" | "terminate_end_reached" | "message_queued")
+        || event.kind == "incident" && event.data["source_kind"] == "terminate_end_return_failure";
+    ensure!(plan.event_sources.len() == plan.events.iter().filter(|event| mandatory(event)).count()
+        && plan.events.iter().enumerate().all(|(index,event)|
+            plan.event_sources.contains_key(&index) == mandatory(event)),
+        "termination history has an extra or missing token action source");
+    let mut acted = HashSet::new();
+    for (index, source_id) in &plan.event_sources {
+        let event = &plan.events[*index];
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        if !plan.create_tokens.iter().any(|created| created.token_id == source.token_id) {
+            ensure!(plan.termination_attempts.iter().any(|attempt| {
+                let input = match attempt {
+                    TerminationAttempt::Success(source) => &source.accepted_input,
+                    TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                };
+                matches!(input, AcceptedInputRef::PersistedReady { token_id, .. }
+                    if token_id == source_id)
+            }), "termination history advanced an unrelated retained ready token");
+        }
+        ensure!(acted.insert(source_id.clone()) && source.status == "ready"
+            && source.scope_id == event.scope_id
+            && event.node_id.as_deref() == Some(source.node_id.as_str())
+            && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+            "termination action did not consume one factual ready token");
+        let path = scope_path(scopes, instance_id, &source.scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let node = nodes.iter().find(|node| node.id == source.node_id)
+            .context("termination action node is outside its pinned body")?;
+        let children = plan.create_tokens.iter().filter(|token|
+            plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
+        let outgoing = flows.iter().filter(|flow| flow.source_id == node.id)
+            .collect::<Vec<_>>();
+        let expected_edges: Vec<String> = match (&node.kind, event.kind.as_str()) {
+            (ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+                | ProcessNodeKind::MessageStart { .. }, "node_completed") => {
+                ensure!(event.data.is_null(), "start completion changed its historical payload");
+                outgoing.iter().map(|edge| edge.id.clone()).collect()
+            }
+            (ProcessNodeKind::End, "end_reached") => {
+                ensure!(event.data.is_null() && children.is_empty(),
+                    "ordinary End invented a successor or changed its historical payload");
+                Vec::new()
+            }
+            (ProcessNodeKind::ExclusiveGateway { default_flow_id }, "exclusive_selected") => {
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. } => event_index <= index,
+                }).count();
+                let locals = variable_states.get(effect_count)
+                    .context("exclusive source-time variables are missing")?;
+                let effective = effective_scope_variables(scopes, locals, instance_id,
+                    locals.get(instance_id).context("exclusive root variables are missing")?,
+                    &source.scope_id)?;
+                let mut matches = Vec::new();
+                for edge in &outgoing {
+                    if default_flow_id.as_ref() == Some(&edge.id) { continue; }
+                    let selected = edge.condition.as_ref().map_or(Ok(true), |expression| {
+                        super::runtime::condition(expression, &effective, &Value::Null)
+                    })?;
+                    if selected { matches.push(edge.id.as_str()); }
+                }
+                let selected = match matches.as_slice() {
+                    [only] => *only,
+                    [] => default_flow_id.as_deref().context("exclusive gateway has no matching flow")?,
+                    _ => bail!("exclusive gateway has more than one true branch"),
+                };
+                let normal = serde_json::json!({"sequence_flow_id":selected});
+                let continuation = serde_json::json!({"sequence_flow_id":selected,
+                    "source_token_id":source_id,"activation_id":source_id});
+                ensure!(event.data == normal || event.data == continuation,
+                    "exclusive choice differs from pinned source-time CEL/default");
+                vec![selected.to_owned()]
+            }
+            (ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. },
+                "parallel_split" | "inclusive_split") => {
+                let pair = super::model::gateway_pairs(nodes, flows)?.remove(&node.id)
+                    .context("termination gateway split has no pinned branches")?;
+                ensure!((pair.kind == GatewayKind::Parallel && event.kind == "parallel_split")
+                    || (pair.kind == GatewayKind::Inclusive && event.kind == "inclusive_split"),
+                    "termination split event changed its pinned gateway kind");
+                let activation = event.data["activation_id"].as_str()
+                    .context("termination split activation is missing")?;
+                ensure!(Uuid::parse_str(activation).is_ok(),
+                    "termination split has a malformed activation ID");
+                let mut selected = Vec::new();
+                let mut default_selected = false;
+                if let ProcessNodeKind::InclusiveGateway { default_flow_id } = &node.kind {
+                    let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                        VariableEffect::Mapped { event_index, .. }
+                        | VariableEffect::ScopeEntry { event_index, .. } => event_index <= index,
+                    }).count();
+                    let locals = variable_states.get(effect_count)
+                        .context("inclusive source-time variables are missing")?;
+                    let effective = effective_scope_variables(scopes, locals, instance_id,
+                        locals.get(instance_id).context("inclusive root variables are missing")?,
+                        &source.scope_id)?;
+                    for edge_id in pair.branches.keys() {
+                        if default_flow_id.as_ref() == Some(edge_id) { continue; }
+                        let edge = outgoing.iter().find(|edge| &edge.id == edge_id)
+                            .context("inclusive candidate edge is missing")?;
+                        let expression = edge.condition.as_deref()
+                            .context("inclusive candidate condition is missing")?;
+                        if super::runtime::condition(expression, &effective, &Value::Null)? {
+                            selected.push(edge_id.clone());
+                        }
+                    }
+                    default_selected = selected.is_empty() && default_flow_id.is_some();
+                    if default_selected {
+                        selected.push(default_flow_id.as_ref()
+                            .context("inclusive default edge is missing")?.clone());
+                    }
+                } else {
+                    selected.extend(pair.branches.keys().cloned());
+                }
+                ensure!(!selected.is_empty(), "termination split selected no branch");
+                let expected = if pair.kind == GatewayKind::Parallel {
+                    serde_json::json!({"activation_id":activation})
+                } else {
+                    serde_json::json!({"activation_id":activation,
+                        "selected_branch_edge_ids":selected,
+                        "default_selected":default_selected})
+                };
+                let enriched = if pair.kind == GatewayKind::Inclusive {
+                    let mut data = expected.clone();
+                    data["source_token_id"] = serde_json::json!(source_id);
+                    Some(data)
+                } else { None };
+                ensure!(event.data == expected || enriched.as_ref() == Some(&event.data),
+                    "termination split differs from pinned source-time selected set");
+                ensure!(children.iter().all(|child| child.fork_stack.last().is_some_and(|frame|
+                    frame.activation_id == activation
+                        && frame.selected_branch_edge_ids.iter().eq(selected.iter()))),
+                    "termination split successor changed its selected activation");
+                selected
+            }
+            (ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. },
+                "parallel_joined" | "inclusive_joined") => {
+                let frame = source.fork_stack.last()
+                    .context("termination joining action lost its factual fork frame")?;
+                let expected = if frame.gateway_kind == GatewayKind::Parallel {
+                    serde_json::json!({"activation_id":frame.activation_id})
+                } else {
+                    serde_json::json!({"activation_id":frame.activation_id,
+                        "selected_branch_edge_ids":frame.selected_branch_edge_ids})
+                };
+                ensure!(event.data == expected
+                    && (event.kind == "parallel_joined") ==
+                        (frame.gateway_kind == GatewayKind::Parallel),
+                    "termination join history changed its actual selected activation");
+                ensure!(children.iter().any(|child| child.status == "joining")
+                    && children.iter().filter(|child| child.status == "ready").count() == 1,
+                    "termination join lacks its real arrival and one continuation");
+                outgoing.iter().map(|edge| edge.id.clone()).collect()
+            }
+            (ProcessNodeKind::ErrorEnd { error_ref }, "error_end_reached") => {
+                let declaration = model.errors.iter().find(|error| &error.error_id == error_ref)
+                    .context("termination ErrorEnd declaration is missing")?;
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. } => event_index <= index,
+                }).count();
+                let locals = variable_states.get(effect_count)
+                    .context("ErrorEnd source-time variables are missing")?;
+                let outputs = effective_scope_variables(scopes, locals, instance_id,
+                    locals.get(instance_id).context("ErrorEnd root variables are missing")?,
+                    &source.scope_id)?;
+                let source_event_id = plan.event_ids.get(index)
+                    .context("ErrorEnd source event identity is missing")?;
+                ensure!(event.data == serde_json::json!({"kind":"ErrorEnd",
+                    "error_ref":error_ref,"error_code":declaration.error_code,
+                    "source_instance_id":instance_id,"source_scope_id":source.scope_id,
+                    "source_node_id":source.node_id,"source_event_id":source_event_id,
+                    "source_token_id":source_id,"outputs":outputs}),
+                    "ErrorEnd history differs from its pinned source-time variables");
+                Vec::new()
+            }
+            (ProcessNodeKind::TerminateEnd, "terminate_end_reached") => Vec::new(),
+            (ProcessNodeKind::TerminateEnd, "incident")
+                if event.data["source_kind"] == "terminate_end_return_failure" => Vec::new(),
+            (ProcessNodeKind::MessageThrow { .. }, "message_queued") => {
+                let queued = plan.create_messages.iter().filter(|message|
+                    message.source_activation_id == *source_id
+                        && message.source_event_index == *index
+                        && message.source_node_id == node.id).collect::<Vec<_>>();
+                ensure!(queued.len() == 1
+                    && event.data == serde_json::json!({"message_id":queued[0].message.message_id,
+                        "source_activation_id":source_id,"target":queued[0].message.target,
+                        "message_name":queued[0].message.message_name,
+                        "correlation_key":queued[0].message.correlation_key}),
+                    "termination message throw lacks its actual queued row");
+                outgoing.iter().map(|edge| edge.id.clone()).collect()
+            }
+            _ => bail!("termination action history differs from its pinned source node"),
+        };
+        if !matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined") {
+            let actual = children.iter().filter_map(|child| child.arrival_edge_id.as_deref())
+                .filter(|edge| outgoing.iter().any(|candidate| candidate.id == *edge))
+                .collect::<Vec<_>>();
+            ensure!(actual.len() == expected_edges.len()
+                && expected_edges.iter().all(|edge|
+                    actual.iter().filter(|actual_edge| **actual_edge == edge.as_str()).count() == 1),
+                "termination action has an extra or missing selected successor");
+        }
+    }
+    let human_prefix = match entry {
+        EntryAuthority::Accepted(human_input @ AcceptedInputRef::Human {
+            task_id, expected_task_revision, ..
+        }) => {
+            let (token_id, scope_id, node_id, revision): (String, String, String, u64) =
+                tx.query_row("SELECT token_id,scope_id,node_id,revision FROM bpmn_user_tasks \
+                    WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                    params![instance_id, task_id], |row| Ok((row.get(0)?, row.get(1)?,
+                        row.get(2)?, row_u64(row, 3)?)))?;
+            ensure!(revision == *expected_task_revision,
+                "termination boundary disarm changed its accepted human task revision");
+            let first_source_index = plan.termination_attempts.iter().filter_map(|attempt| {
+                let (accepted, index) = match attempt {
+                    TerminationAttempt::Success(source) =>
+                        (&source.accepted_input, source.source_event_index),
+                    TerminationAttempt::ReturnFailure(failure) =>
+                        (&failure.accepted_input, failure.source_event_index),
+                };
+                (accepted == human_input).then_some(index)
+            }).min();
+            Some((task_id.clone(), token_id, scope_id, node_id, first_source_index))
+        }
+        _ => None,
+    };
+    let human_disarm = |scope_id: &str, node_id: &str, token_id: &str, event_index: usize| {
+        let Some((task_id, accepted_token, accepted_scope, accepted_node, first_source_index)) =
+            human_prefix.as_ref() else { return false; };
+        scope_id == accepted_scope.as_str() && node_id == accepted_node.as_str()
+            && token_id == accepted_token.as_str()
+            && plan.complete_user_task_ids.iter().filter(|id| *id == task_id).count() == 1
+            && plan.consume_token_ids.iter().filter(|id| *id == accepted_token).count() == 1
+            && plan.events.iter().enumerate().any(|(index, completed)|
+                index > event_index && (*first_source_index).is_some_and(|source| index < source)
+                    && matches!(completed.kind.as_str(),
+                        "user_task_completed" | "verification_approved")
+                    && completed.scope_id == *accepted_scope
+                    && completed.node_id.as_deref() == Some(accepted_node.as_str())
+                    && completed.data["user_task_id"].as_str() == Some(task_id.as_str()))
+    };
+    for (event_index, event) in plan.events.iter().enumerate() {
+        if mandatory(event) { continue; }
+        let node = event.node_id.as_deref();
+        let closure_source = plan.termination_attempts.iter().filter_map(|attempt|
+            match attempt {
+                TerminationAttempt::Success(source)
+                    if source.source_event_index < event_index
+                        && descendant_scope_ids(scopes, &source.source_scope_id)
+                            .is_ok_and(|closure| closure.contains(&event.scope_id)) =>
+                    Some(source),
+                _ => None,
+            }).max_by_key(|source| source.source_event_index);
+        let count = |kind: &str, key: &str, value: &str| plan.events.iter().filter(|candidate|
+            candidate.kind == kind && candidate.data[key].as_str() == Some(value)).count();
+        let linked = match event.kind.as_str() {
+            "instance_started" => plan.start_instance_id.as_deref() == Some(instance_id)
+                && event.scope_id == instance_id && node.is_none()
+                && plan.events.iter().filter(|candidate| candidate.kind == "instance_started").count() == 1,
+            "user_task_opened" => event.data["user_task_id"].as_str().is_some_and(|id|
+                count("user_task_opened", "user_task_id", id) == 1
+                && plan.create_user_tasks.iter().any(|task|
+                    task.user_task_id == id && task.scope_id == event.scope_id
+                    && node == Some(task.node_id.as_str())
+                    && event.data == serde_json::json!({"user_task_id":id,
+                        "assignee_user_id":task.assignee_user_id,"kind":task.kind}))),
+            "service_queued" => event.data["job_id"].as_str().is_some_and(|id|
+                count("service_queued", "job_id", id) == 1
+                && plan.create_jobs.iter().any(|job| job.job_id == id
+                    && job.scope_id == event.scope_id && node == Some(job.node_id.as_str())
+                    && event.data == serde_json::json!({"job_id":id}))),
+            "call_requested" => event.data["call_id"].as_str().is_some_and(|id|
+                count("call_requested", "call_id", id) == 1
+                && plan.call_requests.iter().any(|request| request.call_id == id
+                    && request.parent_scope_id == event.scope_id
+                    && node == Some(request.call_node_id.as_str())
+                    && event.data == serde_json::json!({"call_id":id,
+                        "parent_token_id":request.parent_token_id}))),
+            "event_race_armed" => event.data["race_id"].as_str().is_some_and(|id|
+                count("event_race_armed", "race_id", id) == 1
+                && plan.create_event_races.iter().any(|race| race.race_id == id
+                    && race.scope_id == event.scope_id
+                    && node == Some(race.gateway_node_id.as_str())
+                    && event.data == serde_json::json!({"race_id":id,
+                        "activation_id":race.activation_id}))),
+            "scope_entered" => event.data["scope_id"].as_str().is_some_and(|id|
+                count("scope_entered", "scope_id", id) == 1
+                && plan.create_scopes.iter().any(|scope| scope.scope_id == id
+                    && event.scope_id == id && node.is_none()
+                    && event.data == serde_json::json!({"scope_id":id,
+                        "parent_scope_id":scope.parent_scope_id,
+                        "parent_token_id":scope.parent_token_id,
+                        "subprocess_node_id":scope.subprocess_node_id}))),
+            "instance_completed" => event.scope_id == instance_id && node.is_none()
+                && plan.status == ProcessInstanceStatus::Completed
+                && plan.events.iter().filter(|candidate| candidate.kind == "instance_completed").count() == 1,
+            "incident" => plan.add_incidents.iter().any(|incident| {
+                let expected = match incident.code.as_str() {
+                    "SCOPE_RETURN_ERROR" => scopes.iter().find(|scope|
+                        scope.scope_id == incident.scope_id)
+                        .and_then(|scope| scope.parent_token_id.as_deref())
+                        .map(|parent_token_id| serde_json::json!({
+                            "incident_id":incident.incident_id,"code":incident.code,
+                            "message":incident.message,"parent_token_id":parent_token_id})),
+                    "INCLUSIVE_GATEWAY_ERROR" => {
+                        let source = event.data["source_token_id"].as_str();
+                        let waiting = event.data["waiting_token_id"].as_str();
+                        let reason = event.data["reason"].as_str();
+                        match (source, waiting, reason) {
+                            (Some(source), Some(waiting), Some(reason)) =>
+                                Some(serde_json::json!({
+                                    "code":incident.code,"message":incident.message,
+                                    "source_token_id":source,"waiting_token_id":waiting,
+                                    "reason":reason,"condition_edge_id":event.data["condition_edge_id"]})),
+                            _ => None,
+                        }
+                    }
+                    _ => Some(serde_json::json!({
+                        "code":incident.code,"message":incident.message})),
+                };
+                incident.scope_id == event.scope_id
+                    && node == incident.node_id.as_deref()
+                    && expected.as_ref() == Some(&event.data)
+            })
+                && plan.events.iter().filter(|candidate| candidate.kind == "incident"
+                    && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id
+                    && candidate.data["code"] == event.data["code"]
+                    && candidate.data["message"] == event.data["message"]).count()
+                    == plan.add_incidents.iter().filter(|incident|
+                        incident.scope_id == event.scope_id
+                            && incident.node_id == event.node_id
+                            && event.data["code"].as_str() == Some(incident.code.as_str())
+                            && event.data["message"].as_str() == Some(incident.message.as_str()))
+                        .count(),
+            "timer_armed" | "timer_error" => event.data["timer_id"].as_str().is_some_and(|id|
+                count(event.kind.as_str(), "timer_id", id) == 1
+                && plan.create_timers.iter().any(|timer| timer.timer_id == id
+                    && timer.scope_id.as_deref() == Some(event.scope_id.as_str())
+                    && node == Some(timer.node_id.as_str())
+                    && (event.kind == "timer_armed") ==
+                        (timer.status == ProcessTimerStatus::Pending)
+                    && event.data["kind"] == serde_json::json!(timer.kind)
+                    && event.data["due_at_ms"] == serde_json::json!(timer.due_at_ms)
+                    && (event.kind == "timer_error"
+                        || event.data["timezone"] == serde_json::json!(timer.timezone)))),
+            "timer_cancelled" => event.data["timer_id"].as_str().is_some_and(|id|
+                count("timer_cancelled", "timer_id", id) == 1
+                && plan.timer_updates.iter().any(|update|
+                    update.timer_id == id && update.status == ProcessTimerStatus::Cancelled
+                    && event.data["reason"] == serde_json::json!(update.last_reason))
+                && timer_on(tx, id).ok().or_else(|| plan.create_timers.iter()
+                    .find(|timer| timer.timer_id == id).cloned()).is_some_and(|timer|
+                        timer.scope_id.as_deref() == Some(event.scope_id.as_str())
+                        && node == Some(timer.node_id.as_str())
+                        && (event.data["attached_token_id"] == serde_json::json!(timer.token_id)
+                            || event.data["reason"] == "event_race_lost"
+                                && event.data["race_id"] == serde_json::json!(timer.race_id)
+                                && timer.race_id.as_ref().is_some_and(|race_id|
+                                    plan.race_updates.iter().any(|update|
+                                        &update.race_id == race_id
+                                            && update.status == ProcessEventRaceStatus::Won)))
+                        && (closure_source.is_some()
+                            || event.data["reason"] != "activity_completed"
+                            || human_prefix.is_none()
+                            || {
+                                let Ok(pinned) = scope_node(model, scopes, instance_id,
+                                    &event.scope_id, &timer.node_id) else { return false; };
+                                let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &pinned.kind else {
+                                    return false;
+                                };
+                                matches!(timer.status, ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked)
+                                    && timer.token_id.as_deref().is_some_and(|token_id|
+                                        human_disarm(&event.scope_id, attached_to_id,
+                                            token_id, event_index))
+                                    && event.data == serde_json::json!({
+                                        "kind":"Boundary","timer_id":timer.timer_id,
+                                        "attached_to_id":attached_to_id,
+                                        "attached_token_id":timer.token_id,
+                                        "reason":"activity_completed","winning_timer_id":null})
+                            })
+                        && closure_source.is_none_or(|source| {
+                            let Ok(pinned) = scope_node(model, scopes, instance_id,
+                                &event.scope_id, &timer.node_id) else { return false; };
+                            let attached_to_id = match &pinned.kind {
+                                ProcessNodeKind::BoundaryTimer { attached_to_id, .. } =>
+                                    attached_to_id.as_str(),
+                                ProcessNodeKind::TimerCatch { .. } => timer.node_id.as_str(),
+                                _ => return false,
+                            };
+                            event.data == serde_json::json!({
+                                "timer_id":timer.timer_id,"kind":timer.kind,
+                                "attached_to_id":attached_to_id,
+                                "attached_token_id":timer.token_id,"reason":"terminate_end",
+                                "source_instance_id":instance_id,
+                                "source_event_id":source.source_event_id})
+                        }))),
+            "message_armed" | "error_boundary_armed" | "escalation_boundary_armed" =>
+                event.data["subscription_id"].as_str().is_some_and(|id|
+                    count(event.kind.as_str(), "subscription_id", id) == 1
+                    && plan.create_subscriptions.iter().any(|subscription|
+                        subscription.subscription_id == id
+                        && subscription.scope_id == event.scope_id
+                        && node == Some(subscription.node_id.as_str())
+                        && event.data["attached_token_id"].as_str()
+                            .or_else(|| event.data["token_id"].as_str())
+                            == Some(subscription.token_id.as_str())
+                        && (event.kind == "escalation_boundary_armed") ==
+                            (subscription.kind == ProcessSubscriptionKind::BoundaryEscalation))),
+            "subscription_cancelled" => event.data["subscription_id"].as_str().is_some_and(|id|
+                count("subscription_cancelled", "subscription_id", id) == 1
+                && plan.subscription_updates.iter().any(|update|
+                    update.subscription_id == id
+                    && update.status == ProcessSubscriptionStatus::Cancelled
+                    && event.data["reason"] == serde_json::json!(update.last_reason))
+                && subscription_on(tx, id).ok().or_else(|| plan.create_subscriptions.iter()
+                    .find(|subscription| subscription.subscription_id == id).cloned())
+                    .is_some_and(|subscription|
+                        subscription.scope_id == event.scope_id
+                        && node == Some(subscription.node_id.as_str())
+                        && event.data["attached_token_id"].as_str()
+                            == Some(subscription.token_id.as_str())
+                        && (closure_source.is_some()
+                            || event.data["reason"] != "activity_completed"
+                            || human_prefix.is_none()
+                            || {
+                                let Ok(pinned) = scope_node(model, scopes, instance_id,
+                                    &event.scope_id, &subscription.node_id) else { return false; };
+                                let (ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                                    | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                                    | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }) = &pinned.kind else {
+                                    return false;
+                                };
+                                subscription.status == ProcessSubscriptionStatus::Open
+                                    && human_disarm(&event.scope_id, attached_to_id,
+                                        &subscription.token_id, event_index)
+                                    && event.data == serde_json::json!({
+                                        "subscription_id":subscription.subscription_id,
+                                        "attached_token_id":subscription.token_id,
+                                        "reason":"activity_completed"})
+                            })
+                        && closure_source.is_none_or(|source| event.data == serde_json::json!({
+                            "subscription_id":subscription.subscription_id,
+                            "attached_token_id":subscription.token_id,
+                            "reason":"terminate_end","source_instance_id":instance_id,
+                            "source_event_id":source.source_event_id})))),
+            "event_race_won" | "event_race_cancelled" =>
+                event.data["race_id"].as_str().is_some_and(|id|
+                    count(event.kind.as_str(), "race_id", id) == 1
+                    && race_on(tx, id).ok().or_else(|| plan.create_event_races.iter()
+                        .find(|race| race.race_id == id).cloned()).is_some_and(|race|
+                            race.scope_id == event.scope_id
+                                && node == Some(race.gateway_node_id.as_str()))
+                    && plan.race_updates.iter().any(|update| update.race_id == id
+                        && (event.kind == "event_race_won") ==
+                            (update.status == ProcessEventRaceStatus::Won)
+                        && (if event.kind == "event_race_won" {
+                            event.data == serde_json::json!({"race_id":id,
+                                "winner_node_id":update.winner_node_id,
+                                "subscription_id":update.winner_subscription_id,
+                                "timer_id":update.winner_timer_id})
+                        } else { match closure_source {
+                            Some(source) => event.data == serde_json::json!({
+                                "race_id":id,"reason":"terminate_end",
+                                "source_instance_id":instance_id,
+                                "source_event_id":source.source_event_id}),
+                            None => event.data == serde_json::json!({
+                                "race_id":id,"reason":"scope_cancelled"}),
+                        }}))),
+            "scope_cancelled" => scopes.iter().find(|scope|
+                scope.scope_id == event.scope_id).is_some_and(|scope| {
+                let id = scope.scope_id.as_str();
+                let caught_error = plan.scope_terminal_errors.get(id).is_some_and(|fact| {
+                    let source = plan.events.iter().enumerate().find(|(index, source)|
+                        source.kind == "error_end_reached"
+                            && source.scope_id == id
+                            && source.node_id.as_deref() == Some(fact.source_node_id.as_str())
+                            && plan.event_ids.get(index) == Some(&fact.source_event_id));
+                    let selected = event.data["boundary_id"].as_str().and_then(|boundary_id|
+                        subscription_on(tx, boundary_id).ok().map(|subscription|
+                            (boundary_id, subscription)));
+                    fact.source_scope_id == id
+                        && source.is_some_and(|(source_index, _)| selected.is_some_and(
+                        |(boundary_id, subscription)| {
+                            subscription.kind == ProcessSubscriptionKind::BoundaryError
+                                && subscription.status == ProcessSubscriptionStatus::Open
+                                && subscription.instance_id == instance_id
+                                && Some(subscription.scope_id.as_str()) == scope.parent_scope_id.as_deref()
+                                && Some(subscription.token_id.as_str()) == scope.parent_token_id.as_deref()
+                                && plan.subscription_updates.iter().any(|update|
+                                    update.subscription_id == boundary_id
+                                        && update.status == ProcessSubscriptionStatus::Consumed)
+                                && plan.events.iter().enumerate().any(|(caught_index, caught)|
+                                    source_index < event_index && event_index < caught_index
+                                        && caught.kind == "business_error_caught"
+                                        && caught.scope_id == subscription.scope_id
+                                        && caught.node_id.as_deref() == Some(subscription.node_id.as_str())
+                                        && caught.data["subscription_id"].as_str() == Some(boundary_id)
+                                        && caught.data["attached_token_id"].as_str()
+                                            == Some(subscription.token_id.as_str())
+                                        && caught.data["source_instance_id"].as_str() == Some(instance_id)
+                                        && caught.data["source_scope_id"].as_str() == Some(id)
+                                        && caught.data["source_event_id"].as_str()
+                                            == Some(fact.source_event_id.as_str())
+                                        && caught.data["error_code"].as_str()
+                                            == Some(fact.error_code.as_str())
+                                        && caught.data["source_kind"] == "error_end")
+                        }))
+                });
+                let updated = count("scope_cancelled", "scope_id", id) == 1
+                    && node.is_none()
+                    && plan.scope_updates.iter().any(|update| update.scope_id == id
+                        && (update.status == ProcessInstanceStatus::Cancelled
+                            || update.status == ProcessInstanceStatus::Error && caught_error));
+                let error_final = plan.scope_updates.iter().any(|update|
+                    update.scope_id == id && update.status == ProcessInstanceStatus::Error);
+                let terminated = closure_source.is_some_and(|source| {
+                    let expected = serde_json::json!({
+                        "scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,
+                        "parent_token_id":scope.parent_token_id,
+                        "subprocess_node_id":scope.subprocess_node_id,
+                        "reason":"terminate_end","source_instance_id":instance_id,
+                        "source_event_id":source.source_event_id});
+                    event.data == expected && source.source_scope_id != id
+                });
+                let ordinary = closure_source.is_none()
+                    && plan.cancel_scope_roots.iter().any(|root| {
+                    if plan.termination_attempts.iter().any(|attempt| matches!(attempt,
+                        TerminationAttempt::Success(source)
+                            if source.source_scope_id == *root)) {
+                        return false;
+                    }
+                    if !descendant_scope_ids(scopes, root)
+                        .is_ok_and(|closure| closure.contains(id)) {
+                        return false;
+                    }
+                    let boundary_id = event.data["boundary_id"].as_str();
+                    let error_end = boundary_id == Some("error_end") && root.as_str() == instance_id
+                        && plan.terminal_error.as_ref().is_some_and(|fact|
+                            plan.events.iter().enumerate().any(|(index,source)|
+                                source.kind == "error_end_reached"
+                                    && plan.event_ids.get(&index)
+                                        == Some(&fact.source_event_id)));
+                    let root_scope = scopes.iter().find(|candidate| candidate.scope_id == *root);
+                    let root_parent_token = root_scope.and_then(|candidate|
+                        candidate.parent_token_id.as_deref());
+                    let root_parent_scope = root_scope.and_then(|candidate|
+                        candidate.parent_scope_id.as_deref());
+                    let timer = boundary_id.is_some_and(|timer_id|
+                        plan.timer_updates.iter().any(|update|
+                            update.timer_id == timer_id
+                                && update.status == ProcessTimerStatus::Fired)
+                        && timer_on(tx, timer_id).is_ok_and(|timer|
+                            timer.instance_id.as_deref() == Some(instance_id)
+                                && timer.scope_id.as_deref() == root_parent_scope
+                                && timer.kind == ProcessTimerKind::Boundary
+                                && timer.token_id.as_deref() == root_parent_token));
+                    let subscription = boundary_id.is_some_and(|subscription_id|
+                        subscription_on(tx, subscription_id).is_ok_and(|subscription|
+                            subscription.instance_id == instance_id
+                                && Some(subscription.scope_id.as_str()) == root_parent_scope
+                                && Some(subscription.token_id.as_str()) == root_parent_token
+                                && subscription.status == ProcessSubscriptionStatus::Open
+                                && plan.subscription_updates.iter().any(|update|
+                                    update.subscription_id == subscription_id
+                                        && update.status == ProcessSubscriptionStatus::Consumed)
+                                && plan.events.iter().any(|caught|
+                                    matches!(caught.kind.as_str(), "message_delivered"
+                                        | "business_error_caught" | "escalation_caught")
+                                        && caught.scope_id == subscription.scope_id
+                                        && caught.node_id.as_deref() == Some(subscription.node_id.as_str())
+                                        && caught.data["subscription_id"].as_str()
+                                            == Some(subscription_id)
+                                        && caught.data["attached_token_id"].as_str()
+                                            == root_parent_token)));
+                    let expected = serde_json::json!({
+                        "scope_id":scope.scope_id,"parent_scope_id":scope.parent_scope_id,
+                        "parent_token_id":scope.parent_token_id,
+                        "subprocess_node_id":scope.subprocess_node_id,
+                        "reason":"scope_cancelled","boundary_id":boundary_id});
+                    (error_end || timer || subscription) && event.data == expected
+                });
+                updated && (terminated || ordinary) && (!error_final || ordinary)
+            }),
+            "scope_completed" => scopes.iter().find(|scope|
+                scope.scope_id == event.scope_id).is_some_and(|scope| {
+                let expected = if let Some(source) = closure_source.filter(|source|
+                    source.source_scope_id == scope.scope_id) {
+                    serde_json::json!({"scope_id":scope.scope_id,
+                        "parent_scope_id":scope.parent_scope_id,
+                        "parent_token_id":scope.parent_token_id,
+                        "subprocess_node_id":scope.subprocess_node_id,
+                        "reason":"terminate_end","source_instance_id":instance_id,
+                        "source_event_id":source.source_event_id})
+                } else {
+                    serde_json::json!({"scope_id":scope.scope_id,
+                        "parent_scope_id":scope.parent_scope_id,
+                        "parent_token_id":scope.parent_token_id,
+                        "subprocess_node_id":scope.subprocess_node_id})
+                };
+                count("scope_completed", "scope_id", &scope.scope_id) == 1
+                    && node.is_none() && event.data == expected
+                    && plan.scope_updates.iter().any(|update|
+                        update.scope_id == scope.scope_id
+                            && update.status == ProcessInstanceStatus::Completed)
+            }),
+            "user_task_completed" | "verification_approved" | "verification_rejected" =>
+                event.data["user_task_id"].as_str().is_some_and(|id|
+                    count(event.kind.as_str(), "user_task_id", id) == 1
+                    && plan.complete_user_task_ids.iter().any(|task| task == id)),
+            "service_result" => {
+                let accepted = plan.termination_attempts.iter().find_map(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    match input {
+                        AcceptedInputRef::Service { job_id, .. } => Some(job_id),
+                        _ => None,
+                    }
+                });
+                accepted.is_some_and(|job_id|
+                    plan.complete_job_ids.iter().any(|id| id == job_id)
+                    && tx.query_row("SELECT scope_id,node_id,result_json,result_origin FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                        params![instance_id, job_id], |row| Ok((row.get::<_,String>(0)?,
+                            row.get::<_,String>(1)?, row.get::<_,String>(2)?,
+                            row.get::<_,String>(3)?)))
+                        .is_ok_and(|(scope,node_id,result,origin)| scope == event.scope_id
+                            && node == Some(node_id.as_str())
+                            && parse::<ActivityResult>(result).is_ok_and(|actual|
+                                serde_json::to_value(actual).is_ok_and(|mut expected| {
+                                    expected["result_origin"] = serde_json::json!(origin);
+                                    event.data == expected
+                                })))
+                    && plan.events.iter().filter(|candidate| candidate.kind == "service_result").count() == 1)
+            }
+            "verification_passed" => plan.termination_attempts.iter().any(|attempt| {
+                let input = match attempt {
+                    TerminationAttempt::Success(source) => &source.accepted_input,
+                    TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                };
+                matches!(input, AcceptedInputRef::Service { .. })
+            }) && plan.events.iter().filter(|candidate| candidate.kind == "verification_passed"
+                && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id).count() == 1
+                && node.is_some_and(|node_id| scope_node(model, scopes, instance_id,
+                    &event.scope_id, node_id).is_ok_and(|pinned| matches!(&pinned.kind,
+                        ProcessNodeKind::ServiceTask { verification:
+                            tentaflow_protocol::processes::ActivityVerification::Condition {
+                                expression }, .. }
+                            if event.data == serde_json::json!({"expression":expression})))),
+            "call_returned" | "call_error_propagated" => event.data["call_id"].as_str().is_some_and(|id|
+                count(event.kind.as_str(), "call_id", id) == 1
+                && calls_on(tx, instance_id).is_ok_and(|calls| calls.iter().any(|call|
+                    call.call_id == id && call.parent_scope_id == event.scope_id
+                        && (event.kind == "call_error_propagated"
+                            || node == Some(call.call_node_id.as_str()))
+                        && plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::CallReturn {
+                                call_id, child_instance_id, parent_token_id, .. }
+                                if call_id == id && child_instance_id == &call.child_instance_id
+                                    && parent_token_id == &call.parent_token_id)
+                        })
+                        && if event.kind == "call_returned" {
+                            call_source.is_none() && event.data == serde_json::json!({
+                                "call_id":call.call_id,"child_instance_id":call.child_instance_id,
+                                "parent_token_id":call.parent_token_id})
+                        } else {
+                            let Some(source) = call_source else { return false; };
+                            let (source_instance, source_scope, source_event, source_kind, code) =
+                                match source {
+                                    BusinessErrorSource::ErrorEnd { instance_id, fact, .. } =>
+                                        (instance_id.as_str(),fact.source_scope_id.as_str(),
+                                            fact.source_event_id.as_str(),"error_end",
+                                            Some(fact.error_code.as_str())),
+                                    BusinessErrorSource::ServiceContract {
+                                        instance_id, scope_id, result_event_id, result, .. } =>
+                                        (instance_id.as_str(),scope_id.as_str(),
+                                            result_event_id.as_str(),"contract",result.code.as_deref()),
+                                };
+                            plan.events.iter().any(|caught|
+                                caught.kind == "business_error_caught"
+                                    && caught.scope_id == event.scope_id
+                                    && caught.node_id == event.node_id
+                                    && caught.data["source_instance_id"].as_str() == Some(source_instance)
+                                    && caught.data["source_event_id"].as_str() == Some(source_event)
+                                    && caught.data["attached_token_id"].as_str().is_some_and(|id|
+                                        event.data == serde_json::json!({
+                                            "call_id":call.call_id,"source_instance_id":source_instance,
+                                            "source_scope_id":source_scope,
+                                            "source_event_id":source_event,"source_kind":source_kind,
+                                            "handler_node_id":event.node_id,"attached_token_id":id,
+                                            "error_code":code})))
+                        }))),
+            "scope_error_propagated" => event.data["source_job_id"].as_str().is_some_and(|id|
+                plan.complete_job_ids.iter().any(|job| job == id)
+                && plan.termination_attempts.iter().any(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    matches!(input, AcceptedInputRef::Service { job_id, .. } if job_id == id)
+                })
+                && plan.events.iter().any(|source| source.kind == "service_result"
+                    && source.data["result_origin"] == "contract")
+                && event.data["source_scope_id"].as_str().is_some()
+                && event.data["from_scope_id"].as_str().is_some()
+                && event.data["to_scope_id"].as_str().is_some()
+                && event.data == serde_json::json!({
+                    "source_scope_id":event.data["source_scope_id"],
+                    "source_job_id":id,
+                    "source_token_id":event.data["source_token_id"],
+                    "from_scope_id":event.data["from_scope_id"],
+                    "to_scope_id":event.data["to_scope_id"],
+                    "handler_node_id":event.data["handler_node_id"],
+                    "code":event.data["code"],
+                    "source_result_index":event.data["source_result_index"]})
+                && plan.events.iter().filter(|candidate| candidate.kind == "scope_error_propagated"
+                    && candidate.data["source_job_id"].as_str() == Some(id)
+                    && candidate.data["from_scope_id"] == event.data["from_scope_id"]).count() == 1),
+            "business_error_caught" | "escalation_caught" =>
+                event.data["subscription_id"].as_str().is_some_and(|id|
+                    count(event.kind.as_str(), "subscription_id", id) == 1
+                    && plan.subscription_updates.iter().any(|update| update.subscription_id == id
+                        && update.status == ProcessSubscriptionStatus::Consumed)
+                    && subscription_on(tx, id).ok().or_else(||
+                        plan.create_subscriptions.iter().find(|subscription|
+                            subscription.subscription_id == id).cloned()).is_some_and(|subscription|
+                        subscription.instance_id == instance_id
+                        && subscription.scope_id == event.scope_id
+                        && node == Some(subscription.node_id.as_str())
+                        && event.data["attached_token_id"].as_str()
+                            == Some(subscription.token_id.as_str())
+                        && if event.kind == "escalation_caught" {
+                            event.data == serde_json::json!({
+                                "subscription_id":id,"boundary_id":subscription.node_id,
+                                "attached_token_id":subscription.token_id,
+                                "source_token_id":subscription.token_id,
+                                "source_scope_id":event.data["source_scope_id"],
+                                "job_id":event.data["job_id"],
+                                "attempt":event.data["attempt"],"fence":event.data["fence"],
+                                "result_origin":"contract",
+                                "cancel_activity":event.data["cancel_activity"],
+                                "result_event_id":event.data["result_event_id"],
+                                "code":event.data["code"],
+                                "matched_escalation_code":subscription.escalation_code})
+                        } else if event.data["job_id"].is_string() {
+                            event.data == serde_json::json!({
+                                "subscription_id":id,
+                                "attached_token_id":subscription.token_id,
+                                "job_id":event.data["job_id"],
+                                "error_code":event.data["error_code"],
+                                "result_origin":"contract"})
+                        } else if event.data.get("source_scope_id").is_some() {
+                            event.data == serde_json::json!({
+                                "subscription_id":id,
+                                "attached_token_id":subscription.token_id,
+                                "error_code":event.data["error_code"],
+                                "source_instance_id":event.data["source_instance_id"],
+                                "source_event_id":event.data["source_event_id"],
+                                "source_scope_id":event.data["source_scope_id"],
+                                "source_kind":"error_end"})
+                        } else {
+                            event.data == serde_json::json!({
+                                "subscription_id":id,
+                                "attached_token_id":subscription.token_id,
+                                "error_code":event.data["error_code"],
+                                "source_instance_id":event.data["source_instance_id"],
+                                "source_event_id":event.data["source_event_id"],
+                                "source_kind":event.data["source_kind"]})
+                        })),
+            "message_delivered" => event.data["message_id"].as_str().is_some_and(|id|
+                count("message_delivered", "message_id", id) == 1
+                && plan.termination_attempts.iter().any(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    let (org_id, sender_user_id, subscription_id) = match input {
+                        AcceptedInputRef::Message { org_id, sender_user_id, message_id,
+                            target_subscription_id, .. } if message_id == id =>
+                            (org_id, sender_user_id, target_subscription_id.as_deref()),
+                        AcceptedInputRef::Start { cause: StartInputRef::Message {
+                            org_id, sender_user_id, message_id, .. }, .. }
+                            if message_id == id => (org_id, sender_user_id, None),
+                        _ => return false,
+                    };
+                    let key = MessageKey { org_id: org_id.clone(),
+                        sender_user_id: sender_user_id.clone(), message_id: id.to_owned() };
+                    let Ok(message) = message_on(tx, &key, true) else { return false; };
+                    let Some(payload) = message.payload.as_ref() else { return false; };
+                    let metadata = serde_json::json!({"message_id":id,
+                        "sender_user_id":message.key.sender_user_id,
+                        "message_name":message.message_name,
+                        "correlation_key":message.correlation_key,
+                        "received_at_ms":message.received_at_ms,
+                        "expires_at_ms":message.expires_at_ms,
+                        "payload_sha256":message.payload_sha256});
+                    match subscription_id {
+                        Some(subscription_id) => subscription_on(tx, subscription_id)
+                            .is_ok_and(|subscription|
+                                subscription.instance_id == instance_id
+                                    && subscription.scope_id == event.scope_id
+                                    && node == Some(subscription.node_id.as_str())
+                                    && event.data == serde_json::json!({
+                                        "subscription_id":subscription_id,
+                                        "attached_token_id":subscription.token_id,
+                                        "message_id":id,"message":metadata,"payload":payload})),
+                        None => plan.start_instance_id.as_deref() == Some(instance_id)
+                            && event.scope_id == instance_id
+                            && event.data == serde_json::json!({
+                                "message_id":id,"message":metadata,"payload":payload}),
+                    }
+                })),
+            "timer_fired" => event.data["timer_id"].as_str().is_some_and(|id|
+                count("timer_fired", "timer_id", id) == 1
+                && plan.termination_attempts.iter().any(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    matches!(input, AcceptedInputRef::Timer { timer_id, .. } if timer_id == id)
+                        || matches!(input, AcceptedInputRef::Start {
+                            cause: StartInputRef::Timer { timer_id, .. }, .. }
+                            if timer_id == id)
+                })),
+            "scope_entry_failed" => event.data["incident_id"].as_str().is_some_and(|id|
+                count("scope_entry_failed", "incident_id", id) == 1
+                && plan.add_incidents.iter().any(|incident| incident.incident_id == id
+                    && incident.scope_id == event.scope_id
+                    && incident.code == "SCOPE_LIMIT"
+                    && node == incident.node_id.as_deref())
+                && event.data["parent_token_id"].as_str().is_some_and(|token_id|
+                    plan.create_tokens.iter().any(|token|
+                        token.token_id == token_id && token.scope_id == event.scope_id
+                            && token.node_id.as_str() == node.unwrap_or_default()
+                            && token.status == "waiting")
+                    && event.data == serde_json::json!({
+                        "parent_token_id":token_id,"scope_id":event.scope_id,
+                        "subprocess_node_id":node,"incident_id":id,
+                        "code":"SCOPE_LIMIT","reason":"scope_limit"}))),
+            "message_error" => event.data["incident_id"].as_str().is_some_and(|id|
+                count("message_error", "incident_id", id) == 1
+                && plan.add_incidents.iter().any(|incident| incident.incident_id == id
+                    && incident.scope_id == event.scope_id
+                    && incident.code == "MESSAGE_PREDICATE_ERROR"
+                    && node == incident.node_id.as_deref()
+                    && event.data["subscription_id"].as_str().is_some_and(|subscription_id|
+                        plan.create_subscriptions.iter().any(|subscription|
+                            subscription.subscription_id == subscription_id
+                                && subscription.scope_id == event.scope_id
+                                && node == Some(subscription.node_id.as_str())
+                                && subscription.status == ProcessSubscriptionStatus::Error
+                                && event.data == serde_json::json!({
+                                    "subscription_id":subscription_id,
+                                    "attached_token_id":subscription.token_id,
+                                    "incident_id":id,"reason":incident.message}))))),
+            "instance_error" => event.scope_id == instance_id && node.is_none()
+                && plan.terminal_error.as_ref().is_some_and(|fact|
+                    event.data == serde_json::json!({"error_ref":fact.error_ref,
+                        "error_code":fact.error_code}))
+                && plan.events.iter().filter(|candidate| candidate.kind == "instance_error").count() == 1,
+            _ => false,
+        };
+        ensure!(linked,
+            "termination history has an unlinked or duplicate effect fact at local event {event_index} ({})",
+            event.kind);
+    }
+    ensure!(plan.create_user_tasks.iter().all(|task| plan.events.iter().filter(|event|
+        event.kind == "user_task_opened"
+            && event.data["user_task_id"].as_str() == Some(task.user_task_id.as_str())).count() == 1)
+        && plan.create_jobs.iter().all(|job| plan.events.iter().filter(|event|
+            event.kind == "service_queued"
+                && event.data["job_id"].as_str() == Some(job.job_id.as_str())).count() == 1)
+        && plan.create_timers.iter().all(|timer| plan.events.iter().filter(|event|
+            matches!(event.kind.as_str(), "timer_armed" | "timer_error")
+                && event.data["timer_id"].as_str() == Some(timer.timer_id.as_str())).count() == 1)
+        && plan.create_subscriptions.iter().all(|subscription| plan.events.iter().filter(|event|
+            matches!(event.kind.as_str(), "message_armed" | "error_boundary_armed"
+                | "escalation_boundary_armed")
+                && event.data["subscription_id"].as_str()
+                    == Some(subscription.subscription_id.as_str())).count() == 1)
+        && plan.create_event_races.iter().all(|race| plan.events.iter().filter(|event|
+            event.kind == "event_race_armed"
+                && event.data["race_id"].as_str() == Some(race.race_id.as_str())).count() == 1)
+        && plan.create_scopes.iter().all(|scope| plan.events.iter().filter(|event|
+            event.kind == "scope_entered"
+                && event.data["scope_id"].as_str() == Some(scope.scope_id.as_str())).count() == 1)
+        && plan.call_requests.iter().all(|request| plan.events.iter().filter(|event|
+            event.kind == "call_requested"
+                && event.data["call_id"].as_str() == Some(request.call_id.as_str())).count() == 1)
+        && plan.add_incidents.iter().all(|incident| plan.events.iter().filter(|event|
+            event.kind == "incident" && event.scope_id == incident.scope_id
+                && event.node_id == incident.node_id
+                && event.data["code"].as_str() == Some(incident.code.as_str())
+                && event.data["message"].as_str() == Some(incident.message.as_str())).count()
+                == plan.add_incidents.iter().filter(|other|
+                    other.scope_id == incident.scope_id && other.node_id == incident.node_id
+                    && other.code == incident.code && other.message == incident.message).count()),
+        "termination durable effects differ from their exact creation facts");
+    for timer in &plan.create_timers {
+        let event = plan.events.iter().find(|event|
+            matches!(event.kind.as_str(), "timer_armed" | "timer_error")
+                && event.data["timer_id"].as_str() == Some(timer.timer_id.as_str()))
+            .context("termination timer lacks its unique arm fact")?;
+        let node = scope_node(model, scopes, instance_id,
+            timer.scope_id.as_deref().context("termination timer scope is missing")?,
+            &timer.node_id)?;
+        let attached_to_id = match &node.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.as_str()),
+            ProcessNodeKind::TimerCatch { .. } => None,
+            _ => bail!("termination timer arm references another pinned node"),
+        };
+        let mut expected = if timer.status == ProcessTimerStatus::Pending {
+            serde_json::json!({"kind":timer.kind,"timer_id":timer.timer_id,
+                "attached_to_id":attached_to_id,
+                "attached_token_id":if timer.kind == ProcessTimerKind::Boundary {
+                    timer.token_id.as_deref() } else { None },
+                "due_at_ms":timer.due_at_ms,"timezone":timer.timezone,"occurrence":1})
+        } else {
+            let incident_id = event.data["incident_id"].as_str()
+                .context("termination timer error has no incident identity")?;
+            let incident = plan.add_incidents.iter().find(|incident|
+                incident.incident_id == incident_id && incident.code == "TIMER_ERROR"
+                    && incident.scope_id == event.scope_id
+                    && incident.node_id.as_deref() == Some(timer.node_id.as_str()))
+                .context("termination timer error has no factual incident")?;
+            serde_json::json!({"kind":timer.kind,"timer_id":timer.timer_id,
+                "attached_to_id":attached_to_id,"attached_token_id":timer.token_id,
+                "incident_id":incident_id,"reason":incident.message,
+                "due_at_ms":timer.due_at_ms})
+        };
+        if let Some(working_time) = super::calendar::working_time_summary(
+            &timer.rule, model.calendar_pin.as_ref(), timer.due_at_ms)? {
+            expected["working_time"] = serde_json::to_value(working_time)?;
+            expected["timezone"] = serde_json::json!(timer.timezone);
+        }
+        ensure!(event.data == expected,
+            "termination timer arm history differs from its exact planned slot");
+    }
+    for subscription in &plan.create_subscriptions {
+        let event = plan.events.iter().find(|event|
+            event.data["subscription_id"].as_str()
+                == Some(subscription.subscription_id.as_str())
+                && matches!(event.kind.as_str(), "message_armed" | "error_boundary_armed"
+                    | "escalation_boundary_armed"))
+            .context("termination subscription lacks its unique arm fact")?;
+        let node = scope_node(model, scopes, instance_id,
+            &subscription.scope_id, &subscription.node_id)?;
+        let (kind, expected) = match &node.kind {
+            ProcessNodeKind::BoundaryEscalation { attached_to_id, cancel_activity, .. } =>
+                ("escalation_boundary_armed", serde_json::json!({
+                    "subscription_id":subscription.subscription_id,
+                    "attached_token_id":subscription.token_id,
+                    "attached_to_id":attached_to_id,
+                    "escalation_code":subscription.escalation_code,
+                    "cancel_activity":cancel_activity})),
+            ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. } =>
+                (if subscription.kind == ProcessSubscriptionKind::BoundaryError {
+                    "error_boundary_armed" } else { "message_armed" },
+                    serde_json::json!({"subscription_id":subscription.subscription_id,
+                        "token_id":subscription.token_id,"attached_to_id":attached_to_id,
+                        "message_name":subscription.message_name,
+                        "correlation_key":subscription.correlation_key,
+                        "error_code":subscription.error_code,"race_id":subscription.race_id,
+                        "kind":subscription.kind})),
+            ProcessNodeKind::MessageCatch { .. } =>
+                ("message_armed", serde_json::json!({
+                    "subscription_id":subscription.subscription_id,
+                    "token_id":subscription.token_id,"attached_to_id":None::<String>,
+                    "message_name":subscription.message_name,
+                    "correlation_key":subscription.correlation_key,
+                    "error_code":subscription.error_code,"race_id":subscription.race_id,
+                    "kind":subscription.kind})),
+            _ => bail!("termination subscription arm references another pinned node"),
+        };
+        ensure!(event.kind == kind && event.data == expected,
+            "termination subscription arm history differs from its factual row");
+    }
+    ensure!(plan.complete_user_task_ids.iter().all(|id| plan.events.iter().filter(|event|
+        matches!(event.kind.as_str(), "user_task_completed" | "verification_approved"
+            | "verification_rejected")
+            && event.data["user_task_id"].as_str() == Some(id.as_str())).count() == 1)
+        && plan.complete_job_ids.iter().all(|_| plan.events.iter()
+            .filter(|event| event.kind == "service_result").count() == 1)
+        && plan.timer_updates.iter().all(|update| match update.status {
+            ProcessTimerStatus::Cancelled => plan.events.iter().filter(|event|
+                event.kind == "timer_cancelled"
+                    && event.data["timer_id"].as_str() == Some(update.timer_id.as_str())).count() == 1,
+            ProcessTimerStatus::Fired => plan.events.iter().filter(|event|
+                event.kind == "timer_fired"
+                    && event.data["timer_id"].as_str() == Some(update.timer_id.as_str())).count() == 1,
+            _ => true,
+        })
+        && plan.subscription_updates.iter().all(|update| match update.status {
+            ProcessSubscriptionStatus::Cancelled => plan.events.iter().filter(|event|
+                event.kind == "subscription_cancelled"
+                    && event.data["subscription_id"].as_str()
+                        == Some(update.subscription_id.as_str())).count() == 1,
+            ProcessSubscriptionStatus::Consumed => plan.events.iter().filter(|event|
+                matches!(event.kind.as_str(), "message_delivered" | "business_error_caught"
+                    | "escalation_caught")
+                    && event.data["subscription_id"].as_str()
+                        == Some(update.subscription_id.as_str())).count() == 1,
+            _ => true,
+        })
+        && plan.race_updates.iter().all(|update| plan.events.iter().filter(|event|
+            event.data["race_id"].as_str() == Some(update.race_id.as_str())
+                && (event.kind == "event_race_won"
+                    && update.status == ProcessEventRaceStatus::Won
+                    || event.kind == "event_race_cancelled"
+                        && update.status == ProcessEventRaceStatus::Cancelled)).count() == 1),
+        "termination control updates differ from their factual transition history");
+    Ok(())
+}
+
+fn validate_termination_plan_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    expected_revision: u64,
+    plan: &RuntimePlan,
+    call_source: Option<&BusinessErrorSource>,
+    entry: EntryAuthority<'_>,
+) -> Result<HashSet<String>> {
+    let mut mapping_scopes = Vec::new();
+    let variable_states = if plan.termination_attempts.is_empty() {
+        Vec::new()
+    } else {
+        let persisted_scopes = scopes_on(tx, instance_id, model)?;
+        mapping_scopes = scopes.to_vec();
+        for scope in &mut mapping_scopes {
+            if let Some(persisted) = persisted_scopes.iter().find(|persisted|
+                persisted.scope_id == scope.scope_id) {
+                scope.status = persisted.status.clone();
+            } else {
+                ensure!(plan.create_scopes.iter().any(|created|
+                    created.scope_id == scope.scope_id),
+                    "termination mapping references an unplanned scope");
+                // Mapping occurs while a new scope is active, before its same-plan closure.
+                scope.status = ProcessInstanceStatus::Running;
+            }
+        }
+        validate_termination_variables_on(tx, instance_id, model, &mapping_scopes, plan, call_source)?
+    };
+    if !plan.termination_attempts.is_empty() {
+        validate_termination_action_provenance_on(tx, instance_id, model,
+            &mapping_scopes, plan, &variable_states, call_source, entry)?;
+    }
+    let mut sources = HashSet::new();
+    let mut successful_scopes = HashSet::new();
+    let mut previous_index = None;
+    for attempt in &plan.termination_attempts {
+        let (source_instance_id, source_scope_id, source_node_id, source_token_id,
+            source_arrival_edge_id, parent_token_id, source_event_index, source_event_id,
+            accepted_input) = match attempt {
+            TerminationAttempt::Success(source) => (
+                &source.source_instance_id, &source.source_scope_id, &source.source_node_id,
+                &source.source_token_id, &source.source_arrival_edge_id, source.parent_token_id.as_deref(),
+                source.source_event_index, &source.source_event_id, &source.accepted_input,
+            ),
+            TerminationAttempt::ReturnFailure(failure) => (
+                &failure.source_instance_id, &failure.source_scope_id, &failure.source_node_id,
+                &failure.source_token_id, &failure.source_arrival_edge_id,
+                Some(failure.parent_token_id.as_str()), failure.source_event_index,
+                &failure.source_event_id, &failure.accepted_input,
+            ),
+        };
+        match accepted_input {
+            AcceptedInputRef::PersistedReady { token_id, expected_instance_revision } => {
+                let actual: Option<String> = tx.query_row(
+                    "SELECT status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+                    params![instance_id, token_id], |row| row.get(0)).optional()?;
+                ensure!(matches!(entry, EntryAuthority::PersistedReady | EntryAuthority::Accepted(_))
+                    && *expected_instance_revision == expected_revision
+                    && actual.as_deref() == Some("ready"),
+                    "termination persisted-ready input is not an actual ready activation");
+            }
+            _ => ensure!(matches!(entry, EntryAuthority::Accepted(actual) if actual == accepted_input),
+                "termination input differs from its authenticated writer entry"),
+        }
+        ensure!(source_instance_id == instance_id
+            && Uuid::parse_str(source_event_id).is_ok()
+            && sources.insert(source_token_id.clone())
+            && previous_index.is_none_or(|index| index < source_event_index),
+            "termination attempt has a duplicate or out-of-order source");
+        previous_index = Some(source_event_index);
+        let effect_count = match attempt {
+            TerminationAttempt::Success(source) => source.variable_effect_count,
+            TerminationAttempt::ReturnFailure(failure) => failure.variable_effect_count,
+        };
+        ensure!(effect_count <= plan.variable_effects.len(),
+            "termination source variable cutoff exceeds its accepted prefix");
+        ensure!(plan.variable_effects.iter().take(effect_count).all(|effect| match effect {
+            VariableEffect::Mapped { event_index, .. }
+            | VariableEffect::ScopeEntry { event_index, .. } => *event_index <= source_event_index,
+        }) && plan.variable_effects.iter().skip(effect_count).all(|effect| match effect {
+            VariableEffect::Mapped { event_index, .. }
+            | VariableEffect::ScopeEntry { event_index, .. } => *event_index >= source_event_index,
+        }), "termination variable cutoff does not match source event order");
+        let source_locals = variable_states.get(effect_count)
+            .context("termination source has no independently replayed variable prefix")?;
+        ensure!(plan.event_ids.get(&source_event_index) == Some(source_event_id),
+            "termination source event ID differs from its local event index");
+        let source_event = plan.events.get(source_event_index)
+            .context("termination attempt source event is missing")?;
+        let scope = scopes.iter().find(|scope| scope.scope_id == *source_scope_id)
+            .context("termination source scope does not exist")?;
+        ensure!(scope.parent_token_id.as_deref() == parent_token_id,
+            "termination source changed its enclosing wait");
+        let source = termination_token_on(tx, instance_id, plan, source_token_id)?;
+        ensure!(source.scope_id == *source_scope_id && source.node_id == *source_node_id
+            && source.arrival_edge_id.as_ref() == source_arrival_edge_id.as_ref()
+            && source.status == "ready"
+            && plan.consume_token_ids.iter().filter(|id| *id == source_token_id).count() == 1
+            && !plan.cancel_token_ids.contains(source_token_id),
+            "termination source is not one factual consumed ready token");
+        let path = scope_path(scopes, instance_id, source_scope_id)?;
+        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let node = nodes.iter().find(|node| node.id == *source_node_id)
+            .context("termination source node is outside its pinned body")?;
+        ensure!(matches!(node.kind, ProcessNodeKind::TerminateEnd),
+            "termination source is not a pinned TerminateEnd");
+        let pairs = super::model::gateway_pairs(nodes, flows)?;
+        for frame in &source.fork_stack {
+            let pair = pairs.get(&frame.split_node_id)
+                .context("terminating fork frame has no pinned split")?;
+            ensure!(pair.kind == frame.gateway_kind
+                && pair.join_node_id == frame.join_node_id
+                && frame.selected_branch_edge_ids.binary_search(&frame.branch_edge_id).is_ok()
+                && pair.branches.get(&frame.branch_edge_id)
+                    .is_some_and(|branch| branch.terminate_end_node_ids.contains(source_node_id)),
+                "termination source did not follow its selected branch terminal frontier");
+        }
+        if let Some(arrival) = source_arrival_edge_id {
+            ensure!(flows.iter().any(|flow| flow.id == *arrival && flow.target_id == *source_node_id),
+                "termination source arrived from another body");
+        }
+        let fact = match attempt {
+            TerminationAttempt::Success(_) => {
+                ensure!(successful_scopes.insert(source_scope_id.clone())
+                    && plan.cancel_scope_roots.iter().filter(|id| *id == source_scope_id).count() == 1,
+                    "termination closure lacks one unique source scope");
+                let expected = serde_json::json!({
+                    "source_instance_id":instance_id,"source_event_id":source_event_id,
+                    "source_token_id":source_token_id,"source_scope_id":source_scope_id,
+                    "source_node_id":source_node_id,"terminated_scope_id":source_scope_id,
+                });
+                ensure!(source_event.kind == "terminate_end_reached"
+                    && source_event.scope_id == *source_scope_id
+                    && source_event.node_id.as_deref() == Some(source_node_id)
+                    && source_event.data == expected,
+                    "termination source history differs from its factual token");
+                true
+            }
+            TerminationAttempt::ReturnFailure(failure) => {
+                ensure!(source_scope_id != instance_id
+                    && !plan.cancel_scope_roots.contains(source_scope_id)
+                    && failure.parent_token_id == scope.parent_token_id.as_deref().unwrap_or(""),
+                    "failed return may not close a root or its parent wait");
+                let parent_scope_id = scope.parent_scope_id.as_deref()
+                    .context("failed return has no enclosing scope")?;
+                let parent_node_id = scope.subprocess_node_id.as_deref()
+                    .context("failed return has no enclosing subprocess")?;
+                let parent_node = scope_node(model, scopes, instance_id, parent_scope_id, parent_node_id)?;
+                let ProcessNodeKind::SubProcess { output_mapping, .. } = &parent_node.kind else {
+                    bail!("failed return parent is not its pinned subprocess")
+                };
+                let parent_prior_revision = if parent_scope_id == instance_id { expected_revision }
+                    else { scopes.iter().find(|prior| prior.scope_id == parent_scope_id)
+                        .context("failed return parent has no scoped state")?.revision };
+                ensure!(failure.child_scope_revision == scope.revision
+                    && failure.parent_scope_revision == parent_prior_revision,
+                    "failed return scope revisions differ from its accepted input");
+                let child_local = source_locals.get(source_scope_id)
+                    .context("failed return child variables are absent")?;
+                let root_variables = source_locals.get(instance_id)
+                    .context("failed return root variables are absent")?;
+                let parent_effective = effective_scope_variables(&mapping_scopes, source_locals, instance_id,
+                    root_variables, parent_scope_id)?;
+                ensure!(failure.pre_return_child_locals == *child_local
+                    && failure.pre_return_parent_effective == parent_effective,
+                    "failed return variables differ from its accepted prefix");
+                let parent_local = source_locals.get(parent_scope_id)
+                    .context("failed return parent locals are absent")?;
+                let mapping_error = match super::runtime::patch_variables(output_mapping,
+                    parent_local, &parent_effective, child_local, &[]) {
+                    Ok(_) => bail!("failed return actually has a successful pinned output mapping"),
+                    Err(error) => error,
+                };
+                let expected_message = bounded_failure_message(&format!("{mapping_error:#}"));
+                let waiting = plan.create_tokens.iter().filter(|token|
+                    token.token_id == failure.waiting_token_id && token.scope_id == *source_scope_id
+                        && token.node_id == *source_node_id && token.arrival_edge_id.as_ref() == source_arrival_edge_id.as_ref()
+                        && token.fork_stack == source.fork_stack && token.status == "waiting")
+                    .count();
+                let incident = plan.add_incidents.iter().filter(|incident|
+                    incident.incident_id == failure.incident_id && incident.scope_id == *source_scope_id
+                        && incident.node_id.as_deref() == Some(source_node_id)
+                        && incident.code == "SCOPE_RETURN_ERROR" && incident.job_id.is_none()
+                        && !incident.can_retry).collect::<Vec<_>>();
+                ensure!(waiting == 1 && incident.len() == 1,
+                    "failed return must park one source and one nonretryable incident");
+                ensure!(incident[0].message == expected_message,
+                    "failed return incident differs from the actual pinned mapping error");
+                let expected = serde_json::json!({
+                    "incident_id":failure.incident_id,"code":"SCOPE_RETURN_ERROR",
+                    "message":incident[0].message,"source_kind":"terminate_end_return_failure",
+                    "source_instance_id":instance_id,"source_event_id":source_event_id,
+                    "source_scope_id":source_scope_id,"source_node_id":source_node_id,
+                    "source_token_id":source_token_id,"waiting_token_id":failure.waiting_token_id,
+                    "parent_token_id":failure.parent_token_id,
+                });
+                ensure!(source_event.kind == "incident" && source_event.scope_id == *source_scope_id
+                    && source_event.node_id.as_deref() == Some(source_node_id)
+                    && source_event.data == expected,
+                    "failed return history differs from its parked factual source");
+                false
+            }
+        };
+        let seed_token_id = match accepted_input {
+            AcceptedInputRef::PersistedReady { token_id, expected_instance_revision } => {
+                ensure!(*expected_instance_revision == expected_revision
+                    && !plan.create_tokens.iter().any(|token| token.token_id == *token_id),
+                    "persisted termination input changed its ready source or revision");
+                Some(token_id.clone())
+            }
+            AcceptedInputRef::Start { instance_id: started, .. } => {
+                ensure!(started == instance_id && plan.start_instance_id.as_deref() == Some(instance_id),
+                    "termination start input differs from its instance");
+                None
+            }
+            AcceptedInputRef::Human { task_id, expected_task_revision, expected_instance_revision, .. } => {
+                let task: (u64, String) = tx.query_row(
+                    "SELECT revision,token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                    params![instance_id,task_id], |row| Ok((row_u64(row,0)?,row.get(1)?)))?;
+                ensure!(task.0 == *expected_task_revision && *expected_instance_revision == expected_revision
+                    && plan.complete_user_task_ids.contains(task_id)
+                    && plan.consume_token_ids.contains(&task.1),
+                    "terminating human input differs from its open submitted task");
+                Some(task.1)
+            }
+            AcceptedInputRef::Timer { timer_id, expected_timer_revision, fired_occurrence } => {
+                let timer = timer_on(tx,timer_id)?;
+                ensure!(timer.instance_id.as_deref() == Some(instance_id)
+                    && timer.revision == *expected_timer_revision
+                    && plan.timer_updates.iter().any(|update| update.timer_id == *timer_id
+                        && update.fired_occurrence == Some(*fired_occurrence)),
+                    "terminating timer input differs from its due slot");
+                timer.token_id.clone()
+            }
+            AcceptedInputRef::Message { org_id, sender_user_id, message_id,
+                expected_message_revision, target_subscription_id, expected_subscription_revision } => {
+                let key = MessageKey {org_id:org_id.clone(), sender_user_id:sender_user_id.clone(),
+                    message_id:message_id.clone()};
+                let message = message_on(tx,&key,false)?;
+                ensure!(message.revision == *expected_message_revision
+                    && plan.events.iter().any(|event| event.kind == "message_delivered"
+                        && event.data["message_id"].as_str() == Some(message_id)),
+                    "terminating message input differs from its immutable envelope");
+                if let Some(id) = target_subscription_id {
+                    let subscription: (u64,String) = tx.query_row(
+                        "SELECT revision,token_id FROM bpmn_event_subscriptions WHERE instance_id=?1 AND subscription_id=?2 AND status='open'",
+                        params![instance_id,id], |row| Ok((row_u64(row,0)?,row.get(1)?)))?;
+                    ensure!(Some(subscription.0) == *expected_subscription_revision
+                        && plan.subscription_updates.iter().any(|update| update.subscription_id == *id
+                            && update.status == ProcessSubscriptionStatus::Consumed),
+                        "terminating catch input differs from its open subscription");
+                    Some(subscription.1)
+                } else {
+                    ensure!(plan.start_instance_id.as_deref() == Some(instance_id),
+                        "message start input unexpectedly names a catch");
+                    None
+                }
+            }
+            AcceptedInputRef::Service { job_id, attempt, fence, result_event_id } => {
+                let job: (u32,u64,String,String) = tx.query_row(
+                    "SELECT attempt,fence,status,token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2",
+                    params![instance_id,job_id], |row| Ok((row.get(0)?,row_u64(row,1)?,row.get(2)?,row.get(3)?)))?;
+                ensure!(job.0 == *attempt && job.1 == *fence && job.2 == "running"
+                    && plan.complete_job_ids.contains(job_id)
+                    && plan.event_ids.iter().any(|(index,id)| id == result_event_id
+                        && plan.events.get(*index).is_some_and(|event| event.kind == "service_result")),
+                    "terminating service input differs from its accepted fenced result");
+                Some(job.3)
+            }
+            AcceptedInputRef::CallReturn { call_id, child_instance_id, expected_child_revision, parent_token_id } => {
+                let call = calls_on(tx, instance_id)?.into_iter()
+                    .find(|call| call.call_id == *call_id)
+                    .context("terminating call return activation is missing")?;
+                let child: (u64,String) = tx.query_row(
+                    "SELECT revision,status FROM bpmn_instances WHERE instance_id=?1",
+                    [child_instance_id], |row| Ok((row_u64(row,0)?,row.get(1)?)))?;
+                ensure!(call.parent_instance_id == instance_id
+                    && call.child_instance_id == *child_instance_id
+                    && call.parent_token_id == *parent_token_id
+                    && child.0 == *expected_child_revision,
+                    "terminating call return changed its actual child or revision");
+                if let Some(source) = call_source {
+                    validate_business_source_on(tx, source, &call)?;
+                    ensure!(child.1 != "completed"
+                        && (plan.consume_token_ids.contains(parent_token_id)
+                            || plan.cancel_token_ids.contains(parent_token_id))
+                        && plan.events.iter().any(|event| event.kind == "call_error_propagated"
+                            && event.data["call_id"].as_str() == Some(call_id.as_str()))
+                        && plan.events.iter().any(|event| event.kind == "business_error_caught"
+                            && event.data["attached_token_id"].as_str() == Some(parent_token_id.as_str())),
+                        "terminating call error lacks its authenticated caught source");
+                } else {
+                    ensure!(child.1 == "completed"
+                        && plan.consume_token_ids.contains(parent_token_id)
+                        && plan.events.iter().any(|event| event.kind == "call_returned"
+                            && event.data["call_id"].as_str() == Some(call_id.as_str())),
+                        "terminating normal call return is not a factual completed child");
+                }
+                Some(parent_token_id.clone())
+            }
+        };
+        trace_termination_source_on(tx, instance_id, model, scopes, plan, source_token_id,
+            seed_token_id.as_deref(), accepted_input, &mut HashSet::new())?;
+        if fact {
+            let closure = descendant_scope_ids(scopes, source_scope_id)?;
+            let mut active_tokens = tx.prepare(
+                "SELECT token_id,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')",
+            )?;
+            let persisted_tokens = active_tokens.query_map([instance_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(active_tokens);
+            for (token_id, scope_id) in persisted_tokens {
+                if closure.contains(&scope_id) {
+                    ensure!(plan.consume_token_ids.contains(&token_id)
+                        || plan.cancel_token_ids.contains(&token_id),
+                        "terminated scope retains a persisted active token");
+                }
+            }
+            let mut controls = tx.prepare(
+                "SELECT 'task',user_task_id,scope_id FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open' UNION ALL SELECT 'job',job_id,scope_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running','error') UNION ALL SELECT 'incident',incident_id,scope_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL UNION ALL SELECT 'timer',timer_id,scope_id FROM bpmn_timers WHERE instance_id=?1 AND status IN ('pending','blocked') UNION ALL SELECT 'subscription',subscription_id,scope_id FROM bpmn_event_subscriptions WHERE instance_id=?1 AND status='open' UNION ALL SELECT 'race',race_id,scope_id FROM bpmn_event_races WHERE instance_id=?1 AND status='open' UNION ALL SELECT 'receipt',token_id,scope_id FROM bpmn_gateway_receipts WHERE instance_id=?1",
+            )?;
+            let persisted_controls = controls.query_map([instance_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(controls);
+            for (kind, id, scope_id) in persisted_controls {
+                if !closure.contains(&scope_id) { continue; }
+                let closed = match kind.as_str() {
+                    "task" => plan.complete_user_task_ids.contains(&id)
+                        || plan.cancel_user_task_ids.contains(&id),
+                    "job" => plan.complete_job_ids.contains(&id)
+                        || plan.cancel_job_ids.contains(&id),
+                    "incident" => plan.resolve_incident_ids.contains(&id),
+                    "timer" => plan.timer_updates.iter().any(|update| update.timer_id == id
+                        && !matches!(update.status, ProcessTimerStatus::Pending
+                            | ProcessTimerStatus::Blocked)),
+                    "subscription" => plan.subscription_updates.iter().any(|update|
+                        update.subscription_id == id),
+                    "race" => plan.race_updates.iter().any(|update| update.race_id == id),
+                    "receipt" => plan.remove_gateway_receipts.iter().any(|receipt|
+                        receipt.token_id == id),
+                    _ => false,
+                };
+                ensure!(closed, "terminated scope retained a persisted control row");
+            }
+            for token in &plan.create_tokens {
+                if closure.contains(&token.scope_id) && token.token_id != *source_token_id {
+                    ensure!(plan.consume_token_ids.contains(&token.token_id)
+                        || plan.cancel_token_ids.contains(&token.token_id),
+                        "terminated closure retained a same-plan token");
+                }
+            }
+            for task in plan.create_user_tasks.iter().filter(|task| closure.contains(&task.scope_id)) {
+                ensure!(plan.complete_user_task_ids.contains(&task.user_task_id)
+                    || plan.cancel_user_task_ids.contains(&task.user_task_id),
+                    "terminated scope retains same-plan open work");
+            }
+            for job in plan.create_jobs.iter().filter(|job| closure.contains(&job.scope_id)) {
+                ensure!(plan.complete_job_ids.contains(&job.job_id)
+                    || plan.cancel_job_ids.contains(&job.job_id),
+                    "terminated scope retains same-plan active service work");
+            }
+            for timer in plan.create_timers.iter().filter(|timer|
+                timer.scope_id.as_ref().is_some_and(|scope_id| closure.contains(scope_id))) {
+                ensure!(plan.timer_updates.iter().any(|update| update.timer_id == timer.timer_id
+                    && !matches!(update.status, ProcessTimerStatus::Pending
+                        | ProcessTimerStatus::Blocked)),
+                    "terminated scope retains same-plan timer");
+            }
+            for subscription in plan.create_subscriptions.iter().filter(|subscription|
+                closure.contains(&subscription.scope_id)) {
+                ensure!(plan.subscription_updates.iter().any(|update|
+                    update.subscription_id == subscription.subscription_id),
+                    "terminated scope retains same-plan subscription");
+            }
+            for race in plan.create_event_races.iter().filter(|race| closure.contains(&race.scope_id)) {
+                ensure!(plan.race_updates.iter().any(|update| update.race_id == race.race_id),
+                    "terminated scope retains same-plan event race");
+            }
+            for incident in plan.add_incidents.iter().filter(|incident| closure.contains(&incident.scope_id)) {
+                ensure!(plan.resolve_incident_ids.contains(&incident.incident_id),
+                    "terminated scope retains same-plan incident");
+            }
+            for receipt in plan.add_gateway_receipts.iter().filter(|receipt| closure.contains(&receipt.scope_id)) {
+                ensure!(plan.remove_gateway_receipts.iter().any(|removed|
+                    removed.scope_id == receipt.scope_id
+                        && removed.join_node_id == receipt.join_node_id
+                        && removed.activation_id == receipt.activation_id
+                        && removed.branch_edge_id == receipt.branch_edge_id
+                        && removed.token_id == receipt.token_id
+                        && removed.gateway_kind == receipt.gateway_kind),
+                    "terminated scope retains same-plan gateway receipt");
+            }
+        }
+    }
+    let successes = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
+        TerminationAttempt::Success(source) => Some(source),
+        TerminationAttempt::ReturnFailure(_) => None,
+    }).collect::<Vec<_>>();
+    let mut authorized_roots = successes.iter().map(|source|
+        source.source_scope_id.clone()).collect::<HashSet<_>>();
+    for root in &plan.cancel_scope_roots {
+        if authorized_roots.contains(root) { continue; }
+        if root == instance_id {
+            let fact = plan.terminal_error.as_ref()
+                .context("ordinary root closure lacks a factual terminal ErrorEnd")?;
+            ensure!(plan.events.iter().enumerate().any(|(index,event)|
+                event.kind == "error_end_reached"
+                    && event.scope_id == fact.source_scope_id
+                    && event.node_id.as_deref() == Some(fact.source_node_id.as_str())
+                    && plan.event_ids.get(&index) == Some(&fact.source_event_id)
+                    && plan.event_sources.get(&index).is_some_and(|source_token_id|
+                        ordinary_error_source_matches_entry_on(tx, instance_id,
+                            model, scopes, plan, source_token_id,
+                            expected_revision, entry).unwrap_or(false))),
+                "ordinary root closure changed its ErrorEnd source");
+            authorized_roots.insert(root.clone());
+            continue;
+        }
+        let child = scopes.iter().find(|scope| scope.scope_id == *root)
+            .context("ordinary scope closure has no retained child")?;
+        let parent_scope = child.parent_scope_id.as_deref()
+            .context("ordinary scope closure has no parent")?;
+        let attached_id = child.parent_token_id.as_deref()
+            .context("ordinary scope closure has no attached wait")?;
+        let attached = termination_token_on(tx, instance_id, plan, attached_id)?;
+        ensure!(attached.scope_id == parent_scope && attached.status == "waiting",
+            "ordinary scope closure changed its attached waiting token");
+        let accepted_error_service = |caught: &PlannedEvent| -> Result<bool> {
+            let EntryAuthority::Accepted(AcceptedInputRef::Service {
+                job_id, attempt, fence, result_event_id,
+            }) = entry else { return Ok(false); };
+            if caught.data["job_id"].as_str() != Some(job_id.as_str())
+                || !plan.complete_job_ids.contains(job_id) {
+                return Ok(false);
+            }
+            let job: Option<(String, String, String, String, u32, u64,
+                Option<String>, Option<String>)> = tx.query_row(
+                "SELECT scope_id,node_id,token_id,status,attempt,fence,result_json,result_origin FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2",
+                params![job_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?,
+                    row.get(2)?, row.get(3)?, row.get(4)?, row_u64(row, 5)?,
+                    row.get(6)?, row.get(7)?))).optional()?;
+            let Some((scope_id, node_id, token_id, status, actual_attempt,
+                actual_fence, Some(stored_result), Some(origin))) = job else {
+                return Ok(false);
+            };
+            let result: ActivityResult = parse(stored_result)?;
+            let mut expected_event = serde_json::to_value(&result)?;
+            expected_event["result_origin"] = serde_json::json!("contract");
+            let mut result_events = plan.events.iter().enumerate()
+                .filter(|(_, event)| event.kind == "service_result");
+            let Some((result_index, result_event)) = result_events.next() else {
+                return Ok(false);
+            };
+            if result_events.next().is_some() { return Ok(false); }
+            Ok(status == "running" && actual_attempt == *attempt
+                && actual_fence == *fence && origin == "contract"
+                && result.outcome == ActivityOutcome::Error
+                && caught.data["error_code"] == serde_json::to_value(&result.code)?
+                && caught.data["result_origin"] == "contract"
+                && descendant_scope_ids(scopes, root)?.contains(&scope_id)
+                && result_event.scope_id == scope_id
+                && result_event.node_id.as_deref() == Some(node_id.as_str())
+                && result_event.data == expected_event
+                && plan.event_ids.get(&result_index) == Some(result_event_id)
+                && tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 AND status='waiting')",
+                    params![instance_id,scope_id,node_id,token_id], |row| row.get::<_, bool>(0))?)
+        };
+        let valid_boundary = plan.events.iter().any(|event| {
+            if event.scope_id != parent_scope
+                || event.data["attached_token_id"].as_str() != Some(attached_id) {
+                return false;
+            }
+            let Some(boundary_id) = event.node_id.as_deref() else { return false; };
+            let Ok(boundary) = scope_node(model, scopes, instance_id,
+                parent_scope, boundary_id) else { return false; };
+            let matching_attachment = match &boundary.kind {
+                ProcessNodeKind::BoundaryTimer { attached_to_id, cancel_activity, .. }
+                | ProcessNodeKind::BoundaryMessage { attached_to_id, cancel_activity, .. } =>
+                    *cancel_activity && attached_to_id == &attached.node_id,
+                ProcessNodeKind::BoundaryError { attached_to_id, .. } =>
+                    attached_to_id == &attached.node_id,
+                _ => false,
+            };
+            if !matching_attachment { return false; }
+            match (&boundary.kind, event.kind.as_str()) {
+                (ProcessNodeKind::BoundaryTimer { .. }, "timer_fired") => {
+                    let Some(timer_id) = event.data["timer_id"].as_str() else { return false; };
+                    let Ok(timer) = timer_on(tx, timer_id) else { return false; };
+                    matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Timer {
+                        timer_id: accepted_id, expected_timer_revision, fired_occurrence,
+                    }) if accepted_id == timer_id && *expected_timer_revision == timer.revision
+                        && plan.timer_updates.iter().any(|update|
+                            update.timer_id == timer_id
+                                && update.fired_occurrence == Some(*fired_occurrence)))
+                        && timer.instance_id.as_deref() == Some(instance_id)
+                        && timer.scope_id.as_deref() == Some(parent_scope)
+                        && timer.token_id.as_deref() == Some(attached_id)
+                        && timer.node_id == boundary_id
+                        && timer.kind == ProcessTimerKind::Boundary
+                        && plan.timer_updates.iter().any(|update|
+                            update.timer_id == timer_id
+                                && update.status == ProcessTimerStatus::Fired)
+                        && event.data["timer_id"].as_str() == Some(timer_id)
+                }
+                (ProcessNodeKind::BoundaryMessage { .. }, "message_delivered") => {
+                    let Some(subscription_id) = event.data["subscription_id"].as_str()
+                        else { return false; };
+                    let Ok(subscription) = subscription_on(tx, subscription_id) else { return false; };
+                    matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Message {
+                        target_subscription_id: Some(accepted_id),
+                        expected_subscription_revision: Some(accepted_revision), ..
+                    }) if accepted_id == subscription_id
+                        && *accepted_revision == subscription.revision)
+                        && subscription.instance_id == instance_id
+                        && subscription.scope_id == parent_scope
+                        && subscription.token_id == attached_id
+                        && subscription.node_id == boundary_id
+                        && subscription.status == ProcessSubscriptionStatus::Open
+                        && plan.subscription_updates.iter().any(|update|
+                            update.subscription_id == subscription_id
+                                && update.status == ProcessSubscriptionStatus::Consumed)
+                        && event.data["attached_token_id"].as_str() == Some(attached_id)
+                }
+                (ProcessNodeKind::BoundaryError { .. }, "business_error_caught") => {
+                    let valid_error_end = event.data["source_event_id"].as_str().is_some_and(|id|
+                        plan.events.iter().enumerate().any(|(index,source)|
+                            source.kind == "error_end_reached"
+                                && plan.event_ids.get(&index).is_some_and(|actual| actual == id)
+                                && plan.event_sources.get(&index).is_some_and(|source_token_id|
+                                    ordinary_error_source_matches_entry_on(tx, instance_id,
+                                        model, scopes, plan, source_token_id,
+                                        expected_revision, entry).unwrap_or(false))));
+                    let accepted_job = accepted_error_service(event)
+                        .unwrap_or(false);
+                    let accepted_call = event.data["source_instance_id"].as_str().is_some_and(|id|
+                        call_source.is_some_and(|source| match source {
+                            BusinessErrorSource::ErrorEnd { instance_id, .. }
+                            | BusinessErrorSource::ServiceContract { instance_id, .. } =>
+                                instance_id == id
+                        }));
+                    valid_error_end
+                        || accepted_job
+                        || accepted_call && matches!(entry,
+                            EntryAuthority::Accepted(AcceptedInputRef::CallReturn { .. }))
+                }
+                _ => false,
+            }
+        });
+        ensure!(valid_boundary,
+            "ordinary scope closure lacks an independently accepted boundary activation");
+        authorized_roots.insert(root.clone());
+    }
+    ensure!(plan.cancel_scope_roots.len() == authorized_roots.len()
+        && plan.cancel_scope_roots.iter().all(|root| authorized_roots.contains(root))
+        && successes.iter().all(|source| plan.cancel_scope_roots.contains(&source.source_scope_id)),
+        "termination closure roots differ from their factual sources");
+    ensure!(plan.events.iter().filter(|event| event.kind == "terminate_end_reached").count()
+        == successes.len(), "termination history has an extra or missing source event");
+    let failures = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
+        TerminationAttempt::ReturnFailure(failure) => Some(failure),
+        TerminationAttempt::Success(_) => None,
+    }).collect::<Vec<_>>();
+    ensure!(plan.events.iter().filter(|event| event.kind == "incident"
+        && event.data["source_kind"].as_str() == Some("terminate_end_return_failure"))
+        .count() == failures.len(),
+        "termination return failure has an extra or missing incident fact");
+    for failure in &failures {
+        ensure!(plan.events.iter().filter(|event| event.kind == "incident"
+            && event.scope_id == failure.source_scope_id
+            && event.node_id.as_deref() == Some(failure.source_node_id.as_str())
+            && event.data["source_kind"].as_str() == Some("terminate_end_return_failure")
+            && event.data["source_event_id"].as_str() == Some(failure.source_event_id.as_str()))
+            .count() == 1,
+            "termination return failure incident is not unique to its source");
+        ensure!(!plan.events.iter().any(|event| event.kind == "scope_completed"
+            && event.scope_id == failure.source_scope_id
+            && event.data["reason"].as_str() == Some("terminate_end")),
+            "failed return cannot continue its parent scope");
+    }
+    for source in &successes {
+        if source.source_scope_id == instance_id {
+            let expected = serde_json::json!({"reason":"terminate_end",
+                "source_instance_id":instance_id,"source_event_id":source.source_event_id,
+                "source_scope_id":source.source_scope_id,"source_node_id":source.source_node_id,
+                "source_token_id":source.source_token_id});
+            ensure!(plan.events.iter().filter(|event| event.kind == "instance_completed"
+                && event.scope_id == instance_id && event.node_id.is_none()
+                && event.data == expected).count() == 1,
+                "root termination lacks exactly one canonical completion fact");
+        } else {
+            let scope = scopes.iter().find(|scope| scope.scope_id == source.source_scope_id)
+                .context("terminating child scope disappeared")?;
+            let parent_scope_id = scope.parent_scope_id.as_deref()
+                .context("terminating child lost its parent scope")?;
+            let parent_token_id = scope.parent_token_id.as_deref()
+                .context("terminating child lost its parent waiting token")?;
+            let source_state = variable_states.get(source.variable_effect_count)
+                .context("terminating child lost its source-time variables")?;
+            let child_local = source_state.get(&source.source_scope_id)
+                .context("terminating child lacks source-time locals")?;
+            ensure!(matches!(plan.variable_effects.get(source.variable_effect_count),
+                Some(VariableEffect::Mapped { scope_id, source_token_id, outputs, .. })
+                    if scope_id == parent_scope_id && source_token_id == parent_token_id
+                        && outputs == child_local),
+                "terminating child did not map its actual source-time locals to the parent");
+            let expected = serde_json::json!({"scope_id":scope.scope_id,
+                "parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,
+                "subprocess_node_id":scope.subprocess_node_id,"reason":"terminate_end",
+                "source_instance_id":instance_id,"source_event_id":source.source_event_id});
+            ensure!(plan.events.iter().filter(|event| event.kind == "scope_completed"
+                && event.scope_id == source.source_scope_id && event.node_id.is_none()
+                && event.data == expected).count() == 1,
+                "embedded termination lacks exactly one canonical parent continuation fact");
+        }
+    }
+    ensure!(plan.events.iter().filter(|event| event.data["reason"].as_str() == Some("terminate_end"))
+        .all(|event| successes.iter().any(|source|
+            event.data["source_instance_id"].as_str() == Some(instance_id)
+                && event.data["source_event_id"].as_str() == Some(source.source_event_id.as_str()))),
+        "termination effect history names no successful local source");
+    Ok(successful_scopes)
+}
+
+#[derive(Clone, Copy)]
+enum EntryAuthority<'a> {
+    Accepted(&'a AcceptedInputRef),
+    PersistedReady,
+    CallAdmission,
+}
+
+fn ordinary_error_source_matches_entry_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    source_token_id: &str, expected_revision: u64, entry: EntryAuthority<'_>,
+) -> Result<bool> {
+    match entry {
+        EntryAuthority::Accepted(accepted) => {
+            let seed = match accepted {
+                AcceptedInputRef::Start { .. } => None,
+                AcceptedInputRef::Human { task_id, .. } => Some(tx.query_row(
+                    "SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                    params![instance_id, task_id], |row| row.get::<_, String>(0))?),
+                AcceptedInputRef::Timer { timer_id, .. } => timer_on(tx, timer_id)?.token_id,
+                AcceptedInputRef::Message { target_subscription_id, .. } =>
+                    target_subscription_id.as_ref().map(|id|
+                        subscription_on(tx, id).map(|subscription| subscription.token_id)).transpose()?,
+                AcceptedInputRef::Service { job_id, .. } => Some(tx.query_row(
+                    "SELECT token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                    params![instance_id, job_id], |row| row.get::<_, String>(0))?),
+                AcceptedInputRef::CallReturn { parent_token_id, .. } => Some(parent_token_id.clone()),
+                AcceptedInputRef::PersistedReady { .. } => return Ok(false),
+            };
+            if trace_termination_source_on(tx, instance_id, model, scopes, plan,
+                source_token_id, seed.as_deref(), accepted, &mut HashSet::new()).is_ok() {
+                return Ok(true);
+            }
+        }
+        EntryAuthority::PersistedReady => {}
+        EntryAuthority::CallAdmission => return Ok(false),
+    }
+    let mut statement = tx.prepare(
+        "SELECT token_id FROM bpmn_tokens WHERE instance_id=?1 AND status='ready'")?;
+    let ready = statement.query_map([instance_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for token_id in ready {
+        if !plan.consume_token_ids.contains(&token_id) { continue; }
+        let accepted = AcceptedInputRef::PersistedReady {
+            token_id: token_id.clone(), expected_instance_revision: expected_revision,
+        };
+        if trace_termination_source_on(tx, instance_id, model, scopes, plan,
+            source_token_id, Some(&token_id), &accepted, &mut HashSet::new()).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn apply_plan_on(
@@ -6068,6 +9208,8 @@ fn apply_plan_on(
     expected_revision: u64,
     plan: &RuntimePlan,
     at_ms: i64,
+    call_source: Option<&BusinessErrorSource>,
+    entry: EntryAuthority<'_>,
 ) -> Result<Vec<CancelledJobClaim>> {
     let (current_revision, current_status): (u64, String) = tx.query_row(
         "SELECT revision,status FROM bpmn_instances WHERE instance_id=?1",
@@ -6084,11 +9226,12 @@ fn apply_plan_on(
     let (definition_id,version,org_id,initiator):(String,u32,String,String)=tx.query_row("SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",[instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
     let model = current_version_model_on(tx, &definition_id, version)?;
     validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
+    let successful_terminations = validate_termination_plan_on(tx, instance_id, &model, &proposed_scopes,
+        expected_revision, plan, call_source, entry)?;
     validate_gateway_join_plan_on(tx, instance_id, &model, &proposed_scopes, plan)?;
 
     let mut cancelled_claims = Vec::new();
     insert_scoped_tokens_on(tx, instance_id, plan, at_ms)?;
-    apply_event_plan_on(tx, instance_id, plan, at_ms)?;
     for token_id in &plan.consume_token_ids {
         let mut statement = tx.prepare("SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 AND token_id=?2 AND kind='boundary' AND status IN ('pending','blocked')")?;
         let siblings = statement
@@ -6105,20 +9248,7 @@ fn apply_plan_on(
             );
         }
     }
-    for timer in &plan.create_timers {
-        ensure!(
-            timer.instance_id.as_deref() == Some(instance_id)
-                && matches!(
-                    timer.kind,
-                    ProcessTimerKind::Catch | ProcessTimerKind::Boundary
-                )
-                && timer.anchor_at_ms == at_ms
-                && timer.created_at_ms == at_ms
-                && timer.updated_at_ms == at_ms,
-            "transition may only create activity timers for its instance"
-        );
-        insert_timer_on(tx, timer)?;
-    }
+    apply_event_plan_on(tx, instance_id, &proposed_scopes, &successful_terminations, plan, at_ms)?;
     for update in &plan.timer_updates {
         let actual = timer_on(tx, &update.timer_id)?;
         ensure!(
@@ -6142,7 +9272,7 @@ fn apply_plan_on(
                 .context("boundary cancellation lacks its reason")?;
             ensure!(
                 (reason == "activity_completed" && plan.consume_token_ids.iter().any(|id|id == token_id))
-                    || (matches!(reason,"sibling_interrupted"|"scope_cancelled") && plan.cancel_token_ids.iter().any(|id|id == token_id)),
+                    || (matches!(reason,"sibling_interrupted"|"scope_cancelled"|"terminate_end") && plan.cancel_token_ids.iter().any(|id|id == token_id)),
                 "boundary cancellation does not follow its exact activity completion or interruption"
             );
             ensure!(
@@ -6155,14 +9285,27 @@ fn apply_plan_on(
                 "boundary cancellation lacks its actual activation history"
             );
         }
+        if update.status == ProcessTimerStatus::Cancelled
+            && update.last_reason.as_deref() == Some("terminate_end")
+        {
+            let scope_id = actual.scope_id.as_deref()
+                .context("terminated timer has no exact scope")?;
+            let source = plan.termination_attempts.iter().find_map(|attempt| match attempt {
+                TerminationAttempt::Success(source) if descendant_scope_ids(
+                    &proposed_scopes, &source.source_scope_id)
+                    .is_ok_and(|ids| ids.contains(scope_id)) => Some(source),
+                _ => None,
+            }).context("timer termination lacks a factual source scope")?;
+            let expected = serde_json::json!({"timer_id":actual.timer_id,"kind":actual.kind,
+                "attached_to_id":timer_activation_node(tx, &model, &actual)?,
+                "attached_token_id":actual.token_id,"reason":"terminate_end",
+                "source_instance_id":source.source_instance_id,"source_event_id":source.source_event_id});
+            ensure!(plan.events.iter().filter(|event| event.kind == "timer_cancelled"
+                && event.scope_id == scope_id && event.node_id.as_deref() == Some(actual.node_id.as_str())
+                && event.data == expected).count() == 1,
+                "terminated timer cancellation differs from its pinned activation and source");
+        }
         update_timer_on(tx, update, at_ms)?;
-    }
-    for receipt in &plan.remove_gateway_receipts {
-        let affected=tx.execute("DELETE FROM bpmn_gateway_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5 AND scope_id=?6 AND gateway_kind=?7",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,receipt.scope_id,match receipt.gateway_kind { GatewayKind::Parallel => "parallel", GatewayKind::Inclusive => "inclusive" }])?;
-        ensure!(
-            affected == 1,
-            "gateway join receipt changed before transition"
-        );
     }
     for receipt in &plan.add_gateway_receipts {
         let (node,stack,status,scope):(String,String,String,String)=tx.query_row("SELECT node_id,fork_stack_json,status,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",params![instance_id,receipt.token_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
@@ -6172,13 +9315,20 @@ fn apply_plan_on(
             status == "joining"
                 && scope == receipt.scope_id
                 && node == receipt.join_node_id
-                && frame.join_node_id == receipt.join_node_id
+                && frame.join_node_id.as_deref() == Some(receipt.join_node_id.as_str())
                 && frame.activation_id == receipt.activation_id
                 && frame.branch_edge_id == receipt.branch_edge_id
                 && frame.gateway_kind == receipt.gateway_kind,
             "join receipt differs from its actual scoped joining token"
         );
         tx.execute("INSERT INTO bpmn_gateway_receipts(instance_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,scope_id,gateway_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,at_ms,receipt.scope_id,match receipt.gateway_kind { GatewayKind::Parallel => "parallel", GatewayKind::Inclusive => "inclusive" }])?;
+    }
+    for receipt in &plan.remove_gateway_receipts {
+        let affected=tx.execute("DELETE FROM bpmn_gateway_receipts WHERE instance_id=?1 AND join_node_id=?2 AND activation_id=?3 AND branch_edge_id=?4 AND token_id=?5 AND scope_id=?6 AND gateway_kind=?7",params![instance_id,receipt.join_node_id,receipt.activation_id,receipt.branch_edge_id,receipt.token_id,receipt.scope_id,match receipt.gateway_kind { GatewayKind::Parallel => "parallel", GatewayKind::Inclusive => "inclusive" }])?;
+        ensure!(
+            affected == 1,
+            "gateway join receipt changed before transition"
+        );
     }
     for task in &plan.create_user_tasks {
         ensure!(
@@ -6444,19 +9594,72 @@ fn apply_plan_on(
             at_ms,
         )?;
     }
-    cancelled_claims.extend(cancel_call_children_on(
-        tx,
-        instance_id,
-        Some(&plan.cancel_token_ids),
-        &plan.cancel_scope_roots,
-        actor_id,
-        if plan.terminal_error.is_some() {
-            "error_end"
-        } else {
-            "call_interrupted"
-        },
-        at_ms,
-    )?);
+    for request in &plan.call_requests {
+        if !plan.cancel_token_ids.contains(&request.parent_token_id) {
+            continue;
+        }
+        let source = plan.termination_attempts.iter().find_map(|attempt| match attempt {
+            TerminationAttempt::Success(source) if descendant_scope_ids(
+                &proposed_scopes, &source.source_scope_id)
+                .is_ok_and(|ids| ids.contains(&request.parent_scope_id)) => Some(source),
+            _ => None,
+        });
+        let Some(source) = source else { continue };
+        ensure!(plan.events.iter().filter(|event| event.kind == "call_requested"
+            && event.scope_id == request.parent_scope_id
+            && event.node_id.as_deref() == Some(request.call_node_id.as_str())
+            && event.data["call_id"].as_str() == Some(request.call_id.as_str())
+            && event.data["parent_token_id"].as_str() == Some(request.parent_token_id.as_str()))
+            .count() == 1, "terminated call request lacks its factual request event");
+        let started: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_calls WHERE call_id=?1 AND parent_instance_id=?2)",
+            params![request.call_id, instance_id], |row| row.get(0),
+        )?;
+        ensure!(!started, "terminated unstarted request already owns a called child");
+        let seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [instance_id], |row| row_u64(row, 0),
+        )?;
+        insert_event_on(tx, instance_id, seq, Some(actor_id), &PlannedEvent {
+            scope_id: request.parent_scope_id.clone(),
+            kind: "call_request_cancelled".into(),
+            node_id: Some(request.call_node_id.clone()),
+            data: serde_json::json!({"call_id":request.call_id,
+                "parent_token_id":request.parent_token_id,"reason":"terminate_end",
+                "source_instance_id":source.source_instance_id,
+                "source_event_id":source.source_event_id}),
+        }, at_ms, None)?;
+    }
+    let termination_sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
+        TerminationAttempt::Success(source) => Some(source),
+        TerminationAttempt::ReturnFailure(_) => None,
+    }).collect::<Vec<_>>();
+    let mut terminated_scopes = HashSet::new();
+    for source in &termination_sources {
+        terminated_scopes.extend(descendant_scope_ids(&proposed_scopes, &source.source_scope_id)?);
+    }
+    let mut ordinary_tokens = Vec::new();
+    for token_id in &plan.cancel_token_ids {
+        let scope_id: String = tx.query_row(
+            "SELECT scope_id FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+            params![instance_id, token_id], |row| row.get(0),
+        )?;
+        if !terminated_scopes.contains(&scope_id) {
+            ordinary_tokens.push(token_id.clone());
+        }
+    }
+    let ordinary_roots = plan.cancel_scope_roots.iter()
+        .filter(|scope_id| !terminated_scopes.contains(*scope_id))
+        .cloned().collect::<Vec<_>>();
+    cancelled_claims.extend(cancel_call_children_on(tx, instance_id,
+        Some(&ordinary_tokens), &ordinary_roots, actor_id,
+        if plan.terminal_error.is_some() { "error_end" } else { "call_interrupted" },
+        at_ms, None)?);
+    for source in &termination_sources {
+        cancelled_claims.extend(cancel_call_children_on(tx, instance_id,
+            Some(&[]), std::slice::from_ref(&source.source_scope_id), actor_id,
+            "terminate_end", at_ms, Some(*source))?);
+    }
     for update in &plan.scope_updates {
         if matches!(
             update.status,
@@ -6477,8 +9680,10 @@ fn apply_plan_on(
                 .context("terminal child missing")?;
             if update.status == ProcessInstanceStatus::Completed {
                 let ended:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='end_reached')",params![instance_id,scope.scope_id],|row|row.get(0))?;
+                let terminated = plan.termination_attempts.iter().any(|attempt| matches!(attempt,
+                    TerminationAttempt::Success(source) if source.source_scope_id == scope.scope_id));
                 ensure!(
-                    ended,
+                    ended || terminated,
                     "child completion has not reached its actual local End"
                 );
                 let parent_token = scope
@@ -6543,19 +9748,36 @@ fn apply_plan_on(
                 .as_ref()
                 .is_some_and(|id| closure.contains(id))
             {
+                let termination = termination_sources.iter().find(|source|
+                    message.source_scope_id.as_ref().is_some_and(|scope_id|
+                        descendant_scope_ids(&proposed_scopes, &source.source_scope_id)
+                            .is_ok_and(|ids| ids.contains(scope_id))));
                 ensure!(
                     update_message_state_on(
                         tx,
                         &message,
                         ProcessMessageStatus::Cancelled,
-                        Some("scope_cancelled"),
+                        Some(if termination.is_some() { "terminate_end" } else { "scope_cancelled" }),
                         at_ms,
-                        at_ms
+                        at_ms,
+                        termination.copied(),
                     )?,
                     "outgoing scope receipt changed before closure"
                 );
             }
         }
+    }
+    for source in &termination_sources {
+        let source_closure = descendant_scope_ids(&proposed_scopes, &source.source_scope_id)?;
+        let mut pending = tx.prepare(
+            "SELECT source_scope_id FROM bpmn_messages WHERE source_instance_id=?1 AND status IN ('pending','blocked','ambiguous')",
+        )?;
+        let pending_scopes = pending.query_map([instance_id], |row|
+            row.get::<_, Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(pending);
+        ensure!(pending_scopes.iter().all(|scope|
+            scope.as_ref().is_none_or(|id| !source_closure.contains(id))),
+            "terminated scope retained a pending process outbox receipt");
     }
     validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
     let unresolved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_timers x JOIN bpmn_tokens t ON t.token_id=x.token_id AND t.instance_id=x.instance_id AND t.scope_id=x.scope_id WHERE x.instance_id=?1 AND x.kind='catch' AND x.status='error' AND t.status='waiting')",[instance_id],|row|row.get(0))?;
@@ -6566,8 +9788,10 @@ fn apply_plan_on(
     };
     if status == ProcessInstanceStatus::Completed || status == ProcessInstanceStatus::Error {
         let ended:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?1 AND kind='end_reached')",[instance_id],|row|row.get(0))?;
+        let terminated = plan.termination_attempts.iter().any(|attempt| matches!(attempt,
+            TerminationAttempt::Success(source) if source.source_scope_id == instance_id));
         ensure!(
-            status == ProcessInstanceStatus::Error || ended,
+            status == ProcessInstanceStatus::Error || ended || terminated,
             "root completion has not reached its actual End"
         );
         let active:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')) OR EXISTS(SELECT 1 FROM bpmn_calls WHERE parent_instance_id=?1 AND status IN ('waiting','return_incident')) OR EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_jobs j JOIN bpmn_tokens t ON t.token_id=j.token_id WHERE j.instance_id=?1 AND j.status IN ('queued','running','error') AND t.status IN ('ready','waiting','joining')) OR EXISTS(SELECT 1 FROM bpmn_gateway_receipts WHERE instance_id=?1) OR EXISTS(SELECT 1 FROM bpmn_event_subscriptions WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_timers WHERE instance_id=?1 AND status IN ('pending','blocked')) OR EXISTS(SELECT 1 FROM bpmn_event_races WHERE instance_id=?1 AND status='open') OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL)",[instance_id],|row|row.get(0))?;
@@ -6962,6 +10186,19 @@ fn prepare_call_steps(
                     child.instance.variables.clone(),
                     super::runtime::StartCause::Manual,
                     at_ms,
+                    StartInputRef::CallStart {
+                        call_id: request.call_id.clone(),
+                        parent_instance_id: instance_id.clone(),
+                        parent_scope_id: request.parent_scope_id.clone(),
+                        parent_token_id: request.parent_token_id.clone(),
+                        call_node_id: request.call_node_id.clone(),
+                        parent_instance_revision_at_step: parent.instance.revision,
+                        call_step_index: steps.len(),
+                        child_instance_id: request.child_instance_id.clone(),
+                        child_definition_id: called_definition_id.clone(),
+                        child_version: *called_version,
+                        child_model_sha256: target.version.model_sha256.clone(),
+                    },
                 )?;
                 Ok((child, plan))
             })();
@@ -7075,7 +10312,10 @@ fn prepare_call_steps(
                 if authority.contains_key(&call.parent_instance_id) {
                     break;
                 }
-                if let Some(plan) = super::runtime::plan_call_error(&parent, &call, source, at_ms)?
+                let child_revision = snapshots.get(&call.child_instance_id)
+                    .context("error call child snapshot is missing")?.instance.revision;
+                if let Some(plan) = super::runtime::plan_call_error(&parent, &call, source,
+                    at_ms, child_revision)?
                 {
                     let status = if matches!(source,BusinessErrorSource::ErrorEnd {instance_id,..} if instance_id==&call.child_instance_id)
                     {
@@ -7144,6 +10384,7 @@ fn prepare_call_steps(
                         &call,
                         &child.instance.variables,
                         at_ms,
+                        child.instance.revision,
                     ),
                 };
                 let (plan, status) = match candidate {
@@ -7314,6 +10555,12 @@ fn prepare_call_plan<'pool>(
             }
         }
         if current {
+            #[cfg(test)]
+            CALL_PLAN_TEST_MUTATOR.with(|mutator| {
+                if let Some(mutate) = mutator.borrow_mut().take() {
+                    mutate(&mut composite);
+                }
+            });
             return Ok((composite, conn));
         }
         drop(conn);
@@ -7355,6 +10602,20 @@ pub fn start_instance(
         require_instance_reader(&tx, actor, &prior.instance_id)?;
         return reproject_instance_on(&tx, actor, &prior.instance_id);
     }
+    for attempt in &plan.termination_attempts {
+        let accepted = match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        ensure!(matches!(accepted, AcceptedInputRef::Start { instance_id: started,
+            cause: StartInputRef::Manual { command_id, request_hash } }
+            if started == instance_id && command_id == &stamp.command_id
+                && request_hash == &stamp.request_hash),
+            "terminating manual start differs from its authenticated command");
+    }
+    let entry = AcceptedInputRef::Start { instance_id: instance_id.to_owned(),
+        cause: StartInputRef::Manual { command_id: stamp.command_id.clone(),
+            request_hash: stamp.request_hash.clone() } };
     let result = start_instance_on(
         &tx,
         actor,
@@ -7366,6 +10627,7 @@ pub fn start_instance(
         at_ms,
         None,
         None,
+        &entry,
     )?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -7383,6 +10645,7 @@ fn start_instance_on(
     at_ms: i64,
     start_identity: Option<(&str, u64)>,
     message_identity: Option<&MessageKey>,
+    entry: &AcceptedInputRef,
 ) -> Result<ProcessInstance> {
     validate_variables(initial_variables)?;
     ensure!(Uuid::parse_str(instance_id).is_ok(), "instance_id must be a UUID");
@@ -7398,7 +10661,7 @@ fn start_instance_on(
         "archived process cannot start new instances"
     );
     ensure!(
-        reaches_error_end(plan)
+        reaches_error_end(plan) || reaches_terminate_end(plan)
             || (plan.cancel_scope_roots.is_empty()
                 && plan.cancel_token_ids.is_empty()
                 && plan.cancel_user_task_ids.is_empty()
@@ -7479,7 +10742,8 @@ fn start_instance_on(
         "INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES(?1,?1)",
         [instance_id],
     )?;
-    apply_plan_on(tx, instance_id, &actor.user_id, 1, plan, at_ms)?;
+    apply_plan_on(tx, instance_id, &actor.user_id, 1, plan, at_ms, None,
+        EntryAuthority::Accepted(entry))?;
     instance_on(tx, actor, instance_id, None)
 }
 
@@ -7491,8 +10755,17 @@ pub fn apply_transition(
     plan: &RuntimePlan,
     at_ms: i64,
 ) -> Result<ProcessTransitionOutcome> {
+    ensure!(plan.termination_attempts.iter().all(|attempt| match attempt {
+        TerminationAttempt::Success(source) => matches!(&source.accepted_input,
+            AcceptedInputRef::PersistedReady { expected_instance_revision, .. }
+                if *expected_instance_revision == expected_revision),
+        TerminationAttempt::ReturnFailure(failure) => matches!(&failure.accepted_input,
+            AcceptedInputRef::PersistedReady { expected_instance_revision, .. }
+                if *expected_instance_revision == expected_revision),
+    }),
+        "ordinary advancement cannot invent another terminating entry");
     ensure!(
-        reaches_error_end(plan)
+        reaches_error_end(plan) || reaches_terminate_end(plan)
             || (plan.cancel_scope_roots.is_empty()
                 && plan.cancel_token_ids.is_empty()
                 && plan.cancel_job_ids.is_empty()
@@ -7523,6 +10796,8 @@ pub fn apply_transition(
         expected_revision,
         plan,
         at_ms,
+        None,
+        EntryAuthority::PersistedReady,
     )?;
     let result = instance_on(&tx, actor, instance_id, None)?;
     tx.commit()?;
@@ -7546,7 +10821,7 @@ pub fn complete_user_task(
 ) -> Result<ProcessTransitionOutcome> {
     validate_output(outputs)?;
     ensure!(
-        reaches_error_end(plan)
+        reaches_error_end(plan) || reaches_terminate_end(plan)
             || (plan.cancel_scope_roots.is_empty()
                 && plan.cancel_token_ids.is_empty()
                 && plan.cancel_job_ids.is_empty()
@@ -7565,7 +10840,7 @@ pub fn complete_user_task(
             cancelled_claims: Vec::new(),
         });
     }
-    let (assignee,kind,status,token_id,node_id):(String,String,String,Option<String>,String)=tx.query_row("SELECT assignee_user_id,kind,status,token_id,node_id FROM bpmn_user_tasks WHERE user_task_id=?1 AND instance_id=?2",params![user_task_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).context("user task not found")?;
+    let (assignee,kind,status,token_id,node_id,scope_id):(String,String,String,Option<String>,String,String)=tx.query_row("SELECT assignee_user_id,kind,status,token_id,node_id,scope_id FROM bpmn_user_tasks WHERE user_task_id=?1 AND instance_id=?2",params![user_task_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).context("user task not found")?;
     let token_id = token_id.context("open user task lacks its waiting activation")?;
     let activation_live: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND i.status NOT IN ('completed','cancelled','error'))",params![token_id,instance_id,node_id],|row|row.get(0))?;
     ensure!(
@@ -7580,12 +10855,56 @@ pub fn complete_user_task(
         (kind == "verification") == approved.is_some(),
         "verification decision must match user task kind"
     );
+    for attempt in &plan.termination_attempts {
+        let accepted = match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        if let AcceptedInputRef::Human { task_id, expected_task_revision,
+            expected_instance_revision, command_id, request_hash } = accepted {
+            let current_task_revision: u64 = tx.query_row(
+                "SELECT revision FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+                params![instance_id,task_id], |row| row_u64(row,0))?;
+            ensure!(task_id == user_task_id && *expected_task_revision == current_task_revision
+                && *expected_instance_revision == expected_revision
+                && command_id == &stamp.command_id && request_hash == &stamp.request_hash,
+                "terminating human input differs from its authenticated completion");
+        } else {
+            ensure!(matches!(accepted, AcceptedInputRef::PersistedReady { .. }),
+                "human completion cannot invent another terminating entry");
+        }
+    }
     ensure!(
         plan.complete_user_task_ids
             .iter()
             .any(|id| id == user_task_id),
         "completion plan does not consume the requested user task"
     );
+    if kind == "verification" && !plan.termination_attempts.is_empty() {
+        ensure!(approved == Some(true)
+            && plan.events.iter().filter(|event|
+                event.kind == "verification_approved"
+                    && event.scope_id == scope_id
+                    && event.node_id.as_deref() == Some(node_id.as_str())
+                    && event.data == serde_json::json!({"user_task_id":user_task_id,
+                        "outputs":outputs}))
+                .count() == 1,
+            "terminating verification history differs from the accepted human decision");
+    }
+    if kind == "work" {
+        tx.execute(
+            "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE user_task_id=?2",
+            params![json(outputs)?, user_task_id],
+        )?;
+    }
+    let task_revision: u64 = tx.query_row(
+        "SELECT revision FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+        params![instance_id,user_task_id], |row| row_u64(row,0))?;
+    let entry = AcceptedInputRef::Human {
+        task_id: user_task_id.to_owned(), expected_task_revision: task_revision,
+        expected_instance_revision: expected_revision,
+        command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
+    };
     let cancelled_claims = apply_plan_on(
         &tx,
         instance_id,
@@ -7593,11 +10912,15 @@ pub fn complete_user_task(
         expected_revision,
         plan,
         at_ms,
+        None,
+        EntryAuthority::Accepted(&entry),
     )?;
-    tx.execute(
-        "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE user_task_id=?2",
-        params![json(outputs)?, user_task_id],
-    )?;
+    if kind == "verification" {
+        tx.execute(
+            "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE user_task_id=?2",
+            params![json(outputs)?, user_task_id],
+        )?;
+    }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -7626,7 +10949,7 @@ pub fn cancel_instance(
             cancelled_claims: Vec::new(),
         });
     }
-    let cancelled_claims = cancel_instance_on(&tx, actor, instance_id, expected_revision, at_ms)?;
+    let cancelled_claims = cancel_instance_on(&tx, actor, instance_id, expected_revision, at_ms, None)?;
     if let Some(call) = calls_on(&tx, instance_id)?
         .into_iter()
         .find(|c| c.child_instance_id == instance_id && c.status == ProcessCallStatus::Waiting)
@@ -7656,7 +10979,9 @@ fn cancel_instance_on(
     instance_id: &str,
     expected_revision: u64,
     at_ms: i64,
+    termination: Option<&TerminationSource>,
 ) -> Result<Vec<CancelledJobClaim>> {
+    let reason = if termination.is_some() { "terminate_end" } else { "instance_cancelled" };
     let mut claims = tx.prepare("SELECT job_id,attempt,fence,worker_id FROM bpmn_jobs WHERE instance_id=?1 AND status='running' ORDER BY job_id")?;
     let mut cancelled_claims = claims
         .query_map([instance_id], |row| {
@@ -7672,7 +10997,7 @@ fn cancel_instance_on(
     for claim in &cancelled_claims {
         sql_incrementable(claim.fence)?;
     }
-    retract_call_outbox_on(tx, instance_id, "instance_cancelled", at_ms)?;
+    retract_call_outbox_on(tx, instance_id, reason, at_ms, termination)?;
     let changed=tx.execute("UPDATE bpmn_instances SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND revision=?3 AND status NOT IN ('completed','cancelled','error')",params![at_ms,instance_id,sql_incrementable(expected_revision)?])?;
     ensure!(
         changed == 1,
@@ -7692,8 +11017,8 @@ fn cancel_instance_on(
             continue;
         }
         tx.execute(
-            "UPDATE bpmn_timers SET status='cancelled',last_reason='instance_cancelled',next_check_at_ms=?1,revision=revision+1,updated_at_ms=?1 WHERE timer_id=?2 AND revision=?3 AND status IN ('pending','blocked')",
-            params![at_ms,id,sql_incrementable(timer.revision)?],
+            "UPDATE bpmn_timers SET status='cancelled',last_reason=?1,next_check_at_ms=?2,revision=revision+1,updated_at_ms=?2 WHERE timer_id=?3 AND revision=?4 AND status IN ('pending','blocked')",
+            params![reason,at_ms,id,sql_incrementable(timer.revision)?],
         )?;
         let seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
@@ -7712,7 +11037,16 @@ fn cancel_instance_on(
                     .context("instance timer has no scope")?,
                 kind: "timer_cancelled".into(),
                 node_id: Some(timer.node_id.clone()),
-                data: serde_json::json!({"timer_id":id,"kind":timer.kind,"reason":"instance_cancelled","attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(tx,&model,&timer)? } else { None },"attached_token_id":timer.token_id}),
+                data: {
+                    let mut data = serde_json::json!({"timer_id":id,"kind":timer.kind,"reason":reason,
+                        "attached_to_id":if timer.kind == ProcessTimerKind::Boundary { timer_activation_node(tx,&model,&timer)? } else { None },
+                        "attached_token_id":timer.token_id});
+                    if let Some(source) = termination {
+                        data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+                        data["source_event_id"] = serde_json::json!(source.source_event_id);
+                    }
+                    data
+                },
             },
             at_ms,
             None,
@@ -7722,7 +11056,7 @@ fn cancel_instance_on(
         if subscription.status != ProcessSubscriptionStatus::Open {
             continue;
         }
-        tx.execute("UPDATE bpmn_event_subscriptions SET status='cancelled',last_reason='instance_cancelled',revision=revision+1,updated_at_ms=?1 WHERE subscription_id=?2 AND revision=?3 AND status='open'",params![at_ms,subscription.subscription_id,sql_incrementable(subscription.revision)?])?;
+        tx.execute("UPDATE bpmn_event_subscriptions SET status='cancelled',last_reason=?1,revision=revision+1,updated_at_ms=?2 WHERE subscription_id=?3 AND revision=?4 AND status='open'",params![reason,at_ms,subscription.subscription_id,sql_incrementable(subscription.revision)?])?;
         let seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [instance_id],
@@ -7737,7 +11071,15 @@ fn cancel_instance_on(
                 scope_id: subscription.scope_id.clone(),
                 kind: "subscription_cancelled".into(),
                 node_id: Some(subscription.node_id),
-                data: serde_json::json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"reason":"instance_cancelled"}),
+                data: {
+                    let mut data = serde_json::json!({"subscription_id":subscription.subscription_id,
+                        "attached_token_id":subscription.token_id,"reason":reason});
+                    if let Some(source) = termination {
+                        data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+                        data["source_event_id"] = serde_json::json!(source.source_event_id);
+                    }
+                    data
+                },
             },
             at_ms,
             None,
@@ -7762,7 +11104,14 @@ fn cancel_instance_on(
                 scope_id: race.scope_id.clone(),
                 kind: "event_race_cancelled".into(),
                 node_id: Some(race.gateway_node_id),
-                data: serde_json::json!({"race_id":race.race_id,"reason":"instance_cancelled"}),
+                data: {
+                    let mut data = serde_json::json!({"race_id":race.race_id,"reason":reason});
+                    if let Some(source) = termination {
+                        data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+                        data["source_event_id"] = serde_json::json!(source.source_event_id);
+                    }
+                    data
+                },
             },
             at_ms,
             None,
@@ -7780,9 +11129,10 @@ fn cancel_instance_on(
                 tx,
                 &message,
                 ProcessMessageStatus::Cancelled,
-                Some("instance_cancelled"),
+                Some(reason),
                 at_ms,
                 at_ms,
+                termination,
             )?;
         }
     }
@@ -7819,7 +11169,15 @@ fn cancel_instance_on(
                 scope_id: child.scope_id.clone(),
                 kind: "scope_cancelled".into(),
                 node_id: None,
-                data: serde_json::json!({"scope_id":child.scope_id,"parent_scope_id":child.parent_scope_id,"parent_token_id":child.parent_token_id,"subprocess_node_id":child.subprocess_node_id,"reason":"instance_cancelled"}),
+                data: {
+                    let mut data = serde_json::json!({"scope_id":child.scope_id,"parent_scope_id":child.parent_scope_id,
+                        "parent_token_id":child.parent_token_id,"subprocess_node_id":child.subprocess_node_id,"reason":reason});
+                    if let Some(source) = termination {
+                        data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+                        data["source_event_id"] = serde_json::json!(source.source_event_id);
+                    }
+                    data
+                },
             },
             at_ms,
             None,
@@ -7839,7 +11197,10 @@ fn cancel_instance_on(
             scope_id: instance_id.to_owned(),
             kind: "cancelled".into(),
             node_id: None,
-            data: Value::Null,
+            data: if let Some(source) = termination {
+                serde_json::json!({"reason":reason,"source_instance_id":source.source_instance_id,
+                    "source_event_id":source.source_event_id})
+            } else { Value::Null },
         },
         at_ms,
         None,
@@ -7850,8 +11211,9 @@ fn cancel_instance_on(
         None,
         &[],
         &actor.user_id,
-        "instance_cancelled",
+        reason,
         at_ms,
+        termination,
     )?);
     Ok(cancelled_claims)
 }
@@ -8132,7 +11494,7 @@ fn validate_escalation_successor_on(
                     event.scope_id == scope_id && event.node_id.as_deref() == Some(target.id.as_str())
                         && event.kind == joined_kind
                         && event.data["activation_id"].as_str() == Some(frame.activation_id.as_str()));
-                ensure!(joining == 1 && frame.join_node_id == target.id
+                ensure!(joining == 1 && frame.join_node_id.as_deref() == Some(target.id.as_str())
                     && matches!(&target.kind, ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. })
                     && !plan.cancel_token_ids.contains(&token.token_id)
                     && ((retained && !plan.consume_token_ids.contains(&token.token_id))
@@ -8146,7 +11508,7 @@ fn validate_escalation_successor_on(
         ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
             | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. });
     let join_target = expected_stack.last()
-        .is_some_and(|frame| frame.join_node_id == target.id);
+        .is_some_and(|frame| frame.join_node_id.as_deref() == Some(target.id.as_str()));
     ensure!(waiting == usize::from(durable_target) && joining == usize::from(join_target),
         "escalation continuation did not create its exact durable wait or join arrival");
     Ok(())
@@ -8293,7 +11655,7 @@ fn validate_escalation_choices_on(
                     "inclusive choice has invalid split activation"
                 );
                 let mut selected = Vec::new();
-                for edge in pair.branch_to_incoming_edge.keys() {
+                for edge in pair.branches.keys() {
                     if default_flow_id.as_ref() == Some(edge) {
                         continue;
                     }
@@ -8518,7 +11880,7 @@ fn validate_escalation_provenance_on(
                 ensure!(split.len() == 1, "escalation AND lacks its one traced split fact");
                 let activation = split[0].data["activation_id"].as_str()
                     .context("escalation AND activation is missing")?;
-                let branches = pair.branch_to_incoming_edge.keys().cloned().collect::<Vec<_>>();
+                let branches = pair.branches.keys().cloned().collect::<Vec<_>>();
                 expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
                     kind: "parallel_split".into(), node_id: Some(node.id.clone()),
                     data: serde_json::json!({"activation_id":activation}) });
@@ -8534,7 +11896,7 @@ fn validate_escalation_provenance_on(
             ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
                 let frame = token.fork_stack.last()
                     .context("escalation join lacks its traced fork frame")?;
-                ensure!(frame.join_node_id == node.id,
+                ensure!(frame.join_node_id.as_deref() == Some(node.id.as_str()),
                     "escalation join is outside its traced activation");
                 let kind = match frame.gateway_kind {
                     GatewayKind::Parallel => "parallel_joined",
@@ -8822,6 +12184,26 @@ fn validate_escalation_provenance_on(
     Ok(expected_events)
 }
 
+fn selected_escalation_subscription_on(
+    conn: &Connection, instance_id: &str, source_scope: &str,
+    source_token_id: &str, code: Option<&str>,
+) -> Result<Option<EventSubscription>> {
+    let open = subscriptions_on(conn, instance_id)?
+        .into_iter()
+        .filter(|sub| {
+            sub.kind == ProcessSubscriptionKind::BoundaryEscalation
+                && sub.status == ProcessSubscriptionStatus::Open
+                && sub.scope_id == source_scope
+                && sub.token_id == source_token_id
+        })
+        .collect::<Vec<_>>();
+    Ok(open.iter()
+        .find(|sub| sub.escalation_code.as_deref().is_some_and(|expected|
+            Some(expected) == code))
+        .or_else(|| open.iter().find(|sub| sub.escalation_code.is_none()))
+        .cloned())
+}
+
 fn validate_escalation_result_plan_on(
     tx: &Transaction<'_>,
     instance: &ProcessInstance,
@@ -8844,23 +12226,48 @@ fn validate_escalation_result_plan_on(
         && observed.origin == ActivityResultOrigin::Contract
         && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
     {
-        let open = subscriptions_on(tx, &instance.instance_id)?
-            .into_iter()
-            .filter(|sub| {
-                sub.kind == ProcessSubscriptionKind::BoundaryEscalation
-                    && sub.status == ProcessSubscriptionStatus::Open
-                    && sub.scope_id == source_scope
-                    && sub.token_id == source_token_id
-            })
-            .collect::<Vec<_>>();
-        open.iter()
-            .find(|sub| {
-                sub.escalation_code.is_some() && sub.escalation_code == observed.result.code
-            })
-            .or_else(|| open.iter().find(|sub| sub.escalation_code.is_none()))
-            .cloned()
+        selected_escalation_subscription_on(tx, &instance.instance_id,
+            source_scope, source_token_id, observed.result.code.as_deref())?
     } else {
         None
+    };
+    let mut incident_stmt = tx.prepare("SELECT incident_id,scope_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL")?;
+    let remaining_incidents = incident_stmt
+        .query_map([&instance.instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(id, _)| !plan.resolve_incident_ids.contains(id))
+        .collect::<Vec<_>>();
+    let mut ready_stmt = tx.prepare("SELECT scope_id,token_id FROM bpmn_tokens WHERE instance_id=?1 AND status='ready'")?;
+    let ready = ready_stmt.query_map([&instance.instance_id], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut job_stmt = tx.prepare("SELECT scope_id,job_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running')")?;
+    let active_jobs = job_stmt.query_map([&instance.instance_id], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_status = |scope: Option<&str>| {
+        if remaining_incidents.iter().any(|(_, incident_scope)|
+            scope.is_none() || scope == Some(incident_scope.as_str())) {
+            ProcessInstanceStatus::Incident
+        } else if ready.iter().any(|(token_scope, id)|
+            (scope.is_none() || scope == Some(token_scope.as_str()))
+                && !plan.consume_token_ids.contains(id) && !plan.cancel_token_ids.contains(id))
+            || plan.create_tokens.iter().any(|token|
+                (scope.is_none() || scope == Some(token.scope_id.as_str()))
+                    && token.status == "ready" && !plan.consume_token_ids.contains(&token.token_id)
+                    && !plan.cancel_token_ids.contains(&token.token_id))
+            || active_jobs.iter().any(|(job_scope, id)|
+                (scope.is_none() || scope == Some(job_scope.as_str()))
+                    && !plan.complete_job_ids.contains(id) && !plan.cancel_job_ids.contains(id))
+            || plan.create_jobs.iter().any(|job|
+                scope.is_none() || scope == Some(job.scope_id.as_str())) {
+            ProcessInstanceStatus::Running
+        } else {
+            ProcessInstanceStatus::Waiting
+        }
     };
     let Some(subscription) = selected else {
         ensure!(
@@ -8877,6 +12284,73 @@ fn validate_escalation_result_plan_on(
                     != ProcessSubscriptionKind::BoundaryEscalation,
                 "unselected escalation handler cannot consume a result"
             );
+        }
+        if observed.origin == ActivityResultOrigin::Contract
+            && observed.result.outcome
+                == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman {
+            let node = scope_node(model, scopes, &instance.instance_id,
+                source_scope, source_node_id)?;
+            let waiting: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
+                params![instance.instance_id,source_scope,source_token_id,source_node_id],
+                |row| row.get(0))?;
+            ensure!(plan.create_user_tasks.len() == 1,
+                "unselected NeedsHuman result differs from its factual Verification wait");
+            let task = &plan.create_user_tasks[0];
+            let accepted_result = serde_json::to_value(&observed.result)?;
+            ensure!(waiting
+                && matches!(&node.kind, ProcessNodeKind::ServiceTask { .. })
+                && task.kind == ProcessUserTaskKind::Verification
+                    && task.scope_id == source_scope && task.node_id == source_node_id
+                    && task.token_id.as_deref() == Some(source_token_id)
+                    && task.name == node.name
+                    && task.assignee_user_id == instance.initiator_user_id
+                    && task.status == ProcessUserTaskStatus::Open
+                    && task.outputs == accepted_result
+                    && task.revision == 1 && !task.can_complete
+                && plan.complete_job_ids == [job_id.to_owned()]
+                && plan.events.len() == 2
+                && plan.events[0].kind == "service_result"
+                && plan.events[1].kind == "user_task_opened"
+                && plan.events[1].scope_id == source_scope
+                && plan.events[1].node_id.as_deref() == Some(source_node_id)
+                && plan.events[1].data == serde_json::json!({
+                    "user_task_id":task.user_task_id,
+                    "assignee_user_id":instance.initiator_user_id.as_str(),
+                    "kind":ProcessUserTaskKind::Verification})
+                && plan.event_ids.len() == 1 && plan.event_ids.contains_key(&0)
+                && plan.termination_attempts.is_empty()
+                && plan.variable_effects.is_empty()
+                && plan.event_sources.is_empty() && plan.token_sources.is_empty()
+                && plan.start_instance_id.is_none() && plan.start_variables.is_none()
+                && plan.consume_token_ids.is_empty() && plan.cancel_token_ids.is_empty()
+                && plan.create_tokens.is_empty()
+                && plan.add_gateway_receipts.is_empty()
+                && plan.remove_gateway_receipts.is_empty()
+                && plan.complete_user_task_ids.is_empty()
+                && plan.cancel_user_task_ids.is_empty()
+                && plan.create_jobs.is_empty() && plan.cancel_job_ids.is_empty()
+                && plan.add_incidents.is_empty() && plan.resolve_incident_ids.is_empty()
+                && plan.create_timers.is_empty() && plan.timer_updates.is_empty()
+                && plan.create_subscriptions.is_empty() && plan.subscription_updates.is_empty()
+                && plan.create_event_races.is_empty() && plan.race_updates.is_empty()
+                && plan.create_messages.is_empty() && plan.create_scopes.is_empty()
+                && plan.cancel_scope_roots.is_empty()
+                && plan.call_requests.is_empty() && plan.call_steps.is_empty()
+                && plan.scope_terminal_errors.is_empty()
+                && plan.terminal_error.is_none() && plan.business_error.is_none()
+                && plan.variables == instance.variables
+                && plan.status == expected_status(None)
+                && plan.scope_updates.iter().all(|update|
+                    update.scope_id == source_scope && update.variables.is_none()
+                        && update.status == expected_status(Some(source_scope))),
+                "unselected NeedsHuman result differs from its factual Verification wait");
+            if source_scope != instance.instance_id
+                && !plan.scope_updates.iter().any(|update| update.scope_id == source_scope) {
+                ensure!(scopes.iter().any(|scope| scope.scope_id == source_scope
+                    && scope.status == expected_status(Some(source_scope))),
+                    "unselected NeedsHuman source scope status differs from factual work");
+            }
         }
         return Ok(());
     };
@@ -9089,44 +12563,6 @@ fn validate_escalation_result_plan_on(
             "escalation plan changed variables outside its source scope mapping"
         );
         instance.variables.clone()
-    };
-    let mut incident_stmt = tx.prepare("SELECT incident_id,scope_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL")?;
-    let remaining_incidents = incident_stmt
-        .query_map([&instance.instance_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|(id, _)| !plan.resolve_incident_ids.contains(id))
-        .collect::<Vec<_>>();
-    let mut ready_stmt = tx.prepare("SELECT scope_id,token_id FROM bpmn_tokens WHERE instance_id=?1 AND status='ready'")?;
-    let ready = ready_stmt.query_map([&instance.instance_id], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut job_stmt = tx.prepare("SELECT scope_id,job_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running')")?;
-    let active_jobs = job_stmt.query_map([&instance.instance_id], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let expected_status = |scope: Option<&str>| {
-        if remaining_incidents.iter().any(|(_, incident_scope)|
-            scope.is_none() || scope == Some(incident_scope.as_str())) {
-            ProcessInstanceStatus::Incident
-        } else if ready.iter().any(|(token_scope, id)|
-            (scope.is_none() || scope == Some(token_scope.as_str()))
-                && !plan.consume_token_ids.contains(id) && !plan.cancel_token_ids.contains(id))
-            || plan.create_tokens.iter().any(|token|
-                (scope.is_none() || scope == Some(token.scope_id.as_str()))
-                    && token.status == "ready" && !plan.consume_token_ids.contains(&token.token_id)
-                    && !plan.cancel_token_ids.contains(&token.token_id))
-            || active_jobs.iter().any(|(job_scope, id)|
-                (scope.is_none() || scope == Some(job_scope.as_str()))
-                    && !plan.complete_job_ids.contains(id) && !plan.cancel_job_ids.contains(id))
-            || plan.create_jobs.iter().any(|job|
-                scope.is_none() || scope == Some(job.scope_id.as_str())) {
-            ProcessInstanceStatus::Running
-        } else {
-            ProcessInstanceStatus::Waiting
-        }
     };
     ensure!(
         plan.create_scopes.is_empty()
@@ -9432,7 +12868,7 @@ fn validate_job_result_plan_on(
         }
         None => {
             ensure!(
-                (reaches_error_end(plan)
+                (reaches_error_end(plan) || reaches_terminate_end(plan)
                     || handling_escalation
                     || (plan.cancel_scope_roots.is_empty()
                         && plan.cancel_token_ids.is_empty()
@@ -9445,7 +12881,7 @@ fn validate_job_result_plan_on(
                 "uncaught or platform result cannot interrupt another scope"
             );
             ensure!(
-                (reaches_error_end(plan)
+                (reaches_error_end(plan) || reaches_terminate_end(plan)
                     || handling_escalation
                     || (caught.is_empty()
                         && !plan.subscription_updates.iter().any(|update| update.status
@@ -9491,16 +12927,91 @@ pub fn accept_job_result(
         json(result)?.len() <= 384 * 1024 - 4096,
         "activity result exceeds the process history budget"
     );
-    let source_id: String = {
+    let (source_id, initial_status, initial_attempt, initial_fence,
+        initial_worker, initial_lease, initial_activation, selected_escalation):
+        (String,String,u32,u64,Option<String>,Option<i64>,bool,bool) = {
         let conn = pool.read()?;
-        conn.query_row(
-            "SELECT instance_id FROM bpmn_jobs WHERE job_id=?1",
+        let (source_id,source_scope,source_token_id,status,attempt,fence,worker,lease):
+            (String,String,String,String,u32,u64,Option<String>,Option<i64>) = conn.query_row(
+            "SELECT instance_id,scope_id,token_id,status,attempt,fence,worker_id,lease_until_ms FROM bpmn_jobs WHERE job_id=?1",
             [job_id],
-            |row| row.get(0),
-        )?
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
+                row.get(4)?,row_u64(row,5)?,row.get(6)?,row.get(7)?)),
+        )?;
+        let activation = status != "running" || job_activation_live_on(&conn, job_id)?;
+        let selected_escalation = observed.origin == ActivityResultOrigin::Contract
+            && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+            && selected_escalation_subscription_on(&conn, &source_id, &source_scope,
+                &source_token_id, result.code.as_deref())?.is_some();
+        (source_id,status,attempt,fence,worker,lease,activation,selected_escalation)
     };
-    let (composite, mut conn) = prepare_call_plan(pool, actor, &source_id, None, plan, at_ms)?;
-    let plan = &composite;
+    if matches!(initial_status.as_str(), "completed" | "error" | "cancelled") {
+        let mut conn = pool.write()?;
+        let tx = conn.transaction()?;
+        require_actor(&tx, actor)?;
+        let (instance_id, status, current_attempt, current_fence, stored_result,
+            stored_origin): (String, String, u32, u64, Option<String>, Option<String>) =
+            tx.query_row("SELECT instance_id,status,attempt,fence,result_json,result_origin FROM bpmn_jobs WHERE job_id=?1",
+                [job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                    row_u64(row, 3)?, row.get(4)?, row.get(5)?)))?;
+        let instance = instance_on(&tx, actor, &instance_id, None)?;
+        ensure!(instance.initiator_user_id == actor.user_id,
+            "process job actor is not the initiator");
+        ensure!((status == "completed" || status == "error"
+                || status == "cancelled" && stored_result.is_some())
+            && current_attempt == attempt && current_fence == fence
+            && stored_result.as_deref() == Some(json(result)?.as_str())
+            && stored_origin.as_deref() == Some(result_origin_text(&observed.origin)),
+            "service job result conflicts with accepted result");
+        return Ok(ProcessTransitionOutcome { instance, cancelled_claims: Vec::new() });
+    }
+    let result_indices = plan.events.iter().enumerate()
+        .filter_map(|(index, event)| (event.kind == "service_result").then_some(index))
+        .collect::<Vec<_>>();
+    ensure!(result_indices.len() == 1, "accepted service result has no unique event");
+    let result_index = result_indices[0];
+    let retained_shape = observed.origin == ActivityResultOrigin::Contract
+        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+        && plan.termination_attempts.is_empty()
+        && plan.call_requests.is_empty() && plan.call_steps.is_empty()
+        && plan.events.len() == 2 && result_index == 0
+        && plan.events[1].kind == "incident"
+        && plan.add_incidents.len() == 1
+        && plan.add_incidents[0].code == "ESCALATION_HANDLER_FAILED"
+        && plan.event_ids.is_empty();
+    ensure!(!retained_shape || selected_escalation,
+        "unselected escalation handler cannot retain a handler failure");
+    let retained_failure = retained_shape && selected_escalation;
+    if observed.origin == ActivityResultOrigin::Contract
+        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+        && !selected_escalation {
+        ensure!(plan.event_ids.is_empty(),
+            "unselected NeedsHuman result cannot supply an event identity");
+    }
+    let source_bearing = !plan.termination_attempts.is_empty()
+        || plan.business_error.is_some()
+        || plan.events.iter().any(|event| matches!(event.kind.as_str(),
+            "business_error_caught" | "escalation_caught" | "scope_error_propagated"))
+        || observed.origin == ActivityResultOrigin::Contract
+            && (result.outcome == tentaflow_protocol::processes::ActivityOutcome::Error
+                || result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+                    && selected_escalation && !retained_failure);
+    ensure!(plan.event_ids.contains_key(&result_index) || !source_bearing,
+        "accepted service result lacks its required source identity");
+    if initial_status == "running" {
+        let preflight_now_ms = now_ms()?;
+        ensure!(initial_attempt == attempt && initial_fence == fence
+            && initial_worker.as_deref() == Some(worker_id)
+            && initial_lease.is_some_and(|lease| lease >= preflight_now_ms)
+            && initial_activation,
+            "service job fence is stale");
+    }
+    let mut prepared = plan.clone();
+    if !retained_failure && !prepared.event_ids.contains_key(&result_index) {
+        prepared.event_ids.insert(result_index, Uuid::new_v4().to_string());
+    }
+    let (mut composite, mut conn) =
+        prepare_call_plan(pool, actor, &source_id, None, &prepared, at_ms)?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     let (instance_id,node_id,status,current_attempt,current_fence,current_worker,lease_until_ms,stored_result):(String,String,String,u32,u64,Option<String>,Option<i64>,Option<String>)=tx.query_row("SELECT instance_id,node_id,status,attempt,fence,worker_id,lease_until_ms,result_json FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,row.get(7)?))).context("process job not found")?;
@@ -9542,18 +13053,41 @@ pub fn accept_job_result(
             && job_activation_live_on(&tx, job_id)?,
         "service job fence is stale"
     );
+    for attempt_fact in &composite.termination_attempts {
+        let accepted = match attempt_fact {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        ensure!(matches!(accepted,
+            AcceptedInputRef::Service { job_id: selected, attempt: selected_attempt, fence: selected_fence, .. }
+                if selected == job_id && *selected_attempt == attempt && *selected_fence == fence)
+            || matches!(accepted, AcceptedInputRef::PersistedReady { .. }),
+            "terminating service input differs from its accepted job generation");
+    }
     require_call_control_authority_on(&tx, actor, &instance_id)?;
     let flow_id = job_flow_id_on(&tx, job_id)?;
     require_flow_current(&tx, actor, &flow_id, None)?;
     ensure!(
-        plan.complete_job_ids.iter().any(|id| id == job_id),
+        composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
     );
-    validate_job_result_plan_on(&tx, &instance, &node_id, job_id, observed, plan)?;
+    validate_job_result_plan_on(&tx, &instance, &node_id, job_id, observed,
+        if retained_failure { plan } else { &composite })?;
+    if retained_failure {
+        ensure!(composite.call_steps.is_empty()
+            && composite.termination_attempts.is_empty(),
+            "retained service failure cannot add a call or termination");
+        composite.event_ids.insert(result_index, Uuid::new_v4().to_string());
+    }
+    let plan = &composite;
     tx.execute(
         "UPDATE bpmn_jobs SET result_json=?1,result_origin=?2 WHERE job_id=?3",
         params![json(result)?, result_origin_text(&observed.origin), job_id],
     )?;
+    let result_event_id = plan.event_ids.get(&result_index)
+        .context("accepted service result has no event identity")?;
+    let entry = AcceptedInputRef::Service { job_id: job_id.to_owned(), attempt, fence,
+        result_event_id: result_event_id.clone() };
     let cancelled_claims = apply_plan_on(
         &tx,
         &instance_id,
@@ -9561,6 +13095,8 @@ pub fn accept_job_result(
         expected_revision,
         plan,
         at_ms,
+        None,
+        EntryAuthority::Accepted(&entry),
     )?;
     let terminal = match result.outcome {
         tentaflow_protocol::processes::ActivityOutcome::Completed
@@ -10087,6 +13623,8 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
 fn apply_event_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
+    scopes: &[ProcessScopeSummary],
+    successful_terminations: &HashSet<String>,
     plan: &RuntimePlan,
     at_ms: i64,
 ) -> Result<()> {
@@ -10242,6 +13780,20 @@ fn apply_event_plan_on(
         }
         insert_subscription_on(tx, s)?;
     }
+    for timer in &plan.create_timers {
+        ensure!(
+            timer.instance_id.as_deref() == Some(instance_id)
+                && matches!(
+                    timer.kind,
+                    ProcessTimerKind::Catch | ProcessTimerKind::Boundary
+                )
+                && timer.anchor_at_ms == at_ms
+                && timer.created_at_ms == at_ms
+                && timer.updated_at_ms == at_ms,
+            "transition may only create activity timers for its instance"
+        );
+        insert_timer_on(tx, timer)?;
+    }
     for update in &plan.race_updates {
         let actual = race_on(tx, &update.race_id)?;
         ensure!(
@@ -10260,7 +13812,7 @@ fn apply_event_plan_on(
                 .winner_node_id
                 .as_deref()
                 .context("event winner node is missing")?;
-            match (&update.winner_subscription_id, &update.winner_timer_id) {
+            let winner_token_id = match (&update.winner_subscription_id, &update.winner_timer_id) {
                 (Some(id), None) => {
                     let s = subscription_on(tx, id)?;
                     ensure!(
@@ -10271,6 +13823,7 @@ fn apply_event_plan_on(
                             && s.status == ProcessSubscriptionStatus::Open,
                         "race winning subscription changed"
                     );
+                    s.token_id
                 }
                 (None, Some(id)) => {
                     let t = timer_on(tx, id)?;
@@ -10285,9 +13838,12 @@ fn apply_event_plan_on(
                             ),
                         "race winning timer changed"
                     );
+                    t.token_id.context("race winning timer has no activation")?
                 }
                 _ => bail!("event race needs exactly one winning branch"),
-            }
+            };
+            ensure!(!plan.cancel_token_ids.contains(&winner_token_id),
+                "race winning activation cannot be cancelled");
             let mut losers = subscriptions_on(tx, instance_id)?
                 .into_iter()
                 .filter(|sub| {
@@ -10309,12 +13865,21 @@ fn apply_event_plan_on(
                     .map(|timer| timer.token_id.context("race timer lacks activation"))
                     .collect::<Result<Vec<_>>>()?,
             );
-            ensure!(
-                losers.len() == plan.cancel_token_ids.len()
-                    && losers.iter().all(|id| plan.cancel_token_ids.contains(id))
-                    && plan.cancel_token_ids.iter().collect::<HashSet<_>>().len() == losers.len(),
-                "race cancels a foreign activation or omits a losing branch"
-            );
+            let unique_losers = losers.iter().collect::<HashSet<_>>();
+            ensure!(unique_losers.len() == losers.len()
+                && losers.iter().all(|id| plan.cancel_token_ids.iter().filter(|cancelled| *cancelled == id).count() == 1)
+                && plan.cancel_token_ids.iter().collect::<HashSet<_>>().len() == plan.cancel_token_ids.len(),
+                "race cancels a losing branch more than once or omits one");
+            for token_id in plan.cancel_token_ids.iter().filter(|id| !unique_losers.contains(id)) {
+                let (scope_id, status): (String, String) = tx.query_row(
+                    "SELECT scope_id,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+                    params![instance_id, *token_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).context("race cancellation references no factual token")?;
+                ensure!(matches!(status.as_str(), "ready" | "waiting" | "joining")
+                    && successful_terminations.iter().any(|root|
+                        descendant_scope_ids(scopes, root).is_ok_and(|closure| closure.contains(&scope_id))),
+                    "race cancels a foreign activation outside a validated termination closure");
+            }
             for s in subscriptions_on(tx, instance_id)?
                 .iter()
                 .filter(|s| s.race_id.as_deref() == Some(actual.race_id.as_str()))
@@ -10388,6 +13953,34 @@ fn apply_event_plan_on(
                 && event.data["race_id"].as_str() == Some(actual.race_id.as_str())),
             "event race transition lacks its actual history"
         );
+        if update.status == ProcessEventRaceStatus::Cancelled {
+            let scopes = scopes_on(tx, instance_id, &model)?;
+            let source = plan.termination_attempts.iter().find_map(|attempt| match attempt {
+                TerminationAttempt::Success(source) if successful_terminations.contains(&source.source_scope_id)
+                    && descendant_scope_ids(
+                    &scopes, &source.source_scope_id)
+                    .is_ok_and(|ids| ids.contains(&actual.scope_id)) => Some(source),
+                _ => None,
+            });
+            ensure!(source.is_some() || !plan.race_updates.iter().any(|other|
+                other.status == ProcessEventRaceStatus::Won),
+                "another race may be cancelled only by a validated termination closure");
+            if let Some(source) = source {
+                let expected = serde_json::json!({"race_id":actual.race_id,
+                    "reason":"terminate_end","source_instance_id":source.source_instance_id,
+                    "source_event_id":source.source_event_id});
+                ensure!(plan.events.iter().filter(|event| event.kind == "event_race_cancelled"
+                    && event.scope_id == actual.scope_id
+                    && event.node_id.as_deref() == Some(actual.gateway_node_id.as_str())
+                    && event.data == expected).count() == 1,
+                    "terminated race lacks exact source-linked cancellation");
+            } else {
+                ensure!(!plan.events.iter().any(|event| event.kind == "event_race_cancelled"
+                    && event.data["race_id"].as_str() == Some(actual.race_id.as_str())
+                    && event.data["reason"].as_str() == Some("terminate_end")),
+                    "foreign race cites an unrelated termination source");
+            }
+        }
         let count=tx.execute("UPDATE bpmn_event_races SET revision=revision+1,status=?1,winner_node_id=?2,winner_subscription_id=?3,winner_timer_id=?4,won_at_ms=?5,updated_at_ms=?6 WHERE race_id=?7 AND revision=?8 AND status='open'",params![race_status_text(&update.status),update.winner_node_id,update.winner_subscription_id,update.winner_timer_id,if update.status==ProcessEventRaceStatus::Won{Some(at_ms)}else{None},at_ms,update.race_id,sql_incrementable(update.expected_revision)?])?;
         ensure!(count == 1, "event race revision conflict");
     }
@@ -10430,10 +14023,28 @@ fn apply_event_plan_on(
                     && plan.consume_token_ids.contains(&actual.token_id))
                     || (matches!(
                         reason,
-                        "sibling_interrupted" | "event_race_lost" | "scope_cancelled"
+                        "sibling_interrupted" | "event_race_lost" | "scope_cancelled" | "terminate_end"
                     ) && plan.cancel_token_ids.contains(&actual.token_id)),
                 "subscription cancellation is unrelated to its exact activation"
             );
+            if reason == "terminate_end" {
+                let scopes = scopes_on(tx, instance_id, &model)?;
+                let source = plan.termination_attempts.iter().find_map(|attempt| match attempt {
+                    TerminationAttempt::Success(source) if descendant_scope_ids(
+                        &scopes, &source.source_scope_id)
+                        .is_ok_and(|ids| ids.contains(&actual.scope_id)) => Some(source),
+                    _ => None,
+                }).context("terminated subscription has no factual source scope")?;
+                let expected = serde_json::json!({"subscription_id":actual.subscription_id,
+                    "attached_token_id":actual.token_id,"reason":"terminate_end",
+                    "source_instance_id":source.source_instance_id,
+                    "source_event_id":source.source_event_id});
+                ensure!(plan.events.iter().filter(|event| event.kind == "subscription_cancelled"
+                    && event.scope_id == actual.scope_id
+                    && event.node_id.as_deref() == Some(actual.node_id.as_str())
+                    && event.data == expected).count() == 1,
+                    "terminated subscription lacks exact source-linked cancellation");
+            }
             if actual.kind == ProcessSubscriptionKind::BoundaryEscalation {
                 ensure!(
                     plan.events
@@ -11253,8 +14864,13 @@ fn update_message_state_on(
     reason: Option<&str>,
     next: i64,
     at_ms: i64,
+    termination: Option<&TerminationSource>,
 ) -> Result<bool> {
-    let reason = reason.map(timer_reason).transpose()?;
+    if termination.is_some() {
+        ensure!(matches!(&status, ProcessMessageStatus::Cancelled) && reason.is_some(),
+            "termination source requires a cancelled message receipt");
+    }
+    let reason = reason.map(|value| timer_reason(if termination.is_some() { "terminate_end" } else { value })).transpose()?;
     let changed = m.status != status || m.last_reason != reason;
     let count = if changed {
         tx.execute("UPDATE bpmn_messages SET status=?1,last_reason=?2,next_check_at_ms=?3,revision=revision+1,updated_at_ms=?4 WHERE org_id=?5 AND sender_user_id=?6 AND message_id=?7 AND revision=?8 AND next_check_at_ms=?9 AND status IN ('pending','blocked','ambiguous')",params![message_status_text(&status),reason,next,at_ms,m.key.org_id,m.key.sender_user_id,m.key.message_id,sql_incrementable(m.revision)?,m.next_check_at_ms])?
@@ -11274,11 +14890,16 @@ fn update_message_state_on(
             ProcessMessageStatus::Error => "message_error",
             ProcessMessageStatus::Delivered => bail!("delivery needs its matched identity"),
         };
+        let mut data = serde_json::json!({"message_id":m.key.message_id,"sender_user_id":m.key.sender_user_id,"reason":reason});
+        if let Some(source) = termination {
+            data["source_instance_id"] = serde_json::json!(source.source_instance_id);
+            data["source_event_id"] = serde_json::json!(source.source_event_id);
+        }
         message_receipt_on(
             tx,
             m,
             kind,
-            serde_json::json!({"message_id":m.key.message_id,"sender_user_id":m.key.sender_user_id,"reason":reason}),
+            data,
             at_ms,
         )?;
     }
@@ -11394,7 +15015,8 @@ pub fn cancel_message(
             ProcessMessageStatus::Cancelled,
             Some("sender_cancelled"),
             at_ms,
-            at_ms
+            at_ms,
+            None,
         )?,
         "message revision conflict"
     );
@@ -11438,6 +15060,7 @@ fn record_message_selection(
         None,
         next,
         at_ms,
+        None,
     )?;
     tx.commit()?;
     Ok(result)
@@ -11469,6 +15092,7 @@ pub fn record_message_blocked(
         Some(reason),
         next,
         at_ms,
+        None,
     )?;
     tx.commit()?;
     Ok(result)
@@ -11502,6 +15126,7 @@ pub fn record_message_failed(
                 Some(reason),
                 at_ms,
                 at_ms,
+                None,
             )?;
             tx.commit()?;
             return Ok(result);
@@ -11533,6 +15158,12 @@ pub fn record_message_failed(
         plan.status = ProcessInstanceStatus::Incident;
         plan.events.push(PlannedEvent{scope_id:subscription.scope_id.clone(),kind:"message_error".into(),node_id:Some(subscription.node_id.clone()),data:serde_json::json!({"message_id":m.key.message_id,"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"incident_id":incident.incident_id,"reason":bounded_failure_message(reason)})});
         plan.add_incidents.push(incident);
+        let entry = AcceptedInputRef::Message {
+            org_id: m.key.org_id.clone(), sender_user_id: m.key.sender_user_id.clone(),
+            message_id: m.key.message_id.clone(), expected_message_revision: m.revision,
+            target_subscription_id: Some(subscription.subscription_id.clone()),
+            expected_subscription_revision: Some(subscription.revision),
+        };
         apply_plan_on(
             &tx,
             &snapshot.instance.instance_id,
@@ -11540,6 +15171,8 @@ pub fn record_message_failed(
             snapshot.instance.revision,
             &plan,
             at_ms,
+            None,
+            EntryAuthority::Accepted(&entry),
         )?;
     }
     let result = update_message_state_on(
@@ -11549,6 +15182,7 @@ pub fn record_message_failed(
         Some(reason),
         at_ms,
         at_ms,
+        None,
     )?;
     tx.commit()?;
     Ok(result)
@@ -11603,6 +15237,35 @@ pub fn deliver_message(
             && Some(&delivered[0].data["payload"]) == m.payload.as_ref(),
         "message delivery lacks its immutable envelope facts"
     );
+    for attempt in &plan.termination_attempts {
+        let accepted = match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        let matches_message = match accepted {
+            AcceptedInputRef::Message { org_id, sender_user_id, message_id,
+                expected_message_revision, target_subscription_id, expected_subscription_revision } => {
+                let target = match &fresh.target {
+                    MessageDeliveryTarget::Start { .. } => target_subscription_id.is_none()
+                        && expected_subscription_revision.is_none(),
+                    MessageDeliveryTarget::Catch { subscription, .. } =>
+                        target_subscription_id.as_deref() == Some(subscription.subscription_id.as_str())
+                            && *expected_subscription_revision == Some(subscription.revision),
+                };
+                target && org_id == &m.key.org_id && sender_user_id == &m.key.sender_user_id
+                    && message_id == &m.key.message_id && *expected_message_revision == m.revision
+            }
+            AcceptedInputRef::Start { instance_id: started,
+                cause: StartInputRef::Message { org_id, sender_user_id, message_id,
+                    expected_message_revision } } =>
+                matches!(&fresh.target, MessageDeliveryTarget::Start { instance_id, .. } if started == instance_id)
+                    && org_id == &m.key.org_id && sender_user_id == &m.key.sender_user_id
+                    && message_id == &m.key.message_id && *expected_message_revision == m.revision,
+            AcceptedInputRef::PersistedReady { .. } => true,
+            _ => false,
+        };
+        ensure!(matches_message, "terminating message input differs from its accepted envelope");
+    }
     let (actor, instance, version, node_id, subscription_id, claims) = match (
         &prepared.target,
         &fresh.target,
@@ -11627,6 +15290,13 @@ pub fn deliver_message(
                 delivered[0].node_id.as_deref() == Some(node.id.as_str()),
                 "message start event uses another node"
             );
+            let entry = AcceptedInputRef::Start { instance_id: instance_id.clone(),
+                cause: StartInputRef::Message {
+                    org_id: fresh.message.key.org_id.clone(),
+                    sender_user_id: fresh.message.key.sender_user_id.clone(),
+                    message_id: fresh.message.key.message_id.clone(),
+                    expected_message_revision: fresh.message.revision,
+                } };
             let instance = start_instance_on(
                 &tx,
                 actor,
@@ -11640,6 +15310,7 @@ pub fn deliver_message(
                 at_ms,
                 None,
                 Some(&fresh.message.key),
+                &entry,
             )?;
             (
                 actor.clone(),
@@ -11695,25 +15366,28 @@ pub fn deliver_message(
                 )?;
             } else {
                 ensure!(
-                    (reaches_error_end(plan)
+                    (reaches_error_end(plan) || reaches_terminate_end(plan)
                         || (plan.cancel_user_task_ids.is_empty()
                             && plan.cancel_job_ids.is_empty()
                             && plan.cancel_scope_roots.is_empty())),
                     "message catch cannot cancel an activity"
                 );
                 if let Some(id) = &subscription.race_id {
+                    let winners = plan.race_updates.iter().filter(|update|
+                        update.status == ProcessEventRaceStatus::Won).collect::<Vec<_>>();
                     ensure!(
-                        plan.race_updates.len() == 1
-                            && plan.race_updates[0].race_id == *id
-                            && plan.race_updates[0].status == ProcessEventRaceStatus::Won
-                            && plan.race_updates[0].winner_subscription_id.as_deref()
+                        winners.len() == 1
+                            && winners[0].race_id == *id
+                            && winners[0].winner_subscription_id.as_deref()
                                 == Some(subscription.subscription_id.as_str())
-                            && plan.race_updates[0].winner_timer_id.is_none(),
+                            && winners[0].winner_timer_id.is_none()
+                            && plan.race_updates.iter().all(|update| update.race_id == *id
+                                || update.status == ProcessEventRaceStatus::Cancelled),
                         "message delivery does not win its exact race"
                     );
                 }
                 ensure!(
-                    reaches_error_end(plan)
+                    reaches_error_end(plan) || reaches_terminate_end(plan)
                         || subscription.race_id.is_some()
                         || (plan.cancel_token_ids.is_empty()
                             && plan.race_updates.is_empty()
@@ -11721,6 +15395,14 @@ pub fn deliver_message(
                     "ordinary catch cannot cancel another activation"
                 );
             }
+            let entry = AcceptedInputRef::Message {
+                org_id: fresh.message.key.org_id.clone(),
+                sender_user_id: fresh.message.key.sender_user_id.clone(),
+                message_id: fresh.message.key.message_id.clone(),
+                expected_message_revision: fresh.message.revision,
+                target_subscription_id: Some(subscription.subscription_id.clone()),
+                expected_subscription_revision: Some(subscription.revision),
+            };
             let claims = apply_plan_on(
                 &tx,
                 &snapshot.instance.instance_id,
@@ -11728,6 +15410,8 @@ pub fn deliver_message(
                 snapshot.instance.revision,
                 plan,
                 at_ms,
+                None,
+                EntryAuthority::Accepted(&entry),
             )?;
             (
                 actor.clone(),
@@ -11793,6 +15477,7 @@ pub fn expire_messages(pool: &DbPool, at_ms: i64, limit: u32) -> Result<u32> {
             Some("ttl_expired"),
             at_ms,
             at_ms,
+            None,
         )?);
     }
     tx.commit()?;
@@ -11845,6 +15530,63 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn fork_frame_requires_explicit_nullable_join_and_preserves_joined_bytes() {
+        let joined = r#"{"activation_id":"a","split_node_id":"Split","join_node_id":"Join","branch_edge_id":"Branch","gateway_kind":"parallel","selected_branch_edge_ids":["Branch","Other"]}"#;
+        let frame: ForkFrame = serde_json::from_str(joined).unwrap();
+        assert_eq!(frame.join_node_id.as_deref(), Some("Join"));
+        assert_eq!(serde_json::to_string(&frame).unwrap(), joined);
+        let terminal = joined.replace("\"Join\"", "null");
+        let terminal_frame: ForkFrame = serde_json::from_str(&terminal).unwrap();
+        assert_eq!(terminal_frame.join_node_id, None);
+        assert_eq!(serde_json::to_string(&terminal_frame).unwrap(), terminal);
+        let missing = joined.replace("\"join_node_id\":\"Join\",", "");
+        assert!(serde_json::from_str::<ForkFrame>(&missing).is_err());
+        for invalid in ["true", "4", "[]", "{}"] {
+            let text = joined.replace("\"Join\"", invalid);
+            assert!(serde_json::from_str::<ForkFrame>(&text).is_err());
+        }
+        let extra = joined.replace("\"activation_id\":", "\"unexpected\":1,\"activation_id\":");
+        assert!(serde_json::from_str::<ForkFrame>(&extra).is_err());
+    }
+
+    #[test]
+    fn ordinary_boundary_closure_requires_its_factual_timer_writer_entry() {
+        use super::super::runtime::test_support::{
+            embedded_model, start_model, user_model, with_boundaries, Fixture,
+        };
+        let fixture = Fixture::new();
+        let model = with_boundaries(embedded_model(user_model(None), "Scope"),
+            "Scope", &[("Limit", true, 1)]);
+        let started = start_model(&fixture, &model);
+        let before = runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
+        let timer = before.timers.iter().find(|timer| timer.node_id == "Limit").unwrap();
+        let due = timer.due_at_ms.unwrap();
+        let candidate = due_timers(&fixture.db, due, 32).unwrap().into_iter()
+            .find(|candidate| candidate.timer_id == timer.timer_id).unwrap();
+        let timer_snapshot = timer_snapshot(&fixture.db, &candidate).unwrap();
+        let plan = super::super::timers::plan_timer_fire(&timer_snapshot, due).unwrap();
+        assert!(plan.cancel_scope_roots.iter().any(|scope| scope != &started.instance_id));
+        let before_rows = super::super::call_tests::transition_rows(&fixture);
+        let mut connection = fixture.db.write().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let rejection = apply_plan_on(&transaction, &started.instance_id,
+            &fixture.owner.user_id, before.instance.revision, &plan, due,
+            None, EntryAuthority::PersistedReady).unwrap_err();
+        assert!(format!("{rejection:#}").contains(
+            "ordinary scope closure lacks an independently accepted boundary activation"));
+        transaction.rollback().unwrap();
+        drop(connection);
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before_rows);
+        let committed = fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(before.instance.revision), &plan, due).unwrap().unwrap();
+        assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = runtime_snapshot(&reopened, &fixture.owner, &started.instance_id).unwrap();
+        assert_eq!(persisted.instance.status, committed.instance.status);
+        assert_eq!(persisted.instance.revision, committed.instance.revision);
+    }
 
     #[test]
     fn claim_variables_hash_has_fixed_utf8_recursive_key_order() {
@@ -12224,9 +15966,11 @@ mod tests {
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
+        let command = stamp("start catch");
         let plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
-            &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000).unwrap();
-        let waiting = start_instance(&db, &actor, &stamp("start catch"), &instance_id,
+            &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
+            super::super::runtime::test_support::manual_input(&command)).unwrap();
+        let waiting = start_instance(&db, &actor, &command, &instance_id,
             &draft.definition_id, 1, &json!({}), &plan, 1_000).unwrap();
         assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
         assert_eq!(waiting.timers.len(), 1);
@@ -12300,24 +16044,28 @@ mod tests {
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
+        let command = stamp("start revocation");
         let start_plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
-            &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000).unwrap();
-        let started = start_instance(&db, &actor, &stamp("start revocation"), &instance_id,
+            &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
+            super::super::runtime::test_support::manual_input(&command)).unwrap();
+        let started = start_instance(&db, &actor, &command, &instance_id,
             &draft.definition_id, 1, &json!({}), &start_plan, 1_000).unwrap();
         let task_id = started.user_tasks[0].user_task_id.clone();
         let task_snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
+        let completion_command = stamp("complete before timer");
         let completed_plan = super::super::runtime::plan_user_completion(
             &task_snapshot,
             &task_id,
             &json!({}),
             None,
             1_500,
+            super::super::runtime::test_support::human_input(&task_snapshot, &task_id, &completion_command),
         )
         .unwrap();
         let waiting = complete_user_task(
             &db,
             &participant,
-            &stamp("complete before timer"),
+            &completion_command,
             &instance_id,
             &task_id,
             started.revision,
@@ -12537,14 +16285,16 @@ mod tests {
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
+        let command = stamp("start");
         let start_plan = super::super::runtime::plan_start(
             &model, &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
+            super::super::runtime::test_support::manual_input(&command),
         ).unwrap();
         let waiting = start_instance(
             &db,
             &actor,
-            &stamp("start"),
+            &command,
             &instance_id,
             &definition.definition_id,
             1,
@@ -12564,9 +16314,9 @@ mod tests {
         assert!(get_user_task(&db, &unrelated, &instance_id, &task_id).is_err());
         let snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
         let outputs = json!(["approved", {"case_id": "C-1"}]);
-        let plan = super::super::runtime::plan_user_completion(&snapshot, &task_id, &outputs, None, 2_000)
-            .unwrap();
         let completion = stamp("complete");
+        let plan = super::super::runtime::plan_user_completion(&snapshot, &task_id, &outputs, None, 2_000,
+            super::super::runtime::test_support::human_input(&snapshot, &task_id, &completion)).unwrap();
         assert!(complete_user_task(
             &db,
             &participant,
@@ -12716,11 +16466,12 @@ mod tests {
         )
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
+        let command = stamp("start inactive");
         let plan = super::super::runtime::plan_start(
             &model, &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
+            super::super::runtime::test_support::manual_input(&command),
         ).unwrap();
-        let command = stamp("start inactive");
         assert!(start_instance(
             &db,
             &actor,

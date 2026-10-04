@@ -6,6 +6,7 @@ const ELEMENTS = [
   ['Start', 'start', 'play', 'events', 56, 56],
   ['End', 'end', 'stop', 'events', 56, 56],
   ['ErrorEnd', 'error_end', 'alert-triangle', 'events', 56, 56],
+  ['TerminateEnd', 'terminate_end', 'ban', 'events', 56, 56],
   ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
   ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
   ['BoundaryTimer', 'boundary_timer', 'clock', 'events', 56, 56],
@@ -30,7 +31,7 @@ export function processTemplates() {
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
     input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
-    output_ports: ['End', 'ErrorEnd'].includes(kind) ? [] : ['full'],
+    output_ports: ['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) ? [] : ['full'],
     width, height,
   }));
 }
@@ -178,7 +179,7 @@ export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
-        kind: ['Start', 'End', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) } };
+        kind: ['Start', 'End', 'TerminateEnd', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) } };
     }),
     sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null })),
     diagram: { shapes: nodes.map((node) => ({ elementId: node.id, x: node.x, y: node.y, width: node.width, height: node.height })),

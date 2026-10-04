@@ -94,6 +94,19 @@ test('inclusive gateway save keeps the selected default and opaque variables', {
   }), /unknown field|unsupported/i);
 });
 
+test('terminate end save keeps a unit node kind and opaque business keys', { skip }, () => {
+  const model = { schemaVersion: 1, processId: 'P_1', nodes: [
+    { id: 'Start_1', name: 'Start', kind: 'Start' },
+    { id: 'Stop_1', name: 'Stop', kind: 'TerminateEnd' },
+  ], sequenceFlows: [{ id: 'Flow_1', sourceId: 'Start_1', targetId: 'Stop_1', condition: null }],
+  variables: { terminate_end: { attached_to_id: 'business value' } },
+  diagram: { shapes: [], edges: [] } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Stop', description: '', model });
+  assert.equal(saved.model.nodes[1].kind, 'TerminateEnd');
+  assert.deepEqual(saved.model.variables, model.variables);
+});
+
 test('BPMN typed save retains mapping and variable business keys', { skip }, () => {
   const model = {
     schemaVersion: 1, processId: 'P_1', variables: { user_id: 'u1', nested_value: { inner_key: 4 } },

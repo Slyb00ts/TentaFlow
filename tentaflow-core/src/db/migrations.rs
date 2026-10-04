@@ -2332,16 +2332,19 @@ fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
                 "B2e migration: empty legacy fork identity on token {token_id}");
             let pair = pairs.get(&frame.split_node_id)
                 .with_context(|| format!("B2e migration: fork {} missing on token {token_id}", frame.split_node_id))?;
-            ensure!(pair.kind == GatewayKind::Parallel && pair.join_node_id == frame.join_node_id
-                && pair.branch_to_incoming_edge.contains_key(&frame.branch_edge_id),
+            ensure!(pair.kind == GatewayKind::Parallel
+                && pair.join_node_id.as_deref() == Some(frame.join_node_id.as_str())
+                && pair.branches.contains_key(&frame.branch_edge_id)
+                && pair.branches.values().all(|branch|
+                    branch.join_incoming_edge_id.is_some() && branch.terminate_end_node_ids.is_empty()),
                 "B2e migration: legacy fork does not match pinned parallel pair on token {token_id}");
-            let selected: Vec<String> = pair.branch_to_incoming_edge.keys().cloned().collect();
+            let selected: Vec<String> = pair.branches.keys().cloned().collect();
             let key = (instance_id.clone(),scope_id.clone(),frame.join_node_id.clone(),frame.activation_id.clone());
             if let Some(previous) = groups.get(&key) {
                 ensure!(previous == &selected, "B2e migration: conflicting legacy fork activation");
             } else { groups.insert(key, selected.clone()); }
             stack.push(repository::ForkFrame { activation_id: frame.activation_id,
-                split_node_id: frame.split_node_id, join_node_id: frame.join_node_id,
+                split_node_id: frame.split_node_id, join_node_id: Some(frame.join_node_id),
                 branch_edge_id: frame.branch_edge_id, gateway_kind: GatewayKind::Parallel,
                 selected_branch_edge_ids: selected });
         }
@@ -2367,7 +2370,7 @@ fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         ensure!(token_instance == &instance_id && token_scope == &scope_id
             && node_id == &join_id && status == "joining"
             && frame.gateway_kind == GatewayKind::Parallel
-            && frame.join_node_id == join_id && frame.activation_id == activation_id
+            && frame.join_node_id.as_deref() == Some(join_id.as_str()) && frame.activation_id == activation_id
             && frame.branch_edge_id == branch_id,
             "B2e migration: receipt differs from its joining token {token_id}");
         let selected = groups.get(&(instance_id.clone(),scope_id.clone(),join_id.clone(),activation_id.clone()))
@@ -2386,7 +2389,9 @@ fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         path.reverse();
         let (nodes,flows,_) = model::scope_body(&pinned,&path)?;
         let pairs=model::gateway_pairs(nodes,flows)?;
-        ensure!(pairs.get(&frame.split_node_id).and_then(|pair| pair.branch_to_incoming_edge.get(&branch_id)) == arrival_edge_id.as_ref(),
+        ensure!(pairs.get(&frame.split_node_id)
+            .and_then(|pair| pair.branches.get(&branch_id))
+            .and_then(|branch| branch.join_incoming_edge_id.as_ref()) == arrival_edge_id.as_ref(),
             "B2e migration: receipt arrived through a wrong join edge");
     }
     for (token_id, (_, _, _, _, status, _)) in &tokens {
@@ -16392,8 +16397,9 @@ mod tests {
             assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Waiting);
             let task = snapshot.instance.user_tasks.iter().find(|task| task.node_id == format!("Branch_{branch}") && task.status == ProcessUserTaskStatus::Open).unwrap();
             let at_ms = chrono::Utc::now().timestamp_millis();
-            let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&serde_json::Value::Null,None,at_ms).unwrap();
             let stamp = repository::CommandStamp { command_id: uuid::Uuid::new_v4().to_string(), request_hash: repository::request_hash(&format!("complete branch {branch}")).unwrap() };
+            let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&serde_json::Value::Null,None,at_ms,
+                runtime::test_support::human_input(&snapshot,&task.user_task_id,&stamp)).unwrap();
             last_task = task.user_task_id.clone();
             last_revision = snapshot.instance.revision;
             last_plan = Some(plan.clone());
