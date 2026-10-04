@@ -2343,6 +2343,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (accepted_result).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             after.instance.revision,
             &repository::RuntimePlan::initial(json!({})),

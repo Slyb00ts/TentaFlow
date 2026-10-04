@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::processes::{
-    ProcessDiagram, ProcessMessageTargetSpec, ProcessModel, ProcessNode, ProcessNodeKind,
-    ProcessSequenceFlow, ProcessTimerSpec,
+    ProcessDiagram, ProcessEscalationPathReason, ProcessMessageTargetSpec, ProcessModel,
+    ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessTimerSpec,
 };
 
 use crate::flow_engine::expr;
@@ -99,6 +99,7 @@ pub fn starter_model() -> ProcessModel {
         messages: Vec::new(),
         errors: Vec::new(),
         target_namespace: None,
+        escalations: Vec::new(),
     }
 }
 
@@ -121,10 +122,13 @@ fn validate_declarations<'a>(model: &'a ProcessModel, ids: &mut HashSet<&'a str>
             "invalid process target namespace"
         );
         let parsed = url::Url::parse(namespace).context("invalid process target namespace")?;
-        ensure!(!parsed.scheme().is_empty(), "process namespace must be absolute");
+        ensure!(
+            !parsed.scheme().is_empty(),
+            "process namespace must be absolute"
+        );
     }
     ensure!(
-        model.messages.len() <= 32 && model.errors.len() <= 32,
+        model.messages.len() <= 32 && model.errors.len() <= 32 && model.escalations.len() <= 32,
         "process declaration limit exceeded"
     );
     let mut names = HashSet::new();
@@ -166,6 +170,32 @@ fn validate_declarations<'a>(model: &'a ProcessModel, ids: &mut HashSet<&'a str>
                 && codes.insert(error.error_code.as_str()),
             "invalid or duplicate error code: {}",
             error.error_code
+        );
+    }
+    let mut escalation_codes = HashSet::new();
+    for escalation in &model.escalations {
+        ensure!(
+            valid_id(&escalation.escalation_id) && ids.insert(escalation.escalation_id.as_str()),
+            "invalid or duplicate BPMN ID: {}",
+            escalation.escalation_id
+        );
+        ensure!(
+            !escalation.name.is_empty()
+                && escalation.name.len() <= 256
+                && !escalation.name.chars().any(char::is_control),
+            "invalid escalation name: {}",
+            escalation.escalation_id
+        );
+        ensure!(
+            (1..=64).contains(&escalation.escalation_code.len())
+                && escalation
+                    .escalation_code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'_' | b'.' | b':' | b'-'))
+                && escalation_codes.insert(escalation.escalation_code.as_str()),
+            "invalid or duplicate escalation code: {}",
+            escalation.escalation_code
         );
     }
     Ok(())
@@ -360,9 +390,17 @@ pub fn validate_draft(model: &ProcessModel) -> Result<()> {
     let mut node_count = 0;
     let mut flow_count = 0;
     validate_draft_body(
-        &model.nodes, &model.sequence_flows, &model.variables, &model.diagram,
-        0, &mut all_ids, &mut node_count, &mut flow_count,
-    )
+        &model.nodes,
+        &model.sequence_flows,
+        &model.variables,
+        &model.diagram,
+        0,
+        &mut all_ids,
+        &mut node_count,
+        &mut flow_count,
+    )?;
+    validate_escalation_prefixes(&model.nodes, &model.sequence_flows, false)?;
+    Ok(())
 }
 
 fn validate_draft_body<'a>(
@@ -400,12 +438,27 @@ fn validate_draft_body<'a>(
                     validate_expression(expression, "service result expression", false)?;
                 }
             }
-            ProcessNodeKind::UserTask { output_mapping, .. }
+            ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
+            | ProcessNodeKind::UserTask { output_mapping, .. }
             | ProcessNodeKind::MessageStart { output_mapping, .. }
-            | ProcessNodeKind::BoundaryError { output_mapping, .. } => validate_mapping(output_mapping)?,
-            ProcessNodeKind::MessageCatch { correlation_expression, output_mapping, .. }
-            | ProcessNodeKind::BoundaryMessage { correlation_expression, output_mapping, .. } => {
-                validate_expression(correlation_expression, "message correlation expression", false)?;
+            | ProcessNodeKind::BoundaryError { output_mapping, .. } => {
+                validate_mapping(output_mapping)?
+            }
+            ProcessNodeKind::MessageCatch {
+                correlation_expression,
+                output_mapping,
+                ..
+            }
+            | ProcessNodeKind::BoundaryMessage {
+                correlation_expression,
+                output_mapping,
+                ..
+            } => {
+                validate_expression(
+                    correlation_expression,
+                    "message correlation expression",
+                    false,
+                )?;
                 validate_mapping(output_mapping)?;
             }
             ProcessNodeKind::MessageThrow { target, correlation_expression, payload_expression,
@@ -466,16 +519,45 @@ fn validate_draft_body<'a>(
 
 pub fn validate_model(model: &ProcessModel) -> Result<()> {
     validate_draft(model)?;
-    let message_ids: HashSet<_> = model.messages.iter().map(|message| message.message_id.as_str()).collect();
-    let error_ids: HashSet<_> = model.errors.iter().map(|error| error.error_id.as_str()).collect();
+    let message_ids: HashSet<_> = model
+        .messages
+        .iter()
+        .map(|message| message.message_id.as_str())
+        .collect();
+    let error_ids: HashSet<_> = model
+        .errors
+        .iter()
+        .map(|error| error.error_id.as_str())
+        .collect();
+    let escalation_ids: HashSet<_> = model
+        .escalations
+        .iter()
+        .map(|escalation| escalation.escalation_id.as_str())
+        .collect();
     let mut used_messages = HashSet::new();
     let mut used_errors = HashSet::new();
+    let mut used_escalations = HashSet::new();
     validate_body(
-        &model.nodes, &model.sequence_flows, &model.diagram, 0,
-        &message_ids, &error_ids, &mut used_messages, &mut used_errors,
+        &model.nodes,
+        &model.sequence_flows,
+        &model.diagram,
+        0,
+        &message_ids,
+        &error_ids,
+        &escalation_ids,
+        &mut used_messages,
+        &mut used_errors,
+        &mut used_escalations,
     )?;
-    ensure!(message_ids == used_messages, "unreferenced message declaration");
+    ensure!(
+        message_ids == used_messages,
+        "unreferenced message declaration"
+    );
     ensure!(error_ids == used_errors, "unreferenced error declaration");
+    ensure!(
+        escalation_ids == used_escalations,
+        "unreferenced escalation declaration"
+    );
     Ok(())
 }
 
@@ -486,13 +568,18 @@ fn validate_body<'a>(
     depth: usize,
     message_ids: &HashSet<&str>,
     error_ids: &HashSet<&str>,
+    escalation_ids: &HashSet<&str>,
     used_messages: &mut HashSet<&'a str>,
     used_errors: &mut HashSet<&'a str>,
+    used_escalations: &mut HashSet<&'a str>,
 ) -> Result<()> {
-    ensure!(!graph_nodes.is_empty() && !graph_flows.is_empty(),
-        "process body requires nodes and sequence flows");
+    ensure!(
+        !graph_nodes.is_empty() && !graph_flows.is_empty(),
+        "process body requires nodes and sequence flows"
+    );
     let mut nodes = HashMap::new();
     let mut boundary_error_handlers = HashSet::new();
+    let mut boundary_escalation_handlers = HashSet::new();
     for node in graph_nodes {
         ensure!(valid_id(&node.id), "invalid node ID: {}", node.id);
         ensure!(
@@ -571,24 +658,74 @@ fn validate_body<'a>(
                     ensure!(error_ids.contains(reference.as_str()), "boundary error {} references an unknown declaration", node.id);
                     used_errors.insert(reference.as_str());
                 }
-                ensure!(boundary_error_handlers.insert((attached_to_id.as_str(), error_ref.as_deref())), "duplicate boundary error handler on {}", attached_to_id);
+                ensure!(
+                    boundary_error_handlers.insert((attached_to_id.as_str(), error_ref.as_deref())),
+                    "duplicate boundary error handler on {}",
+                    attached_to_id
+                );
                 validate_mapping(output_mapping)?;
             }
-            ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
+            ProcessNodeKind::BoundaryEscalation {
+                attached_to_id,
+                escalation_ref,
+                output_mapping,
+                ..
+            } => {
+                if let Some(reference) = escalation_ref {
+                    ensure!(
+                        escalation_ids.contains(reference.as_str()),
+                        "boundary escalation {} references an unknown declaration",
+                        node.id
+                    );
+                    used_escalations.insert(reference.as_str());
+                }
+                ensure!(
+                    boundary_escalation_handlers
+                        .insert((attached_to_id.as_str(), escalation_ref.as_deref())),
+                    "duplicate boundary escalation handler on {}",
+                    attached_to_id
+                );
+                validate_mapping(output_mapping)?;
+            }
+            ProcessNodeKind::SubProcess {
+                body,
+                input_mapping,
+                output_mapping,
+            } => {
                 ensure!(depth < 3, "embedded subprocess depth exceeds three levels");
                 validate_mapping(input_mapping)?;
                 validate_mapping(output_mapping)?;
-                validate_body(&body.nodes, &body.sequence_flows, &body.diagram,
-                    depth + 1, message_ids, error_ids, used_messages, used_errors)
-                    .with_context(|| format!("embedded subprocess {}", node.id))?;
+                validate_body(
+                    &body.nodes,
+                    &body.sequence_flows,
+                    &body.diagram,
+                    depth + 1,
+                    message_ids,
+                    error_ids,
+                    escalation_ids,
+                    used_messages,
+                    used_errors,
+                    used_escalations,
+                )
+                .with_context(|| format!("embedded subprocess {}", node.id))?;
             }
-            ProcessNodeKind::CallActivity { called_definition_id, called_version,
-                called_element, input_mapping, output_mapping } => {
-                uuid::Uuid::parse_str(called_definition_id)
-                    .with_context(|| format!("call activity {} has invalid target definition", node.id))?;
-                ensure!(*called_version > 0 && valid_id(&called_element.process_id)
-                    && !called_element.namespace_uri.is_empty(),
-                    "call activity {} requires an exact published target QName and version", node.id);
+            ProcessNodeKind::CallActivity {
+                called_definition_id,
+                called_version,
+                called_element,
+                input_mapping,
+                output_mapping,
+            } => {
+                uuid::Uuid::parse_str(called_definition_id).with_context(|| {
+                    format!("call activity {} has invalid target definition", node.id)
+                })?;
+                ensure!(
+                    *called_version > 0
+                        && valid_id(&called_element.process_id)
+                        && !called_element.namespace_uri.is_empty(),
+                    "call activity {} requires an exact published target QName and version",
+                    node.id
+                );
                 validate_mapping(input_mapping)?;
                 validate_mapping(output_mapping)?;
             }
@@ -661,24 +798,48 @@ fn validate_body<'a>(
             ),
             ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
             | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
-            | ProcessNodeKind::BoundaryError { attached_to_id, .. } => {
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => {
                 ensure!(
                     in_count == 0 && out_count == 1,
                     "boundary event {} needs one outgoing flow and no incoming flow",
                     node.id
                 );
                 ensure!(
-                    matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                Some(ProcessNodeKind::ServiceTask { .. } | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. }))
-                        || (!matches!(node.kind, ProcessNodeKind::BoundaryError { .. })
-                            && matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                                Some(ProcessNodeKind::UserTask { .. }))),
+                    matches!(
+                        nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(
+                            ProcessNodeKind::ServiceTask { .. }
+                                | ProcessNodeKind::SubProcess { .. }
+                                | ProcessNodeKind::CallActivity { .. }
+                        )
+                    ) || (!matches!(
+                        node.kind,
+                        ProcessNodeKind::BoundaryError { .. }
+                            | ProcessNodeKind::BoundaryEscalation { .. }
+                    ) && matches!(
+                        nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::UserTask { .. })
+                    )),
                     "boundary event {} has an unsupported attachment",
                     node.id
                 );
+                if matches!(node.kind, ProcessNodeKind::BoundaryEscalation { .. }) {
+                    ensure!(
+                        matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::ServiceTask { result_expression: Some(expression), .. })
+                            if !expression.is_empty()),
+                        "boundary escalation {} requires a ServiceTask with result expression",
+                        node.id
+                    );
+                }
             }
             ProcessNodeKind::EventBasedGateway => {
-                ensure!(in_count == 1 && (2..=8).contains(&out_count), "event gateway {} needs one incoming and 2..=8 outgoing flows", node.id);
+                ensure!(
+                    in_count == 1 && (2..=8).contains(&out_count),
+                    "event gateway {} needs one incoming and 2..=8 outgoing flows",
+                    node.id
+                );
                 for flow in graph_flows.iter().filter(|flow| flow.source_id == node.id) {
                     ensure!(flow.condition.is_none(), "event gateway {} cannot have conditions", node.id);
                     let branch = nodes[flow.target_id.as_str()];
@@ -779,7 +940,9 @@ fn validate_body<'a>(
     for node in graph_nodes {
         if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
         | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
-        | ProcessNodeKind::BoundaryError { attached_to_id, .. } = &node.kind {
+        | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+        | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } = &node.kind
+        {
             graph_outgoing
                 .entry(attached_to_id.as_str())
                 .or_default()
@@ -861,6 +1024,7 @@ fn validate_body<'a>(
                 ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
                 | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
                 | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }
                 if attached_to_id.as_str() == *node_id)
         }) {
             ensure!(
@@ -872,7 +1036,274 @@ fn validate_body<'a>(
         }
     }
     validate_event_gateway_regions(graph_nodes, graph_flows, &nodes, &outgoing, &order)?;
+    validate_escalation_prefixes(graph_nodes, graph_flows, true)?;
     validate_diagram(diagram, graph_nodes, graph_flows, &nodes, &flow_ids)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(super) struct EscalationPathError {
+    pub boundary_id: String,
+    pub flow_id: Option<String>,
+    pub node_id: Option<String>,
+    pub reason: ProcessEscalationPathReason,
+}
+
+impl std::fmt::Display for EscalationPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.reason {
+            ProcessEscalationPathReason::CrossBody => "cross_body",
+            ProcessEscalationPathReason::ScopeEntry => "scope_entry",
+            ProcessEscalationPathReason::CallEntry => "call_entry",
+            ProcessEscalationPathReason::TerminalBeforeWait => "terminal_before_wait",
+            ProcessEscalationPathReason::VariableWrite => "variable_write",
+            ProcessEscalationPathReason::InvalidGateway => "invalid_gateway",
+            ProcessEscalationPathReason::NoDurableWait => "no_durable_wait",
+        };
+        write!(
+            formatter,
+            "escalation boundary {} has unsupported immediate path {reason} at {}",
+            self.boundary_id,
+            self.flow_id
+                .as_deref()
+                .or(self.node_id.as_deref())
+                .unwrap_or(&self.boundary_id)
+        )
+    }
+}
+
+impl std::error::Error for EscalationPathError {}
+
+struct EscalationPrefixProof<'a> {
+    boundary_id: &'a str,
+    nodes: HashMap<&'a str, &'a ProcessNode>,
+    outgoing: HashMap<&'a str, Vec<&'a ProcessSequenceFlow>>,
+    pairs: HashMap<String, GatewayPair>,
+    memo: HashMap<(String, Option<String>), bool>,
+    active: HashSet<(String, Option<String>)>,
+    complete: bool,
+    inspections: usize,
+}
+
+impl EscalationPrefixProof<'_> {
+    fn failure(
+        &self,
+        flow_id: Option<&str>,
+        node_id: Option<&str>,
+        reason: ProcessEscalationPathReason,
+    ) -> anyhow::Error {
+        EscalationPathError {
+            boundary_id: self.boundary_id.to_string(),
+            flow_id: flow_id.map(str::to_string),
+            node_id: node_id.map(str::to_string),
+            reason,
+        }
+        .into()
+    }
+
+    fn follow_one(&mut self, node_id: &str, stop_join: Option<&str>) -> Result<bool> {
+        let outgoing = self.outgoing.get(node_id).cloned().unwrap_or_default();
+        if outgoing.len() != 1 {
+            if !self.complete {
+                return Ok(false);
+            }
+            return Err(self.failure(
+                None,
+                Some(node_id),
+                ProcessEscalationPathReason::NoDurableWait,
+            ));
+        }
+        self.visit(&outgoing[0].target_id, stop_join, Some(&outgoing[0].id))
+    }
+
+    fn visit(
+        &mut self,
+        node_id: &str,
+        stop_join: Option<&str>,
+        incoming_flow: Option<&str>,
+    ) -> Result<bool> {
+        self.inspections += 1;
+        if self.inspections > 2_129_920 {
+            return Err(self.failure(
+                incoming_flow,
+                Some(node_id),
+                ProcessEscalationPathReason::InvalidGateway,
+            ));
+        }
+        if stop_join == Some(node_id) {
+            return Ok(true);
+        }
+        let key = (node_id.to_string(), stop_join.map(str::to_string));
+        if let Some(value) = self.memo.get(&key) {
+            return Ok(*value);
+        }
+        let limit = self.nodes.len() * (self.pairs.len() + 1);
+        if self.memo.len() + self.active.len() > limit || !self.active.insert(key.clone()) {
+            return Err(self.failure(
+                incoming_flow,
+                Some(node_id),
+                ProcessEscalationPathReason::InvalidGateway,
+            ));
+        }
+        let result = (|| {
+            let node = match self.nodes.get(node_id).copied() {
+                Some(node) => node,
+                None => {
+                    return Err(self.failure(
+                        incoming_flow,
+                        Some(node_id),
+                        ProcessEscalationPathReason::CrossBody,
+                    ))
+                }
+            };
+            match &node.kind {
+                ProcessNodeKind::UserTask { .. }
+                | ProcessNodeKind::ServiceTask { .. }
+                | ProcessNodeKind::TimerCatch { .. }
+                | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::EventBasedGateway => Ok(false),
+                ProcessNodeKind::MessageThrow { .. } => self.follow_one(node_id, stop_join),
+                ProcessNodeKind::ExclusiveGateway { .. } => {
+                    let outgoing = self.outgoing.get(node_id).cloned().unwrap_or_default();
+                    if outgoing.is_empty() && !self.complete {
+                        return Ok(false);
+                    }
+                    if outgoing.is_empty() {
+                        return Err(self.failure(
+                            incoming_flow,
+                            Some(node_id),
+                            ProcessEscalationPathReason::NoDurableWait,
+                        ));
+                    }
+                    let mut may_sync = false;
+                    for edge in outgoing {
+                        may_sync |= self.visit(&edge.target_id, stop_join, Some(&edge.id))?;
+                    }
+                    Ok(may_sync)
+                }
+                ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
+                    if let Some(pair) = self.pairs.get(node_id).cloned() {
+                        let branches = self.outgoing.get(node_id).cloned().unwrap_or_default();
+                        let mut arrivals = Vec::with_capacity(branches.len());
+                        for edge in branches {
+                            arrivals.push(self.visit(
+                                &edge.target_id,
+                                Some(&pair.join_node_id),
+                                Some(&edge.id),
+                            )?);
+                        }
+                        let may_join = match pair.kind {
+                            GatewayKind::Parallel => arrivals.iter().all(|arrival| *arrival),
+                            GatewayKind::Inclusive => arrivals.iter().any(|arrival| *arrival),
+                        };
+                        if may_join {
+                            self.follow_one(&pair.join_node_id, stop_join)
+                        } else {
+                            Ok(false)
+                        }
+                    } else if !self.complete {
+                        Ok(false)
+                    } else {
+                        Err(self.failure(
+                            incoming_flow,
+                            Some(node_id),
+                            ProcessEscalationPathReason::InvalidGateway,
+                        ))
+                    }
+                }
+                ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } => Err(self.failure(
+                    incoming_flow,
+                    Some(node_id),
+                    ProcessEscalationPathReason::TerminalBeforeWait,
+                )),
+                ProcessNodeKind::SubProcess { .. } => Err(self.failure(
+                    incoming_flow,
+                    Some(node_id),
+                    ProcessEscalationPathReason::ScopeEntry,
+                )),
+                ProcessNodeKind::CallActivity { .. } => Err(self.failure(
+                    incoming_flow,
+                    Some(node_id),
+                    ProcessEscalationPathReason::CallEntry,
+                )),
+                _ => Err(self.failure(
+                    incoming_flow,
+                    Some(node_id),
+                    ProcessEscalationPathReason::NoDurableWait,
+                )),
+            }
+        })();
+        self.active.remove(&key);
+        if let Ok(value) = &result {
+            self.memo.insert(key, *value);
+        }
+        result
+    }
+}
+
+fn validate_escalation_prefixes(
+    nodes: &[ProcessNode],
+    flows: &[ProcessSequenceFlow],
+    complete: bool,
+) -> Result<()> {
+    if !nodes
+        .iter()
+        .any(|node| matches!(node.kind, ProcessNodeKind::BoundaryEscalation { .. }))
+    {
+        for node in nodes {
+            if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+                validate_escalation_prefixes(&body.nodes, &body.sequence_flows, complete)?;
+            }
+        }
+        return Ok(());
+    }
+    let pairs = match gateway_pairs(nodes, flows) {
+        Ok(pairs) => pairs,
+        Err(error) if !complete => {
+            let _ = error;
+            HashMap::new()
+        }
+        Err(error) => return Err(error),
+    };
+    for boundary in nodes
+        .iter()
+        .filter(|node| matches!(node.kind, ProcessNodeKind::BoundaryEscalation { .. }))
+    {
+        let starts: Vec<_> = flows
+            .iter()
+            .filter(|flow| flow.source_id == boundary.id)
+            .collect();
+        if starts.len() != 1 && !complete {
+            continue;
+        }
+        ensure!(
+            starts.len() == 1,
+            "escalation boundary {} needs one outgoing flow",
+            boundary.id
+        );
+        let mut proof = EscalationPrefixProof {
+            boundary_id: &boundary.id,
+            nodes: nodes.iter().map(|node| (node.id.as_str(), node)).collect(),
+            outgoing: {
+                let mut outgoing: HashMap<&str, Vec<&ProcessSequenceFlow>> = HashMap::new();
+                for flow in flows {
+                    outgoing.entry(&flow.source_id).or_default().push(flow);
+                }
+                outgoing
+            },
+            pairs: pairs.clone(),
+            memo: HashMap::new(),
+            active: HashSet::new(),
+            complete,
+            inspections: 0,
+        };
+        proof.visit(&starts[0].target_id, None, Some(&starts[0].id))?;
+    }
+    for node in nodes {
+        if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+            validate_escalation_prefixes(&body.nodes, &body.sequence_flows, complete)?;
+        }
+    }
     Ok(())
 }
 
@@ -1068,6 +1499,196 @@ pub fn gateway_pairs(nodes: &[ProcessNode], flows: &[ProcessSequenceFlow]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn escalation_model() -> ProcessModel {
+        use tentaflow_protocol::processes::{ActivityVerification, ProcessEscalationDeclaration};
+        let mut model = starter_model();
+        model.escalations.push(ProcessEscalationDeclaration {
+            escalation_id: "Escalation_1".into(),
+            name: "Human review".into(),
+            escalation_code: "NEEDS.HUMAN".into(),
+        });
+        model.nodes.extend([
+            ProcessNode {
+                id: "Service_1".into(),
+                name: "Check".into(),
+                kind: ProcessNodeKind::ServiceTask {
+                    flow_id: "flow-123".into(),
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::new(),
+                    verification: ActivityVerification::Human,
+                    timeout_seconds: 60,
+                    result_expression: Some("outputs.result".into()),
+                },
+            },
+            ProcessNode {
+                id: "Boundary_1".into(),
+                name: "Escalate".into(),
+                kind: ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id: "Service_1".into(),
+                    escalation_ref: Some("Escalation_1".into()),
+                    cancel_activity: false,
+                    output_mapping: BTreeMap::from([(
+                        "review_key".into(),
+                        "outputs.customer_ID".into(),
+                    )]),
+                },
+            },
+            ProcessNode {
+                id: "Wait_1".into(),
+                name: "Review".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        model.sequence_flows[0].target_id = "Service_1".into();
+        for (id, source, target) in [
+            ("Flow_Normal", "Service_1", "End_1"),
+            ("Flow_Escalation", "Boundary_1", "Wait_1"),
+            ("Flow_Review", "Wait_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(),
+                source_id: source.into(),
+                target_id: target.into(),
+                condition: None,
+            });
+        }
+        model
+    }
+
+    #[test]
+    fn escalation_declarations_and_immediate_routes_require_a_real_durable_wait() {
+        let mut model = escalation_model();
+        validate_model(&model).unwrap();
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "Flow_Escalation")
+            .unwrap()
+            .target_id = "End_1".into();
+        model.nodes.retain(|node| node.id != "Wait_1");
+        model.sequence_flows.retain(|flow| flow.id != "Flow_Review");
+        let error = validate_model(&model).unwrap_err();
+        let path = error
+            .downcast_ref::<EscalationPathError>()
+            .expect("typed path diagnostic");
+        assert_eq!(path.boundary_id, "Boundary_1");
+        assert_eq!(path.flow_id.as_deref(), Some("Flow_Escalation"));
+        assert_eq!(path.reason, ProcessEscalationPathReason::TerminalBeforeWait);
+        model = escalation_model();
+        model.escalations[0].escalation_code = "invalid code".into();
+        assert!(validate_draft(&model).is_err());
+        model = escalation_model();
+        model.escalations.push(model.escalations[0].clone());
+        assert!(validate_draft(&model).is_err());
+        model = escalation_model();
+        if let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service_1")
+            .unwrap()
+            .kind
+        {
+            *result_expression = Some(String::new());
+        }
+        assert!(validate_model(&model)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid service result expression length"));
+        if let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service_1")
+            .unwrap()
+            .kind
+        {
+            *result_expression = None;
+        }
+        assert!(validate_model(&model)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a ServiceTask with result expression"));
+    }
+
+    #[test]
+    fn escalation_prefix_distinguishes_or_singleton_from_and_waiting_branch() {
+        let mut model = escalation_model();
+        model.nodes.extend([
+            ProcessNode {
+                id: "Split_1".into(),
+                name: "Split".into(),
+                kind: ProcessNodeKind::InclusiveGateway {
+                    default_flow_id: Some("To_Sync".into()),
+                },
+            },
+            ProcessNode {
+                id: "Join_1".into(),
+                name: "Join".into(),
+                kind: ProcessNodeKind::InclusiveGateway {
+                    default_flow_id: None,
+                },
+            },
+            ProcessNode {
+                id: "Xor_1".into(),
+                name: "Immediate".into(),
+                kind: ProcessNodeKind::ExclusiveGateway {
+                    default_flow_id: None,
+                },
+            },
+        ]);
+        model.sequence_flows.retain(|flow| flow.id != "Flow_Review");
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "Flow_Escalation")
+            .unwrap()
+            .target_id = "Split_1".into();
+        for (id, source, target, condition) in [
+            (
+                "To_Wait",
+                "Split_1",
+                "Wait_1",
+                Some("vars.select_wait == true"),
+            ),
+            ("To_Sync", "Split_1", "Xor_1", None),
+            ("From_Wait", "Wait_1", "Join_1", None),
+            ("From_Sync", "Xor_1", "Join_1", None),
+            ("After_Join", "Join_1", "End_1", None),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(),
+                source_id: source.into(),
+                target_id: target.into(),
+                condition: condition.map(str::to_string),
+            });
+        }
+        model
+            .variables
+            .insert("select_wait".into(), serde_json::json!(true));
+        let error = validate_model(&model).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<EscalationPathError>().unwrap().reason,
+            ProcessEscalationPathReason::TerminalBeforeWait
+        );
+        for node in &mut model.nodes {
+            if node.id == "Split_1" || node.id == "Join_1" {
+                node.kind = ProcessNodeKind::ParallelGateway;
+            }
+        }
+        for flow in &mut model.sequence_flows {
+            if flow.id == "To_Wait" {
+                flow.condition = None;
+            }
+        }
+        validate_model(&model).unwrap();
+    }
 
     #[test]
     fn inclusive_pair_maps_selected_edges_and_rejects_invalid_conditions_and_crossing() {

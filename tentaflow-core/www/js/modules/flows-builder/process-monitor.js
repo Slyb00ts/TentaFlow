@@ -127,6 +127,13 @@ export function processEventText(event) {
   if (event.kind === 'business_error_caught') return text('event_business_error_caught', {
     node, code: event.data.error_code || text('error_catch_all_hint'),
   });
+  if (event.kind === 'escalation_boundary_armed') return text('event_escalation_boundary_armed', {
+    node, code: event.data.escalation_code || text('escalation_any_code'),
+  });
+  if (event.kind === 'escalation_caught') return text('event_escalation_caught', {
+    node, code: event.data.code || text('escalation_no_code'),
+    matched: event.data.matched_escalation_code || text('escalation_any_code'),
+  });
   if (['scope_entered', 'scope_completed', 'scope_cancelled'].includes(event.kind)) return text(`event_${event.kind}`, {
     element: event.data.subprocess_node_id || '',
     reason: processLifecycleReasonText(event.data.reason || ''),
@@ -244,6 +251,7 @@ export async function openProcessSchedule(definitionId) {
 function processIncidentText(incident) {
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
+  if (incident.code === 'ESCALATION_HANDLER_FAILED') return `${text('incident_escalation_handler_failed')} ${text('incident_escalation_guidance')}`;
   const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
@@ -292,7 +300,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
     <section data-calls><h3>${escapeHtml(text('calls'))}</h3><div data-call-rows></div></section>
     <section data-scopes><h3>${escapeHtml(text('scopes'))}</h3><div data-scope-rows></div><div data-scope-detail></div></section>
-    <section data-subscriptions><h3>${escapeHtml(text('message_subscriptions'))}</h3><div data-subscription-rows></div></section>
+    <section data-subscriptions><h3>${escapeHtml(text('event_subscriptions'))}</h3><div data-subscription-rows></div></section>
     <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
     <section data-outgoing><h3>${escapeHtml(text('outgoing_messages'))}</h3><div data-outgoing-rows></div></section>
     <div data-variables></div><section class="fb-process-history"><h3>${escapeHtml(text('history'))}</h3><ol data-events></ol>
@@ -351,7 +359,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         at.dateTime = new Date(event.atMs).toISOString();
         at.textContent = date(event.atMs);
         item.append(description, at);
-        if (event.kind === 'service_result' && event.data.outputs !== undefined) item.append(jsonSection(text('actual_outputs'), event.data.outputs, false));
+        if (event.kind === 'service_result') item.append(jsonSection(text('actual_outputs'), event.data, false));
         if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
       }
@@ -509,8 +517,11 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.dataset.subscriptionId = subscription.subscriptionId;
-      row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || subscription.nodeId)}</strong><p>${escapeHtml(subscription.messageName || subscription.errorCode || text('element_unavailable'))} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
-        <p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p><p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
+      const subject = subscription.kind === 'BoundaryEscalation'
+        ? subscription.escalationCode || text('escalation_any_code')
+        : subscription.messageName || subscription.errorCode || text('element_unavailable');
+      row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || subscription.nodeId)}</strong><p>${escapeHtml(subject)} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
+        ${subscription.kind === 'BoundaryEscalation' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}<p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
       subscriptions.append(row);
     }
     renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
@@ -655,33 +666,41 @@ export function openProcessDeclarations(model, readOnly, onSave) {
     ${readOnly ? '' : `<tf-button variant="secondary" data-add-message>${escapeHtml(text('add_message_declaration'))}</tf-button>`}
     <h3>${escapeHtml(text('error_declarations'))}</h3><div data-error-rows></div>
     ${readOnly ? '' : `<tf-button variant="secondary" data-add-error>${escapeHtml(text('add_error_declaration'))}</tf-button>`}
+    <h3>${escapeHtml(text('escalation_declarations'))}</h3><div data-escalation-rows></div>
+    ${readOnly ? '' : `<tf-button variant="secondary" data-add-escalation>${escapeHtml(text('add_escalation_declaration'))}</tf-button>`}
     <tf-alert data-declaration-error tone="danger" hidden></tf-alert>`;
   const addRow = (kind, declaration) => {
     const row = document.createElement('div');
     row.className = 'fb-declaration-row';
     row.dataset.declarationKind = kind;
     const message = kind === 'message';
-    row.innerHTML = `<tf-textarea data-declaration-id label="${escapeAttr(text(message ? 'message_declaration_id' : 'error_declaration_id'))}" value="${escapeAttr(message ? declaration.messageId : declaration.errorId)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+    const escalation = kind === 'escalation';
+    row.innerHTML = `<tf-textarea data-declaration-id label="${escapeAttr(text(message ? 'message_declaration_id' : escalation ? 'escalation_declaration_id' : 'error_declaration_id'))}" value="${escapeAttr(message ? declaration.messageId : escalation ? declaration.escalationId : declaration.errorId)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
       <tf-textarea data-declaration-name label="${escapeAttr(text('declaration_name'))}" value="${escapeAttr(declaration.name)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
-      ${message ? '' : `<tf-textarea data-declaration-code label="${escapeAttr(text('error_code'))}" value="${escapeAttr(declaration.errorCode)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>`}
+      ${message ? '' : `<tf-textarea data-declaration-code label="${escapeAttr(text(escalation ? 'escalation_code' : 'error_code'))}" value="${escapeAttr(escalation ? declaration.escalationCode : declaration.errorCode)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>`}
       ${readOnly ? '' : `<tf-button variant="ghost" wrap data-remove-declaration>${escapeHtml(text('remove_declaration'))}</tf-button>`}`;
-    section.querySelector(message ? '[data-message-rows]' : '[data-error-rows]').append(row);
+    section.querySelector(`[data-${kind}-rows]`).append(row);
   };
   (model.messages || []).forEach((item) => addRow('message', item));
   (model.errors || []).forEach((item) => addRow('error', item));
+  (model.escalations || []).forEach((item) => addRow('escalation', item));
   section.addEventListener('click', (event) => {
     if (readOnly) return;
     if (event.target.closest('[data-add-message]')) addRow('message', { messageId: `Message_${crypto.randomUUID().replaceAll('-', '_')}`, name: '' });
     else if (event.target.closest('[data-add-error]')) addRow('error', { errorId: `Error_${crypto.randomUUID().replaceAll('-', '_')}`, name: '', errorCode: '' });
+    else if (event.target.closest('[data-add-escalation]')) addRow('escalation', { escalationId: `Escalation_${crypto.randomUUID().replaceAll('-', '_')}`, name: '', escalationCode: '' });
     else event.target.closest('[data-remove-declaration]')?.closest('.fb-declaration-row')?.remove();
   });
   const collect = () => {
     const rows = (kind) => Array.from(section.querySelectorAll(`[data-declaration-kind="${kind}"]`)).map((row) => {
       const id = row.querySelector('[data-declaration-id]').value;
       const name = row.querySelector('[data-declaration-name]').value;
-      return kind === 'message' ? { messageId: id, name } : { errorId: id, name, errorCode: row.querySelector('[data-declaration-code]').value };
+      return kind === 'message' ? { messageId: id, name }
+        : kind === 'escalation' ? { escalationId: id, name, escalationCode: row.querySelector('[data-declaration-code]').value }
+          : { errorId: id, name, errorCode: row.querySelector('[data-declaration-code]').value };
     });
-    return { messages: rows('message'), errors: rows('error'), targetNamespace: section.querySelector('[data-declaration-namespace]').value || null };
+    return { messages: rows('message'), errors: rows('error'), escalations: rows('escalation'),
+      targetNamespace: section.querySelector('[data-declaration-namespace]').value || null };
   };
   return openFormWindow({ title: text('declarations'), icon: 'mail', width: 720, sections: [section],
     submitLabel: text('apply'), canSubmit: () => !readOnly, collect,

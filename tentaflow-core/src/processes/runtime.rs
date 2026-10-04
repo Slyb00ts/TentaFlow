@@ -97,7 +97,7 @@ pub fn prepare_service_input(
     Ok(input)
 }
 
-fn patch_variables(
+pub(super) fn patch_variables(
     mapping: &BTreeMap<String, String>,
     local: &Value,
     effective: &Value,
@@ -140,6 +140,7 @@ struct Transition<'a> {
     boundary_incidents: Vec<BoundaryEventIncident>,
     subscriptions: Vec<super::repository::EventSubscription>,
     event_races: Vec<super::repository::EventRace>,
+    escalation_continuation: bool,
     plan: RuntimePlan,
 }
 
@@ -188,6 +189,7 @@ impl<'a> Transition<'a> {
             boundary_incidents: Vec::new(),
             subscriptions: Vec::new(),
             event_races: Vec::new(),
+            escalation_continuation: false,
             plan: RuntimePlan::initial(variables),
         })
     }
@@ -542,7 +544,8 @@ impl<'a> Transition<'a> {
             .filter(|n| match &n.kind {
                 ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
                 | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
-                | ProcessNodeKind::BoundaryError { attached_to_id, .. } => {
+                | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => {
                     attached_to_id == &activity.id
                 }
                 _ => false,
@@ -1132,43 +1135,59 @@ impl<'a> Transition<'a> {
         use tentaflow_protocol::processes::{
             ProcessSubscriptionKind as K, ProcessSubscriptionStatus as S,
         };
-        let (kind, message_ref, correlation, error_ref, attachment) = match &node.kind {
-            ProcessNodeKind::MessageCatch {
-                message_ref,
-                correlation_expression,
-                ..
-            } => (
-                K::MessageCatch,
-                Some(message_ref),
-                Some(correlation_expression),
-                None,
-                None,
-            ),
-            ProcessNodeKind::BoundaryMessage {
-                attached_to_id,
-                message_ref,
-                correlation_expression,
-                ..
-            } => (
-                K::BoundaryMessage,
-                Some(message_ref),
-                Some(correlation_expression),
-                None,
-                Some(attached_to_id),
-            ),
-            ProcessNodeKind::BoundaryError {
-                attached_to_id,
-                error_ref,
-                ..
-            } => (
-                K::BoundaryError,
-                None,
-                None,
-                Some(error_ref),
-                Some(attached_to_id),
-            ),
-            _ => anyhow::bail!("node does not arm a subscription"),
-        };
+        let (kind, message_ref, correlation, error_ref, escalation_ref, attachment) =
+            match &node.kind {
+                ProcessNodeKind::MessageCatch {
+                    message_ref,
+                    correlation_expression,
+                    ..
+                } => (
+                    K::MessageCatch,
+                    Some(message_ref),
+                    Some(correlation_expression),
+                    None,
+                    None,
+                    None,
+                ),
+                ProcessNodeKind::BoundaryMessage {
+                    attached_to_id,
+                    message_ref,
+                    correlation_expression,
+                    ..
+                } => (
+                    K::BoundaryMessage,
+                    Some(message_ref),
+                    Some(correlation_expression),
+                    None,
+                    None,
+                    Some(attached_to_id),
+                ),
+                ProcessNodeKind::BoundaryError {
+                    attached_to_id,
+                    error_ref,
+                    ..
+                } => (
+                    K::BoundaryError,
+                    None,
+                    None,
+                    Some(error_ref),
+                    None,
+                    Some(attached_to_id),
+                ),
+                ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id,
+                    escalation_ref,
+                    ..
+                } => (
+                    K::BoundaryEscalation,
+                    None,
+                    None,
+                    None,
+                    Some(escalation_ref),
+                    Some(attached_to_id),
+                ),
+                _ => anyhow::bail!("node does not arm a subscription"),
+            };
         let name = message_ref
             .map(|id| {
                 self.model
@@ -1188,6 +1207,17 @@ impl<'a> Transition<'a> {
                     .find(|d| &d.error_id == id)
                     .map(|d| d.error_code.clone())
                     .context("boundary error declaration missing")
+            })
+            .transpose()?;
+        let escalation_code = escalation_ref
+            .and_then(|id| id.as_ref())
+            .map(|id| {
+                self.model
+                    .escalations
+                    .iter()
+                    .find(|d| &d.escalation_id == id)
+                    .map(|d| d.escalation_code.clone())
+                    .context("boundary escalation declaration missing")
             })
             .transpose()?;
         let effective = self.effective()?;
@@ -1215,6 +1245,7 @@ impl<'a> Transition<'a> {
             message_name: name,
             correlation_key: key,
             error_code: code,
+            escalation_code,
             race_id,
             revision: 1,
             status: status.clone(),
@@ -1239,6 +1270,14 @@ impl<'a> Transition<'a> {
                 .incident_id
                 .clone();
             self.event("message_error",Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":token_id,"incident_id":incident_id,"reason":reason}));
+        } else if kind == K::BoundaryEscalation {
+            let ProcessNodeKind::BoundaryEscalation {
+                cancel_activity, ..
+            } = &node.kind
+            else {
+                anyhow::bail!("escalation subscription has a different node kind");
+            };
+            self.event("escalation_boundary_armed",Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":token_id,"attached_to_id":attachment,"escalation_code":s.escalation_code,"cancel_activity":cancel_activity}));
         } else {
             self.event(if kind==K::BoundaryError{"error_boundary_armed"}else{"message_armed"},Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"token_id":token_id,"attached_to_id":attachment,"message_name":s.message_name,"correlation_key":s.correlation_key,"error_code":s.error_code,"race_id":s.race_id,"kind":kind}));
         }
@@ -1575,7 +1614,8 @@ impl<'a> Transition<'a> {
                 }
                 ProcessNodeKind::BoundaryTimer { .. }
                 | ProcessNodeKind::BoundaryMessage { .. }
-                | ProcessNodeKind::BoundaryError { .. } => {
+                | ProcessNodeKind::BoundaryError { .. }
+                | ProcessNodeKind::BoundaryEscalation { .. } => {
                     anyhow::bail!("boundary events are entered only by their attached timer")
                 }
                 ProcessNodeKind::ServiceTask { input_mapping, .. } => {
@@ -1664,11 +1704,12 @@ impl<'a> Transition<'a> {
                         break;
                     };
                     self.consume(&id);
-                    self.event(
-                        "exclusive_selected",
-                        Some(node.id),
-                        json!({"sequence_flow_id": edge}),
-                    );
+                    let mut data = json!({"sequence_flow_id": edge});
+                    if self.escalation_continuation {
+                        data["source_token_id"] = json!(id);
+                        data["activation_id"] = json!(id);
+                    }
+                    self.event("exclusive_selected", Some(node.id), data);
                     self.follow(&token, &edge)?;
                 }
                 ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
@@ -1724,12 +1765,18 @@ impl<'a> Transition<'a> {
                         };
                         let activation_id = Uuid::new_v4().to_string();
                         self.consume(&id);
-                        let kind = match gateway_kind { GatewayKind::Parallel => "parallel_split", GatewayKind::Inclusive => "inclusive_split" };
-                        let data = match gateway_kind {
+                        let kind = match gateway_kind {
+                            GatewayKind::Parallel => "parallel_split",
+                            GatewayKind::Inclusive => "inclusive_split",
+                        };
+                        let mut data = match gateway_kind {
                             GatewayKind::Parallel => json!({"activation_id": activation_id}),
                             GatewayKind::Inclusive => json!({"activation_id": activation_id,
                                 "selected_branch_edge_ids": selected, "default_selected": default_selected}),
                         };
+                        if self.escalation_continuation && gateway_kind == GatewayKind::Inclusive {
+                            data["source_token_id"] = json!(id);
+                        }
                         self.event(kind, Some(node.id.clone()), data);
                         for edge in &selected {
                             let mut branch = token.clone();
@@ -2534,6 +2581,117 @@ pub fn plan_job_result(
         data
     });
     if observed.origin == super::repository::ActivityResultOrigin::Contract
+        && result.outcome == ActivityOutcome::NeedsHuman
+    {
+        use tentaflow_protocol::processes::{
+            ProcessSubscriptionKind as K, ProcessSubscriptionStatus as S,
+        };
+        let local = transition
+            .subscriptions
+            .iter()
+            .filter(|subscription| {
+                subscription.kind == K::BoundaryEscalation
+                    && subscription.status == S::Open
+                    && subscription.scope_id == job.scope_id
+                    && subscription.token_id == token.token_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = local
+            .iter()
+            .find(|subscription| {
+                subscription.escalation_code.is_some()
+                    && subscription.escalation_code == result.code
+            })
+            .or_else(|| {
+                local
+                    .iter()
+                    .find(|subscription| subscription.escalation_code.is_none())
+            })
+            .cloned();
+        if let Some(subscription) = selected {
+            let boundary_id = subscription.node_id.clone();
+            let planned = (|| -> Result<RuntimePlan> {
+                let handler = transition.node(&boundary_id)?.clone();
+                let ProcessNodeKind::BoundaryEscalation {
+                    output_mapping,
+                    cancel_activity,
+                    ..
+                } = &handler.kind
+                else {
+                    anyhow::bail!("selected escalation subscription is not a boundary");
+                };
+                transition.map_outputs(
+                    output_mapping,
+                    &result.outputs,
+                    &[("activity_result".into(), serde_json::to_value(result)?)],
+                )?;
+                let result_event_id = Uuid::new_v4().to_string();
+                transition.plan.event_ids.insert(0, result_event_id.clone());
+                transition.settle_subscription(&subscription, S::Consumed, None);
+                if *cancel_activity {
+                    transition.interrupt_activity(&token, &subscription.subscription_id)?;
+                    transition
+                        .plan
+                        .cancel_job_ids
+                        .retain(|id| id != &job.job_id);
+                } else {
+                    transition.user_task(
+                        &node,
+                        ProcessUserTaskKind::Verification,
+                        transition.initiator.to_owned(),
+                        serde_json::to_value(result)?,
+                        &token.token_id,
+                    );
+                }
+                transition.event(
+                    "escalation_caught",
+                    Some(handler.id.clone()),
+                    json!({
+                        "subscription_id": subscription.subscription_id,
+                        "boundary_id": handler.id,
+                        "attached_token_id": token.token_id,
+                        "source_token_id": token.token_id,
+                        "source_scope_id": job.scope_id,
+                        "job_id": job.job_id,
+                        "attempt": job.attempt,
+                        "fence": job.fence,
+                        "result_origin": "contract",
+                        "cancel_activity": cancel_activity,
+                        "result_event_id": result_event_id,
+                        "code": result.code,
+                        "matched_escalation_code": subscription.escalation_code,
+                    }),
+                );
+                for edge in transition.outgoing(&handler.id) {
+                    transition.follow(&token, &edge)?;
+                }
+                transition.escalation_continuation = true;
+                transition.advance()?;
+                ensure!(
+                    transition.plan.add_incidents.is_empty(),
+                    "escalation continuation created a failure wait"
+                );
+                ensure!(
+                    transition.plan.terminal_error.is_none(),
+                    "escalation continuation reached a terminal error"
+                );
+                transition.finish()
+            })();
+            return match planned {
+                Ok(plan) => Ok(plan),
+                Err(error) => plan_retained_escalation_incident(
+                    snapshot,
+                    job,
+                    observed,
+                    &boundary_id,
+                    &error.to_string(),
+                    now_ms,
+                ),
+            };
+        }
+    }
+    if observed.origin == super::repository::ActivityResultOrigin::Contract
         && result.outcome == ActivityOutcome::Error
     {
         if let Some((subscription, attached, hops)) =
@@ -2676,6 +2834,50 @@ pub fn plan_job_result(
             }
         }
     }
+    transition.finish()
+}
+
+pub(super) fn plan_retained_escalation_incident(
+    snapshot: &RuntimeSnapshot,
+    job: &ProcessJob,
+    observed: &super::repository::ObservedActivityResult,
+    boundary_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<RuntimePlan> {
+    ensure!(
+        observed.origin == super::repository::ActivityResultOrigin::Contract
+            && observed.result.outcome == ActivityOutcome::NeedsHuman,
+        "retained escalation incident requires an accepted Contract NeedsHuman result"
+    );
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.current_scope = job.scope_id.clone();
+    let node = transition.node(&job.node_id)?.clone();
+    ensure!(
+        matches!(node.kind, ProcessNodeKind::ServiceTask { .. })
+            && transition
+                .tokens
+                .iter()
+                .any(|token| token.token_id == job.token_id
+                    && token.scope_id == job.scope_id
+                    && token.status == "waiting"),
+        "retained escalation incident lost its factual service wait"
+    );
+    transition.plan.complete_job_ids.push(job.job_id.clone());
+    transition
+        .jobs
+        .retain(|existing| existing.job_id != job.job_id);
+    transition.event("service_result", Some(node.id.clone()), {
+        let mut data = serde_json::to_value(&observed.result)?;
+        data["result_origin"] = json!("contract");
+        data
+    });
+    transition.incident(
+        &node.id,
+        Some(job.job_id.clone()),
+        "ESCALATION_HANDLER_FAILED",
+        super::repository::bounded_failure_message(&format!("boundary {boundary_id}: {reason}")),
+    );
     transition.finish()
 }
 
@@ -5402,6 +5604,7 @@ mod tests {
         let observed = ObservedActivityResult {
             result: serde_json::from_value(business.clone()).unwrap(),
             origin: ActivityResultOrigin::Contract,
+            expression_observation: None,
         };
         let mut forged = plan_job_result(
             &snapshot,

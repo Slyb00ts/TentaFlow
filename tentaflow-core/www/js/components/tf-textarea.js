@@ -1,13 +1,13 @@
 // =============================================================================
 // File: tf-textarea.js — <tf-textarea> multi-line input, light DOM, auto-grow.
-// Supports: label, aria-label, placeholder, value, hint, error, rows, disabled, autogrow.
+// Supports: label, aria-label, placeholder, value, hint, error, rows, disabled, readonly, autogrow.
 // Reflects .value to attribute and emits "input"/"change".
 // Example: <tf-textarea placeholder="Zapytaj o cokolwiek..." autogrow rows="2">
 // =============================================================================
 
 class TfTextarea extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'aria-label', 'placeholder', 'value', 'hint', 'error', 'rows', 'disabled', 'autogrow', 'maxlength'];
+    return ['label', 'aria-label', 'placeholder', 'value', 'hint', 'error', 'rows', 'disabled', 'readonly', 'autogrow', 'maxlength'];
   }
 
   constructor() {
@@ -119,6 +119,7 @@ class TfTextarea extends HTMLElement {
     if (document.activeElement !== this._textarea) this._textarea.value = value;
     this._textarea.rows = parseInt(rows, 10) || 2;
     this._textarea.disabled = disabled;
+    this._textarea.readOnly = this.hasAttribute('readonly');
     const accessibleName = this.getAttribute('aria-label') || labelText;
     if (accessibleName) this._textarea.setAttribute('aria-label', accessibleName);
     else this._textarea.removeAttribute('aria-label');

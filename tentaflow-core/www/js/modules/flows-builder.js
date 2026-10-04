@@ -254,7 +254,12 @@ const FlowBuilderScreen = {
       getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       onEdgeChange: (id, patch) => state.canvas.updateEdge(id, patch),
-      onLabelChange: (id, label) => { state.canvas.updateNodeLabel(id, label); },
+      onLabelChange: (id, label) => {
+        state.canvas.updateNodeLabel(id, label);
+        if (state.canvas.selectedIds.size !== 1 || !state.canvas.selectedIds.has(id)) return;
+        const node = state.canvas.nodes.find((candidate) => candidate.id === id);
+        if (node) root.querySelector('[data-role="crumb-name"]').textContent = getNodeDisplayTitle(node, state.templatesMap.get(node.type));
+      },
       onPositionChange: (id, patch) => {
         const n = state.canvas.nodes.find((x) => x.id === id);
         if (!n) return;

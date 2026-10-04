@@ -38,6 +38,33 @@ function cbor(value) {
   return [...head(5, entries.length), ...entries.flatMap(([key, item]) => [...cbor(key), ...cbor(item)])];
 }
 
+test('escalation wire preserves typed declarations, boundary mapping and diagnostic context', { skip }, () => {
+  const model = { schemaVersion: 1, processId: 'P_1', targetNamespace: 'urn:example:review',
+    escalations: [{ escalationId: 'Esc_1', name: 'Review & approve', escalationCode: 'NEEDS.HUMAN' }],
+    nodes: [{ id: 'Boundary_1', name: 'Review', kind: { BoundaryEscalation: {
+      attachedToId: 'Service_1', escalationRef: 'Esc_1', cancelActivity: false,
+      outputMapping: { business_key: 'outputs.customer_ID' },
+    } } }], sequenceFlows: [], variables: { customer_ID: { attached_to_id: 'kept' } },
+    diagram: { shapes: [], edges: [] } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Review', description: '', model });
+  assert.equal(saved.model.escalations[0].escalationCode, 'NEEDS.HUMAN');
+  assert.equal(saved.model.nodes[0].kind.BoundaryEscalation.escalationRef, 'Esc_1');
+  assert.equal(saved.model.nodes[0].kind.BoundaryEscalation.cancelActivity, false);
+  assert.deepEqual(saved.model.nodes[0].kind.BoundaryEscalation.outputMapping,
+    { business_key: 'outputs.customer_ID' });
+  assert.deepEqual(saved.model.variables, model.variables);
+  const diagnostic = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    XmlImportResponse: { model: null, diagnostics: [{ code: 'ESCALATION_IMMEDIATE_PATH_UNSUPPORTED',
+      message: 'terminal_before_wait', element_id: 'Flow_1', offset: 42, fatal: true,
+      boundary_id: 'Boundary_1', flow_id: 'Flow_1', node_id: 'End_1',
+      reason: 'terminal_before_wait' }] },
+  } })));
+  assert.equal(diagnostic.diagnostics[0].boundaryId, 'Boundary_1');
+  assert.equal(diagnostic.diagnostics[0].flowId, 'Flow_1');
+  assert.equal(diagnostic.diagnostics[0].reason, 'terminal_before_wait');
+});
+
 test('inclusive gateway save keeps the selected default and opaque variables', { skip }, () => {
   const model = {
     schemaVersion: 1, processId: 'P_1',

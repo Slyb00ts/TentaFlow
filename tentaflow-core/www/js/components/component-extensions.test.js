@@ -113,6 +113,30 @@ test('tf-textarea: autogrow includes measured borders in a border-box height', (
   textarea.remove();
 });
 
+test('tf-textarea: readonly keeps a long value focusable and separate from disabled', () => {
+  const fullId = `Sequence_${'a'.repeat(96)}`;
+  const field = mount(new TfTextarea(), { label: 'Element ID', value: fullId, readonly: '', autogrow: '', rows: '2' });
+  const control = field.querySelector('textarea');
+  assert.equal(field.value, fullId);
+  assert.equal(control.value, fullId);
+  assert.equal(control.readOnly, true);
+  assert.equal(control.disabled, false);
+  assert.equal(field.hasAttribute('autogrow'), true);
+  field.focus();
+  assert.equal(document.activeElement, control);
+  field.value = `${fullId}_updated`;
+  assert.equal(control.value, `${fullId}_updated`);
+  field.removeAttribute('readonly');
+  assert.equal(control.readOnly, false);
+  field.setAttribute('disabled', '');
+  assert.equal(control.disabled, true);
+  field.removeAttribute('disabled');
+  assert.equal(control.disabled, false);
+  field.setAttribute('readonly', '');
+  assert.equal(control.readOnly, true);
+  field.remove();
+});
+
 // ---------------------------------------------------------------------------
 // 1. tf-tree — node.badge
 // ---------------------------------------------------------------------------

@@ -497,6 +497,13 @@ function processModel(model, nested = false) {
       processKnownFields(body, ['attachedToId', 'errorRef', 'outputMapping'], 'boundary error');
       fields = { attached_to_id: body.attachedToId, error_ref: body.errorRef ?? null,
         output_mapping: body.outputMapping ?? {} };
+    } else if (tag === 'BoundaryEscalation') {
+      processKnownFields(body, ['attachedToId', 'escalationRef', 'cancelActivity', 'outputMapping'], 'boundary escalation');
+      if (typeof body.attachedToId !== 'string' || typeof body.cancelActivity !== 'boolean') {
+        throw new TypeError('boundary escalation requires an attachment and cancellation choice');
+      }
+      fields = { attached_to_id: body.attachedToId, escalation_ref: body.escalationRef ?? null,
+        cancel_activity: body.cancelActivity, output_mapping: body.outputMapping ?? {} };
     } else if (tag === 'SubProcess') {
       processKnownFields(body, ['body', 'inputMapping', 'outputMapping'], 'subprocess');
       fields = { body: processModel(body.body, true), input_mapping: body.inputMapping ?? {},
@@ -561,6 +568,11 @@ function processModel(model, nested = false) {
       return { error_id: error.errorId, name: error.name, error_code: error.errorCode };
     }) } : {}),
     ...(model.targetNamespace == null ? {} : { target_namespace: model.targetNamespace }),
+    ...(model.escalations?.length ? { escalations: model.escalations.map((escalation) => {
+      processKnownFields(escalation, ['escalationId', 'name', 'escalationCode'], 'escalation declaration');
+      return { escalation_id: escalation.escalationId, name: escalation.name,
+        escalation_code: escalation.escalationCode };
+    }) } : {}),
   };
 }
 

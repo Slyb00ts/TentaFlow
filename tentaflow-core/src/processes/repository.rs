@@ -225,6 +225,14 @@ pub enum ActivityResultOrigin {
 pub struct ObservedActivityResult {
     pub result: ActivityResult,
     pub origin: ActivityResultOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_observation: Option<ExpressionObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpressionObservation {
+    pub normalized_outputs: Value,
+    pub evaluation_variables: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +249,8 @@ pub struct EventSubscription {
     pub message_name: Option<String>,
     pub correlation_key: Option<String>,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_code: Option<String>,
     pub race_id: Option<String>,
     pub revision: u64,
     pub status: ProcessSubscriptionStatus,
@@ -1384,6 +1394,11 @@ fn validate_boundary_plan_on(
             attached_to_id,
             cancel_activity,
             ..
+        }
+        | ProcessNodeKind::BoundaryEscalation {
+            attached_to_id,
+            cancel_activity,
+            ..
         } => (attached_to_id, *cancel_activity),
         ProcessNodeKind::BoundaryError { attached_to_id, .. } => (attached_to_id, true),
         _ => bail!("activation is not a boundary"),
@@ -2026,6 +2041,30 @@ fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 pub fn request_hash<T: Serialize>(request: &T) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(request)?)))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn expression_variables_hash(value: &Value) -> Result<String> {
+    validate_variables(value)?;
+    let mut hash = Sha256::new();
+    hash.update(b"tentaflow:claim-vars:");
+    hash.update(serde_json::to_vec(&canonical_json_value(value))?);
+    Ok(hex::encode(hash.finalize()))
 }
 
 fn actor_active_on(conn: &Connection, actor: &ProcessActor) -> Result<bool> {
@@ -3763,7 +3802,7 @@ fn incident_on(
 ) -> Result<ProcessIncidentSelection> {
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
     let initiator = require_instance_reader(conn, actor, instance_id)?;
-    let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
+    let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error') AND NOT (status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
     let scope_id: String = conn.query_row(
         "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![id, instance_id],
@@ -3814,7 +3853,10 @@ fn subscription_summary(
     let n = scoped_node_on(conn, &s.instance_id, &s.scope_id, model, &s.node_id)?;
     let attached_to_id = match &n.kind {
         ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
-        | ProcessNodeKind::BoundaryError { attached_to_id, .. } => Some(attached_to_id.clone()),
+        | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+        | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => {
+            Some(attached_to_id.clone())
+        }
         _ => None,
     };
     Ok(ProcessSubscriptionSummary {
@@ -3829,6 +3871,7 @@ fn subscription_summary(
         message_name: s.message_name.clone(),
         correlation_key: s.correlation_key.clone(),
         error_code: s.error_code.clone(),
+        escalation_code: s.escalation_code.clone(),
         attached_to_id,
         race_id: s.race_id.clone(),
         last_reason: s.last_reason.clone(),
@@ -4177,7 +4220,7 @@ pub fn list_instances(
             params![actor.org_id, actor.user_id, definition_id],
             |row| row.get(0),
         )?;
-        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND j.status IN ('error','completed') AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
+        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND j.status IN ('error','completed') AND NOT (j.status='completed' AND j.result_origin='contract' AND json_extract(j.result_json,'$.outcome')='NeedsHuman') AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -7901,11 +7944,46 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
         [&job_id],
         |row| Ok((row.get(0)?, row_u64(row, 1)?)),
     )?;
+    let claimed_before_event = runtime_snapshot_on(&tx, &actor, &instance_id)?;
+    let claimed_node = scope_node(
+        &claimed_before_event.model,
+        &claimed_before_event.scopes,
+        &instance_id,
+        &scope_id,
+        &node_id,
+    )?;
+    let has_expression = matches!(
+        &claimed_node.kind,
+        ProcessNodeKind::ServiceTask {
+            result_expression: Some(_),
+            ..
+        }
+    );
+    let body_path = scope_path(&claimed_before_event.scopes, &instance_id, &scope_id)?;
+    let has_escalation = super::model::scope_body(&claimed_before_event.model, &body_path)?.0
+        .iter().any(|node| matches!(&node.kind,
+            ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } if attached_to_id == &node_id));
+    let expression_variables_sha256 = if has_expression && has_escalation {
+        let effective = effective_scope_variables(
+            &claimed_before_event.scopes,
+            &claimed_before_event.scope_variables,
+            &instance_id,
+            &claimed_before_event.instance.variables,
+            &scope_id,
+        )?;
+        Some(expression_variables_hash(&effective)?)
+    } else {
+        None
+    };
     let next_seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [&instance_id],
         |row| row_u64(row, 0),
     )?;
+    let mut claim_data = serde_json::json!({"job_id":job_id,"attempt":attempt,"fence":fence});
+    if let Some(hash) = &expression_variables_sha256 {
+        claim_data["expression_variables_sha256"] = serde_json::json!(hash);
+    }
     insert_event_on(
         &tx,
         &instance_id,
@@ -7915,7 +7993,7 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
             scope_id: scope_id.clone(),
             kind: "service_claimed".into(),
             node_id: Some(node_id),
-            data: serde_json::json!({"job_id":job_id,"attempt":attempt,"fence":fence}),
+            data: claim_data,
         },
         now_ms,
         None,
@@ -7927,6 +8005,19 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
         .find(|job| job.job_id == job_id)
         .cloned()
         .context("claimed process job disappeared")?;
+    if let Some(hash) = &expression_variables_sha256 {
+        let effective = effective_scope_variables(
+            &snapshot.scopes,
+            &snapshot.scope_variables,
+            &instance_id,
+            &snapshot.instance.variables,
+            &scope_id,
+        )?;
+        ensure!(
+            expression_variables_hash(&effective)? == *hash,
+            "claimed process variables changed before claim commit"
+        );
+    }
     tx.commit()?;
     Ok(Some(ClaimedProcessJob {
         actor,
@@ -7967,6 +8058,1174 @@ pub fn renew_job_lease(
     Ok(changed == 1)
 }
 
+fn validate_escalation_successor_on(
+    plan: &RuntimePlan,
+    scope_id: &str,
+    edge_id: &str,
+    target: &ProcessNode,
+    expected_stack: &[ForkFrame],
+) -> Result<()> {
+    let successors = plan.create_tokens.iter()
+        .filter(|token| token.scope_id == scope_id
+            && token.arrival_edge_id.as_deref() == Some(edge_id))
+        .collect::<Vec<_>>();
+    let ready = successors.iter().filter(|token| token.status == "ready").collect::<Vec<_>>();
+    ensure!(ready.len() == 1
+        && ready[0].node_id == target.id
+        && ready[0].fork_stack.as_slice() == expected_stack
+        && plan.consume_token_ids.iter().filter(|id| *id == &ready[0].token_id).count() == 1
+        && !plan.cancel_token_ids.contains(&ready[0].token_id),
+        "escalation continuation lacks one consumed exact ready successor");
+    let mut waiting = 0;
+    let mut joining = 0;
+    for token in &successors {
+        ensure!(token.node_id == target.id && token.fork_stack.as_slice() == expected_stack,
+            "escalation continuation successor changed its target or fork activation");
+        match token.status.as_str() {
+            "ready" => ensure!(token.token_id == ready[0].token_id,
+                "escalation continuation created another ready successor"),
+            "waiting" => {
+                waiting += 1;
+                ensure!(waiting == 1
+                    && !plan.consume_token_ids.contains(&token.token_id)
+                    && !plan.cancel_token_ids.contains(&token.token_id),
+                    "escalation continuation created an extra or closed waiting successor");
+                let work = match &target.kind {
+                    ProcessNodeKind::UserTask { .. } => plan.create_user_tasks.iter()
+                        .filter(|task| task.scope_id == scope_id && task.node_id == target.id
+                            && task.token_id.as_deref() == Some(token.token_id.as_str())
+                            && task.status == ProcessUserTaskStatus::Open).count(),
+                    ProcessNodeKind::ServiceTask { .. } => plan.create_jobs.iter()
+                        .filter(|job| job.scope_id == scope_id && job.node_id == target.id
+                            && job.token_id == token.token_id && job.status == "queued").count(),
+                    ProcessNodeKind::TimerCatch { .. } => plan.create_timers.iter()
+                        .filter(|timer| timer.scope_id.as_deref() == Some(scope_id)
+                            && timer.node_id == target.id
+                            && timer.token_id.as_deref() == Some(token.token_id.as_str())
+                            && timer.kind == ProcessTimerKind::Catch
+                            && matches!(&timer.status, ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked)).count(),
+                    ProcessNodeKind::MessageCatch { .. } => plan.create_subscriptions.iter()
+                        .filter(|subscription| subscription.scope_id == scope_id
+                            && subscription.node_id == target.id
+                            && subscription.token_id == token.token_id
+                            && subscription.kind == ProcessSubscriptionKind::MessageCatch
+                            && subscription.status == ProcessSubscriptionStatus::Open).count(),
+                    _ => 0,
+                };
+                ensure!(work == 1,
+                    "escalation waiting successor lacks its exact durable work");
+            }
+            "joining" => {
+                joining += 1;
+                let frame = expected_stack.last().context("joining successor lacks a fork frame")?;
+                let retained = plan.add_gateway_receipts.iter().filter(|receipt|
+                    receipt.scope_id == scope_id && receipt.join_node_id == target.id
+                        && receipt.activation_id == frame.activation_id
+                        && receipt.branch_edge_id == frame.branch_edge_id
+                        && receipt.gateway_kind == frame.gateway_kind
+                        && receipt.token_id == token.token_id).count() == 1;
+                let joined_kind = match frame.gateway_kind {
+                    GatewayKind::Parallel => "parallel_joined",
+                    GatewayKind::Inclusive => "inclusive_joined",
+                };
+                let completed = plan.events.iter().any(|event|
+                    event.scope_id == scope_id && event.node_id.as_deref() == Some(target.id.as_str())
+                        && event.kind == joined_kind
+                        && event.data["activation_id"].as_str() == Some(frame.activation_id.as_str()));
+                ensure!(joining == 1 && frame.join_node_id == target.id
+                    && matches!(&target.kind, ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. })
+                    && !plan.cancel_token_ids.contains(&token.token_id)
+                    && ((retained && !plan.consume_token_ids.contains(&token.token_id))
+                        || (completed && plan.consume_token_ids.iter().filter(|id| *id == &token.token_id).count() == 1)),
+                    "escalation joining successor lacks its exact gateway arrival");
+            }
+            _ => bail!("escalation continuation created an invalid successor status"),
+        }
+    }
+    let durable_target = matches!(&target.kind,
+        ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. });
+    let join_target = expected_stack.last()
+        .is_some_and(|frame| frame.join_node_id == target.id);
+    ensure!(waiting == usize::from(durable_target) && joining == usize::from(join_target),
+        "escalation continuation did not create its exact durable wait or join arrival");
+    Ok(())
+}
+
+fn validate_escalation_choices_on(
+    tx: &Transaction<'_>,
+    instance: &ProcessInstance,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    source_scope: &str,
+    mapped_effective: &Value,
+    plan: &RuntimePlan,
+) -> Result<()> {
+    let path = scope_path(scopes, &instance.instance_id, source_scope)?;
+    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    let pairs = super::model::gateway_pairs(nodes, flows)?;
+    let choices = plan
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "exclusive_selected" | "inclusive_split"
+            )
+        })
+        .collect::<Vec<_>>();
+    for event in &choices {
+        ensure!(
+            event.scope_id == source_scope,
+            "escalation continuation selected a gateway outside its source body"
+        );
+        let source_id = event.data["source_token_id"]
+            .as_str()
+            .context("escalation gateway choice lacks its source token")?;
+        let stored: Option<(String,String,String,String,Option<String>)> = tx.query_row(
+            "SELECT scope_id,node_id,status,fork_stack_json,arrival_edge_id FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+            params![instance.instance_id,source_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional()?;
+        let source = if let Some((scope_id, node_id, status, stack, arrival)) = stored {
+            ProcessToken {
+                token_id: source_id.to_owned(),
+                scope_id,
+                node_id,
+                status,
+                fork_stack: parse(stack)?,
+                arrival_edge_id: arrival,
+            }
+        } else {
+            plan.create_tokens
+                .iter()
+                .find(|token| token.token_id == source_id)
+                .cloned()
+                .context("escalation choice source token is not planned or persisted")?
+        };
+        ensure!(
+            source.scope_id == source_scope
+                && source.status == "ready"
+                && plan
+                    .consume_token_ids
+                    .iter()
+                    .filter(|id| id.as_str() == source_id)
+                    .count()
+                    == 1
+                && choices
+                    .iter()
+                    .filter(|other| other.data["source_token_id"].as_str() == Some(source_id))
+                    .count()
+                    == 1,
+            "escalation choice is not linked to one consumed ready token"
+        );
+        let node = nodes
+            .iter()
+            .find(|node| node.id == source.node_id)
+            .context("escalation choice source node is absent from its pinned body")?;
+        let outgoing = flows
+            .iter()
+            .filter(|flow| flow.source_id == node.id)
+            .collect::<Vec<_>>();
+        match (&node.kind, event.kind.as_str()) {
+            (ProcessNodeKind::ExclusiveGateway { default_flow_id }, "exclusive_selected") => {
+                ensure!(
+                    event.node_id.as_deref() == Some(node.id.as_str())
+                        && event.data["activation_id"].as_str() == Some(source_id),
+                    "exclusive choice activation differs from consumed token"
+                );
+                let mut matches = Vec::new();
+                for flow in &outgoing {
+                    if default_flow_id.as_ref() == Some(&flow.id) {
+                        continue;
+                    }
+                    let selected = flow.condition.as_ref().map_or(Ok(true), |expression| {
+                        super::runtime::evaluate(expression, mapped_effective, &Value::Null, &[])?
+                            .as_bool()
+                            .context("exclusive condition is not boolean")
+                    })?;
+                    if selected {
+                        matches.push(flow.id.as_str());
+                    }
+                }
+                let edge = match matches.as_slice() {
+                    [only] => *only,
+                    [] => default_flow_id
+                        .as_deref()
+                        .context("exclusive choice has no matching flow")?,
+                    _ => bail!("exclusive choice is ambiguous under mapped variables"),
+                };
+                ensure!(
+                    event.data["sequence_flow_id"].as_str() == Some(edge),
+                    "exclusive choice differs from pinned CEL/default evaluation"
+                );
+                let target = outgoing
+                    .iter()
+                    .find(|flow| flow.id == edge)
+                    .context("exclusive selected flow is missing")?
+                    .target_id
+                    .as_str();
+                let target = nodes.iter().find(|node| node.id == target)
+                    .context("exclusive selected target is absent")?;
+                validate_escalation_successor_on(plan, source_scope, edge, target, &source.fork_stack)?;
+                ensure!(
+                    plan.create_tokens
+                        .iter()
+                        .filter(|token| token.scope_id == source_scope
+                            && outgoing
+                                .iter()
+                                .any(|flow| token.arrival_edge_id.as_deref()
+                                    == Some(flow.id.as_str())))
+                        .all(|token| token.arrival_edge_id.as_deref() == Some(edge)),
+                    "exclusive choice created an unselected successor"
+                );
+            }
+            (ProcessNodeKind::InclusiveGateway { default_flow_id }, "inclusive_split") => {
+                let pair = pairs
+                    .get(&node.id)
+                    .context("inclusive choice is not a paired split")?;
+                let activation = event.data["activation_id"]
+                    .as_str()
+                    .context("inclusive choice activation is missing")?;
+                ensure!(
+                    event.node_id.as_deref() == Some(node.id.as_str())
+                        && Uuid::parse_str(activation).is_ok(),
+                    "inclusive choice has invalid split activation"
+                );
+                let mut selected = Vec::new();
+                for edge in pair.branch_to_incoming_edge.keys() {
+                    if default_flow_id.as_ref() == Some(edge) {
+                        continue;
+                    }
+                    let flow = outgoing
+                        .iter()
+                        .find(|flow| &flow.id == edge)
+                        .context("inclusive candidate flow is missing")?;
+                    let expression = flow
+                        .condition
+                        .as_deref()
+                        .context("inclusive candidate condition is missing")?;
+                    let value =
+                        super::runtime::evaluate(expression, mapped_effective, &Value::Null, &[])?;
+                    if value
+                        .as_bool()
+                        .context("inclusive condition is not boolean")?
+                    {
+                        selected.push(edge.clone());
+                    }
+                }
+                let default_selected = selected.is_empty() && default_flow_id.is_some();
+                if default_selected {
+                    selected.push(
+                        default_flow_id
+                            .as_ref()
+                            .context("inclusive default disappeared")?
+                            .clone(),
+                    );
+                }
+                ensure!(
+                    !selected.is_empty()
+                        && event.data["selected_branch_edge_ids"]
+                            == serde_json::to_value(&selected)?
+                        && event.data["default_selected"].as_bool() == Some(default_selected),
+                    "inclusive choice differs from pinned CEL/default evaluation"
+                );
+                let successors = plan
+                    .create_tokens
+                    .iter()
+                    .filter(|token| {
+                        token.scope_id == source_scope
+                            && outgoing.iter().any(|flow| {
+                                token.arrival_edge_id.as_deref() == Some(flow.id.as_str())
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    successors.iter().all(|token| selected.iter().any(|edge|
+                        token.arrival_edge_id.as_deref() == Some(edge.as_str()))),
+                    "inclusive choice created an unselected successor"
+                );
+                for edge in &selected {
+                    let target = outgoing
+                        .iter()
+                        .find(|flow| &flow.id == edge)
+                        .context("inclusive selected flow is missing")?
+                        .target_id
+                        .as_str();
+                    let target = nodes.iter().find(|node| node.id == target)
+                        .context("inclusive selected target is absent")?;
+                    let mut expected_stack = source.fork_stack.clone();
+                    expected_stack.push(ForkFrame {
+                        activation_id: activation.to_owned(),
+                        split_node_id: node.id.clone(),
+                        join_node_id: pair.join_node_id.clone(),
+                        branch_edge_id: edge.clone(),
+                        gateway_kind: GatewayKind::Inclusive,
+                        selected_branch_edge_ids: selected.clone(),
+                    });
+                    validate_escalation_successor_on(plan, source_scope, edge, target, &expected_stack)?;
+                }
+            }
+            _ => bail!("escalation choice kind differs from its consumed gateway token"),
+        }
+    }
+    for token in plan.create_tokens.iter().filter(|token| {
+        token.scope_id == source_scope
+            && token.status == "ready"
+            && plan.consume_token_ids.contains(&token.token_id)
+    }) {
+        let node = nodes
+            .iter()
+            .find(|node| node.id == token.node_id)
+            .context("consumed continuation token node is absent")?;
+        if matches!(node.kind, ProcessNodeKind::ExclusiveGateway { .. })
+            || (matches!(node.kind, ProcessNodeKind::InclusiveGateway { .. })
+                && pairs.contains_key(&node.id))
+        {
+            ensure!(
+                choices
+                    .iter()
+                    .any(|event| event.data["source_token_id"].as_str()
+                        == Some(token.token_id.as_str())),
+                "consumed escalation gateway token lacks its choice fact"
+            );
+        }
+    }
+    for source_id in &plan.consume_token_ids {
+        let stored: Option<(String,String,String)> = tx.query_row(
+            "SELECT scope_id,node_id,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+            params![instance.instance_id,source_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).optional()?;
+        let Some((scope_id, node_id, status)) = stored else {
+            continue;
+        };
+        if scope_id != source_scope || status != "ready" {
+            continue;
+        }
+        let node = nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .context("consumed persisted gateway token node is absent")?;
+        if matches!(node.kind, ProcessNodeKind::ExclusiveGateway { .. })
+            || (matches!(node.kind, ProcessNodeKind::InclusiveGateway { .. })
+                && pairs.contains_key(&node.id))
+        {
+            ensure!(choices.iter().any(|event|
+                event.data["source_token_id"].as_str() == Some(source_id.as_str())),
+                "consumed persisted escalation gateway token lacks its choice fact");
+        }
+    }
+    Ok(())
+}
+
+fn validate_escalation_provenance_on(
+    plan: &RuntimePlan,
+    model: &ProcessModel,
+    mapped_effective: &Value,
+    accepted_result: &Value,
+    scope_id: &str,
+    source_token_id: &str,
+    source_node_id: &str,
+    boundary_id: &str,
+    boundary_edge_id: &str,
+    cancel_activity: bool,
+    nodes: &[ProcessNode],
+    flows: &[tentaflow_protocol::processes::ProcessSequenceFlow],
+) -> Result<Vec<PlannedEvent>> {
+    let pairs = super::model::gateway_pairs(nodes, flows)?;
+    let mut traced = HashSet::new();
+    let mut visited_ready = HashSet::new();
+    let mut completed_joins = HashSet::new();
+    let mut frontier = Vec::new();
+    let mut expected_events = Vec::new();
+    let trace_edge = |source: &str, edge_id: &str, stack: &[ForkFrame],
+                      traced: &mut HashSet<String>, frontier: &mut Vec<ProcessToken>| -> Result<()> {
+        let edge = flows.iter().find(|edge| edge.id == edge_id && edge.source_id == source)
+            .context("escalation prefix left its pinned sequence flow")?;
+        let target = nodes.iter().find(|node| node.id == edge.target_id)
+            .context("escalation prefix target is outside its pinned body")?;
+        validate_escalation_successor_on(plan, scope_id, edge_id, target, stack)?;
+        for token in plan.create_tokens.iter().filter(|token|
+            token.scope_id == scope_id && token.arrival_edge_id.as_deref() == Some(edge_id)) {
+            ensure!(traced.insert(token.token_id.clone()),
+                "escalation prefix token has two unrelated predecessors");
+            if token.status == "ready" { frontier.push(token.clone()); }
+        }
+        Ok(())
+    };
+    trace_edge(boundary_id, boundary_edge_id, &[], &mut traced, &mut frontier)?;
+    while let Some(token) = frontier.pop() {
+        ensure!(visited_ready.insert(token.token_id.clone()),
+            "escalation prefix revisited a ready activation");
+        let node = nodes.iter().find(|node| node.id == token.node_id)
+            .context("escalation prefix token node is outside its pinned body")?;
+        let outgoing = flows.iter().filter(|edge| edge.source_id == node.id).collect::<Vec<_>>();
+        match &node.kind {
+            ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. } => {}
+            ProcessNodeKind::ExclusiveGateway { .. } => {
+                let selected = plan.events.iter().filter(|event|
+                    event.kind == "exclusive_selected" && event.scope_id == scope_id
+                        && event.node_id.as_deref() == Some(node.id.as_str())
+                        && event.data["source_token_id"].as_str() == Some(token.token_id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(selected.len() == 1, "escalation XOR lacks its traced choice fact");
+                let edge = selected[0].data["sequence_flow_id"].as_str()
+                    .context("escalation XOR choice edge is missing")?;
+                expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                    kind: "exclusive_selected".into(), node_id: Some(node.id.clone()),
+                    data: serde_json::json!({"sequence_flow_id":edge,
+                        "source_token_id":token.token_id,"activation_id":token.token_id}) });
+                trace_edge(&node.id, edge, &token.fork_stack, &mut traced, &mut frontier)?;
+            }
+            ProcessNodeKind::InclusiveGateway { .. } if pairs.contains_key(&node.id) => {
+                let pair = &pairs[&node.id];
+                let selected = plan.events.iter().filter(|event|
+                    event.kind == "inclusive_split" && event.scope_id == scope_id
+                        && event.node_id.as_deref() == Some(node.id.as_str())
+                        && event.data["source_token_id"].as_str() == Some(token.token_id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(selected.len() == 1, "escalation OR lacks its traced split fact");
+                let activation = selected[0].data["activation_id"].as_str()
+                    .context("escalation OR activation is missing")?;
+                let branches = selected[0].data["selected_branch_edge_ids"].as_array()
+                    .context("escalation OR selected branches are missing")?
+                    .iter().map(|edge| edge.as_str().map(str::to_owned)
+                        .context("escalation OR branch ID is invalid"))
+                    .collect::<Result<Vec<_>>>()?;
+                expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                    kind: "inclusive_split".into(), node_id: Some(node.id.clone()),
+                    data: serde_json::json!({"activation_id":activation,
+                        "selected_branch_edge_ids":branches,
+                        "default_selected":selected[0].data["default_selected"],
+                        "source_token_id":token.token_id}) });
+                for edge in &branches {
+                    let mut stack = token.fork_stack.clone();
+                    stack.push(ForkFrame { activation_id: activation.to_owned(),
+                        split_node_id: node.id.clone(), join_node_id: pair.join_node_id.clone(),
+                        branch_edge_id: edge.clone(), gateway_kind: GatewayKind::Inclusive,
+                        selected_branch_edge_ids: branches.clone() });
+                    trace_edge(&node.id, edge, &stack, &mut traced, &mut frontier)?;
+                }
+            }
+            ProcessNodeKind::ParallelGateway if pairs.contains_key(&node.id) => {
+                let pair = &pairs[&node.id];
+                let split = plan.events.iter().filter(|event|
+                    event.kind == "parallel_split" && event.scope_id == scope_id
+                        && event.node_id.as_deref() == Some(node.id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(split.len() == 1, "escalation AND lacks its one traced split fact");
+                let activation = split[0].data["activation_id"].as_str()
+                    .context("escalation AND activation is missing")?;
+                let branches = pair.branch_to_incoming_edge.keys().cloned().collect::<Vec<_>>();
+                expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                    kind: "parallel_split".into(), node_id: Some(node.id.clone()),
+                    data: serde_json::json!({"activation_id":activation}) });
+                for edge in &branches {
+                    let mut stack = token.fork_stack.clone();
+                    stack.push(ForkFrame { activation_id: activation.to_owned(),
+                        split_node_id: node.id.clone(), join_node_id: pair.join_node_id.clone(),
+                        branch_edge_id: edge.clone(), gateway_kind: GatewayKind::Parallel,
+                        selected_branch_edge_ids: branches.clone() });
+                    trace_edge(&node.id, edge, &stack, &mut traced, &mut frontier)?;
+                }
+            }
+            ProcessNodeKind::ParallelGateway | ProcessNodeKind::InclusiveGateway { .. } => {
+                let frame = token.fork_stack.last()
+                    .context("escalation join lacks its traced fork frame")?;
+                ensure!(frame.join_node_id == node.id,
+                    "escalation join is outside its traced activation");
+                let kind = match frame.gateway_kind {
+                    GatewayKind::Parallel => "parallel_joined",
+                    GatewayKind::Inclusive => "inclusive_joined",
+                };
+                let joined = plan.events.iter().filter(|event| event.kind == kind
+                    && event.scope_id == scope_id
+                    && event.node_id.as_deref() == Some(node.id.as_str())
+                    && event.data["activation_id"].as_str() == Some(frame.activation_id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(joined.len() <= 1, "escalation join has duplicate completion facts");
+                if !joined.is_empty() && completed_joins.insert((node.id.clone(), frame.activation_id.clone())) {
+                    let data = match frame.gateway_kind {
+                        GatewayKind::Parallel => serde_json::json!({"activation_id":frame.activation_id}),
+                        GatewayKind::Inclusive => serde_json::json!({"activation_id":frame.activation_id,
+                            "selected_branch_edge_ids":frame.selected_branch_edge_ids}),
+                    };
+                    expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                        kind: kind.into(), node_id: Some(node.id.clone()), data });
+                    ensure!(outgoing.len() == 1, "escalation join lacks its unique continuation");
+                    let outer = &token.fork_stack[..token.fork_stack.len() - 1];
+                    trace_edge(&node.id, &outgoing[0].id, outer, &mut traced, &mut frontier)?;
+                }
+            }
+            ProcessNodeKind::MessageThrow { .. } => {
+                let messages = plan.create_messages.iter().filter(|message|
+                    message.source_scope_id == scope_id && message.source_node_id == node.id
+                        && message.source_activation_id == token.token_id).collect::<Vec<_>>();
+                ensure!(messages.len() == 1,
+                    "escalation MessageThrow lacks its traced queued message");
+                let mut expected = super::messages::prepare_throw(model, node, mapped_effective)?;
+                expected.message_id = messages[0].message.message_id.clone();
+                ensure!(serde_json::to_value(expected)? == serde_json::to_value(&messages[0].message)?,
+                    "escalation queued message differs from its pinned expression inputs");
+                let message = &messages[0].message;
+                expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                    kind: "message_queued".into(), node_id: Some(node.id.clone()),
+                    data: serde_json::json!({"message_id":message.message_id,
+                        "source_activation_id":token.token_id,"target":message.target,
+                        "message_name":message.message_name,"correlation_key":message.correlation_key}) });
+                for edge in outgoing {
+                    trace_edge(&node.id, &edge.id, &token.fork_stack, &mut traced, &mut frontier)?;
+                }
+            }
+            ProcessNodeKind::EventBasedGateway => {
+                let races = plan.create_event_races.iter().filter(|race|
+                    race.scope_id == scope_id && race.gateway_node_id == node.id
+                        && race.activation_id == token.token_id).collect::<Vec<_>>();
+                ensure!(races.len() == 1, "escalation race lacks its traced activation");
+                expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+                    kind: "event_race_armed".into(), node_id: Some(node.id.clone()),
+                    data: serde_json::json!({"race_id":races[0].race_id,
+                        "activation_id":token.token_id}) });
+                for edge in outgoing {
+                    let branches = plan.create_tokens.iter().filter(|candidate|
+                        candidate.scope_id == scope_id
+                            && candidate.arrival_edge_id.as_deref() == Some(edge.id.as_str()))
+                        .collect::<Vec<_>>();
+                    ensure!(branches.len() == 1 && branches[0].status == "waiting"
+                        && branches[0].node_id == edge.target_id
+                        && branches[0].fork_stack == token.fork_stack,
+                        "escalation race created an unrelated branch token");
+                    let waiting = branches[0];
+                    let subscription = plan.create_subscriptions.iter().filter(|sub|
+                        sub.scope_id == scope_id && sub.node_id == waiting.node_id
+                            && sub.token_id == waiting.token_id
+                            && sub.status == ProcessSubscriptionStatus::Open
+                            && sub.race_id.as_deref() == Some(races[0].race_id.as_str())).count();
+                    let timer = plan.create_timers.iter().filter(|timer|
+                        timer.scope_id.as_deref() == Some(scope_id)
+                            && timer.node_id == waiting.node_id
+                            && timer.token_id.as_deref() == Some(waiting.token_id.as_str())
+                            && timer.status == ProcessTimerStatus::Pending
+                            && timer.race_id.as_deref() == Some(races[0].race_id.as_str())).count();
+                    ensure!(subscription + timer == 1 && traced.insert(waiting.token_id.clone()),
+                        "escalation race branch lacks its exact one-shot wait");
+                }
+            }
+            _ => bail!("escalation prefix reached a node without a permitted durable wait"),
+        }
+    }
+    ensure!(plan.create_tokens.len() == traced.len()
+        && plan.create_tokens.iter().all(|token| token.scope_id == scope_id
+            && traced.contains(&token.token_id)),
+        "escalation plan created a token outside its traced same-body prefix");
+    ensure!(plan.consume_token_ids.len() == plan.consume_token_ids.iter()
+        .collect::<HashSet<_>>().len()
+        && plan.consume_token_ids.iter().all(|id| traced.contains(id)
+            && plan.create_tokens.iter().any(|token| token.token_id.as_str() == id.as_str()
+                && matches!(token.status.as_str(), "ready" | "joining"))),
+        "escalation plan consumed an untraced or persisted token");
+    ensure!(if cancel_activity { plan.cancel_token_ids == [source_token_id.to_owned()] }
+        else { plan.cancel_token_ids.is_empty() },
+        "escalation plan cancelled a token outside its source activity");
+    let waiting = plan.create_tokens.iter().filter(|token|
+        traced.contains(&token.token_id) && token.status == "waiting")
+        .map(|token| token.token_id.as_str()).collect::<HashSet<_>>();
+    let verification = plan.create_user_tasks.iter().filter(|task|
+        task.kind == ProcessUserTaskKind::Verification).collect::<Vec<_>>();
+    ensure!(verification.len() == usize::from(!cancel_activity)
+        && verification.iter().all(|task| task.scope_id == scope_id
+            && task.node_id == source_node_id
+            && task.token_id.as_deref() == Some(source_token_id)
+            && task.status == ProcessUserTaskStatus::Open
+            && &task.outputs == accepted_result),
+        "escalation source Verification differs from its accepted job");
+    ensure!(plan.create_user_tasks.iter().filter(|task|
+        task.kind != ProcessUserTaskKind::Verification).all(|task|
+        task.kind == ProcessUserTaskKind::Work && task.scope_id == scope_id
+            && task.token_id.as_deref().is_some_and(|id| waiting.contains(id)
+                && plan.create_tokens.iter().any(|token| token.token_id == id
+                    && token.node_id == task.node_id && token.status == "waiting"))
+            && nodes.iter().any(|node| node.id == task.node_id
+                && matches!(&node.kind, ProcessNodeKind::UserTask { .. }))),
+        "escalation plan created work outside its traced waits");
+    ensure!(plan.create_user_tasks.iter().filter(|task|
+        task.kind == ProcessUserTaskKind::Work).all(|task| task.outputs.is_null()),
+        "escalation continuation opened work with fabricated outputs");
+    for task in &plan.create_user_tasks {
+        expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+            kind: "user_task_opened".into(), node_id: Some(task.node_id.clone()),
+            data: serde_json::json!({"user_task_id":task.user_task_id,
+                "assignee_user_id":task.assignee_user_id,"kind":task.kind}) });
+    }
+    ensure!(plan.create_jobs.iter().all(|job| job.scope_id == scope_id
+        && waiting.contains(job.token_id.as_str())
+        && plan.create_tokens.iter().any(|token| token.token_id == job.token_id
+            && token.node_id == job.node_id && token.status == "waiting")
+        && nodes.iter().any(|node| node.id == job.node_id
+            && matches!(&node.kind, ProcessNodeKind::ServiceTask { .. }))),
+        "escalation plan queued a job outside its traced waits");
+    for job in &plan.create_jobs {
+        let node = nodes.iter().find(|node| node.id == job.node_id)
+            .context("escalation queued service is outside its pinned body")?;
+        let ProcessNodeKind::ServiceTask { input_mapping, .. } = &node.kind else {
+            bail!("escalation queued job node is not a pinned service task");
+        };
+        ensure!(job.input == super::runtime::prepare_service_input(input_mapping, mapped_effective)?,
+            "escalation queued service input differs from its pinned mapping");
+        expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+            kind: "service_queued".into(), node_id: Some(job.node_id.clone()),
+            data: serde_json::json!({"job_id":job.job_id}) });
+    }
+    ensure!(plan.create_timers.iter().all(|timer|
+        timer.scope_id.as_deref() == Some(scope_id)
+            && timer.token_id.as_deref().is_some_and(|id| waiting.contains(id)
+                && plan.create_tokens.iter().any(|token| token.token_id == id
+                    && match &timer.kind {
+                        ProcessTimerKind::Catch => token.node_id == timer.node_id,
+                        ProcessTimerKind::Boundary => nodes.iter().any(|node| node.id == timer.node_id
+                            && matches!(&node.kind, ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                                if attached_to_id == &token.node_id)),
+                        ProcessTimerKind::Start => false,
+                    }))),
+        "escalation plan armed a timer outside its traced waits");
+    for timer in &plan.create_timers {
+        let node = nodes.iter().find(|node| node.id == timer.node_id)
+            .context("escalation timer node is outside its pinned body")?;
+        let rule = match &node.kind {
+            ProcessNodeKind::TimerCatch { timer } => timer,
+            ProcessNodeKind::BoundaryTimer { timer, .. } => timer,
+            _ => bail!("escalation timer node has no pinned timer rule"),
+        };
+        let due = super::timers::resolve_timer_due(rule, &timer.timezone,
+            timer.kind.clone(), timer.anchor_at_ms, model.calendar_pin.as_ref())?;
+        ensure!(timer.rule == *rule && timer.status == ProcessTimerStatus::Pending
+            && timer.due_at_ms == Some(due) && timer.next_check_at_ms == due
+            && timer.occurrence == 1 && timer.revision == 1
+            && timer.last_reason.is_none(),
+            "escalation timer differs from its pinned due slot");
+        let attached_to_id = match &node.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. } => Some(attached_to_id.as_str()),
+            _ => None,
+        };
+        let mut data = serde_json::json!({"kind":timer.kind,"timer_id":timer.timer_id,
+            "attached_to_id":attached_to_id,
+            "attached_token_id":if timer.kind == ProcessTimerKind::Boundary {
+                timer.token_id.as_deref() } else { None },
+            "due_at_ms":timer.due_at_ms,"timezone":timer.timezone,"occurrence":1});
+        if let Some(working_time) = super::calendar::working_time_summary(
+            rule, model.calendar_pin.as_ref(), timer.due_at_ms)? {
+            data["working_time"] = serde_json::to_value(working_time)?;
+            data["timezone"] = serde_json::json!(timer.timezone);
+        }
+        expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+            kind: "timer_armed".into(), node_id: Some(timer.node_id.clone()), data });
+    }
+    ensure!(plan.create_subscriptions.iter().all(|subscription|
+        subscription.scope_id == scope_id && waiting.contains(subscription.token_id.as_str())
+            && plan.create_tokens.iter().any(|token| token.token_id == subscription.token_id
+                && nodes.iter().any(|node| node.id == subscription.node_id
+                    && match (&subscription.kind, &node.kind) {
+                        (ProcessSubscriptionKind::MessageCatch, ProcessNodeKind::MessageCatch { .. }) =>
+                            token.node_id == node.id,
+                        (ProcessSubscriptionKind::BoundaryMessage,
+                            ProcessNodeKind::BoundaryMessage { attached_to_id, .. })
+                        | (ProcessSubscriptionKind::BoundaryError,
+                            ProcessNodeKind::BoundaryError { attached_to_id, .. })
+                        | (ProcessSubscriptionKind::BoundaryEscalation,
+                            ProcessNodeKind::BoundaryEscalation { attached_to_id, .. }) =>
+                            attached_to_id == &token.node_id,
+                        _ => false,
+                    }))),
+        "escalation plan armed a subscription outside its traced waits");
+    for subscription in &plan.create_subscriptions {
+        ensure!(subscription.status == ProcessSubscriptionStatus::Open
+            && subscription.last_reason.is_none() && subscription.revision == 1,
+            "escalation continuation created a failed subscription wait");
+        let node = nodes.iter().find(|node| node.id == subscription.node_id)
+            .context("escalation subscription node is outside its pinned body")?;
+        let correlation = match &node.kind {
+            ProcessNodeKind::MessageCatch { correlation_expression, .. }
+            | ProcessNodeKind::BoundaryMessage { correlation_expression, .. } =>
+                Some(correlation_expression.as_str()),
+            _ => None,
+        };
+        if let Some(expression) = correlation {
+            let expected_key = super::messages::evaluate_key(expression, mapped_effective)?;
+            ensure!(subscription.correlation_key.as_deref() == Some(expected_key.as_str()),
+                "escalation subscription correlation differs from its pinned expression");
+        }
+        let attached_to_id = match &node.kind {
+            ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => Some(attached_to_id.as_str()),
+            _ => None,
+        };
+        let (kind, data) = match &node.kind {
+            ProcessNodeKind::BoundaryEscalation { cancel_activity, .. } => (
+                "escalation_boundary_armed",
+                serde_json::json!({"subscription_id":subscription.subscription_id,
+                    "attached_token_id":subscription.token_id,"attached_to_id":attached_to_id,
+                    "escalation_code":subscription.escalation_code,"cancel_activity":cancel_activity})),
+            _ => (if subscription.kind == ProcessSubscriptionKind::BoundaryError {
+                "error_boundary_armed" } else { "message_armed" },
+                serde_json::json!({"subscription_id":subscription.subscription_id,
+                    "token_id":subscription.token_id,"attached_to_id":attached_to_id,
+                    "message_name":subscription.message_name,
+                    "correlation_key":subscription.correlation_key,
+                    "error_code":subscription.error_code,"race_id":subscription.race_id,
+                    "kind":subscription.kind})),
+        };
+        expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
+            kind: kind.into(), node_id: Some(subscription.node_id.clone()), data });
+    }
+    for token in plan.create_tokens.iter().filter(|token|
+        token.scope_id == scope_id && token.status == "waiting"
+            && nodes.iter().any(|node| node.id == token.node_id
+                && matches!(&node.kind, ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }))) {
+        for boundary in nodes.iter().filter(|node| match &node.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } => attached_to_id == &token.node_id,
+            _ => false,
+        }) {
+            let armed = match &boundary.kind {
+                ProcessNodeKind::BoundaryTimer { .. } => plan.create_timers.iter().filter(|timer|
+                    timer.node_id == boundary.id && timer.token_id.as_deref() == Some(token.token_id.as_str())
+                        && timer.kind == ProcessTimerKind::Boundary
+                        && matches!(&timer.status, ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked)).count(),
+                _ => plan.create_subscriptions.iter().filter(|subscription|
+                    subscription.node_id == boundary.id && subscription.token_id == token.token_id
+                        && subscription.status == ProcessSubscriptionStatus::Open).count(),
+            };
+            ensure!(armed == 1, "escalation traced wait did not arm its exact boundary");
+        }
+    }
+    ensure!(plan.create_event_races.iter().all(|race|
+        race.scope_id == scope_id && visited_ready.contains(&race.activation_id)),
+        "escalation plan armed a race outside its traced prefix");
+    ensure!(plan.create_messages.iter().all(|message|
+        message.source_scope_id == scope_id && visited_ready.contains(&message.source_activation_id)
+            && plan.create_tokens.iter().any(|token| token.token_id == message.source_activation_id
+                && token.node_id == message.source_node_id
+                && nodes.iter().any(|node| node.id == token.node_id
+                    && matches!(&node.kind, ProcessNodeKind::MessageThrow { .. })))),
+        "escalation plan queued a message outside its traced prefix");
+    ensure!(plan.add_gateway_receipts.iter().all(|receipt|
+        traced.contains(&receipt.token_id)
+            && plan.create_tokens.iter().any(|token| token.token_id == receipt.token_id
+                && token.status == "joining"))
+        && plan.remove_gateway_receipts.is_empty(),
+        "escalation plan changed a receipt outside its traced gateway");
+    Ok(expected_events)
+}
+
+fn validate_escalation_result_plan_on(
+    tx: &Transaction<'_>,
+    instance: &ProcessInstance,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    source_scope: &str,
+    source_token_id: &str,
+    source_node_id: &str,
+    job_id: &str,
+    observed: &ObservedActivityResult,
+    plan: &RuntimePlan,
+    has_escalation: bool,
+) -> Result<()> {
+    let caught = plan
+        .events
+        .iter()
+        .filter(|event| event.kind == "escalation_caught")
+        .collect::<Vec<_>>();
+    let selected = if has_escalation
+        && observed.origin == ActivityResultOrigin::Contract
+        && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+    {
+        let open = subscriptions_on(tx, &instance.instance_id)?
+            .into_iter()
+            .filter(|sub| {
+                sub.kind == ProcessSubscriptionKind::BoundaryEscalation
+                    && sub.status == ProcessSubscriptionStatus::Open
+                    && sub.scope_id == source_scope
+                    && sub.token_id == source_token_id
+            })
+            .collect::<Vec<_>>();
+        open.iter()
+            .find(|sub| {
+                sub.escalation_code.is_some() && sub.escalation_code == observed.result.code
+            })
+            .or_else(|| open.iter().find(|sub| sub.escalation_code.is_none()))
+            .cloned()
+    } else {
+        None
+    };
+    let Some(subscription) = selected else {
+        ensure!(
+            caught.is_empty(),
+            "unselected escalation handler cannot catch a result"
+        );
+        for update in plan
+            .subscription_updates
+            .iter()
+            .filter(|update| update.status == ProcessSubscriptionStatus::Consumed)
+        {
+            ensure!(
+                subscription_on(tx, &update.subscription_id)?.kind
+                    != ProcessSubscriptionKind::BoundaryEscalation,
+                "unselected escalation handler cannot consume a result"
+            );
+        }
+        return Ok(());
+    };
+    let handler = scope_node(
+        model,
+        scopes,
+        &instance.instance_id,
+        source_scope,
+        &subscription.node_id,
+    )?;
+    let ProcessNodeKind::BoundaryEscalation {
+        output_mapping,
+        cancel_activity,
+        ..
+    } = &handler.kind
+    else {
+        bail!("selected escalation subscription refers to a different node kind");
+    };
+    let result_index = plan
+        .events
+        .iter()
+        .position(|event| event.kind == "service_result")
+        .context("accepted escalation has no factual result event")?;
+    ensure!(result_index == 0, "accepted service result must precede its continuation");
+    let result_event_id = plan.event_ids.get(&result_index);
+    if caught.is_empty() {
+        ensure!(
+            plan.complete_job_ids == [job_id.to_owned()]
+                && plan.cancel_job_ids.is_empty()
+                && plan.consume_token_ids.is_empty()
+                && plan.cancel_token_ids.is_empty()
+                && plan.create_tokens.is_empty()
+                && plan.add_gateway_receipts.is_empty()
+                && plan.remove_gateway_receipts.is_empty()
+                && plan.resolve_incident_ids.is_empty()
+                && plan.create_user_tasks.is_empty()
+                && plan.complete_user_task_ids.is_empty()
+                && plan.cancel_user_task_ids.is_empty()
+                && plan.create_jobs.is_empty()
+                && plan.create_timers.is_empty()
+                && plan.timer_updates.is_empty()
+                && plan.create_subscriptions.is_empty()
+                && plan.subscription_updates.is_empty()
+                && plan.create_event_races.is_empty()
+                && plan.race_updates.is_empty()
+                && plan.create_messages.is_empty()
+                && plan.create_scopes.is_empty()
+                && plan.cancel_scope_roots.is_empty()
+                && plan.call_requests.is_empty()
+                && plan.call_steps.is_empty()
+                && plan.scope_terminal_errors.is_empty()
+                && plan.terminal_error.is_none()
+                && plan.variables == instance.variables
+                && plan.status == ProcessInstanceStatus::Incident,
+            "retained escalation failure changed boundary or source work"
+        );
+        ensure!(
+            plan.scope_updates
+                .iter()
+                .all(|update| update.scope_id == source_scope
+                    && update.variables.is_none()
+                    && update.status == ProcessInstanceStatus::Incident),
+            "retained escalation failure changed another scope"
+        );
+        ensure!(
+            plan.add_incidents.len() == 1
+                && plan.add_incidents[0].scope_id == source_scope
+                && plan.add_incidents[0].node_id.as_deref() == Some(source_node_id)
+                && plan.add_incidents[0].job_id.as_deref() == Some(job_id)
+                && plan.add_incidents[0].code == "ESCALATION_HANDLER_FAILED"
+                && !plan.add_incidents[0].can_retry
+                && plan.event_ids.is_empty()
+                && plan.events.len() == 2
+                && plan.events[result_index].kind == "service_result"
+                && plan.events.iter().any(|event| event.kind == "incident"
+                    && event.scope_id == source_scope
+                    && event.node_id.as_deref() == Some(source_node_id)
+                    && event.data == serde_json::json!({"code":"ESCALATION_HANDLER_FAILED",
+                        "message":plan.add_incidents[0].message})),
+            "retained escalation failure lacks its factual source incident"
+        );
+        return Ok(());
+    }
+    ensure!(
+        caught.len() == 1 && result_event_id.is_some(),
+        "escalation catch requires one factual result event ID"
+    );
+    ensure!(plan.event_ids.len() == 1,
+        "escalation catch assigned an unrelated event identity");
+    let event = caught[0];
+    let expected = serde_json::json!({
+        "subscription_id": subscription.subscription_id,
+        "boundary_id": subscription.node_id,
+        "attached_token_id": source_token_id,
+        "source_token_id": source_token_id,
+        "source_scope_id": source_scope,
+        "job_id": job_id,
+        "attempt": tx.query_row("SELECT attempt FROM bpmn_jobs WHERE job_id=?1", [job_id], |row| row.get::<_,u32>(0))?,
+        "fence": tx.query_row("SELECT fence FROM bpmn_jobs WHERE job_id=?1", [job_id], |row| row_u64(row,0))?,
+        "result_origin": "contract",
+        "cancel_activity": cancel_activity,
+        "result_event_id": result_event_id,
+        "code": observed.result.code,
+        "matched_escalation_code": subscription.escalation_code,
+    });
+    ensure!(
+        event.scope_id == source_scope
+            && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+            && event.data == expected,
+        "escalation catch differs from the accepted result and selected handler"
+    );
+    ensure!(
+        plan.complete_job_ids == [job_id.to_owned()]
+            && !plan.cancel_job_ids.iter().any(|id| id == job_id)
+            && plan.complete_user_task_ids.is_empty()
+            && plan.add_incidents.is_empty()
+            && plan.terminal_error.is_none()
+            && !reaches_error_end(plan),
+        "caught escalation cannot cancel its accepted job or introduce a failure incident"
+    );
+    let consumed = plan
+        .subscription_updates
+        .iter()
+        .filter(|update| update.status == ProcessSubscriptionStatus::Consumed)
+        .collect::<Vec<_>>();
+    ensure!(
+        consumed.len() == 1
+            && consumed[0].subscription_id == subscription.subscription_id
+            && consumed[0].expected_revision == subscription.revision,
+        "escalation must consume only its selected one-shot handler"
+    );
+    validate_boundary_plan_on(
+        tx,
+        &BoundaryActivationId::Subscription(subscription.subscription_id.clone()),
+        Some(job_id),
+        plan,
+    )?;
+    let path = scope_path(scopes, &instance.instance_id, source_scope)?;
+    let (body_nodes, body_flows, _) = super::model::scope_body(model, &path)?;
+    let boundary_flows = body_flows
+        .iter()
+        .filter(|flow| flow.source_id == subscription.node_id)
+        .collect::<Vec<_>>();
+    ensure!(boundary_flows.len() == 1,
+        "escalation catch does not start its exact boundary continuation"
+    );
+    let target = body_nodes.iter()
+        .find(|node| node.id == boundary_flows[0].target_id)
+        .context("escalation boundary target is absent from its source body")?;
+    validate_escalation_successor_on(plan, source_scope, &boundary_flows[0].id, target, &[])?;
+    let source_local = scope_variables_on(tx, &instance.instance_id, source_scope)?;
+    let mut locals = BTreeMap::new();
+    for scope in scopes
+        .iter()
+        .filter(|scope| scope.scope_id != instance.instance_id)
+    {
+        if !matches!(
+            scope.status,
+            ProcessInstanceStatus::Completed
+                | ProcessInstanceStatus::Cancelled
+                | ProcessInstanceStatus::Error
+        ) {
+            locals.insert(
+                scope.scope_id.clone(),
+                scope_variables_on(tx, &instance.instance_id, &scope.scope_id)?,
+            );
+        }
+    }
+    let effective = effective_scope_variables(
+        scopes,
+        &locals,
+        &instance.instance_id,
+        &instance.variables,
+        source_scope,
+    )?;
+    let canonical_source = super::runtime::patch_variables(
+        output_mapping,
+        &source_local,
+        &effective,
+        &observed.result.outputs,
+        &[(
+            "activity_result".into(),
+            serde_json::to_value(&observed.result)?,
+        )],
+    )?;
+    let canonical_root = if source_scope == instance.instance_id {
+        ensure!(
+            plan.variables == canonical_source
+                && plan
+                    .scope_updates
+                    .iter()
+                    .all(|update| update.variables.is_none()),
+            "escalation plan changed variables outside its root mapping"
+        );
+        canonical_source.clone()
+    } else {
+        ensure!(
+            plan.variables == instance.variables
+                && plan
+                    .scope_updates
+                    .iter()
+                    .filter(|update| update.variables.is_some())
+                    .count()
+                    == 1
+                && plan
+                    .scope_updates
+                    .iter()
+                    .any(|update| update.scope_id == source_scope
+                        && update.variables.as_ref() == Some(&canonical_source)),
+            "escalation plan changed variables outside its source scope mapping"
+        );
+        instance.variables.clone()
+    };
+    let mut incident_stmt = tx.prepare("SELECT incident_id,scope_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL")?;
+    let remaining_incidents = incident_stmt
+        .query_map([&instance.instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(id, _)| !plan.resolve_incident_ids.contains(id))
+        .collect::<Vec<_>>();
+    let mut ready_stmt = tx.prepare("SELECT scope_id,token_id FROM bpmn_tokens WHERE instance_id=?1 AND status='ready'")?;
+    let ready = ready_stmt.query_map([&instance.instance_id], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut job_stmt = tx.prepare("SELECT scope_id,job_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running')")?;
+    let active_jobs = job_stmt.query_map([&instance.instance_id], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_status = |scope: Option<&str>| {
+        if remaining_incidents.iter().any(|(_, incident_scope)|
+            scope.is_none() || scope == Some(incident_scope.as_str())) {
+            ProcessInstanceStatus::Incident
+        } else if ready.iter().any(|(token_scope, id)|
+            (scope.is_none() || scope == Some(token_scope.as_str()))
+                && !plan.consume_token_ids.contains(id) && !plan.cancel_token_ids.contains(id))
+            || plan.create_tokens.iter().any(|token|
+                (scope.is_none() || scope == Some(token.scope_id.as_str()))
+                    && token.status == "ready" && !plan.consume_token_ids.contains(&token.token_id)
+                    && !plan.cancel_token_ids.contains(&token.token_id))
+            || active_jobs.iter().any(|(job_scope, id)|
+                (scope.is_none() || scope == Some(job_scope.as_str()))
+                    && !plan.complete_job_ids.contains(id) && !plan.cancel_job_ids.contains(id))
+            || plan.create_jobs.iter().any(|job|
+                scope.is_none() || scope == Some(job.scope_id.as_str())) {
+            ProcessInstanceStatus::Running
+        } else {
+            ProcessInstanceStatus::Waiting
+        }
+    };
+    ensure!(
+        plan.create_scopes.is_empty()
+            && plan.cancel_scope_roots.is_empty()
+            && plan.call_requests.is_empty()
+            && plan.call_steps.is_empty()
+            && plan.scope_terminal_errors.is_empty()
+            && plan.status == expected_status(None)
+            && plan
+                .scope_updates
+                .iter()
+                .all(|update| update.scope_id == source_scope
+                    && update.status == expected_status(Some(source_scope))),
+        "escalation continuation changed another scope or call activation"
+    );
+    if source_scope != instance.instance_id && !plan.scope_updates.iter().any(|update|
+        update.scope_id == source_scope) {
+        ensure!(scopes.iter().any(|scope| scope.scope_id == source_scope
+            && scope.status == expected_status(Some(source_scope))),
+            "escalation source scope status differs from its factual active work");
+    }
+    let mapped_effective = if source_scope == instance.instance_id {
+        canonical_root.clone()
+    } else {
+        locals.insert(source_scope.to_owned(), canonical_source);
+        effective_scope_variables(
+            scopes,
+            &locals,
+            &instance.instance_id,
+            &canonical_root,
+            source_scope,
+        )?
+    };
+    validate_escalation_choices_on(
+        tx,
+        instance,
+        model,
+        scopes,
+        source_scope,
+        &mapped_effective,
+        plan,
+    )?;
+    let mut expected_events = validate_escalation_provenance_on(plan, model, &mapped_effective,
+        &serde_json::to_value(&observed.result)?,
+        source_scope, source_token_id, source_node_id,
+        &subscription.node_id, &boundary_flows[0].id, *cancel_activity,
+        body_nodes, body_flows)?;
+    expected_events.push(plan.events[result_index].clone());
+    expected_events.push(event.clone());
+    for update in plan.subscription_updates.iter()
+        .filter(|update| update.status == ProcessSubscriptionStatus::Cancelled) {
+        let actual = subscription_on(tx, &update.subscription_id)?;
+        ensure!(*cancel_activity && actual.scope_id == source_scope
+            && actual.token_id == source_token_id
+            && update.last_reason.as_deref() == Some("sibling_interrupted"),
+            "escalation cancelled a subscription outside its source activity");
+        expected_events.push(PlannedEvent { scope_id: source_scope.to_owned(),
+            kind: "subscription_cancelled".into(), node_id: Some(actual.node_id),
+            data: serde_json::json!({"subscription_id":actual.subscription_id,
+                "attached_token_id":actual.token_id,"reason":update.last_reason}) });
+    }
+    for update in plan.timer_updates.iter()
+        .filter(|update| update.status == ProcessTimerStatus::Cancelled) {
+        let actual = timer_on(tx, &update.timer_id)?;
+        ensure!(*cancel_activity && actual.scope_id.as_deref() == Some(source_scope)
+            && actual.token_id.as_deref() == Some(source_token_id)
+            && update.last_reason.as_deref() == Some("sibling_interrupted"),
+            "escalation cancelled a timer outside its source activity");
+        let node = body_nodes.iter().find(|node| node.id == actual.node_id)
+            .context("cancelled escalation timer is outside its pinned body")?;
+        let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &node.kind else {
+            bail!("cancelled escalation timer is not a boundary timer");
+        };
+        expected_events.push(PlannedEvent { scope_id: source_scope.to_owned(),
+            kind: "timer_cancelled".into(), node_id: Some(actual.node_id),
+            data: serde_json::json!({"kind":"Boundary","timer_id":actual.timer_id,
+                "attached_to_id":attached_to_id,"attached_token_id":actual.token_id,
+                "reason":update.last_reason,"winning_timer_id":subscription.subscription_id}) });
+    }
+    let mut expected_history = expected_events.iter().map(json)
+        .collect::<Result<Vec<_>>>()?;
+    let mut planned_history = plan.events.iter().map(json)
+        .collect::<Result<Vec<_>>>()?;
+    expected_history.sort();
+    planned_history.sort();
+    ensure!(planned_history == expected_history,
+        "escalation history differs from its factual selected continuation");
+    ensure!(
+        plan.create_tokens
+            .iter()
+            .any(|token| token.scope_id == source_scope
+                && token.status == "waiting"
+                && !plan.consume_token_ids.contains(&token.token_id)
+                && !plan.cancel_token_ids.contains(&token.token_id)),
+        "escalation continuation did not reach a durable wait"
+    );
+    Ok(())
+}
+
 fn validate_job_result_plan_on(
     tx: &Transaction<'_>,
     instance: &ProcessInstance,
@@ -8001,6 +9260,48 @@ fn validate_job_result_plan_on(
             "business result requires an explicit pinned output contract"
         );
         super::jobs::parse_contract_result(serde_json::to_value(&observed.result)?)?;
+    }
+    let body_path = scope_path(&scopes, &instance.instance_id, &source_scope)?;
+    let has_escalation = super::model::scope_body(&model, &body_path)?
+        .0
+        .iter()
+        .any(|candidate| {
+            matches!(&candidate.kind,
+            ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } if attached_to_id == node_id)
+        });
+    if has_escalation && observed.origin == ActivityResultOrigin::Contract {
+        let observation = observed
+            .expression_observation
+            .as_ref()
+            .context("accepted escalation result lacks its original expression observation")?;
+        validate_output(&observation.normalized_outputs)?;
+        validate_variables(&observation.evaluation_variables)?;
+        let claim_data: String = tx.query_row(
+            "SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='service_claimed' AND json_extract(data_json,'$.job_id')=?3 AND json_extract(data_json,'$.attempt')=?4 AND json_extract(data_json,'$.fence')=?5 ORDER BY seq DESC LIMIT 1",
+            params![instance.instance_id,source_scope,job_id,
+                tx.query_row("SELECT attempt FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|row.get::<_,u32>(0))?,
+                sql_integer(tx.query_row("SELECT fence FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|row_u64(row,0))?)?],
+            |row| row.get(0),
+        ).context("fenced service claim event is missing")?;
+        let claim: Value = parse(claim_data)?;
+        ensure!(
+            claim["expression_variables_sha256"].as_str()
+                == Some(expression_variables_hash(&observation.evaluation_variables)?.as_str()),
+            "accepted escalation expression variables differ from the fenced claim"
+        );
+        let expression = result_expression
+            .as_deref()
+            .context("accepted escalation has no pinned result expression")?;
+        let actual = super::jobs::parse_contract_result(super::runtime::evaluate(
+            expression,
+            &observation.evaluation_variables,
+            &observation.normalized_outputs,
+            &[],
+        )?)?;
+        ensure!(
+            actual == observed.result,
+            "accepted escalation result differs from its pinned expression observation"
+        );
     }
     let mut expected = serde_json::to_value(&observed.result)?;
     expected["result_origin"] = serde_json::json!(result_origin_text(&observed.origin));
@@ -8077,6 +9378,10 @@ fn validate_job_result_plan_on(
                 && event.data["source_kind"].as_str() != Some("error_end")
         })
         .collect::<Vec<_>>();
+    let handling_escalation = plan
+        .events
+        .iter()
+        .any(|event| event.kind == "escalation_caught");
     match handler {
         Some(sub) => {
             ensure!(
@@ -8128,6 +9433,7 @@ fn validate_job_result_plan_on(
         None => {
             ensure!(
                 (reaches_error_end(plan)
+                    || handling_escalation
                     || (plan.cancel_scope_roots.is_empty()
                         && plan.cancel_token_ids.is_empty()
                         && plan.cancel_job_ids.is_empty()
@@ -8140,6 +9446,7 @@ fn validate_job_result_plan_on(
             );
             ensure!(
                 (reaches_error_end(plan)
+                    || handling_escalation
                     || (caught.is_empty()
                         && !plan.subscription_updates.iter().any(|update| update.status
                             == ProcessSubscriptionStatus::Consumed
@@ -8150,6 +9457,19 @@ fn validate_job_result_plan_on(
             );
         }
     }
+    validate_escalation_result_plan_on(
+        tx,
+        instance,
+        &model,
+        &scopes,
+        &source_scope,
+        &token_id,
+        node_id,
+        job_id,
+        observed,
+        plan,
+        has_escalation,
+    )?;
     Ok(())
 }
 
@@ -8286,6 +9606,14 @@ pub fn retry_job(
     ensure!(
         job_activation_live_on(&tx, job_id)?,
         "service activity is no longer retryable"
+    );
+    let accepted_needs_human: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman')",
+        params![job_id,instance_id], |row| row.get(0),
+    )?;
+    ensure!(
+        !accepted_needs_human,
+        "accepted Contract NeedsHuman service job cannot be retried"
     );
     let (node_id,scope_id):(String,String)=tx.query_row("SELECT j.node_id,j.scope_id FROM bpmn_jobs j JOIN bpmn_incidents x ON x.job_id=j.job_id AND x.instance_id=j.instance_id AND x.resolved_at_ms IS NULL WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status IN ('error','completed')",params![job_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?))).context("retryable job not found")?;
     require_call_control_authority_on(&tx, actor, instance_id)?;
@@ -8489,6 +9817,7 @@ fn subscription_kind_text(kind: &ProcessSubscriptionKind) -> &'static str {
         ProcessSubscriptionKind::MessageCatch => "message_catch",
         ProcessSubscriptionKind::BoundaryMessage => "boundary_message",
         ProcessSubscriptionKind::BoundaryError => "boundary_error",
+        ProcessSubscriptionKind::BoundaryEscalation => "boundary_escalation",
     }
 }
 fn subscription_kind(value: &str) -> Result<ProcessSubscriptionKind> {
@@ -8496,6 +9825,7 @@ fn subscription_kind(value: &str) -> Result<ProcessSubscriptionKind> {
         "message_catch" => Ok(ProcessSubscriptionKind::MessageCatch),
         "boundary_message" => Ok(ProcessSubscriptionKind::BoundaryMessage),
         "boundary_error" => Ok(ProcessSubscriptionKind::BoundaryError),
+        "boundary_escalation" => Ok(ProcessSubscriptionKind::BoundaryEscalation),
         _ => bail!("unknown subscription kind"),
     }
 }
@@ -8532,7 +9862,7 @@ fn race_status(value: &str) -> Result<ProcessEventRaceStatus> {
     }
 }
 fn subscription_on(conn: &Connection, id: &str) -> Result<EventSubscription> {
-    let row = conn.query_row("SELECT instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions WHERE subscription_id=?1",[id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u32>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?,row_u64(r,11)?,r.get::<_,String>(12)?,r.get::<_,Option<String>>(13)?,r.get::<_,i64>(14)?,r.get::<_,i64>(15)?))).context("subscription not found")?;
+    let row = conn.query_row("SELECT instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions WHERE subscription_id=?1",[id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u32>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,row_u64(r,12)?,r.get::<_,String>(13)?,r.get::<_,Option<String>>(14)?,r.get::<_,i64>(15)?,r.get::<_,i64>(16)?))).context("subscription not found")?;
     Ok(EventSubscription {
         scope_id: conn.query_row(
             "SELECT scope_id FROM bpmn_event_subscriptions WHERE subscription_id=?1",
@@ -8550,12 +9880,13 @@ fn subscription_on(conn: &Connection, id: &str) -> Result<EventSubscription> {
         message_name: row.7,
         correlation_key: row.8,
         error_code: row.9,
-        race_id: row.10,
-        revision: row.11,
-        status: subscription_status(&row.12)?,
-        last_reason: row.13,
-        created_at_ms: row.14,
-        updated_at_ms: row.15,
+        escalation_code: row.10,
+        race_id: row.11,
+        revision: row.12,
+        status: subscription_status(&row.13)?,
+        last_reason: row.14,
+        created_at_ms: row.15,
+        updated_at_ms: row.16,
     })
 }
 fn subscriptions_on(conn: &Connection, instance_id: &str) -> Result<Vec<EventSubscription>> {
@@ -8602,11 +9933,11 @@ fn subscription_activation<'a>(
     s: &EventSubscription,
 ) -> Result<&'a str> {
     let node = scoped_node_on(conn, &s.instance_id, &s.scope_id, model, &s.node_id)?;
-    let (attachment, message_ref, error_ref) = match (&s.kind, &node.kind) {
+    let (attachment, message_ref, error_ref, escalation_ref) = match (&s.kind, &node.kind) {
         (
             ProcessSubscriptionKind::MessageCatch,
             ProcessNodeKind::MessageCatch { message_ref, .. },
-        ) => (node.id.as_str(), Some(message_ref), None),
+        ) => (node.id.as_str(), Some(message_ref), None, None),
         (
             ProcessSubscriptionKind::BoundaryMessage,
             ProcessNodeKind::BoundaryMessage {
@@ -8614,7 +9945,7 @@ fn subscription_activation<'a>(
                 message_ref,
                 ..
             },
-        ) => (attached_to_id.as_str(), Some(message_ref), None),
+        ) => (attached_to_id.as_str(), Some(message_ref), None, None),
         (
             ProcessSubscriptionKind::BoundaryError,
             ProcessNodeKind::BoundaryError {
@@ -8622,7 +9953,15 @@ fn subscription_activation<'a>(
                 error_ref,
                 ..
             },
-        ) => (attached_to_id.as_str(), None, Some(error_ref)),
+        ) => (attached_to_id.as_str(), None, Some(error_ref), None),
+        (
+            ProcessSubscriptionKind::BoundaryEscalation,
+            ProcessNodeKind::BoundaryEscalation {
+                attached_to_id,
+                escalation_ref,
+                ..
+            },
+        ) => (attached_to_id.as_str(), None, None, Some(escalation_ref)),
         _ => bail!("subscription kind differs from pinned node"),
     };
     if let Some(id) = message_ref {
@@ -8658,6 +9997,28 @@ fn subscription_activation<'a>(
         ensure!(
             s.error_code.as_deref() == expected,
             "subscription error code differs from pinned declaration"
+        );
+    }
+    if let Some(id) = escalation_ref {
+        let expected = id
+            .as_ref()
+            .map(|id| {
+                model
+                    .escalations
+                    .iter()
+                    .find(|e| &e.escalation_id == id)
+                    .map(|e| e.escalation_code.as_str())
+                    .context("escalation declaration is missing")
+            })
+            .transpose()?;
+        ensure!(
+            s.escalation_code.as_deref() == expected,
+            "subscription escalation code differs from pinned declaration"
+        );
+    } else {
+        ensure!(
+            s.escalation_code.is_none(),
+            "non-escalation subscription has escalation code"
         );
     }
     Ok(attachment)
@@ -8720,7 +10081,7 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
             "subscription is not a branch of its event race"
         );
     }
-    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13,?14,?15,?16,?17)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms,s.scope_id])?;
+    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.escalation_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms,s.scope_id])?;
     Ok(())
 }
 fn apply_event_plan_on(
@@ -8852,6 +10213,33 @@ fn apply_event_plan_on(
                 && s.updated_at_ms == at_ms,
             "new subscription belongs to another transition"
         );
+        if s.kind == ProcessSubscriptionKind::BoundaryEscalation {
+            let node = scoped_node_on(tx, instance_id, &s.scope_id, &model, &s.node_id)?;
+            let ProcessNodeKind::BoundaryEscalation {
+                attached_to_id,
+                cancel_activity,
+                ..
+            } = &node.kind
+            else {
+                bail!("escalation subscription references another node kind");
+            };
+            ensure!(
+                plan.events
+                    .iter()
+                    .any(|event| event.kind == "escalation_boundary_armed"
+                        && event.scope_id == s.scope_id
+                        && event.node_id.as_deref() == Some(s.node_id.as_str())
+                        && event.data
+                            == serde_json::json!({
+                                "subscription_id":s.subscription_id,
+                                "attached_token_id":s.token_id,
+                                "attached_to_id":attached_to_id,
+                                "escalation_code":s.escalation_code,
+                                "cancel_activity":cancel_activity,
+                            })),
+                "escalation subscription lacks its exact armed event"
+            );
+        }
         insert_subscription_on(tx, s)?;
     }
     for update in &plan.race_updates {
@@ -9022,6 +10410,9 @@ fn apply_event_plan_on(
                 ProcessNodeKind::BoundaryMessage {
                     cancel_activity: false,
                     ..
+                } | ProcessNodeKind::BoundaryEscalation {
+                    cancel_activity: false,
+                    ..
                 }
             );
             ensure!(
@@ -9043,6 +10434,21 @@ fn apply_event_plan_on(
                     ) && plan.cancel_token_ids.contains(&actual.token_id)),
                 "subscription cancellation is unrelated to its exact activation"
             );
+            if actual.kind == ProcessSubscriptionKind::BoundaryEscalation {
+                ensure!(
+                    plan.events
+                        .iter()
+                        .any(|event| event.kind == "subscription_cancelled"
+                            && event.scope_id == actual.scope_id
+                            && event.node_id.as_deref() == Some(actual.node_id.as_str())
+                            && event.data["subscription_id"].as_str()
+                                == Some(actual.subscription_id.as_str())
+                            && event.data["attached_token_id"].as_str()
+                                == Some(actual.token_id.as_str())
+                            && event.data["reason"].as_str() == Some(reason)),
+                    "escalation disarm lacks its actual subscription history"
+                );
+            }
         }
         let count=tx.execute("UPDATE bpmn_event_subscriptions SET status=?1,last_reason=?2,revision=revision+1,updated_at_ms=?3 WHERE subscription_id=?4 AND instance_id=?5 AND revision=?6 AND status='open'",params![subscription_status_text(&update.status),update.last_reason,at_ms,update.subscription_id,instance_id,sql_incrementable(update.expected_revision)?])?;
         ensure!(count == 1, "subscription revision conflict");
@@ -10264,7 +11670,8 @@ pub fn deliver_message(
                 return Ok(None);
             }
             ensure!(
-                subscription.kind != ProcessSubscriptionKind::BoundaryError
+                (subscription.kind == ProcessSubscriptionKind::MessageCatch
+                    || subscription.kind == ProcessSubscriptionKind::BoundaryMessage)
                     && delivered[0].node_id.as_deref() == Some(subscription.node_id.as_str())
                     && delivered[0].data["subscription_id"].as_str()
                         == Some(subscription.subscription_id.as_str())
@@ -10440,6 +11847,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claim_variables_hash_has_fixed_utf8_recursive_key_order() {
+        let value = json!({"z":[{"b":2,"a":1}],"a":"ä"});
+        assert_eq!(
+            expression_variables_hash(&value).unwrap(),
+            "734ab3481265d16f414104b6962401ea55b0e5d42a70da42f3d5a65d0d9b198f"
+        );
+    }
+
+    #[test]
     fn complete_detail_frame_with_eight_maximum_pages_utf8_floats_and_selected_rows_fits_wire_budget(
     ) {
         use tentaflow_protocol::processes::HolidayPolicy;
@@ -10518,6 +11934,7 @@ mod tests {
                 message_name: Some(name.clone()),
                 correlation_key: Some(name.clone()),
                 error_code: Some("E".repeat(64)),
+                escalation_code: None,
                 attached_to_id: Some(identifier.clone()),
                 race_id: Some(uuid.clone()),
                 last_reason: Some(reason.clone())

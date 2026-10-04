@@ -7,13 +7,17 @@ use quick_xml::events::Event;
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
-    ActivityVerification, ProcessCalendarPin, ProcessCallableReference, ProcessDiagnostic, ProcessDiagram, ProcessEdgeDiagram, ProcessModel,
-    ProcessErrorDeclaration, ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessNode,
-    ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessTimerSpec,
-    ProcessSubProcess, ProcessWorkCalendar,
+    ActivityVerification, ProcessCalendarPin, ProcessCallableReference, ProcessDiagnostic,
+    ProcessDiagram, ProcessEdgeDiagram, ProcessErrorDeclaration, ProcessEscalationDeclaration,
+    ProcessMessageDeclaration, ProcessMessageTargetSpec, ProcessModel, ProcessNode,
+    ProcessNodeKind, ProcessPoint, ProcessSequenceFlow, ProcessShape, ProcessSubProcess,
+    ProcessTimerSpec, ProcessWorkCalendar,
 };
 
-use super::model::{validate_model, validate_timer_spec, validate_variables, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES};
+use super::model::{
+    validate_model, validate_timer_spec, validate_variables, EscalationPathError, MAX_MODEL_BYTES,
+    MAX_VARIABLE_BYTES,
+};
 
 const BPMN: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
 const BPMNDI: &str = "http://www.omg.org/spec/BPMN/20100524/DI";
@@ -57,6 +61,12 @@ impl std::fmt::Display for XmlElementError {
 impl std::error::Error for XmlElementError {}
 
 impl Element {
+    fn find_id(&self, id: &str) -> Option<&Element> {
+        if self.attr("id") == Some(id) {
+            return Some(self);
+        }
+        self.children.iter().find_map(|child| child.find_id(id))
+    }
     fn is(&self, ns: &str, local: &str) -> bool {
         self.ns == ns && self.local == local
     }
@@ -171,10 +181,18 @@ fn parse_tree(xml: &str) -> Result<Element> {
                     let attr_ns = ns_text(attr_ns)?;
                     let attr_local = String::from_utf8(attr_local.as_ref().to_vec())?;
                     let value = attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
-                    if attr_ns.is_empty() && matches!(attr_local.as_str(), "messageRef" | "errorRef" | "calledElement") {
+                    if attr_ns.is_empty()
+                        && matches!(
+                            attr_local.as_str(),
+                            "messageRef" | "errorRef" | "escalationRef" | "calledElement"
+                        )
+                    {
                         let invalid_qname = |reason: &str| XmlElementError {
                             message: format!("{reason} at byte {offset}"),
-                            element_id: stack.last().and_then(|parent| parent.attr("id")).map(str::to_string),
+                            element_id: stack
+                                .last()
+                                .and_then(|parent| parent.attr("id"))
+                                .map(str::to_string),
                             offset,
                         };
                         let (uri, local) = if let Some((prefix, local)) = value.split_once(':') {
@@ -348,11 +366,20 @@ fn message_configuration<T: serde::de::DeserializeOwned>(element: &Element) -> R
 }
 
 fn event_reference(element: &Element, kind: &str, namespace: &str) -> Result<String> {
-    let definition = element.child(BPMN, kind)?.context("event definition is required")?;
-    let attribute = if kind == "messageEventDefinition" { "messageRef" } else { "errorRef" };
+    let definition = element
+        .child(BPMN, kind)?
+        .context("event definition is required")?;
+    let attribute = match kind {
+        "messageEventDefinition" => "messageRef",
+        "escalationEventDefinition" => "escalationRef",
+        _ => "errorRef",
+    };
     definition.attrs_only(&[attribute])?;
-    ensure!(definition.children.is_empty() && definition.text.trim().is_empty(),
-        "event definition cannot contain other content at byte {}", definition.offset);
+    ensure!(
+        definition.children.is_empty() && definition.text.trim().is_empty(),
+        "event definition cannot contain other content at byte {}",
+        definition.offset
+    );
     definition.reference(attribute, namespace)
 }
 
@@ -557,15 +584,27 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
         }
         "boundaryEvent" => {
             element.attrs_only(&["id", "name", "attachedToRef", "cancelActivity"])?;
-            element.children_only(&[(BPMN, "timerEventDefinition"), (BPMN, "messageEventDefinition"), (BPMN, "errorEventDefinition"), (BPMN, "extensionElements")])?;
+            element.children_only(&[
+                (BPMN, "timerEventDefinition"),
+                (BPMN, "messageEventDefinition"),
+                (BPMN, "errorEventDefinition"),
+                (BPMN, "escalationEventDefinition"),
+                (BPMN, "extensionElements"),
+            ])?;
             let cancel_activity = match element.attr("cancelActivity") {
                 None | Some("true" | "1") => true,
                 Some("false" | "0") => false,
-                Some(other) => return Err(XmlElementError {
-                    message: format!("invalid boundary cancelActivity {other} at byte {}", element.offset),
-                    element_id: Some(id.clone()),
-                    offset: element.offset,
-                }.into()),
+                Some(other) => {
+                    return Err(XmlElementError {
+                        message: format!(
+                            "invalid boundary cancelActivity {other} at byte {}",
+                            element.offset
+                        ),
+                        element_id: Some(id.clone()),
+                        offset: element.offset,
+                    }
+                    .into())
+                }
             };
             if element.child(BPMN, "timerEventDefinition")?.is_some() {
                 ensure!(element.children.len() == 1, "boundary timer cannot have another event definition");
@@ -578,17 +617,68 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 ensure!(element.children.len() == 2, "boundary message requires one definition and one config");
                 let config: MessageCatchConfig = message_configuration(element)?;
                 ProcessNodeKind::BoundaryMessage {
-                    attached_to_id: element.required("attachedToRef")?, cancel_activity,
-                    message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
+                    attached_to_id: element.required("attachedToRef")?,
+                    cancel_activity,
+                    message_ref: event_reference(
+                        element,
+                        "messageEventDefinition",
+                        target_namespace,
+                    )?,
                     correlation_expression: config.correlation_expression,
                     output_mapping: config.output_mapping,
                 }
+            } else if let Some(definition) = element.child(BPMN, "escalationEventDefinition")? {
+                ensure!(
+                    element.children.len() <= 2,
+                    "boundary escalation has unsupported event definitions"
+                );
+                ensure!(
+                    element
+                        .children
+                        .iter()
+                        .all(|child| child.is(BPMN, "escalationEventDefinition")
+                            || child.is(BPMN, "extensionElements")),
+                    "boundary escalation cannot contain another event definition"
+                );
+                definition.attrs_only(&["escalationRef"])?;
+                ensure!(
+                    definition.children.is_empty() && definition.text.trim().is_empty(),
+                    "escalation definition must be empty"
+                );
+                let output_mapping =
+                    if let Some(extension) = element.child(BPMN, "extensionElements")? {
+                        extension.attrs_only(&[])?;
+                        extension.children_only(&[(TF, "outputMapping")])?;
+                        ensure!(
+                            extension.children.len() == 1,
+                            "boundary escalation extension requires outputMapping"
+                        );
+                        mapping(extension, "outputMapping")?
+                    } else {
+                        BTreeMap::new()
+                    };
+                ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id: element.required("attachedToRef")?,
+                    cancel_activity,
+                    escalation_ref: if definition.attr("escalationRef").is_some() {
+                        Some(definition.reference("escalationRef", target_namespace)?)
+                    } else {
+                        None
+                    },
+                    output_mapping,
+                }
             } else {
-                ensure!(cancel_activity, "boundary error must interrupt its activity");
-                ensure!(element.child(BPMN, "timerEventDefinition")?.is_none()
-                    && element.child(BPMN, "messageEventDefinition")?.is_none(),
-                    "boundary error cannot contain another event definition");
-                let definition = element.child(BPMN, "errorEventDefinition")?
+                ensure!(
+                    cancel_activity,
+                    "boundary error must interrupt its activity"
+                );
+                ensure!(
+                    element.child(BPMN, "timerEventDefinition")?.is_none()
+                        && element.child(BPMN, "messageEventDefinition")?.is_none(),
+                    "boundary error cannot contain another event definition"
+                );
+                let definition = element
+                    .child(BPMN, "errorEventDefinition")?
                     .context("boundary error requires errorEventDefinition")?;
                 definition.attrs_only(&["errorRef"])?;
                 ensure!(definition.children.is_empty() && definition.text.trim().is_empty(), "error definition must be empty");
@@ -961,24 +1051,60 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         "BPMN root must use the BPMN model namespace"
     );
     root.attrs_only(&["id", "targetNamespace"])?;
-    root.children_only(&[(BPMN, "process"), (BPMNDI, "BPMNDiagram"), (BPMN, "message"), (BPMN, "error")])?;
-    let has_declarations = root.children.iter().any(|child| child.is(BPMN, "message") || child.is(BPMN, "error"));
+    root.children_only(&[
+        (BPMN, "process"),
+        (BPMNDI, "BPMNDiagram"),
+        (BPMN, "message"),
+        (BPMN, "error"),
+        (BPMN, "escalation"),
+    ])?;
+    let has_declarations = root.children.iter().any(|child| {
+        child.is(BPMN, "message") || child.is(BPMN, "error") || child.is(BPMN, "escalation")
+    });
     if has_declarations {
-        ensure!(root.attr("targetNamespace").is_some_and(|value| !value.is_empty()),
-            "BPMN declarations require explicit targetNamespace");
+        ensure!(
+            root.attr("targetNamespace")
+                .is_some_and(|value| !value.is_empty()),
+            "BPMN declarations require explicit targetNamespace"
+        );
     }
     let namespace = root.attr("targetNamespace").unwrap_or(TF);
     let mut messages = Vec::new();
     let mut errors = Vec::new();
+    let mut escalations = Vec::new();
     for child in &root.children {
         if child.is(BPMN, "message") {
             child.attrs_only(&["id", "name"])?;
-            ensure!(child.children.is_empty() && child.text.trim().is_empty(), "message declaration must be empty");
-            messages.push(ProcessMessageDeclaration { message_id: child.required("id")?, name: child.required("name")? });
+            ensure!(
+                child.children.is_empty() && child.text.trim().is_empty(),
+                "message declaration must be empty"
+            );
+            messages.push(ProcessMessageDeclaration {
+                message_id: child.required("id")?,
+                name: child.required("name")?,
+            });
         } else if child.is(BPMN, "error") {
             child.attrs_only(&["id", "name", "errorCode"])?;
-            ensure!(child.children.is_empty() && child.text.trim().is_empty(), "error declaration must be empty");
-            errors.push(ProcessErrorDeclaration { error_id: child.required("id")?, name: child.required("name")?, error_code: child.required("errorCode")? });
+            ensure!(
+                child.children.is_empty() && child.text.trim().is_empty(),
+                "error declaration must be empty"
+            );
+            errors.push(ProcessErrorDeclaration {
+                error_id: child.required("id")?,
+                name: child.required("name")?,
+                error_code: child.required("errorCode")?,
+            });
+        } else if child.is(BPMN, "escalation") {
+            child.attrs_only(&["id", "name", "escalationCode"])?;
+            ensure!(
+                child.children.is_empty() && child.text.trim().is_empty(),
+                "escalation declaration must be empty"
+            );
+            escalations.push(ProcessEscalationDeclaration {
+                escalation_id: child.required("id")?,
+                name: child.required("name")?,
+                escalation_code: child.required("escalationCode")?,
+            });
         }
     }
     let processes: Vec<_> = root
@@ -1012,14 +1138,37 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
             ProcessNodeKind::ErrorEnd { error_ref } => Some(error_ref.as_str()),
             _ => None,
         };
-        if message_ref.is_some_and(|reference| !messages.iter().any(|declaration| declaration.message_id == reference))
-            || error_ref.is_some_and(|reference| !errors.iter().any(|declaration| declaration.error_id == reference)) {
-            let offset = process.children.iter().find(|child| child.attr("id") == Some(node.id.as_str()))
+        let escalation_ref = match &node.kind {
+            ProcessNodeKind::BoundaryEscalation { escalation_ref, .. } => escalation_ref.as_deref(),
+            _ => None,
+        };
+        if message_ref.is_some_and(|reference| {
+            !messages
+                .iter()
+                .any(|declaration| declaration.message_id == reference)
+        }) || error_ref.is_some_and(|reference| {
+            !errors
+                .iter()
+                .any(|declaration| declaration.error_id == reference)
+        }) || escalation_ref.is_some_and(|reference| {
+            !escalations
+                .iter()
+                .any(|declaration| declaration.escalation_id == reference)
+        }) {
+            let offset = process
+                .children
+                .iter()
+                .find(|child| child.attr("id") == Some(node.id.as_str()))
                 .map_or(process.offset, |child| child.offset);
             return Err(XmlElementError {
-                message: format!("event {} references an unknown or wrong-type declaration at byte {offset}", node.id),
-                element_id: Some(node.id.clone()), offset,
-            }.into());
+                message: format!(
+                    "event {} references an unknown or wrong-type declaration at byte {offset}",
+                    node.id
+                ),
+                element_id: Some(node.id.clone()),
+                offset,
+            }
+            .into());
         }
     }
     if timer_timezone.is_none() {
@@ -1064,11 +1213,32 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         messages,
         errors,
         target_namespace: (namespace != TF).then(|| namespace.to_string()),
+        escalations,
     };
-    validate_model(&model).map_err(|error| XmlElementError {
-        message: error.to_string(),
-        element_id: Some(model.process_id.clone()),
-        offset: process.offset,
+    validate_model(&model).map_err(|error| {
+        if let Some(path) = error.downcast_ref::<EscalationPathError>() {
+            let element_id = path
+                .flow_id
+                .as_ref()
+                .or(path.node_id.as_ref())
+                .unwrap_or(&path.boundary_id);
+            let offset = root
+                .find_id(element_id)
+                .map_or(process.offset, |element| element.offset);
+            let context = XmlElementError {
+                message: error.to_string(),
+                element_id: Some(element_id.clone()),
+                offset,
+            };
+            error.context(context)
+        } else {
+            XmlElementError {
+                message: error.to_string(),
+                element_id: Some(model.process_id.clone()),
+                offset: process.offset,
+            }
+            .into()
+        }
     })?;
     Ok(model)
 }
@@ -1078,14 +1248,24 @@ pub fn import_xml(xml: &str) -> (Option<ProcessModel>, Vec<ProcessDiagnostic>) {
         Ok(model) => (Some(model), Vec::new()),
         Err(error) => {
             let element = error.downcast_ref::<XmlElementError>();
+            let path = error.downcast_ref::<EscalationPathError>();
             (
                 None,
                 vec![ProcessDiagnostic {
-                    code: "UNSUPPORTED_OR_INVALID_BPMN".into(),
+                    code: if path.is_some() {
+                        "ESCALATION_IMMEDIATE_PATH_UNSUPPORTED"
+                    } else {
+                        "UNSUPPORTED_OR_INVALID_BPMN"
+                    }
+                    .into(),
                     message: error.to_string(),
                     element_id: element.and_then(|element| element.element_id.clone()),
                     offset: element.map(|element| element.offset),
                     fatal: true,
+                    boundary_id: path.map(|path| path.boundary_id.clone()),
+                    flow_id: path.and_then(|path| path.flow_id.clone()),
+                    node_id: path.and_then(|path| path.node_id.clone()),
+                    reason: path.map(|path| path.reason),
                 }],
             )
         }
@@ -1144,6 +1324,10 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ProcessNodeKind::BoundaryError { attached_to_id, .. } => (
                 "boundaryEvent",
                 format!(" attachedToRef=\"{}\" cancelActivity=\"true\"", escaped(attached_to_id)),
+            ),
+            ProcessNodeKind::BoundaryEscalation { attached_to_id, cancel_activity, .. } => (
+                "boundaryEvent",
+                format!(" attachedToRef=\"{}\" cancelActivity=\"{}\"", escaped(attached_to_id), cancel_activity),
             ),
             ProcessNodeKind::End => ("endEvent", String::new()),
             ProcessNodeKind::ErrorEnd { .. } => ("endEvent", String::new()),
@@ -1217,9 +1401,32 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                 xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
                     escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
             }
-            ProcessNodeKind::BoundaryError { error_ref, output_mapping, .. } => {
-                let reference = error_ref.as_ref().map(|id| format!(" errorRef=\"tns:{}\"", escaped(id))).unwrap_or_default();
+            ProcessNodeKind::BoundaryError {
+                error_ref,
+                output_mapping,
+                ..
+            } => {
+                let reference = error_ref
+                    .as_ref()
+                    .map(|id| format!(" errorRef=\"tns:{}\"", escaped(id)))
+                    .unwrap_or_default();
                 xml.push_str(&format!("><bpmn:errorEventDefinition{reference}/>"));
+                if !output_mapping.is_empty() {
+                    xml.push_str(&format!("<bpmn:extensionElements><tentaflow:outputMapping>{}</tentaflow:outputMapping></bpmn:extensionElements>",
+                        escaped(&serde_json::to_string(output_mapping)?)));
+                }
+                xml.push_str(&format!("</bpmn:{tag}>"));
+            }
+            ProcessNodeKind::BoundaryEscalation {
+                escalation_ref,
+                output_mapping,
+                ..
+            } => {
+                let reference = escalation_ref
+                    .as_ref()
+                    .map(|id| format!(" escalationRef=\"tns:{}\"", escaped(id)))
+                    .unwrap_or_default();
+                xml.push_str(&format!("><bpmn:escalationEventDefinition{reference}/>"));
                 if !output_mapping.is_empty() {
                     xml.push_str(&format!("<bpmn:extensionElements><tentaflow:outputMapping>{}</tentaflow:outputMapping></bpmn:extensionElements>",
                         escaped(&serde_json::to_string(output_mapping)?)));
@@ -1342,12 +1549,18 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
 pub fn export_xml(model: &ProcessModel) -> Result<String> {
     validate_model(model)?;
     let namespace = model.target_namespace.as_deref().unwrap_or(TF);
-    let declarations = !model.messages.is_empty() || !model.errors.is_empty();
-    let call_namespaces: BTreeSet<_> = super::model::all_nodes(model).into_iter().filter_map(|node| {
-        if let ProcessNodeKind::CallActivity { called_element, .. } = &node.kind {
-            Some(called_element.namespace_uri.clone())
-        } else { None }
-    }).collect();
+    let declarations =
+        !model.messages.is_empty() || !model.errors.is_empty() || !model.escalations.is_empty();
+    let call_namespaces: BTreeSet<_> = super::model::all_nodes(model)
+        .into_iter()
+        .filter_map(|node| {
+            if let ProcessNodeKind::CallActivity { called_element, .. } = &node.kind {
+                Some(called_element.namespace_uri.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut call_prefixes = BTreeMap::new();
     let tns = if declarations || call_namespaces.contains(namespace) {
         call_prefixes.insert(namespace.to_string(), "tns".to_string());
@@ -1364,9 +1577,25 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
         xml.push_str(&format!("<bpmn:message id=\"{}\" name=\"{}\"/>", escaped(&message.message_id), escaped(&message.name)));
     }
     for error in &model.errors {
-        xml.push_str(&format!("<bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\"/>", escaped(&error.error_id), escaped(&error.name), escaped(&error.error_code)));
+        xml.push_str(&format!(
+            "<bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\"/>",
+            escaped(&error.error_id),
+            escaped(&error.name),
+            escaped(&error.error_code)
+        ));
     }
-    xml.push_str(&format!("<bpmn:process id=\"{}\" isExecutable=\"true\">", escaped(&model.process_id)));
+    for escalation in &model.escalations {
+        xml.push_str(&format!(
+            "<bpmn:escalation id=\"{}\" name=\"{}\" escalationCode=\"{}\"/>",
+            escaped(&escalation.escalation_id),
+            escaped(&escalation.name),
+            escaped(&escalation.escalation_code)
+        ));
+    }
+    xml.push_str(&format!(
+        "<bpmn:process id=\"{}\" isExecutable=\"true\">",
+        escaped(&model.process_id)
+    ));
     xml.push_str(&format!(
         "<bpmn:extensionElements><tentaflow:variables>{}</tentaflow:variables>",
         escaped(&serde_json::to_string(&model.variables)?)
@@ -1384,12 +1613,34 @@ pub fn export_xml(model: &ProcessModel) -> Result<String> {
     write_graph(&mut xml, &model.nodes, &model.sequence_flows, &call_prefixes)?;
     xml.push_str("</bpmn:process>");
     let mut used_ids = HashSet::from([model.process_id.clone()]);
-    used_ids.extend(model.messages.iter().map(|declaration| declaration.message_id.clone()));
-    used_ids.extend(model.errors.iter().map(|declaration| declaration.error_id.clone()));
+    used_ids.extend(
+        model
+            .messages
+            .iter()
+            .map(|declaration| declaration.message_id.clone()),
+    );
+    used_ids.extend(
+        model
+            .errors
+            .iter()
+            .map(|declaration| declaration.error_id.clone()),
+    );
+    used_ids.extend(
+        model
+            .escalations
+            .iter()
+            .map(|declaration| declaration.escalation_id.clone()),
+    );
     used_ids.extend(model.sequence_flows.iter().map(|flow| flow.id.clone()));
     let mut shapes = Vec::new();
     let mut edges = Vec::new();
-    collect_diagram(&model.nodes, &model.diagram, &mut shapes, &mut edges, &mut used_ids);
+    collect_diagram(
+        &model.nodes,
+        &model.diagram,
+        &mut shapes,
+        &mut edges,
+        &mut used_ids,
+    );
     if !shapes.is_empty() || !edges.is_empty() {
         let subprocess_ids: HashSet<&str> = super::model::all_nodes(model).into_iter()
             .filter(|node| matches!(node.kind, ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. }))
@@ -1536,8 +1787,98 @@ mod tests {
         ] {
             let (parsed, diagnostics) = import_xml(&invalid);
             assert!(parsed.is_none(), "{invalid}");
-            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal && diagnostic.offset.is_some()), "{diagnostics:?}");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.fatal && diagnostic.offset.is_some()),
+                "{diagnostics:?}"
+            );
         }
+    }
+
+    #[test]
+    fn escalation_xml_round_trip_and_immediate_path_diagnostic_preserve_context() {
+        let mut model = super::super::model::starter_model();
+        model.target_namespace = Some("urn:example:review".into());
+        model.escalations.push(ProcessEscalationDeclaration {
+            escalation_id: "Escalation_1".into(),
+            name: "Review & approve".into(),
+            escalation_code: "NEEDS.HUMAN".into(),
+        });
+        model.nodes.extend([
+            ProcessNode {
+                id: "Service_1".into(),
+                name: "Check".into(),
+                kind: ProcessNodeKind::ServiceTask {
+                    flow_id: "flow-123".into(),
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::new(),
+                    verification: ActivityVerification::Human,
+                    timeout_seconds: 60,
+                    result_expression: Some("outputs.result".into()),
+                },
+            },
+            ProcessNode {
+                id: "Boundary_1".into(),
+                name: "Escalate".into(),
+                kind: ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id: "Service_1".into(),
+                    escalation_ref: Some("Escalation_1".into()),
+                    cancel_activity: false,
+                    output_mapping: BTreeMap::from([(
+                        "business_key".into(),
+                        "outputs.customer_ID".into(),
+                    )]),
+                },
+            },
+            ProcessNode {
+                id: "Wait_1".into(),
+                name: "Review".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        model.sequence_flows[0].target_id = "Service_1".into();
+        for (id, source, target) in [
+            ("Flow_Normal", "Service_1", "End_1"),
+            ("Flow_Escalation", "Boundary_1", "Wait_1"),
+            ("Flow_Review", "Wait_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow {
+                id: id.into(),
+                source_id: source.into(),
+                target_id: target.into(),
+                condition: None,
+            });
+        }
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:escalation id=\"Escalation_1\""));
+        assert!(xml.contains("escalationRef=\"tns:Escalation_1\""));
+        assert_eq!(import_xml(&xml).0, Some(model));
+        let wrong_type = xml.replace(
+            "escalationRef=\"tns:Escalation_1\"",
+            "escalationRef=\"tns:Unknown_1\"",
+        );
+        let (restored, diagnostics) = import_xml(&wrong_type);
+        assert!(restored.is_none());
+        assert_eq!(diagnostics[0].element_id.as_deref(), Some("Boundary_1"));
+        let immediate_end = xml.replace("targetRef=\"Wait_1\"", "targetRef=\"End_1\"");
+        let (restored, diagnostics) = import_xml(&immediate_end);
+        assert!(restored.is_none());
+        assert_eq!(diagnostics[0].code, "ESCALATION_IMMEDIATE_PATH_UNSUPPORTED");
+        assert_eq!(diagnostics[0].boundary_id.as_deref(), Some("Boundary_1"));
+        assert_eq!(diagnostics[0].flow_id.as_deref(), Some("Flow_Escalation"));
+        assert_eq!(
+            diagnostics[0].element_id.as_deref(),
+            Some("Flow_Escalation")
+        );
+        assert!(diagnostics[0].offset.is_some_and(|offset| offset > 0));
+        assert_eq!(
+            diagnostics[0].reason,
+            Some(tentaflow_protocol::processes::ProcessEscalationPathReason::TerminalBeforeWait)
+        );
     }
 
     #[test]

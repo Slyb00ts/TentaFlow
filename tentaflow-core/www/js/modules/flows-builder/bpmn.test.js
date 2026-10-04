@@ -430,6 +430,36 @@ test('boundary inspector uses stable activity selection and an actual checked to
   graph.destroy(); panel.destroy(); readonly.destroy();
 });
 
+test('process inspector keeps long node and sequence IDs fully available in readonly multiline controls', () => {
+  const model = emptyProcessModel();
+  const nodeId = `Start_${'N'.repeat(96)}`;
+  const edgeId = `Sequence_${'E'.repeat(96)}`;
+  model.nodes[0].id = nodeId;
+  model.sequenceFlows[0].sourceId = nodeId;
+  model.sequenceFlows[0].id = edgeId;
+  model.diagram.shapes[0].elementId = nodeId;
+  model.diagram.edges[0].sequenceFlowId = edgeId;
+  const graph = canvas(model);
+  const panel = inspector(graph);
+  const assertId = (expected) => {
+    const field = panel.root.querySelector('[data-process="elementId"]');
+    const control = field.querySelector('textarea');
+    assert.equal(field.tagName, 'TF-TEXTAREA');
+    assert.equal(field.value, expected);
+    assert.equal(field.hasAttribute('autogrow'), true);
+    assert.equal(control.value, expected);
+    assert.equal(control.readOnly, true);
+    assert.equal(control.disabled, false);
+  };
+  const node = graph.nodes.find((candidate) => candidate.id === nodeId);
+  panel.show(node, graph.templates.get(node.type));
+  assertId(nodeId);
+  panel.showEdge(graph.edges.find((candidate) => candidate.id === edgeId));
+  assertId(edgeId);
+  assert.deepEqual(graph.getData(), model);
+  graph.destroy(); panel.destroy();
+});
+
 test('boundary moves with its activity once, cascades on delete and remaps cloned parent', () => {
   const graph = canvas(boundaryModel());
   graph.view.zoom = 1;
@@ -739,6 +769,64 @@ test('boundary message switch click saves its checked boolean with a visible acc
   assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
 });
 
+test('escalation boundary editor saves the exact declaration, attachment, mapping and switch state', async () => {
+  const model = emptyProcessModel();
+  model.escalations = [{ escalationId: 'Escalation_1', name: 'Needs human', escalationCode: 'NEEDS.HUMAN' }];
+  model.nodes.splice(1, 0,
+    { id: 'Service_1', name: 'Check order', kind: { ServiceTask: { flowId: 'flow-one',
+      inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60,
+      resultExpression: 'outputs.activity_result' } } },
+    { id: 'Boundary_1', name: 'Escalate', kind: { BoundaryEscalation: {
+      attachedToId: 'Service_1', escalationRef: 'Escalation_1', cancelActivity: true,
+      outputMapping: { customer_ID: 'outputs.customer_ID' },
+    } } });
+  const current = definition('escalation-boundary-editor', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  assert.equal(processBoundaryKind('bpmn_boundary_escalation'), true);
+  assert.equal(state.canvas.nodesLayer.querySelector('[data-node-id="Boundary_1"] .fb-port-in'), null);
+  state.canvas.selectNode('Boundary_1'); await flush(2);
+  const fullName = `Actual boundary ${'FullSelectedName'.repeat(12)} <&>`;
+  const nameControl = state.config.root.querySelector('[data-process="name"]');
+  const nameTextarea = nameControl.querySelector('textarea');
+  nameTextarea.focus();
+  change(nameControl, fullName);
+  await flush(2);
+  assert.equal(nameControl.isConnected, true);
+  assert.equal(nameControl.querySelector('textarea'), nameTextarea);
+  assert.equal(document.activeElement, nameTextarea);
+  assert.equal(state.canvas.nodes.find((node) => node.id === 'Boundary_1').label, fullName);
+  assert.equal(state.config.root.querySelector('.fb-config-title').textContent, fullName);
+  assert.equal(state.root.querySelector('[data-role="crumb-name"]').textContent, fullName);
+  assert.equal(state.config.root.querySelector('[data-process="name"] textarea').value, fullName);
+  const attachment = state.config.root.querySelector('[data-process="attachedToId"]');
+  attachment.focus();
+  assert.equal(document.activeElement, attachment.querySelector('select'));
+  assert.equal(attachment.value, 'Service_1');
+  assert.equal(state.config.root.querySelector('[data-process="escalationRef"]').value, 'Escalation_1');
+  const toggle = state.config.root.querySelector('[data-process="cancelActivity"]');
+  assert.equal(toggle.checked, true);
+  toggle.querySelector('[role="switch"]').click();
+  assert.equal(toggle.checked, false);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload;
+  const boundary = saved.model.nodes.find((node) => node.id === 'Boundary_1').kind.BoundaryEscalation;
+  assert.equal(saved.model.nodes.find((node) => node.id === 'Boundary_1').name, fullName);
+  assert.deepEqual(boundary, { attachedToId: 'Service_1', escalationRef: 'Escalation_1',
+    cancelActivity: false, outputMapping: { customer_ID: 'outputs.customer_ID' } });
+  assert.deepEqual(saved.model.escalations, model.escalations);
+  const beforeClone = state.canvas.getData();
+  state.canvas.duplicateNodes(['Service_1', 'Boundary_1']);
+  const clones = state.canvas.nodes.filter((node) => state.canvas.selectedIds.has(node.id));
+  const clonedService = clones.find((node) => node.type === 'bpmn_service_task');
+  const clonedBoundary = clones.find((node) => node.type === 'bpmn_boundary_escalation');
+  assert.ok(clonedService && clonedBoundary);
+  assert.equal(clonedBoundary.config.attachedToId, clonedService.id);
+  state.canvas.undo();
+  assert.deepEqual(state.canvas.getData(), beforeClone);
+});
+
 test('incomplete boundary attachment or date blocks the real save and publication requests', async () => {
   const original = definition('boundary-save', { model: boundaryModel() });
   const state = await mount(original, {
@@ -869,7 +957,8 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 19);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 20);
+  assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1022,6 +1111,13 @@ test('message receipts and cancellation history localize finite reasons while pr
   ];
   const markup = '<script>kept as text</script>';
   const diagnostic = `${'x'.repeat(32768 - markup.length)}${markup}`;
+  const eventWaitLabels = {
+    en: 'Escalate: event wait cancelled — ',
+    pl: 'Escalate: anulowano oczekiwanie na zdarzenie — ',
+    de: 'Escalate: Warten auf Ereignis beendet — ',
+    es: 'Escalate: espera de evento cancelada — ',
+    fr: 'Escalate : attente de l’événement annulée — ',
+  };
   assert.equal(new TextEncoder().encode(diagnostic).length, 32768);
   try {
     for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
@@ -1055,6 +1151,13 @@ test('message receipts and cancellation history localize finite reasons while pr
         assert.ok(rendered.includes(label));
         assert.doesNotMatch(rendered, /bpmn\.|\{node\}|\{reason\}/);
       }
+      const escalationCancellation = { kind: 'subscription_cancelled', nodeName: 'Escalate',
+        data: { subscription_id: 'escalation-any', reason: 'activity_completed' } };
+      const originalCancellation = structuredClone(escalationCancellation);
+      const cancellation = processEventText(escalationCancellation);
+      assert.equal(cancellation, `${eventWaitLabels[language]}${I18n.t('bpmn.timer_reason_activity_completed')}`);
+      assert.doesNotMatch(cancellation, /message|mensaje|Nachricht|wiadomość/i);
+      assert.deepEqual(escalationCancellation, originalCancellation);
       const summary = { messageId: 'message-2', senderUserId: 'owner', messageName: 'order.received',
         correlationKey: 'case-2', status: 'Error', revision: 3, payloadAvailable: false,
         canResolve: false, canCancel: false, lastReason: diagnostic };
@@ -1076,7 +1179,9 @@ test('five locales describe message and business-error outcomes without losing r
     for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
       await I18n.setLanguage(language);
       for (const key of ['node_message_start', 'node_message_catch', 'node_message_throw',
-        'node_boundary_message', 'node_boundary_error', 'node_event_based_gateway',
+        'node_boundary_message', 'node_boundary_error', 'node_boundary_escalation',
+        'escalation_declarations', 'escalation_reference', 'escalation_any_code',
+        'incident_escalation_guidance', 'node_event_based_gateway',
         'message_status_ambiguous', 'subscription_status_open', 'race_status_won']) {
         assert.notEqual(I18n.t(`bpmn.${key}`), `bpmn.${key}`);
       }
@@ -1099,13 +1204,36 @@ test('five locales describe message and business-error outcomes without losing r
       assert.equal(raceRow.querySelector('script'), null);
       raceWindow.dispatchEvent(new Event('closed'));
       raceWindow.remove();
+      const escalationWindow = await monitor(instance(`escalation-${language}`, {
+        status: 'Incident', incidents: [{ incidentId: 'incident-1', nodeId: 'Service_1',
+          nodeName: 'Check', scopeId: `escalation-${language}`, code: 'ESCALATION_HANDLER_FAILED',
+          message: 'boundary failed', jobId: 'job-1', canRetry: false, status: 'Open' }],
+        subscriptions: [{ subscriptionId: 'subscription-1', nodeId: 'Boundary_1', nodeName: 'Escalate',
+          tokenId: 'token-1', kind: 'BoundaryEscalation', escalationCode: 'NEEDS.HUMAN',
+          status: 'Open', scopeId: `escalation-${language}`, messageName: null,
+          correlationKey: null, errorCode: null }],
+      }));
+      const incidentRow = escalationWindow.querySelector('[data-incidents] .fb-process-work');
+      assert.ok(incidentRow.textContent.includes(I18n.t('bpmn.incident_escalation_guidance')));
+      assert.equal(incidentRow.querySelector('[data-retry]'), null);
+      assert.ok(escalationWindow.querySelector('[data-subscription-rows]').textContent.includes('NEEDS.HUMAN'));
+      escalationWindow.dispatchEvent(new Event('closed'));
+      escalationWindow.remove();
       const caught = processEventText({ kind: 'business_error_caught', nodeName: 'Check',
         data: { error_code: 'BUSINESS.INVALID' } });
       assert.match(caught, /BUSINESS\.INVALID/);
       const armed = processEventText({ kind: 'error_boundary_armed', nodeName: 'Check',
         data: { subscription_id: 's1', attached_to_id: 'Check', error_code: 'BUSINESS.INVALID' } });
       assert.match(armed, /Check/);
-      for (const value of [queued, race, caught, armed]) assert.doesNotMatch(value, /bpmn\.|\{node\}|\{message\}|\{key\}|\{winner\}|\{code\}|undefined/);
+      const escalationArmed = processEventText({ kind: 'escalation_boundary_armed', nodeName: 'Check',
+        data: { subscription_id: 's2', attached_to_id: 'Check', escalation_code: 'NEEDS.HUMAN' } });
+      const escalationCaught = processEventText({ kind: 'escalation_caught', nodeName: 'Check',
+        data: { code: 'RESULT.REVIEW', matched_escalation_code: null } });
+      assert.match(escalationArmed, /NEEDS\.HUMAN/);
+      assert.match(escalationCaught, /RESULT\.REVIEW/);
+      assert.ok(escalationCaught.includes(I18n.t('bpmn.escalation_any_code')));
+      for (const value of [queued, race, caught, armed, escalationArmed, escalationCaught])
+        assert.doesNotMatch(value, /bpmn\.|\{node\}|\{message\}|\{key\}|\{winner\}|\{code\}|\{matched\}|undefined/);
     }
   } finally { await I18n.setLanguage('en'); }
 });
@@ -1119,6 +1247,11 @@ test('declaration editor keeps exact namespace and long names in the real draft 
   const form = document.querySelector('.tf-act-window');
   change(form.querySelector('[data-declaration-namespace]'), 'urn:orders:Łódź');
   click(form.querySelector('[data-add-message]'));
+  click(form.querySelector('[data-add-escalation]'));
+  const escalation = form.querySelector('[data-declaration-kind="escalation"]');
+  change(escalation.querySelector('[data-declaration-id]'), 'Escalation_Order');
+  change(escalation.querySelector('[data-declaration-name]'), `${'Review'.repeat(40)}<&>`);
+  change(escalation.querySelector('[data-declaration-code]'), 'NEEDS.HUMAN');
   const row = form.querySelector('[data-declaration-kind="message"]');
   change(row.querySelector('[data-declaration-id]'), 'Message_Order');
   const name = `${'Order'.repeat(40)}<&>`;
@@ -1127,10 +1260,13 @@ test('declaration editor keeps exact namespace and long names in the real draft 
   click(form.querySelector('[data-act="submit"]')); await flush();
   assert.equal(state.canvas.processModel.targetNamespace, 'urn:orders:Łódź');
   assert.equal(state.canvas.processModel.messages[0].name, name);
+  assert.equal(state.canvas.processModel.escalations[0].escalationCode, 'NEEDS.HUMAN');
   assert.equal(await builder._save(), true);
   const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model;
   assert.equal(saved.targetNamespace, 'urn:orders:Łódź');
   assert.deepEqual(saved.messages, [{ messageId: 'Message_Order', name }]);
+  assert.deepEqual(saved.escalations, [{ escalationId: 'Escalation_Order',
+    name: `${'Review'.repeat(40)}<&>`, escalationCode: 'NEEDS.HUMAN' }]);
   assert.deepEqual(saved.variables, {});
   assert.equal(state.definition.publishedVersion, 1, 'draft edits do not mutate the published version');
 });
@@ -1416,6 +1552,38 @@ test('history uses authoritative hasMore even when the bounded byte page has few
   assert.equal(win.querySelectorAll('[data-process-seq]').length, 2); assert.equal(win.querySelector('[data-more]').hidden, true); assert.doesNotMatch(win.textContent, /internal/);
 });
 
+test('interrupting escalation history shows the full accepted result and origin without Verification in five locales', async () => {
+  const result = { outcome: 'NeedsHuman', code: 'NEEDS.HUMAN', summary: 'Actual reviewed result <&>',
+    outputs: { customer_ID: 17, nested_value: { Preserve_Me: '<img src=x onerror=alert(1)>' } },
+    evidence: ['real-pinned-flow-output'], result_origin: 'contract' };
+  const events = [
+    { seq: 1, atMs: 1000, eventId: 'result-1', kind: 'service_result', nodeName: 'Check service', data: result },
+    { seq: 2, atMs: 1001, eventId: 'catch-1', kind: 'escalation_caught', nodeName: 'Escalate',
+      data: { code: 'NEEDS.HUMAN', matched_escalation_code: 'NEEDS.HUMAN', result_event_id: 'result-1', cancel_activity: true } },
+  ];
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const current = instance(`interrupting-${language}`, { userTasks: [{ userTaskId: 'handler-1', nodeId: 'Handler',
+        name: 'Human handler', kind: 'Work', status: 'Open', scopeId: `interrupting-${language}`, canComplete: false }] });
+      const win = await monitor(current, { processHistoryRequest: { events, nextSeq: 2, hasMore: false } });
+      assert.equal(current.userTasks.some((task) => task.kind === 'Verification'), false);
+      assert.equal(win.querySelectorAll('[data-work] .fb-process-work').length, 1);
+      const entries = win.querySelectorAll('[data-events] [data-process-seq]');
+      assert.equal(entries.length, 2);
+      assert.equal(entries[0].querySelector('h3').textContent, I18n.t('bpmn.actual_outputs'));
+      const editor = entries[0].querySelector('tf-code-editor');
+      assert.equal(editor.hasAttribute('readonly'), true);
+      assert.deepEqual(JSON.parse(editor.value), result);
+      assert.equal(entries[1].querySelector('tf-code-editor'), null);
+      assert.equal(win.querySelector('[data-events] img'), null);
+      assert.equal(win.querySelector('[data-events] script'), null);
+      win.dispatchEvent(new Event('closed'));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('instance summaries paginate without fetching full opaque business values', async () => {
   fixtures({ processInstanceListRequest: ({ offset }) => ({ instances: [instance(`page-${offset}`)], total: 60, hasMore: true }) });
   const win = await openProcessInstances(); const table = win.querySelector('tf-table'); table.dispatchEvent(new CustomEvent('page-change', { detail: { page: 3 }, bubbles: true })); await flush();
@@ -1434,7 +1602,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 19);
+    assert.equal(processTemplates().length, 20);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });

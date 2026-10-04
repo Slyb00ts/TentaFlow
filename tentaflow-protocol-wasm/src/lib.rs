@@ -25873,6 +25873,37 @@ mod process_wire_tests {
     use super::*;
 
     #[test]
+    fn process_request_encoder_keeps_escalation_declaration_and_boundary_mapping() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+        let fields = serde_json::json!({
+            "command_id":"cmd", "definition_id":null, "expected_revision":0,
+            "name":"Escalation", "description":"",
+            "model":{"schema_version":1,"process_id":"P_1","target_namespace":"urn:example:review",
+                "escalations":[{"escalation_id":"Esc_1","name":"Needs review","escalation_code":"NEEDS.HUMAN"}],
+                "nodes":[{"id":"Boundary_1","name":"Review","kind":{"BoundaryEscalation":{
+                    "attached_to_id":"Service_1","escalation_ref":"Esc_1","cancel_activity":false,
+                    "output_mapping":{"business_key":"outputs.customer_ID"}}}}],
+                "sequence_flows":[],"variables":{"customer_ID":{"attached_to_id":true}},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes =
+            encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body
+        else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.escalations[0].escalation_code, "NEEDS.HUMAN");
+        assert_eq!(model.variables["customer_ID"]["attached_to_id"], true);
+        assert!(
+            matches!(&model.nodes[0].kind, ProcessNodeKind::BoundaryEscalation {
+            attached_to_id, escalation_ref: Some(reference), cancel_activity: false, output_mapping
+        } if attached_to_id == "Service_1" && reference == "Esc_1"
+            && output_mapping["business_key"] == "outputs.customer_ID")
+        );
+    }
+
+    #[test]
     fn process_request_encoder_uses_typed_body_and_pagination() {
         let bytes = encode_process_request(
             "DefinitionListRequest".into(),

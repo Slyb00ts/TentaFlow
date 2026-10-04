@@ -14,6 +14,7 @@ const ELEMENTS = [
   ['MessageThrow', 'message_throw', 'send', 'events', 56, 56],
   ['BoundaryMessage', 'boundary_message', 'mail', 'events', 56, 56],
   ['BoundaryError', 'boundary_error', 'alert-triangle', 'events', 56, 56],
+  ['BoundaryEscalation', 'boundary_escalation', 'alert-triangle', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
@@ -28,7 +29,7 @@ export function processTemplates() {
   return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind) ? [] : ['in'],
+    input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
     output_ports: ['End', 'ErrorEnd'].includes(kind) ? [] : ['full'],
     width, height,
   }));
@@ -53,6 +54,8 @@ export function processNodeConfig(kind) {
   if (kind === 'BoundaryMessage') return { attachedToId: '', cancelActivity: true,
     messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'BoundaryError') return { attachedToId: '', errorRef: null, outputMapping: {} };
+  if (kind === 'BoundaryEscalation') return { attachedToId: '', escalationRef: null,
+    cancelActivity: true, outputMapping: {} };
   if (kind === 'SubProcess') {
     const suffix = crypto.randomUUID().replaceAll('-', '_');
     const start = `LocalStart_${suffix}`, end = `LocalEnd_${suffix}`;
@@ -86,7 +89,7 @@ export function processHasTimer(model) {
 }
 
 export function processBoundaryKind(type) {
-  return ['bpmn_boundary_timer', 'bpmn_boundary_message', 'bpmn_boundary_error'].includes(type);
+  return ['bpmn_boundary_timer', 'bpmn_boundary_message', 'bpmn_boundary_error', 'bpmn_boundary_escalation'].includes(type);
 }
 
 export function emptyProcessModel() {
@@ -124,7 +127,7 @@ export function cloneProcessBody(body) {
     const [kind, config] = Object.entries(node.kind)[0];
     if (kind === 'SubProcess') config.body = cloneProcessBody(config.body);
     if (['ExclusiveGateway', 'InclusiveGateway'].includes(kind) && config.defaultFlowId) config.defaultFlowId = flows.get(config.defaultFlowId);
-    if (['BoundaryTimer', 'BoundaryMessage', 'BoundaryError'].includes(kind)) config.attachedToId = ids.get(config.attachedToId);
+    if (['BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind)) config.attachedToId = ids.get(config.attachedToId);
   }
   for (const flow of copy.sequenceFlows) {
     flow.id = flows.get(flow.id);
@@ -193,6 +196,7 @@ export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
     ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
     ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
     ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
+    ...(model.escalations?.length ? { escalations: structuredClone(model.escalations) } : {}),
     ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
     ...graph,
   };

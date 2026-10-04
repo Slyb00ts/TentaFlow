@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use tentaflow_protocol::processes::{ActivityOutcome, ActivityResult, ProcessNodeKind};
 use tokio_util::sync::CancellationToken;
 
-use super::repository::{self, ActivityResultOrigin, ClaimedProcessJob, ObservedActivityResult};
+use super::repository::{
+    self, ActivityResultOrigin, ClaimedProcessJob, ExpressionObservation, ObservedActivityResult,
+};
 use super::runtime::{plan_job_result, validate_output};
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::{FlowDispatcher, PinnedFlowSnapshot};
@@ -80,27 +82,36 @@ fn observed_result(
         Err(error) => ObservedActivityResult {
             result: failure("OUTPUT_LIMIT", error.to_string()),
             origin: ActivityResultOrigin::Platform,
+            expression_observation: None,
         },
         Ok(result) if platform_error => ObservedActivityResult {
             result,
             origin: ActivityResultOrigin::Platform,
+            expression_observation: None,
         },
         Ok(result) => match expression {
             None => ObservedActivityResult {
                 result,
                 origin: ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             Some(expression) => {
+                let expression_observation = ExpressionObservation {
+                    normalized_outputs: result.outputs.clone(),
+                    evaluation_variables: variables.clone(),
+                };
                 match super::runtime::evaluate(expression, variables, &result.outputs, &[])
                     .and_then(parse_contract_result)
                 {
                     Ok(result) => ObservedActivityResult {
                         result,
                         origin: ActivityResultOrigin::Contract,
+                        expression_observation: Some(expression_observation),
                     },
                     Err(error) => ObservedActivityResult {
                         result: failure("RESULT_EXPRESSION_ERROR", format!("{error:#}")),
                         origin: ActivityResultOrigin::Platform,
+                        expression_observation: None,
                     },
                 }
             }
@@ -336,12 +347,12 @@ pub async fn execute_claimed(
             }
             _ = &mut timeout => {
                 cancel.cancel();
-                break ObservedActivityResult{result:failure("SERVICE_TIMEOUT", "the service task exceeded its configured timeout"),origin:ActivityResultOrigin::Platform};
+                break ObservedActivityResult{result:failure("SERVICE_TIMEOUT", "the service task exceeded its configured timeout"),origin:ActivityResultOrigin::Platform,expression_observation:None};
             }
             outcome = &mut execution => {
                 break match outcome {
                     Ok(outcome) => observed_result(outcome,result_expression.as_deref(),&effective),
-                    Err(error) => ObservedActivityResult{result:failure("FLOW_ERROR", error.to_string()),origin:ActivityResultOrigin::Platform},
+                    Err(error) => ObservedActivityResult{result:failure("FLOW_ERROR", error.to_string()),origin:ActivityResultOrigin::Platform,expression_observation:None},
                 };
             }
         }
@@ -392,8 +403,37 @@ pub async fn execute_claimed(
             );
         }
         let at_ms = now_ms();
+        let escalation_boundary = if result.origin == ActivityResultOrigin::Contract
+            && result.result.outcome == ActivityOutcome::NeedsHuman
+        {
+            let open = current.subscriptions.iter().filter(|sub|
+                sub.kind == tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryEscalation
+                    && sub.status == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+                    && sub.scope_id == job.scope_id && sub.token_id == job.token_id)
+                .collect::<Vec<_>>();
+            open.iter()
+                .find(|sub| {
+                    sub.escalation_code.is_some() && sub.escalation_code == result.result.code
+                })
+                .or_else(|| open.iter().find(|sub| sub.escalation_code.is_none()))
+                .map(|sub| sub.node_id.clone())
+        } else {
+            None
+        };
         let plan = match plan_job_result(&current, job, &result, at_ms) {
             Ok(plan) => plan,
+            Err(error) if escalation_boundary.is_some() => {
+                super::runtime::plan_retained_escalation_incident(
+                    &current,
+                    job,
+                    &result,
+                    escalation_boundary
+                        .as_deref()
+                        .context("selected escalation disappeared")?,
+                    &error.to_string(),
+                    at_ms,
+                )?
+            }
             Err(error) => {
                 return fail_claim(
                     pool,
@@ -422,6 +462,55 @@ pub async fn execute_claimed(
                 return Ok(());
             }
             Err(error) if error.to_string().contains("revision conflict") => continue,
+            Err(error)
+                if escalation_boundary.is_some()
+                    && plan
+                        .events
+                        .iter()
+                        .any(|event| event.kind == "escalation_caught") =>
+            {
+                let fallback = super::runtime::plan_retained_escalation_incident(
+                    &current,
+                    job,
+                    &result,
+                    escalation_boundary
+                        .as_deref()
+                        .context("selected escalation disappeared")?,
+                    &error.to_string(),
+                    at_ms,
+                )?;
+                match repository::accept_job_result(
+                    pool,
+                    &claimed.actor,
+                    &job.job_id,
+                    job.attempt,
+                    job.fence,
+                    worker_id,
+                    &result,
+                    current.instance.revision,
+                    &fallback,
+                    at_ms,
+                ) {
+                    Ok(committed) => {
+                        super::runtime::signal_cancelled_claims(
+                            dispatcher,
+                            &committed.cancelled_claims,
+                        );
+                        return Ok(());
+                    }
+                    Err(conflict) if conflict.to_string().contains("revision conflict") => continue,
+                    Err(failure) => {
+                        return fail_claim(
+                            pool,
+                            worker_id,
+                            &claimed,
+                            "RESULT_REJECTED",
+                            failure,
+                            Some(&result),
+                        )
+                    }
+                }
+            }
             Err(error) => {
                 return fail_claim(
                     pool,
@@ -450,7 +539,7 @@ mod tests {
     use super::*;
     use tentaflow_protocol::processes::{
         ActivityVerification, ProcessInstanceStatus, ProcessNode, ProcessNodeKind,
-        ProcessUserTaskStatus,
+        ProcessUserTaskKind, ProcessUserTaskStatus,
     };
 
     async fn execute(fixture: &Fixture, worker: &str) -> ClaimedProcessJob {
@@ -556,6 +645,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (result).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             at_ms,
         )
@@ -570,6 +660,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (result).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             claim.snapshot.instance.revision,
             &plan,
@@ -788,6 +879,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             at_ms,
         )
@@ -828,7 +920,8 @@ mod tests {
             "lost-worker",
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
-                origin: crate::processes::repository::ActivityResultOrigin::Envelope
+                origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             claim.snapshot.instance.revision,
             &late_plan,
@@ -937,6 +1030,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             at_ms,
         )
@@ -975,7 +1069,8 @@ mod tests {
             "cancelled-worker",
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
-                origin: crate::processes::repository::ActivityResultOrigin::Envelope
+                origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             current.revision,
             &plan,
@@ -1336,6 +1431,7 @@ mod tests {
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             at_ms,
         )
@@ -1349,7 +1445,8 @@ mod tests {
             "overdue-worker",
             &crate::processes::repository::ObservedActivityResult {
                 result: (observed).clone(),
-                origin: crate::processes::repository::ActivityResultOrigin::Envelope
+                origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                expression_observation: None,
             },
             claim.snapshot.instance.revision,
             &plan,
@@ -1369,6 +1466,7 @@ mod tests {
             Some(&ObservedActivityResult {
                 result: observed.clone(),
                 origin: ActivityResultOrigin::Envelope,
+                expression_observation: None,
             }),
         )
         .unwrap();
@@ -1438,6 +1536,7 @@ mod tests {
                     &crate::processes::repository::ObservedActivityResult {
                         result: (result).clone(),
                         origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                        expression_observation: None,
                     },
                     now_ms(),
                 )
@@ -1499,7 +1598,8 @@ mod tests {
                         "late-worker",
                         &crate::processes::repository::ObservedActivityResult {
                             result: (result).clone(),
-                            origin: crate::processes::repository::ActivityResultOrigin::Envelope
+                            origin: crate::processes::repository::ActivityResultOrigin::Envelope,
+                            expression_observation: None,
                         },
                         claim.snapshot.instance.revision,
                         late_plan.as_ref().unwrap(),
@@ -1574,6 +1674,1529 @@ mod tests {
             ]);
         }
         model
+    }
+
+    fn escalation_handlers(
+        mut model: tentaflow_protocol::processes::ProcessModel,
+    ) -> tentaflow_protocol::processes::ProcessModel {
+        use tentaflow_protocol::processes::ProcessEscalationDeclaration;
+        model.escalations.push(ProcessEscalationDeclaration {
+            escalation_id: "EscalationDecl".into(),
+            name: "Human review".into(),
+            escalation_code: "REVIEW".into(),
+        });
+        for (id, reference, cancel_activity) in [
+            ("Exact", Some("EscalationDecl"), false),
+            ("Any", None, true),
+        ] {
+            model.nodes.push(ProcessNode {
+                id: id.into(),
+                name: format!("Escalate {id}"),
+                kind: ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id: "Service".into(),
+                    escalation_ref: reference.map(str::to_owned),
+                    cancel_activity,
+                    output_mapping: BTreeMap::new(),
+                },
+            });
+            model.nodes.push(ProcessNode {
+                id: format!("Work_{id}"),
+                name: format!("Review {id}"),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            });
+            model.sequence_flows.extend([
+                edge(&format!("EscalationPath_{id}"), id, &format!("Work_{id}")),
+                edge(
+                    &format!("EscalationEnd_{id}"),
+                    &format!("Work_{id}"),
+                    "End_1",
+                ),
+            ]);
+        }
+        model
+    }
+
+    #[test]
+    fn service_claim_without_escalation_keeps_legacy_event_bytes() {
+        let fixture = Fixture::new();
+        let business = json!({"outcome":"Completed","code":null,"summary":"Unchanged claim",
+            "outputs":{},"evidence":[]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(business));
+        let mut model = service_model(&flow_id, ActivityVerification::Human);
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let started = start_model(&fixture, &model);
+        let claimed = repository::claim_job(&fixture.db, "legacy-claim-worker", now_ms())
+            .unwrap()
+            .unwrap();
+        let stored: String = fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND kind='service_claimed'",
+                [&started.instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            format!(
+                "{{\"job_id\":\"{}\",\"attempt\":{},\"fence\":{}}}",
+                claimed.job.job_id, claimed.job.attempt, claimed.job.fence
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn real_contract_needs_human_selects_one_exact_or_catchall_escalation() {
+        for (code, boundary, interrupt) in [
+            (Some("REVIEW"), "Exact", false),
+            (Some("OTHER"), "Any", true),
+            (None, "Any", true),
+        ] {
+            let fixture = Fixture::new();
+            let body = json!({"outcome":"NeedsHuman","code":code,"summary":"A real human decision is needed","outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+            let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+            let mut model =
+                escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+            let service = model
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "Service")
+                .unwrap();
+            let ProcessNodeKind::ServiceTask {
+                result_expression, ..
+            } = &mut service.kind
+            else {
+                panic!("fixture service node changed kind");
+            };
+            *result_expression = Some("outputs.variables.actual_result".into());
+            let started = start_model(&fixture, &model);
+            let claim = execute(&fixture, "escalation-worker").await;
+            let current =
+                repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                    .unwrap();
+            assert_eq!(current.jobs[0].status, "completed");
+            assert_eq!(
+                current.jobs[0].result_origin,
+                Some(ActivityResultOrigin::Contract)
+            );
+            assert_eq!(
+                current.jobs[0].result.as_ref().unwrap().outputs["customer_ID"],
+                17
+            );
+            assert!(current
+                .user_tasks
+                .iter()
+                .any(|task| task.node_id == format!("Work_{boundary}")));
+            assert_eq!(
+                current
+                    .user_tasks
+                    .iter()
+                    .filter(|task| task.kind
+                        == tentaflow_protocol::processes::ProcessUserTaskKind::Verification)
+                    .count(),
+                usize::from(!interrupt)
+            );
+            let history =
+                repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                    .unwrap()
+                    .0;
+            let result = history
+                .iter()
+                .find(|event| event.kind == "service_result")
+                .unwrap();
+            let caught = history
+                .iter()
+                .filter(|event| event.kind == "escalation_caught")
+                .collect::<Vec<_>>();
+            assert_eq!(caught.len(), 1);
+            assert_eq!(caught[0].node_id.as_deref(), Some(boundary));
+            assert_eq!(caught[0].data["job_id"], claim.job.job_id);
+            assert_eq!(caught[0].data["source_token_id"], claim.job.token_id);
+            assert_eq!(caught[0].data["result_event_id"], result.event_id);
+            assert_eq!(caught[0].data["code"], json!(code));
+            assert_eq!(
+                caught[0].data["matched_escalation_code"],
+                if boundary == "Exact" {
+                    json!("REVIEW")
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(caught[0].data["cancel_activity"], interrupt);
+            assert!(
+                history
+                    .iter()
+                    .filter(|event| event.kind == "service_result")
+                    .count()
+                    == 1
+            );
+            assert!(history.iter().any(|event| event.kind == "service_claimed"
+                && event.data["expression_variables_sha256"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 64)));
+            if !interrupt {
+                let verification = current
+                    .user_tasks
+                    .iter()
+                    .find(|task| {
+                        task.kind
+                            == tentaflow_protocol::processes::ProcessUserTaskKind::Verification
+                    })
+                    .unwrap();
+                let at = now_ms();
+                let rejection = runtime::plan_user_completion(
+                    &current,
+                    &verification.user_task_id,
+                    &json!("declined"),
+                    Some(false),
+                    at,
+                )
+                .unwrap();
+                let rejected = repository::complete_user_task(
+                    &fixture.db,
+                    &fixture.owner,
+                    &stamp("reject accepted escalation verification"),
+                    &started.instance_id,
+                    &verification.user_task_id,
+                    current.instance.revision,
+                    &json!("declined"),
+                    Some(false),
+                    &rejection,
+                    at,
+                )
+                .unwrap()
+                .instance;
+                assert_eq!(rejected.incidents[0].code, "HUMAN_REJECTED");
+                assert!(repository::retry_job(
+                    &fixture.db,
+                    &fixture.owner,
+                    &stamp("deny retry after accepted human rejection"),
+                    &started.instance_id,
+                    &claim.job.job_id,
+                    rejected.revision
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_contract_needs_human_runtime_choice_failure_retains_result_without_catch() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required","outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "EscalationPath_Exact")
+            .unwrap()
+            .target_id = "Choice".into();
+        model.nodes.push(ProcessNode {
+            id: "Choice".into(),
+            name: "Choose a reviewer".into(),
+            kind: ProcessNodeKind::ExclusiveGateway {
+                default_flow_id: Some("ChoiceDefault".into()),
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Work_Fallback".into(),
+            name: "Fallback reviewer".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None,
+                output_mapping: BTreeMap::new(),
+            },
+        });
+        let mut invalid = edge("ChoiceCondition", "Choice", "Work_Exact");
+        invalid.condition = Some("1".into());
+        model.sequence_flows.extend([
+            invalid,
+            edge("ChoiceDefault", "Choice", "Work_Fallback"),
+            edge("EscalationEnd_Fallback", "Work_Fallback", "End_1"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let claim = execute(&fixture, "failure-worker").await;
+        let current =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(current.jobs[0].status, "completed");
+        assert_eq!(
+            current.jobs[0].result_origin,
+            Some(ActivityResultOrigin::Contract)
+        );
+        assert_eq!(
+            current.jobs[0].result.as_ref().unwrap(),
+            &serde_json::from_value::<ActivityResult>(body).unwrap()
+        );
+        assert_eq!(current.instance.status, ProcessInstanceStatus::Incident);
+        assert_eq!(current.incidents.len(), 1);
+        assert_eq!(current.incidents[0].code, "ESCALATION_HANDLER_FAILED");
+        assert_eq!(
+            current.incidents[0].job_id.as_deref(),
+            Some(claim.job.job_id.as_str())
+        );
+        assert!(!current.incidents[0].can_retry);
+        assert!(current.user_tasks.is_empty());
+        assert!(current
+            .tokens
+            .iter()
+            .any(|token| token.token_id == claim.job.token_id
+                && token.node_id == "Service"
+                && token.status == "waiting"));
+        let history =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == "service_result")
+                .count(),
+            1
+        );
+        assert!(history
+            .iter()
+            .all(|event| event.kind != "escalation_caught"));
+        assert!(repository::retry_job(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("accepted human result cannot retry"),
+            &started.instance_id,
+            &claim.job.job_id,
+            current.instance.revision
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn real_prior_independent_incident_does_not_block_later_local_escalation_catch() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required",
+            "outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        model.timer_timezone = Some("UTC".into());
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        model.nodes.extend([
+            ProcessNode {
+                id: "IndependentTimer".into(),
+                name: "Independent deadline".into(),
+                kind: ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: "Service".into(),
+                    cancel_activity: false,
+                    timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 1 },
+                },
+            },
+            ProcessNode {
+                id: "IndependentChoice".into(),
+                name: "Independent failing choice".into(),
+                kind: ProcessNodeKind::ExclusiveGateway {
+                    default_flow_id: Some("IndependentDefault".into()),
+                },
+            },
+            ProcessNode {
+                id: "IndependentWork".into(),
+                name: "Independent human work".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+            ProcessNode {
+                id: "IndependentFallback".into(),
+                name: "Independent fallback".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        let mut invalid = edge("IndependentInvalid", "IndependentChoice", "IndependentWork");
+        invalid.condition = Some("1".into());
+        model.sequence_flows.extend([
+            edge(
+                "IndependentArrival",
+                "IndependentTimer",
+                "IndependentChoice",
+            ),
+            invalid,
+            edge(
+                "IndependentDefault",
+                "IndependentChoice",
+                "IndependentFallback",
+            ),
+            edge("IndependentEnd", "IndependentWork", "End_1"),
+            edge("IndependentFallbackEnd", "IndependentFallback", "End_1"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let claimed = repository::claim_job(&fixture.db, "incident-escalation-worker", now_ms())
+            .unwrap()
+            .unwrap();
+        let due = started
+            .timers
+            .iter()
+            .find(|timer| timer.node_id == "IndependentTimer")
+            .unwrap()
+            .due_at_ms
+            .unwrap();
+        let candidate = repository::due_timers(&fixture.db, due, 32)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.instance_id.as_deref() == Some(started.instance_id.as_str())
+            })
+            .unwrap();
+        let timer_snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+        let timer_plan = super::super::timers::plan_timer_fire(&timer_snapshot, due).unwrap();
+        let timer_revision = match &timer_snapshot {
+            repository::TimerSnapshot::Boundary { snapshot, .. } => snapshot.instance.revision,
+            _ => panic!("independent timer changed its boundary kind"),
+        };
+        repository::fire_timer(
+            &fixture.db,
+            &candidate,
+            &fixture.owner,
+            Some(timer_revision),
+            &timer_plan,
+            due,
+        )
+        .unwrap();
+        let independent =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert_eq!(independent.instance.status, ProcessInstanceStatus::Incident);
+        assert_eq!(independent.jobs[0].status, "running");
+        assert_eq!(independent.incidents.len(), 1);
+        assert_eq!(
+            independent.incidents[0].node_id.as_deref(),
+            Some("IndependentChoice")
+        );
+        let normalized = observe_effect(&fixture, &claimed).await;
+        let effective = repository::effective_scope_variables(
+            &claimed.snapshot.scopes,
+            &claimed.snapshot.scope_variables,
+            &started.instance_id,
+            &claimed.snapshot.instance.variables,
+            &claimed.job.scope_id,
+        )
+        .unwrap();
+        let observed = ObservedActivityResult {
+            result: serde_json::from_value(body).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: normalized.outputs,
+                evaluation_variables: effective,
+            }),
+        };
+        let at = due + 1;
+        let plan = plan_job_result(&independent, &independent.jobs[0], &observed, at).unwrap();
+        assert_eq!(plan.status, ProcessInstanceStatus::Incident);
+        assert_eq!(
+            plan.events
+                .iter()
+                .filter(|event| event.kind == "escalation_caught")
+                .count(),
+            1
+        );
+        let committed = repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claimed.job.job_id,
+            claimed.job.attempt,
+            claimed.job.fence,
+            "incident-escalation-worker",
+            &observed,
+            independent.instance.revision,
+            &plan,
+            at,
+        )
+        .unwrap()
+        .instance;
+        assert_eq!(committed.status, ProcessInstanceStatus::Incident);
+        assert_eq!(committed.incidents.len(), 1);
+        assert_eq!(
+            committed.incidents[0].incident_id,
+            independent.incidents[0].incident_id
+        );
+        assert!(committed
+            .user_tasks
+            .iter()
+            .any(|task| task.node_id == "Work_Exact"));
+        let events =
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "escalation_caught")
+                .count(),
+            1
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.data["code"] != "ESCALATION_HANDLER_FAILED"));
+    }
+
+    #[tokio::test]
+    async fn fenced_escalation_writer_rejects_forged_catch_mapping_and_claim_observation_atomically(
+    ) {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required","outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let exact = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Exact")
+            .unwrap();
+        let ProcessNodeKind::BoundaryEscalation { output_mapping, .. } = &mut exact.kind else {
+            panic!("fixture escalation node changed kind");
+        };
+        output_mapping.insert("review_route".into(), "outputs.customer_ID".into());
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "EscalationPath_Exact")
+            .unwrap()
+            .target_id = "Choice".into();
+        model.nodes.push(ProcessNode {
+            id: "Choice".into(),
+            name: "Choose a reviewer".into(),
+            kind: ProcessNodeKind::ExclusiveGateway {
+                default_flow_id: Some("ChoiceDefault".into()),
+            },
+        });
+        model.nodes.push(ProcessNode {
+            id: "Work_Fallback".into(),
+            name: "Fallback reviewer".into(),
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None,
+                output_mapping: BTreeMap::new(),
+            },
+        });
+        let mut selected = edge("ChoiceSelected", "Choice", "Work_Exact");
+        selected.condition = Some("vars.review_route == 17".into());
+        model.sequence_flows.extend([
+            selected,
+            edge("ChoiceDefault", "Choice", "Work_Fallback"),
+            edge("EscalationEnd_Fallback", "Work_Fallback", "End_1"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(&fixture.db, "fenced-escalation-worker", now_ms())
+            .unwrap()
+            .unwrap();
+        let normalized = observe_effect(&fixture, &claim).await;
+        let effective = repository::effective_scope_variables(
+            &claim.snapshot.scopes,
+            &claim.snapshot.scope_variables,
+            &started.instance_id,
+            &claim.snapshot.instance.variables,
+            &claim.job.scope_id,
+        )
+        .unwrap();
+        let observed = ObservedActivityResult {
+            result: serde_json::from_value(body).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: normalized.outputs,
+                evaluation_variables: effective,
+            }),
+        };
+        let at = now_ms();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert!(plan
+            .events
+            .iter()
+            .any(|event| event.kind == "escalation_caught"));
+        let choice = plan
+            .events
+            .iter()
+            .find(|event| event.kind == "exclusive_selected")
+            .unwrap();
+        assert_eq!(choice.data["sequence_flow_id"], "ChoiceSelected");
+        assert_eq!(choice.data["source_token_id"], choice.data["activation_id"]);
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            [
+                "bpmn_instances",
+                "bpmn_scopes",
+                "bpmn_tokens",
+                "bpmn_gateway_receipts",
+                "bpmn_user_tasks",
+                "bpmn_jobs",
+                "bpmn_incidents",
+                "bpmn_timers",
+                "bpmn_event_subscriptions",
+                "bpmn_event_races",
+                "bpmn_messages",
+                "bpmn_calls",
+                "bpmn_events",
+                "bpmn_commands",
+            ]
+            .iter()
+            .map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+            .collect::<Vec<_>>()
+        };
+        let before = rows();
+        for kind in [ProcessUserTaskKind::Work, ProcessUserTaskKind::Verification] {
+            let mut forged = plan.clone();
+            forged.create_user_tasks.iter_mut()
+                .find(|task| task.kind == kind).unwrap()
+                .outputs = json!({"fabricated":"result"});
+            assert!(repository::accept_job_result(
+                &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+                claim.job.fence, "fenced-escalation-worker", &observed,
+                claim.snapshot.instance.revision, &forged, at,
+            ).is_err());
+            assert_eq!(rows(), before);
+        }
+        for edge_id in ["EscalationPath_Exact", "ChoiceSelected"] {
+            let mut forged = plan.clone();
+            let mut extra = plan.create_tokens.iter()
+                .find(|token| token.arrival_edge_id.as_deref() == Some(edge_id))
+                .unwrap().clone();
+            extra.token_id = uuid::Uuid::new_v4().to_string();
+            extra.status = "waiting".into();
+            forged.create_tokens.push(extra);
+            assert!(repository::accept_job_result(
+                &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+                claim.job.fence, "fenced-escalation-worker", &observed,
+                claim.snapshot.instance.revision, &forged, at,
+            ).is_err());
+            assert_eq!(rows(), before);
+        }
+        for status in ["ready", "waiting", "joining"] {
+            let mut forged = plan.clone();
+            let mut unrelated = plan.create_tokens.iter()
+                .find(|token| token.node_id == "Work_Exact" && token.status == "waiting")
+                .unwrap().clone();
+            unrelated.token_id = uuid::Uuid::new_v4().to_string();
+            unrelated.node_id = "Work_Any".into();
+            unrelated.arrival_edge_id = Some("EscalationPath_Any".into());
+            unrelated.status = status.into();
+            unrelated.fork_stack.clear();
+            if status == "waiting" {
+                let mut work = plan.create_user_tasks.iter()
+                    .find(|task| task.node_id == "Work_Exact").unwrap().clone();
+                work.user_task_id = uuid::Uuid::new_v4().to_string();
+                work.node_id = unrelated.node_id.clone();
+                work.token_id = Some(unrelated.token_id.clone());
+                forged.create_user_tasks.push(work);
+            }
+            forged.create_tokens.push(unrelated);
+            assert!(repository::accept_job_result(
+                &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+                claim.job.fence, "fenced-escalation-worker", &observed,
+                claim.snapshot.instance.revision, &forged, at,
+            ).is_err());
+            assert_eq!(rows(), before);
+        }
+        let mut forged = plan.clone();
+        forged
+            .events
+            .iter_mut()
+            .find(|event| event.kind == "escalation_caught")
+            .unwrap()
+            .data["source_token_id"] = json!("detached-token");
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged.variables["intruder"] = json!(true);
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged
+            .events
+            .retain(|event| event.kind != "escalation_caught");
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged
+            .events
+            .iter_mut()
+            .find(|event| event.kind == "exclusive_selected")
+            .unwrap()
+            .data["sequence_flow_id"] = json!("ChoiceDefault");
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        let mut forged_observed = observed.clone();
+        forged_observed
+            .expression_observation
+            .as_mut()
+            .unwrap()
+            .evaluation_variables = json!({"intruder":true});
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &forged_observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        forged_observed = observed.clone();
+        forged_observed
+            .expression_observation
+            .as_mut()
+            .unwrap()
+            .normalized_outputs["variables"]["actual_result"]["outputs"]["customer_ID"] = json!(18);
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &forged_observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        let committed = repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at,
+        )
+        .unwrap()
+        .instance;
+        let replay = repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "fenced-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at,
+        )
+        .unwrap()
+        .instance;
+        assert_eq!(replay.revision, committed.revision);
+        assert_eq!(
+            repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+                .unwrap()
+                .0
+                .iter()
+                .filter(|event| event.kind == "escalation_caught")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_escalation_first_wait_rows_match_pinned_inputs_atomically() {
+        use tentaflow_protocol::processes::{ProcessMessageDeclaration, ProcessTimerSpec};
+        for route in ["service", "timer", "message", "race"] {
+            let fixture = Fixture::new();
+            let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required",
+                "outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+            let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+            let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+            let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+            let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut service.kind else {
+                panic!("fixture service node changed kind");
+            };
+            *result_expression = Some("outputs.variables.actual_result".into());
+            let exact = model.nodes.iter_mut().find(|node| node.id == "Exact").unwrap();
+            let ProcessNodeKind::BoundaryEscalation { output_mapping, .. } = &mut exact.kind else {
+                panic!("fixture escalation node changed kind");
+            };
+            output_mapping.insert("accepted_customer_id".into(), "outputs.customer_ID".into());
+            model.variables.insert("accepted_customer_id".into(), Value::Null);
+            model.variables.insert("case_key".into(), json!("review-17"));
+            let work = model.nodes.iter_mut().find(|node| node.id == "Work_Exact").unwrap();
+            work.kind = match route {
+                "service" => ProcessNodeKind::ServiceTask { flow_id: flow_id.clone(),
+                    input_mapping: BTreeMap::from([("payload".into(), "vars.accepted_customer_id".into())]),
+                    output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
+                    timeout_seconds: 30, result_expression: None },
+                "timer" => ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 30 } },
+                "message" => ProcessNodeKind::MessageCatch { message_ref: "ReviewMessage".into(),
+                    correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() },
+                "race" => ProcessNodeKind::EventBasedGateway,
+                _ => unreachable!(),
+            };
+            if route == "timer" || route == "race" { model.timer_timezone = Some("UTC".into()); }
+            if route == "message" || route == "race" {
+                model.messages.push(ProcessMessageDeclaration { message_id: "ReviewMessage".into(),
+                    name: "review.requested".into() });
+            }
+            if route == "race" {
+                model.nodes.extend([
+                    ProcessNode { id: "RaceMessage".into(), name: "Review message".into(),
+                        kind: ProcessNodeKind::MessageCatch { message_ref: "ReviewMessage".into(),
+                            correlation_expression: "vars.case_key".into(),
+                            output_mapping: BTreeMap::new() } },
+                    ProcessNode { id: "RaceTimer".into(), name: "Review timeout".into(),
+                        kind: ProcessNodeKind::TimerCatch {
+                            timer: ProcessTimerSpec::Duration { seconds: 30 } } },
+                ]);
+                model.sequence_flows.retain(|edge| edge.id != "EscalationEnd_Exact");
+                model.sequence_flows.extend([
+                    edge("RaceToMessage", "Work_Exact", "RaceMessage"),
+                    edge("RaceToTimer", "Work_Exact", "RaceTimer"),
+                    edge("RaceMessageEnd", "RaceMessage", "End_1"),
+                    edge("RaceTimerEnd", "RaceTimer", "End_1"),
+                ]);
+            }
+            let started = start_model(&fixture, &model);
+            let claim = repository::claim_job(&fixture.db, "pinned-wait-worker", now_ms()).unwrap().unwrap();
+            let normalized = observe_effect(&fixture, &claim).await;
+            let effective = repository::effective_scope_variables(&claim.snapshot.scopes,
+                &claim.snapshot.scope_variables, &started.instance_id,
+                &claim.snapshot.instance.variables, &claim.job.scope_id).unwrap();
+            let observed = ObservedActivityResult { result: serde_json::from_value(body).unwrap(),
+                origin: ActivityResultOrigin::Contract,
+                expression_observation: Some(ExpressionObservation {
+                    normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
+            let at = now_ms();
+            let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+            let rows = || {
+                let conn = fixture.db.read().unwrap();
+                ["bpmn_instances","bpmn_scopes","bpmn_tokens","bpmn_gateway_receipts",
+                 "bpmn_user_tasks","bpmn_jobs","bpmn_incidents","bpmn_timers",
+                 "bpmn_event_subscriptions","bpmn_event_races","bpmn_messages",
+                 "bpmn_calls","bpmn_events","bpmn_commands"]
+                .iter().map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+                .collect::<Vec<_>>()
+            };
+            let before = rows();
+            let mut forged = plan.clone();
+            match route {
+                "service" => forged.create_jobs[0].input["payload"] = json!("fabricated"),
+                "timer" => forged.create_timers[0].due_at_ms = Some(
+                    forged.create_timers[0].due_at_ms.unwrap() + 1_000),
+                "message" => forged.create_subscriptions.iter_mut()
+                    .find(|sub| sub.node_id == "Work_Exact").unwrap()
+                    .correlation_key = Some("wrong-key".into()),
+                "race" => forged.create_subscriptions.iter_mut()
+                    .find(|sub| sub.node_id == "RaceMessage").unwrap()
+                    .status = tentaflow_protocol::processes::ProcessSubscriptionStatus::Error,
+                _ => unreachable!(),
+            }
+            assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+                &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
+                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+            assert_eq!(rows(), before);
+            forged = plan.clone();
+            forged.status = if route == "service" {
+                ProcessInstanceStatus::Waiting
+            } else {
+                ProcessInstanceStatus::Running
+            };
+            assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+                &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
+                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+            assert_eq!(rows(), before);
+            repository::accept_job_result(&fixture.db, &fixture.owner,
+                &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
+                &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn fenced_escalation_message_throw_uses_exact_pinned_outbox_atomically() {
+        use tentaflow_protocol::processes::{ProcessMessageDeclaration, ProcessMessageTarget,
+            ProcessMessageTargetSpec,
+            ProcessTimerSpec};
+        let fixture = Fixture::new();
+        let mut receiver = super::super::model::starter_model();
+        receiver.messages.push(ProcessMessageDeclaration { message_id: "ReceiverMessage".into(),
+            name: "review.sent".into() });
+        receiver.nodes[0].kind = ProcessNodeKind::MessageStart {
+            message_ref: "ReceiverMessage".into(), output_mapping: BTreeMap::new() };
+        let receiver = publish_model(&fixture, &receiver);
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required",
+            "outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+        let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut service.kind else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        model.variables.insert("case_key".into(), json!("review-17"));
+        model.messages.push(ProcessMessageDeclaration { message_id: "ThrowMessage".into(),
+            name: "review.sent".into() });
+        model.nodes.iter_mut().find(|node| node.id == "Work_Exact").unwrap().kind =
+            ProcessNodeKind::MessageThrow { message_ref: "ThrowMessage".into(),
+                target: ProcessMessageTargetSpec::Start {
+                    definition_id: receiver.definition_id.clone() },
+                correlation_expression: "vars.case_key".into(),
+                payload_expression: "vars.case_key".into(), ttl_seconds: 60 };
+        model.nodes.push(ProcessNode { id: "AfterThrowTimer".into(),
+            name: "Await review follow-up".into(),
+            kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 30 } } });
+        model.sequence_flows.iter_mut().find(|edge| edge.id == "EscalationEnd_Exact")
+            .unwrap().target_id = "AfterThrowTimer".into();
+        model.sequence_flows.push(edge("AfterThrowEnd", "AfterThrowTimer", "End_1"));
+        model.timer_timezone = Some("UTC".into());
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(&fixture.db, "throw-worker", now_ms()).unwrap().unwrap();
+        let normalized = observe_effect(&fixture, &claim).await;
+        let effective = repository::effective_scope_variables(&claim.snapshot.scopes,
+            &claim.snapshot.scope_variables, &started.instance_id,
+            &claim.snapshot.instance.variables, &claim.job.scope_id).unwrap();
+        let observed = ObservedActivityResult { result: serde_json::from_value(body).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
+        let at = now_ms();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert_eq!(plan.create_messages.len(), 1);
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            ["bpmn_instances","bpmn_scopes","bpmn_tokens","bpmn_gateway_receipts",
+             "bpmn_user_tasks","bpmn_jobs","bpmn_incidents","bpmn_timers",
+             "bpmn_event_subscriptions","bpmn_event_races","bpmn_messages",
+             "bpmn_calls","bpmn_events","bpmn_commands"]
+            .iter().map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+            .collect::<Vec<_>>()
+        };
+        let before = rows();
+        for field in ["payload", "correlation", "target", "ttl"] {
+            let mut forged = plan.clone();
+            let message = &mut forged.create_messages[0].message;
+            match field {
+                "payload" => message.payload = json!("fabricated"),
+                "correlation" => message.correlation_key = "wrong-key".into(),
+                "target" => message.target = ProcessMessageTarget::Start {
+                    definition_id: uuid::Uuid::new_v4().to_string() },
+                "ttl" => message.ttl_seconds += 1,
+                _ => unreachable!(),
+            }
+            assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+                &claim.job.job_id, claim.job.attempt, claim.job.fence, "throw-worker",
+                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+            assert_eq!(rows(), before);
+        }
+        repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, "throw-worker",
+            &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fenced_escalation_inclusive_choice_uses_mapped_variables_and_exact_selected_set() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required","outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let exact = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Exact")
+            .unwrap();
+        let ProcessNodeKind::BoundaryEscalation { output_mapping, .. } = &mut exact.kind else {
+            panic!("fixture escalation node changed kind");
+        };
+        output_mapping.insert("review_route".into(), "outputs.customer_ID".into());
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "EscalationPath_Exact")
+            .unwrap()
+            .target_id = "Split".into();
+        model
+            .sequence_flows
+            .iter_mut()
+            .find(|flow| flow.id == "EscalationEnd_Exact")
+            .unwrap()
+            .target_id = "Join".into();
+        model.nodes.extend([
+            ProcessNode {
+                id: "Split".into(),
+                name: "Choose review branches".into(),
+                kind: ProcessNodeKind::InclusiveGateway {
+                    default_flow_id: None,
+                },
+            },
+            ProcessNode {
+                id: "Work_Fallback".into(),
+                name: "Second review".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None,
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+            ProcessNode {
+                id: "Join".into(),
+                name: "Join reviews".into(),
+                kind: ProcessNodeKind::InclusiveGateway {
+                    default_flow_id: None,
+                },
+            },
+        ]);
+        let mut first = edge("ChoiceFirst", "Split", "Work_Exact");
+        first.condition = Some("vars.review_route == 17".into());
+        let mut second = edge("ChoiceSecond", "Split", "Work_Fallback");
+        second.condition = Some("vars.review_route > 0".into());
+        model.sequence_flows.extend([
+            first,
+            second,
+            edge("SecondJoin", "Work_Fallback", "Join"),
+            edge("JoinEnd", "Join", "End_1"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(&fixture.db, "inclusive-escalation-worker", now_ms())
+            .unwrap()
+            .unwrap();
+        let normalized = observe_effect(&fixture, &claim).await;
+        let effective = repository::effective_scope_variables(
+            &claim.snapshot.scopes,
+            &claim.snapshot.scope_variables,
+            &started.instance_id,
+            &claim.snapshot.instance.variables,
+            &claim.job.scope_id,
+        )
+        .unwrap();
+        let observed = ObservedActivityResult {
+            result: serde_json::from_value(body).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: normalized.outputs,
+                evaluation_variables: effective,
+            }),
+        };
+        let at = now_ms();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let choice = plan
+            .events
+            .iter()
+            .find(|event| event.kind == "inclusive_split")
+            .unwrap();
+        assert_eq!(
+            choice.data["selected_branch_edge_ids"],
+            json!(["ChoiceFirst", "ChoiceSecond"])
+        );
+        assert!(choice.data["source_token_id"].as_str().is_some());
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            [
+                "bpmn_instances",
+                "bpmn_scopes",
+                "bpmn_tokens",
+                "bpmn_gateway_receipts",
+                "bpmn_user_tasks",
+                "bpmn_jobs",
+                "bpmn_incidents",
+                "bpmn_timers",
+                "bpmn_event_subscriptions",
+                "bpmn_event_races",
+                "bpmn_messages",
+                "bpmn_calls",
+                "bpmn_events",
+                "bpmn_commands",
+            ]
+            .iter()
+            .map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+            .collect::<Vec<_>>()
+        };
+        let before = rows();
+        let mut forged = plan.clone();
+        forged
+            .events
+            .iter_mut()
+            .find(|event| event.kind == "inclusive_split")
+            .unwrap()
+            .data["selected_branch_edge_ids"] = json!(["ChoiceFirst"]);
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "inclusive-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        for missing_frame in [false, true] {
+            forged = plan.clone();
+            let mut extra = plan
+                .create_tokens
+                .iter()
+                .find(|token| token.arrival_edge_id.as_deref() == Some("ChoiceFirst"))
+                .unwrap()
+                .clone();
+            extra.token_id = uuid::Uuid::new_v4().to_string();
+            if missing_frame {
+                extra.fork_stack.pop();
+            } else {
+                extra.fork_stack.last_mut().unwrap().activation_id =
+                    uuid::Uuid::new_v4().to_string();
+            }
+            forged.create_tokens.push(extra);
+            assert!(repository::accept_job_result(
+                &fixture.db,
+                &fixture.owner,
+                &claim.job.job_id,
+                claim.job.attempt,
+                claim.job.fence,
+                "inclusive-escalation-worker",
+                &observed,
+                claim.snapshot.instance.revision,
+                &forged,
+                at
+            )
+            .is_err());
+            assert_eq!(rows(), before);
+        }
+        forged = plan.clone();
+        let mut extra_waiting = plan.create_tokens.iter()
+            .find(|token| token.arrival_edge_id.as_deref() == Some("ChoiceFirst")
+                && token.status == "waiting")
+            .unwrap().clone();
+        extra_waiting.token_id = uuid::Uuid::new_v4().to_string();
+        forged.create_tokens.push(extra_waiting);
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "inclusive-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), before);
+        let committed = repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "inclusive-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at,
+        )
+        .unwrap()
+        .instance;
+        assert_eq!(
+            committed
+                .user_tasks
+                .iter()
+                .filter(|task| task.node_id == "Work_Exact" || task.node_id == "Work_Fallback")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn real_escalation_inclusive_singleton_direct_join_reaches_human_wait() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required",
+            "outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+        let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut service.kind else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        model.sequence_flows.iter_mut()
+            .find(|flow| flow.id == "EscalationPath_Exact")
+            .unwrap().target_id = "Split".into();
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Select review branch".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "Join".into(), name: "Join selected review".into(),
+                kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None } },
+            ProcessNode { id: "OtherWork".into(), name: "Other review".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None,
+                    output_mapping: BTreeMap::new() } },
+        ]);
+        let mut direct = edge("ChoiceDirect", "Split", "Join");
+        direct.condition = Some("true".into());
+        let mut other = edge("ChoiceOther", "Split", "OtherWork");
+        other.condition = Some("false".into());
+        model.sequence_flows.extend([
+            direct, other, edge("OtherJoin", "OtherWork", "Join"),
+            edge("JoinWork", "Join", "Work_Exact"),
+        ]);
+        let started = start_model(&fixture, &model);
+        let claim = execute(&fixture, "singleton-join-worker").await;
+        let current = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(current.jobs[0].status, "completed");
+        assert!(current.user_tasks.iter().any(|task| task.node_id == "Work_Exact"));
+        assert!(current.receipts.is_empty());
+        let history = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        let selected = history.iter().find(|event| event.kind == "inclusive_split").unwrap();
+        assert_eq!(selected.data["selected_branch_edge_ids"], json!(["ChoiceDirect"]));
+        assert_eq!(history.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
+        let caught = history.iter().filter(|event| event.kind == "escalation_caught")
+            .collect::<Vec<_>>();
+        assert_eq!(caught.len(), 1);
+        assert_eq!(caught[0].data["job_id"], claim.job.job_id);
+    }
+
+    #[tokio::test]
+    async fn fenced_embedded_escalation_rejects_ancestor_scope_variable_write_atomically() {
+        let fixture = Fixture::new();
+        let body = json!({"outcome":"NeedsHuman","code":"REVIEW","summary":"Review required",
+            "outputs":{"customer_ID":17},"evidence":["actual_public_flow_result"]});
+        let flow_id = flow(&fixture.db, &fixture.owner, &business_graph(body.clone()));
+        let mut model = escalation_handlers(service_model(&flow_id, ActivityVerification::Human));
+        let service = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Service")
+            .unwrap();
+        let ProcessNodeKind::ServiceTask {
+            result_expression, ..
+        } = &mut service.kind
+        else {
+            panic!("fixture service node changed kind");
+        };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let exact = model
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "Exact")
+            .unwrap();
+        let ProcessNodeKind::BoundaryEscalation { output_mapping, .. } = &mut exact.kind else {
+            panic!("fixture escalation node changed kind");
+        };
+        output_mapping.insert("accepted_customer_id".into(), "outputs.customer_ID".into());
+        let mut model = runtime::test_support::embedded_model(model, "Scope");
+        model.nodes.extend([
+            ProcessNode { id: "RootSplit".into(), name: "Open independent work".into(),
+                kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { id: "RootSibling".into(), name: "Independent human review".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None,
+                    output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "RootJoin".into(), name: "Join independent work".into(),
+                kind: ProcessNodeKind::ParallelGateway },
+        ]);
+        model.sequence_flows = vec![
+            edge("RootStartSplit", "RootStart_Scope", "RootSplit"),
+            edge("RootToScope", "RootSplit", "Scope"),
+            edge("RootToSibling", "RootSplit", "RootSibling"),
+            edge("RootScopeJoin", "Scope", "RootJoin"),
+            edge("RootSiblingJoin", "RootSibling", "RootJoin"),
+            edge("RootJoinEnd", "RootJoin", "RootEnd_Scope"),
+        ];
+        let started = start_model(&fixture, &model);
+        let claim = repository::claim_job(&fixture.db, "embedded-escalation-worker", now_ms())
+            .unwrap()
+            .unwrap();
+        assert_ne!(claim.job.scope_id, started.instance_id);
+        let normalized = observe_effect(&fixture, &claim).await;
+        let effective = repository::effective_scope_variables(
+            &claim.snapshot.scopes,
+            &claim.snapshot.scope_variables,
+            &started.instance_id,
+            &claim.snapshot.instance.variables,
+            &claim.job.scope_id,
+        )
+        .unwrap();
+        let observed = ObservedActivityResult {
+            result: serde_json::from_value(body).unwrap(),
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(ExpressionObservation {
+                normalized_outputs: normalized.outputs,
+                evaluation_variables: effective,
+            }),
+        };
+        let at = now_ms();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert!(plan
+            .events
+            .iter()
+            .any(|event| event.kind == "escalation_caught"));
+        assert!(plan
+            .scope_updates
+            .iter()
+            .any(|update| update.scope_id == claim.job.scope_id
+                && update
+                    .variables
+                    .as_ref()
+                    .is_some_and(|variables| variables["accepted_customer_id"] == 17)));
+        let rows = || {
+            let conn = fixture.db.read().unwrap();
+            [
+                "bpmn_instances",
+                "bpmn_scopes",
+                "bpmn_tokens",
+                "bpmn_gateway_receipts",
+                "bpmn_user_tasks",
+                "bpmn_jobs",
+                "bpmn_incidents",
+                "bpmn_timers",
+                "bpmn_event_subscriptions",
+                "bpmn_event_races",
+                "bpmn_messages",
+                "bpmn_calls",
+                "bpmn_events",
+                "bpmn_commands",
+            ]
+            .iter()
+            .map(|table| super::super::call_pin_tests::table_rows(&conn, table, "rowid"))
+            .collect::<Vec<_>>()
+        };
+        let before = rows();
+        let sibling = claim.snapshot.user_tasks.iter()
+            .find(|task| task.node_id == "RootSibling"
+                && task.status == ProcessUserTaskStatus::Open).unwrap();
+        let mut forged = plan.clone();
+        forged.complete_user_task_ids.push(sibling.user_task_id.clone());
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "embedded-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged.events.push(repository::PlannedEvent {
+            scope_id: started.instance_id.clone(),
+            kind: "user_task_completed".into(),
+            node_id: Some("RootSibling".into()),
+            data: json!({"user_task_id":sibling.user_task_id,"outputs":null}),
+        });
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "embedded-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged.events.push(plan.events.iter()
+            .find(|event| event.kind == "user_task_opened").unwrap().clone());
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "embedded-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged.events.iter_mut()
+            .find(|event| event.kind == "user_task_opened").unwrap()
+            .data["user_task_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "embedded-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), before);
+        let ancestor = claim.snapshot.tokens.iter()
+            .find(|token| token.scope_id == started.instance_id && token.status == "waiting")
+            .unwrap();
+        for status in ["ready", "waiting", "joining"] {
+            let mut forged = plan.clone();
+            let mut foreign = ancestor.clone();
+            foreign.token_id = uuid::Uuid::new_v4().to_string();
+            foreign.status = status.into();
+            forged.create_tokens.push(foreign);
+            assert!(repository::accept_job_result(
+                &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+                claim.job.fence, "embedded-escalation-worker", &observed,
+                claim.snapshot.instance.revision, &forged, at,
+            ).is_err());
+            assert_eq!(rows(), before);
+        }
+        let mut forged = plan.clone();
+        forged.scope_updates.push(repository::ScopeUpdate {
+            scope_id: started.instance_id.clone(),
+            expected_revision: claim.snapshot.instance.revision,
+            status: ProcessInstanceStatus::Waiting,
+            variables: Some(json!({"intruder":true})),
+        });
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "embedded-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        forged = plan.clone();
+        forged.variables["intruder"] = json!(true);
+        assert!(repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "embedded-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &forged,
+            at
+        )
+        .is_err());
+        assert_eq!(rows(), before);
+        let unrelated = uuid::Uuid::new_v4().to_string();
+        fixture.db.write().unwrap().execute(
+            "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?3,'End_1','ToEnd','[]','ready',?4)",
+            rusqlite::params![unrelated, started.instance_id, claim.job.scope_id, at],
+        ).unwrap();
+        let with_unrelated = rows();
+        forged = plan.clone();
+        forged.consume_token_ids.push(unrelated.clone());
+        assert!(repository::accept_job_result(
+            &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
+            claim.job.fence, "embedded-escalation-worker", &observed,
+            claim.snapshot.instance.revision, &forged, at,
+        ).is_err());
+        assert_eq!(rows(), with_unrelated);
+        fixture.db.write().unwrap().execute(
+            "DELETE FROM bpmn_tokens WHERE token_id=?1", [&unrelated],
+        ).unwrap();
+        assert_eq!(rows(), before);
+        let committed = repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            "embedded-escalation-worker",
+            &observed,
+            claim.snapshot.instance.revision,
+            &plan,
+            at,
+        )
+        .unwrap()
+        .instance;
+        assert!(committed
+            .user_tasks
+            .iter()
+            .any(|task| task.node_id == "Work_Exact" && task.scope_id == claim.job.scope_id));
+        assert_eq!(committed.variables, started.variables);
     }
 
     #[tokio::test]
@@ -1729,6 +3352,7 @@ mod tests {
             .unwrap();
         let result = ObservedActivityResult {
             origin: ActivityResultOrigin::Contract,
+            expression_observation: None,
             result: ActivityResult {
                 outcome: ActivityOutcome::Error,
                 code: Some("REJECTED".into()),

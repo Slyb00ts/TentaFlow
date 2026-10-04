@@ -26,6 +26,8 @@ pub struct ProcessModel {
     pub errors: Vec<ProcessErrorDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalations: Vec<ProcessEscalationDeclaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +43,14 @@ pub struct ProcessErrorDeclaration {
     pub error_id: String,
     pub name: String,
     pub error_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessEscalationDeclaration {
+    pub escalation_id: String,
+    pub name: String,
+    pub escalation_code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,6 +275,12 @@ pub enum ProcessNodeKind {
     },
     InclusiveGateway {
         default_flow_id: Option<String>,
+    },
+    BoundaryEscalation {
+        attached_to_id: String,
+        escalation_ref: Option<String>,
+        cancel_activity: bool,
+        output_mapping: BTreeMap<String, String>,
     },
 }
 
@@ -632,6 +648,7 @@ pub enum ProcessSubscriptionKind {
     MessageCatch,
     BoundaryMessage,
     BoundaryError,
+    BoundaryEscalation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -799,6 +816,8 @@ pub struct ProcessSubscriptionSummary {
     pub race_id: Option<String>,
     pub last_reason: Option<String>,
     pub scope_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -927,6 +946,26 @@ pub struct ProcessDiagnostic {
     pub element_id: Option<String>,
     pub offset: Option<usize>,
     pub fatal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ProcessEscalationPathReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessEscalationPathReason {
+    CrossBody,
+    ScopeEntry,
+    CallEntry,
+    TerminalBeforeWait,
+    VariableWrite,
+    InvalidGateway,
+    NoDurableWait,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1165,11 +1204,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escalation_fields_round_trip_without_changing_absent_model_or_diagnostic_bytes() {
+        let old = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],
+            "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
+        let mut model: ProcessModel = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&model).unwrap(), old);
+        model.escalations.push(ProcessEscalationDeclaration {
+            escalation_id: "Esc_1".into(),
+            name: "Review & approve".into(),
+            escalation_code: "NEEDS.HUMAN".into(),
+        });
+        model.nodes.push(ProcessNode {
+            id: "Boundary_1".into(),
+            name: "Review".into(),
+            kind: ProcessNodeKind::BoundaryEscalation {
+                attached_to_id: "Service_1".into(),
+                escalation_ref: Some("Esc_1".into()),
+                cancel_activity: false,
+                output_mapping: BTreeMap::from([(
+                    "business_key".into(),
+                    "outputs.customer_ID".into(),
+                )]),
+            },
+        });
+        assert_eq!(
+            crate::cbor::decode::<ProcessModel>(&crate::cbor::encode(&model).unwrap()).unwrap(),
+            model
+        );
+        assert_eq!(
+            serde_json::to_value(&model).unwrap()["nodes"][0]["kind"]["BoundaryEscalation"]
+                ["output_mapping"]["business_key"],
+            "outputs.customer_ID"
+        );
+        assert!(serde_json::from_value::<ProcessNodeKind>(
+            serde_json::json!({"BoundaryEscalation": {
+                "attached_to_id":"Service_1","escalation_ref":null,"cancel_activity":true,
+                "output_mapping":{},"unknown":true
+            }})
+        )
+        .is_err());
+        let old_diagnostic = serde_json::json!({"code":"OLD","message":"old","element_id":null,
+            "offset":null,"fatal":true});
+        let old_decoded: ProcessDiagnostic =
+            serde_json::from_value(old_diagnostic.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&old_decoded).unwrap(), old_diagnostic);
+        let diagnostic = ProcessDiagnostic {
+            code: "ESCALATION_IMMEDIATE_PATH_UNSUPPORTED".into(),
+            message: "boundary path is invalid".into(),
+            element_id: Some("Flow_1".into()),
+            offset: Some(42),
+            fatal: true,
+            boundary_id: Some("Boundary_1".into()),
+            flow_id: Some("Flow_1".into()),
+            node_id: Some("End_1".into()),
+            reason: Some(ProcessEscalationPathReason::TerminalBeforeWait),
+        };
+        assert_eq!(
+            crate::cbor::decode::<ProcessDiagnostic>(&crate::cbor::encode(&diagnostic).unwrap())
+                .unwrap(),
+            diagnostic
+        );
+    }
+
+    #[test]
     fn inclusive_gateway_appends_a_typed_variant_without_changing_old_parallel_shape() {
         let parallel = ProcessNodeKind::ParallelGateway;
-        assert_eq!(serde_json::to_string(&parallel).unwrap(), "\"ParallelGateway\"");
-        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&parallel).unwrap()).unwrap(), parallel);
-        let inclusive = ProcessNodeKind::InclusiveGateway { default_flow_id: Some("Flow_default".into()) };
+        assert_eq!(
+            serde_json::to_string(&parallel).unwrap(),
+            "\"ParallelGateway\""
+        );
+        assert_eq!(
+            crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&parallel).unwrap())
+                .unwrap(),
+            parallel
+        );
+        let inclusive = ProcessNodeKind::InclusiveGateway {
+            default_flow_id: Some("Flow_default".into()),
+        };
         let bytes = crate::cbor::encode(&inclusive).unwrap();
         assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&bytes).unwrap(), inclusive);
         assert_eq!(serde_json::to_value(&inclusive).unwrap(), serde_json::json!({
@@ -1183,10 +1294,19 @@ mod tests {
     #[test]
     fn message_variants_round_trip_without_rewriting_opaque_payload_or_old_model_bytes() {
         let old = ProcessModel {
-            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
-            sequence_flows: Vec::new(), variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
-            timer_timezone: None, work_calendar: None, calendar_pin: None,
-            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
+            schema_version: 1,
+            process_id: "P_1".into(),
+            nodes: Vec::new(),
+            sequence_flows: Vec::new(),
+            variables: BTreeMap::new(),
+            diagram: ProcessDiagram::default(),
+            timer_timezone: None,
+            work_calendar: None,
+            calendar_pin: None,
+            messages: Vec::new(),
+            errors: Vec::new(),
+            target_namespace: None,
+            escalations: Vec::new(),
         };
         assert_eq!(serde_json::to_string(&old).unwrap(),
             "{\"schema_version\":1,\"process_id\":\"P_1\",\"nodes\":[],\"sequence_flows\":[],\"variables\":{},\"diagram\":{\"shapes\":[],\"edges\":[]}}");
@@ -1268,11 +1388,19 @@ mod tests {
     #[test]
     fn timer_rules_round_trip_and_timerless_model_omits_new_fields() {
         let timerless = ProcessModel {
-            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
-            sequence_flows: Vec::new(), variables: BTreeMap::new(),
-            diagram: ProcessDiagram::default(), timer_timezone: None,
-            work_calendar: None, calendar_pin: None,
-            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
+            schema_version: 1,
+            process_id: "P_1".into(),
+            nodes: Vec::new(),
+            sequence_flows: Vec::new(),
+            variables: BTreeMap::new(),
+            diagram: ProcessDiagram::default(),
+            timer_timezone: None,
+            work_calendar: None,
+            calendar_pin: None,
+            messages: Vec::new(),
+            errors: Vec::new(),
+            target_namespace: None,
+            escalations: Vec::new(),
         };
         let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
         assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
@@ -1349,6 +1477,7 @@ mod tests {
                 messages: Vec::new(),
                 errors: Vec::new(),
                 target_namespace: None,
+                escalations: Vec::new(),
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();
@@ -1532,15 +1661,29 @@ mod tests {
     #[test]
     fn call_response_arrays_and_terminal_error_are_typed_without_link_disclosure() {
         let model = ProcessModel {
-            schema_version: 1, process_id: "P_1".into(), nodes: Vec::new(),
-            sequence_flows: Vec::new(), variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
-            timer_timezone: None, work_calendar: None, calendar_pin: None,
-            messages: Vec::new(), errors: Vec::new(), target_namespace: None,
+            schema_version: 1,
+            process_id: "P_1".into(),
+            nodes: Vec::new(),
+            sequence_flows: Vec::new(),
+            variables: BTreeMap::new(),
+            diagram: ProcessDiagram::default(),
+            timer_timezone: None,
+            work_calendar: None,
+            calendar_pin: None,
+            messages: Vec::new(),
+            errors: Vec::new(),
+            target_namespace: None,
+            escalations: Vec::new(),
         };
         let version = ProcessVersion {
-            definition_id: "definition".into(), version: 1, model,
-            published_at_ms: 1, published_by: "owner".into(), model_sha256: "sha".into(),
-            service_flows: Vec::new(), call_activities: Vec::new(),
+            definition_id: "definition".into(),
+            version: 1,
+            model,
+            published_at_ms: 1,
+            published_by: "owner".into(),
+            model_sha256: "sha".into(),
+            service_flows: Vec::new(),
+            call_activities: Vec::new(),
         };
         let json = serde_json::to_value(&version).unwrap();
         assert_eq!(json["call_activities"], serde_json::json!([]));
