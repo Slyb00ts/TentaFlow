@@ -25,11 +25,12 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
-const GRAPH_ELEMENTS: [(&str, &str); 17] = [
+const GRAPH_ELEMENTS: [(&str, &str); 19] = [
     (BPMN, "extensionElements"), (BPMN, "startEvent"),
     (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
     (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
-    (BPMN, "serviceTask"), (BPMN, "scriptTask"), (BPMN, "manualTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
+    (BPMN, "serviceTask"), (BPMN, "scriptTask"), (BPMN, "manualTask"), (BPMN, "sendTask"), (BPMN, "receiveTask"),
+    (BPMN, "subProcess"), (BPMN, "callActivity"),
     (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
     (BPMN, "parallelGateway"), (BPMN, "inclusiveGateway"), (BPMN, "sequenceFlow"),
 ];
@@ -371,17 +372,33 @@ struct MessageThrowConfig {
     ttl_seconds: u32,
 }
 
-fn message_configuration<T: serde::de::DeserializeOwned>(element: &Element) -> Result<T> {
+fn message_configuration<T: serde::de::DeserializeOwned>(element: &Element, marker: &str) -> Result<T> {
     let extension = element.child(BPMN, "extensionElements")?
-        .context("message event requires TentaFlow extension")?;
-    extension.attrs_only(&[])?;
-    extension.children_only(&[(TF, "message")])?;
-    ensure!(extension.children.len() == 1, "message event requires exactly one TentaFlow message config");
-    let config = extension.child(TF, "message")?.expect("validated message extension");
-    config.attrs_only(&[])?;
-    ensure!(config.children.is_empty(), "message config must contain JSON text");
+        .ok_or_else(|| XmlElementError { message: format!("{} requires TentaFlow {marker} marker at byte {}", element.local, element.offset),
+            element_id: element.attr("id").map(str::to_string), offset: element.offset })?;
+    extension.attrs_only(&[]).map_err(|error| XmlElementError {
+        message: format!("invalid message extension at byte {}: {error}", extension.offset),
+        element_id: element.attr("id").map(str::to_string), offset: extension.offset,
+    })?;
+    if extension.children.len() != 1 || !extension.children[0].is(TF, marker) {
+        let offending = extension.children.iter().find(|child| !child.is(TF, marker))
+            .or_else(|| extension.children.get(1)).unwrap_or(extension);
+        return Err(XmlElementError {
+            message: format!("{} requires exactly one TentaFlow {marker} marker at byte {}", element.local, offending.offset),
+            element_id: element.attr("id").map(str::to_string), offset: offending.offset,
+        }.into());
+    }
+    let config = &extension.children[0];
+    config.attrs_only(&[]).map_err(|error| XmlElementError {
+        message: format!("invalid {marker} marker at byte {}: {error}", config.offset),
+        element_id: element.attr("id").map(str::to_string), offset: config.offset,
+    })?;
+    if !config.children.is_empty() {
+        return Err(XmlElementError { message: format!("{marker} config must contain JSON text at byte {}", config.offset),
+            element_id: element.attr("id").map(str::to_string), offset: config.offset }.into());
+    }
     serde_json::from_str(config.text.trim()).map_err(|error| XmlElementError {
-        message: format!("invalid message config at byte {}: {error}", config.offset),
+        message: format!("invalid {marker} config at byte {}: {error}", config.offset),
         element_id: element.attr("id").map(str::to_string),
         offset: config.offset,
     }.into())
@@ -739,7 +756,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 ProcessNodeKind::TimerStart { timer: parsed_timer()? }
             } else {
                 ensure!(element.children.len() == 2, "message start requires one definition and one config");
-                let config: MessageStartConfig = message_configuration(element)?;
+                let config: MessageStartConfig = message_configuration(element, "message")?;
                 ProcessNodeKind::MessageStart {
                     message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
                     output_mapping: config.output_mapping,
@@ -754,7 +771,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 ProcessNodeKind::TimerCatch { timer: parsed_timer()? }
             } else {
                 ensure!(element.children.len() == 2, "message catch requires one definition and one config");
-                let config: MessageCatchConfig = message_configuration(element)?;
+                let config: MessageCatchConfig = message_configuration(element, "message")?;
                 ProcessNodeKind::MessageCatch {
                     message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
                     correlation_expression: config.correlation_expression,
@@ -766,7 +783,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
             element.attrs_only(&["id", "name"])?;
             element.children_only(&[(BPMN, "messageEventDefinition"), (BPMN, "extensionElements")])?;
             ensure!(element.children.len() == 2, "message throw requires one definition and one config");
-            let config: MessageThrowConfig = message_configuration(element)?;
+            let config: MessageThrowConfig = message_configuration(element, "message")?;
             ProcessNodeKind::MessageThrow {
                 message_ref: event_reference(element, "messageEventDefinition", target_namespace)?,
                 target: config.target,
@@ -808,7 +825,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 }
             } else if element.child(BPMN, "messageEventDefinition")?.is_some() {
                 ensure!(element.children.len() == 2, "boundary message requires one definition and one config");
-                let config: MessageCatchConfig = message_configuration(element)?;
+                let config: MessageCatchConfig = message_configuration(element, "message")?;
                 ProcessNodeKind::BoundaryMessage {
                     attached_to_id: element.required("attachedToRef")?,
                     cancel_activity,
@@ -1042,6 +1059,56 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     element_id: Some(id.clone()), offset: marker.offset }.into());
             }
             ProcessNodeKind::ManualTask { assignee_user_id: marker.attr("assigneeUserId").map(str::to_string), instructions }
+        }
+        "sendTask" | "receiveTask" => {
+            let receive = element.local == "receiveTask";
+            element.attrs_only(if receive {
+                &["id", "name", "messageRef", "implementation", "instantiate"]
+            } else {
+                &["id", "name", "messageRef", "implementation"]
+            }).map_err(|error| XmlElementError { message: format!("unsupported {} attribute at byte {}: {error}", element.local, element.offset),
+                element_id: Some(id.clone()), offset: element.offset })?;
+            if element.attr("implementation") != Some("##unspecified") {
+                return Err(XmlElementError { message: format!("{} {} requires implementation ##unspecified at byte {}", element.local, id, element.offset),
+                    element_id: Some(id.clone()), offset: element.offset }.into());
+            }
+            if receive && xml_boolean(element.attr("instantiate"), false, element, "instantiate")? {
+                return Err(XmlElementError { message: format!("receive task cannot instantiate at byte {}", element.offset),
+                    element_id: Some(id.clone()), offset: element.offset }.into());
+            }
+            if !element.text.trim().is_empty() {
+                return Err(XmlElementError { message: format!("{} has unsupported text at byte {}", element.local, element.offset),
+                    element_id: Some(id.clone()), offset: element.offset }.into());
+            }
+            for child in &element.children {
+                if !child.is(BPMN, "extensionElements") {
+                    return Err(XmlElementError { message: format!("unsupported {} child at byte {}", element.local, child.offset),
+                        element_id: Some(id.clone()), offset: child.offset }.into());
+                }
+            }
+            let marker = if receive { "receiveTask" } else { "sendTask" };
+            let message_ref = element.reference("messageRef", target_namespace)?;
+            if !element.qnames.get("messageRef").is_some_and(|(uri, _)| uri == target_namespace) {
+                return Err(XmlElementError { message: format!("{} requires target-namespace messageRef QName at byte {}", element.local, element.offset),
+                    element_id: Some(id.clone()), offset: element.offset }.into());
+            }
+            if receive {
+                let config: MessageCatchConfig = message_configuration(element, marker)?;
+                ProcessNodeKind::ReceiveTask {
+                    message_ref,
+                    correlation_expression: config.correlation_expression,
+                    output_mapping: config.output_mapping,
+                }
+            } else {
+                let config: MessageThrowConfig = message_configuration(element, marker)?;
+                ProcessNodeKind::SendTask {
+                    message_ref,
+                    target: config.target,
+                    correlation_expression: config.correlation_expression,
+                    payload_expression: config.payload_expression,
+                    ttl_seconds: config.ttl_seconds,
+                }
+            }
         }
         "scriptTask" => {
             element.attrs_only(&["id", "name", "scriptFormat"])?;
@@ -1736,6 +1803,10 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ProcessNodeKind::ServiceTask { .. } => ("serviceTask", String::new()),
             ProcessNodeKind::ScriptTask { .. } => ("scriptTask", " scriptFormat=\"application/vnd.tentaflow.cel\"".into()),
             ProcessNodeKind::ManualTask { .. } => ("manualTask", String::new()),
+            ProcessNodeKind::SendTask { message_ref, .. } => ("sendTask",
+                format!(" messageRef=\"tns:{}\" implementation=\"##unspecified\"", escaped(message_ref))),
+            ProcessNodeKind::ReceiveTask { message_ref, .. } => ("receiveTask",
+                format!(" messageRef=\"tns:{}\" implementation=\"##unspecified\" instantiate=\"false\"", escaped(message_ref))),
             ProcessNodeKind::SubProcess { .. } => ("subProcess", String::new()),
             ProcessNodeKind::CallActivity { called_element, .. } => {
                 let prefix = call_prefixes.get(&called_element.namespace_uri)
@@ -1878,6 +1949,18 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                     xml.push_str(&format!(" assigneeUserId=\"{}\"", escaped(assignee)));
                 }
                 xml.push_str("/></bpmn:extensionElements></bpmn:manualTask>");
+            }
+            ProcessNodeKind::SendTask { target, correlation_expression, payload_expression, ttl_seconds, .. } => {
+                let config = serde_json::json!({ "target": target, "correlation_expression": correlation_expression,
+                    "payload_expression": payload_expression, "ttl_seconds": ttl_seconds });
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:sendTask>{}</tentaflow:sendTask></bpmn:extensionElements></bpmn:sendTask>",
+                    escaped(&serde_json::to_string(&config)?)));
+            }
+            ProcessNodeKind::ReceiveTask { correlation_expression, output_mapping, .. } => {
+                let config = serde_json::json!({ "correlation_expression": correlation_expression,
+                    "output_mapping": output_mapping });
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:receiveTask>{}</tentaflow:receiveTask></bpmn:extensionElements></bpmn:receiveTask>",
+                    escaped(&serde_json::to_string(&config)?)));
             }
             ProcessNodeKind::ServiceTask {
                 flow_id,
@@ -3255,6 +3338,74 @@ mod tests {
         let default_xml = export_xml(&model).unwrap();
         assert!(default_xml.contains("<tentaflow:manual/>"));
         assert_eq!(import_xml(&default_xml).0, Some(model));
+    }
+
+    #[test]
+    fn send_receive_task_xml_requires_distinct_markers_and_preserves_di() {
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].name = "Zażółć 日本語".into();
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.nodes.insert(1, ProcessNode { id: "Send_1".into(), name: "Admit <&>".into(), repeat: None,
+            kind: ProcessNodeKind::SendTask { message_ref: "Message_1".into(),
+                target: ProcessMessageTargetSpec::Start { definition_id: uuid::Uuid::nil().to_string() },
+                correlation_expression: "vars.case_key".into(), payload_expression: "vars.payload".into(),
+                ttl_seconds: 60 } });
+        model.nodes.insert(2, ProcessNode { id: "Receive_1".into(), name: "Wait <&>".into(), repeat: None,
+            kind: ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() } });
+        model.sequence_flows[0].target_id = "Send_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Send".into(),
+            source_id: "Send_1".into(), target_id: "Receive_1".into(), condition: None });
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Receive".into(),
+            source_id: "Receive_1".into(), target_id: "End_1".into(), condition: None });
+        model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+        model.variables.insert("payload".into(), serde_json::json!({"business_key": 1}));
+        model.diagram.shapes.push(ProcessShape { element_id: "Send_1".into(),
+            x: 180.0, y: 100.0, width: 240.0, height: 96.0 });
+        model.diagram.shapes.push(ProcessShape { element_id: "Receive_1".into(),
+            x: 460.0, y: 100.0, width: 240.0, height: 96.0 });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:sendTask id=\"Send_1\" name=\"Admit &lt;&amp;&gt;\" messageRef=\"tns:Message_1\" implementation=\"##unspecified\">"));
+        assert!(xml.contains("<bpmn:receiveTask id=\"Receive_1\" name=\"Wait &lt;&amp;&gt;\" messageRef=\"tns:Message_1\" implementation=\"##unspecified\" instantiate=\"false\">"));
+        assert!(xml.contains("<tentaflow:sendTask>") && xml.contains("<tentaflow:receiveTask>"));
+        assert!(xml.contains("bpmnElement=\"Send_1\"") && xml.contains("bpmnElement=\"Receive_1\""));
+        assert_eq!(import_xml(&xml).0, Some(model));
+        let send_extension_start = xml.find("<bpmn:extensionElements><tentaflow:sendTask>").unwrap();
+        let send_extension_end = send_extension_start
+            + xml[send_extension_start..].find("</bpmn:extensionElements>").unwrap()
+            + "</bpmn:extensionElements>".len();
+        let mut missing = xml.clone();
+        missing.replace_range(send_extension_start..send_extension_end, "");
+        let duplicate = xml.replacen("</tentaflow:sendTask>",
+            "</tentaflow:sendTask><tentaflow:sendTask>{}</tentaflow:sendTask>", 1);
+        let nested = xml.replacen("</tentaflow:receiveTask>",
+            "<bpmn:documentation>nested</bpmn:documentation></tentaflow:receiveTask>", 1);
+        for (invalid, id, marker) in [
+            (missing, "Send_1", "<bpmn:sendTask"),
+            (duplicate, "Send_1", "<tentaflow:sendTask>{}"),
+            (nested, "Receive_1", "<tentaflow:receiveTask>"),
+            (xml.replacen("<tentaflow:sendTask>", "<tentaflow:receiveTask>", 1)
+                .replacen("</tentaflow:sendTask>", "</tentaflow:receiveTask>", 1), "Send_1", "<tentaflow:receiveTask>"),
+            (xml.replacen("<tentaflow:receiveTask>", "<tentaflow:sendTask>", 1)
+                .replacen("</tentaflow:receiveTask>", "</tentaflow:sendTask>", 1), "Receive_1", "<tentaflow:sendTask>"),
+            (xml.replacen("instantiate=\"false\"", "instantiate=\"true\"", 1), "Receive_1", "<bpmn:receiveTask"),
+            (xml.replacen("messageRef=\"tns:Message_1\"", "messageRef=\"bpmn:Message_1\"", 1), "Send_1", "<bpmn:sendTask"),
+            (xml.replacen("messageRef=\"tns:Message_1\"", "messageRef=\"Message_1\"", 1), "Send_1", "<bpmn:sendTask"),
+            (xml.replacen("messageRef=\"tns:Message_1\" implementation=\"##unspecified\"",
+                "messageRef=\"tns:Message_1\" operationRef=\"tns:Operation_1\" implementation=\"##unspecified\"", 1), "Send_1", "<bpmn:sendTask"),
+        ] {
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none());
+            let task = if id == "Send_1" { "<bpmn:sendTask id=\"Send_1\"" }
+                else { "<bpmn:receiveTask id=\"Receive_1\"" };
+            let task_offset = invalid.find(task).unwrap();
+            let marker_offset = task_offset + invalid[task_offset..].find(marker).unwrap();
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some(id)
+                && diagnostic.offset == Some(marker_offset)), "{diagnostics:?}");
+        }
     }
 
 }

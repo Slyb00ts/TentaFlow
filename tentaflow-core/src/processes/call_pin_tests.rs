@@ -593,7 +593,7 @@ fn migration_preserves_populated_legacy_call_free_rows_and_foreign_keys() {
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        190
+        191
     );
     let after = [
         table_rows(&conn, "bpmn_versions", "definition_id,version"),

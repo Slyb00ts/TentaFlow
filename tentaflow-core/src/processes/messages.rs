@@ -84,16 +84,13 @@ pub fn prepare_throw(
     node: &ProcessNode,
     variables: &Value,
 ) -> Result<PreparedMessage> {
-    let ProcessNodeKind::MessageThrow {
-        message_ref,
-        target,
-        correlation_expression,
-        payload_expression,
-        ttl_seconds,
-    } = &node.kind
-    else {
-        anyhow::bail!("message throw node required")
-    };
+    let (message_ref, target, correlation_expression, payload_expression, ttl_seconds) =
+        match &node.kind {
+            ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds }
+            | ProcessNodeKind::SendTask { message_ref, target, correlation_expression, payload_expression, ttl_seconds } =>
+                (message_ref, target, correlation_expression, payload_expression, ttl_seconds),
+            _ => anyhow::bail!("message-producing node required"),
+        };
     let message_name = model
         .messages
         .iter()

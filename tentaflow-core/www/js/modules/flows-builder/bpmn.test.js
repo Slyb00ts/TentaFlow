@@ -789,6 +789,49 @@ test('sequential message target and TTL edits survive Save and the official proc
   assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
 });
 
+test('distinct send and receive task inspectors save exact message fields and disclose local admission', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.nodes.splice(1, 0,
+    { id: 'Send_1', name: 'Admit locally', kind: { SendTask: { messageRef: 'Message_1',
+      target: { Start: { definitionId: '' } }, correlationExpression: 'vars.case_key',
+      payloadExpression: 'vars.payload', ttlSeconds: 60 } } },
+    { id: 'Receive_1', name: 'Receive later', kind: { ReceiveTask: { messageRef: 'Message_1',
+      correlationExpression: 'vars.case_key', outputMapping: {} } } });
+  const current = definition('send-receive-draft', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  state.canvas.selectNode('Send_1');
+  await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.ok(state.config.root.querySelector('[data-process="targetType"]'));
+  assert.ok(state.config.root.textContent.includes(I18n.t('bpmn.node_send_task_hint')));
+  change(state.config.root.querySelector('[data-process="targetDefinitionId"]'), 'target-definition');
+  change(state.config.root.querySelector('[data-process="ttlSeconds"]'), '240');
+  state.canvas.selectNode('Receive_1');
+  await flush(2);
+  assert.ok(state.config.root.querySelector('[data-process="messageRef"]'));
+  assert.ok(state.config.root.querySelector('[data-process="outputMapping"]'));
+  assert.equal(state.config.root.querySelector('[data-process="targetType"]'), null);
+  assert.equal(state.config.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload;
+  assert.deepEqual(saved.model.nodes.find((node) => node.id === 'Send_1').kind.SendTask, {
+    messageRef: 'Message_1', target: { Start: { definitionId: 'target-definition' } },
+    correlationExpression: 'vars.case_key', payloadExpression: 'vars.payload', ttlSeconds: 240,
+  });
+  assert.deepEqual(saved.model.nodes.find((node) => node.id === 'Receive_1').kind.ReceiveTask, {
+    messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {},
+  });
+  const readonly = inspector(state.canvas, true);
+  readonly.show(state.canvas.nodes.find((node) => node.id === 'Receive_1'),
+    state.canvas.templates.get('bpmn_receive_task'));
+  assert.equal(readonly.root.querySelector('[data-process="correlationExpression"]').hasAttribute('disabled'), true);
+  readonly.destroy();
+  assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
+});
+
 test('boundary message switch click saves its checked boolean with a visible accessible label', async () => {
   const model = emptyProcessModel();
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
@@ -1219,9 +1262,11 @@ test('repeat inspector changes survive the mounted draft save and undo/redo snap
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 23);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 25);
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_manual_task"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_send_task"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_receive_task"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1992,13 +2037,27 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 23);
+    assert.equal(processTemplates().length, 25);
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_manual_task')?.label,
       I18n.t('bpmn.node_manual_task'));
+    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_send_task')?.label,
+      I18n.t('bpmn.node_send_task'));
+    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_receive_task')?.label,
+      I18n.t('bpmn.node_receive_task'));
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of ['manual_task_opened', 'manual_task_acknowledged']) {
       assert.equal(processEventText({ kind, nodeName: 'External work', data: {} }),
         I18n.t(`bpmn.event_${kind}`, { node: 'External work' }));
+    }
+    for (const [kind, data] of [
+      ['send_task_admitted', { message_name: 'order.received', correlation_key: 'case-1' }],
+      ['receive_task_opened', { message_name: 'order.received', correlation_key: 'case-1' }],
+      ['receive_task_completed', { message_id: 'message-1' }],
+    ]) {
+      const output = processEventText({ kind, nodeName: 'Message task', data });
+      assert.equal(output, I18n.t(`bpmn.event_${kind}`, {
+        node: 'Message task', message: data.message_name || data.message_id, key: data.correlation_key,
+      }));
     }
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });

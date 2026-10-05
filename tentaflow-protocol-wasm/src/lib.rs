@@ -26208,6 +26208,34 @@ mod process_wire_tests {
     }
 
     #[test]
+    fn process_request_encoder_preserves_distinct_message_task_models() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload, ProcessSubscriptionKind};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Message tasks","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[
+                    {"id":"Send_1","name":"Admit message","kind":{"SendTask":{
+                        "message_ref":"Message_1","target":{"Start":{"definition_id":"d1"}},
+                        "correlation_expression":"vars.key","payload_expression":"vars.payload","ttl_seconds":60}}},
+                    {"id":"Receive_1","name":"Wait","kind":{"ReceiveTask":{
+                        "message_ref":"Message_1","correlation_expression":"vars.key",
+                        "output_mapping":{"received":"outputs"}}}}],
+                "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed message-task save request expected");
+        };
+        assert!(matches!(&model.nodes[0].kind, ProcessNodeKind::SendTask { message_ref, .. } if message_ref == "Message_1"));
+        assert!(matches!(&model.nodes[1].kind, ProcessNodeKind::ReceiveTask { message_ref, .. } if message_ref == "Message_1"));
+        let subscription = ProcessSubscriptionKind::ReceiveTask;
+        assert_eq!(serde_json::to_value(subscription).unwrap(), "ReceiveTask");
+    }
+
+    #[test]
     fn process_request_encoder_keeps_repeat_variants_and_selected_value_selector() {
         use tentaflow_protocol::processes::{ProcessMultiInstanceInput, ProcessMultiInstanceMode,
             ProcessPayload, ProcessRepeatSpec, ProcessRepetitionValueKind};

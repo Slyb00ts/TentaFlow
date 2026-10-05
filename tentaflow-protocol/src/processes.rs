@@ -330,6 +330,18 @@ pub enum ProcessNodeKind {
         assignee_user_id: Option<String>,
         instructions: String,
     },
+    SendTask {
+        message_ref: String,
+        target: ProcessMessageTargetSpec,
+        correlation_expression: String,
+        payload_expression: String,
+        ttl_seconds: u32,
+    },
+    ReceiveTask {
+        message_ref: String,
+        correlation_expression: String,
+        output_mapping: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -700,6 +712,7 @@ pub enum ProcessSubscriptionKind {
     BoundaryMessage,
     BoundaryError,
     BoundaryEscalation,
+    ReceiveTask,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1820,6 +1833,33 @@ mod tests {
         }));
         assert!(body["ManualTaskAcknowledgeRequest"].get("outputs").is_none());
         assert!(body["ManualTaskAcknowledgeRequest"].get("approved").is_none());
+    }
+
+    #[test]
+    fn send_and_receive_tasks_append_distinct_wire_variants() {
+        let target = ProcessMessageTargetSpec::Catch {
+            definition_id: "definition-1".into(), instance_id_expression: Some("vars.instance_id".into()),
+            subscription_id_expression: None,
+        };
+        let send = ProcessNodeKind::SendTask { message_ref: "Message_1".into(), target,
+            correlation_expression: "vars.case_key".into(), payload_expression: "vars.payload".into(),
+            ttl_seconds: 3600 };
+        let receive = ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
+            correlation_expression: "vars.case_key".into(),
+            output_mapping: BTreeMap::from([("received".into(), "outputs".into())]) };
+        for kind in [&send, &receive] {
+            let bytes = crate::cbor::encode(kind).unwrap();
+            assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&bytes).unwrap(), *kind);
+        }
+        assert!(serde_json::to_value(&send).unwrap().get("MessageThrow").is_none());
+        assert!(serde_json::to_value(&receive).unwrap().get("MessageCatch").is_none());
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "ReceiveTask":{"message_ref":"Message_1","correlation_expression":"vars.case_key"}
+        })).is_err());
+        let subscription = ProcessSubscriptionKind::ReceiveTask;
+        let bytes = crate::cbor::encode(&subscription).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessSubscriptionKind>(&bytes).unwrap(), subscription);
+        assert_eq!(serde_json::to_value(subscription).unwrap(), "ReceiveTask");
     }
 
     #[test]

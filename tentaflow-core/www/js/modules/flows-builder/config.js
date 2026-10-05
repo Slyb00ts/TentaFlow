@@ -395,7 +395,7 @@ export class FlowConfig {
       else if (timerKind === 'Daily') fields += `<div class="fb-timer-clock">${input('timerHour', 'timer_hour', timer.hour, 'type="number" min="0" max="23" step="1"')}${input('timerMinute', 'timer_minute', timer.minute, 'type="number" min="0" max="59" step="1"')}</div><p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_daily_hint'))}</p>`;
       if (timerKind === 'Cycle' || timerKind === 'Daily') fields += input('timerTotal', 'timer_total', timer.totalFirings, 'type="number" min="1" max="4294967295" step="1"') + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timer_total_hint'))}</p>`;
       fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'TimerStart' ? 'bpmn.timer_start_hint' : kind === 'BoundaryTimer' ? 'bpmn.boundary_timer_hint' : 'bpmn.timer_catch_hint'))}</p>`;
-    } else if (kind === 'MessageStart' || kind === 'MessageCatch' || kind === 'BoundaryMessage' || kind === 'MessageThrow' || kind === 'BoundaryError' || kind === 'BoundaryEscalation') {
+    } else if (kind === 'MessageStart' || kind === 'MessageCatch' || kind === 'BoundaryMessage' || kind === 'MessageThrow' || kind === 'SendTask' || kind === 'ReceiveTask' || kind === 'BoundaryError' || kind === 'BoundaryEscalation') {
       if (processBoundaryKind(node.type)) fields += boundary();
       if (kind === 'BoundaryMessage') fields += `<tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>`;
       if (kind === 'BoundaryEscalation') fields += `<tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>`;
@@ -403,8 +403,8 @@ export class FlowConfig {
       else if (kind === 'BoundaryEscalation') fields += declaration('escalationRef', 'escalation_reference', model.escalations, 'escalationId', config.escalationRef)
         + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.escalation_catch_all_hint'))}</p>`;
       else fields += declaration('messageRef', 'message_reference', model.messages, 'messageId', config.messageRef);
-      if (kind === 'MessageCatch' || kind === 'BoundaryMessage' || kind === 'MessageThrow') fields += textarea('correlationExpression', 'correlation_expression', config.correlationExpression, 3);
-      if (kind === 'MessageThrow') {
+      if (kind === 'MessageCatch' || kind === 'ReceiveTask' || kind === 'BoundaryMessage' || kind === 'MessageThrow' || kind === 'SendTask') fields += textarea('correlationExpression', 'correlation_expression', config.correlationExpression, 3);
+      if (kind === 'MessageThrow' || kind === 'SendTask') {
         const target = config.target || { Start: { definitionId: '' } };
         const targetKind = Object.keys(target)[0];
         fields += `<tf-select data-process="targetType" label="${escapeAttr(I18n.t('bpmn.message_target_type'))}" value="${escapeAttr(targetKind)}" ${disabled}><option value="Start">${escapeHtml(I18n.t('bpmn.message_target_start'))}</option><option value="Catch">${escapeHtml(I18n.t('bpmn.message_target_catch'))}</option></tf-select>`;
@@ -415,7 +415,8 @@ export class FlowConfig {
         if (targetKind === 'Catch') fields += textarea('instanceIdExpression', 'message_target_instance_expression', target.Catch.instanceIdExpression || '', 3) + textarea('subscriptionIdExpression', 'message_target_subscription_expression', target.Catch.subscriptionIdExpression || '', 3);
         fields += textarea('payloadExpression', 'message_payload_expression', config.payloadExpression, 4) + input('ttlSeconds', 'message_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"');
       }
-      if (kind !== 'MessageThrow') fields += mapping('outputMapping', 'output_mapping');
+      if (kind !== 'MessageThrow' && kind !== 'SendTask') fields += mapping('outputMapping', 'output_mapping');
+      if (kind === 'SendTask' || kind === 'ReceiveTask') fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(`bpmn.node_${kind === 'SendTask' ? 'send' : 'receive'}_task_hint`))}</p>`;
     } else if (kind === 'ExclusiveGateway' || kind === 'InclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
@@ -512,7 +513,7 @@ export class FlowConfig {
           const names = publishedModel.nodes.flatMap((candidate) => {
             if (typeof candidate.kind !== 'object') return [];
             const [tag, body] = Object.entries(candidate.kind)[0];
-            if (!['MessageStart', 'MessageCatch', 'BoundaryMessage'].includes(tag)) return [];
+            if (!['MessageStart', 'MessageCatch', 'ReceiveTask', 'BoundaryMessage'].includes(tag)) return [];
             return publishedModel.messages.filter((declaration) => declaration.messageId === body.messageRef).map((declaration) => declaration.name);
           });
           capability.textContent = `${I18n.t('bpmn.target_declared_names')}: ${[...new Set(names)].join(', ') || I18n.t('bpmn.none')}`;

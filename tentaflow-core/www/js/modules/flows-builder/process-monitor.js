@@ -121,6 +121,15 @@ export function processEventText(event) {
   if (event.kind === 'script_completed') return text('event_script_completed', { node });
   if (event.kind === 'manual_task_opened') return text('event_manual_task_opened', { node });
   if (event.kind === 'manual_task_acknowledged') return text('event_manual_task_acknowledged', { node });
+  if (event.kind === 'send_task_admitted') return text('event_send_task_admitted', {
+    node, message: event.data.message_name, key: event.data.correlation_key,
+  });
+  if (event.kind === 'receive_task_opened') return text('event_receive_task_opened', {
+    node, message: event.data.message_name, key: event.data.correlation_key,
+  });
+  if (event.kind === 'receive_task_completed') return text('event_receive_task_completed', {
+    node, message: event.data.message_id,
+  });
   if (event.kind === 'inclusive_split') return text('event_inclusive_split', { node,
     count: event.data.selected_branch_edge_ids.length,
     default: event.data.default_selected ? text('inclusive_default_selected') : '' });

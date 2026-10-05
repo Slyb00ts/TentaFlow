@@ -1947,7 +1947,8 @@ fn validate_boundary_plan_on(
         .into_iter()
         .filter(|sub| {
             (active_scopes.contains(&sub.scope_id)
-                || (sub.token_id == token_id && sub.kind != ProcessSubscriptionKind::MessageCatch))
+                || (sub.token_id == token_id && !matches!(sub.kind,
+                    ProcessSubscriptionKind::MessageCatch | ProcessSubscriptionKind::ReceiveTask)))
                 && sub.status == ProcessSubscriptionStatus::Open
         })
         .collect::<Vec<_>>();
@@ -4529,6 +4530,7 @@ fn instance_state_on(
         .into_iter()
         .filter_map(|n| match &n.kind {
             ProcessNodeKind::MessageCatch { message_ref, .. }
+            | ProcessNodeKind::ReceiveTask { message_ref, .. }
             | ProcessNodeKind::BoundaryMessage { message_ref, .. } => Some(message_ref),
             _ => None,
         })
@@ -6977,6 +6979,7 @@ fn validate_termination_variables_on(
                     | ProcessNodeKind::BoundaryError { output_mapping, .. }
                     | ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
                     | ProcessNodeKind::MessageCatch { output_mapping, .. }
+                    | ProcessNodeKind::ReceiveTask { output_mapping, .. }
                     | ProcessNodeKind::BoundaryMessage { output_mapping, .. }
                     | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping,
                     _ => bail!("mapped variable effect has no pinned output mapping"),
@@ -7165,8 +7168,10 @@ fn validate_termination_variables_on(
                         (error_effective, extra.clone())
                     }
                     (ProcessNodeKind::MessageCatch { .. }
+                        | ProcessNodeKind::ReceiveTask { .. }
                         | ProcessNodeKind::BoundaryMessage { .. },
-                        AcceptedInputRef::Message { org_id, sender_user_id, message_id, .. }) => {
+                        AcceptedInputRef::Message { org_id, sender_user_id, message_id,
+                            target_subscription_id: Some(subscription_id), .. }) => {
                         let message = message_on(tx, &MessageKey {org_id:org_id.clone(),
                             sender_user_id:sender_user_id.clone(), message_id:message_id.clone()}, true)?;
                         let payload = message.payload.context("mapped message payload was pruned")?;
@@ -7175,13 +7180,16 @@ fn validate_termination_variables_on(
                             "message_name":message.message_name,"correlation_key":message.correlation_key,
                             "received_at_ms":message.received_at_ms,"expires_at_ms":message.expires_at_ms,
                             "payload_sha256":message.payload_sha256});
-                        ensure!(plan.events.iter().filter(|event| event.kind == "message_delivered"
+                        ensure!(plan.events.iter().enumerate().filter(|(index,event)|
+                            *event_index <= *index && event.kind == "message_delivered"
                             && event.scope_id == *scope_id
                             && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["subscription_id"].as_str() == Some(subscription_id.as_str())
+                            && event.data["attached_token_id"].as_str() == Some(source_token_id.as_str())
                             && event.data["message_id"].as_str() == Some(message_id.as_str())
                             && event.data["payload"] == payload
                             && event.data["message"] == metadata).count() == 1,
-                            "mapped message output lacks one exact delivered envelope");
+                            "mapped message output has no exact source-time delivered envelope");
                         (payload, vec![("message".to_owned(), metadata)])
                     }
                     (ProcessNodeKind::CallActivity { .. },
@@ -7840,7 +7848,7 @@ fn validate_termination_immediate_failure_on(
                 "reason":reason,"condition_edge_id":condition_edge_id,
                 "source_token_id":source.token_id,"waiting_token_id":waiting.token_id}))
         }
-        ProcessNodeKind::MessageThrow { .. } => {
+        ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
             let error = match super::messages::prepare_throw(model, node, &effective) {
                 Ok(_) => bail!("termination message throw has a prepared message, not a failure wait"),
                 Err(error) => error,
@@ -7922,7 +7930,7 @@ fn validate_termination_action_provenance_on(
             let immediate_wait = matches!(&pinned.kind,
                 ProcessNodeKind::ExclusiveGateway { .. }
                 | ProcessNodeKind::InclusiveGateway { .. }
-                | ProcessNodeKind::MessageThrow { .. });
+                | ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. });
             let script_wait = matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
                 && plan.events.iter().enumerate().any(|(index, event)|
                     event.kind == "incident" && event.scope_id == source.scope_id
@@ -7948,6 +7956,7 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
                 || immediate_wait
                 || script_wait
@@ -8105,7 +8114,7 @@ fn validate_termination_action_provenance_on(
                                 && timer.scope_id.as_deref() == Some(source.scope_id.as_str())
                                 && timer.token_id.as_deref() == Some(source_id.as_str())
                                 && timer.node_id == source.node_id)),
-                ProcessNodeKind::MessageCatch { .. } => plan.subscription_updates.iter().any(|update|
+                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } => plan.subscription_updates.iter().any(|update|
                     update.status == ProcessSubscriptionStatus::Consumed
                         && (matches!(entry, EntryAuthority::Accepted(
                             AcceptedInputRef::Message { target_subscription_id: Some(id), .. })
@@ -8260,6 +8269,7 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. } =>
                     ensure!(waits == 1 && joins == 0,
                         "termination activity has no unique factual durable wait"),
@@ -8286,6 +8296,7 @@ fn validate_termination_action_provenance_on(
                         "termination gateway added an unauthenticated wait or join");
                 }
                 ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. }
+                | ProcessNodeKind::SendTask { .. }
                 | ProcessNodeKind::ScriptTask { .. } => {
                     let incident_count = plan.add_incidents.iter().filter(|incident|
                         incident.scope_id == source.scope_id
@@ -8339,10 +8350,12 @@ fn validate_termination_action_provenance_on(
         "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
         | "parallel_joined" | "inclusive_joined" | "end_reached"
         | "error_end_reached" | "terminate_end_reached" | "message_queued"
+        | "send_task_admitted"
         | "script_completed")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
-                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })))
+                .is_ok_and(|node| matches!(&node.kind,
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. })))
         || event.kind == "incident" && event.data["source_kind"] == "terminate_end_return_failure";
     ensure!(plan.event_sources.len() == plan.events.iter().filter(|event| mandatory(event)).count()
         && plan.events.iter().enumerate().all(|(index,event)|
@@ -8529,7 +8542,8 @@ fn validate_termination_action_provenance_on(
             (ProcessNodeKind::TerminateEnd, "terminate_end_reached") => Vec::new(),
             (ProcessNodeKind::TerminateEnd, "incident")
                 if event.data["source_kind"] == "terminate_end_return_failure" => Vec::new(),
-            (ProcessNodeKind::MessageThrow { .. }, "message_queued") => {
+            (ProcessNodeKind::MessageThrow { .. }, "message_queued")
+            | (ProcessNodeKind::SendTask { .. }, "send_task_admitted") => {
                 let queued = plan.create_messages.iter().filter(|message|
                     message.source_activation_id == *source_id
                         && message.source_event_index == *index
@@ -8789,7 +8803,7 @@ fn validate_termination_action_provenance_on(
                                 "source_instance_id":instance_id,
                                 "source_event_id":source.source_event_id})
                         }))),
-            "message_armed" | "error_boundary_armed" | "escalation_boundary_armed" =>
+            "message_armed" | "receive_task_opened" | "error_boundary_armed" | "escalation_boundary_armed" =>
                 event.data["subscription_id"].as_str().is_some_and(|id|
                     count(event.kind.as_str(), "subscription_id", id) == 1
                     && plan.create_subscriptions.iter().any(|subscription|
@@ -8800,7 +8814,29 @@ fn validate_termination_action_provenance_on(
                             .or_else(|| event.data["token_id"].as_str())
                             == Some(subscription.token_id.as_str())
                         && (event.kind == "escalation_boundary_armed") ==
-                            (subscription.kind == ProcessSubscriptionKind::BoundaryEscalation))),
+                            (subscription.kind == ProcessSubscriptionKind::BoundaryEscalation)
+                        && (event.kind == "receive_task_opened") ==
+                            (subscription.kind == ProcessSubscriptionKind::ReceiveTask))),
+            "receive_task_completed" => event.data["subscription_id"].as_str().is_some_and(|id|
+                count("receive_task_completed", "subscription_id", id) == 1
+                && subscription_on(tx, id).is_ok_and(|subscription|
+                    subscription.kind == ProcessSubscriptionKind::ReceiveTask
+                        && subscription.instance_id == instance_id
+                        && subscription.scope_id == event.scope_id
+                        && node == Some(subscription.node_id.as_str())
+                        && event.data == serde_json::json!({
+                            "subscription_id":subscription.subscription_id,
+                            "attached_token_id":subscription.token_id,
+                            "message_id":event.data["message_id"]})
+                        && plan.subscription_updates.iter().filter(|update|
+                            update.subscription_id == subscription.subscription_id
+                                && update.status == ProcessSubscriptionStatus::Consumed).count() == 1
+                        && plan.events.iter().enumerate().any(|(prior, delivered)|
+                            prior < event_index && delivered.kind == "message_delivered"
+                                && delivered.scope_id == event.scope_id
+                                && delivered.node_id == event.node_id
+                                && delivered.data["subscription_id"] == id
+                                && delivered.data["message_id"] == event.data["message_id"]))),
             "subscription_cancelled" => event.data["subscription_id"].as_str().is_some_and(|id|
                 count("subscription_cancelled", "subscription_id", id) == 1
                 && plan.subscription_updates.iter().any(|update|
@@ -9187,11 +9223,13 @@ fn validate_termination_action_provenance_on(
                         })),
             "message_delivered" => event.data["message_id"].as_str().is_some_and(|id|
                 count("message_delivered", "message_id", id) == 1
-                && plan.termination_attempts.iter().any(|attempt| {
-                    let input = match attempt {
+                && plan.termination_attempts.iter().map(|attempt| match attempt {
                         TerminationAttempt::Success(source) => &source.accepted_input,
                         TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
-                    };
+                    }).chain(match entry {
+                        EntryAuthority::Accepted(input) => Some(input),
+                        _ => None,
+                    }).any(|input| {
                     let (org_id, sender_user_id, subscription_id) = match input {
                         AcceptedInputRef::Message { org_id, sender_user_id, message_id,
                             target_subscription_id, .. } if message_id == id =>
@@ -9293,7 +9331,7 @@ fn validate_termination_action_provenance_on(
             matches!(event.kind.as_str(), "timer_armed" | "timer_error")
                 && event.data["timer_id"].as_str() == Some(timer.timer_id.as_str())).count() == 1)
         && plan.create_subscriptions.iter().all(|subscription| plan.events.iter().filter(|event|
-            matches!(event.kind.as_str(), "message_armed" | "error_boundary_armed"
+            matches!(event.kind.as_str(), "message_armed" | "receive_task_opened" | "error_boundary_armed"
                 | "escalation_boundary_armed")
                 && event.data["subscription_id"].as_str()
                     == Some(subscription.subscription_id.as_str())).count() == 1)
@@ -9359,7 +9397,7 @@ fn validate_termination_action_provenance_on(
         let event = plan.events.iter().find(|event|
             event.data["subscription_id"].as_str()
                 == Some(subscription.subscription_id.as_str())
-                && matches!(event.kind.as_str(), "message_armed" | "error_boundary_armed"
+                && matches!(event.kind.as_str(), "message_armed" | "receive_task_opened" | "error_boundary_armed"
                     | "escalation_boundary_armed"))
             .context("termination subscription lacks its unique arm fact")?;
         let node = scope_node(model, scopes, instance_id,
@@ -9382,14 +9420,15 @@ fn validate_termination_action_provenance_on(
                         "correlation_key":subscription.correlation_key,
                         "error_code":subscription.error_code,"race_id":subscription.race_id,
                         "kind":subscription.kind})),
-            ProcessNodeKind::MessageCatch { .. } =>
-                ("message_armed", serde_json::json!({
+            ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } =>
+                (if subscription.kind == ProcessSubscriptionKind::ReceiveTask {
+                    "receive_task_opened" } else { "message_armed" }, serde_json::json!({
                     "subscription_id":subscription.subscription_id,
                     "token_id":subscription.token_id,"attached_to_id":None::<String>,
                     "message_name":subscription.message_name,
                     "correlation_key":subscription.correlation_key,
                     "error_code":subscription.error_code,"race_id":subscription.race_id,
-                    "kind":subscription.kind})),
+                    "kind":if subscription.kind == ProcessSubscriptionKind::ReceiveTask { serde_json::json!("receive_task") } else { serde_json::json!(subscription.kind) }})),
             _ => bail!("termination subscription arm references another pinned node"),
         };
         ensure!(event.kind == kind && event.data == expected,
@@ -9439,14 +9478,92 @@ fn validate_script_actions_on(
 ) -> Result<()> {
     let mut sources = HashSet::new();
     for (index, event) in plan.events.iter().enumerate() {
-        if !matches!(event.kind.as_str(), "script_completed" | "incident") { continue; }
+        if !matches!(event.kind.as_str(), "script_completed" | "send_task_admitted" | "incident") { continue; }
         let Some(node_id) = event.node_id.as_deref() else {
-            ensure!(event.kind != "script_completed", "Script completion has no pinned node");
+            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"),
+                "immediate activity completion has no pinned node");
             continue;
         };
         let node = scope_node(model, scopes, instance_id, &event.scope_id, node_id)?;
+        if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
+            let source_id = plan.event_sources.get(&index)
+                .context("Send action has no exact ready-token source")?;
+            ensure!(sources.insert(source_id.clone())
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                "Send action did not consume one unique ready activation");
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            ensure!(source.status == "ready" && source.scope_id == event.scope_id
+                && source.node_id == node.id
+                && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                    plan, source_id, expected_revision, entry, false)?,
+                "Send action is outside its authenticated entry lineage");
+            let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                VariableEffect::Mapped { event_index, .. }
+                | VariableEffect::ScopeEntry { event_index, .. }
+                | VariableEffect::RepetitionAggregate { event_index, .. }
+                | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < index,
+            }).count();
+            let locals = variable_states.get(effect_count)
+                .context("Send source-time variables are missing")?;
+            let effective = effective_scope_variables(scopes, locals, instance_id,
+                locals.get(instance_id).context("Send root variables are missing")?, &source.scope_id)?;
+            let path = scope_path(scopes, instance_id, &source.scope_id)?;
+            let (_, flows, _) = super::model::scope_body(model, &path)?;
+            let outgoing = flows.iter().filter(|flow| flow.source_id == node.id).collect::<Vec<_>>();
+            let children = plan.create_tokens.iter().filter(|token|
+                plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
+            ensure!(outgoing.len() == 1, "SendTask has no pinned single successor");
+            let prepared = super::messages::prepare_throw(model, node, &effective);
+            if event.kind == "send_task_admitted" {
+                let expected = prepared.context("Send admission has no valid pinned message")?;
+                let rows = plan.create_messages.iter().filter(|message|
+                    message.source_event_index == index
+                        && message.source_scope_id == event.scope_id
+                        && message.source_node_id == node.id
+                        && message.source_activation_id == *source_id).collect::<Vec<_>>();
+                ensure!(rows.len() == 1
+                    && rows[0].message.target == expected.target
+                    && rows[0].message.message_name == expected.message_name
+                    && rows[0].message.correlation_key == expected.correlation_key
+                    && rows[0].message.payload == expected.payload
+                    && rows[0].message.ttl_seconds == expected.ttl_seconds
+                    && event.data == serde_json::json!({
+                        "message_id":rows[0].message.message_id,
+                        "source_activation_id":source_id,
+                        "target":rows[0].message.target,
+                        "message_name":rows[0].message.message_name,
+                        "correlation_key":rows[0].message.correlation_key})
+                    && children.len() == 1 && children[0].status == "ready"
+                    && children[0].scope_id == source.scope_id
+                    && children[0].node_id == outgoing[0].target_id
+                    && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
+                    && children[0].fork_stack == source.fork_stack
+                    && plan.event_sources.iter().all(|(child_index, child_source)|
+                        child_source != &children[0].token_id || *child_index > index),
+                    "Send admission differs from its pinned message or single successor");
+            } else {
+                let error = prepared.err().context("Send incident has a valid pinned message")?;
+                let message = bounded_failure_message(&error.to_string());
+                ensure!(event.kind == "incident"
+                    && event.data == serde_json::json!({
+                        "code":"MESSAGE_EXPRESSION_ERROR","message":message})
+                    && plan.add_incidents.iter().filter(|incident|
+                        incident.scope_id == event.scope_id
+                            && incident.node_id.as_deref() == Some(node_id)
+                            && incident.code == "MESSAGE_EXPRESSION_ERROR"
+                            && incident.message == message).count() == 1
+                    && children.len() == 1 && children[0].status == "waiting"
+                    && children[0].scope_id == source.scope_id
+                    && children[0].node_id == source.node_id
+                    && children[0].arrival_edge_id == source.arrival_edge_id
+                    && children[0].fork_stack == source.fork_stack,
+                    "Send failure differs from its pinned expression and parked wait");
+            }
+            continue;
+        }
         let ProcessNodeKind::ScriptTask { script, output_mapping } = &node.kind else {
-            ensure!(event.kind != "script_completed", "Script completion named a non-Script node");
+            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"),
+                "immediate completion named another pinned node");
             continue;
         };
         let source_id = plan.event_sources.get(&index)
@@ -9532,7 +9649,83 @@ fn validate_script_actions_on(
     for source_id in plan.consume_token_ids.iter().chain(plan.token_sources.values()) {
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
         let node = scope_node(model, scopes, instance_id, &source.scope_id, &source.node_id)?;
-        if source.status == "ready" && matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+        if source.status == "ready" {
+            if let ProcessNodeKind::ReceiveTask { correlation_expression, .. } = &node.kind {
+                let waits = plan.create_tokens.iter().filter(|token|
+                    plan.token_sources.get(&token.token_id) == Some(source_id)
+                        && token.status == "waiting" && token.scope_id == source.scope_id
+                        && token.node_id == source.node_id
+                        && token.arrival_edge_id == source.arrival_edge_id
+                        && token.fork_stack == source.fork_stack).collect::<Vec<_>>();
+                ensure!(waits.len() == 1
+                    && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
+                    && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                        plan, source_id, expected_revision, entry, false)?,
+                    "ReceiveTask lacks one authenticated ready-to-waiting activation");
+                let subscriptions = plan.create_subscriptions.iter().filter(|subscription|
+                    subscription.kind == ProcessSubscriptionKind::ReceiveTask
+                        && subscription.scope_id == source.scope_id
+                        && subscription.node_id == source.node_id
+                        && subscription.token_id == waits[0].token_id).collect::<Vec<_>>();
+                ensure!(subscriptions.len() == 1 && subscriptions[0].race_id.is_none()
+                    && subscriptions[0].error_code.is_none()
+                    && subscriptions[0].escalation_code.is_none(),
+                    "ReceiveTask wait lacks its sole pinned subscription");
+                let arm = plan.events.iter().enumerate().filter(|(_, event)|
+                    event.kind == "receive_task_opened"
+                        && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(node.id.as_str())
+                        && event.data["subscription_id"].as_str()
+                            == Some(subscriptions[0].subscription_id.as_str()))
+                    .collect::<Vec<_>>();
+                let error = plan.events.iter().enumerate().filter(|(_, event)|
+                    event.kind == "message_error"
+                        && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(node.id.as_str())
+                        && event.data["subscription_id"].as_str()
+                            == Some(subscriptions[0].subscription_id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(arm.len() + error.len() == 1,
+                    "ReceiveTask wait has no unique factual arm or error");
+                let index = arm.first().or_else(|| error.first())
+                    .context("ReceiveTask arm index missing")?.0;
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. }
+                    | VariableEffect::RepetitionAggregate { event_index, .. }
+                    | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < index,
+                }).count();
+                let locals = variable_states.get(effect_count)
+                    .context("ReceiveTask source-time variables are missing")?;
+                let effective = effective_scope_variables(scopes, locals, instance_id,
+                    locals.get(instance_id).context("ReceiveTask root variables are missing")?,
+                    &source.scope_id)?;
+                let expected = super::messages::evaluate_key(correlation_expression, &effective);
+                match expected {
+                    Ok(key) => ensure!(arm.len() == 1
+                        && subscriptions[0].status == ProcessSubscriptionStatus::Open
+                        && subscriptions[0].correlation_key.as_deref() == Some(key.as_str())
+                        && arm[0].1.data == serde_json::json!({
+                            "subscription_id":subscriptions[0].subscription_id,
+                            "token_id":waits[0].token_id,
+                            "attached_to_id":None::<String>,
+                            "message_name":subscriptions[0].message_name,
+                            "correlation_key":subscriptions[0].correlation_key,
+                            "error_code":None::<String>,
+                            "race_id":None::<String>,
+                            "kind":"receive_task"}),
+                        "ReceiveTask correlation differs from its pinned entry variables"),
+                    Err(failure) => ensure!(error.len() == 1
+                        && subscriptions[0].status == ProcessSubscriptionStatus::Error
+                        && subscriptions[0].correlation_key.is_none()
+                        && subscriptions[0].last_reason.as_deref()
+                            == Some(timer_reason(&format!("{failure:#}"))?.as_str()),
+                        "ReceiveTask error differs from its pinned correlation failure"),
+                }
+            }
+        }
+        if source.status == "ready" && matches!(&node.kind,
+            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }) {
             ensure!(sources.contains(source_id)
                 && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
                 "Script consumed or continued without one authenticated action fact");
@@ -9541,7 +9734,8 @@ fn validate_script_actions_on(
     for incident in &plan.add_incidents {
         let Some(node_id) = incident.node_id.as_deref() else { continue; };
         let node = scope_node(model, scopes, instance_id, &incident.scope_id, node_id)?;
-        if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+        if matches!(&node.kind,
+            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }) {
             let events = plan.events.iter().filter(|event|
                 event.kind == "incident" && event.scope_id == incident.scope_id
                     && event.node_id.as_deref() == Some(node_id)
@@ -9575,19 +9769,23 @@ fn validate_termination_plan_on(
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
         if source.status == "ready" && scope_node(model, scopes, instance_id,
             &source.scope_id, &source.node_id)
-            .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })) {
+            .is_ok_and(|node| matches!(&node.kind,
+                ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. })) {
             has_script = true;
             break;
         }
     }
-    has_script |= plan.events.iter().any(|event| event.kind == "script_completed"
+    has_script |= plan.events.iter().any(|event| matches!(event.kind.as_str(),
+            "script_completed" | "send_task_admitted")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
-                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
+                .is_ok_and(|node| matches!(&node.kind,
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }))));
     has_script |= plan.add_incidents.iter().any(|incident|
         incident.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &incident.scope_id, node_id)
-                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
+                .is_ok_and(|node| matches!(&node.kind,
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }))));
     has_script |= plan.variable_effects.iter().any(|effect| matches!(effect,
         VariableEffect::Mapped { scope_id, node_id, .. }
             if scope_node(model, scopes, instance_id, scope_id, node_id)
@@ -9598,9 +9796,24 @@ fn validate_termination_plan_on(
             "manual_task_opened" | "manual_task_acknowledged"))
         || plan.create_user_tasks.iter().any(|task|
             task.kind == ProcessUserTaskKind::Manual);
+    let has_receive = matches!(entry,
+        EntryAuthority::Accepted(AcceptedInputRef::Message {
+            target_subscription_id: Some(_), .. }))
+        && plan.events.iter().any(|event| event.kind == "receive_task_completed")
+        || plan.create_subscriptions.iter().any(|subscription|
+            subscription.kind == ProcessSubscriptionKind::ReceiveTask)
+        || plan.events.iter().any(|event|
+            matches!(event.kind.as_str(), "receive_task_opened" | "receive_task_completed"));
+    let has_receive = has_receive || plan.consume_token_ids.iter()
+        .chain(plan.token_sources.values()).any(|source_id|
+            termination_token_on(tx, instance_id, plan, source_id).is_ok_and(|source|
+                source.status == "ready" && scope_node(model, scopes, instance_id,
+                    &source.scope_id, &source.node_id).is_ok_and(|node|
+                        matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }))));
     let replay_variables = !plan.termination_attempts.is_empty()
         || has_script
         || has_manual
+        || has_receive
         || plan.variable_effects.iter().any(|effect|
             matches!(effect, VariableEffect::RepetitionEntry { .. }
                 | VariableEffect::RepetitionAggregate { .. }))
@@ -9629,7 +9842,7 @@ fn validate_termination_plan_on(
         }
         validate_termination_variables_on(tx, instance_id, model, &mapping_scopes, plan, call_source, entry)?
     };
-    if has_script || has_manual {
+    if has_script || has_manual || has_receive {
         validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
             expected_revision, plan, &variable_states, entry)?;
         if plan.termination_attempts.is_empty() {
@@ -9640,7 +9853,7 @@ fn validate_termination_plan_on(
             }
         }
     }
-    if !plan.termination_attempts.is_empty() || has_script || has_manual {
+    if !plan.termination_attempts.is_empty() || has_script || has_manual || has_receive {
         validate_termination_action_provenance_on(tx, instance_id, model,
             &mapping_scopes, plan, &variable_states, call_source, entry, actor_id)?;
     }
@@ -12161,7 +12374,7 @@ fn apply_plan_on(
             .get(message.source_event_index)
             .context("outbox event index is absent")?;
         ensure!(
-            event.kind == "message_queued"
+            matches!(event.kind.as_str(), "message_queued" | "send_task_admitted")
                 && event.scope_id == message.source_scope_id
                 && event.node_id.as_deref() == Some(message.source_node_id.as_str())
                 && event.data["message_id"].as_str() == Some(message.message.message_id.as_str())
@@ -14232,11 +14445,13 @@ fn validate_escalation_successor_on(
                             && timer.token_id.as_deref() == Some(token.token_id.as_str())
                             && timer.kind == ProcessTimerKind::Catch
                             && matches!(&timer.status, ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked)).count(),
-                    ProcessNodeKind::MessageCatch { .. } => plan.create_subscriptions.iter()
+                    ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } => plan.create_subscriptions.iter()
                         .filter(|subscription| subscription.scope_id == scope_id
                             && subscription.node_id == target.id
                             && subscription.token_id == token.token_id
-                            && subscription.kind == ProcessSubscriptionKind::MessageCatch
+                            && subscription.kind == (if matches!(&target.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                                ProcessSubscriptionKind::ReceiveTask
+                            } else { ProcessSubscriptionKind::MessageCatch })
                             && subscription.status == ProcessSubscriptionStatus::Open).count(),
                     _ => 0,
                 };
@@ -14272,7 +14487,8 @@ fn validate_escalation_successor_on(
     }
     let durable_target = matches!(&target.kind,
         ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
-            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. });
+            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+            | ProcessNodeKind::ReceiveTask { .. });
     let join_target = expected_stack.last()
         .is_some_and(|frame| frame.join_node_id.as_deref() == Some(target.id.as_str()));
     ensure!(waiting == usize::from(durable_target) && joining == usize::from(join_target),
@@ -14591,7 +14807,8 @@ fn validate_escalation_provenance_on(
         let outgoing = flows.iter().filter(|edge| edge.source_id == node.id).collect::<Vec<_>>();
         match &node.kind {
             ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
-            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. } => {}
+            | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
+            | ProcessNodeKind::ReceiveTask { .. } => {}
             ProcessNodeKind::ExclusiveGateway { .. } => {
                 let selected = plan.events.iter().filter(|event|
                     event.kind == "exclusive_selected" && event.scope_id == scope_id
@@ -14687,7 +14904,7 @@ fn validate_escalation_provenance_on(
                     trace_edge(&node.id, &outgoing[0].id, outer, &mut traced, &mut frontier)?;
                 }
             }
-            ProcessNodeKind::MessageThrow { .. } => {
+            ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
                 let messages = plan.create_messages.iter().filter(|message|
                     message.source_scope_id == scope_id && message.source_node_id == node.id
                         && message.source_activation_id == token.token_id).collect::<Vec<_>>();
@@ -14699,7 +14916,9 @@ fn validate_escalation_provenance_on(
                     "escalation queued message differs from its pinned expression inputs");
                 let message = &messages[0].message;
                 expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
-                    kind: "message_queued".into(), node_id: Some(node.id.clone()),
+                    kind: if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
+                        "send_task_admitted" } else { "message_queued" }.into(),
+                    node_id: Some(node.id.clone()),
                     data: serde_json::json!({"message_id":message.message_id,
                         "source_activation_id":token.token_id,"target":message.target,
                         "message_name":message.message_name,"correlation_key":message.correlation_key}) });
@@ -14855,7 +15074,8 @@ fn validate_escalation_provenance_on(
             && plan.create_tokens.iter().any(|token| token.token_id == subscription.token_id
                 && nodes.iter().any(|node| node.id == subscription.node_id
                     && match (&subscription.kind, &node.kind) {
-                        (ProcessSubscriptionKind::MessageCatch, ProcessNodeKind::MessageCatch { .. }) =>
+                        (ProcessSubscriptionKind::MessageCatch, ProcessNodeKind::MessageCatch { .. })
+                        | (ProcessSubscriptionKind::ReceiveTask, ProcessNodeKind::ReceiveTask { .. }) =>
                             token.node_id == node.id,
                         (ProcessSubscriptionKind::BoundaryMessage,
                             ProcessNodeKind::BoundaryMessage { attached_to_id, .. })
@@ -14875,6 +15095,7 @@ fn validate_escalation_provenance_on(
             .context("escalation subscription node is outside its pinned body")?;
         let correlation = match &node.kind {
             ProcessNodeKind::MessageCatch { correlation_expression, .. }
+            | ProcessNodeKind::ReceiveTask { correlation_expression, .. }
             | ProcessNodeKind::BoundaryMessage { correlation_expression, .. } =>
                 Some(correlation_expression.as_str()),
             _ => None,
@@ -14897,13 +15118,14 @@ fn validate_escalation_provenance_on(
                     "attached_token_id":subscription.token_id,"attached_to_id":attached_to_id,
                     "escalation_code":subscription.escalation_code,"cancel_activity":cancel_activity})),
             _ => (if subscription.kind == ProcessSubscriptionKind::BoundaryError {
-                "error_boundary_armed" } else { "message_armed" },
+                "error_boundary_armed" } else if subscription.kind == ProcessSubscriptionKind::ReceiveTask {
+                "receive_task_opened" } else { "message_armed" },
                 serde_json::json!({"subscription_id":subscription.subscription_id,
                     "token_id":subscription.token_id,"attached_to_id":attached_to_id,
                     "message_name":subscription.message_name,
                     "correlation_key":subscription.correlation_key,
                     "error_code":subscription.error_code,"race_id":subscription.race_id,
-                    "kind":subscription.kind})),
+                    "kind":if subscription.kind == ProcessSubscriptionKind::ReceiveTask { serde_json::json!("receive_task") } else { serde_json::json!(subscription.kind) }})),
         };
         expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
             kind: kind.into(), node_id: Some(subscription.node_id.clone()), data });
@@ -14939,7 +15161,8 @@ fn validate_escalation_provenance_on(
             && plan.create_tokens.iter().any(|token| token.token_id == message.source_activation_id
                 && token.node_id == message.source_node_id
                 && nodes.iter().any(|node| node.id == token.node_id
-                    && matches!(&node.kind, ProcessNodeKind::MessageThrow { .. })))),
+                    && matches!(&node.kind, ProcessNodeKind::MessageThrow { .. }
+                        | ProcessNodeKind::SendTask { .. })))),
         "escalation plan queued a message outside its traced prefix");
     ensure!(plan.add_gateway_receipts.iter().all(|receipt|
         traced.contains(&receipt.token_id)
@@ -16225,6 +16448,7 @@ pub fn fail_job(
 fn subscription_kind_text(kind: &ProcessSubscriptionKind) -> &'static str {
     match kind {
         ProcessSubscriptionKind::MessageCatch => "message_catch",
+        ProcessSubscriptionKind::ReceiveTask => "receive_task",
         ProcessSubscriptionKind::BoundaryMessage => "boundary_message",
         ProcessSubscriptionKind::BoundaryError => "boundary_error",
         ProcessSubscriptionKind::BoundaryEscalation => "boundary_escalation",
@@ -16233,6 +16457,7 @@ fn subscription_kind_text(kind: &ProcessSubscriptionKind) -> &'static str {
 fn subscription_kind(value: &str) -> Result<ProcessSubscriptionKind> {
     match value {
         "message_catch" => Ok(ProcessSubscriptionKind::MessageCatch),
+        "receive_task" => Ok(ProcessSubscriptionKind::ReceiveTask),
         "boundary_message" => Ok(ProcessSubscriptionKind::BoundaryMessage),
         "boundary_error" => Ok(ProcessSubscriptionKind::BoundaryError),
         "boundary_escalation" => Ok(ProcessSubscriptionKind::BoundaryEscalation),
@@ -16347,6 +16572,10 @@ fn subscription_activation<'a>(
         (
             ProcessSubscriptionKind::MessageCatch,
             ProcessNodeKind::MessageCatch { message_ref, .. },
+        ) => (node.id.as_str(), Some(message_ref), None, None),
+        (
+            ProcessSubscriptionKind::ReceiveTask,
+            ProcessNodeKind::ReceiveTask { message_ref, .. },
         ) => (node.id.as_str(), Some(message_ref), None, None),
         (
             ProcessSubscriptionKind::BoundaryMessage,
@@ -17229,13 +17458,12 @@ fn require_message_source_on(
         return Err(MessageClosed::Source.into());
     }
     let node = scoped_node_on(conn, instance_id, scope_id, &model, node_id)?;
-    let ProcessNodeKind::MessageThrow {
-        message_ref,
-        target: declared_target,
-        ..
-    } = &node.kind
-    else {
-        bail!("message source is not its pinned Throw node");
+    let (message_ref, declared_target, expected_event_kind) = match &node.kind {
+        ProcessNodeKind::MessageThrow { message_ref, target, .. } =>
+            (message_ref, target, "message_queued"),
+        ProcessNodeKind::SendTask { message_ref, target, .. } =>
+            (message_ref, target, "send_task_admitted"),
+        _ => bail!("message source is not its pinned producing node"),
     };
     let declared_name = model
         .messages
@@ -17279,7 +17507,7 @@ fn require_message_source_on(
         .context("message source event is missing")?;
     let data: Value = parse(data)?;
     ensure!(
-        kind == "message_queued"
+        kind == expected_event_kind
             && event_node.as_deref() == Some(node_id)
             && data["message_id"].as_str() == Some(message_id)
             && data["source_activation_id"].as_str() == Some(activation_id)
@@ -17620,26 +17848,39 @@ fn message_selection_on(conn: &Connection, c: &MessageCandidate) -> Result<Messa
             );
         }
     }
-    let mut q=conn.prepare("SELECT s.subscription_id FROM bpmn_event_subscriptions s JOIN bpmn_tokens t ON t.token_id=s.token_id AND t.instance_id=s.instance_id AND t.status='waiting' JOIN bpmn_instances i ON i.instance_id=s.instance_id AND i.status NOT IN ('completed','cancelled','error') LEFT JOIN bpmn_event_races r ON r.race_id=s.race_id WHERE s.org_id=?1 AND s.definition_id=?2 AND s.kind IN ('message_catch','boundary_message') AND s.message_name=?3 AND s.correlation_key=?4 AND s.status='open' AND (s.race_id IS NULL OR r.status='open') AND (?5 IS NULL OR s.instance_id=?5) AND (?6 IS NULL OR s.subscription_id=?6) ORDER BY s.subscription_id LIMIT 2")?;
-    let ids = q
-        .query_map(
-            params![
-                m.key.org_id,
-                definition_id,
-                m.message_name,
-                m.correlation_key,
-                exact_instance,
-                exact_subscription
-            ],
-            |r| r.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut eligible = Vec::new();
-    for id in ids {
-        let s = subscription_on(conn, &id)?;
-        if subscription_live_on(conn, &s)? {
-            eligible.push(s);
+    let mut cursor = String::new();
+    loop {
+        let mut q=conn.prepare("SELECT s.subscription_id FROM bpmn_event_subscriptions s JOIN bpmn_tokens t ON t.token_id=s.token_id AND t.instance_id=s.instance_id AND t.status='waiting' JOIN bpmn_instances i ON i.instance_id=s.instance_id AND i.status NOT IN ('completed','cancelled','error') LEFT JOIN bpmn_event_races r ON r.race_id=s.race_id WHERE s.org_id=?1 AND s.definition_id=?2 AND s.kind IN ('message_catch','boundary_message','receive_task') AND s.message_name=?3 AND s.correlation_key=?4 AND s.status='open' AND (s.race_id IS NULL OR r.status='open') AND (?5 IS NULL OR s.instance_id=?5) AND (?6 IS NULL OR s.subscription_id=?6) AND s.subscription_id>?7 ORDER BY s.subscription_id LIMIT 64")?;
+        let ids = q.query_map(params![m.key.org_id,definition_id,m.message_name,m.correlation_key,
+            exact_instance,exact_subscription,cursor], |r| r.get::<_,String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ids.is_empty() { break; }
+        let page_len = ids.len();
+        cursor = ids.last().context("subscription page has no cursor")?.clone();
+        for id in ids {
+            let s = subscription_on(conn, &id)?;
+            if subscription_live_on(conn, &s)? {
+                let recipient: String = conn.query_row(
+                    "SELECT initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+                    [&s.instance_id], |row| row.get(0))?;
+                let recipient_actor = ProcessActor {
+                    org_id: m.key.org_id.clone(), user_id: recipient,
+                };
+                let authority = require_instance_reader(conn, &recipient_actor, &s.instance_id)
+                    .and_then(|_| require_call_control_authority_on(conn, &recipient_actor,
+                    &s.instance_id)).and_then(|()| require_version_execution_on(conn,
+                        &recipient_actor, &s.definition_id, s.version));
+                match authority {
+                    Ok(()) => {},
+                    Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => continue,
+                    Err(error) => return Err(error),
+                }
+                eligible.push(s);
+                if eligible.len() == 2 { break; }
+            }
         }
+        if eligible.len() == 2 || page_len < 64 { break; }
     }
     if eligible.is_empty() {
         if exact_subscription.is_some() {
@@ -18248,6 +18489,7 @@ pub fn deliver_message(
             }
             ensure!(
                 (subscription.kind == ProcessSubscriptionKind::MessageCatch
+                    || subscription.kind == ProcessSubscriptionKind::ReceiveTask
                     || subscription.kind == ProcessSubscriptionKind::BoundaryMessage)
                     && delivered[0].node_id.as_deref() == Some(subscription.node_id.as_str())
                     && delivered[0].data["subscription_id"].as_str()
@@ -18263,6 +18505,32 @@ pub fn deliver_message(
                         && u.status == ProcessSubscriptionStatus::Consumed),
                 "message plan does not consume its exact subscription"
             );
+            let completion_facts = plan.events.iter().enumerate().filter(|(_, event)|
+                event.kind == "receive_task_completed").collect::<Vec<_>>();
+            if subscription.kind == ProcessSubscriptionKind::ReceiveTask {
+                let delivery_index = plan.events.iter().position(|event|
+                    event.kind == "message_delivered"
+                        && event.data["subscription_id"].as_str()
+                            == Some(subscription.subscription_id.as_str()))
+                    .context("receive task has no exact delivered message")?;
+                ensure!(completion_facts.len() == 1
+                    && completion_facts[0].0 > delivery_index
+                    && completion_facts[0].1.scope_id == subscription.scope_id
+                    && completion_facts[0].1.node_id.as_deref()
+                        == Some(subscription.node_id.as_str())
+                    && completion_facts[0].1.data == serde_json::json!({
+                        "subscription_id":subscription.subscription_id,
+                        "attached_token_id":subscription.token_id,
+                        "message_id":fresh.message.key.message_id}),
+                    "receive task completion differs from its factual message delivery");
+                ensure!(plan.event_sources.iter().all(|(index, source)|
+                    *index > completion_facts[0].0 || !plan.token_sources.iter().any(|(child, parent)|
+                        child == source && parent == &subscription.token_id)),
+                    "receive task continuation precedes its factual completion");
+            } else {
+                ensure!(completion_facts.is_empty(),
+                    "non-receive message created a receive task completion");
+            }
             if subscription.kind == ProcessSubscriptionKind::BoundaryMessage {
                 validate_boundary_plan_on(
                     &tx,

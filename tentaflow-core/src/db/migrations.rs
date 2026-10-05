@@ -1151,6 +1151,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_manual_task_acknowledgments",
             MigrationStep::RustSelfManaged(bpmn_manual_task_acknowledgments),
         ),
+        (
+            191,
+            "bpmn_send_receive_task_subscriptions",
+            MigrationStep::RustSelfManaged(bpmn_send_receive_task_subscriptions),
+        ),
     ]
 }
 
@@ -2393,6 +2398,91 @@ fn process_activity_repetition(conn: &rusqlite::Connection) -> anyhow::Result<()
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     anyhow::ensure!(integrity == "ok", "repetition migration integrity: {integrity}");
     Ok(())
+}
+
+const BPMN_SEND_RECEIVE_TASK_SUBSCRIPTIONS: &str = r#"
+CREATE TABLE bpmn_event_subscriptions_191 (
+    subscription_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    kind TEXT NOT NULL CHECK(kind IN ('message_catch','boundary_message','boundary_error','boundary_escalation','receive_task')),
+    message_name TEXT,
+    correlation_key TEXT,
+    error_code TEXT,
+    escalation_code TEXT,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','consumed','cancelled','error')),
+    last_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    UNIQUE(instance_id,node_id,token_id),
+    CHECK(
+        (kind='boundary_error' AND message_name IS NULL AND correlation_key IS NULL AND race_id IS NULL AND escalation_code IS NULL)
+        OR (kind='boundary_escalation' AND message_name IS NULL AND correlation_key IS NULL AND error_code IS NULL AND race_id IS NULL
+            AND (escalation_code IS NULL OR (typeof(escalation_code)='text' AND length(CAST(escalation_code AS BLOB)) BETWEEN 1 AND 64 AND escalation_code NOT GLOB '*[^A-Za-z0-9_.:-]*')))
+        OR (kind IN ('message_catch','boundary_message','receive_task') AND error_code IS NULL AND escalation_code IS NULL
+            AND ((status='error' AND correlation_key IS NULL) OR (message_name IS NOT NULL AND length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256 AND correlation_key IS NOT NULL AND length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256)))
+    ),
+    CHECK(kind='message_catch' OR race_id IS NULL),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,subscription_id),
+    FOREIGN KEY(instance_id,scope_id,race_id) REFERENCES bpmn_event_races(instance_id,scope_id,race_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_event_subscriptions_191(subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms)
+SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions;
+"#;
+
+const BPMN_SEND_RECEIVE_TASK_SUBSCRIPTIONS_SWAP: &str = r#"
+DROP TABLE bpmn_event_subscriptions;
+ALTER TABLE bpmn_event_subscriptions_191 RENAME TO bpmn_event_subscriptions;
+CREATE INDEX idx_bpmn_subscriptions_match ON bpmn_event_subscriptions(org_id,definition_id,message_name,correlation_key,status,instance_id,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_instance ON bpmn_event_subscriptions(instance_id,status,created_at_ms,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_race ON bpmn_event_subscriptions(race_id);
+CREATE UNIQUE INDEX uq_bpmn_escalation_exact_open ON bpmn_event_subscriptions(instance_id,scope_id,token_id,escalation_code) WHERE kind='boundary_escalation' AND status='open' AND escalation_code IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_escalation_catchall_open ON bpmn_event_subscriptions(instance_id,scope_id,token_id) WHERE kind='boundary_escalation' AND status='open' AND escalation_code IS NULL;
+"#;
+
+fn bpmn_send_receive_task_subscriptions(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let original_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        let old_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_event_subscriptions", [], |row| row.get(0))?;
+        tx.execute_batch(BPMN_SEND_RECEIVE_TASK_SUBSCRIPTIONS)?;
+        let new_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_event_subscriptions_191", [], |row| row.get(0))?;
+        anyhow::ensure!(old_count == new_count, "send/receive migration changed subscription count");
+        let changed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions EXCEPT SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions_191)",
+            [], |row| row.get(0))?;
+        anyhow::ensure!(changed == 0, "send/receive migration changed an existing subscription row");
+        tx.execute_batch(BPMN_SEND_RECEIVE_TASK_SUBSCRIPTIONS_SWAP)?;
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(violations.is_empty(), "send/receive migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "send/receive migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations (version,name) VALUES (?1,?2)", rusqlite::params![version,name])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if original_fk == 0 { "PRAGMA foreign_keys = OFF;" } else { "PRAGMA foreign_keys = ON;" };
+    let restored = conn.execute_batch(restore).and_then(|()| conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)));
+    match (result, restored) {
+        (Ok(()), Ok(mode)) if mode == original_fk => Ok(()),
+        (Ok(()), Ok(_)) => anyhow::bail!("send/receive migration could not restore foreign key mode"),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Ok(mode)) if mode == original_fk => Err(error),
+        (Err(error), Ok(_)) => Err(error.context("send/receive migration could not restore foreign key mode")),
+        (Err(error), Err(restore)) => Err(error.context(format!("send/receive migration could not restore foreign key mode: {restore}"))),
+    }
 }
 
 const BPMN_MANUAL_TASK_ACKNOWLEDGMENTS: &str = r#"
@@ -16255,7 +16345,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 190);
+        assert_eq!(version, 191);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -16282,7 +16372,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 190);
+        assert_eq!(version, 191);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -16386,7 +16476,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 190);
+        assert_eq!(version, 191);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(
@@ -16491,7 +16581,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            190
+            191
         );
         assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
         let receipt: (String, String, String) = conn
@@ -16880,7 +16970,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            190
+            191
         );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(
@@ -16921,6 +17011,55 @@ mod tests {
     }
 
     #[test]
+    fn send_receive_migration_preserves_populated_subscriptions_and_foreign_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("send-receive-upgrade.db")).unwrap();
+        escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 190);
+        let old: (String, String, String, String) = conn.query_row(
+            "SELECT subscription_id,token_id,kind,COALESCE(escalation_code,'') FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        let old_events: (String, String) = conn.query_row(
+            "SELECT v.model_json,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='escalation-instance' WHERE v.definition_id='escalation-legacy' LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        run(&conn).unwrap();
+        let new: (String, String, String, String) = conn.query_row(
+            "SELECT subscription_id,token_id,kind,COALESCE(escalation_code,'') FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(new, old);
+        let new_events: (String, String) = conn.query_row(
+            "SELECT v.model_json,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='escalation-instance' WHERE v.definition_id='escalation-legacy' LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(new_events, old_events);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 191);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn send_receive_migration_rolls_back_invalid_legacy_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("send-receive-corrupt.db")).unwrap();
+        escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 190);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE bpmn_event_subscriptions SET token_id='missing-token' WHERE subscription_id='legacy-subscription'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 190);
+        assert_eq!(conn.query_row("SELECT token_id FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "missing-token");
+        assert!(!table_exists(&conn, "bpmn_event_subscriptions_191").unwrap());
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
     fn repetition_migration_adds_only_empty_scoped_tables_after_populated_legacy_facts() {
         let directory = tempfile::tempdir().unwrap();
         let conn = Connection::open(directory.path().join("repeat-upgrade.db")).unwrap();
@@ -16934,7 +17073,7 @@ mod tests {
         let old_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         run(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 190);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 191);
         let new_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(new_tables.len(), old_tables.len() + 2);
@@ -16987,7 +17126,7 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         run(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 190);
+            |row| row.get::<_,i64>(0)).unwrap(), 191);
         let after: (String,String,String) = conn.query_row(
             "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();

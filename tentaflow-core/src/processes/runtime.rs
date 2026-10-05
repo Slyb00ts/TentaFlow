@@ -2092,6 +2092,18 @@ impl<'a> Transition<'a> {
                     None,
                     None,
                 ),
+                ProcessNodeKind::ReceiveTask {
+                    message_ref,
+                    correlation_expression,
+                    ..
+                } => (
+                    K::ReceiveTask,
+                    Some(message_ref),
+                    Some(correlation_expression),
+                    None,
+                    None,
+                    None,
+                ),
                 ProcessNodeKind::BoundaryMessage {
                     attached_to_id,
                     message_ref,
@@ -2222,7 +2234,7 @@ impl<'a> Transition<'a> {
             };
             self.event("escalation_boundary_armed",Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":token_id,"attached_to_id":attachment,"escalation_code":s.escalation_code,"cancel_activity":cancel_activity}));
         } else {
-            self.event(if kind==K::BoundaryError{"error_boundary_armed"}else{"message_armed"},Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"token_id":token_id,"attached_to_id":attachment,"message_name":s.message_name,"correlation_key":s.correlation_key,"error_code":s.error_code,"race_id":s.race_id,"kind":kind}));
+            self.event(if kind==K::BoundaryError {"error_boundary_armed"} else if kind==K::ReceiveTask {"receive_task_opened"} else {"message_armed"},Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"token_id":token_id,"attached_to_id":attachment,"message_name":s.message_name,"correlation_key":s.correlation_key,"error_code":s.error_code,"race_id":s.race_id,"kind":if kind==K::ReceiveTask {json!("receive_task")} else {json!(kind)}}));
         }
         self.subscriptions.push(s.clone());
         self.plan.create_subscriptions.push(s);
@@ -2419,7 +2431,7 @@ impl<'a> Transition<'a> {
         let prepared = super::messages::prepare_throw(self.model, node, &self.effective()?)?;
         let event_index = self.plan.events.len();
         self.plan.event_sources.insert(event_index, token.token_id.clone());
-        self.event("message_queued",Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
+        self.event(if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {"send_task_admitted"} else {"message_queued"},Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
         self.plan
             .create_messages
             .push(super::repository::PlannedMessage {
@@ -2711,13 +2723,16 @@ impl<'a> Transition<'a> {
                     let token_id = self.wait(&token, "waiting");
                     self.arm_timer(&node, &token_id, ProcessTimerKind::Catch, &timer)?;
                 }
-                ProcessNodeKind::MessageCatch { .. } => {
+                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } => {
                     let waiting = self.wait(&token, "waiting");
                     self.arm_subscription(&node, &waiting, None)?;
                 }
-                ProcessNodeKind::MessageThrow { .. } => {
+                ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
                     if let Err(error) = self.throw_message(&node, &token) {
                         self.wait(&token, "waiting");
+                        if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
+                            self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                        }
                         self.incident(
                             &node.id,
                             None,
@@ -4330,7 +4345,8 @@ pub(super) fn plan_message_catch(
     transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();
     let (mapping, interrupt) = match &node.kind {
-        ProcessNodeKind::MessageCatch { output_mapping, .. } => (output_mapping, None),
+        ProcessNodeKind::MessageCatch { output_mapping, .. }
+        | ProcessNodeKind::ReceiveTask { output_mapping, .. } => (output_mapping, None),
         ProcessNodeKind::BoundaryMessage {
             output_mapping,
             cancel_activity,
@@ -4360,7 +4376,12 @@ pub(super) fn plan_message_catch(
         Some(false) => {}
         None => transition.consume(&token.token_id),
     }
-    transition.event("message_delivered",Some(node.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":metadata["message_id"],"message":metadata,"payload":payload}));
+    let message_id = metadata["message_id"].clone();
+    transition.event("message_delivered",Some(node.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":message_id,"message":metadata,"payload":payload}));
+    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+        transition.event("receive_task_completed", Some(node.id.clone()),
+            json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":message_id}));
+    }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
     }

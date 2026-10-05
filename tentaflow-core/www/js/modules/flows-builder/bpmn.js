@@ -20,6 +20,8 @@ const ELEMENTS = [
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['ScriptTask', 'script_task', 'code', 'tasks', 240, 96],
   ['ManualTask', 'manual_task', 'check', 'tasks', 240, 96],
+  ['SendTask', 'send_task', 'send', 'tasks', 240, 96],
+  ['ReceiveTask', 'receive_task', 'mail', 'tasks', 240, 96],
   ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
   ['CallActivity', 'call_activity', 'layers', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
@@ -56,6 +58,9 @@ export function processNodeConfig(kind) {
   if (kind === 'MessageCatch') return { messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'MessageThrow') return { messageRef: '', target: { Start: { definitionId: '' } },
     correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
+  if (kind === 'SendTask') return { messageRef: '', target: { Start: { definitionId: '' } },
+    correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
+  if (kind === 'ReceiveTask') return { messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'BoundaryMessage') return { attachedToId: '', cancelActivity: true,
     messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'BoundaryError') return { attachedToId: '', errorRef: null, outputMapping: {} };

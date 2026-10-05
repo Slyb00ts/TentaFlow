@@ -40,3 +40,7 @@ mod script_proof_tests;
 mod manual_tests;
 #[cfg(test)]
 mod manual_proof_tests;
+#[cfg(test)]
+mod send_receive_tests;
+#[cfg(test)]
+mod send_receive_proof_tests;

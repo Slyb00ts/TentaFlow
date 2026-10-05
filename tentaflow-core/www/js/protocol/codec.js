@@ -542,6 +542,23 @@ function processModel(model, nested = false) {
       fields = { message_ref: body.messageRef, target: processMessageTarget(body.target, true),
         correlation_expression: body.correlationExpression, payload_expression: body.payloadExpression,
         ttl_seconds: body.ttlSeconds };
+    } else if (tag === 'SendTask') {
+      processKnownFields(body, ['messageRef', 'target', 'correlationExpression', 'payloadExpression', 'ttlSeconds'], 'send task');
+      if (typeof body.messageRef !== 'string' || typeof body.correlationExpression !== 'string'
+        || typeof body.payloadExpression !== 'string' || !Number.isInteger(body.ttlSeconds)) {
+        throw new TypeError('send task requires a declaration, expressions and TTL');
+      }
+      fields = { message_ref: body.messageRef, target: processMessageTarget(body.target, true),
+        correlation_expression: body.correlationExpression, payload_expression: body.payloadExpression,
+        ttl_seconds: body.ttlSeconds };
+    } else if (tag === 'ReceiveTask') {
+      processKnownFields(body, ['messageRef', 'correlationExpression', 'outputMapping'], 'receive task');
+      if (typeof body.messageRef !== 'string' || typeof body.correlationExpression !== 'string'
+        || !body.outputMapping || typeof body.outputMapping !== 'object' || Array.isArray(body.outputMapping)) {
+        throw new TypeError('receive task requires a declaration, correlation and output mapping');
+      }
+      fields = { message_ref: body.messageRef, correlation_expression: body.correlationExpression,
+        output_mapping: body.outputMapping };
     } else if (tag === 'BoundaryMessage') {
       processKnownFields(body, ['attachedToId', 'cancelActivity', 'messageRef', 'correlationExpression', 'outputMapping'], 'boundary message');
       fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity,

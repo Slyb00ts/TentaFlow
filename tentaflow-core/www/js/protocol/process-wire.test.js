@@ -649,6 +649,31 @@ test('manual task uses a distinct acknowledgment request without work outputs', 
   assert.equal(detail.task.instructions, 'Inspect the external register.\nAcknowledge here.');
 });
 
+test('send and receive tasks keep distinct typed model fields', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [], variables: {},
+    diagram: { shapes: [], edges: [] } };
+  const nodes = [
+    { id: 'Send_1', name: 'Admit locally', kind: { SendTask: { messageRef: 'Message_1',
+      target: { Start: { definitionId: 'definition-1' } }, correlationExpression: 'vars.key',
+      payloadExpression: 'vars.payload', ttlSeconds: 60 } } },
+    { id: 'Receive_1', name: 'Wait for delivery', kind: { ReceiveTask: { messageRef: 'Message_1',
+      correlationExpression: 'vars.key', outputMapping: { received: 'outputs' } } } },
+  ];
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Message tasks', description: '', model: { ...base, nodes } });
+  assert.deepEqual(saved.model.nodes.map((node) => node.kind), nodes.map((node) => node.kind));
+  for (const kind of [
+    { SendTask: { ...nodes[0].kind.SendTask, unsupported: true } },
+    { ReceiveTask: { messageRef: 'Message_1', correlationExpression: 'vars.key' } },
+    { ReceiveTask: { ...nodes[1].kind.ReceiveTask, unsupported: true } },
+  ]) {
+    assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+      expectedRevision: 0, name: 'Message tasks', description: '',
+      model: { ...base, nodes: [{ id: 'Task_1', name: 'Invalid', kind }] } }),
+    /unsupported|requires|unknown/);
+  }
+});
+
 test('user task detail response preserves opaque output keys', { skip }, () => {
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     UserTaskGetResponse: { task: {

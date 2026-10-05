@@ -512,6 +512,11 @@ fn validate_draft_body<'a>(
                 output_mapping,
                 ..
             }
+            | ProcessNodeKind::ReceiveTask {
+                correlation_expression,
+                output_mapping,
+                ..
+            }
             | ProcessNodeKind::BoundaryMessage {
                 correlation_expression,
                 output_mapping,
@@ -525,6 +530,8 @@ fn validate_draft_body<'a>(
                 validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageThrow { target, correlation_expression, payload_expression,
+                ttl_seconds, .. }
+            | ProcessNodeKind::SendTask { target, correlation_expression, payload_expression,
                 ttl_seconds, .. } => {
                 validate_message_target(target, false)?;
                 validate_expression(correlation_expression, "message correlation expression", false)?;
@@ -731,13 +738,15 @@ fn validate_body<'a>(
                 validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageCatch { message_ref, correlation_expression, output_mapping }
+            | ProcessNodeKind::ReceiveTask { message_ref, correlation_expression, output_mapping }
             | ProcessNodeKind::BoundaryMessage { message_ref, correlation_expression, output_mapping, .. } => {
                 ensure!(message_ids.contains(message_ref.as_str()), "message event {} references an unknown declaration", node.id);
                 used_messages.insert(message_ref.as_str());
                 validate_expression(correlation_expression, "message correlation expression", true)?;
                 validate_mapping(output_mapping, false)?;
             }
-            ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
+            ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds }
+            | ProcessNodeKind::SendTask { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
                 ensure!(message_ids.contains(message_ref.as_str()), "message throw {} references an unknown declaration", node.id);
                 used_messages.insert(message_ref.as_str());
                 validate_message_target(target, true)?;
@@ -1257,8 +1266,10 @@ impl EscalationPrefixProof<'_> {
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. }
                 | ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::EventBasedGateway => Ok(false),
-                ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::ScriptTask { .. } => self.follow_one(node_id, stop_join),
+                ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. }
+                | ProcessNodeKind::ScriptTask { .. } => self.follow_one(node_id, stop_join),
                 ProcessNodeKind::ExclusiveGateway { .. } => {
                     let outgoing = self.outgoing.get(node_id).cloned().unwrap_or_default();
                     if outgoing.is_empty() && !self.complete {
@@ -2622,5 +2633,40 @@ mod tests {
             output_collection_variable: "results".into(),
         });
         assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
+    }
+
+    #[test]
+    fn send_and_receive_tasks_require_declared_messages_and_refuse_direct_repeat() {
+        let mut model = starter_model();
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.nodes.insert(1, ProcessNode { id: "Send_1".into(), name: "Admit locally".into(), repeat: None,
+            kind: ProcessNodeKind::SendTask { message_ref: "Message_1".into(),
+                target: ProcessMessageTargetSpec::Start { definition_id: uuid::Uuid::nil().to_string() },
+                correlation_expression: "vars.case_key".into(), payload_expression: "vars.payload".into(),
+                ttl_seconds: 60 } });
+        model.nodes.insert(2, ProcessNode { id: "Receive_1".into(), name: "Wait".into(), repeat: None,
+            kind: ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() } });
+        model.sequence_flows[0].target_id = "Send_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Send".into(),
+            source_id: "Send_1".into(), target_id: "Receive_1".into(), condition: None });
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Receive".into(),
+            source_id: "Receive_1".into(), target_id: "End_1".into(), condition: None });
+        model.variables.insert("case_key".into(), serde_json::Value::String("case-1".into()));
+        model.variables.insert("payload".into(), serde_json::json!({"opaque_key": 1}));
+        validate_model(&model).unwrap();
+        model.nodes[2].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
+        model.nodes[2].repeat = None;
+        if let ProcessNodeKind::SendTask { message_ref, .. } = &mut model.nodes[1].kind {
+            *message_ref = "Missing".into();
+        }
+        assert!(validate_model(&model).unwrap_err().to_string().contains("unknown declaration"));
     }
 }
