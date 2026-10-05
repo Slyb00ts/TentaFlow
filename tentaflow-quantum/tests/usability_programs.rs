@@ -72,16 +72,16 @@ c = measure q;
 }
 
 #[test]
-fn stabilizer_path_handles_a_hundred_qubit_ghz() {
-    let mut source = String::from("OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[100] q;\nbit[100] c;\nh q[0];\n");
-    source.push_str("for int i in [0:98] { cx q[i], q[i + 1]; }\nc = measure q;\n");
+fn stabilizer_path_handles_a_256_qubit_ghz() {
+    let mut source = String::from("OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[256] q;\nbit[256] c;\nh q[0];\n");
+    source.push_str("for int i in [0:254] { cx q[i], q[i + 1]; }\nc = measure q;\n");
     let circuit = parse(&source);
     assert!(circuit.is_clifford());
     let result = stabilizer::run(&circuit, &SimOptions::default(), 100, Cancel::none())
-        .expect("a Clifford circuit of a hundred qubits runs");
+        .expect("a Clifford circuit of 256 qubits runs");
     assert_eq!(result.counts.len(), 2, "GHZ never yields a mixed string");
-    assert!(result.counts.contains_key(&"0".repeat(100)));
-    assert!(result.counts.contains_key(&"1".repeat(100)));
+    assert!(result.counts.contains_key(&"0".repeat(256)));
+    assert!(result.counts.contains_key(&"1".repeat(256)));
 }
 
 #[test]
