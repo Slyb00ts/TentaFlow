@@ -25027,6 +25027,24 @@ pub fn encode_tentavm_inbox_snooze_request(request_json: String) -> Result<Vec<u
 }
 
 /// `nodeKind` empty and `operator` null both mean "leave this field alone": the
+}
+
+/// MessageBody::TentaQuantBody(ExampleListRequest) — the shipped examples in their fixed order.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleListRequest)]
+pub fn encode_tentaquant_example_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ExampleGetRequest) — one example with its README, circuit and reference outcome at a width.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleGetRequest)]
+pub fn encode_tentaquant_example_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ExampleForkRequest) — copies an example into a new private project of the caller's.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleForkRequest)]
+pub fn encode_tentaquant_example_fork_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleForkRequest", &request_json)
 /// dashboard sends only the control the administrator actually moved, and an
 /// unchanged field must not travel as an authority statement.
 #[wasm_bindgen(js_name = encodeMeshNodeProfileSetRequest)]

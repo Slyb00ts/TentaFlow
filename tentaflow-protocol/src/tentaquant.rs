@@ -820,6 +820,50 @@ pub struct KataRankingEntry {
     pub is_me: bool,
 }
 
+// ---- Examples (Przykłady, plan §12.1) ----
+
+/// One shipped example, as the gallery lists it. Counters that describe the
+/// circuit (`qubits`, `depth`) are measured from the parsed program, never
+/// typed into the example's manifest, so a card cannot disagree with what the
+/// fork will contain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExampleInfo {
+    pub example_id: String,
+    /// 1-based position in the shipped order.
+    pub position: u32,
+    /// Language code → title / one-paragraph description; every example
+    /// carries at least "pl" and "en".
+    pub titles: BTreeMap<String, String>,
+    pub descriptions: BTreeMap<String, String>,
+    /// "intro" | "core" | "advanced".
+    pub level: String,
+    pub tags: Vec<String>,
+    /// Register width the circuit below has. For a parametric example this is
+    /// the width that was asked for (or the default one in a listing).
+    pub qubits: u32,
+    /// Smallest and largest width the example can be built at; equal for a
+    /// fixed circuit.
+    pub qubits_min: u32,
+    pub qubits_max: u32,
+    pub qubits_default: u32,
+    /// Layers of the circuit when every gate is placed as early as its qubits
+    /// allow; measurements count as a layer.
+    pub depth: u32,
+}
+
+/// Shots, seed and tolerance an example's `expected.json` holds a run to, so
+/// the browser can say what "correct" looks like next to the histogram.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExampleExpected {
+    pub shots: u64,
+    pub seed: u64,
+    /// Largest total variation distance a correct run may have.
+    pub tolerance: f64,
+    /// Bitstring → ideal probability at the requested width. Any other
+    /// outcome is a wrong answer, not noise.
+    pub outcomes: BTreeMap<String, f64>,
+}
+
 /// TentaQuant message family (request + response). ciborium encodes variants
 /// external-tagged by variant NAME, so never rename a variant or a field
 /// without updating the frontend and the golden test (`tentaquant_wire_golden`).
@@ -1414,6 +1458,56 @@ pub enum TentaQuantPayload {
         #[serde(default)]
         me: Option<KataRankingEntry>,
     },
+
+    // ---- Examples ----
+    /// The shipped examples in their fixed order. No per-person state: an
+    /// example is a document, so the list is the same for everyone who may read
+    /// the laboratory.
+    ExampleListRequest {
+        instance_id: String,
+    },
+    ExampleListResponse {
+        instance_id: String,
+        examples: Vec<ExampleInfo>,
+    },
+    /// One example with its README and circuit. `qubits` picks the width of a
+    /// parametric example (absent = its default); a width outside the
+    /// example's range is a `BadRequest`, and so is a width on a fixed one.
+    ExampleGetRequest {
+        instance_id: String,
+        example_id: String,
+        #[serde(default)]
+        qubits: Option<u32>,
+    },
+    ExampleGetResponse {
+        instance_id: String,
+        example: ExampleInfo,
+        /// Language code → README (Markdown).
+        readme: BTreeMap<String, String>,
+        /// The canonical OpenQASM 3 circuit at the requested width.
+        qasm3: String,
+        expected: ExampleExpected,
+    },
+    /// Copies an example into the caller's laboratory as a new private
+    /// project holding one notebook (the README as a markdown cell, the
+    /// circuit as a circuit cell). `quant.run`, like creating any project.
+    ExampleForkRequest {
+        instance_id: String,
+        example_id: String,
+        #[serde(default)]
+        qubits: Option<u32>,
+        /// Language the project name, description and README are taken in;
+        /// "en" when the example has no text in it.
+        language: String,
+    },
+    ExampleForkResponse {
+        instance_id: String,
+        project: ProjectInfo,
+        notebook: NotebookInfo,
+        /// The circuit cell of the new notebook, so the Studio can be opened
+        /// on exactly that cell.
+        circuit_cell_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -1824,6 +1918,86 @@ mod tests {
         });
     }
 
+    #[test]
+    fn example_family_round_trips() {
+        let info = ExampleInfo {
+            example_id: "ghz".to_string(),
+            position: 2,
+            titles: BTreeMap::from([
+                ("pl".to_string(), "Stan GHZ".to_string()),
+                ("en".to_string(), "GHZ state".to_string()),
+            ]),
+            descriptions: BTreeMap::from([("en".to_string(), "n entangled qubits".to_string())]),
+            level: "intro".to_string(),
+            tags: vec!["entanglement".to_string()],
+            qubits: 5,
+            qubits_min: 3,
+            qubits_max: 28,
+            qubits_default: 5,
+            depth: 6,
+        };
+        round_trip(TentaQuantPayload::ExampleListRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+        });
+        round_trip(TentaQuantPayload::ExampleListResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            examples: vec![info.clone()],
+        });
+        round_trip(TentaQuantPayload::ExampleGetRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: Some(12),
+        });
+        round_trip(TentaQuantPayload::ExampleGetResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example: info.clone(),
+            readme: BTreeMap::from([("en".to_string(), "# GHZ".to_string())]),
+            qasm3: "OPENQASM 3.0;\n".to_string(),
+            expected: ExampleExpected {
+                shots: 4096,
+                seed: 7,
+                tolerance: 0.05,
+                outcomes: BTreeMap::from([("00000".to_string(), 0.5), ("11111".to_string(), 0.5)]),
+            },
+        });
+        round_trip(TentaQuantPayload::ExampleForkRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: None,
+            language: "pl".to_string(),
+        });
+        round_trip(TentaQuantPayload::ExampleForkResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            project: ProjectInfo {
+                project_id: "p1".to_string(),
+                name: "Stan GHZ".to_string(),
+                description: String::new(),
+                owner_user_id: "u1".to_string(),
+                owner_name: "Anna".to_string(),
+                visibility: "private".to_string(),
+                my_role: "owner".to_string(),
+                share_count: 0,
+                file_count: 1,
+                notebook_count: 1,
+                run_count: 0,
+                linked_project_id: None,
+                created_at: "2026-09-03 10:00:00".to_string(),
+                updated_at: "2026-09-03 10:00:00".to_string(),
+                archived_at: None,
+            },
+            notebook: NotebookInfo {
+                notebook_id: "n1".to_string(),
+                project_id: "p1".to_string(),
+                file_id: "f1".to_string(),
+                name: "Stan GHZ".to_string(),
+                current_version: 1,
+                updated_by: "u1".to_string(),
+                updated_at: "2026-09-03 10:00:00".to_string(),
+            },
+            circuit_cell_id: "c1".to_string(),
+        });
+    }
+
     /// The tile is a STORED document as much as a wire field: the column holds
     /// exactly the JSON the client parses, so its key names are a storage
     /// format and pinning them here is what stops a rename from making every
@@ -2165,5 +2339,16 @@ mod tests {
             ),
             "TargetResolveRequest wire drift"
         );
+
+        // A fork as the dashboard's encoder builds it; `qubits` omitted means
+        // the example's default width.
+        let fork = TentaQuantPayload::ExampleForkRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: Some(5),
+            language: "pl".to_string(),
+        };
+        let bytes = crate::cbor::encode(&fork).expect("encode");
+        assert_eq!(bytes, hex_bytes("a1724578616d706c65466f726b52657175657374a46b696e7374616e63655f69647374656e74617175616e742d30613162326333646a6578616d706c655f69646367687a6671756269747305686c616e677561676562706c"), "ExampleForkRequest wire drift");
     }
 }

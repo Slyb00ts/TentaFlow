@@ -41,7 +41,7 @@ use super::{HandlerContext, SessionAuthKind};
 use crate::addon::native_apps::NODE_STATUS_KEY_PREFIX;
 use crate::db::DbPool;
 use crate::tentaquant::{
-    cas, circuit, compare, db as store, export, kata,
+    cas, circuit, compare, db as store, examples, export, kata,
     people::{self, PERM_ADMIN, PERM_INSTRUCT, PERM_READ, PERM_RUN, PERM_RUN_GPU},
     runs::{self, MIME_EXPORT},
     state, targets, PACKAGE_ID,
@@ -2301,6 +2301,134 @@ fn kata_ranking(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, 
 }
 
 // =============================================================================
+// Examples (Przykłady, plan §12.1)
+// =============================================================================
+
+fn example_not_found() -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::NotFound, "example not found")
+}
+
+/// An example and the width a request asked for, refused with a `BadRequest`
+/// the caller can show when the width does not belong to it.
+fn example_at(
+    example_id: &str,
+    qubits: Option<u32>,
+) -> Result<(&'static examples::Example, u32), ProtocolError> {
+    let example = examples::catalog()
+        .example(example_id)
+        .ok_or_else(example_not_found)?;
+    let width = example.width(qubits).map_err(ProtocolError::bad_request)?;
+    Ok((example, width))
+}
+
+fn example_list(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let examples = examples::catalog()
+        .examples
+        .iter()
+        .map(|example| example.info(example.qubits_default))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal("example list", e))?;
+    Ok(tq(P::ExampleListResponse {
+        instance_id: g.instance_id,
+        examples,
+    }))
+}
+
+fn example_get(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    example_id: &str,
+    qubits: Option<u32>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let (example, width) = example_at(example_id, qubits)?;
+    Ok(tq(P::ExampleGetResponse {
+        instance_id: g.instance_id,
+        example: example
+            .info(width)
+            .map_err(|e| internal("example info", e))?,
+        readme: example.readme.clone(),
+        qasm3: example.qasm_at(width),
+        expected: example.expected_at(width),
+    }))
+}
+
+/// The text of a language map in the caller's language, then English.
+fn pick_language<'a>(
+    texts: &'a std::collections::BTreeMap<String, String>,
+    language: &str,
+) -> &'a str {
+    texts
+        .get(language)
+        .or_else(|| texts.get("en"))
+        .map_or("", String::as_str)
+}
+
+/// Copies an example into a new private project of the caller's: one notebook
+/// whose first cell is the README and whose second is the circuit. It goes
+/// through the same two store writes as creating a project and a notebook by
+/// hand, so a fork is an ordinary project from the first moment — owned,
+/// shareable and deletable like any other. A notebook that cannot be written
+/// takes the project it was meant for with it, so a failed fork leaves nothing
+/// half-made behind.
+fn example_fork(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    example_id: &str,
+    qubits: Option<u32>,
+    language: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    let (example, width) = example_at(example_id, qubits)?;
+    let title = validate_name(pick_language(&example.titles, language))?;
+    let description = pick_language(&example.descriptions, language);
+    let readme = pick_language(&example.readme, language);
+
+    let circuit_cell_id = uuid::Uuid::new_v4().to_string();
+    let cells = serde_json::json!([
+        { "id": uuid::Uuid::new_v4().to_string(), "kind": "markdown", "source": readme },
+        { "id": circuit_cell_id, "kind": "circuit", "source": example.qasm_at(width) },
+    ])
+    .to_string();
+    let path = cas::validate_path(&format!("notebooks/{}.ipynb", slug(&title)))
+        .map_err(|e| internal("example notebook path", e))?;
+
+    let project_id = store::create_project(&g.db, &g.user_id, &title, description, "private", None)
+        .map_err(|e| internal("example project", e))?;
+    let notebook =
+        match store::create_notebook(&g.db, &project_id, &title, &path, &cells, &g.user_id) {
+            Ok(store::NotebookCreation::Created(record)) => record,
+            Ok(store::NotebookCreation::PathTaken) => {
+                // A brand-new project has no files, so this is unreachable; still
+                // roll the project back rather than leave an empty one.
+                discard_project(&g, &project_id);
+                return Err(internal("example notebook", "path already taken"));
+            }
+            Err(e) => {
+                discard_project(&g, &project_id);
+                return Err(internal("example notebook", e));
+            }
+        };
+    let record = store::project(&g.db, &project_id)
+        .map_err(|e| internal("project", e))?
+        .ok_or_else(not_found)?;
+    let role = role(&g, &project_id)?;
+    Ok(tq(P::ExampleForkResponse {
+        instance_id: g.instance_id.clone(),
+        project: one_project_info(ctx, &g, &record, Some(role))?,
+        notebook: notebook_info(notebook),
+        circuit_cell_id,
+    }))
+}
+
+fn discard_project(g: &Lab, project_id: &str) {
+    if let Err(e) = store::delete_project(&g.db, project_id) {
+        tracing::warn!(error = %e, project_id, "could not roll back a failed example fork");
+    }
+}
+
+// =============================================================================
 // Dispatcher
 // =============================================================================
 
@@ -2554,6 +2682,19 @@ pub async fn tentaquant_dispatch(
         } => kata_submit(ctx, instance_id, kata_id, qasm3),
         P::KataRankingRequest { instance_id } => kata_ranking(ctx, instance_id),
 
+        P::ExampleListRequest { instance_id } => example_list(ctx, instance_id),
+        P::ExampleGetRequest {
+            instance_id,
+            example_id,
+            qubits,
+        } => example_get(ctx, instance_id, example_id, *qubits),
+        P::ExampleForkRequest {
+            instance_id,
+            example_id,
+            qubits,
+            language,
+        } => example_fork(ctx, instance_id, example_id, *qubits, language),
+
         P::TargetListRequest { instance_id } => target_list(ctx, instance_id),
         P::TargetResolveRequest {
             instance_id,
@@ -2750,6 +2891,18 @@ register_tentaquant_variant!(
 register_tentaquant_variant!(
     "TentaQuantKataRankingRequest",
     "tentaflow_ws_handler_tq_kata_ranking"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleListRequest",
+    "tentaflow_ws_handler_tq_example_list"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleGetRequest",
+    "tentaflow_ws_handler_tq_example_get"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleForkRequest",
+    "tentaflow_ws_handler_tq_example_fork"
 );
 register_tentaquant_variant!(
     "TentaQuantTargetListRequest",
@@ -5256,6 +5409,169 @@ mod tests {
                 instance_id: lab.clone(),
                 kata_id: first.id.clone(),
                 qasm3: first.solution.clone(),
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    // =========================================================================
+    // Examples
+    // =========================================================================
+
+    /// The gallery is the same document for everyone who may read; a width is
+    /// only accepted where the example has one to give.
+    #[tokio::test]
+    async fn the_gallery_lists_and_opens_examples_at_a_requested_width() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "90909090", "anna", &[PERM_READ]);
+        let anna = ctx(&fx, "anna");
+
+        match call(
+            &anna,
+            P::ExampleListRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::ExampleListResponse { examples, .. }) => {
+                let ids: Vec<&str> = examples.iter().map(|e| e.example_id.as_str()).collect();
+                assert_eq!(ids, ["bell-state", "ghz"]);
+                assert_eq!((examples[0].qubits, examples[0].depth), (2, 3));
+                assert_eq!((examples[1].qubits, examples[1].qubits_max), (5, 28));
+            }
+            other => panic!("expected ExampleListResponse, got {other:?}"),
+        }
+
+        match call(
+            &anna,
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(7),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::ExampleGetResponse {
+                example,
+                readme,
+                qasm3,
+                expected,
+                ..
+            }) => {
+                assert_eq!(example.qubits, 7);
+                assert!(qasm3.contains("qubit[7] q;"));
+                assert!(readme.contains_key("pl") && readme.contains_key("en"));
+                let keys: Vec<&String> = expected.outcomes.keys().collect();
+                assert_eq!(keys, ["0000000", "1111111"]);
+            }
+            other => panic!("expected ExampleGetResponse, got {other:?}"),
+        }
+
+        for request in [
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(29),
+            },
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "bell-state".to_string(),
+                qubits: Some(3),
+            },
+        ] {
+            assert_eq!(
+                fail(&anna, request).await.code,
+                ProtocolErrorCode::BadRequest
+            );
+        }
+        assert_eq!(
+            fail(
+                &anna,
+                P::ExampleGetRequest {
+                    instance_id: lab.clone(),
+                    example_id: "no-such-example".to_string(),
+                    qubits: None,
+                },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+    }
+
+    /// A fork is an ordinary private project of the caller's holding the README
+    /// and the circuit, and it needs `quant.run` like any new project.
+    #[tokio::test]
+    async fn forking_an_example_makes_a_private_project_with_its_notebook() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "91919191", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let fork = call(
+            &anna,
+            P::ExampleForkRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(9),
+                language: "pl".to_string(),
+            },
+        )
+        .await;
+        let MessageBody::TentaQuantBody(P::ExampleForkResponse {
+            project,
+            notebook,
+            circuit_cell_id,
+            ..
+        }) = fork
+        else {
+            panic!("expected ExampleForkResponse, got {fork:?}");
+        };
+        assert_eq!(project.name, "Stan GHZ — n kubitów");
+        assert_eq!(project.visibility, "private");
+        assert_eq!(project.my_role, "owner");
+        assert_eq!(project.notebook_count, 1);
+
+        match call(
+            &anna,
+            P::NotebookGetRequest {
+                instance_id: lab.clone(),
+                project_id: project.project_id.clone(),
+                notebook_id: notebook.notebook_id.clone(),
+                version: None,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::NotebookGetResponse { cells_json, .. }) => {
+                let cells: serde_json::Value = serde_json::from_str(&cells_json).expect("cells");
+                let cells = cells.as_array().expect("array");
+                assert_eq!(cells.len(), 2);
+                assert_eq!(cells[0]["kind"], "markdown");
+                assert!(cells[0]["source"].as_str().expect("readme").contains("GHZ"));
+                assert_eq!(cells[1]["kind"], "circuit");
+                assert_eq!(cells[1]["id"], circuit_cell_id.as_str());
+                assert!(cells[1]["source"]
+                    .as_str()
+                    .expect("qasm")
+                    .contains("qubit[9] q;"));
+            }
+            other => panic!("expected NotebookGetResponse, got {other:?}"),
+        }
+
+        // A reader may open the gallery but not copy from it.
+        let marek_lab = install_lab(&mut fx, "92929292", "marek", &[PERM_READ]);
+        test_support::set_permission(&fx.state, &marek_lab, "user", "marek", PERM_RUN, "deny");
+        let marek = ctx(&fx, "marek");
+        let denied = fail(
+            &marek,
+            P::ExampleForkRequest {
+                instance_id: marek_lab,
+                example_id: "bell-state".to_string(),
+                qubits: None,
+                language: "en".to_string(),
             },
         )
         .await;

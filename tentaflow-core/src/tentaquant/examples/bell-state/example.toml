@@ -1,0 +1,16 @@
+id = "bell-state"
+level = "intro"
+tags = ["entanglement", "measurement"]
+
+[title]
+pl = "Stan Bella i korelacje"
+en = "Bell state and correlations"
+
+[description]
+pl = "Dwa kubity, H + CNOT, pomiar. Najkrótsza droga do zobaczenia splątania: wyniki 00 i 11 po połowie, nigdy 01 ani 10."
+en = "Two qubits, H + CNOT, measurement. The shortest way to see entanglement: 00 and 11 half of the time each, never 01 or 10."
+
+[qubits]
+min = 2
+max = 2
+default = 2

@@ -18,6 +18,7 @@
 //   circuit    the OpenQASM 3 front end of tier T1 (validate, export, options)
 //   keyframes  the recorded evolution of a run, live and in the store
 //   kata       the course: embedded katas, grading, unlocking and the ranking
+//   examples   the gallery: embedded circuits with a reference outcome
 //   runs       T1 execution: slots, cancellation, the run stream, orphans
 //   compare    the distributions of several runs on one aligned axis
 //   state      reduced quantities of a run's state, asked for after the fact
@@ -31,6 +32,7 @@ pub mod cas;
 pub mod circuit;
 pub mod compare;
 pub mod db;
+pub mod examples;
 pub mod export;
 pub mod kata;
 pub mod keyframes;

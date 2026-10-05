@@ -2719,6 +2719,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         // decoder builds the same string by concatenation
         // (`decode_provider_account_payload`), so a variant has ONE name on
         // both sides even where that repeats the word "Account".
+                Tq::ExampleListRequest { .. } => "TentaQuantExampleListRequest",
+                Tq::ExampleListResponse { .. } => "TentaQuantExampleListResponse",
+                Tq::ExampleGetRequest { .. } => "TentaQuantExampleGetRequest",
+                Tq::ExampleGetResponse { .. } => "TentaQuantExampleGetResponse",
+                Tq::ExampleForkRequest { .. } => "TentaQuantExampleForkRequest",
+                Tq::ExampleForkResponse { .. } => "TentaQuantExampleForkResponse",
         MessageBody::ProviderAccountBody(p) => {
             use tentaflow_protocol::provider_account::ProviderAccountPayload as Pa;
             match p {

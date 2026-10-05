@@ -10796,6 +10796,38 @@ export const encode = {
 export function decodeFrame(bytes) {
   assertReady();
   const view = _wasm.decodeEnvelope(bytes);
+  /** MessageBody::TentaQuantBody(ExampleListRequest). payload: { instanceId } — the shipped examples in their fixed order. */
+  tentaQuantExampleListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantExampleListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ExampleGetRequest). payload: { instanceId, exampleId, qubits? } — README, circuit and reference outcome; `qubits` picks the width of a parametric example. */
+  tentaQuantExampleGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      example_id: csText(payload.exampleId ?? payload.example_id),
+      qubits: csOptNumber(payload.qubits),
+    };
+    const body = _wasm.encodeTentaQuantExampleGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ExampleForkRequest). payload: { instanceId, exampleId, qubits?, language } — a new private project holding the example as a notebook. */
+  tentaQuantExampleForkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      example_id: csText(payload.exampleId ?? payload.example_id),
+      qubits: csOptNumber(payload.qubits),
+      language: csText(payload.language),
+    };
+    const body = _wasm.encodeTentaQuantExampleForkRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   const body = _wasm.decodeMessageBody(view.body);
   return {
     envelope: {

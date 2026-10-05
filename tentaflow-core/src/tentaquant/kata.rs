@@ -218,15 +218,20 @@ pub fn catalog() -> &'static Catalog {
     &CATALOG
 }
 
-/// Splits `task.md` into its `@@ <lang>` sections.
-fn task_sections(id: &str, text: &str) -> Result<BTreeMap<String, String>, String> {
+/// Splits a Markdown file (`task.md`, an example's `README.md`) into its
+/// `@@ <lang>` sections; `file` only names the file in a defect message.
+pub(super) fn language_sections(
+    id: &str,
+    file: &str,
+    text: &str,
+) -> Result<BTreeMap<String, String>, String> {
     let mut sections: BTreeMap<String, String> = BTreeMap::new();
     let mut current: Option<String> = None;
     for line in text.lines() {
         if let Some(language) = line.strip_prefix("@@ ") {
             let language = language.trim().to_string();
             if sections.insert(language.clone(), String::new()).is_some() {
-                return Err(format!("{id}: task.md repeats the section '{language}'"));
+                return Err(format!("{id}: {file} repeats the section '{language}'"));
             }
             current = Some(language);
         } else if let Some(language) = &current {
@@ -234,7 +239,7 @@ fn task_sections(id: &str, text: &str) -> Result<BTreeMap<String, String>, Strin
             body.push_str(line);
             body.push('\n');
         } else if !line.trim().is_empty() {
-            return Err(format!("{id}: task.md has text before its first section"));
+            return Err(format!("{id}: {file} has text before its first section"));
         }
     }
     for body in sections.values_mut() {
@@ -368,7 +373,7 @@ impl Catalog {
                 })?;
                 require_languages(id, "the title", &file.title)?;
                 require_languages(id, "the summary", &file.summary)?;
-                let task = task_sections(id, source.task_md)?;
+                let task = language_sections(id, "task.md", source.task_md)?;
                 require_languages(id, "the task", &task)?;
                 if file.points == 0 {
                     return Err(format!("{id}: a kata is worth at least one point"));
@@ -1090,11 +1095,12 @@ mod tests {
 
     #[test]
     fn a_broken_catalog_is_described_not_accepted() {
-        assert!(task_sections("x", "text before").is_err());
-        let sections = task_sections("x", "@@ pl\njeden\n\n@@ en\none\n").expect("sections");
+        assert!(language_sections("x", "task.md", "text before").is_err());
+        let sections =
+            language_sections("x", "task.md", "@@ pl\njeden\n\n@@ en\none\n").expect("sections");
         assert_eq!(sections["pl"], "jeden");
         assert_eq!(sections["en"], "one");
-        assert!(task_sections("x", "@@ pl\na\n@@ pl\nb\n").is_err());
+        assert!(language_sections("x", "task.md", "@@ pl\na\n@@ pl\nb\n").is_err());
 
         let bad_state =
             "kind = \"state_equals\"\ntolerance = 1e-9\ntarget = [[1.0, 0.0], [1.0, 0.0]]\n";
