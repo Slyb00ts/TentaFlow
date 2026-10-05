@@ -655,7 +655,11 @@ impl Lowerer<'_> {
                 match list.expressions[0].expression() {
                     Expr::RangeExpression(range) => {
                         let bound = |value: i64| -> Result<i64> {
-                            Ok(if value < 0 { value + size as i64 } else { value })
+                            Ok(if value < 0 {
+                                value + size as i64
+                            } else {
+                                value
+                            })
                         };
                         let start = bound(self.eval(range.start())?.as_i64()?)?;
                         let stop = bound(self.eval(range.stop())?.as_i64()?)?;

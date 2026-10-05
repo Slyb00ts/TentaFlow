@@ -147,8 +147,8 @@ impl StabilizerSim {
                 + i64::from((px & !x2 & z2).count_ones())
                 + i64::from((pz & x2 & z2).count_ones());
         }
-        let total = (2 * i64::from(self.r[h]) + 2 * i64::from(self.r[i]) + plus - minus)
-            .rem_euclid(4);
+        let total =
+            (2 * i64::from(self.r[h]) + 2 * i64::from(self.r[i]) + plus - minus).rem_euclid(4);
         self.r[h] = total == 2;
         for w in 0..words {
             self.x[hs + w] ^= self.x[is + w];
@@ -158,8 +158,10 @@ impl StabilizerSim {
 
     fn copy_row(&mut self, to: usize, from: usize) {
         let words = self.words;
-        self.x.copy_within(from * words..(from + 1) * words, to * words);
-        self.z.copy_within(from * words..(from + 1) * words, to * words);
+        self.x
+            .copy_within(from * words..(from + 1) * words, to * words);
+        self.z
+            .copy_within(from * words..(from + 1) * words, to * words);
     }
 
     fn clear_row(&mut self, row: usize) {

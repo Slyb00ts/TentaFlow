@@ -73,7 +73,9 @@ c = measure q;
 
 #[test]
 fn stabilizer_path_handles_a_256_qubit_ghz() {
-    let mut source = String::from("OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[256] q;\nbit[256] c;\nh q[0];\n");
+    let mut source = String::from(
+        "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[256] q;\nbit[256] c;\nh q[0];\n",
+    );
     source.push_str("for int i in [0:254] { cx q[i], q[i + 1]; }\nc = measure q;\n");
     let circuit = parse(&source);
     assert!(circuit.is_clifford());
@@ -165,12 +167,20 @@ fn quantum_fourier_transform_matches_the_analytic_amplitudes() {
     .expect("a unitary circuit has a final state");
     let dim = 1usize << n;
     let mut reference: Vec<Complex64> = (0..dim)
-        .map(|j| Complex64::from_polar(1.0 / (dim as f64).sqrt(), 2.0 * PI * (j * k) as f64 / dim as f64))
+        .map(|j| {
+            Complex64::from_polar(
+                1.0 / (dim as f64).sqrt(),
+                2.0 * PI * (j * k) as f64 / dim as f64,
+            )
+        })
         .collect();
     // Compare up to a global phase, which the program may legitimately carry.
     let phase = amplitudes[0] / reference[0];
     for (got, want) in amplitudes.iter().zip(reference.iter_mut()) {
-        assert!((*got - *want * phase).norm() < 1e-9, "amplitude {got} vs {want}");
+        assert!(
+            (*got - *want * phase).norm() < 1e-9,
+            "amplitude {got} vs {want}"
+        );
     }
 }
 
@@ -211,8 +221,16 @@ out[0] = measure q[2];
         .map(|(_, count)| *count as f64)
         .sum::<f64>()
         / result.shots as f64;
-    assert_eq!(bob_zero, 1.0, "teleported state was damaged: {:?}", result.counts);
-    assert_eq!(result.counts.len(), 4, "Alice's two bits must take all four values");
+    assert_eq!(
+        bob_zero, 1.0,
+        "teleported state was damaged: {:?}",
+        result.counts
+    );
+    assert_eq!(
+        result.counts.len(),
+        4,
+        "Alice's two bits must take all four values"
+    );
 }
 
 #[test]
@@ -230,7 +248,14 @@ c[0] = measure q[0];
     let mut inputs = InputValues::new();
     inputs.insert("theta".to_string(), PI / 2.0);
     let circuit = parse_qasm3(source, &inputs).expect("bound input");
-    let result = run(&circuit, &SimOptions::default(), Device::Cpu, 20_000, Cancel::none()).unwrap();
+    let result = run(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        20_000,
+        Cancel::none(),
+    )
+    .unwrap();
     // rx(pi/2)|0> has P(1) = sin^2(pi/4) = 0.5.
     assert!((share(&result, "1") - 0.5).abs() < 0.02);
 }
