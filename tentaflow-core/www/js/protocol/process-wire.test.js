@@ -674,6 +674,32 @@ test('send and receive tasks keep distinct typed model fields', { skip }, () => 
   }
 });
 
+test('signal declarations and event kinds use typed camel case without changing absent fields', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [], variables: {},
+    diagram: { shapes: [], edges: [] } };
+  const nodes = [
+    { id: 'Throw_1', name: 'Admit', kind: { SignalThrow: { signalRef: 'Signal_1',
+      payloadExpression: 'vars.payload', ttlSeconds: 3600 } } },
+    { id: 'Catch_1', name: 'Wait', kind: { SignalCatch: { signalRef: 'Signal_1',
+      outputMapping: { received: 'outputs' } } } },
+  ];
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Signals', description: '', model: { ...base, targetNamespace: 'urn:orders',
+      signals: [{ signalId: 'Signal_1', namespaceUri: 'urn:orders', name: 'Order changed' }], nodes } });
+  assert.deepEqual(saved.model.nodes.map((node) => node.kind), nodes.map((node) => node.kind));
+  assert.deepEqual(saved.model.signals, [{ signalId: 'Signal_1', namespaceUri: 'urn:orders', name: 'Order changed' }]);
+  const old = request('processDefinitionSaveRequest', { commandId: 'old', definitionId: null,
+    expectedRevision: 0, name: 'Old', description: '', model: { ...base, nodes: [] } });
+  assert.equal(Object.hasOwn(old.model, 'signals'), false);
+  for (const kind of [
+    { SignalThrow: { signalRef: 'Signal_1', payloadExpression: 'vars.payload' } },
+    { SignalCatch: { signalRef: 'Signal_1' } },
+    { SignalCatch: { ...nodes[1].kind.SignalCatch, unsupported: true } },
+  ]) assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'bad', definitionId: null,
+    expectedRevision: 0, name: 'Invalid', description: '',
+    model: { ...base, nodes: [{ id: 'Bad_1', name: 'Invalid', kind }] } }), /unsupported|requires|unknown/);
+});
+
 test('user task detail response preserves opaque output keys', { skip }, () => {
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     UserTaskGetResponse: { task: {

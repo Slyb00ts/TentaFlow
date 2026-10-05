@@ -832,6 +832,98 @@ test('distinct send and receive task inspectors save exact message fields and di
   assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
 });
 
+test('signal throw and catch inspectors preserve exact declarations, expressions and source history', async () => {
+  const model = emptyProcessModel();
+  model.targetNamespace = 'urn:orders';
+  model.signals = [{ signalId: 'Signal_1', namespaceUri: 'urn:orders', name: 'Order changed <&>' }];
+  model.nodes.splice(1, 0,
+    { id: 'Throw_1', name: 'Admit signal', kind: { SignalThrow: { signalRef: 'Signal_1',
+      payloadExpression: 'vars.payload', ttlSeconds: 60 } } },
+    { id: 'Catch_1', name: 'Wait for signal', kind: { SignalCatch: { signalRef: 'Signal_1',
+      outputMapping: { received: 'outputs' } } } });
+  const current = definition('signal-draft', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  state.canvas.selectNode('Throw_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="targetType"]'), null);
+  assert.equal(state.config.root.querySelector('[data-process="signalRef"]').value, 'Signal_1');
+  change(state.config.root.querySelector('[data-process="payloadExpression"]'), 'vars.payload');
+  change(state.config.root.querySelector('[data-process="ttlSeconds"]'), '240');
+  state.canvas.selectNode('Catch_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="signalRef"]').value, 'Signal_1');
+  assert.ok(state.config.root.querySelector('[data-process="outputMapping"]'));
+  assert.equal(state.config.root.querySelector('[data-process="correlationExpression"]'), null);
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model;
+  assert.deepEqual(saved.signals, model.signals);
+  assert.deepEqual(saved.nodes.find((node) => node.id === 'Throw_1').kind.SignalThrow,
+    { signalRef: 'Signal_1', payloadExpression: 'vars.payload', ttlSeconds: 240 });
+  assert.deepEqual(saved.nodes.find((node) => node.id === 'Catch_1').kind.SignalCatch,
+    { signalRef: 'Signal_1', outputMapping: { received: 'outputs' } });
+  for (const kind of ['signal_admitted', 'signal_catch_opened', 'signal_received']) {
+    const label = processEventText({ kind, nodeName: 'Order changed <&>', data: {} });
+    assert.match(label, /Order changed <&>/);
+    assert.doesNotMatch(label, /recipient_count|subscription_id|signal_id/);
+  }
+  const win = await monitor(instance('signal-wait', { subscriptions: [{
+    subscriptionId: 'subscription-private', nodeId: 'Catch_1', nodeName: 'Order changed <&>',
+    tokenId: 'token-private', kind: 'SignalCatch', status: 'Open', revision: 1,
+    signalName: 'Order changed <&>', correlationKey: null, scopeId: 'signal-wait',
+  }] }));
+  const subscription = win.querySelector('[data-subscription-rows]').textContent;
+  assert.match(subscription, /Order changed <&>/);
+  assert.equal(subscription.includes(I18n.t('bpmn.message_correlation_key')), false);
+  win.remove();
+});
+
+test('signal history distinguishes admitted source from received delivery after zero-recipient completion', async () => {
+  const nodeName = 'Signal <img src=x onerror="window.__bpmnSignalMarkupExecuted=true">';
+  const sourceData = { signal_id: 'source-signal', source_activation_id: 'source-token',
+    signal_namespace_uri: 'urn:orders', signal_declaration_id: 'Signal_1' };
+  const receivedData = { signal_id: 'source-signal', subscription_id: 'recipient-subscription',
+    attached_token_id: 'recipient-token', source_event_id: 'source-event' };
+  const event = (seq, kind, data = {}) => ({ seq, atMs: 1000 + seq, kind, nodeName, data });
+  const sourceEvents = [event(1, 'instance_started'), event(2, 'node_completed'),
+    event(3, 'signal_admitted', sourceData), event(4, 'end_reached'), event(5, 'instance_completed')];
+  const recipientEvents = [event(1, 'instance_started'), event(2, 'node_completed'),
+    event(3, 'signal_catch_opened', { subscription_id: 'recipient-subscription', attached_token_id: 'recipient-token',
+      signal_namespace_uri: 'urn:orders', signal_declaration_id: 'Signal_1' }),
+    event(4, 'signal_received', receivedData), event(5, 'end_reached'), event(6, 'instance_completed')];
+  const admittedLabels = { en: `${nodeName}: signal admitted`, pl: `${nodeName}: sygnał zapisany`,
+    de: `${nodeName}: Signal angenommen`, es: `${nodeName}: señal admitida`, fr: `${nodeName} : signal admis` };
+  const receivedLabels = { en: `${nodeName}: signal received`, pl: `${nodeName}: odebrano sygnał`,
+    de: `${nodeName}: Signal empfangen`, es: `${nodeName}: señal recibida`, fr: `${nodeName} : signal reçu` };
+  const sourceFacts = structuredClone(sourceEvents);
+  const recipientFacts = structuredClone(recipientEvents);
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const source = await monitor(instance(`zero-signal-${language}`, { status: 'Completed', activeNodeIds: [] }), {
+        processHistoryRequest: { events: sourceEvents, nextSeq: 5, hasMore: false },
+      });
+      assert.equal(source.querySelectorAll('[data-process-seq]').length, 5);
+      assert.equal(source.querySelector('[data-process-seq="3"] > div').textContent, admittedLabels[language]);
+      assert.equal(source.textContent.includes(receivedLabels[language]), false);
+      assert.equal(source.querySelector('[data-events] img'), null);
+      source.remove();
+      const recipient = await monitor(instance(`received-signal-${language}`, { status: 'Completed', activeNodeIds: [] }), {
+        processHistoryRequest: { events: recipientEvents, nextSeq: 6, hasMore: false },
+      });
+      assert.equal(recipient.querySelectorAll('[data-process-seq]').length, 6);
+      assert.equal(recipient.querySelector('[data-process-seq="4"] > div').textContent, receivedLabels[language]);
+      assert.notEqual(admittedLabels[language], receivedLabels[language]);
+      assert.equal(recipient.textContent.includes(admittedLabels[language]), false);
+      assert.equal(recipient.querySelector('[data-events] img'), null);
+      recipient.remove();
+      assert.deepEqual(sourceEvents, sourceFacts);
+      assert.deepEqual(recipientEvents, recipientFacts);
+      assert.deepEqual(Object.keys(sourceData).sort(), ['signal_id', 'source_activation_id', 'signal_namespace_uri', 'signal_declaration_id'].sort());
+      assert.deepEqual(Object.keys(receivedData).sort(), ['signal_id', 'subscription_id', 'attached_token_id', 'source_event_id'].sort());
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('boundary message switch click saves its checked boolean with a visible accessible label', async () => {
   const model = emptyProcessModel();
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
@@ -1262,11 +1354,13 @@ test('repeat inspector changes survive the mounted draft save and undo/redo snap
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 25);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 27);
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_manual_task"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_send_task"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_receive_task"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_signal_throw"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_signal_catch"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1556,6 +1650,10 @@ test('declaration editor keeps exact namespace and long names in the real draft 
   change(form.querySelector('[data-declaration-namespace]'), 'urn:orders:Łódź');
   click(form.querySelector('[data-add-message]'));
   click(form.querySelector('[data-add-escalation]'));
+  click(form.querySelector('[data-add-signal]'));
+  const signal = form.querySelector('[data-declaration-kind="signal"]');
+  change(signal.querySelector('[data-declaration-id]'), 'Signal_Order');
+  change(signal.querySelector('[data-declaration-name]'), 'Order changed <&>');
   const escalation = form.querySelector('[data-declaration-kind="escalation"]');
   change(escalation.querySelector('[data-declaration-id]'), 'Escalation_Order');
   change(escalation.querySelector('[data-declaration-name]'), `${'Review'.repeat(40)}<&>`);
@@ -1569,14 +1667,63 @@ test('declaration editor keeps exact namespace and long names in the real draft 
   assert.equal(state.canvas.processModel.targetNamespace, 'urn:orders:Łódź');
   assert.equal(state.canvas.processModel.messages[0].name, name);
   assert.equal(state.canvas.processModel.escalations[0].escalationCode, 'NEEDS.HUMAN');
+  assert.deepEqual(state.canvas.processModel.signals, [{ signalId: 'Signal_Order',
+    namespaceUri: 'urn:orders:Łódź', name: 'Order changed <&>' }]);
+  state.canvas.undo();
+  assert.equal(state.canvas.processModel.signals, undefined);
+  state.canvas.redo();
+  assert.equal(state.canvas.processModel.signals[0].signalId, 'Signal_Order');
   assert.equal(await builder._save(), true);
   const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload.model;
   assert.equal(saved.targetNamespace, 'urn:orders:Łódź');
   assert.deepEqual(saved.messages, [{ messageId: 'Message_Order', name }]);
   assert.deepEqual(saved.escalations, [{ escalationId: 'Escalation_Order',
     name: `${'Review'.repeat(40)}<&>`, escalationCode: 'NEEDS.HUMAN' }]);
+  assert.deepEqual(saved.signals, [{ signalId: 'Signal_Order',
+    namespaceUri: 'urn:orders:Łódź', name: 'Order changed <&>' }]);
   assert.deepEqual(saved.variables, {});
   assert.equal(state.definition.publishedVersion, 1, 'draft edits do not mutate the published version');
+});
+
+test('pinned published signal declarations remain inspectable without enabling edits', async () => {
+  const pinned = { ...emptyProcessModel(), targetNamespace: 'urn:orders:Łódź',
+    signals: [{ signalId: 'Signal_Order', namespaceUri: 'urn:orders:Łódź', name: 'Order changed <&>' }] };
+  const draft = { ...emptyProcessModel(), targetNamespace: 'urn:orders:revised',
+    signals: [{ signalId: 'Signal_Revised', namespaceUri: 'urn:orders:revised', name: 'Revised' }] };
+  const current = definition('signal-preview', { model: draft, publishedVersion: 2 });
+  const state = await mount(current, {
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: { version: { version: 1, model: pinned } },
+  });
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush();
+  assert.equal(state.previewVersion, 1);
+  assert.equal(state.canvas.readOnly, true);
+  assert.equal(state.root.querySelector('[data-role="save"]').hasAttribute('disabled'), true);
+  const declarations = state.root.querySelector('[data-role="declarations"]');
+  assert.equal(declarations.hasAttribute('disabled'), false);
+  const before = state.canvas.getData();
+  click(declarations);
+  const form = document.querySelector('.tf-act-window');
+  assert.equal(form.querySelector('[data-declaration-namespace]').value, pinned.targetNamespace);
+  const signal = form.querySelector('[data-declaration-kind="signal"]');
+  assert.equal(form.querySelectorAll('[data-declaration-kind="signal"]').length, 1);
+  assert.equal(signal.querySelector('[data-declaration-id]').value, pinned.signals[0].signalId);
+  assert.equal(signal.querySelector('[data-declaration-name]').value, pinned.signals[0].name);
+  for (const control of [form.querySelector('[data-declaration-namespace]'),
+    signal.querySelector('[data-declaration-id]'), signal.querySelector('[data-declaration-name]')])
+    assert.equal(control.hasAttribute('disabled'), true);
+  assert.equal(form.querySelector('[data-add-signal]'), null);
+  assert.equal(signal.querySelector('[data-remove-declaration]'), null);
+  assert.equal(form.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
+  assert.deepEqual(state.canvas.getData(), before);
+  assert.equal(state.dirty, false);
+  assert.equal(calls.some((call) => call.kind === 'processDefinitionSaveRequest'), false);
+  state.operationBusy = 'saving'; builder._syncProcessControls();
+  assert.equal(declarations.hasAttribute('disabled'), true);
+  state.operationBusy = null; builder._syncProcessControls();
+  assert.equal(declarations.hasAttribute('disabled'), false);
 });
 
 test('documents and business JSON are bounded before sending without changing business keys', () => {
@@ -1688,6 +1835,14 @@ test('archived definitions remain read-only and real unarchive restores editing'
   const current = definition('archived', { archived: true, publishedVersion: 2 });
   const state = await mount(current, { processDefinitionArchiveRequest: (payload) => ({ definition: { ...current, archived: payload.archived, draftRevision: 5 } }) });
   assert.equal(state.canvas.readOnly, true); assert.equal(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'), true);
+  const declarations = state.root.querySelector('[data-role="declarations"]');
+  assert.equal(declarations.hasAttribute('disabled'), false);
+  click(declarations);
+  const form = document.querySelector('.tf-act-window');
+  assert.equal(form.querySelector('[data-declaration-namespace]').hasAttribute('disabled'), true);
+  assert.equal(form.querySelector('[data-add-signal]'), null);
+  assert.equal(form.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
+  click(form.querySelector('[data-act="cancel"]'));
   await builder._archiveProcess();
   assert.equal(calls.find((row) => row.kind === 'processDefinitionArchiveRequest').payload.archived, false);
   assert.equal(state.canvas.readOnly, false); assert.equal(state.root.querySelector('[data-role="save"]').hasAttribute('disabled'), false);
@@ -2037,17 +2192,25 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 25);
+    assert.equal(processTemplates().length, 27);
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_manual_task')?.label,
       I18n.t('bpmn.node_manual_task'));
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_send_task')?.label,
       I18n.t('bpmn.node_send_task'));
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_receive_task')?.label,
       I18n.t('bpmn.node_receive_task'));
+    for (const name of ['signal_throw', 'signal_catch']) assert.equal(
+      processTemplates().find((template) => template.node_type === `bpmn_${name}`)?.label,
+      I18n.t(`bpmn.node_${name}`));
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of ['manual_task_opened', 'manual_task_acknowledged']) {
       assert.equal(processEventText({ kind, nodeName: 'External work', data: {} }),
         I18n.t(`bpmn.event_${kind}`, { node: 'External work' }));
+    }
+    for (const kind of ['signal_admitted', 'signal_catch_opened', 'signal_received']) {
+      const output = processEventText({ kind, nodeName: 'Order changed', data: {} });
+      assert.equal(output, I18n.t(`bpmn.event_${kind}`, { node: 'Order changed' }));
+      assert.doesNotMatch(output, /recipient_count|signal_id|subscription_id|bpmn\./);
     }
     for (const [kind, data] of [
       ['send_task_admitted', { message_name: 'order.received', correlation_key: 'case-1' }],

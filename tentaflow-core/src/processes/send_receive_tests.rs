@@ -66,11 +66,11 @@ fn send_admission_is_durable_before_receive_delivery_and_reopens_with_distinct_f
     let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db, &candidate).unwrap()
         else { panic!("the actual ReceiveTask must be selected") };
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
     let delivered_index = plan.events.iter().position(|event| event.kind == "message_delivered").unwrap();
     let completed_index = plan.events.iter().position(|event| event.kind == "receive_task_completed").unwrap();
     assert!(delivered_index < completed_index);
-    let result = repository::deliver_message(&fixture.db, &prepared, &plan, at_ms).unwrap().unwrap();
+    let result = repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
     assert_eq!(result.transition.instance.status, ProcessInstanceStatus::Completed);
     let reopened = repository::get_instance(&fixture.db, &fixture.owner,
         &receiver.instance_id, None).unwrap();
@@ -89,7 +89,7 @@ fn send_admission_is_durable_before_receive_delivery_and_reopens_with_distinct_f
         &receiver.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
     assert_eq!(repository::get_message(&reopened, &fixture.owner,
         &fixture.owner.user_id, message_id).unwrap().message.status, ProcessMessageStatus::Delivered);
-    assert!(repository::deliver_message(&reopened, &prepared, &plan, at_ms).unwrap().is_none());
+    assert!(repository::deliver_message(&reopened, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
 }
 
 #[test]
@@ -113,14 +113,14 @@ fn two_receive_waits_keep_a_broad_message_ambiguous_and_exact_delivery_single_co
         .into_iter().find(|item| item.key.message_id == exact.message_id).unwrap();
     let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db, &candidate).unwrap()
         else { panic!("the exact subscription must be selected") };
-    let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
-    repository::deliver_message(&fixture.db, &prepared, &plan, at_ms).unwrap().unwrap();
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner,
         &first.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner,
         &second.instance_id, None).unwrap().subscriptions[0].status,
         ProcessSubscriptionStatus::Open);
-    assert!(repository::deliver_message(&fixture.db, &prepared, &plan, at_ms).unwrap().is_none());
+    assert!(repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
 }
 
 #[test]
@@ -198,15 +198,15 @@ fn broad_receive_selection_skips_open_subscriptions_in_dead_scopes_across_cursor
                 .into_iter().find(|item| item.key.message_id == exact.message_id).unwrap();
             let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db,
                 &exact_candidate).unwrap() else { panic!("the later exact ReceiveTask is live") };
-            let plan = messages::plan_message_delivery(&prepared, exact_at_ms).unwrap();
-            repository::deliver_message(&fixture.db, &prepared, &plan, exact_at_ms).unwrap().unwrap();
+            let plan = messages::plan_message_delivery(&prepared, exact_at_ms, None).unwrap();
+            repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), exact_at_ms).unwrap().unwrap();
             assert_eq!(repository::get_instance(&fixture.db, &fixture.owner,
                 &recipients[3].0, None).unwrap().status, ProcessInstanceStatus::Waiting);
         } else {
             let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db,
                 &candidate).unwrap() else { panic!("the later live ReceiveTask must be selected") };
-            let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
-            let completed = repository::deliver_message(&fixture.db, &prepared, &plan, at_ms)
+            let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+            let completed = repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms)
                 .unwrap().unwrap();
             assert_eq!(completed.transition.instance.instance_id.as_str(),
                 recipients.last().unwrap().0.as_str());
@@ -249,9 +249,9 @@ fn receive_task_uses_accepted_source_time_variables_for_key_and_output_mapping()
     let at_ms = chrono::Utc::now().timestamp_millis();
     let outputs = json!({"case_key":"after"});
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs,
-        None, at_ms, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        None, at_ms, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let waiting = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-        &before.instance_id, &task.user_task_id, before.revision, &outputs, None, &plan, at_ms)
+        &before.instance_id, &task.user_task_id, before.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
     assert_eq!(waiting.variables["case_key"], "after");
@@ -276,8 +276,8 @@ fn receive_task_uses_accepted_source_time_variables_for_key_and_output_mapping()
         .into_iter().find(|item| item.key.message_id == actual.message_id).unwrap();
     let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db,
         &candidate).unwrap() else { panic!("the accepted key must select its pinned ReceiveTask") };
-    let delivery = messages::plan_message_delivery(&prepared, deliver_at_ms).unwrap();
-    let completed = repository::deliver_message(&fixture.db, &prepared, &delivery, deliver_at_ms)
+    let delivery = messages::plan_message_delivery(&prepared, deliver_at_ms, None).unwrap();
+    let completed = repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&delivery), deliver_at_ms)
         .unwrap().unwrap().transition.instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["case_key"], "after");
@@ -318,8 +318,8 @@ fn embedded_receive_completes_its_scope_and_maps_the_actual_delivery_once() {
         .into_iter().find(|item| item.key.message_id == message.message_id).unwrap();
     let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db,
         &candidate).unwrap() else { panic!("the embedded ReceiveTask must remain live") };
-    let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
-    let completed = repository::deliver_message(&fixture.db, &prepared, &plan, at_ms)
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    let completed = repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().unwrap().transition.instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["received"], json!({"embedded":42}));
@@ -336,7 +336,7 @@ fn embedded_receive_completes_its_scope_and_maps_the_actual_delivery_once() {
     assert_eq!(events.iter().filter(|event| event.kind == "scope_completed"
         && event.scope_id == child_scope_id).count(), 1);
     let rows = super::call_tests::transition_rows(&fixture);
-    assert!(repository::deliver_message(&fixture.db, &prepared, &plan, at_ms).unwrap().is_none());
+    assert!(repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
     assert_eq!(super::call_tests::transition_rows(&fixture), rows);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     assert_eq!(repository::get_instance(&reopened, &fixture.owner,
@@ -385,8 +385,8 @@ fn called_receive_returns_to_its_pinned_parent_and_cancelled_child_refuses_late_
         .into_iter().find(|item| item.key.message_id == message.message_id).unwrap();
     let MessageSelection::Ready(prepared) = repository::message_snapshot(&fixture.db,
         &candidate).unwrap() else { panic!("the pinned called ReceiveTask must be live") };
-    let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
-    repository::deliver_message(&fixture.db, &prepared, &plan, at_ms).unwrap().unwrap();
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    repository::deliver_message(&fixture.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner,
         &child_id, None).unwrap().status, ProcessInstanceStatus::Completed);
     let returned = repository::get_instance(&fixture.db, &fixture.owner,
@@ -396,7 +396,7 @@ fn called_receive_returns_to_its_pinned_parent_and_cancelled_child_refuses_late_
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     assert_eq!(repository::get_instance(&reopened, &fixture.owner,
         &parent.instance_id, None).unwrap().variables["received"], json!({"called":true}));
-    assert!(repository::deliver_message(&reopened, &prepared, &plan, at_ms).unwrap().is_none());
+    assert!(repository::deliver_message(&reopened, &prepared, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
 
     let cancelled_parent = start_version(&fixture, &caller_version);
     let cancelled_child_id = super::call_tests::child_id(&fixture, &cancelled_parent.instance_id);

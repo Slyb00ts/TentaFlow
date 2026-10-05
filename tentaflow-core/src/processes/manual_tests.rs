@@ -30,11 +30,11 @@ pub(super) fn start_manual(fixture: &Fixture, model: &ProcessModel,
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, vars.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "manual_task_opened").count(), 1);
     assert!(!plan.events.iter().any(|event| event.kind == "user_task_opened"));
     repository::start_instance(&fixture.db, &fixture.owner, &command, &instance_id,
-        &version.definition_id, version.version, &vars, &plan, at_ms).unwrap();
+        &version.definition_id, version.version, &vars, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     (instance_id, version, command)
 }
 
@@ -64,12 +64,12 @@ fn assigned_acknowledger_commits_distinct_manual_fact_and_replays_after_reopen()
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.participant.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "manual_task_acknowledged").count(), 1);
     assert!(!plan.events.iter().any(|event| event.kind == "user_task_completed"));
     let outcome = repository::acknowledge_manual_task(&fixture.db, &fixture.participant,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(outcome.instance.status, ProcessInstanceStatus::Completed);
     let reopened = repository::get_instance(&fixture.db, &fixture.participant, &instance_id, None).unwrap();
     assert_eq!(reopened.status, ProcessInstanceStatus::Completed);
@@ -92,13 +92,13 @@ fn assigned_acknowledger_commits_distinct_manual_fact_and_replays_after_reopen()
     let before_replay = transition_rows(&fixture);
     repository::acknowledge_manual_task(&fixture.db, &fixture.participant,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(transition_rows(&fixture), before_replay);
     let conflicting = repository::CommandStamp { command_id: command.command_id.clone(),
         request_hash: repository::request_hash(&"different manual acknowledgment").unwrap() };
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.participant,
         &conflicting, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before_replay);
 }
 
@@ -113,21 +113,21 @@ fn manual_acknowledgment_requires_its_assignee_and_distinct_command() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.participant.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     let before = transition_rows(&fixture);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     assert!(runtime::plan_user_completion(&snapshot, &task.user_task_id, &json!({}),
-        None, at_ms, human_input(&snapshot, &task.user_task_id, &command)).is_err());
+        None, at_ms, human_input(&snapshot, &task.user_task_id, &command), None).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut stale = plan.clone();
     stale.events.iter_mut().find(|event| event.kind == "manual_task_acknowledged")
         .unwrap().data["acknowledged_by_user_id"] = json!(fixture.owner.user_id);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.participant,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &stale, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&stale), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
 }
 
@@ -149,7 +149,7 @@ fn manual_acknowledgment_advances_to_script_and_preserves_both_factual_actions()
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.owner.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "manual_task_acknowledged").count(), 1);
     assert_eq!(plan.events.iter().filter(|event| event.kind == "script_completed"
         && event.data == json!({"outputs":42})).count(), 1);
@@ -159,11 +159,11 @@ fn manual_acknowledgment_advances_to_script_and_preserves_both_factual_actions()
         .unwrap().data = json!({"outputs":43});
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &forged, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let committed = repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.instance.variables["answer"], 42);
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None)
         .unwrap().variables["answer"], 42);
@@ -210,7 +210,7 @@ fn embedded_manual_acknowledgment_returns_only_after_the_real_child_wait() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.owner.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "scope_completed").count(), 1);
     assert_eq!(plan.events.iter().filter(|event| event.kind == "script_completed"
         && event.node_id.as_deref() == Some("ParentScript")).count(), 1);
@@ -220,7 +220,7 @@ fn embedded_manual_acknowledgment_returns_only_after_the_real_child_wait() {
     let before = transition_rows(&fixture);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &forged, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let child_end_index = plan.events.iter().position(|event|
         event.kind == "end_reached" && event.scope_id == task.scope_id).unwrap();
@@ -236,29 +236,29 @@ fn embedded_manual_acknowledgment_returns_only_after_the_real_child_wait() {
     wrong_child_source.event_sources.insert(child_end_index, parent_wait_id);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &wrong_child_source, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_child_source), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut wrong_parent_source = plan.clone();
     wrong_parent_source.event_sources.insert(parent_script_index, child_end_source.clone());
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &wrong_parent_source, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_parent_source), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut wrong_parent_end = plan.clone();
     wrong_parent_end.event_sources.insert(parent_end_index, child_end_source);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &wrong_parent_end, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_parent_end), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut missing_child_end = plan.clone();
     missing_child_end.events[child_end_index].kind = "node_completed".into();
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &missing_child_end, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&missing_child_end), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let committed = repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None)
         .unwrap().status, ProcessInstanceStatus::Completed);
@@ -275,14 +275,14 @@ fn owner_cancel_closes_manual_wait_and_denies_late_acknowledgment() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.owner.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     let cancelled = repository::cancel_instance(&fixture.db, &fixture.owner,
         &stamp("cancel-manual"), &instance_id, snapshot.instance.revision).unwrap();
     assert_eq!(cancelled.instance.status, ProcessInstanceStatus::Cancelled);
     let before = transition_rows(&fixture);
     assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
     assert_eq!(reopened.status, ProcessInstanceStatus::Cancelled);

@@ -1156,6 +1156,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_send_receive_task_subscriptions",
             MigrationStep::RustSelfManaged(bpmn_send_receive_task_subscriptions),
         ),
+        (
+            192,
+            "bpmn_signal_fanout",
+            MigrationStep::RustSelfManaged(bpmn_signal_fanout),
+        ),
     ]
 }
 
@@ -2482,6 +2487,173 @@ fn bpmn_send_receive_task_subscriptions(conn: &Connection, version: i64, name: &
         (Err(error), Ok(mode)) if mode == original_fk => Err(error),
         (Err(error), Ok(_)) => Err(error.context("send/receive migration could not restore foreign key mode")),
         (Err(error), Err(restore)) => Err(error.context(format!("send/receive migration could not restore foreign key mode: {restore}"))),
+    }
+}
+
+const BPMN_SIGNAL_FANOUT_SUBSCRIPTIONS: &str = r#"
+CREATE TABLE bpmn_event_subscriptions_192 (
+    subscription_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    kind TEXT NOT NULL CHECK(kind IN ('message_catch','boundary_message','boundary_error','boundary_escalation','receive_task','signal_catch')),
+    message_name TEXT,
+    correlation_key TEXT,
+    error_code TEXT,
+    escalation_code TEXT,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    signal_namespace_uri TEXT,
+    signal_declaration_id TEXT,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('open','consumed','cancelled','error')),
+    last_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    UNIQUE(instance_id,node_id,token_id),
+    CHECK(
+        (kind='boundary_error' AND message_name IS NULL AND correlation_key IS NULL AND race_id IS NULL AND escalation_code IS NULL)
+        OR (kind='boundary_escalation' AND message_name IS NULL AND correlation_key IS NULL AND error_code IS NULL AND race_id IS NULL
+            AND (escalation_code IS NULL OR (typeof(escalation_code)='text' AND length(CAST(escalation_code AS BLOB)) BETWEEN 1 AND 64 AND escalation_code NOT GLOB '*[^A-Za-z0-9_.:-]*')))
+        OR (kind IN ('message_catch','boundary_message','receive_task') AND error_code IS NULL AND escalation_code IS NULL
+            AND ((status='error' AND correlation_key IS NULL) OR (message_name IS NOT NULL AND length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256 AND correlation_key IS NOT NULL AND length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256)))
+        OR (kind='signal_catch' AND message_name IS NULL AND correlation_key IS NULL AND error_code IS NULL AND escalation_code IS NULL AND race_id IS NULL)
+    ),
+    CHECK(kind='message_catch' OR race_id IS NULL),
+    CHECK((kind='signal_catch' AND signal_namespace_uri IS NOT NULL AND length(CAST(signal_namespace_uri AS BLOB)) BETWEEN 1 AND 256
+        AND signal_declaration_id IS NOT NULL AND length(CAST(signal_declaration_id AS BLOB)) BETWEEN 1 AND 256)
+        OR (kind<>'signal_catch' AND signal_namespace_uri IS NULL AND signal_declaration_id IS NULL)),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,subscription_id),
+    FOREIGN KEY(instance_id,scope_id,race_id) REFERENCES bpmn_event_races(instance_id,scope_id,race_id) DEFERRABLE INITIALLY DEFERRED
+);
+INSERT INTO bpmn_event_subscriptions_192(subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms)
+SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions;
+"#;
+
+const BPMN_SIGNAL_FANOUT_SWAP: &str = r#"
+DROP TABLE bpmn_event_subscriptions;
+ALTER TABLE bpmn_event_subscriptions_192 RENAME TO bpmn_event_subscriptions;
+CREATE INDEX idx_bpmn_subscriptions_match ON bpmn_event_subscriptions(org_id,definition_id,message_name,correlation_key,status,instance_id,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_instance ON bpmn_event_subscriptions(instance_id,status,created_at_ms,subscription_id);
+CREATE INDEX idx_bpmn_subscriptions_race ON bpmn_event_subscriptions(race_id);
+CREATE INDEX idx_bpmn_subscriptions_signal ON bpmn_event_subscriptions(org_id,signal_namespace_uri,signal_declaration_id,status,subscription_id);
+CREATE UNIQUE INDEX uq_bpmn_escalation_exact_open ON bpmn_event_subscriptions(instance_id,scope_id,token_id,escalation_code) WHERE kind='boundary_escalation' AND status='open' AND escalation_code IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_escalation_catchall_open ON bpmn_event_subscriptions(instance_id,scope_id,token_id) WHERE kind='boundary_escalation' AND status='open' AND escalation_code IS NULL;
+CREATE TABLE bpmn_signal_emissions (
+    signal_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    sender_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    source_instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id),
+    source_scope_id TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
+    source_activation_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    source_definition_id TEXT NOT NULL,
+    source_version INTEGER NOT NULL CHECK(source_version>0),
+    source_model_sha256 TEXT NOT NULL,
+    source_event_id TEXT NOT NULL UNIQUE REFERENCES bpmn_events(event_id),
+    signal_namespace_uri TEXT NOT NULL,
+    signal_declaration_id TEXT NOT NULL,
+    payload_json TEXT,
+    payload_sha256 TEXT NOT NULL,
+    payload_bytes INTEGER NOT NULL CHECK(payload_bytes>=0 AND payload_bytes<=262144),
+    admitted_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>admitted_at_ms),
+    status TEXT NOT NULL CHECK(status IN ('pending','settled')),
+    revision INTEGER NOT NULL CHECK(revision>0),
+    settled_at_ms INTEGER,
+    payload_pruned_at_ms INTEGER,
+    CHECK((payload_json IS NOT NULL AND payload_pruned_at_ms IS NULL) OR (payload_json IS NULL AND payload_pruned_at_ms IS NOT NULL AND status='settled')),
+    CHECK((status='pending' AND settled_at_ms IS NULL) OR (status='settled' AND settled_at_ms IS NOT NULL)),
+    FOREIGN KEY(source_definition_id,source_version) REFERENCES bpmn_versions(definition_id,version),
+    FOREIGN KEY(source_instance_id,source_scope_id,source_activation_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id),
+    UNIQUE(source_instance_id,source_activation_id,source_node_id)
+);
+CREATE INDEX idx_bpmn_signal_emissions_sender ON bpmn_signal_emissions(org_id,sender_user_id,status,signal_id);
+CREATE INDEX idx_bpmn_signal_emissions_org ON bpmn_signal_emissions(org_id,status,signal_id);
+CREATE INDEX idx_bpmn_signal_emissions_prune ON bpmn_signal_emissions(status,settled_at_ms,signal_id);
+CREATE TABLE bpmn_signal_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    signal_id TEXT NOT NULL REFERENCES bpmn_signal_emissions(signal_id),
+    recipient_org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    recipient_instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id),
+    recipient_definition_id TEXT NOT NULL,
+    recipient_version INTEGER NOT NULL CHECK(recipient_version>0),
+    recipient_model_sha256 TEXT NOT NULL,
+    recipient_scope_id TEXT NOT NULL,
+    recipient_node_id TEXT NOT NULL,
+    recipient_token_id TEXT NOT NULL REFERENCES bpmn_tokens(token_id),
+    recipient_subscription_id TEXT NOT NULL REFERENCES bpmn_event_subscriptions(subscription_id),
+    recipient_activation_id TEXT NOT NULL,
+    recipient_ordinal INTEGER NOT NULL CHECK(recipient_ordinal>=0 AND recipient_ordinal<64),
+    status TEXT NOT NULL CHECK(status IN ('pending','claimed','delivered','cancelled','expired','denied','error')),
+    terminal_reason TEXT CHECK(terminal_reason IN ('recipient_closed','activation_consumed','activation_error','ttl_expired','recipient_access_revoked','recipient_mapping_failed','transient_retry_exhausted')),
+    revision INTEGER NOT NULL CHECK(revision>0),
+    attempt_count INTEGER NOT NULL CHECK(attempt_count BETWEEN 0 AND 5),
+    claim_fence TEXT,
+    claim_owner TEXT,
+    lease_until_ms INTEGER,
+    next_check_at_ms INTEGER,
+    delivered_at_ms INTEGER,
+    terminal_at_ms INTEGER,
+    incident_id TEXT REFERENCES bpmn_incidents(incident_id),
+    UNIQUE(signal_id,recipient_subscription_id),
+    UNIQUE(signal_id,recipient_activation_id),
+    UNIQUE(signal_id,recipient_ordinal),
+    FOREIGN KEY(recipient_definition_id,recipient_version) REFERENCES bpmn_versions(definition_id,version),
+    FOREIGN KEY(recipient_instance_id,recipient_scope_id,recipient_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id),
+    FOREIGN KEY(recipient_instance_id,recipient_scope_id,recipient_subscription_id) REFERENCES bpmn_event_subscriptions(instance_id,scope_id,subscription_id),
+    CHECK((status IN ('pending','claimed','delivered') AND terminal_reason IS NULL) OR
+        (status='cancelled' AND terminal_reason IN ('recipient_closed','activation_consumed','activation_error')) OR
+        (status='expired' AND terminal_reason='ttl_expired') OR
+        (status='denied' AND terminal_reason='recipient_access_revoked') OR
+        (status='error' AND terminal_reason IN ('recipient_mapping_failed','transient_retry_exhausted'))),
+    CHECK((status='delivered' AND delivered_at_ms IS NOT NULL) OR (status<>'delivered' AND delivered_at_ms IS NULL)),
+    CHECK((status IN ('delivered','cancelled','expired','denied','error') AND terminal_at_ms IS NOT NULL) OR
+        (status IN ('pending','claimed') AND terminal_at_ms IS NULL)),
+    CHECK((status='claimed' AND claim_fence IS NOT NULL AND claim_owner IS NOT NULL AND lease_until_ms IS NOT NULL) OR
+        (status<>'claimed' AND claim_fence IS NULL AND claim_owner IS NULL AND lease_until_ms IS NULL))
+);
+CREATE INDEX idx_bpmn_signal_receipts_due ON bpmn_signal_receipts(status,next_check_at_ms,receipt_id);
+CREATE INDEX idx_bpmn_signal_receipts_recipient ON bpmn_signal_receipts(recipient_instance_id,recipient_subscription_id,status,receipt_id);
+CREATE INDEX idx_bpmn_signal_receipts_emission ON bpmn_signal_receipts(signal_id,status,receipt_id);
+CREATE INDEX idx_bpmn_signal_receipts_org ON bpmn_signal_receipts(recipient_org_id,status,receipt_id);
+"#;
+
+fn bpmn_signal_fanout(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let original_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        let old_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_event_subscriptions", [], |row| row.get(0))?;
+        tx.execute_batch(BPMN_SIGNAL_FANOUT_SUBSCRIPTIONS)?;
+        let new_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_event_subscriptions_192", [], |row| row.get(0))?;
+        anyhow::ensure!(old_count == new_count, "signal migration changed subscription count");
+        let changed: i64 = tx.query_row("SELECT COUNT(*) FROM (SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions EXCEPT SELECT subscription_id,instance_id,scope_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions_192)", [], |row| row.get(0))?;
+        anyhow::ensure!(changed == 0, "signal migration changed an existing subscription row");
+        tx.execute_batch(BPMN_SIGNAL_FANOUT_SWAP)?;
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(violations.is_empty(), "signal migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "signal migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations(version,name) VALUES(?1,?2)", rusqlite::params![version,name])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if original_fk == 0 { "PRAGMA foreign_keys = OFF;" } else { "PRAGMA foreign_keys = ON;" };
+    let restored = conn.execute_batch(restore).and_then(|()| conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)));
+    match (result, restored) {
+        (Ok(()), Ok(mode)) if mode == original_fk => Ok(()),
+        (Ok(()), Ok(_)) => anyhow::bail!("signal migration could not restore foreign key mode"),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Ok(mode)) if mode == original_fk => Err(error),
+        (Err(error), Ok(_)) => Err(error.context("signal migration could not restore foreign key mode")),
+        (Err(error), Err(restore)) => Err(error.context(format!("signal migration could not restore foreign key mode: {restore}"))),
     }
 }
 
@@ -16345,7 +16517,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 191);
+        assert_eq!(version, 192);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -16372,7 +16544,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 191);
+        assert_eq!(version, 192);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -16476,7 +16648,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 191);
+        assert_eq!(version, 192);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(
@@ -16581,7 +16753,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            191
+            192
         );
         assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
         let receipt: (String, String, String) = conn
@@ -16674,14 +16846,14 @@ mod tests {
             let at_ms = chrono::Utc::now().timestamp_millis();
             let stamp = repository::CommandStamp { command_id: uuid::Uuid::new_v4().to_string(), request_hash: repository::request_hash(&format!("complete branch {branch}")).unwrap() };
             let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&serde_json::Value::Null,None,at_ms,
-                runtime::test_support::human_input(&snapshot,&task.user_task_id,&stamp)).unwrap();
+                runtime::test_support::human_input(&snapshot,&task.user_task_id,&stamp), None).unwrap();
             last_task = task.user_task_id.clone();
             last_revision = snapshot.instance.revision;
             last_plan = Some(plan.clone());
             last_at_ms = at_ms;
             last_command = Some(stamp.clone());
             let result = repository::complete_user_task(&db,&actor,&stamp,"and-instance",&task.user_task_id,
-                snapshot.instance.revision,&serde_json::Value::Null,None,&plan,at_ms).unwrap().instance;
+                snapshot.instance.revision,&serde_json::Value::Null,None,repository::ProcessPlanInput::Supplied(&plan),at_ms).unwrap().instance;
             let receipt_count: i64 = db.read().unwrap().query_row(
                 "SELECT COUNT(*) FROM bpmn_gateway_receipts WHERE instance_id='and-instance' AND activation_id='and-activation'", [], |row| row.get(0)).unwrap();
             if branch == 8 {
@@ -16697,7 +16869,7 @@ mod tests {
         assert_eq!(events.iter().filter(|event| event.kind == "end_reached").count(), 1);
         let event_count = events.len();
         let replay = repository::complete_user_task(&db,&actor,&last_command.unwrap(),"and-instance",&last_task,
-            last_revision,&serde_json::Value::Null,None,&last_plan.unwrap(),last_at_ms).unwrap().instance;
+            last_revision,&serde_json::Value::Null,None,repository::ProcessPlanInput::Supplied(&last_plan.unwrap()),last_at_ms).unwrap().instance;
         assert_eq!(replay.status, ProcessInstanceStatus::Completed);
         assert_eq!(repository::list_events(&db,&actor,"and-instance",0,200).unwrap().0.len(), event_count);
         let conn = db.read().unwrap();
@@ -16970,7 +17142,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            191
+            192
         );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(
@@ -17032,7 +17204,7 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(new_events, old_events);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 191);
+            |row| row.get::<_,i64>(0)).unwrap(), 192);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(), "ok");
@@ -17060,6 +17232,64 @@ mod tests {
     }
 
     #[test]
+    fn signal_migration_preserves_populated_subscriptions_and_opaque_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("signal-upgrade.db")).unwrap();
+        escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 191);
+        let old: (String, String, String, String) = conn.query_row(
+            "SELECT s.subscription_id,s.kind,v.model_json,e.data_json \
+             FROM bpmn_event_subscriptions s JOIN bpmn_versions v \
+             ON v.definition_id=s.definition_id AND v.version=s.version \
+             JOIN bpmn_events e ON e.instance_id=s.instance_id \
+             WHERE s.subscription_id='legacy-subscription' LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        run(&conn).unwrap();
+        let current: (String, String, String, String) = conn.query_row(
+            "SELECT s.subscription_id,s.kind,v.model_json,e.data_json \
+             FROM bpmn_event_subscriptions s JOIN bpmn_versions v \
+             ON v.definition_id=s.definition_id AND v.version=s.version \
+             JOIN bpmn_events e ON e.instance_id=s.instance_id \
+             WHERE s.subscription_id='legacy-subscription' LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(current, old);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 192);
+        for table in ["bpmn_signal_emissions", "bpmn_signal_receipts"] {
+            assert!(table_exists(&conn, table).unwrap());
+            assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [],
+                |row| row.get::<_,u32>(0)).unwrap(), 0);
+        }
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn signal_migration_rolls_back_invalid_legacy_reference_and_restores_fk_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("signal-invalid.db")).unwrap();
+        escalation_subscription_fixture(&conn);
+        run_ladder_up_to(&conn, 191);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE bpmn_event_subscriptions SET token_id='missing-token' \
+            WHERE subscription_id='legacy-subscription'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 191);
+        assert_eq!(conn.query_row("SELECT token_id FROM bpmn_event_subscriptions \
+            WHERE subscription_id='legacy-subscription'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "missing-token");
+        assert!(!table_exists(&conn, "bpmn_event_subscriptions_192").unwrap());
+        assert!(!table_exists(&conn, "bpmn_signal_emissions").unwrap());
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
     fn repetition_migration_adds_only_empty_scoped_tables_after_populated_legacy_facts() {
         let directory = tempfile::tempdir().unwrap();
         let conn = Connection::open(directory.path().join("repeat-upgrade.db")).unwrap();
@@ -17073,10 +17303,10 @@ mod tests {
         let old_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         run(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 191);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 192);
         let new_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(new_tables.len(), old_tables.len() + 2);
+        assert_eq!(new_tables.len(), old_tables.len() + 4);
         assert!(new_tables.contains(&"bpmn_repetition_groups".to_string()));
         assert!(new_tables.contains(&"bpmn_repetition_occurrences".to_string()));
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_groups", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
@@ -17126,7 +17356,7 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         run(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 191);
+            |row| row.get::<_,i64>(0)).unwrap(), 192);
         let after: (String,String,String) = conn.query_row(
             "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();

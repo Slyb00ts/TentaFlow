@@ -370,7 +370,9 @@ pub fn next_timer_occurrence(
     })
 }
 
-pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePlan> {
+pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
+    signal_admission: Option<&runtime::SignalAdmissionResolver<'_>>,
+) -> Result<RuntimePlan> {
     let timer = match snapshot {
         TimerSnapshot::Start { timer, .. }
         | TimerSnapshot::Catch { timer, .. }
@@ -412,7 +414,7 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
                     expected_timer_revision: timer.revision,
                     fired_occurrence: advance.selected_occurrence,
                 },
-            )?
+            signal_admission)?
         }
         TimerSnapshot::Catch {
             timer, snapshot, ..
@@ -421,7 +423,7 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
                 timer_id: timer.timer_id.clone(),
                 expected_timer_revision: timer.revision,
                 fired_occurrence: advance.selected_occurrence,
-            })?,
+            }, signal_admission)?,
         TimerSnapshot::Boundary {
             timer, snapshot, ..
         } => runtime::plan_timer_boundary(snapshot, timer, at_ms,
@@ -429,7 +431,7 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64) -> Result<RuntimePl
                 timer_id: timer.timer_id.clone(),
                 expected_timer_revision: timer.revision,
                 fired_occurrence: advance.selected_occurrence,
-            })?,
+            }, signal_admission)?,
     };
     let skipped_from = (advance.skipped_count > 0).then_some(timer.occurrence);
     let skipped_through = (advance.skipped_count > 0).then(|| advance.selected_occurrence - 1);
@@ -548,7 +550,6 @@ pub fn drain_due(pool: &DbPool, at_ms: i64) -> TimerDrainOutcome {
     for candidate in candidates {
         let outcome = (|| {
             let snapshot = repository::timer_snapshot(pool, &candidate)?;
-            let plan = plan_timer_fire(&snapshot, at_ms)?;
             let (actor, revision) = match &snapshot {
                 TimerSnapshot::Start { actor, .. } => (actor, None),
                 TimerSnapshot::Catch {
@@ -558,7 +559,8 @@ pub fn drain_due(pool: &DbPool, at_ms: i64) -> TimerDrainOutcome {
                     actor, snapshot, ..
                 } => (actor, Some(snapshot.instance.revision)),
             };
-            repository::fire_timer(pool, &candidate, actor, revision, &plan, at_ms)
+            repository::fire_timer(pool, &candidate, actor, revision,
+                repository::ProcessPlanInput::Canonical, at_ms)
         })();
         match outcome {
             Ok(Some(committed)) => {
@@ -717,7 +719,7 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap()
             .into_iter().find(|timer| timer.timer_id == before.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
         assert_eq!(plan.events[0].kind, "timer_fired");
         assert_eq!(plan.create_messages.len(), 1);
         let queued_index = plan.create_messages[0].source_event_index;
@@ -736,7 +738,7 @@ mod tests {
             | repository::VariableEffect::RepetitionAggregate { event_index, .. } => *event_index > 0,
         }));
         let committed = repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(before.instance.revision), &plan, due).unwrap().unwrap().instance;
+            Some(before.instance.revision), repository::ProcessPlanInput::Supplied(&plan), due).unwrap().unwrap().instance;
         assert_eq!(committed.status, ProcessInstanceStatus::Completed);
         assert_eq!(committed.outgoing_messages.len(), 1);
         assert_eq!(committed.outgoing_messages[0].status, ProcessMessageStatus::Pending);
@@ -773,7 +775,7 @@ mod tests {
             StartCause::Manual,
             at_ms,
             runtime::test_support::manual_input(&command),
-        )
+        None)
         .unwrap();
         repository::start_instance(
             &fixture.db,
@@ -783,7 +785,7 @@ mod tests {
             &version.definition_id,
             version.version,
             &variables,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -802,7 +804,7 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
         use tentaflow_protocol::processes::{ProcessEventRaceStatus as R, ProcessSubscriptionStatus as S};
         assert_eq!(plan.race_updates.len(), 1);
         assert_eq!(plan.race_updates[0].status, R::Won);
@@ -818,18 +820,18 @@ mod tests {
         extra.winner_timer_id = None;
         duplicate.race_updates.push(extra);
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &duplicate, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&duplicate), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut wrong_winner = plan.clone();
         wrong_winner.race_updates[0].winner_node_id = Some("Catch_1".into());
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &wrong_winner, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&wrong_winner), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut foreign = plan.clone();
         let other_tokens = repository::runtime_snapshot(&fixture.db, &fixture.owner, &other.instance_id).unwrap().tokens;
         foreign.cancel_token_ids.push(other_tokens[0].token_id.clone());
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &foreign, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&foreign), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let drained = drain_due(&fixture.db, due);
         drained.completion.unwrap();
@@ -884,9 +886,9 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &plan, due).unwrap().is_some());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&plan), due).unwrap().is_some());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
         assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
         assert_eq!(after.event_races[0].status, tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
@@ -913,7 +915,7 @@ mod tests {
             .find(|candidate| candidate.timer_id == started.timers.iter()
                 .find(|timer| timer.node_id == "Timer_1").unwrap().timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
         use tentaflow_protocol::processes::ProcessEventRaceStatus as R;
         assert_eq!(plan.race_updates.len(), 2);
         assert!(plan.race_updates.iter().any(|update| update.race_id == first.race_id && update.status == R::Won));
@@ -924,19 +926,19 @@ mod tests {
         let mut missing_loser = plan.clone();
         missing_loser.cancel_token_ids.retain(|id| id != &loser);
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &missing_loser, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&missing_loser), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut duplicate_loser = plan.clone();
         duplicate_loser.cancel_token_ids.push(loser);
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &duplicate_loser, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&duplicate_loser), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut wrong_scope = plan.clone();
         wrong_scope.events.iter_mut().find(|event| event.kind == "event_race_cancelled"
             && event.data["race_id"].as_str() == Some(other.race_id.as_str())).unwrap().scope_id =
             Uuid::new_v4().to_string();
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &wrong_scope, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&wrong_scope), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut extra_winner = plan.clone();
         let other_update = extra_winner.race_updates.iter_mut().find(|update| update.race_id == other.race_id).unwrap();
@@ -945,10 +947,10 @@ mod tests {
         other_update.winner_subscription_id = started.subscriptions.iter().find(|sub| sub.node_id == "OtherCatch")
             .map(|sub| sub.subscription_id.clone());
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &extra_winner, due).is_err());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&extra_winner), due).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(started.revision), &plan, due).unwrap().is_some());
+            Some(started.revision), repository::ProcessPlanInput::Supplied(&plan), due).unwrap().is_some());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
         assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
         assert_eq!(after.event_races.iter().find(|race| race.race_id == first.race_id).unwrap().status, R::Won);
@@ -1195,7 +1197,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms, None).unwrap();
         let id = plan
             .start_instance_id
             .clone()
@@ -1233,7 +1235,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let other_snapshot = repository::timer_snapshot(&reopened, &other_candidate).unwrap();
-        let other_plan = plan_timer_fire(&other_snapshot, at_ms).unwrap();
+        let other_plan = plan_timer_fire(&other_snapshot, at_ms, None).unwrap();
         let other_id = other_plan.start_instance_id.clone().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let results = std::thread::scope(|scope| {
@@ -1241,7 +1243,7 @@ mod tests {
             let (pool, first_candidate, actor, first_plan) = (&reopened, &candidate, &owner, &plan);
             let first = scope.spawn(move || {
                 first_barrier.wait();
-                repository::fire_timer(pool, first_candidate, actor, None, first_plan, at_ms)
+                repository::fire_timer(pool, first_candidate, actor, None, repository::ProcessPlanInput::Supplied(first_plan), at_ms)
                     .unwrap()
             });
             let second = scope.spawn(|| {
@@ -1251,7 +1253,7 @@ mod tests {
                     &other_candidate,
                     &owner,
                     None,
-                    &other_plan,
+                    repository::ProcessPlanInput::Supplied(&other_plan),
                     at_ms,
                 )
                 .unwrap()
@@ -1286,7 +1288,7 @@ mod tests {
                 && model.nodes.iter().any(|actual| &actual.id == node)
         }));
         assert!(
-            repository::fire_timer(&reopened, &candidate, &owner, None, &plan, at_ms)
+            repository::fire_timer(&reopened, &candidate, &owner, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
                 .unwrap()
                 .is_none()
         );
@@ -1365,7 +1367,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let timer_snapshot = repository::timer_snapshot(&reopened, &candidate).unwrap();
-        let plan = plan_timer_fire(&timer_snapshot, at_ms + 60_000).unwrap();
+        let plan = plan_timer_fire(&timer_snapshot, at_ms + 60_000, None).unwrap();
         repository::cancel_instance(
             &reopened,
             &owner,
@@ -1380,7 +1382,7 @@ mod tests {
             &candidate,
             &owner,
             Some(waiting.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 60_000
         )
         .unwrap()
@@ -1487,13 +1489,13 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms + 60_000).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms + 60_000, None).unwrap();
         let partial = repository::fire_timer(
             &fixture.db,
             &candidate,
             &fixture.owner,
             Some(waiting.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 60_000,
         )
         .unwrap()
@@ -1529,7 +1531,7 @@ mod tests {
             None,
             at_ms + 61_000,
             runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-        )
+        None)
         .unwrap();
         let completed = repository::complete_user_task(
             &reopened,
@@ -1540,7 +1542,7 @@ mod tests {
             partial.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 61_000,
         )
         .unwrap()
@@ -1561,7 +1563,7 @@ mod tests {
             &candidate,
             &owner,
             Some(waiting.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 61_000
         )
         .unwrap()
@@ -1675,7 +1677,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due + 120_000).unwrap();
+        let plan = plan_timer_fire(&snapshot, due + 120_000, None).unwrap();
         crate::db::repository::update_user_account(
             &fixture.db,
             &fixture.owner.user_id,
@@ -1689,7 +1691,7 @@ mod tests {
             &candidate,
             &fixture.owner,
             Some(waiting.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             due + 120_000,
         )
         .unwrap_err();
@@ -1892,7 +1894,7 @@ mod tests {
             None,
             at_ms + 61_000,
             runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-        )
+        None)
         .unwrap();
         let still_incident = repository::complete_user_task(
             &fixture.db,
@@ -1903,7 +1905,7 @@ mod tests {
             snapshot.instance.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 61_000,
         )
         .unwrap()
@@ -2148,7 +2150,7 @@ mod tests {
                 StartCause::Manual,
                 at_ms,
                 runtime::test_support::manual_input(&command),
-            )
+            None)
             .unwrap();
             repository::start_instance(
                 &fixture.db,
@@ -2158,7 +2160,7 @@ mod tests {
                 &version.definition_id,
                 version.version,
                 &json!({}),
-                &plan,
+                repository::ProcessPlanInput::Supplied(&plan),
                 at_ms,
             )
             .unwrap();
@@ -2230,7 +2232,7 @@ mod tests {
             })
             .expect("actual due boundary");
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms, None).unwrap();
         (candidate, snapshot, plan)
     }
 
@@ -2256,7 +2258,7 @@ mod tests {
         let command = stamp("complete exact work");
         let plan =
             runtime::plan_user_completion(&snapshot, task_id, &outputs, None, at_ms,
-                runtime::test_support::human_input(&snapshot, task_id, &command)).unwrap();
+                runtime::test_support::human_input(&snapshot, task_id, &command), None).unwrap();
         repository::complete_user_task(
             &fixture.db,
             actor,
@@ -2266,7 +2268,7 @@ mod tests {
             snapshot.instance.revision,
             &outputs,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -2315,7 +2317,7 @@ mod tests {
             &candidate,
             &fixture.owner,
             Some(started.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             2_000
         )
         .unwrap()
@@ -2367,7 +2369,7 @@ mod tests {
             None,
             2_000,
             runtime::test_support::human_input(&snapshot, &snapshot.user_tasks[0].user_task_id, &command),
-        )
+        None)
         .unwrap();
         let first = current_boundary(&fixture, &started.instance_id, "Limit_A", 2_000);
         let second = current_boundary(&fixture, &started.instance_id, "Limit_B", 2_000);
@@ -2380,7 +2382,7 @@ mod tests {
                     &first.0,
                     &fixture.owner,
                     Some(started.revision),
-                    &first.2,
+                    repository::ProcessPlanInput::Supplied(&first.2),
                     2_000,
                 )
                 .unwrap()
@@ -2392,7 +2394,7 @@ mod tests {
                     &second.0,
                     &fixture.owner,
                     Some(started.revision),
-                    &second.2,
+                    repository::ProcessPlanInput::Supplied(&second.2),
                     2_000,
                 )
                 .unwrap()
@@ -2434,7 +2436,7 @@ mod tests {
             started.revision,
             &json!({"answer":"late"}),
             None,
-            &completion,
+            repository::ProcessPlanInput::Supplied(&completion),
             2_000
         )
         .is_err());
@@ -2484,7 +2486,7 @@ mod tests {
             &first,
             &fixture.owner,
             Some(started.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             2_000,
         )
         .unwrap()
@@ -2536,7 +2538,7 @@ mod tests {
             &second,
             &fixture.owner,
             Some(before.instance.revision),
-            &plan2,
+            repository::ProcessPlanInput::Supplied(&plan2),
             3_000,
         )
         .unwrap()
@@ -2570,7 +2572,7 @@ mod tests {
             &first,
             &fixture.owner,
             Some(started.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             3_000
         )
         .unwrap()
@@ -2580,7 +2582,7 @@ mod tests {
             &second,
             &fixture.owner,
             Some(before.instance.revision),
-            &plan2,
+            repository::ProcessPlanInput::Supplied(&plan2),
             3_000
         )
         .unwrap()
@@ -2639,7 +2641,7 @@ mod tests {
             &candidate,
             &fixture.owner,
             Some(before.instance.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms + 1_000,
         )
         .unwrap()
@@ -2680,7 +2682,7 @@ mod tests {
                 expression_observation: None,
             },
             after.instance.revision,
-            &repository::RuntimePlan::initial(json!({})),
+            repository::ProcessPlanInput::Supplied(&repository::RuntimePlan::initial(json!({}))),
             at_ms + 1_000,
         )
         .unwrap()
@@ -2923,7 +2925,7 @@ mod tests {
             &candidate,
             &fixture.owner,
             Some(started.revision),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             2_000,
         )
         .unwrap_err();
@@ -3220,7 +3222,7 @@ mod tests {
                     Some(true),
                     at_ms,
                     runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-                )
+                None)
                 .unwrap();
                 repository::complete_user_task(
                     &fixture.db,
@@ -3231,7 +3233,7 @@ mod tests {
                     snapshot.instance.revision,
                     &json!({}),
                     Some(true),
-                    &plan,
+                    repository::ProcessPlanInput::Supplied(&plan),
                     at_ms,
                 )
                 .unwrap()
@@ -3318,7 +3320,7 @@ mod tests {
                 StartCause::Manual,
                 anchor,
                 runtime::test_support::manual_input(&command),
-            )
+            None)
             .unwrap();
             let waiting = repository::start_instance(
                 &fixture.db,
@@ -3328,7 +3330,7 @@ mod tests {
                 &version.definition_id,
                 version.version,
                 &json!({}),
-                &plan,
+                repository::ProcessPlanInput::Supplied(&plan),
                 anchor,
             )
             .unwrap();
@@ -3383,7 +3385,7 @@ mod tests {
                 None,
                 activation,
                 runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-            )
+            None)
             .unwrap();
             let opened = repository::complete_user_task(
                 &fixture.db,
@@ -3394,7 +3396,7 @@ mod tests {
                 snapshot.instance.revision,
                 &json!({}),
                 None,
-                &completion,
+                repository::ProcessPlanInput::Supplied(&completion),
                 activation,
             )
             .unwrap()
@@ -3499,7 +3501,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
         fixture
             .db
             .write()
@@ -3510,7 +3512,7 @@ mod tests {
             )
             .unwrap();
         let error =
-            repository::fire_timer(&fixture.db, &candidate, &fixture.owner, None, &plan, due)
+            repository::fire_timer(&fixture.db, &candidate, &fixture.owner, None, repository::ProcessPlanInput::Supplied(&plan), due)
                 .unwrap_err();
         assert!(error
             .downcast_ref::<repository::ProcessAuthorityDenied>()
@@ -3593,13 +3595,13 @@ mod tests {
                 None,
                 anchor + 1000,
                 runtime::test_support::human_input(&before, &task.user_task_id, &command),
-            )
+            None)
             .unwrap();
             let candidate = repository::due_timers(&fixture.db, anchor + 1000, 32)
                 .unwrap()
                 .remove(0);
             let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-            let fire = plan_timer_fire(&snapshot, anchor + 1000).unwrap();
+            let fire = plan_timer_fire(&snapshot, anchor + 1000, None).unwrap();
             if complete_first {
                 repository::complete_user_task(
                     &fixture.db,
@@ -3610,7 +3612,7 @@ mod tests {
                     before.instance.revision,
                     &json!({"answer":"completed"}),
                     None,
-                    &completion,
+                    repository::ProcessPlanInput::Supplied(&completion),
                     anchor + 1000,
                 )
                 .unwrap()
@@ -3620,7 +3622,7 @@ mod tests {
                     &candidate,
                     &fixture.owner,
                     Some(before.instance.revision),
-                    &fire,
+                    repository::ProcessPlanInput::Supplied(&fire),
                     anchor + 1000
                 )
                 .unwrap()
@@ -3631,7 +3633,7 @@ mod tests {
                     &candidate,
                     &fixture.owner,
                     Some(before.instance.revision),
-                    &fire,
+                    repository::ProcessPlanInput::Supplied(&fire),
                     anchor + 1000,
                 )
                 .unwrap()
@@ -3646,7 +3648,7 @@ mod tests {
                     before.instance.revision,
                     &json!({"answer":"completed"}),
                     None,
-                    &completion,
+                    repository::ProcessPlanInput::Supplied(&completion),
                     anchor + 1000
                 )
                 .is_err());
@@ -3805,7 +3807,7 @@ mod tests {
             StartCause::Manual,
             anchor,
             runtime::test_support::manual_input(&command),
-        )
+        None)
         .unwrap();
         assert_eq!(plan.create_timers.len(), 1);
         let timer = &plan.create_timers[0];
@@ -3855,7 +3857,7 @@ mod tests {
                     &version.definition_id,
                     version.version,
                     &variables,
-                    &forged,
+                    repository::ProcessPlanInput::Supplied(&forged),
                     anchor,
                 )
                 .is_err(),
@@ -3881,7 +3883,7 @@ mod tests {
             &version.definition_id,
             version.version,
             &variables,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             anchor,
         )
         .unwrap();

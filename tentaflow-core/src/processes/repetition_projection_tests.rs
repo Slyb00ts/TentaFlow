@@ -109,7 +109,7 @@ fn real_twenty_group_and_occurrence_pages_preserve_selected_aggregate_within_nat
             None,
             at_ms,
             runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-        )
+        None)
         .unwrap();
         repository::complete_user_task(
             &fixture.db,
@@ -120,7 +120,7 @@ fn real_twenty_group_and_occurrence_pages_preserve_selected_aggregate_within_nat
             snapshot.instance.revision,
             &outputs,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap();

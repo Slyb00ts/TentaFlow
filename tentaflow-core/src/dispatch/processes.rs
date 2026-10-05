@@ -343,36 +343,9 @@ pub fn process_dispatch(
             {
                 prior
             } else {
-                let published = repository::get_version(pool, &actor, definition_id, *version)
-                    .map_err(error)?;
                 crate::processes::model::validate_variables(variables).map_err(error)?;
-                let mut merged = serde_json::to_value(&published.model.variables)
-                    .map_err(|error| ProtocolError::internal(error.to_string()))?;
-                let object = merged.as_object_mut().ok_or_else(|| {
-                    ProtocolError::bad_request("process variables must be an object")
-                })?;
-                for (key, value) in variables.as_object().ok_or_else(|| {
-                    ProtocolError::bad_request("process variables must be an object")
-                })? {
-                    object.insert(key.clone(), value.clone());
-                }
                 let instance_id = uuid::Uuid::new_v4().to_string();
                 let at_ms = chrono::Utc::now().timestamp_millis();
-                let plan = runtime::plan_start(
-                    &published.model,
-                    &instance_id,
-                    &actor,
-                    definition_id,
-                    *version,
-                    merged,
-                    runtime::StartCause::Manual,
-                    at_ms,
-                    repository::StartInputRef::Manual {
-                        command_id: stamp.command_id.clone(),
-                        request_hash: stamp.request_hash.clone(),
-                    },
-                )
-                .map_err(error)?;
                 repository::start_instance(
                     pool,
                     &actor,
@@ -381,7 +354,7 @@ pub fn process_dispatch(
                     definition_id,
                     *version,
                     variables,
-                    &plan,
+                    repository::ProcessPlanInput::Canonical,
                     at_ms,
                 )
                 .map_err(error)?
@@ -437,25 +410,10 @@ pub fn process_dispatch(
                     .map_err(error)? {
                 prior
             } else {
-                let snapshot = repository::runtime_snapshot(pool, &actor, instance_id)
-                    .map_err(error)?;
-                let task_revision = snapshot.user_tasks.iter().find(|task|
-                    task.user_task_id == *user_task_id
-                        && task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open
-                        && task.kind == tentaflow_protocol::processes::ProcessUserTaskKind::Manual)
-                    .map(|task| task.revision)
-                    .ok_or_else(|| error(anyhow::anyhow!("open manual task not found")))?;
                 let at_ms = chrono::Utc::now().timestamp_millis();
-                let plan = runtime::plan_manual_acknowledgment(&snapshot, user_task_id,
-                    &actor.user_id, at_ms,
-                    repository::AcceptedInputRef::ManualAcknowledgment {
-                        task_id: user_task_id.clone(), expected_task_revision: task_revision,
-                        expected_instance_revision: snapshot.instance.revision,
-                        command_id: stamp.command_id.clone(),
-                        request_hash: stamp.request_hash.clone(),
-                    }).map_err(error)?;
                 let outcome = repository::acknowledge_manual_task(pool, &actor, &stamp,
-                    instance_id, user_task_id, *expected_revision, &plan, at_ms)
+                    instance_id, user_task_id, *expected_revision,
+                    repository::ProcessPlanInput::Canonical, at_ms)
                     .map_err(error)?;
                 if let Some(executor) = ctx.state.router.flow_dispatcher() {
                     runtime::signal_cancelled_claims(executor, &outcome.cancelled_claims);
@@ -479,29 +437,7 @@ pub fn process_dispatch(
             {
                 prior
             } else {
-                let snapshot =
-                    repository::runtime_snapshot(pool, &actor, instance_id).map_err(error)?;
-                let task_revision = snapshot.user_tasks.iter()
-                    .find(|task| task.user_task_id == *user_task_id
-                        && task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open)
-                    .map(|task| task.revision)
-                    .ok_or_else(|| error(anyhow::anyhow!("open process user task not found")))?;
                 let at_ms = chrono::Utc::now().timestamp_millis();
-                let plan = runtime::plan_user_completion(
-                    &snapshot,
-                    user_task_id,
-                    outputs,
-                    *approved,
-                    at_ms,
-                    repository::AcceptedInputRef::Human {
-                        task_id: user_task_id.clone(),
-                        expected_task_revision: task_revision,
-                        expected_instance_revision: snapshot.instance.revision,
-                        command_id: stamp.command_id.clone(),
-                        request_hash: stamp.request_hash.clone(),
-                    },
-                )
-                .map_err(error)?;
                 let outcome = repository::complete_user_task(
                     pool,
                     &actor,
@@ -511,7 +447,7 @@ pub fn process_dispatch(
                     *expected_revision,
                     outputs,
                     *approved,
-                    &plan,
+                    repository::ProcessPlanInput::Canonical,
                     at_ms,
                 )
                 .map_err(error)?;

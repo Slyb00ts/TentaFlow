@@ -69,7 +69,7 @@ fn complete(
     let command = stamp("complete called work");
     let plan =
         runtime::plan_user_completion(&snapshot, &task.user_task_id, &output, None, at,
-            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     repository::complete_user_task(
         &f.db,
         actor,
@@ -79,7 +79,7 @@ fn complete(
         snapshot.instance.revision,
         &output,
         None,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap()
@@ -129,7 +129,7 @@ fn returned_call_cannot_replay_its_factual_termination_as_a_standalone_entry() {
     assert_eq!(current.user_tasks.iter().filter(|task|
         task.status == ProcessUserTaskStatus::Open).count(), 1);
     let failure = repository::apply_transition(&fixture.db, &fixture.owner,
-        &parent.instance_id, current.instance.revision, &returned_plan,
+        &parent.instance_id, current.instance.revision, repository::ProcessPlanInput::Supplied(&returned_plan),
         chrono::Utc::now().timestamp_millis()).unwrap_err();
     assert!(format!("{failure:#}").contains("ordinary advancement cannot invent another terminating entry"));
     assert_eq!(transition_rows(&fixture), before);
@@ -269,7 +269,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         runtime::StartCause::Manual,
         at,
         manual_input(&command),
-    )
+    None)
     .unwrap();
     let first = repository::start_instance(
         &f.db,
@@ -279,7 +279,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         &outer.definition_id,
         outer.version,
         &json!({}),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -323,7 +323,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         &outer.definition_id,
         outer.version,
         &json!({}),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -381,7 +381,7 @@ fn child_assignee_reopen_returns_without_parent_read_grant_or_private_relation()
     let output = json!({"answer":"verified"});
     let command = stamp("return after restart");
     let plan = runtime::plan_user_completion(&snapshot, &task, &output, None, at,
-        human_input(&snapshot, &task, &command)).unwrap();
+        human_input(&snapshot, &task, &command), None).unwrap();
     let result = repository::complete_user_task(
         &reopened,
         &participant,
@@ -391,7 +391,7 @@ fn child_assignee_reopen_returns_without_parent_read_grant_or_private_relation()
         snapshot.instance.revision,
         &output,
         None,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -408,7 +408,7 @@ fn child_assignee_reopen_returns_without_parent_read_grant_or_private_relation()
         snapshot.instance.revision,
         &output,
         None,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -878,7 +878,7 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
     let command = stamp("forged error source");
     let plan =
         runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at,
-            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     for mutation in 0..4 {
         let mut forged = plan.clone();
         let event = forged
@@ -903,7 +903,7 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
             snapshot.instance.revision,
             &outputs,
             None,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at,
         )
         .is_err());
@@ -922,7 +922,7 @@ fn forged_error_end_missing_node_or_wrong_source_rolls_back_every_transition_fac
         snapshot.instance.revision,
         &outputs,
         None,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -957,7 +957,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         runtime::StartCause::Manual,
         at,
         manual_input(&command),
-    )
+    None)
     .unwrap();
     f.db.write().unwrap().execute_batch("CREATE TRIGGER fail_call_entered BEFORE INSERT ON bpmn_events WHEN NEW.kind='call_entered' BEGIN SELECT RAISE(ABORT,'controlled call storage failure'); END;").unwrap();
     let before = transition_rows(&f);
@@ -969,7 +969,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         &version.definition_id,
         version.version,
         &json!({}),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap_err();
@@ -987,7 +987,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         &version.definition_id,
         version.version,
         &json!({}),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -1039,10 +1039,11 @@ fn parent_sibling_revision_race_replans_return_without_incident_and_interruption
         let outputs = json!({"answer":42});
     let command = stamp("complete after parent changes");
     let plan = runtime::plan_user_completion(&snapshot, &task, &outputs, None, at,
-        human_input(&snapshot, &task, &command)).unwrap();
+        human_input(&snapshot, &task, &command), None).unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
         let actual = std::thread::scope(|scope| {
+            let resume_tx = resume_tx;
             let f = &f;
             let id = &child;
             let task = &task;
@@ -1061,7 +1062,7 @@ fn parent_sibling_revision_race_replans_return_without_incident_and_interruption
                     snapshot.instance.revision,
                     outputs,
                     None,
-                    plan,
+                    repository::ProcessPlanInput::Supplied(plan),
                     at,
                 );
                 repository::CALL_TRANSITION_PREFLIGHT.with(|gate| *gate.borrow_mut() = None);
@@ -1897,6 +1898,7 @@ fn observed_called_service_result_survives_parent_cas_replan_without_another_exe
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
     std::thread::scope(|scope| {
+        let resume_tx = resume_tx;
         let f = &f;
         let observing = scope.spawn(move || {
             repository::CALL_TRANSITION_PREFLIGHT

@@ -183,7 +183,7 @@ fn open_work(snapshot: &repository::RuntimeSnapshot) -> (String, u32, String) {
 fn planned_completion(snapshot: &repository::RuntimeSnapshot,
     task_id: &str, command: &repository::CommandStamp, outputs: &Value, at_ms: i64) -> RuntimePlan {
     runtime::plan_user_completion(snapshot, task_id, outputs, None, at_ms,
-        human_input(snapshot, task_id, command)).unwrap()
+        human_input(snapshot, task_id, command), None).unwrap()
 }
 
 fn accepted_prefix_capacity(plan: &RuntimePlan) -> bool {
@@ -198,7 +198,7 @@ fn assert_rejected_unchanged(fixture: &Fixture, instance_id: &str,
     command: &repository::CommandStamp, outputs: &Value, plan: &RuntimePlan, at_ms: i64,
     before: &[Vec<Vec<rusqlite::types::Value>>]) {
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, command,
-        instance_id, task_id, snapshot.instance.revision, outputs, None, plan, at_ms).is_err());
+        instance_id, task_id, snapshot.instance.revision, outputs, None, repository::ProcessPlanInput::Supplied(plan), at_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(fixture), before);
 }
 
@@ -403,7 +403,7 @@ fn complete_capacity_control(expect_accepted_prefix: bool) {
                 &task_id, &command, selected.0, selected.1, at_ms);
             let committed = repository::complete_user_task(&fixture.db, &fixture.owner,
                 &command, &started.instance_id, &task_id, snapshot.instance.revision,
-                selected.0, None, selected.1, at_ms).unwrap();
+                selected.0, None, repository::ProcessPlanInput::Supplied(selected.1), at_ms).unwrap();
             assert_eq!(committed.instance.status, ProcessInstanceStatus::Cancelled);
             let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
             let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
@@ -444,7 +444,7 @@ fn complete_capacity_control(expect_accepted_prefix: bool) {
             let after = super::call_tests::transition_rows(&fixture);
             repository::complete_user_task(&reopened, &fixture.owner, &command,
                 &started.instance_id, &task_id, snapshot.instance.revision,
-                selected.0, None, selected.1, at_ms).unwrap();
+                selected.0, None, repository::ProcessPlanInput::Supplied(selected.1), at_ms).unwrap();
             assert_eq!(super::call_tests::transition_rows(&fixture), after);
             assert!(repository::cancel_instance(&reopened, &fixture.owner,
                 &stamp("cancel already latched repetition"), &started.instance_id,
@@ -454,7 +454,7 @@ fn complete_capacity_control(expect_accepted_prefix: bool) {
         }
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task_id, snapshot.instance.revision,
-            &small, None, &small_plan, at_ms).unwrap();
+            &small, None, repository::ProcessPlanInput::Supplied(&small_plan), at_ms).unwrap();
         accepted += 1;
     }
 }
@@ -505,13 +505,13 @@ fn aggregate_limit_retains_two_accepted_sources_and_rejects_forged_finite_codes(
         }
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task_id, snapshot.instance.revision,
-            &outputs, None, &canonical, at_ms).unwrap();
+            &outputs, None, repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
         if ordinal == 1 {
             let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
             let committed_rows = super::call_tests::transition_rows(&fixture);
             repository::complete_user_task(&reopened, &fixture.owner, &command,
                 &started.instance_id, &task_id, snapshot.instance.revision,
-                &outputs, None, &canonical, at_ms).unwrap();
+                &outputs, None, repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
             assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
         }
     }
@@ -617,7 +617,7 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
             &gate.user_task_id, &command, &outputs, &foreign_service_source, at_ms, &before);
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &gate.user_task_id, waiting.instance.revision,
-            &outputs, None, &canonical, at_ms).unwrap();
+            &outputs, None, repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
@@ -648,12 +648,12 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
         let after = super::call_tests::transition_rows(&fixture);
         repository::complete_user_task(&reopened, &fixture.owner, &command,
             &started.instance_id, &gate.user_task_id, waiting.instance.revision,
-            &outputs, None, &canonical, at_ms).unwrap();
+            &outputs, None, repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
         assert_eq!(super::call_tests::transition_rows(&fixture), after);
         let approve = stamp("approval after verification cancellation must fail");
         assert!(repository::complete_user_task(&reopened, &fixture.owner, &approve,
             &started.instance_id, &verification_id, persisted.instance.revision,
-            &Value::Null, Some(true), &canonical, at_ms).is_err());
+            &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&canonical), at_ms).is_err());
         assert_eq!(super::call_tests::transition_rows(&fixture), after);
     }
 }
@@ -677,7 +677,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     let start_ms = chrono::Utc::now().timestamp_millis();
     let start_plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        start_ms, manual_input(&start_command)).unwrap();
+        start_ms, manual_input(&start_command), None).unwrap();
     let occurrence_event = start_plan.events.iter().find(|event|
         event.kind == "repetition_occurrence_started").unwrap();
     let occurrence_token_id = occurrence_event.data["token_id"].as_str().unwrap().to_owned();
@@ -689,7 +689,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
             json!(Uuid::new_v4().to_string());
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
         &instance_id, &version.definition_id, version.version, &variables,
-        &wrong_start_source, start_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_start_source), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let manual_wait_id = start_plan.create_user_tasks.iter().find(|task|
         task.kind == ProcessUserTaskKind::Manual).unwrap().token_id.as_ref().unwrap().clone();
@@ -697,18 +697,18 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     wrong_parent.token_sources.insert(occurrence_token_id.clone(), manual_wait_id);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
         &instance_id, &version.definition_id, version.version, &variables,
-        &wrong_parent, start_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_parent), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let mut wrong_ready = start_plan.clone();
     wrong_ready.create_tokens.iter_mut().find(|token|
         token.token_id == occurrence_token_id).unwrap().status = "waiting".into();
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
         &instance_id, &version.definition_id, version.version, &variables,
-        &wrong_ready, start_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&wrong_ready), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let started = repository::start_instance(&fixture.db, &fixture.owner, &start_command,
         &instance_id, &version.definition_id, version.version, &variables,
-        &start_plan, start_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&start_plan), start_ms).unwrap();
     let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();
     let manual = snapshot.user_tasks.iter().find(|task|
@@ -720,7 +720,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let manual_plan = runtime::plan_manual_acknowledgment(&snapshot, &manual_id,
         &fixture.owner.user_id, at_ms,
-        super::manual_tests::manual_entry(&snapshot, &manual_id, &manual_command)).unwrap();
+        super::manual_tests::manual_entry(&snapshot, &manual_id, &manual_command), None).unwrap();
     let gate = snapshot.user_tasks.iter().find(|task|
         task.node_id == "GateHuman" && task.status == ProcessUserTaskStatus::Open).unwrap();
     let gate_command = stamp("release capacity against manual sibling");
@@ -731,7 +731,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     assert_eq!(capacity.reason, "active_occurrences");
     let committed = repository::complete_user_task(&fixture.db, &fixture.owner,
         &gate_command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
-        &gate_outputs, None, &gate_plan, at_ms).unwrap();
+        &gate_outputs, None, repository::ProcessPlanInput::Supplied(&gate_plan), at_ms).unwrap();
     assert_eq!(committed.instance.status, ProcessInstanceStatus::Cancelled);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
@@ -756,10 +756,10 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     assert_eq!(before.len(), 16);
     assert!(repository::acknowledge_manual_task(&reopened, &fixture.owner,
         &manual_command, &started.instance_id, &manual_id, snapshot.instance.revision,
-        &manual_plan, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&manual_plan), at_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     repository::complete_user_task(&reopened, &fixture.owner,
         &gate_command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
-        &gate_outputs, None, &gate_plan, at_ms).unwrap();
+        &gate_outputs, None, repository::ProcessPlanInput::Supplied(&gate_plan), at_ms).unwrap();
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
 }

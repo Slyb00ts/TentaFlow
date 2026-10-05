@@ -559,6 +559,21 @@ function processModel(model, nested = false) {
       }
       fields = { message_ref: body.messageRef, correlation_expression: body.correlationExpression,
         output_mapping: body.outputMapping };
+    } else if (tag === 'SignalThrow') {
+      processKnownFields(body, ['signalRef', 'payloadExpression', 'ttlSeconds'], 'signal throw');
+      if (typeof body.signalRef !== 'string' || typeof body.payloadExpression !== 'string'
+        || !Number.isInteger(body.ttlSeconds)) {
+        throw new TypeError('signal throw requires a declaration, payload expression and TTL');
+      }
+      fields = { signal_ref: body.signalRef, payload_expression: body.payloadExpression,
+        ttl_seconds: body.ttlSeconds };
+    } else if (tag === 'SignalCatch') {
+      processKnownFields(body, ['signalRef', 'outputMapping'], 'signal catch');
+      if (typeof body.signalRef !== 'string' || !body.outputMapping
+        || typeof body.outputMapping !== 'object' || Array.isArray(body.outputMapping)) {
+        throw new TypeError('signal catch requires a declaration and output mapping');
+      }
+      fields = { signal_ref: body.signalRef, output_mapping: body.outputMapping };
     } else if (tag === 'BoundaryMessage') {
       processKnownFields(body, ['attachedToId', 'cancelActivity', 'messageRef', 'correlationExpression', 'outputMapping'], 'boundary message');
       fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity,
@@ -644,6 +659,12 @@ function processModel(model, nested = false) {
       processKnownFields(escalation, ['escalationId', 'name', 'escalationCode'], 'escalation declaration');
       return { escalation_id: escalation.escalationId, name: escalation.name,
         escalation_code: escalation.escalationCode };
+    }) } : {}),
+    ...(model.signals?.length ? { signals: model.signals.map((signal) => {
+      processKnownFields(signal, ['signalId', 'namespaceUri', 'name'], 'signal declaration');
+      if (typeof signal.signalId !== 'string' || typeof signal.namespaceUri !== 'string'
+        || typeof signal.name !== 'string') throw new TypeError('invalid signal declaration');
+      return { signal_id: signal.signalId, namespace_uri: signal.namespaceUri, name: signal.name };
     }) } : {}),
   };
 }

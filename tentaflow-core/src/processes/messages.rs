@@ -155,7 +155,9 @@ pub(super) fn mapped_variables(
     super::model::validate_variables(&result)?;
     Ok(result)
 }
-pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64) -> Result<RuntimePlan> {
+pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64,
+    signal_admission: Option<&super::runtime::SignalAdmissionResolver<'_>>,
+) -> Result<RuntimePlan> {
     let m = &prepared.message;
     let payload = m
         .payload
@@ -202,7 +204,7 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64) -> Result<R
                     message_id: m.key.message_id.clone(),
                     expected_message_revision: m.revision,
                 },
-            )?;
+            signal_admission)?;
             plan.events.push(repository::PlannedEvent {
                 scope_id: instance_id.clone(),
                 kind: "message_delivered".into(),
@@ -223,7 +225,7 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64) -> Result<R
                 expected_message_revision: m.revision,
                 target_subscription_id: Some(subscription.subscription_id.clone()),
                 expected_subscription_revision: Some(subscription.revision),
-            }),
+            }, signal_admission),
     }
 }
 #[derive(Debug)]
@@ -246,9 +248,10 @@ pub fn drain_pending(pool: &DbPool, at_ms: i64) -> MessageDrainOutcome {
             let attempt = (|| -> Result<()> {
                 match repository::message_snapshot(pool, &candidate)? {
                     MessageSelection::Ready(snapshot) => {
-                        let plan = plan_message_delivery(&snapshot, at_ms)?;
+                        plan_message_delivery(&snapshot, at_ms, None)?;
                         if let Some(committed) =
-                            repository::deliver_message(pool, &snapshot, &plan, at_ms)?
+                            repository::deliver_message(pool, &snapshot,
+                                repository::ProcessPlanInput::Canonical, at_ms)?
                         {
                             result.delivered += 1;
                             result
@@ -282,6 +285,26 @@ pub fn drain_pending(pool: &DbPool, at_ms: i64) -> MessageDrainOutcome {
                 }
             }
         }
+        for receipt_id in repository::due_signal_receipts(pool, at_ms)? {
+            let Some(claim) = repository::claim_signal_receipt(pool, &receipt_id, at_ms)? else {
+                continue;
+            };
+            let attempt = (|| -> Result<()> {
+                if let Some(committed) =
+                    repository::deliver_signal_receipt(pool, &claim,
+                        repository::ProcessPlanInput::Canonical, at_ms)? {
+                    result.delivered += 1;
+                    result.cancelled_claims.extend(committed.cancelled_claims);
+                }
+                Ok(())
+            })();
+            if let Err(error) = attempt {
+                tracing::error!(receipt_id=%receipt_id,error=%error,
+                    "process signal receipt delivery failed");
+                repository::record_signal_attempt_failed(pool, &claim, &error, at_ms)?;
+            }
+        }
+        repository::prune_signal_payloads(pool, at_ms)?;
         Ok(())
     })();
     result
@@ -365,7 +388,7 @@ pub(crate) mod test_support {
             runtime::StartCause::Manual,
             now,
             runtime::test_support::manual_input(&command),
-        )
+        None)
         .unwrap();
         repository::start_instance(
             &f.db,
@@ -375,7 +398,7 @@ pub(crate) mod test_support {
             &version.definition_id,
             version.version,
             &vars,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             now,
         )
         .unwrap()
@@ -386,7 +409,7 @@ pub(crate) mod test_support {
         let command = stamp("complete actual work");
         let plan =
             runtime::plan_user_completion(&snapshot, task_id, &json!({}), None, now,
-                runtime::test_support::human_input(&snapshot, task_id, &command)).unwrap();
+                runtime::test_support::human_input(&snapshot, task_id, &command), None).unwrap();
         repository::complete_user_task(
             &f.db,
             &f.owner,
@@ -396,7 +419,7 @@ pub(crate) mod test_support {
             snapshot.instance.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             now,
         )
         .unwrap()
@@ -639,7 +662,7 @@ mod tests {
         else {
             panic!("the real gate completion must arm the matching catch")
         };
-        let delivery = plan_message_delivery(&prepared, at).unwrap();
+        let delivery = plan_message_delivery(&prepared, at, None).unwrap();
         let cancel = stamp("cancel after internal unmatched retries");
         let before_denied = facts();
         f.db.write()
@@ -680,7 +703,7 @@ mod tests {
         assert_eq!(cancelled.revision, admitted.revision + 1);
         assert_eq!(cancelled.last_reason.as_deref(), Some("sender_cancelled"));
         assert!(!cancelled.can_cancel);
-        assert!(repository::deliver_message(&f.db, &prepared, &delivery, at)
+        assert!(repository::deliver_message(&f.db, &prepared, repository::ProcessPlanInput::Supplied(&delivery), at)
             .unwrap()
             .is_none());
         let committed = facts();
@@ -1083,7 +1106,7 @@ mod tests {
         let denied_command = stamp("source revoked before enqueue");
         let plan =
             runtime::plan_user_completion(&snapshot, &gate.user_task_id, &json!({}), None, at,
-                runtime::test_support::human_input(&snapshot, &gate.user_task_id, &denied_command))
+                runtime::test_support::human_input(&snapshot, &gate.user_task_id, &denied_command), None)
                 .unwrap();
         crate::db::repository::resource_permissions::set(
             &f.db,
@@ -1103,7 +1126,7 @@ mod tests {
             snapshot.instance.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap_err()
@@ -1147,7 +1170,7 @@ mod tests {
             snapshot.instance.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -1224,7 +1247,7 @@ mod tests {
         else {
             panic!("actual restored source message is ready");
         };
-        let delivery_plan = plan_message_delivery(&prepared, at + 60_002).unwrap();
+        let delivery_plan = plan_message_delivery(&prepared, at + 60_002, None).unwrap();
         crate::db::repository::resource_permissions::set(
             &f.db,
             "flow",
@@ -1235,7 +1258,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            repository::deliver_message(&f.db, &prepared, &delivery_plan, at + 60_002)
+            repository::deliver_message(&f.db, &prepared, repository::ProcessPlanInput::Supplied(&delivery_plan), at + 60_002)
                 .unwrap_err()
                 .downcast_ref::<repository::ProcessAuthorityDenied>()
                 .is_some()
@@ -1334,7 +1357,7 @@ mod tests {
         else {
             panic!("actual start candidate")
         };
-        let plan = plan_message_delivery(&snapshot, at).unwrap();
+        let plan = plan_message_delivery(&snapshot, at, None).unwrap();
         f.db.write()
             .unwrap()
             .execute(
@@ -1342,7 +1365,7 @@ mod tests {
                 [&f.participant.user_id],
             )
             .unwrap();
-        assert!(repository::deliver_message(&f.db, &snapshot, &plan, at)
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&plan), at)
             .unwrap_err()
             .downcast_ref::<repository::ProcessAuthorityDenied>()
             .is_some());
@@ -1495,7 +1518,7 @@ mod tests {
             &f.owner,
             &instance.instance_id,
             snapshot.instance.revision,
-            &unrelated,
+            repository::ProcessPlanInput::Supplied(&unrelated),
             at,
         )
         .unwrap()
@@ -1541,7 +1564,7 @@ mod tests {
             else {
                 panic!("ready race message")
             };
-            let plan = plan_message_delivery(&snapshot, at).unwrap();
+            let plan = plan_message_delivery(&snapshot, at, None).unwrap();
             let mut forged_facts = plan.clone();
             forged_facts
                 .events
@@ -1549,11 +1572,11 @@ mod tests {
                 .find(|event| event.kind == "message_delivered")
                 .unwrap()
                 .data["payload"] = json!("forged envelope");
-            assert!(repository::deliver_message(&f.db, &snapshot, &forged_facts, at).is_err());
+            assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&forged_facts), at).is_err());
             assert_eq!(current(&f, &m).message.status, M::Pending);
             let mut forged = plan.clone();
             forged.race_updates[0].race_id = other.event_races[0].race_id.clone();
-            assert!(repository::deliver_message(&f.db, &snapshot, &forged, at).is_err());
+            assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
             assert_eq!(
                 repository::get_instance(&f.db, &f.owner, &instance.instance_id, None)
                     .unwrap()
@@ -1622,7 +1645,7 @@ mod tests {
         let MessageSelection::Ready(snapshot) = repository::message_snapshot(&f.db, &candidate).unwrap() else {
             panic!("addressed message must have an open catch");
         };
-        let plan = plan_message_delivery(&snapshot, at).unwrap();
+        let plan = plan_message_delivery(&snapshot, at, None).unwrap();
         assert_eq!(plan.race_updates.len(), 1);
         assert_eq!(plan.race_updates[0].status, R::Won);
         assert_eq!(plan.timer_updates.iter().filter(|update| update.status == T::Cancelled).count(), 1);
@@ -1635,16 +1658,16 @@ mod tests {
         extra.winner_node_id = None;
         extra.winner_subscription_id = None;
         duplicate.race_updates.push(extra);
-        assert!(repository::deliver_message(&f.db, &snapshot, &duplicate, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&duplicate), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let mut wrong_winner = plan.clone();
         wrong_winner.race_updates[0].winner_node_id = Some("Timer_1".into());
-        assert!(repository::deliver_message(&f.db, &snapshot, &wrong_winner, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&wrong_winner), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let mut foreign = plan.clone();
         let other_tokens = repository::runtime_snapshot(&f.db, &f.owner, &other.instance_id).unwrap().tokens;
         foreign.cancel_token_ids.push(other_tokens[0].token_id.clone());
-        assert!(repository::deliver_message(&f.db, &snapshot, &foreign, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&foreign), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let drained = drain_pending(&f.db, at);
         drained.completion.unwrap();
@@ -1703,8 +1726,8 @@ mod tests {
         let MessageSelection::Ready(snapshot) = repository::message_snapshot(&f.db, &candidate).unwrap() else {
             panic!("the companion race message has a factual addressed catch");
         };
-        let plan = plan_message_delivery(&snapshot, sent.received_at_ms).unwrap();
-        assert!(repository::deliver_message(&f.db, &snapshot, &plan, sent.received_at_ms).unwrap().is_some());
+        let plan = plan_message_delivery(&snapshot, sent.received_at_ms, None).unwrap();
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&plan), sent.received_at_ms).unwrap().is_some());
         let after = repository::runtime_snapshot(&f.db, &f.owner, &started.instance_id).unwrap();
         assert_eq!(after.instance.status, I::Completed);
         assert_eq!(after.event_races[0].status, R::Won);
@@ -1733,7 +1756,7 @@ mod tests {
         let MessageSelection::Ready(snapshot) = repository::message_snapshot(&f.db, &candidate).unwrap() else {
             panic!("first race message has a factual addressed catch");
         };
-        let plan = plan_message_delivery(&snapshot, at).unwrap();
+        let plan = plan_message_delivery(&snapshot, at, None).unwrap();
         assert_eq!(plan.race_updates.len(), 2);
         assert_eq!(plan.race_updates.iter().filter(|update| update.status == R::Won).count(), 1);
         assert_eq!(plan.race_updates.iter().filter(|update| update.status == R::Cancelled).count(), 1);
@@ -1746,17 +1769,17 @@ mod tests {
             .timers.into_iter().find(|timer| timer.node_id == "Timer_1").unwrap().token_id.unwrap();
         let mut missing_loser = plan.clone();
         missing_loser.cancel_token_ids.retain(|id| id != &loser);
-        assert!(repository::deliver_message(&f.db, &snapshot, &missing_loser, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&missing_loser), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let mut duplicate_loser = plan.clone();
         duplicate_loser.cancel_token_ids.push(loser.clone());
-        assert!(repository::deliver_message(&f.db, &snapshot, &duplicate_loser, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&duplicate_loser), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let mut wrong_source = plan.clone();
         wrong_source.events.iter_mut().find(|event| event.kind == "event_race_cancelled"
             && event.data["race_id"].as_str() == Some(other.race_id.as_str())).unwrap().data["source_event_id"] =
             json!(Uuid::new_v4().to_string());
-        assert!(repository::deliver_message(&f.db, &snapshot, &wrong_source, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&wrong_source), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
         let mut extra_winner = plan.clone();
         let other_update = extra_winner.race_updates.iter_mut().find(|update| update.race_id == other.race_id).unwrap();
@@ -1764,9 +1787,9 @@ mod tests {
         other_update.winner_node_id = Some("OtherCatch".into());
         other_update.winner_subscription_id = started.subscriptions.iter().find(|sub| sub.node_id == "OtherCatch")
             .map(|sub| sub.subscription_id.clone());
-        assert!(repository::deliver_message(&f.db, &snapshot, &extra_winner, at).is_err());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&extra_winner), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&f), before);
-        assert!(repository::deliver_message(&f.db, &snapshot, &plan, at).unwrap().is_some());
+        assert!(repository::deliver_message(&f.db, &snapshot, repository::ProcessPlanInput::Supplied(&plan), at).unwrap().is_some());
         let after = repository::runtime_snapshot(&f.db, &f.owner, &started.instance_id).unwrap();
         assert_eq!(after.instance.status, I::Completed);
         assert_eq!(after.event_races.iter().find(|race| race.race_id == first.race_id).unwrap().status, R::Won);
@@ -1952,7 +1975,7 @@ mod tests {
         else {
             panic!("ready start")
         };
-        let plan = plan_message_delivery(&prepared, at).unwrap();
+        let plan = plan_message_delivery(&prepared, at, None).unwrap();
         let (draft, _, _) =
             repository::get_definition(&f.db, &f.owner, &version.definition_id).unwrap();
         let mut changed = draft.model.clone();
@@ -1978,7 +2001,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(repository::deliver_message(&f.db, &prepared, &plan, at).is_err());
+        assert!(repository::deliver_message(&f.db, &prepared, repository::ProcessPlanInput::Supplied(&plan), at).is_err());
         drain_pending(&f.db, at).completion.unwrap();
         assert_eq!(current(&f, &m).message.status, M::Error);
         assert_eq!(
@@ -2123,7 +2146,7 @@ mod tests {
             None,
             at,
             runtime::test_support::human_input(&snapshot, &instance.user_tasks[0].user_task_id, &command),
-        )
+        None)
         .unwrap();
         repository::complete_user_task(
             &f.db,
@@ -2134,7 +2157,7 @@ mod tests {
             snapshot.instance.revision,
             &json!({}),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -2306,7 +2329,7 @@ mod tests {
             runtime::StartCause::Manual,
             at,
             runtime::test_support::manual_input(&command),
-        )
+        None)
         .unwrap();
         assert!(repository::start_instance(
             &f.db,
@@ -2316,7 +2339,7 @@ mod tests {
             &version.definition_id,
             1,
             &json!({}),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at
         )
         .is_err());
@@ -2334,7 +2357,7 @@ mod tests {
             runtime::StartCause::Manual,
             at,
             runtime::test_support::manual_input(&command),
-        )
+        None)
         .unwrap();
         forged.create_subscriptions.clear();
         assert!(repository::start_instance(
@@ -2345,7 +2368,7 @@ mod tests {
             &race.definition_id,
             1,
             &json!({}),
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());

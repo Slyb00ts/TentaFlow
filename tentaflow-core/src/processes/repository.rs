@@ -264,6 +264,8 @@ pub struct EventSubscription {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_code: Option<String>,
     pub race_id: Option<String>,
+    pub signal_namespace_uri: Option<String>,
+    pub signal_declaration_id: Option<String>,
     pub revision: u64,
     pub status: ProcessSubscriptionStatus,
     pub last_reason: Option<String>,
@@ -323,6 +325,32 @@ pub struct PlannedMessage {
     pub source_node_id: String,
     pub source_activation_id: String,
     pub source_event_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedSignal {
+    pub signal_id: String,
+    pub signal_namespace_uri: String,
+    pub signal_declaration_id: String,
+    pub payload: Value,
+    pub ttl_seconds: u32,
+    pub source_scope_id: String,
+    pub source_node_id: String,
+    pub source_activation_id: String,
+    pub source_event_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignalClaim {
+    pub receipt_id: String,
+    pub signal_id: String,
+    pub revision: u64,
+    pub fence: String,
+    pub subscription: EventSubscription,
+    pub actor: ProcessActor,
+    pub snapshot: RuntimeSnapshot,
+    pub payload: Value,
+    pub source_event_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,6 +623,7 @@ pub enum AcceptedInputRef {
     ManualAcknowledgment { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
     Timer { timer_id: String, expected_timer_revision: u64, fired_occurrence: u64 },
     Message { org_id: String, sender_user_id: String, message_id: String, expected_message_revision: u64, target_subscription_id: Option<String>, expected_subscription_revision: Option<u64> },
+    Signal { signal_id: String, receipt_id: String, expected_receipt_revision: u64, claim_fence: String, target_subscription_id: String, expected_subscription_revision: u64 },
     Service { job_id: String, attempt: u32, fence: u64, result_event_id: String },
     CallReturn { call_id: String, child_instance_id: String, expected_child_revision: u64, parent_token_id: String },
 }
@@ -744,6 +773,7 @@ pub struct RuntimePlan {
     pub create_event_races: Vec<EventRace>,
     pub race_updates: Vec<EventRaceUpdate>,
     pub create_messages: Vec<PlannedMessage>,
+    pub create_signals: Vec<PlannedSignal>,
     pub create_scopes: Vec<PlannedScope>,
     pub scope_updates: Vec<ScopeUpdate>,
     pub cancel_scope_roots: Vec<String>,
@@ -753,6 +783,11 @@ pub struct RuntimePlan {
     pub event_ids: BTreeMap<usize, String>,
     pub terminal_error: Option<ProcessTerminalError>,
     pub business_error: Option<BusinessErrorSource>,
+}
+
+pub enum ProcessPlanInput<'a> {
+    Canonical,
+    Supplied(&'a RuntimePlan),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -807,6 +842,7 @@ impl RuntimePlan {
             create_event_races: Vec::new(),
             race_updates: Vec::new(),
             create_messages: Vec::new(),
+            create_signals: Vec::new(),
             create_scopes: Vec::new(),
             scope_updates: Vec::new(),
             cancel_scope_roots: Vec::new(),
@@ -1308,7 +1344,10 @@ pub fn due_timers(pool: &DbPool, at_ms: i64, limit: u32) -> Result<Vec<DueTimer>
 }
 
 pub fn timer_snapshot(pool: &DbPool, candidate: &DueTimer) -> Result<TimerSnapshot> {
-    read_snapshot(pool, |conn| {
+    read_snapshot(pool, |conn| timer_snapshot_on(conn, candidate))
+}
+
+fn timer_snapshot_on(conn: &Connection, candidate: &DueTimer) -> Result<TimerSnapshot> {
         let timer = timer_on(conn, &candidate.timer_id)?;
         ensure!(due_candidate_matches(&timer, candidate), "timer candidate changed");
         if !timer_current_authority_on(conn, &timer)? {
@@ -1346,7 +1385,6 @@ pub fn timer_snapshot(pool: &DbPool, candidate: &DueTimer) -> Result<TimerSnapsh
                 Ok(TimerSnapshot::Catch { actor, timer, snapshot })
             }
         }
-    })
 }
 
 fn timer_current_authority_on(conn: &Connection, timer: &ProcessTimer) -> Result<bool> {
@@ -2045,7 +2083,7 @@ pub fn fire_timer(
     candidate: &DueTimer,
     actor: &ProcessActor,
     expected_instance_revision: Option<u64>,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<Option<ProcessTransitionOutcome>> {
     let timer = {
@@ -2053,44 +2091,33 @@ pub fn fire_timer(
         timer_on(&conn, &candidate.timer_id)?
     };
     let input = serde_json::json!({});
-    let (source_id, initial) = if timer.kind == ProcessTimerKind::Start {
-        (
-            plan.start_instance_id
-                .as_deref()
-                .context("timer start lacks instance identity")?,
-            Some((timer.definition_id.as_str(), timer.version, &input)),
-        )
-    } else {
-        (
-            timer
-                .instance_id
-                .as_deref()
-                .context("activity timer lacks instance identity")?,
-            None,
-        )
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (source_id, initial) = if timer.kind == ProcessTimerKind::Start {
+                (plan.start_instance_id.as_deref()
+                    .context("timer start lacks instance identity")?,
+                    Some((timer.definition_id.as_str(), timer.version, &input)))
+            } else {
+                (timer.instance_id.as_deref()
+                    .context("activity timer lacks instance identity")?, None)
+            };
+            let mut instance_plan = plan.clone();
+            let start_update = if timer.kind == ProcessTimerKind::Start {
+                let updates = instance_plan.timer_updates.iter()
+                    .filter(|update| update.timer_id == timer.timer_id)
+                    .cloned().collect::<Vec<_>>();
+                ensure!(updates.len() == 1, "timer fire requires one timer update");
+                instance_plan.timer_updates.retain(|update|
+                    update.timer_id != timer.timer_id);
+                updates.into_iter().next()
+            } else { None };
+            let (mut composite, conn) = prepare_call_plan(pool, actor, source_id,
+                initial, &instance_plan, at_ms)?;
+            if let Some(update) = start_update { composite.timer_updates.push(update); }
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
     };
-    let mut instance_plan = plan.clone();
-    let start_update = if timer.kind == ProcessTimerKind::Start {
-        let updates = instance_plan
-            .timer_updates
-            .iter()
-            .filter(|update| update.timer_id == timer.timer_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        ensure!(updates.len() == 1, "timer fire requires one timer update");
-        instance_plan
-            .timer_updates
-            .retain(|update| update.timer_id != timer.timer_id);
-        updates.into_iter().next()
-    } else {
-        None
-    };
-    let (mut composite, mut conn) =
-        prepare_call_plan(pool, actor, source_id, initial, &instance_plan, at_ms)?;
-    if let Some(update) = start_update {
-        composite.timer_updates.push(update);
-    }
-    let plan = &composite;
     let tx = conn.transaction()?;
     let timer = timer_on(&tx, &candidate.timer_id)?;
     if !due_candidate_matches(&timer, candidate)
@@ -2102,6 +2129,29 @@ pub fn fire_timer(
     if timer.kind != ProcessTimerKind::Start && !timer_activation_live_on(&tx, &timer)? {
         return Ok(None);
     }
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        let snapshot = timer_snapshot_on(&tx, candidate)?;
+        let actual_actor = match &snapshot {
+            TimerSnapshot::Start { actor, .. }
+            | TimerSnapshot::Catch { actor, .. }
+            | TimerSnapshot::Boundary { actor, .. } => actor,
+        };
+        ensure!(actual_actor.org_id == actor.org_id
+            && actual_actor.user_id == actor.user_id,
+            "timer actor differs from its current authority");
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            let source_instance = prefix.start_instance_id.as_deref()
+                .or(timer.instance_id.as_deref())
+                .context("timer Signal source instance is missing")?;
+            signal_admission_on(&tx, actual_actor, source_instance, prefix, signal, accepted)
+        };
+        canonical = super::timers::plan_timer_fire(&snapshot, at_ms, Some(&resolve))?;
+        &canonical
+    };
     if let Some(instance_id) = timer.instance_id.as_deref() {
         let expected =
             expected_instance_revision.context("activity timer needs instance revision")?;
@@ -2228,7 +2278,7 @@ pub fn fire_timer(
         return Err(ProcessAuthorityDenied("timer authority is no longer current").into());
     }
     let mut cancelled_claims = Vec::new();
-    let result = if timer.kind == ProcessTimerKind::Start {
+    let mut result = if timer.kind == ProcessTimerKind::Start {
         ensure!(expected_instance_revision.is_none(), "start timer has no existing instance");
         require_owner(&tx, actor, &timer.definition_id)?;
         let definition = definition_on(&tx, &timer.definition_id)?;
@@ -2273,6 +2323,11 @@ pub fn fire_timer(
             plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
         instance_on(&tx, actor, instance_id, None)?
     };
+    if composite.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx,
+            &result.instance_id, &actor.user_id, plan, at_ms)?);
+        result = instance_on(&tx, actor, &result.instance_id, None)?;
+    }
     tx.commit()?;
     Ok(Some(ProcessTransitionOutcome {
         instance: result,
@@ -3032,9 +3087,13 @@ fn collect_call_versions_on(
             let admission_error = if require_admission {
                 None
             } else {
-                require_call_version_on(conn, actor, &target, true)
-                    .err()
-                    .map(|error| format!("{error:#}"))
+                match require_call_version_on(conn, actor, &target, true) {
+                    Ok(()) => None,
+                    Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some()
+                        || error.downcast_ref::<CallTransitionRejected>().is_some() =>
+                        Some(format!("{error:#}")),
+                    Err(error) => return Err(error),
+                }
             };
             collected.insert(
                 child_key.clone(),
@@ -4247,6 +4306,7 @@ fn subscription_summary(
         correlation_key: s.correlation_key.clone(),
         error_code: s.error_code.clone(),
         escalation_code: s.escalation_code.clone(),
+        signal_name: s.signal_declaration_id.as_ref().and_then(|id| model.signals.iter().find(|signal| &signal.signal_id == id).map(|signal| signal.name.clone())),
         attached_to_id,
         race_id: s.race_id.clone(),
         last_reason: s.last_reason.clone(),
@@ -6134,12 +6194,14 @@ fn apply_call_steps_on(
     tx: &Transaction<'_>,
     source_instance_id: &str,
     actor_id: &str,
-    plan: &RuntimePlan,
+    steps: &[CallStep],
     at_ms: i64,
+    first_index: usize,
+    skipped: &mut HashSet<String>,
 ) -> Result<Vec<CancelledJobClaim>> {
     let mut claims = Vec::new();
-    let mut skipped = HashSet::new();
-    for (index, step) in plan.call_steps.iter().enumerate() {
+    for (offset, step) in steps.iter().enumerate() {
+        let index = first_index + offset;
         let step_instance = match step {
             CallStep::Start { call, .. } => &call.call.child_instance_id,
             CallStep::Return { call, .. } => &call.parent_instance_id,
@@ -6980,6 +7042,7 @@ fn validate_termination_variables_on(
                     | ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
                     | ProcessNodeKind::MessageCatch { output_mapping, .. }
                     | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+                    | ProcessNodeKind::SignalCatch { output_mapping, .. }
                     | ProcessNodeKind::BoundaryMessage { output_mapping, .. }
                     | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping,
                     _ => bail!("mapped variable effect has no pinned output mapping"),
@@ -7191,6 +7254,49 @@ fn validate_termination_variables_on(
                             && event.data["message"] == metadata).count() == 1,
                             "mapped message output has no exact source-time delivered envelope");
                         (payload, vec![("message".to_owned(), metadata)])
+                    }
+                    (ProcessNodeKind::SignalCatch { .. },
+                        AcceptedInputRef::Signal { signal_id, receipt_id,
+                            target_subscription_id, .. }) => {
+                        let (payload_json, hash, source_event_id, receipt_token,
+                            receipt_scope, receipt_node, receipt_subscription):
+                            (String, String, String, String, String, String, String) =
+                            tx.query_row(
+                                "SELECT e.payload_json,e.payload_sha256,e.source_event_id,
+                                    r.recipient_token_id,r.recipient_scope_id,r.recipient_node_id,
+                                    r.recipient_subscription_id
+                                 FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e
+                                   ON e.signal_id=r.signal_id
+                                 WHERE r.receipt_id=?1 AND r.signal_id=?2
+                                   AND r.recipient_instance_id=?3",
+                                params![receipt_id,signal_id,instance_id],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                                    row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
+                        ensure!(receipt_token == *source_token_id
+                            && receipt_scope == *scope_id && receipt_node == *node_id
+                            && receipt_subscription == *target_subscription_id
+                            && hex::encode(Sha256::digest(payload_json.as_bytes())) == hash,
+                            "mapped Signal output changed its retained receipt or payload");
+                        let payload: Value = parse(payload_json)?;
+                        let subscription = subscription_on(tx, target_subscription_id)?;
+                        let metadata = serde_json::json!({
+                            "signal_id":signal_id,
+                            "signal_namespace_uri":subscription.signal_namespace_uri,
+                            "signal_declaration_id":subscription.signal_declaration_id,
+                            "source_event_id":source_event_id,
+                        });
+                        ensure!(plan.events.iter().enumerate().filter(|(index,event)|
+                            *event_index <= *index && event.kind == "signal_received"
+                                && event.scope_id == *scope_id
+                                && event.node_id.as_deref() == Some(node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "signal_id":signal_id,
+                                    "subscription_id":target_subscription_id,
+                                    "attached_token_id":source_token_id,
+                                    "source_event_id":source_event_id,
+                                })).count() == 1,
+                            "mapped Signal output lacks its exact receipt source");
+                        (payload, vec![("signal".to_owned(), metadata)])
                     }
                     (ProcessNodeKind::CallActivity { .. },
                         AcceptedInputRef::CallReturn { call_id, child_instance_id,
@@ -7756,8 +7862,7 @@ fn validate_termination_immediate_failure_on(
 ) -> Result<()> {
     ensure!(source.status == "ready" && waiting.status == "waiting"
         && plan.token_sources.get(&waiting.token_id) == Some(&source.token_id)
-        && plan.consume_token_ids.iter().filter(|id| *id == &source.token_id).count() == 1
-        && !plan.event_sources.values().any(|id| id == &source.token_id),
+        && plan.consume_token_ids.iter().filter(|id| *id == &source.token_id).count() == 1,
         "termination immediate failure lacks its exact consumed source and parked wait");
     let incidents = plan.add_incidents.iter().filter(|incident|
         incident.scope_id == source.scope_id
@@ -7787,6 +7892,17 @@ fn validate_termination_immediate_failure_on(
     let (nodes, flows, _) = super::model::scope_body(model, &path)?;
     let node = nodes.iter().find(|node| node.id == source.node_id)
         .context("termination failure node is outside its pinned body")?;
+    if matches!(&node.kind, ProcessNodeKind::SignalThrow { .. }) {
+        ensure!(plan.event_sources.get(&event_index) == Some(&source.token_id)
+            && plan.event_sources.values().filter(|id| *id == &source.token_id).count() == 1
+            && plan.create_signals.iter().all(|signal|
+                signal.source_activation_id != source.token_id),
+            "parked Signal failure lacks its unique source-linked incident");
+        // Signal payload and admission are replayed before this token proof.
+        return Ok(());
+    }
+    ensure!(!plan.event_sources.values().any(|id| id == &source.token_id),
+        "termination immediate failure has an unrelated sourced effect");
     let (code, message, expected) = match &node.kind {
         ProcessNodeKind::ExclusiveGateway { default_flow_id } => {
             let mut matches = Vec::new();
@@ -7930,7 +8046,8 @@ fn validate_termination_action_provenance_on(
             let immediate_wait = matches!(&pinned.kind,
                 ProcessNodeKind::ExclusiveGateway { .. }
                 | ProcessNodeKind::InclusiveGateway { .. }
-                | ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. });
+                | ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. }
+                | ProcessNodeKind::SignalThrow { .. });
             let script_wait = matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
                 && plan.events.iter().enumerate().any(|(index, event)|
                     event.kind == "incident" && event.scope_id == source.scope_id
@@ -7956,7 +8073,7 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
-                | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SignalCatch { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
                 || immediate_wait
                 || script_wait
@@ -8114,10 +8231,14 @@ fn validate_termination_action_provenance_on(
                                 && timer.scope_id.as_deref() == Some(source.scope_id.as_str())
                                 && timer.token_id.as_deref() == Some(source_id.as_str())
                                 && timer.node_id == source.node_id)),
-                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } => plan.subscription_updates.iter().any(|update|
+                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::SignalCatch { .. } => plan.subscription_updates.iter().any(|update|
                     update.status == ProcessSubscriptionStatus::Consumed
                         && (matches!(entry, EntryAuthority::Accepted(
                             AcceptedInputRef::Message { target_subscription_id: Some(id), .. })
+                                if id == &update.subscription_id)
+                        || matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::Signal { target_subscription_id: id, .. })
                                 if id == &update.subscription_id)
                         || plan.termination_attempts.iter().any(|attempt| {
                             let input = match attempt {
@@ -8269,7 +8390,7 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
-                | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SignalCatch { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. } =>
                     ensure!(waits == 1 && joins == 0,
                         "termination activity has no unique factual durable wait"),
@@ -8296,7 +8417,7 @@ fn validate_termination_action_provenance_on(
                         "termination gateway added an unauthenticated wait or join");
                 }
                 ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. }
-                | ProcessNodeKind::SendTask { .. }
+                | ProcessNodeKind::SendTask { .. } | ProcessNodeKind::SignalThrow { .. }
                 | ProcessNodeKind::ScriptTask { .. } => {
                     let incident_count = plan.add_incidents.iter().filter(|incident|
                         incident.scope_id == source.scope_id
@@ -8350,12 +8471,13 @@ fn validate_termination_action_provenance_on(
         "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
         | "parallel_joined" | "inclusive_joined" | "end_reached"
         | "error_end_reached" | "terminate_end_reached" | "message_queued"
-        | "send_task_admitted"
+        | "send_task_admitted" | "signal_admitted"
         | "script_completed")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
-                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. })))
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+                    | ProcessNodeKind::SignalThrow { .. })))
         || event.kind == "incident" && event.data["source_kind"] == "terminate_end_return_failure";
     ensure!(plan.event_sources.len() == plan.events.iter().filter(|event| mandatory(event)).count()
         && plan.events.iter().enumerate().all(|(index,event)|
@@ -8559,6 +8681,22 @@ fn validate_termination_action_provenance_on(
             (ProcessNodeKind::ScriptTask { .. }, "script_completed") =>
                 outgoing.iter().map(|edge| edge.id.clone()).collect(),
             (ProcessNodeKind::ScriptTask { .. }, "incident") => Vec::new(),
+            (ProcessNodeKind::SignalThrow { .. }, "signal_admitted") => {
+                let admitted = plan.create_signals.iter().filter(|signal|
+                    signal.source_activation_id == *source_id
+                        && signal.source_event_index == *index
+                        && signal.source_scope_id == source.scope_id
+                        && signal.source_node_id == node.id).collect::<Vec<_>>();
+                ensure!(admitted.len() == 1
+                    && event.data == serde_json::json!({
+                        "signal_id":admitted[0].signal_id,
+                        "source_activation_id":source_id,
+                        "signal_namespace_uri":admitted[0].signal_namespace_uri,
+                        "signal_declaration_id":admitted[0].signal_declaration_id,
+                    }), "termination signal source lacks its exact admitted fact");
+                outgoing.iter().map(|edge| edge.id.clone()).collect()
+            }
+            (ProcessNodeKind::SignalThrow { .. }, "incident") => Vec::new(),
             _ => bail!("termination action history differs from its pinned source node"),
         };
         if !matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined") {
@@ -8803,7 +8941,8 @@ fn validate_termination_action_provenance_on(
                                 "source_instance_id":instance_id,
                                 "source_event_id":source.source_event_id})
                         }))),
-            "message_armed" | "receive_task_opened" | "error_boundary_armed" | "escalation_boundary_armed" =>
+            "message_armed" | "receive_task_opened" | "signal_catch_opened"
+            | "error_boundary_armed" | "escalation_boundary_armed" =>
                 event.data["subscription_id"].as_str().is_some_and(|id|
                     count(event.kind.as_str(), "subscription_id", id) == 1
                     && plan.create_subscriptions.iter().any(|subscription|
@@ -8816,7 +8955,16 @@ fn validate_termination_action_provenance_on(
                         && (event.kind == "escalation_boundary_armed") ==
                             (subscription.kind == ProcessSubscriptionKind::BoundaryEscalation)
                         && (event.kind == "receive_task_opened") ==
-                            (subscription.kind == ProcessSubscriptionKind::ReceiveTask))),
+                            (subscription.kind == ProcessSubscriptionKind::ReceiveTask)
+                        && (event.kind == "signal_catch_opened") ==
+                            (subscription.kind == ProcessSubscriptionKind::SignalCatch)
+                        && (event.kind != "signal_catch_opened"
+                            || event.data == serde_json::json!({
+                                "subscription_id":subscription.subscription_id,
+                                "attached_token_id":subscription.token_id,
+                                "signal_namespace_uri":subscription.signal_namespace_uri,
+                                "signal_declaration_id":subscription.signal_declaration_id,
+                            })))),
             "receive_task_completed" => event.data["subscription_id"].as_str().is_some_and(|id|
                 count("receive_task_completed", "subscription_id", id) == 1
                 && subscription_on(tx, id).is_ok_and(|subscription|
@@ -9266,6 +9414,44 @@ fn validate_termination_action_provenance_on(
                                 "message_id":id,"message":metadata,"payload":payload}),
                     }
                 })),
+            "signal_received" => {
+                match (
+                    event.data["signal_id"].as_str(),
+                    event.data["subscription_id"].as_str(),
+                    event.data["source_event_id"].as_str(),
+                ) {
+                (Some(signal_id), Some(subscription_id), Some(source_event_id)) => {
+                    let subscription = subscription_on(tx, subscription_id)?;
+                    let mut authenticated = false;
+                    for input in plan.termination_attempts.iter().map(|attempt| match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    }).chain(match entry {
+                        EntryAuthority::Accepted(input) => Some(input),
+                        _ => None,
+                    }) {
+                        authenticated |= signal_claim_matches_on(tx, instance_id, input,
+                            subscription_id, signal_id, source_event_id)?;
+                    }
+                    count("signal_received", "signal_id", signal_id) == 1
+                        && plan.subscription_updates.iter().filter(|update|
+                            update.subscription_id == subscription_id
+                                && update.status == ProcessSubscriptionStatus::Consumed).count() == 1
+                        && subscription.instance_id == instance_id
+                        && subscription.kind == ProcessSubscriptionKind::SignalCatch
+                        && subscription.scope_id == event.scope_id
+                        && node == Some(subscription.node_id.as_str())
+                        && event.data == serde_json::json!({
+                            "signal_id":signal_id,
+                            "subscription_id":subscription_id,
+                            "attached_token_id":subscription.token_id,
+                            "source_event_id":source_event_id,
+                        })
+                        && authenticated
+                },
+                _ => false,
+                }
+            },
             "timer_fired" => event.data["timer_id"].as_str().is_some_and(|id|
                 count("timer_fired", "timer_id", id) == 1
                 && plan.termination_attempts.iter().any(|attempt| {
@@ -9331,7 +9517,8 @@ fn validate_termination_action_provenance_on(
             matches!(event.kind.as_str(), "timer_armed" | "timer_error")
                 && event.data["timer_id"].as_str() == Some(timer.timer_id.as_str())).count() == 1)
         && plan.create_subscriptions.iter().all(|subscription| plan.events.iter().filter(|event|
-            matches!(event.kind.as_str(), "message_armed" | "receive_task_opened" | "error_boundary_armed"
+            matches!(event.kind.as_str(), "message_armed" | "receive_task_opened"
+                | "signal_catch_opened" | "error_boundary_armed"
                 | "escalation_boundary_armed")
                 && event.data["subscription_id"].as_str()
                     == Some(subscription.subscription_id.as_str())).count() == 1)
@@ -9397,7 +9584,8 @@ fn validate_termination_action_provenance_on(
         let event = plan.events.iter().find(|event|
             event.data["subscription_id"].as_str()
                 == Some(subscription.subscription_id.as_str())
-                && matches!(event.kind.as_str(), "message_armed" | "receive_task_opened" | "error_boundary_armed"
+                && matches!(event.kind.as_str(), "message_armed" | "receive_task_opened"
+                    | "signal_catch_opened" | "error_boundary_armed"
                     | "escalation_boundary_armed"))
             .context("termination subscription lacks its unique arm fact")?;
         let node = scope_node(model, scopes, instance_id,
@@ -9420,6 +9608,13 @@ fn validate_termination_action_provenance_on(
                         "correlation_key":subscription.correlation_key,
                         "error_code":subscription.error_code,"race_id":subscription.race_id,
                         "kind":subscription.kind})),
+            ProcessNodeKind::SignalCatch { .. } =>
+                ("signal_catch_opened", serde_json::json!({
+                    "subscription_id":subscription.subscription_id,
+                    "attached_token_id":subscription.token_id,
+                    "signal_namespace_uri":subscription.signal_namespace_uri,
+                    "signal_declaration_id":subscription.signal_declaration_id,
+                })),
             ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } =>
                 (if subscription.kind == ProcessSubscriptionKind::ReceiveTask {
                     "receive_task_opened" } else { "message_armed" }, serde_json::json!({
@@ -9456,7 +9651,7 @@ fn validate_termination_action_provenance_on(
                         == Some(update.subscription_id.as_str())).count() == 1,
             ProcessSubscriptionStatus::Consumed => plan.events.iter().filter(|event|
                 matches!(event.kind.as_str(), "message_delivered" | "business_error_caught"
-                    | "escalation_caught")
+                    | "escalation_caught" | "signal_received")
                     && event.data["subscription_id"].as_str()
                         == Some(update.subscription_id.as_str())).count() == 1,
             _ => true,
@@ -9478,13 +9673,136 @@ fn validate_script_actions_on(
 ) -> Result<()> {
     let mut sources = HashSet::new();
     for (index, event) in plan.events.iter().enumerate() {
-        if !matches!(event.kind.as_str(), "script_completed" | "send_task_admitted" | "incident") { continue; }
+        if !matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"
+            | "signal_admitted" | "incident") { continue; }
         let Some(node_id) = event.node_id.as_deref() else {
-            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"),
+            ensure!(!matches!(event.kind.as_str(), "script_completed"
+                | "send_task_admitted" | "signal_admitted"),
                 "immediate activity completion has no pinned node");
             continue;
         };
         let node = scope_node(model, scopes, instance_id, &event.scope_id, node_id)?;
+        if let ProcessNodeKind::SignalThrow {
+            signal_ref, payload_expression, ttl_seconds,
+        } = &node.kind {
+            let source_id = plan.event_sources.get(&index)
+                .context("Signal action has no exact ready-token source")?;
+            ensure!(sources.insert(source_id.clone())
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                "Signal action did not consume one unique ready activation");
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            ensure!(source.status == "ready" && source.scope_id == event.scope_id
+                && source.node_id == node.id
+                && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                    plan, source_id, expected_revision, entry, false)?,
+                "Signal action is outside its authenticated entry lineage");
+            let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                VariableEffect::Mapped { event_index, .. }
+                | VariableEffect::ScopeEntry { event_index, .. }
+                | VariableEffect::RepetitionAggregate { event_index, .. }
+                | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < index,
+            }).count();
+            let locals = variable_states.get(effect_count)
+                .context("Signal source-time variables are missing")?;
+            let effective = effective_scope_variables(scopes, locals, instance_id,
+                locals.get(instance_id).context("Signal root variables are missing")?,
+                &source.scope_id)?;
+            let path = scope_path(scopes, instance_id, &source.scope_id)?;
+            let (_, flows, _) = super::model::scope_body(model, &path)?;
+            let outgoing = flows.iter().filter(|flow| flow.source_id == node.id)
+                .collect::<Vec<_>>();
+            ensure!(outgoing.len() == 1, "SignalThrow has no pinned single successor");
+            let children = plan.create_tokens.iter().filter(|token|
+                plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
+            let declaration = model.signals.iter().find(|declaration|
+                declaration.signal_id == *signal_ref)
+                .context("Signal source declaration is missing")?;
+            let evaluated = super::runtime::evaluate(payload_expression, &effective,
+                &Value::Null, &[]);
+            let payload = evaluated.as_ref().ok();
+            let output_error = payload.and_then(|payload|
+                super::runtime::validate_output(payload).err());
+            let admission = if let Some(payload) = payload.filter(|_| output_error.is_none()) {
+                let (org_id, sender_user_id): (String, String) = tx.query_row(
+                    "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+                    [instance_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let source = PlannedSignal {
+                    signal_id: String::new(),
+                    signal_namespace_uri: declaration.namespace_uri.clone(),
+                    signal_declaration_id: declaration.signal_id.clone(),
+                    payload: payload.clone(),
+                    ttl_seconds: *ttl_seconds,
+                    source_scope_id: event.scope_id.clone(),
+                    source_node_id: node.id.clone(),
+                    source_activation_id: source_id.clone(),
+                    source_event_index: index,
+                };
+                let sender = ProcessActor { org_id, user_id: sender_user_id };
+                Some(signal_admission_on(tx, &sender, instance_id, plan, &source,
+                    match entry { EntryAuthority::Accepted(input) => Some(input), _ => None })?)
+            } else {
+                None
+            };
+            if event.kind == "signal_admitted" {
+                let payload = payload.context("Signal admission has an invalid pinned expression")?;
+                ensure!(output_error.is_none(),
+                    "Signal admission exceeded its pinned payload bound");
+                ensure!(admission == Some(super::runtime::SignalAdmissionDecision::Admit),
+                    "Signal admission exceeds its factual source-time capacity");
+                let rows = plan.create_signals.iter().filter(|signal|
+                    signal.source_event_index == index
+                        && signal.source_scope_id == event.scope_id
+                        && signal.source_node_id == node.id
+                        && signal.source_activation_id == *source_id).collect::<Vec<_>>();
+                ensure!(rows.len() == 1
+                    && rows[0].signal_namespace_uri == declaration.namespace_uri
+                    && rows[0].signal_declaration_id == declaration.signal_id
+                    && rows[0].ttl_seconds == *ttl_seconds
+                    && &rows[0].payload == payload
+                    && event.data == serde_json::json!({
+                        "signal_id":rows[0].signal_id,
+                        "source_activation_id":source_id,
+                        "signal_namespace_uri":declaration.namespace_uri,
+                        "signal_declaration_id":declaration.signal_id,
+                    })
+                    && plan.event_ids.get(&index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok())
+                    && children.len() == 1 && children[0].status == "ready"
+                    && children[0].scope_id == source.scope_id
+                    && children[0].node_id == outgoing[0].target_id
+                    && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
+                    && children[0].fork_stack == source.fork_stack,
+                    "Signal admission differs from its pinned payload and continuation");
+            } else {
+                let (code, message) = match (evaluated.err(), output_error, admission) {
+                    (Some(error), _, _) => ("SIGNAL_PAYLOAD_FAILED",
+                        bounded_failure_message(&error.to_string())),
+                    (None, Some(error), _) => ("SIGNAL_PAYLOAD_LIMIT",
+                        bounded_failure_message(&error.to_string())),
+                    (None, None, Some(super::runtime::SignalAdmissionDecision::DenyRecipients)) =>
+                        ("SIGNAL_RECIPIENT_LIMIT",
+                            "Signal has more than 64 authorized live recipients".to_owned()),
+                    (None, None, Some(super::runtime::SignalAdmissionDecision::DenyPending)) =>
+                        ("SIGNAL_PENDING_LIMIT",
+                            "Signal shared pending capacity is exhausted".to_owned()),
+                    _ => bail!("Signal incident has no factual failure cause"),
+                };
+                ensure!(event.data == serde_json::json!({"code":code,"message":message})
+                    && plan.create_signals.iter().all(|signal|
+                        signal.source_activation_id != *source_id)
+                    && plan.add_incidents.iter().filter(|incident|
+                        incident.scope_id == event.scope_id
+                            && incident.node_id.as_deref() == Some(node_id)
+                            && incident.code == code && incident.message == message).count() == 1
+                    && children.len() == 1 && children[0].status == "waiting"
+                    && children[0].scope_id == source.scope_id
+                    && children[0].node_id == source.node_id
+                    && children[0].arrival_edge_id == source.arrival_edge_id
+                    && children[0].fork_stack == source.fork_stack,
+                    "Signal failure differs from its pinned expression and parked wait");
+            }
+            continue;
+        }
         if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
             let source_id = plan.event_sources.get(&index)
                 .context("Send action has no exact ready-token source")?;
@@ -9562,7 +9880,8 @@ fn validate_script_actions_on(
             continue;
         }
         let ProcessNodeKind::ScriptTask { script, output_mapping } = &node.kind else {
-            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"),
+            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"
+                | "signal_admitted"),
                 "immediate completion named another pinned node");
             continue;
         };
@@ -9723,9 +10042,51 @@ fn validate_script_actions_on(
                         "ReceiveTask error differs from its pinned correlation failure"),
                 }
             }
+            if let ProcessNodeKind::SignalCatch { signal_ref, .. } = &node.kind {
+                let declaration = model.signals.iter().find(|declaration|
+                    declaration.signal_id == *signal_ref)
+                    .context("SignalCatch declaration is missing")?;
+                let waits = plan.create_tokens.iter().filter(|token|
+                    plan.token_sources.get(&token.token_id) == Some(source_id)
+                        && token.status == "waiting" && token.scope_id == source.scope_id
+                        && token.node_id == source.node_id
+                        && token.arrival_edge_id == source.arrival_edge_id
+                        && token.fork_stack == source.fork_stack).collect::<Vec<_>>();
+                ensure!(waits.len() == 1
+                    && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
+                    && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                        plan, source_id, expected_revision, entry, false)?,
+                    "SignalCatch lacks one authenticated ready-to-waiting activation");
+                let subscriptions = plan.create_subscriptions.iter().filter(|subscription|
+                    subscription.kind == ProcessSubscriptionKind::SignalCatch
+                        && subscription.scope_id == source.scope_id
+                        && subscription.node_id == source.node_id
+                        && subscription.token_id == waits[0].token_id).collect::<Vec<_>>();
+                ensure!(subscriptions.len() == 1
+                    && subscriptions[0].status == ProcessSubscriptionStatus::Open
+                    && subscriptions[0].race_id.is_none()
+                    && subscriptions[0].message_name.is_none()
+                    && subscriptions[0].correlation_key.is_none()
+                    && subscriptions[0].signal_namespace_uri.as_deref()
+                        == Some(declaration.namespace_uri.as_str())
+                    && subscriptions[0].signal_declaration_id.as_deref()
+                        == Some(signal_ref.as_str())
+                    && plan.events.iter().filter(|event|
+                        event.kind == "signal_catch_opened"
+                            && event.scope_id == source.scope_id
+                            && event.node_id.as_deref() == Some(node.id.as_str())
+                            && event.data == serde_json::json!({
+                                "subscription_id":subscriptions[0].subscription_id,
+                                "attached_token_id":waits[0].token_id,
+                                "signal_namespace_uri":declaration.namespace_uri,
+                                "signal_declaration_id":declaration.signal_id,
+                            })).count() == 1,
+                    "SignalCatch lacks its sole exact pinned arm fact");
+            }
         }
         if source.status == "ready" && matches!(&node.kind,
-            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }) {
+            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+            | ProcessNodeKind::SignalThrow { .. }) {
             ensure!(sources.contains(source_id)
                 && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
                 "Script consumed or continued without one authenticated action fact");
@@ -9735,7 +10096,8 @@ fn validate_script_actions_on(
         let Some(node_id) = incident.node_id.as_deref() else { continue; };
         let node = scope_node(model, scopes, instance_id, &incident.scope_id, node_id)?;
         if matches!(&node.kind,
-            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }) {
+            ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+            | ProcessNodeKind::SignalThrow { .. }) {
             let events = plan.events.iter().filter(|event|
                 event.kind == "incident" && event.scope_id == incident.scope_id
                     && event.node_id.as_deref() == Some(node_id)
@@ -9749,6 +10111,86 @@ fn validate_script_actions_on(
                 "Script incident rows and exact sourced history differ");
         }
     }
+    Ok(())
+}
+
+fn validate_signal_failure_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], input: &AcceptedInputRef,
+) -> Result<()> {
+    let AcceptedInputRef::Signal { signal_id, receipt_id,
+        target_subscription_id, .. } = input else { return Ok(()) };
+    let incidents = plan.add_incidents.iter().filter(|incident|
+        matches!(incident.code.as_str(), "SIGNAL_MAPPING_FAILED" | "SIGNAL_DELIVERY_FAILED"))
+        .collect::<Vec<_>>();
+    if incidents.is_empty() { return Ok(()) }
+    ensure!(incidents.len() == 1 && plan.add_incidents.len() == 1
+        && plan.events.len() == 1 && plan.events[0].kind == "incident"
+        && plan.variable_effects.is_empty() && plan.consume_token_ids.is_empty()
+        && plan.create_signals.is_empty() && plan.termination_attempts.is_empty()
+        && plan.status == ProcessInstanceStatus::Incident,
+        "failed Signal receipt changed unrelated activity facts");
+    let incident = incidents[0];
+    let subscription = subscription_on(tx, target_subscription_id)?;
+    let node = scope_node(model, scopes, instance_id,
+        &subscription.scope_id, &subscription.node_id)?;
+    let ProcessNodeKind::SignalCatch { output_mapping, .. } = &node.kind else {
+        bail!("failed Signal receipt targets another pinned node")
+    };
+    let (payload_json, source_event_id, attempts): (String, String, u32) = tx.query_row(
+        "SELECT e.payload_json,e.source_event_id,r.attempt_count \
+         FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e \
+           ON e.signal_id=r.signal_id \
+         WHERE r.receipt_id=?1 AND r.signal_id=?2 \
+           AND r.recipient_subscription_id=?3",
+        params![receipt_id,signal_id,target_subscription_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    ensure!(signal_claim_matches_on(tx, instance_id, input,
+        target_subscription_id, signal_id, &source_event_id)?
+        && subscription.status == ProcessSubscriptionStatus::Open
+        && incident.scope_id == subscription.scope_id
+        && incident.node_id.as_deref() == Some(subscription.node_id.as_str())
+        && plan.events[0].scope_id == subscription.scope_id
+        && plan.events[0].node_id.as_deref() == Some(subscription.node_id.as_str())
+        && plan.events[0].data == serde_json::json!({
+            "code":incident.code,"message":incident.message})
+        && plan.subscription_updates.len() == 1
+        && plan.subscription_updates[0].subscription_id == subscription.subscription_id
+        && plan.subscription_updates[0].status == ProcessSubscriptionStatus::Error,
+        "failed Signal receipt lacks its fenced subscription and source");
+    let expected_message = if incident.code == "SIGNAL_DELIVERY_FAILED" {
+        ensure!(attempts == 5
+            && plan.subscription_updates[0].last_reason.as_deref()
+                == Some("transient_retry_exhausted"),
+            "Signal delivery failure lacks five factual attempts");
+        "Signal receipt exhausted five transient delivery attempts".to_owned()
+    } else {
+        ensure!(plan.subscription_updates[0].last_reason.as_deref()
+            == Some("recipient_mapping_failed"),
+            "Signal mapping failure changed its exact terminal reason");
+        let states = variable_states.first()
+            .context("Signal mapping failure has no source-time variables")?;
+        let local = states.get(&subscription.scope_id)
+            .context("Signal mapping failure has no source scope local")?;
+        let root = states.get(instance_id)
+            .context("Signal mapping failure has no source root local")?;
+        let effective = effective_scope_variables(scopes, states, instance_id,
+            root, &subscription.scope_id)?;
+        let payload: Value = parse(payload_json)?;
+        let metadata = serde_json::json!({
+            "signal_id":signal_id,
+            "signal_namespace_uri":subscription.signal_namespace_uri,
+            "signal_declaration_id":subscription.signal_declaration_id,
+            "source_event_id":source_event_id,
+        });
+        let error = super::runtime::patch_variables(output_mapping,
+            local, &effective, &payload, &[("signal".into(), metadata)])
+            .err().context("Signal mapping incident has a valid pinned mapping")?;
+        bounded_failure_message(&error.to_string())
+    };
+    ensure!(incident.message == expected_message,
+        "failed Signal receipt differs from its factual failure cause");
     Ok(())
 }
 
@@ -9770,22 +10212,25 @@ fn validate_termination_plan_on(
         if source.status == "ready" && scope_node(model, scopes, instance_id,
             &source.scope_id, &source.node_id)
             .is_ok_and(|node| matches!(&node.kind,
-                ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. })) {
+                ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+                | ProcessNodeKind::SignalThrow { .. })) {
             has_script = true;
             break;
         }
     }
     has_script |= plan.events.iter().any(|event| matches!(event.kind.as_str(),
-            "script_completed" | "send_task_admitted")
+            "script_completed" | "send_task_admitted" | "signal_admitted")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
-                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }))));
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+                    | ProcessNodeKind::SignalThrow { .. }))));
     has_script |= plan.add_incidents.iter().any(|incident|
         incident.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &incident.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
-                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }))));
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
+                    | ProcessNodeKind::SignalThrow { .. }))));
     has_script |= plan.variable_effects.iter().any(|effect| matches!(effect,
         VariableEffect::Mapped { scope_id, node_id, .. }
             if scope_node(model, scopes, instance_id, scope_id, node_id)
@@ -9800,16 +10245,20 @@ fn validate_termination_plan_on(
         EntryAuthority::Accepted(AcceptedInputRef::Message {
             target_subscription_id: Some(_), .. }))
         && plan.events.iter().any(|event| event.kind == "receive_task_completed")
+        || matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Signal { .. }))
         || plan.create_subscriptions.iter().any(|subscription|
-            subscription.kind == ProcessSubscriptionKind::ReceiveTask)
+            matches!(subscription.kind, ProcessSubscriptionKind::ReceiveTask
+                | ProcessSubscriptionKind::SignalCatch))
         || plan.events.iter().any(|event|
-            matches!(event.kind.as_str(), "receive_task_opened" | "receive_task_completed"));
+            matches!(event.kind.as_str(), "receive_task_opened" | "receive_task_completed"
+                | "signal_catch_opened" | "signal_received"));
     let has_receive = has_receive || plan.consume_token_ids.iter()
         .chain(plan.token_sources.values()).any(|source_id|
             termination_token_on(tx, instance_id, plan, source_id).is_ok_and(|source|
                 source.status == "ready" && scope_node(model, scopes, instance_id,
                     &source.scope_id, &source.node_id).is_ok_and(|node|
-                        matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }))));
+                        matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }
+                            | ProcessNodeKind::SignalCatch { .. }))));
     let replay_variables = !plan.termination_attempts.is_empty()
         || has_script
         || has_manual
@@ -9842,6 +10291,10 @@ fn validate_termination_plan_on(
         }
         validate_termination_variables_on(tx, instance_id, model, &mapping_scopes, plan, call_source, entry)?
     };
+    if let EntryAuthority::Accepted(input @ AcceptedInputRef::Signal { .. }) = entry {
+        validate_signal_failure_on(tx, instance_id, model, &mapping_scopes,
+            plan, &variable_states, input)?;
+    }
     if has_script || has_manual || has_receive {
         validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
             expected_revision, plan, &variable_states, entry)?;
@@ -10098,6 +10551,25 @@ fn validate_termination_plan_on(
                         "message start input unexpectedly names a catch");
                     None
                 }
+            }
+            input @ AcceptedInputRef::Signal { signal_id, target_subscription_id, .. } => {
+                let delivered = plan.events.iter().filter(|event|
+                    event.kind == "signal_received"
+                        && event.data["signal_id"].as_str() == Some(signal_id.as_str())
+                        && event.data["subscription_id"].as_str()
+                            == Some(target_subscription_id.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(delivered.len() == 1
+                    && plan.subscription_updates.iter().filter(|update|
+                        update.subscription_id == *target_subscription_id
+                            && update.status == ProcessSubscriptionStatus::Consumed).count() == 1,
+                    "terminating Signal input lacks one factual receipt and consumption");
+                let source_event_id = delivered[0].data["source_event_id"].as_str()
+                    .context("terminating Signal has no sender source event")?;
+                ensure!(signal_claim_matches_on(tx, instance_id, input,
+                    target_subscription_id, signal_id, source_event_id)?,
+                    "terminating Signal input differs from its claimed fenced receipt");
+                Some(subscription_on(tx, target_subscription_id)?.token_id)
             }
             AcceptedInputRef::Service { job_id, attempt, fence, result_event_id } => {
                 let job: (u32,u64,String,String) = tx.query_row(
@@ -10658,6 +11130,8 @@ fn ordinary_action_source_matches_entry_on(
                 AcceptedInputRef::Message { target_subscription_id, .. } =>
                     target_subscription_id.as_ref().map(|id|
                         subscription_on(tx, id).map(|subscription| subscription.token_id)).transpose()?,
+                AcceptedInputRef::Signal { target_subscription_id, .. } =>
+                    Some(subscription_on(tx, target_subscription_id)?.token_id),
                 AcceptedInputRef::Service { job_id, .. } => Some(tx.query_row(
                     "SELECT token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
                     params![instance_id, job_id], |row| row.get::<_, String>(0))?),
@@ -12008,6 +12482,23 @@ fn apply_plan_on(
     let (successful_terminations, repetition_variable_states) = validate_termination_plan_on(tx, instance_id, &model, &proposed_scopes,
         expected_revision, plan, call_source, entry, actor_id)?;
     validate_gateway_join_plan_on(tx, instance_id, &model, &proposed_scopes, plan)?;
+    let signal_actor = ProcessActor { org_id: org_id.clone(), user_id: initiator.clone() };
+    let mut signal_cohorts = BTreeMap::new();
+    for signal in &plan.create_signals {
+        ensure!(Uuid::parse_str(&signal.signal_id).is_ok()
+            && !signal_cohorts.contains_key(&signal.signal_id),
+            "signal admission identity is duplicated or malformed");
+        let cohort = signal_recipients_on(tx, &signal_actor, instance_id, plan, signal)?;
+        ensure!(cohort.len() <= 64, "signal recipient capacity exceeded");
+        signal_cohorts.insert(signal.signal_id.clone(), cohort);
+    }
+    let accepted = match entry { EntryAuthority::Accepted(input) => Some(input), _ => None };
+    let mut admission_debits = BTreeMap::new();
+    for index in plan.create_messages.iter().map(|message| message.source_event_index)
+        .chain(plan.create_signals.iter().map(|signal| signal.source_event_index)) {
+        admission_debits.insert(index, pending_entry_debit_on(tx, &signal_actor,
+            instance_id, plan, index, accepted)?);
+    }
 
     let mut cancelled_claims = Vec::new();
     insert_scoped_tokens_on(tx, instance_id, plan, at_ms)?;
@@ -12027,7 +12518,7 @@ fn apply_plan_on(
             );
         }
     }
-    apply_event_plan_on(tx, instance_id, &proposed_scopes, &successful_terminations, plan, at_ms)?;
+    apply_event_plan_on(tx, instance_id, &proposed_scopes, &successful_terminations, plan, entry, at_ms)?;
     for update in &plan.timer_updates {
         let actual = timer_on(tx, &update.timer_id)?;
         ensure!(
@@ -12368,33 +12859,48 @@ fn apply_plan_on(
         org_id,
         user_id: initiator,
     };
-    for message in &plan.create_messages {
-        let event = plan
-            .events
-            .get(message.source_event_index)
-            .context("outbox event index is absent")?;
-        ensure!(
-            matches!(event.kind.as_str(), "message_queued" | "send_task_admitted")
+    let mut admissions = plan.create_messages.iter().map(|message|
+        (message.source_event_index, Some(message), None))
+        .chain(plan.create_signals.iter().map(|signal|
+            (signal.source_event_index, None, Some(signal))))
+        .collect::<Vec<_>>();
+    admissions.sort_by_key(|(index, _, _)| *index);
+    ensure!(admissions.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "outbox and Signal admissions cannot share one source event");
+    for (event_index, message, signal) in admissions {
+        let event = plan.events.get(event_index)
+            .context("admission source event index is absent")?;
+        let source_event_id = event_ids.get(event_index)
+            .context("admission source event was not committed")?;
+        if let Some(message) = message {
+            ensure!(matches!(event.kind.as_str(), "message_queued" | "send_task_admitted")
                 && event.scope_id == message.source_scope_id
                 && event.node_id.as_deref() == Some(message.source_node_id.as_str())
                 && event.data["message_id"].as_str() == Some(message.message.message_id.as_str())
                 && event.data["source_activation_id"].as_str()
                     == Some(message.source_activation_id.as_str()),
-            "outbox identity differs from its actual queued event"
-        );
-        insert_message_on(
-            tx,
-            &sender,
-            &message.message,
-            Some((
-                instance_id,
-                &message.source_scope_id,
-                &message.source_node_id,
-                &message.source_activation_id,
-                &event_ids[message.source_event_index],
-            )),
-            at_ms,
-        )?;
+                "outbox identity differs from its actual queued event");
+            insert_message_on(tx, &sender, &message.message,
+                Some((instance_id, &message.source_scope_id, &message.source_node_id,
+                    &message.source_activation_id, source_event_id)),
+                *admission_debits.get(&event_index)
+                    .context("directed admission has no source-time pending debit")?, at_ms)?;
+        } else if let Some(signal) = signal {
+            ensure!(event.kind == "signal_admitted"
+                && event.scope_id == signal.source_scope_id
+                && event.node_id.as_deref() == Some(signal.source_node_id.as_str())
+                && event.data == serde_json::json!({
+                    "signal_id":signal.signal_id,
+                    "source_activation_id":signal.source_activation_id,
+                    "signal_namespace_uri":signal.signal_namespace_uri,
+                    "signal_declaration_id":signal.signal_declaration_id,
+                }), "signal admission differs from its exact source event");
+            insert_signal_on(tx, &sender, instance_id, signal, source_event_id,
+                signal_cohorts.get(&signal.signal_id)
+                    .context("signal admission lacks its source-time recipient cohort")?,
+                *admission_debits.get(&event_index)
+                    .context("Signal admission has no source-time pending debit")?, at_ms)?;
+        }
     }
     for request in &plan.call_requests {
         if !plan.cancel_token_ids.contains(&request.parent_token_id) {
@@ -12632,7 +13138,8 @@ fn apply_plan_on(
         affected == 1,
         "process instance revision conflict or closed instance"
     );
-    cancelled_claims.extend(apply_call_steps_on(tx, instance_id, actor_id, plan, at_ms)?);
+    cancelled_claims.extend(apply_call_steps_on(tx, instance_id, actor_id,
+        &plan.call_steps, at_ms, 0, &mut HashSet::new())?);
     Ok(cancelled_claims)
 }
 
@@ -12745,6 +13252,50 @@ fn call_control_live_on(conn: &Connection, instance_id: &str) -> Result<bool> {
     }
 }
 
+fn historical_call_child_on(conn: &Connection, instance_id: &str) -> Result<bool> {
+    let Some(call) = calls_on(conn, instance_id)?.into_iter()
+        .find(|call| call.child_instance_id == instance_id) else {
+        return Ok(false);
+    };
+    if call.status == ProcessCallStatus::Waiting { return Ok(false); }
+    let (child_definition, child_version, child_status, child_org, child_initiator):
+        (String, u32, String, String, String) = conn.query_row(
+        "SELECT definition_id,version,status,org_id,initiator_user_id
+         FROM bpmn_instances WHERE instance_id=?1", [instance_id], |row|
+        Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+    let (parent_definition, parent_version, parent_org, parent_initiator):
+        (String, u32, String, String) = conn.query_row(
+        "SELECT definition_id,version,org_id,initiator_user_id
+         FROM bpmn_instances WHERE instance_id=?1", [&call.parent_instance_id], |row|
+        Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    let pinned_model_sha256: String = conn.query_row(
+        "SELECT model_sha256 FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+        params![child_definition, child_version], |row| row.get(0))?;
+    let parent_activation: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_scopes s
+         ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id
+         WHERE t.instance_id=?1 AND t.scope_id=?2 AND t.token_id=?3
+           AND t.node_id=?4)",
+        params![call.parent_instance_id,call.parent_scope_id,
+            call.parent_token_id,call.call_node_id], |row| row.get(0))?;
+    ensure!(parent_activation && call.called_definition_id == child_definition
+        && call.called_version == child_version && call.model_sha256 == pinned_model_sha256
+        && call.definition_id == parent_definition && call.version == parent_version
+        && child_org == parent_org && child_initiator == parent_initiator,
+        "historical called process differs from its pinned parent activation");
+    let terminal = match call.status {
+        ProcessCallStatus::Returned => child_status == "completed",
+        ProcessCallStatus::Cancelled => matches!(child_status.as_str(),
+            "cancelled" | "completed" | "error"),
+        ProcessCallStatus::Error => child_status == "error",
+        ProcessCallStatus::ReturnIncident => matches!(child_status.as_str(),
+            "completed" | "error"),
+        ProcessCallStatus::Waiting => false,
+    };
+    ensure!(terminal, "historical called process is not factually terminal");
+    Ok(true)
+}
+
 fn require_call_control_authority_on(
     conn: &Connection,
     actor: &ProcessActor,
@@ -12784,13 +13335,14 @@ fn initial_call_snapshot(
     let mut vars = serde_json::to_value(&version.version.model.variables)?;
     for (key, value) in variables
         .as_object()
-        .context("called inputs are not an object")?
+        .context(CallTransitionRejected("called inputs are not an object"))?
     {
         vars.as_object_mut()
-            .context("published default variables are not an object")?
+            .context(CallTransitionRejected("published default variables are not an object"))?
             .insert(key.clone(), value.clone());
     }
-    validate_variables(&vars)?;
+    validate_variables(&vars)
+        .context(CallTransitionRejected("called inputs violate process variable bounds"))?;
     let instance = ProcessInstance {
         instance_id: instance_id.to_owned(),
         definition_id: version.version.definition_id.clone(),
@@ -12867,10 +13419,10 @@ fn projected_call_budget(snapshots: &BTreeMap<String, RuntimeSnapshot>) -> Resul
         rows = rows
             .checked_add(snapshot.scopes.len())
             .context("process call lifetime count overflow")?;
-        ensure!(
-            rows <= 129,
-            "process call tree exceeds 129 retained scope rows"
-        );
+        if rows > 129 {
+            return Err(CallTransitionRejected(
+                "process call tree exceeds 129 retained scope rows").into());
+        }
         if !matches!(
             snapshot.instance.status,
             ProcessInstanceStatus::Completed
@@ -12903,10 +13455,10 @@ fn projected_call_budget(snapshots: &BTreeMap<String, RuntimeSnapshot>) -> Resul
                     .context("process active variable size overflow")?;
             }
         }
-        ensure!(
-            active <= 1024 * 1024,
-            "process call tree active variables exceed 1 MiB"
-        );
+        if active > 1024 * 1024 {
+            return Err(CallTransitionRejected(
+                "process call tree active variables exceed 1 MiB").into());
+        }
     }
     Ok(())
 }
@@ -12932,6 +13484,35 @@ fn append_call_plan(
     Ok(())
 }
 
+fn record_call_step(
+    snapshots: &mut BTreeMap<String, RuntimeSnapshot>,
+    steps: &mut Vec<CallStep>,
+    step: CallStep,
+    projection_instance_id: &str,
+    projection_plan: &RuntimePlan,
+    at_ms: i64,
+    execution: Option<(&Transaction<'_>, &str, &str)>,
+    cancelled_claims: &mut Vec<CancelledJobClaim>,
+    skipped: &mut HashSet<String>,
+) -> Result<()> {
+    let index = steps.len();
+    steps.push(step);
+    if let Some((tx, root_instance_id, actor_id)) = execution {
+        cancelled_claims.extend(apply_call_steps_on(tx, root_instance_id, actor_id,
+            &steps[index..], at_ms, index, skipped)?);
+        let mut persisted = BTreeMap::new();
+        for instance_id in call_tree_ids_on(tx, root_instance_id)? {
+            let initiator = call_initiator_on(tx, &instance_id)?;
+            persisted.insert(instance_id.clone(),
+                runtime_snapshot_on(tx, &initiator, &instance_id)?);
+        }
+        *snapshots = persisted;
+    } else {
+        append_call_plan(snapshots, projection_instance_id, projection_plan, at_ms)?;
+    }
+    Ok(())
+}
+
 fn prepare_call_steps(
     instance_id: &str,
     local_plan: &RuntimePlan,
@@ -12939,9 +13520,13 @@ fn prepare_call_steps(
     authority: &BTreeMap<String, String>,
     steps: &mut Vec<CallStep>,
     at_ms: i64,
+    execution: Option<(&Transaction<'_>, &str, &str)>,
+    cancelled_claims: &mut Vec<CancelledJobClaim>,
 ) -> Result<()> {
     let mut pending = vec![(instance_id.to_owned(), Box::new(local_plan.clone()), 0usize)];
+    let mut skipped = HashSet::new();
     'pending: while let Some((instance_id, local_plan, next_request)) = pending.pop() {
+        if skipped.contains(&instance_id) { continue }
         if let Some(request) = local_plan.call_requests.get(next_request).cloned() {
             pending.push((instance_id.clone(), local_plan, next_request + 1));
             let parent = snapshots
@@ -13001,6 +13586,12 @@ fn prepare_call_steps(
                     &parent.call_versions,
                     at_ms,
                 )?;
+                let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+                    accepted: Option<&AcceptedInputRef>| {
+                    let (tx, _, _) = execution.context("transactional Call source is missing")?;
+                    signal_admission_on(tx, &actor, &request.child_instance_id, prefix,
+                        signal, accepted)
+                };
                 let plan = super::runtime::plan_start(
                     &target.version.model,
                     &request.child_instance_id,
@@ -13023,12 +13614,12 @@ fn prepare_call_steps(
                         child_version: *called_version,
                         child_model_sha256: target.version.model_sha256.clone(),
                     },
-                )?;
+                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>))?;
                 Ok((child, plan))
             })();
             let (child, plan) = match prepared {
                 Ok(pair) => pair,
-                Err(error) => {
+                Err(error) if error.downcast_ref::<CallTransitionRejected>().is_some() => {
                     let incident = super::runtime::plan_call_incident(
                         &parent,
                         &node.id,
@@ -13037,30 +13628,33 @@ fn prepare_call_steps(
                         &format!("{error:#}"),
                         at_ms,
                     )?;
-                    steps.push(CallStep::Advance {
+                    record_call_step(snapshots, steps, CallStep::Advance {
                         instance_id: instance_id.to_owned(),
                         expected_revision: parent.instance.revision,
                         plan: Box::new(incident.clone()),
-                    });
-                    append_call_plan(snapshots, &instance_id, &incident, at_ms)?;
+                    }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped)?;
                     continue;
                 }
+                Err(error) => return Err(error),
             };
             let mut proposed = snapshots.clone();
             proposed.insert(
                 request.child_instance_id.clone(),
                 super::runtime::project_snapshot(&child, &plan, at_ms)?,
             );
-            let error = target
+            let mut error = target
                 .admission_error
                 .clone()
                 .or_else(|| authority.get(&instance_id).cloned())
-                .or_else(|| (depth > 3).then(|| "process call depth exceeds three".into()))
-                .or_else(|| {
-                    projected_call_budget(&proposed)
-                        .err()
-                        .map(|e| format!("{e:#}"))
-                });
+                .or_else(|| (depth > 3).then(|| "process call depth exceeds three".into()));
+            if error.is_none() {
+                if let Err(cause) = projected_call_budget(&proposed) {
+                    if cause.downcast_ref::<CallTransitionRejected>().is_none() {
+                        return Err(cause);
+                    }
+                    error = Some(format!("{cause:#}"));
+                }
+            }
             if let Some(reason) = error {
                 let incident = super::runtime::plan_call_incident(
                     &parent,
@@ -13070,12 +13664,11 @@ fn prepare_call_steps(
                     &reason,
                     at_ms,
                 )?;
-                steps.push(CallStep::Advance {
+                record_call_step(snapshots, steps, CallStep::Advance {
                     instance_id: instance_id.to_owned(),
                     expected_revision: parent.instance.revision,
                     plan: Box::new(incident.clone()),
-                });
-                append_call_plan(snapshots, &instance_id, &incident, at_ms)?;
+                }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped)?;
                 continue;
             }
             let call = CallActivation {
@@ -13103,15 +13696,17 @@ fn prepare_call_steps(
             let mut child = child;
             child.calls.push(call.clone());
             snapshots.insert(request.child_instance_id.clone(), child);
-            steps.push(CallStep::Start {
+            record_call_step(snapshots, steps, CallStep::Start {
                 call: PlannedCall {
                     call: call.clone(),
                     variables: request.variables.clone(),
                 },
                 plan: Box::new(plan.clone()),
-            });
-            append_call_plan(snapshots, &request.child_instance_id, &plan, at_ms)?;
-            pending.push((request.child_instance_id.clone(), Box::new(plan), 0));
+            }, &request.child_instance_id, &plan, at_ms, execution, cancelled_claims,
+                &mut skipped)?;
+            if snapshots.contains_key(&request.child_instance_id) {
+                pending.push((request.child_instance_id.clone(), Box::new(plan), 0));
+            }
             continue;
         }
         if let Some(source) = &local_plan.business_error {
@@ -13138,8 +13733,19 @@ fn prepare_call_steps(
                 }
                 let child_revision = snapshots.get(&call.child_instance_id)
                     .context("error call child snapshot is missing")?.instance.revision;
+                let parent_actor = ProcessActor {
+                    org_id: parent.org_id.clone(),
+                    user_id: parent.instance.initiator_user_id.clone(),
+                };
+                let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+                    accepted: Option<&AcceptedInputRef>| {
+                    let (tx, _, _) = execution.context("transactional Call source is missing")?;
+                    signal_admission_on(tx, &parent_actor, &call.parent_instance_id,
+                        prefix, signal, accepted)
+                };
                 if let Some(plan) = super::runtime::plan_call_error(&parent, &call, source,
-                    at_ms, child_revision)?
+                    at_ms, child_revision,
+                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>))?
                 {
                     let status = if matches!(source,BusinessErrorSource::ErrorEnd {instance_id,..} if instance_id==&call.child_instance_id)
                     {
@@ -13147,14 +13753,14 @@ fn prepare_call_steps(
                     } else {
                         ProcessCallStatus::Cancelled
                     };
-                    steps.push(CallStep::Return {
+                    record_call_step(snapshots, steps, CallStep::Return {
                         call: call.clone(),
                         expected_revision: parent.instance.revision,
                         status,
                         source: Some(source.clone()),
                         plan: Box::new(plan.clone()),
-                    });
-                    append_call_plan(snapshots, &call.parent_instance_id, &plan, at_ms)?;
+                    }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
+                        &mut skipped)?;
                     pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
                     continue 'pending;
                 }
@@ -13173,14 +13779,14 @@ fn prepare_call_steps(
                     "the called process ended with an uncaught business error",
                     at_ms,
                 )?;
-                steps.push(CallStep::Return {
+                record_call_step(snapshots, steps, CallStep::Return {
                     call: call.clone(),
                     expected_revision: parent.instance.revision,
                     status: ProcessCallStatus::Error,
                     source: Some(source.clone()),
                     plan: Box::new(plan.clone()),
-                });
-                append_call_plan(snapshots, &call.parent_instance_id, &plan, at_ms)?;
+                }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
+                    &mut skipped)?;
             }
             continue 'pending;
         }
@@ -13201,59 +13807,73 @@ fn prepare_call_steps(
                     .get(&call.parent_instance_id)
                     .context("call return parent state missing")?
                     .clone();
-                let candidate = match authority.get(&call.parent_instance_id) {
-                    Some(reason) => Err(anyhow::anyhow!(reason.clone())),
-                    None => super::runtime::plan_call_return(
+                let parent_actor = ProcessActor {
+                    org_id: parent.org_id.clone(),
+                    user_id: parent.instance.initiator_user_id.clone(),
+                };
+                let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+                    accepted: Option<&AcceptedInputRef>| {
+                    let (tx, _, _) = execution.context("transactional Call source is missing")?;
+                    signal_admission_on(tx, &parent_actor, &call.parent_instance_id,
+                        prefix, signal, accepted)
+                };
+                let (plan, status) = if let Some(reason) = authority.get(&call.parent_instance_id) {
+                    (super::runtime::plan_call_incident(
+                        &parent, &call.call_node_id, &call.parent_scope_id,
+                        "CALL_RETURN_ERROR", reason, at_ms)?, ProcessCallStatus::ReturnIncident)
+                } else {
+                    let candidate = super::runtime::plan_call_return(
                         &parent,
                         &call,
                         &child.instance.variables,
                         at_ms,
                         child.instance.revision,
-                    ),
-                };
-                let (plan, status) = match candidate {
-                    Ok(plan) => {
-                        let mut proposed = snapshots.clone();
-                        let checked = super::runtime::project_snapshot(&parent, &plan, at_ms)
-                            .and_then(|projected| {
-                                proposed.insert(call.parent_instance_id.clone(), projected);
-                                projected_call_budget(&proposed)
-                            });
-                        if let Err(error) = checked {
-                            (
-                                super::runtime::plan_call_incident(
-                                    &parent,
-                                    &call.call_node_id,
-                                    &call.parent_scope_id,
-                                    "CALL_RETURN_ERROR",
-                                    &format!("{error:#}"),
-                                    at_ms,
-                                )?,
-                                ProcessCallStatus::ReturnIncident,
-                            )
-                        } else {
-                            (plan, ProcessCallStatus::Returned)
+                        execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>));
+                    match candidate {
+                        Ok(plan) => {
+                            let mut proposed = snapshots.clone();
+                            let checked = super::runtime::project_snapshot(&parent, &plan, at_ms)
+                                .and_then(|projected| {
+                                    proposed.insert(call.parent_instance_id.clone(), projected);
+                                    projected_call_budget(&proposed)
+                                });
+                            match checked {
+                                Ok(()) => (plan, ProcessCallStatus::Returned),
+                                Err(error) if error.downcast_ref::<CallTransitionRejected>().is_some() => (
+                                    super::runtime::plan_call_incident(
+                                        &parent,
+                                        &call.call_node_id,
+                                        &call.parent_scope_id,
+                                        "CALL_RETURN_ERROR",
+                                        &format!("{error:#}"),
+                                        at_ms,
+                                    )?,
+                                    ProcessCallStatus::ReturnIncident,
+                                ),
+                                Err(error) => return Err(error),
+                            }
                         }
+                        Err(error) if error.downcast_ref::<super::runtime::CallReturnMappingRejected>().is_some() => (
+                            super::runtime::plan_call_incident(
+                                &parent,
+                                &call.call_node_id,
+                                &call.parent_scope_id,
+                                "CALL_RETURN_ERROR",
+                                &format!("{error:#}"),
+                                at_ms,
+                            )?,
+                            ProcessCallStatus::ReturnIncident,
+                        ),
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => (
-                        super::runtime::plan_call_incident(
-                            &parent,
-                            &call.call_node_id,
-                            &call.parent_scope_id,
-                            "CALL_RETURN_ERROR",
-                            &format!("{error:#}"),
-                            at_ms,
-                        )?,
-                        ProcessCallStatus::ReturnIncident,
-                    ),
                 };
-                steps.push(CallStep::Return {
+                let step = CallStep::Return {
                     call: call.clone(),
                     expected_revision: parent.instance.revision,
                     status: status.clone(),
                     source: None,
                     plan: Box::new(plan.clone()),
-                });
+                };
                 for snapshot in snapshots.values_mut() {
                     for actual in &mut snapshot.calls {
                         if actual.call_id == call.call_id {
@@ -13262,12 +13882,47 @@ fn prepare_call_steps(
                         }
                     }
                 }
-                append_call_plan(snapshots, &call.parent_instance_id, &plan, at_ms)?;
+                record_call_step(snapshots, steps, step, &call.parent_instance_id,
+                    &plan, at_ms, execution, cancelled_claims, &mut skipped)?;
                 pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
             }
         }
     }
     Ok(())
+}
+
+fn apply_canonical_call_steps_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    actor_id: &str,
+    plan: &RuntimePlan,
+    at_ms: i64,
+) -> Result<Vec<CancelledJobClaim>> {
+    ensure!(plan.call_steps.is_empty(),
+        "canonical Call steps must be derived from persisted source facts");
+    let mut snapshots = BTreeMap::new();
+    let mut authority = BTreeMap::new();
+    for id in call_tree_ids_on(tx, instance_id)? {
+        let initiator = call_initiator_on(tx, &id)?;
+        if !historical_call_child_on(tx, &id)? {
+            if let Err(error) = require_call_control_authority_on(tx, &initiator, &id) {
+                if error.downcast_ref::<ProcessAuthorityDenied>().is_none()
+                    && error.downcast_ref::<CallTransitionRejected>().is_none() {
+                    return Err(error);
+                }
+                authority.insert(id.clone(), format!("{error:#}"));
+            }
+        }
+        snapshots.insert(id.clone(), runtime_snapshot_on(tx, &initiator, &id)?);
+    }
+    ensure!(snapshots.contains_key(instance_id),
+        "canonical Call source instance is missing");
+    let mut steps = Vec::new();
+    let mut cancelled_claims = Vec::new();
+    prepare_call_steps(instance_id, plan, &mut snapshots, &authority,
+        &mut steps, at_ms, Some((tx, instance_id, actor_id)),
+        &mut cancelled_claims)?;
+    Ok(cancelled_claims)
 }
 
 fn prepare_call_plan<'pool>(
@@ -13315,8 +13970,14 @@ fn prepare_call_plan<'pool>(
                         "call tree organization or initiator mismatch"
                     );
                     let snapshot = runtime_snapshot_on(conn, &initiator, &id)?;
-                    if let Err(error) = require_call_control_authority_on(conn, &initiator, &id) {
-                        authority.insert(id.clone(), format!("{error:#}"));
+                    if !historical_call_child_on(conn, &id)? {
+                        if let Err(error) = require_call_control_authority_on(conn, &initiator, &id) {
+                            if error.downcast_ref::<ProcessAuthorityDenied>().is_none()
+                                && error.downcast_ref::<CallTransitionRejected>().is_none() {
+                                return Err(error);
+                            }
+                            authority.insert(id.clone(), format!("{error:#}"));
+                        }
                     }
                     snapshots.insert(id, snapshot);
                 }
@@ -13354,6 +14015,8 @@ fn prepare_call_plan<'pool>(
             &authority,
             &mut steps,
             at_ms,
+            None,
+            &mut Vec::new(),
         )?;
         composite.call_steps = steps;
         #[cfg(test)]
@@ -13400,7 +14063,7 @@ pub fn start_instance(
     definition_id: &str,
     version: u32,
     initial_variables: &Value,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessInstance> {
     if let Some(prior) = replay_instance_command(pool, actor, stamp, None)? {
@@ -13410,15 +14073,14 @@ pub fn start_instance(
             reproject_instance_on(conn, actor, &prior.instance_id)
         });
     }
-    let (composite, mut conn) = prepare_call_plan(
-        pool,
-        actor,
-        instance_id,
-        Some((definition_id, version, initial_variables)),
-        plan,
-        at_ms,
-    )?;
-    let plan = &composite;
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (composite, conn) = prepare_call_plan(pool, actor, instance_id,
+                Some((definition_id, version, initial_variables)), plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
+    };
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     require_owner(&tx, actor, definition_id)?;
@@ -13426,6 +14088,32 @@ pub fn start_instance(
         require_instance_reader(&tx, actor, &prior.instance_id)?;
         return reproject_instance_on(&tx, actor, &prior.instance_id);
     }
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        validate_variables(initial_variables)?;
+        let model = current_version_model_on(&tx, definition_id, version)?;
+        let mut variables = serde_json::to_value(&model.variables)?;
+        for (key, value) in initial_variables.as_object()
+            .context("process variables must be an object")? {
+            variables.as_object_mut().expect("model variables are object")
+                .insert(key.clone(), value.clone());
+        }
+        validate_variables(&variables)?;
+        let start_input = StartInputRef::Manual {
+            command_id: stamp.command_id.clone(),
+            request_hash: stamp.request_hash.clone(),
+        };
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            signal_admission_on(&tx, actor, instance_id, prefix, signal, accepted)
+        };
+        canonical = super::runtime::plan_start(&model, instance_id, actor,
+            definition_id, version, variables, super::runtime::StartCause::Manual,
+            at_ms, start_input, Some(&resolve))?;
+        &canonical
+    };
     for attempt in &plan.termination_attempts {
         let accepted = match attempt {
             TerminationAttempt::Success(source) => &source.accepted_input,
@@ -13440,7 +14128,7 @@ pub fn start_instance(
     let entry = AcceptedInputRef::Start { instance_id: instance_id.to_owned(),
         cause: StartInputRef::Manual { command_id: stamp.command_id.clone(),
             request_hash: stamp.request_hash.clone() } };
-    let result = start_instance_on(
+    let mut result = start_instance_on(
         &tx,
         actor,
         instance_id,
@@ -13453,6 +14141,11 @@ pub fn start_instance(
         None,
         &entry,
     )?;
+    if composite.is_none() {
+        apply_canonical_call_steps_on(&tx, instance_id, &actor.user_id,
+            plan, at_ms)?;
+        result = instance_on(&tx, actor, instance_id, None)?;
+    }
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
     Ok(result)
@@ -13577,9 +14270,45 @@ pub fn apply_transition(
     actor: &ProcessActor,
     instance_id: &str,
     expected_revision: u64,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessTransitionOutcome> {
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (composite, conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
+    };
+    let tx = conn.transaction()?;
+    require_actor(&tx, actor)?;
+    let initiator = require_instance_reader(&tx, actor, instance_id)?;
+    ensure!(initiator, "only process initiator can advance the process");
+    require_call_control_authority_on(&tx, actor, instance_id)?;
+    let instance = instance_on(&tx, actor, instance_id, None)?;
+    let snapshots_json: String = tx.query_row(
+        "SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+        params![instance.definition_id, instance.version],
+        |row| row.get(0),
+    )?;
+    let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
+    for snapshot in &snapshots {
+        require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
+    }
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        let snapshot = runtime_snapshot_on(&tx, actor, instance_id)?;
+        ensure!(snapshot.instance.revision == expected_revision,
+            "process instance revision conflict or closed instance");
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            signal_admission_on(&tx, actor, instance_id, prefix, signal, accepted)
+        };
+        canonical = super::runtime::plan_advance(&snapshot, at_ms, Some(&resolve))?;
+        &canonical
+    };
     ensure!(plan.termination_attempts.iter().all(|attempt| match attempt {
         TerminationAttempt::Success(source) => matches!(&source.accepted_input,
             AcceptedInputRef::PersistedReady { expected_instance_revision, .. }
@@ -13598,24 +14327,7 @@ pub fn apply_transition(
                 && plan.cancel_user_task_ids.is_empty()),
         "ordinary advancement cannot authorize interruption"
     );
-    let (composite, mut conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
-    let plan = &composite;
-    let tx = conn.transaction()?;
-    require_actor(&tx, actor)?;
-    let initiator = require_instance_reader(&tx, actor, instance_id)?;
-    ensure!(initiator, "only process initiator can advance the process");
-    require_call_control_authority_on(&tx, actor, instance_id)?;
-    let instance = instance_on(&tx, actor, instance_id, None)?;
-    let snapshots_json: String = tx.query_row(
-        "SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
-        params![instance.definition_id, instance.version],
-        |row| row.get(0),
-    )?;
-    let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
-    for snapshot in &snapshots {
-        require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
-    }
-    let cancelled_claims = apply_plan_on(
+    let mut cancelled_claims = apply_plan_on(
         &tx,
         instance_id,
         &actor.user_id,
@@ -13625,6 +14337,10 @@ pub fn apply_transition(
         None,
         EntryAuthority::PersistedReady,
     )?;
+    if composite.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
+            &actor.user_id, plan, at_ms)?);
+    }
     let result = instance_on(&tx, actor, instance_id, None)?;
     tx.commit()?;
     Ok(ProcessTransitionOutcome {
@@ -13640,18 +14356,19 @@ pub fn acknowledge_manual_task(
     instance_id: &str,
     user_task_id: &str,
     expected_revision: u64,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessTransitionOutcome> {
-    ensure!(reaches_error_end(plan) || reaches_terminate_end(plan)
-        || plan.repetition_capacity.is_some()
-        || (plan.cancel_scope_roots.is_empty()
-            && plan.cancel_token_ids.is_empty()
-            && plan.cancel_job_ids.is_empty()
-            && plan.cancel_user_task_ids.is_empty()),
-        "ordinary advancement cannot authorize interruption");
-    let (composite, mut conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
-    let plan = &composite;
+    if let Some(prior) = replay_instance_command(pool, actor, stamp, Some(instance_id))? {
+        return Ok(ProcessTransitionOutcome { instance: prior, cancelled_claims: Vec::new() });
+    }
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (composite, conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
+    };
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     require_instance_reader(&tx, actor, instance_id)?;
@@ -13693,6 +14410,27 @@ pub fn acknowledge_manual_task(
         expected_instance_revision: expected_revision,
         command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
     };
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        let snapshot = runtime_snapshot_on(&tx, actor, instance_id)?;
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            let sender = call_initiator_on(&tx, instance_id)?;
+            signal_admission_on(&tx, &sender, instance_id, prefix, signal, accepted)
+        };
+        canonical = super::runtime::plan_manual_acknowledgment(&snapshot, user_task_id,
+            &actor.user_id, at_ms, entry.clone(), Some(&resolve))?;
+        &canonical
+    };
+    ensure!(reaches_error_end(plan) || reaches_terminate_end(plan)
+        || plan.repetition_capacity.is_some()
+        || (plan.cancel_scope_roots.is_empty()
+            && plan.cancel_token_ids.is_empty()
+            && plan.cancel_job_ids.is_empty()
+            && plan.cancel_user_task_ids.is_empty()),
+        "ordinary advancement cannot authorize interruption");
     ensure!(plan.complete_user_task_ids.len() == 1
         && plan.complete_user_task_ids[0] == user_task_id
         && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1
@@ -13713,8 +14451,12 @@ pub fn acknowledge_manual_task(
             AcceptedInputRef::PersistedReady { .. }),
             "manual acknowledgment cannot invent another terminating entry");
     }
-    let cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id,
+    let mut cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id,
         expected_revision, plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
+    if composite.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
+            &actor.user_id, plan, at_ms)?);
+    }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -13730,21 +14472,20 @@ pub fn complete_user_task(
     expected_revision: u64,
     outputs: &Value,
     approved: Option<bool>,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessTransitionOutcome> {
     validate_output(outputs)?;
-    ensure!(
-        reaches_error_end(plan) || reaches_terminate_end(plan)
-            || plan.repetition_capacity.is_some()
-            || (plan.cancel_scope_roots.is_empty()
-                && plan.cancel_token_ids.is_empty()
-                && plan.cancel_job_ids.is_empty()
-                && plan.cancel_user_task_ids.is_empty()),
-        "ordinary advancement cannot authorize interruption"
-    );
-    let (composite, mut conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
-    let plan = &composite;
+    if let Some(prior) = replay_instance_command(pool, actor, stamp, Some(instance_id))? {
+        return Ok(ProcessTransitionOutcome { instance: prior, cancelled_claims: Vec::new() });
+    }
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (composite, conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
+    };
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     require_instance_reader(&tx, actor, instance_id)?;
@@ -13769,6 +14510,42 @@ pub fn complete_user_task(
     ensure!(
         (kind == "verification") == approved.is_some(),
         "verification decision must match user task kind"
+    );
+    let actual_revision: u64 = tx.query_row(
+        "SELECT revision FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| row_u64(row, 0))?;
+    ensure!(actual_revision == expected_revision,
+        "process instance revision conflict or closed instance");
+    let task_revision: u64 = tx.query_row(
+        "SELECT revision FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+        params![instance_id,user_task_id], |row| row_u64(row,0))?;
+    let entry = AcceptedInputRef::Human {
+        task_id: user_task_id.to_owned(), expected_task_revision: task_revision,
+        expected_instance_revision: expected_revision,
+        command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
+    };
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        let snapshot = runtime_snapshot_on(&tx, actor, instance_id)?;
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            let sender = call_initiator_on(&tx, instance_id)?;
+            signal_admission_on(&tx, &sender, instance_id, prefix, signal, accepted)
+        };
+        canonical = super::runtime::plan_user_completion(&snapshot, user_task_id,
+            outputs, approved, at_ms, entry.clone(), Some(&resolve))?;
+        &canonical
+    };
+    ensure!(
+        reaches_error_end(plan) || reaches_terminate_end(plan)
+            || plan.repetition_capacity.is_some()
+            || (plan.cancel_scope_roots.is_empty()
+                && plan.cancel_token_ids.is_empty()
+                && plan.cancel_job_ids.is_empty()
+                && plan.cancel_user_task_ids.is_empty()),
+        "ordinary advancement cannot authorize interruption"
     );
     if let Some(approved) = approved {
         let expected_kind = if approved { "verification_approved" } else { "verification_rejected" };
@@ -13827,15 +14604,7 @@ pub fn complete_user_task(
             params![json(outputs)?, user_task_id],
         )?;
     }
-    let task_revision: u64 = tx.query_row(
-        "SELECT revision FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
-        params![instance_id,user_task_id], |row| row_u64(row,0))?;
-    let entry = AcceptedInputRef::Human {
-        task_id: user_task_id.to_owned(), expected_task_revision: task_revision,
-        expected_instance_revision: expected_revision,
-        command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
-    };
-    let cancelled_claims = apply_plan_on(
+    let mut cancelled_claims = apply_plan_on(
         &tx,
         instance_id,
         &actor.user_id,
@@ -13850,6 +14619,10 @@ pub fn complete_user_task(
             "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE user_task_id=?2",
             params![json(outputs)?, user_task_id],
         )?;
+    }
+    if composite.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
+            &actor.user_id, plan, at_ms)?);
     }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
@@ -15942,6 +16715,71 @@ fn validate_job_result_plan_on(
     Ok(())
 }
 
+fn prepare_service_result_plan(
+    plan: &RuntimePlan, observed: &ObservedActivityResult, job_id: &str,
+    attempt: u32, fence: u64, selected_escalation: bool, repeated_source: bool,
+) -> Result<(RuntimePlan, bool, usize)> {
+    let result = &observed.result;
+    let result_indices = plan.events.iter().enumerate()
+        .filter_map(|(index, event)| (event.kind == "service_result").then_some(index))
+        .collect::<Vec<_>>();
+    ensure!(result_indices.len() == 1, "accepted service result has no unique event");
+    let result_index = result_indices[0];
+    let retained_shape = observed.origin == ActivityResultOrigin::Contract
+        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+        && plan.termination_attempts.is_empty()
+        && plan.call_requests.is_empty() && plan.call_steps.is_empty()
+        && plan.events.len() == 2 && result_index == 0
+        && plan.events[1].kind == "incident"
+        && plan.add_incidents.len() == 1
+        && plan.add_incidents[0].code == "ESCALATION_HANDLER_FAILED"
+        && plan.event_ids.is_empty();
+    ensure!(!retained_shape || selected_escalation,
+        "unselected escalation handler cannot retain a handler failure");
+    let retained_failure = retained_shape && selected_escalation;
+    if observed.origin == ActivityResultOrigin::Contract
+        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+        && !selected_escalation && !repeated_source {
+        ensure!(plan.event_ids.is_empty(),
+            "unselected NeedsHuman result cannot supply an event identity");
+    }
+    let source_bearing = repeated_source || !plan.termination_attempts.is_empty()
+        || plan.business_error.is_some()
+        || plan.events.iter().any(|event| matches!(event.kind.as_str(),
+            "business_error_caught" | "escalation_caught" | "scope_error_propagated"))
+        || observed.origin == ActivityResultOrigin::Contract
+            && (result.outcome == tentaflow_protocol::processes::ActivityOutcome::Error
+                || result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+                    && selected_escalation && !retained_failure);
+    ensure!(plan.event_ids.contains_key(&result_index) || !source_bearing,
+        "accepted service result lacks its required source identity");
+    let mut prepared = plan.clone();
+    if !retained_failure && !prepared.event_ids.contains_key(&result_index) {
+        let result_event_id = Uuid::new_v4().to_string();
+        prepared.event_ids.insert(result_index, result_event_id.clone());
+        let mut planned_source_id: Option<String> = None;
+        for effect in &mut prepared.variable_effects {
+            let accepted = match effect {
+                VariableEffect::Mapped { accepted_input, .. }
+                | VariableEffect::ScopeEntry { accepted_input, .. }
+                | VariableEffect::RepetitionEntry { accepted_input, .. }
+                | VariableEffect::RepetitionAggregate { accepted_input, .. } => accepted_input,
+            };
+            let Some(AcceptedInputRef::Service {
+                job_id: source_job, attempt: source_attempt, fence: source_fence,
+                result_event_id: source_event_id,
+            }) = accepted else { continue };
+            if source_job == job_id && *source_attempt == attempt && *source_fence == fence {
+                ensure!(planned_source_id.as_ref().is_none_or(|id| id.as_str() == source_event_id.as_str()),
+                    "accepted service variable effects disagree on source identity");
+                planned_source_id = Some(source_event_id.clone());
+                *source_event_id = result_event_id.clone();
+            }
+        }
+    }
+    Ok((prepared, retained_failure, result_index))
+}
+
 pub fn accept_job_result(
     pool: &DbPool,
     actor: &ProcessActor,
@@ -15951,9 +16789,13 @@ pub fn accept_job_result(
     worker_id: &str,
     observed: &ObservedActivityResult,
     expected_revision: u64,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessTransitionOutcome> {
+    let supplied_plan = match plan_input {
+        ProcessPlanInput::Supplied(plan) => Some(plan),
+        ProcessPlanInput::Canonical => None,
+    };
     let result = &observed.result;
     validate_output(&result.outputs)?;
     ensure!(
@@ -16003,39 +16845,6 @@ pub fn accept_job_result(
             "service job result conflicts with accepted result");
         return Ok(ProcessTransitionOutcome { instance, cancelled_claims: Vec::new() });
     }
-    let result_indices = plan.events.iter().enumerate()
-        .filter_map(|(index, event)| (event.kind == "service_result").then_some(index))
-        .collect::<Vec<_>>();
-    ensure!(result_indices.len() == 1, "accepted service result has no unique event");
-    let result_index = result_indices[0];
-    let retained_shape = observed.origin == ActivityResultOrigin::Contract
-        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
-        && plan.termination_attempts.is_empty()
-        && plan.call_requests.is_empty() && plan.call_steps.is_empty()
-        && plan.events.len() == 2 && result_index == 0
-        && plan.events[1].kind == "incident"
-        && plan.add_incidents.len() == 1
-        && plan.add_incidents[0].code == "ESCALATION_HANDLER_FAILED"
-        && plan.event_ids.is_empty();
-    ensure!(!retained_shape || selected_escalation,
-        "unselected escalation handler cannot retain a handler failure");
-    let retained_failure = retained_shape && selected_escalation;
-    if observed.origin == ActivityResultOrigin::Contract
-        && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
-        && !selected_escalation && !repeated_source {
-        ensure!(plan.event_ids.is_empty(),
-            "unselected NeedsHuman result cannot supply an event identity");
-    }
-    let source_bearing = repeated_source || !plan.termination_attempts.is_empty()
-        || plan.business_error.is_some()
-        || plan.events.iter().any(|event| matches!(event.kind.as_str(),
-            "business_error_caught" | "escalation_caught" | "scope_error_propagated"))
-        || observed.origin == ActivityResultOrigin::Contract
-            && (result.outcome == tentaflow_protocol::processes::ActivityOutcome::Error
-                || result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
-                    && selected_escalation && !retained_failure);
-    ensure!(plan.event_ids.contains_key(&result_index) || !source_bearing,
-        "accepted service result lacks its required source identity");
     if initial_status == "running" {
         let preflight_now_ms = now_ms()?;
         ensure!(initial_attempt == attempt && initial_fence == fence
@@ -16044,32 +16853,22 @@ pub fn accept_job_result(
             && initial_activation,
             "service job fence is stale");
     }
-    let mut prepared = plan.clone();
-    if !retained_failure && !prepared.event_ids.contains_key(&result_index) {
-        let result_event_id = Uuid::new_v4().to_string();
-        prepared.event_ids.insert(result_index, result_event_id.clone());
-        let mut planned_source_id: Option<String> = None;
-        for effect in &mut prepared.variable_effects {
-            let accepted = match effect {
-                VariableEffect::Mapped { accepted_input, .. }
-                | VariableEffect::ScopeEntry { accepted_input, .. }
-                | VariableEffect::RepetitionEntry { accepted_input, .. }
-                | VariableEffect::RepetitionAggregate { accepted_input, .. } => accepted_input,
-            };
-            let Some(AcceptedInputRef::Service {
-                job_id: source_job, attempt: source_attempt, fence: source_fence,
-                result_event_id: source_event_id,
-            }) = accepted else { continue };
-            if source_job == job_id && *source_attempt == attempt && *source_fence == fence {
-                ensure!(planned_source_id.as_ref().is_none_or(|id| id.as_str() == source_event_id.as_str()),
-                    "accepted service variable effects disagree on source identity");
-                planned_source_id = Some(source_event_id.clone());
-                *source_event_id = result_event_id.clone();
+    let (precomposed, mut conn) = if let Some(plan) = supplied_plan {
+        let (prepared, retained_failure, result_index) = prepare_service_result_plan(plan, observed, job_id,
+            attempt, fence, selected_escalation, repeated_source)?;
+        let (composite, conn) = prepare_call_plan(pool, actor, &source_id, None,
+            &prepared, at_ms)?;
+        (Some((composite, retained_failure, result_index)), conn)
+    } else {
+        #[cfg(test)]
+        CALL_TRANSITION_PREFLIGHT.with(|gate| {
+            if let Some((ready, resume)) = gate.borrow_mut().take() {
+                ready.send(()).expect("call transition preflight barrier");
+                resume.recv().expect("call transition writer barrier");
             }
-        }
-    }
-    let (mut composite, mut conn) =
-        prepare_call_plan(pool, actor, &source_id, None, &prepared, at_ms)?;
+        });
+        (None, pool.write()?)
+    };
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     let (instance_id,node_id,status,current_attempt,current_fence,current_worker,lease_until_ms,stored_result):(String,String,String,u32,u64,Option<String>,Option<i64>,Option<String>)=tx.query_row("SELECT instance_id,node_id,status,attempt,fence,worker_id,lease_until_ms,result_json FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,row.get(7)?))).context("process job not found")?;
@@ -16116,6 +16915,21 @@ pub fn accept_job_result(
             && job_activation_live_on(&tx, job_id)?,
         "service job fence is stale"
     );
+    let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
+        prepared
+    } else {
+        let snapshot = runtime_snapshot_on(&tx, actor, &instance_id)?;
+        let job = snapshot.jobs.iter().find(|job| job.job_id == job_id)
+            .context("fenced Service job is missing from its actual snapshot")?;
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            signal_admission_on(&tx, actor, &instance_id, prefix, signal, accepted)
+        };
+        let planned = super::runtime::plan_job_result(&snapshot, job, observed, at_ms,
+            Some(&resolve))?;
+        prepare_service_result_plan(&planned, observed, job_id, attempt, fence,
+            selected_escalation, repeated_source)?
+    };
     for attempt_fact in &composite.termination_attempts {
         let accepted = match attempt_fact {
             TerminationAttempt::Success(source) => &source.accepted_input,
@@ -16135,7 +16949,7 @@ pub fn accept_job_result(
         "result plan does not consume service job"
     );
     validate_job_result_plan_on(&tx, &instance, &node_id, job_id, observed,
-        if retained_failure { plan } else { &composite })?;
+        &composite)?;
     if retained_failure {
         ensure!(composite.call_steps.is_empty()
             && composite.termination_attempts.is_empty(),
@@ -16151,7 +16965,7 @@ pub fn accept_job_result(
         .context("accepted service result has no event identity")?;
     let entry = AcceptedInputRef::Service { job_id: job_id.to_owned(), attempt, fence,
         result_event_id: result_event_id.clone() };
-    let cancelled_claims = apply_plan_on(
+    let mut cancelled_claims = apply_plan_on(
         &tx,
         &instance_id,
         &actor.user_id,
@@ -16168,6 +16982,10 @@ pub fn accept_job_result(
         tentaflow_protocol::processes::ActivityOutcome::Cancelled => "cancelled",
     };
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
+    if supplied_plan.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
+            &actor.user_id, plan, at_ms)?);
+    }
     let result_instance = instance_on(&tx, actor, &instance_id, None)?;
     tx.commit()?;
     Ok(ProcessTransitionOutcome {
@@ -16452,6 +17270,7 @@ fn subscription_kind_text(kind: &ProcessSubscriptionKind) -> &'static str {
         ProcessSubscriptionKind::BoundaryMessage => "boundary_message",
         ProcessSubscriptionKind::BoundaryError => "boundary_error",
         ProcessSubscriptionKind::BoundaryEscalation => "boundary_escalation",
+        ProcessSubscriptionKind::SignalCatch => "signal_catch",
     }
 }
 fn subscription_kind(value: &str) -> Result<ProcessSubscriptionKind> {
@@ -16461,6 +17280,7 @@ fn subscription_kind(value: &str) -> Result<ProcessSubscriptionKind> {
         "boundary_message" => Ok(ProcessSubscriptionKind::BoundaryMessage),
         "boundary_error" => Ok(ProcessSubscriptionKind::BoundaryError),
         "boundary_escalation" => Ok(ProcessSubscriptionKind::BoundaryEscalation),
+        "signal_catch" => Ok(ProcessSubscriptionKind::SignalCatch),
         _ => bail!("unknown subscription kind"),
     }
 }
@@ -16498,12 +17318,12 @@ fn race_status(value: &str) -> Result<ProcessEventRaceStatus> {
 }
 fn subscription_on(conn: &Connection, id: &str) -> Result<EventSubscription> {
     let row = conn.query_row("SELECT instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms FROM bpmn_event_subscriptions WHERE subscription_id=?1",[id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u32>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,row_u64(r,12)?,r.get::<_,String>(13)?,r.get::<_,Option<String>>(14)?,r.get::<_,i64>(15)?,r.get::<_,i64>(16)?))).context("subscription not found")?;
+    let (scope_id, signal_namespace_uri, signal_declaration_id): (String, Option<String>, Option<String>) = conn.query_row(
+        "SELECT scope_id,signal_namespace_uri,signal_declaration_id FROM bpmn_event_subscriptions WHERE subscription_id=?1",
+        [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
     Ok(EventSubscription {
-        scope_id: conn.query_row(
-            "SELECT scope_id FROM bpmn_event_subscriptions WHERE subscription_id=?1",
-            [id],
-            |row| row.get(0),
-        )?,
+        scope_id,
         subscription_id: id.to_owned(),
         instance_id: row.0,
         org_id: row.1,
@@ -16517,6 +17337,8 @@ fn subscription_on(conn: &Connection, id: &str) -> Result<EventSubscription> {
         error_code: row.9,
         escalation_code: row.10,
         race_id: row.11,
+        signal_namespace_uri,
+        signal_declaration_id,
         revision: row.12,
         status: subscription_status(&row.13)?,
         last_reason: row.14,
@@ -16578,6 +17400,17 @@ fn subscription_activation<'a>(
             ProcessNodeKind::ReceiveTask { message_ref, .. },
         ) => (node.id.as_str(), Some(message_ref), None, None),
         (
+            ProcessSubscriptionKind::SignalCatch,
+            ProcessNodeKind::SignalCatch { signal_ref, .. },
+        ) => {
+            let declaration = model.signals.iter().find(|signal| &signal.signal_id == signal_ref)
+                .context("signal catch declaration is missing")?;
+            ensure!(s.signal_namespace_uri.as_deref() == Some(declaration.namespace_uri.as_str())
+                && s.signal_declaration_id.as_deref() == Some(signal_ref.as_str()),
+                "signal catch differs from its pinned declaration");
+            (node.id.as_str(), None, None, None)
+        },
+        (
             ProcessSubscriptionKind::BoundaryMessage,
             ProcessNodeKind::BoundaryMessage {
                 attached_to_id,
@@ -16620,6 +17453,10 @@ fn subscription_activation<'a>(
                     .context("subscription correlation is missing")?,
             )?;
         }
+    }
+    if s.kind != ProcessSubscriptionKind::SignalCatch {
+        ensure!(s.signal_namespace_uri.is_none() && s.signal_declaration_id.is_none(),
+            "non-signal subscription has a signal declaration");
     }
     if let Some(id) = error_ref {
         let expected = id
@@ -16703,6 +17540,13 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
         s.status != ProcessSubscriptionStatus::Open || open < 128,
         "live subscription capacity exceeded"
     );
+    if s.kind == ProcessSubscriptionKind::SignalCatch && s.status == ProcessSubscriptionStatus::Open {
+        let org_open: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM bpmn_event_subscriptions WHERE org_id=?1 AND kind='signal_catch' AND status='open'",
+            [&s.org_id], |row| row.get(0),
+        )?;
+        ensure!(org_open < 4096, "organization signal catch capacity exceeded");
+    }
     if let Some(id) = &s.race_id {
         let race = race_on(tx, id)?;
         let model = current_version_model_on(tx, &s.definition_id, s.version)?;
@@ -16720,7 +17564,7 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
             "subscription is not a branch of its event race"
         );
     }
-    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.escalation_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms,s.scope_id])?;
+    tx.execute("INSERT INTO bpmn_event_subscriptions(subscription_id,instance_id,org_id,definition_id,version,node_id,token_id,kind,message_name,correlation_key,error_code,escalation_code,race_id,revision,status,last_reason,created_at_ms,updated_at_ms,scope_id,signal_namespace_uri,signal_declaration_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18,?19,?20)",params![s.subscription_id,s.instance_id,s.org_id,s.definition_id,s.version,s.node_id,s.token_id,subscription_kind_text(&s.kind),s.message_name,s.correlation_key,s.error_code,s.escalation_code,s.race_id,subscription_status_text(&s.status),s.last_reason,s.created_at_ms,s.updated_at_ms,s.scope_id,s.signal_namespace_uri,s.signal_declaration_id])?;
     Ok(())
 }
 fn apply_event_plan_on(
@@ -16729,6 +17573,7 @@ fn apply_event_plan_on(
     scopes: &[ProcessScopeSummary],
     successful_terminations: &HashSet<String>,
     plan: &RuntimePlan,
+    entry: EntryAuthority<'_>,
     at_ms: i64,
 ) -> Result<()> {
     let (definition_id, version, org_id): (String, u32, String) = tx.query_row(
@@ -16880,6 +17725,19 @@ fn apply_event_plan_on(
                             })),
                 "escalation subscription lacks its exact armed event"
             );
+        }
+        if s.kind == ProcessSubscriptionKind::SignalCatch {
+            ensure!(plan.events.iter().filter(|event|
+                event.kind == "signal_catch_opened"
+                    && event.scope_id == s.scope_id
+                    && event.node_id.as_deref() == Some(s.node_id.as_str())
+                    && event.data == serde_json::json!({
+                        "subscription_id":s.subscription_id,
+                        "attached_token_id":s.token_id,
+                        "signal_namespace_uri":s.signal_namespace_uri,
+                        "signal_declaration_id":s.signal_declaration_id,
+                    })).count() == 1,
+                "signal subscription lacks its exact arm event");
         }
         insert_subscription_on(tx, s)?;
     }
@@ -17099,13 +17957,22 @@ fn apply_event_plan_on(
     }
     for update in &plan.subscription_updates {
         let actual = subscription_on(tx, &update.subscription_id)?;
+        let signal_failure = update.status == ProcessSubscriptionStatus::Error
+            && actual.kind == ProcessSubscriptionKind::SignalCatch
+            && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Signal {
+                target_subscription_id, ..
+            }) if target_subscription_id == &actual.subscription_id)
+            && plan.add_incidents.iter().filter(|incident|
+                incident.scope_id == actual.scope_id
+                    && incident.node_id.as_deref() == Some(actual.node_id.as_str())
+                    && matches!(incident.code.as_str(),
+                        "SIGNAL_MAPPING_FAILED" | "SIGNAL_DELIVERY_FAILED")).count() == 1;
         ensure!(
             actual.instance_id == instance_id
                 && actual.status == ProcessSubscriptionStatus::Open
-                && matches!(
-                    update.status,
-                    ProcessSubscriptionStatus::Consumed | ProcessSubscriptionStatus::Cancelled
-                ),
+                && (matches!(update.status,
+                    ProcessSubscriptionStatus::Consumed | ProcessSubscriptionStatus::Cancelled)
+                    || signal_failure),
             "subscription cannot reopen or cross instance"
         );
         if update.status == ProcessSubscriptionStatus::Consumed {
@@ -17519,11 +18386,1075 @@ fn require_message_source_on(
     Ok((definition_id, version))
 }
 
+fn insert_signal_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    instance_id: &str,
+    signal: &PlannedSignal,
+    source_event_id: &str,
+    recipients: &[EventSubscription],
+    debit: PendingEntryDebit,
+    at_ms: i64,
+) -> Result<()> {
+    ensure!(Uuid::parse_str(&signal.signal_id).is_ok()
+        && Uuid::parse_str(source_event_id).is_ok()
+        && (1..=604800).contains(&signal.ttl_seconds),
+        "signal admission identity or TTL differs from its pinned source");
+    validate_output(&signal.payload)?;
+    let payload = json(&signal.payload)?;
+    let payload_bytes = u32::try_from(payload.len())?;
+    let (definition_id, version, org_id, initiator): (String, u32, String, String) = tx.query_row(
+        "SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+    ensure!(actor.org_id == org_id && actor.user_id == initiator,
+        "signal sender differs from its factual source instance");
+    let pinned = version_on(tx, &definition_id, version)?;
+    let node = scoped_node_on(tx, instance_id, &signal.source_scope_id,
+        &pinned.model, &signal.source_node_id)?;
+    let ProcessNodeKind::SignalThrow { signal_ref, ttl_seconds, .. } = &node.kind else {
+        bail!("signal admission references another pinned node kind")
+    };
+    let declaration = pinned.model.signals.iter().find(|declaration|
+        &declaration.signal_id == signal_ref)
+        .context("signal source declaration is missing")?;
+    ensure!(signal.signal_namespace_uri == declaration.namespace_uri
+        && signal.signal_declaration_id == declaration.signal_id
+        && signal.ttl_seconds == *ttl_seconds,
+        "signal admission differs from its pinned declaration");
+    let (source_node, source_scope, source_status): (String, String, String) = tx.query_row(
+        "SELECT node_id,scope_id,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+        params![instance_id, signal.source_activation_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    ensure!(source_node == signal.source_node_id
+        && source_scope == signal.source_scope_id
+        && source_status == "consumed",
+        "signal source is not its accepted ready activation");
+    let (event_kind, event_node, event_data): (String, Option<String>, String) = tx.query_row(
+        "SELECT kind,node_id,data_json FROM bpmn_events
+         WHERE event_id=?1 AND instance_id=?2 AND scope_id=?3",
+        params![source_event_id, instance_id, signal.source_scope_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    ensure!(event_kind == "signal_admitted"
+        && event_node.as_deref() == Some(signal.source_node_id.as_str())
+        && parse::<Value>(event_data)? == serde_json::json!({
+            "signal_id":signal.signal_id,
+            "source_activation_id":signal.source_activation_id,
+            "signal_namespace_uri":signal.signal_namespace_uri,
+            "signal_declaration_id":signal.signal_declaration_id,
+        }), "signal admission lacks its immutable source event");
+    if !recipients.is_empty() {
+        let (sender_count, sender_bytes, org_count, org_bytes) =
+            apply_pending_entry_debit(pending_emission_budget_on(tx, &org_id,
+                &initiator)?, debit)?;
+        ensure!(sender_count < 1024 && org_count < 4096
+            && sender_bytes.checked_add(u64::from(payload_bytes))
+                .is_some_and(|total| total <= 64 * 1024 * 1024)
+            && org_bytes.checked_add(u64::from(payload_bytes))
+                .is_some_and(|total| total <= 256 * 1024 * 1024),
+            "pending signal capacity exceeded");
+        let (sender_receipts, org_receipts): (u32, u32) = tx.query_row(
+            "SELECT COALESCE(SUM(e.sender_user_id=?2),0),COUNT(*)
+             FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+             WHERE e.org_id=?1 AND r.status IN ('pending','claimed')",
+            params![org_id, initiator], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let sender_receipts = sender_receipts.checked_sub(debit.sender_receipts)
+            .context("physical sender receipt debit underflow")?;
+        let org_receipts = org_receipts.checked_sub(debit.org_receipts)
+            .context("physical organization receipt debit underflow")?;
+        let added = u32::try_from(recipients.len())?;
+        ensure!(sender_receipts.checked_add(added).is_some_and(|total| total <= 1024)
+            && org_receipts.checked_add(added).is_some_and(|total| total <= 4096),
+            "pending signal receipt capacity exceeded");
+    }
+    let expires_at_ms = at_ms.checked_add(i64::from(signal.ttl_seconds) * 1000)
+        .context("signal TTL overflow")?;
+    let settled = recipients.is_empty();
+    tx.execute(
+        "INSERT INTO bpmn_signal_emissions(signal_id,org_id,sender_user_id,source_instance_id,
+         source_scope_id,source_node_id,source_activation_id,source_definition_id,source_version,
+         source_model_sha256,source_event_id,signal_namespace_uri,signal_declaration_id,
+         payload_json,payload_sha256,payload_bytes,admitted_at_ms,expires_at_ms,status,revision,
+         settled_at_ms,payload_pruned_at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,1,?20,NULL)",
+        params![signal.signal_id,org_id,initiator,instance_id,signal.source_scope_id,
+            signal.source_node_id,signal.source_activation_id,definition_id,version,
+            pinned.model_sha256,source_event_id,signal.signal_namespace_uri,
+            signal.signal_declaration_id,payload,
+            hex::encode(Sha256::digest(payload.as_bytes())),payload_bytes,at_ms,expires_at_ms,
+            if settled { "settled" } else { "pending" },
+            if settled { Some(at_ms) } else { None }])?;
+    for (ordinal, recipient) in recipients.iter().enumerate() {
+        let recipient_pin = version_on(tx, &recipient.definition_id, recipient.version)?;
+        ensure!(recipient.status == ProcessSubscriptionStatus::Open
+            && recipient.kind == ProcessSubscriptionKind::SignalCatch
+            && recipient.signal_namespace_uri.as_deref()
+                == Some(signal.signal_namespace_uri.as_str())
+            && recipient.signal_declaration_id.as_deref()
+                == Some(signal.signal_declaration_id.as_str()),
+            "signal recipient differs from its immutable source-time tuple");
+        tx.execute(
+            "INSERT INTO bpmn_signal_receipts(receipt_id,signal_id,recipient_org_id,
+             recipient_instance_id,recipient_definition_id,recipient_version,
+             recipient_model_sha256,recipient_scope_id,recipient_node_id,recipient_token_id,
+             recipient_subscription_id,recipient_activation_id,recipient_ordinal,status,
+             terminal_reason,revision,attempt_count,claim_fence,claim_owner,lease_until_ms,
+             next_check_at_ms,delivered_at_ms,terminal_at_ms,incident_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending',NULL,1,0,NULL,NULL,NULL,?14,NULL,NULL,NULL)",
+            params![Uuid::new_v4().to_string(),signal.signal_id,recipient.org_id,
+                recipient.instance_id,recipient.definition_id,recipient.version,
+                recipient_pin.model_sha256,recipient.scope_id,recipient.node_id,
+                recipient.token_id,recipient.subscription_id,recipient.token_id,
+                i64::try_from(ordinal)?,at_ms])?;
+    }
+    signal_receipt_ordinals_on(tx, &signal.signal_id)?;
+    Ok(())
+}
+
+fn signal_receipt_ordinals_on(conn: &Connection, signal_id: &str) -> Result<()> {
+    let mut query = conn.prepare(
+        "SELECT recipient_ordinal FROM bpmn_signal_receipts WHERE signal_id=?1 \
+         ORDER BY recipient_ordinal,receipt_id")?;
+    let ordinals = query.query_map([signal_id], |row| row.get::<_, u32>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(ordinals.len() <= 64 && ordinals.iter().enumerate().all(|(expected, ordinal)|
+        usize::try_from(*ordinal).ok() == Some(expected)),
+        "signal receipt ordinals are not one contiguous admitted cohort");
+    Ok(())
+}
+
+fn signal_claim_matches_on(
+    conn: &Connection,
+    instance_id: &str,
+    input: &AcceptedInputRef,
+    subscription_id: &str,
+    signal_id: &str,
+    source_event_id: &str,
+) -> Result<bool> {
+    let AcceptedInputRef::Signal {
+        signal_id: input_signal, receipt_id, expected_receipt_revision,
+        claim_fence, target_subscription_id, expected_subscription_revision,
+    } = input else { return Ok(false) };
+    if input_signal != signal_id || target_subscription_id != subscription_id {
+        return Ok(false);
+    }
+    let fact: Option<(String,u64,Option<String>,String,String,String,String,u64,
+        String,String,u32)> = conn.query_row(
+        "SELECT r.status,r.revision,r.claim_fence,r.recipient_instance_id,
+            r.recipient_scope_id,r.recipient_node_id,r.recipient_token_id,s.revision,
+            e.source_event_id,e.payload_sha256,e.payload_bytes
+         FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+         JOIN bpmn_event_subscriptions s ON s.subscription_id=r.recipient_subscription_id
+         WHERE r.receipt_id=?1 AND r.signal_id=?2
+           AND r.recipient_subscription_id=?3",
+        params![receipt_id,signal_id,subscription_id],
+        |row| Ok((row.get(0)?,row_u64(row,1)?,row.get(2)?,row.get(3)?,
+            row.get(4)?,row.get(5)?,row.get(6)?,row_u64(row,7)?,
+            row.get(8)?,row.get(9)?,row.get(10)?))).optional()?;
+    let Some((status, revision, fence, recipient_instance, scope_id, node_id,
+        token_id, subscription_revision, source_event, payload_hash, payload_bytes)) = fact
+    else { return Ok(false) };
+    let payload: Option<String> = conn.query_row(
+        "SELECT payload_json FROM bpmn_signal_emissions WHERE signal_id=?1",
+        [signal_id], |row| row.get(0))?;
+    let subscription = subscription_on(conn, subscription_id)?;
+    Ok(status == "claimed" && revision == *expected_receipt_revision
+        && fence.as_deref() == Some(claim_fence.as_str())
+        && recipient_instance == instance_id
+        && subscription_revision == *expected_subscription_revision
+        && source_event == source_event_id
+        && payload.as_ref().is_some_and(|json|
+            u32::try_from(json.len()).ok() == Some(payload_bytes)
+                && hex::encode(Sha256::digest(json.as_bytes())) == payload_hash)
+        && subscription.scope_id == scope_id
+        && subscription.node_id == node_id
+        && subscription.token_id == token_id
+        && subscription.status == ProcessSubscriptionStatus::Open
+        && subscription.revision == subscription_revision)
+}
+
+fn signal_claim_provenance_on(conn: &Connection, claim: &SignalClaim) -> Result<bool> {
+    if claim.subscription.kind != ProcessSubscriptionKind::SignalCatch
+        || claim.subscription.status != ProcessSubscriptionStatus::Open
+        || claim.subscription.instance_id != claim.snapshot.instance.instance_id
+        || claim.subscription.org_id != claim.actor.org_id
+        || claim.snapshot.org_id != claim.actor.org_id
+        || claim.snapshot.instance.definition_id != claim.subscription.definition_id
+        || claim.snapshot.instance.version != claim.subscription.version
+        || claim.snapshot.instance.initiator_user_id != claim.actor.user_id
+    {
+        return Ok(false);
+    }
+    let payload_hash = hex::encode(Sha256::digest(json(&claim.payload)?.as_bytes()));
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM bpmn_signal_receipts r
+           JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+           JOIN bpmn_event_subscriptions s ON s.subscription_id=r.recipient_subscription_id
+           JOIN bpmn_instances i ON i.instance_id=r.recipient_instance_id
+           JOIN bpmn_versions v ON v.definition_id=r.recipient_definition_id
+             AND v.version=r.recipient_version
+           JOIN bpmn_tokens t ON t.token_id=r.recipient_token_id
+           WHERE r.receipt_id=?1 AND r.signal_id=?2 AND r.status='claimed'
+             AND r.revision=?3 AND r.claim_fence=?4 AND r.claim_owner=?5
+             AND r.recipient_org_id=?6 AND r.recipient_instance_id=?7
+             AND r.recipient_scope_id=?8 AND r.recipient_node_id=?9
+             AND r.recipient_token_id=?10 AND r.recipient_activation_id=?10
+             AND r.recipient_subscription_id=?11
+             AND r.recipient_definition_id=?12 AND r.recipient_version=?13
+             AND r.recipient_model_sha256=v.model_sha256
+             AND s.instance_id=r.recipient_instance_id
+             AND s.org_id=r.recipient_org_id
+             AND s.scope_id=r.recipient_scope_id
+             AND s.definition_id=r.recipient_definition_id
+             AND s.version=r.recipient_version
+             AND s.node_id=r.recipient_node_id AND s.token_id=r.recipient_token_id
+             AND s.kind='signal_catch'
+             AND s.signal_namespace_uri=e.signal_namespace_uri
+             AND s.signal_declaration_id=e.signal_declaration_id
+             AND s.signal_namespace_uri=?14 AND s.signal_declaration_id=?15
+             AND i.org_id=r.recipient_org_id
+             AND i.definition_id=r.recipient_definition_id
+             AND i.version=r.recipient_version AND i.initiator_user_id=?5
+             AND t.instance_id=r.recipient_instance_id
+             AND t.scope_id=r.recipient_scope_id AND t.node_id=r.recipient_node_id
+             AND e.org_id=r.recipient_org_id
+             AND e.source_event_id=?16 AND e.payload_sha256=?17)",
+        params![claim.receipt_id,claim.signal_id,sql_integer(claim.revision)?,
+            claim.fence,claim.actor.user_id,claim.actor.org_id,
+            claim.subscription.instance_id,claim.subscription.scope_id,
+            claim.subscription.node_id,claim.subscription.token_id,
+            claim.subscription.subscription_id,claim.subscription.definition_id,
+            claim.subscription.version,claim.subscription.signal_namespace_uri,
+            claim.subscription.signal_declaration_id,claim.source_event_id,payload_hash],
+        |row| row.get(0),
+    ).map_err(Into::into)
+}
+
+fn signal_claim_authority_on(tx: &Transaction<'_>, claim: &SignalClaim) -> Result<bool> {
+    let sender_user_id: String = tx.query_row(
+        "SELECT e.sender_user_id FROM bpmn_signal_receipts r
+         JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+         WHERE r.receipt_id=?1 AND r.signal_id=?2",
+        params![claim.receipt_id,claim.signal_id], |row| row.get(0))?;
+    let sender = ProcessActor {
+        org_id: claim.actor.org_id.clone(), user_id: sender_user_id,
+    };
+    let authority = require_instance_reader(tx, &sender,
+        &claim.subscription.instance_id)
+        .and_then(|_| require_instance_reader(tx, &claim.actor,
+            &claim.subscription.instance_id).map(|_| ()))
+        .and_then(|_| require_call_control_authority_on(tx, &claim.actor,
+            &claim.subscription.instance_id))
+        .and_then(|_| require_version_execution_on(tx, &claim.actor,
+            &claim.subscription.definition_id, claim.subscription.version));
+    match authority {
+        Ok(()) => Ok(true),
+        Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn settle_signal_receipt_on(
+    tx: &Transaction<'_>,
+    receipt_id: &str,
+    signal_id: &str,
+    revision: u64,
+    status: &str,
+    reason: Option<&str>,
+    incident_id: Option<&str>,
+    at_ms: i64,
+) -> Result<()> {
+    ensure!(matches!(status, "delivered" | "cancelled" | "expired" | "denied" | "error"),
+        "signal receipt terminal state is invalid");
+    ensure!((status == "error") == incident_id.is_some(),
+        "failed signal receipt must identify its exact durable incident");
+    let affected = tx.execute(
+        "UPDATE bpmn_signal_receipts SET status=?1,terminal_reason=?2,revision=revision+1,
+         claim_fence=NULL,claim_owner=NULL,lease_until_ms=NULL,next_check_at_ms=NULL,
+         delivered_at_ms=CASE WHEN ?1='delivered' THEN ?3 ELSE NULL END,
+         terminal_at_ms=?3,incident_id=?7
+         WHERE receipt_id=?4 AND signal_id=?5 AND revision=?6
+           AND status IN ('pending','claimed')",
+        params![status,reason,at_ms,receipt_id,signal_id,sql_integer(revision)?,incident_id])?;
+    ensure!(affected == 1, "signal receipt changed before settlement");
+    tx.execute(
+        "UPDATE bpmn_signal_emissions SET status='settled',revision=revision+1,
+            settled_at_ms=?1 WHERE signal_id=?2 AND status='pending'
+            AND NOT EXISTS (SELECT 1 FROM bpmn_signal_receipts
+                WHERE signal_id=?2 AND status IN ('pending','claimed'))",
+        params![at_ms,signal_id])?;
+    Ok(())
+}
+
+pub fn due_signal_receipts(pool: &DbPool, at_ms: i64) -> Result<Vec<String>> {
+    read_snapshot(pool, |conn| {
+        let mut query = conn.prepare(
+            "SELECT receipt_id FROM bpmn_signal_receipts
+             WHERE (status='pending' AND next_check_at_ms<=?1)
+                OR (status='claimed' AND lease_until_ms<=?1)
+             ORDER BY COALESCE(next_check_at_ms,lease_until_ms),receipt_id LIMIT 32")?;
+        let receipts = query.query_map([at_ms], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(receipts)
+    })
+}
+
+pub fn claim_signal_receipt(
+    pool: &DbPool,
+    receipt_id: &str,
+    at_ms: i64,
+) -> Result<Option<SignalClaim>> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let row: Option<(String, String, String, String, u64, u32, Option<String>, i64,
+        String, String, String, String, u64, Option<String>, Option<String>, Option<i64>)> = tx.query_row(
+        "SELECT r.signal_id,r.recipient_subscription_id,r.recipient_instance_id,
+            r.status,r.revision,r.attempt_count,e.payload_json,e.expires_at_ms,
+            e.payload_sha256,e.source_event_id,e.org_id,e.sender_user_id,
+            s.revision,r.claim_fence,r.claim_owner,r.lease_until_ms
+         FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+         JOIN bpmn_event_subscriptions s ON s.subscription_id=r.recipient_subscription_id
+         WHERE r.receipt_id=?1",
+        [receipt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+            row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,
+            row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,
+            row.get(11)?,row_u64(row,12)?,row.get(13)?,row.get(14)?,
+            row.get(15)?))).optional()?;
+    let Some((signal_id, subscription_id, recipient_instance_id, status, revision,
+        attempts, payload_json, expires_at_ms, payload_sha256, source_event_id,
+        org_id, sender_user_id, subscription_revision, current_fence,
+        current_owner, current_lease)) = row else {
+        return Ok(None);
+    };
+    signal_receipt_ordinals_on(&tx, &signal_id)?;
+    if status != "pending" && status != "claimed" { return Ok(None); }
+    let subscription = subscription_on(&tx, &subscription_id)?;
+    if at_ms >= expires_at_ms {
+        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+            "expired", Some("ttl_expired"), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    if !subscription_live_on(&tx, &subscription)?
+        || subscription.status != ProcessSubscriptionStatus::Open {
+        let reason = if subscription.status == ProcessSubscriptionStatus::Error {
+            "activation_error"
+        } else if subscription.status == ProcessSubscriptionStatus::Consumed {
+            "activation_consumed"
+        } else {
+            "recipient_closed"
+        };
+        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+            "cancelled", Some(reason), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    let sender = ProcessActor { org_id: org_id.clone(), user_id: sender_user_id };
+    if let Err(error) = require_instance_reader(&tx, &sender, &recipient_instance_id) {
+        if error.downcast_ref::<ProcessAuthorityDenied>().is_none() { return Err(error); }
+        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+            "denied", Some("recipient_access_revoked"), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    let payload_json = payload_json.context("live signal receipt has no retained payload")?;
+    ensure!(hex::encode(Sha256::digest(payload_json.as_bytes())) == payload_sha256,
+        "signal payload differs from its retained admission hash");
+    let payload: Value = parse(payload_json)?;
+    let recipient: String = tx.query_row(
+        "SELECT initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+        [&recipient_instance_id], |row| row.get(0))?;
+    let actor = ProcessActor { org_id, user_id: recipient };
+    let recipient_authority = require_call_control_authority_on(
+        &tx, &actor, &recipient_instance_id)
+        .and_then(|()| require_version_execution_on(&tx, &actor,
+            &subscription.definition_id, subscription.version));
+    if let Err(error) = recipient_authority {
+        if error.downcast_ref::<ProcessAuthorityDenied>().is_none() { return Err(error); }
+        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+            "denied", Some("recipient_access_revoked"), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    if status == "claimed" && attempts < 5 {
+        ensure!(attempts >= 1, "claimed signal receipt has no factual attempt");
+        let lease = current_lease.context("claimed signal receipt has no lease")?;
+        if lease > at_ms { return Ok(None); }
+        let fence = current_fence.context("claimed signal receipt has no fence")?;
+        let owner = current_owner.context("claimed signal receipt has no owner")?;
+        ensure!(owner == actor.user_id,
+            "expired signal receipt claim differs from its recipient owner");
+        let backoff_ms = (1i64 << (attempts - 1)) * 1000;
+        let next_check = at_ms.checked_add(backoff_ms)
+            .context("signal receipt retry horizon overflow")?;
+        let changed = tx.execute(
+            "UPDATE bpmn_signal_receipts SET status='pending',revision=revision+1,
+             claim_fence=NULL,claim_owner=NULL,lease_until_ms=NULL,next_check_at_ms=?1
+             WHERE receipt_id=?2 AND signal_id=?3 AND revision=?4
+               AND status='claimed' AND claim_fence=?5 AND claim_owner=?6
+               AND lease_until_ms=?7 AND lease_until_ms<=?8 AND attempt_count=?9",
+            params![next_check,receipt_id,signal_id,sql_integer(revision)?,
+                fence,owner,lease,at_ms,attempts])?;
+        ensure!(changed == 1, "expired signal receipt changed before recovery");
+        tx.commit()?;
+        return Ok(None);
+    }
+    if attempts >= 5 {
+        ensure!(status == "claimed"
+            && current_lease.is_some_and(|lease| lease <= at_ms)
+            && current_owner.as_deref() == Some(actor.user_id.as_str()),
+            "exhausted signal receipt lacks its fifth expired claim");
+        let fence = current_fence.context("exhausted signal receipt lacks its fifth fence")?;
+        let snapshot = runtime_snapshot_on(&tx, &actor, &recipient_instance_id)?;
+        let claim = SignalClaim { receipt_id: receipt_id.to_owned(), signal_id,
+            revision, fence, subscription, actor, snapshot, payload,
+            source_event_id };
+        finalize_signal_delivery_failure_on(&tx, &claim, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    let fence = Uuid::new_v4().to_string();
+    let lease_until_ms = at_ms.checked_add(30_000)
+        .context("signal receipt lease overflow")?;
+    let affected = tx.execute(
+        "UPDATE bpmn_signal_receipts SET status='claimed',revision=revision+1,
+         attempt_count=attempt_count+1,
+         claim_fence=?1,claim_owner=?2,
+         lease_until_ms=?3,next_check_at_ms=NULL
+         WHERE receipt_id=?4 AND revision=?5 AND
+           ((status='pending' AND next_check_at_ms<=?6)
+            OR (status='claimed' AND lease_until_ms<=?6))",
+        params![fence,actor.user_id,lease_until_ms,receipt_id,
+            sql_integer(revision)?,at_ms])?;
+    if affected == 0 { return Ok(None); }
+    ensure!(subscription.revision == subscription_revision,
+        "signal subscription changed during claim");
+    let snapshot = runtime_snapshot_on(&tx, &actor, &recipient_instance_id)?;
+    let claim = SignalClaim { receipt_id: receipt_id.to_owned(), signal_id,
+        revision: revision + 1, fence, subscription, actor, snapshot,
+        payload, source_event_id };
+    tx.commit()?;
+    Ok(Some(claim))
+}
+
+fn finalize_signal_delivery_failure_on(
+    tx: &Transaction<'_>, claim: &SignalClaim, at_ms: i64,
+) -> Result<()> {
+    let subscription = subscription_on(tx, &claim.subscription.subscription_id)?;
+    if !subscription_live_on(tx, &subscription)?
+        || subscription.status != ProcessSubscriptionStatus::Open {
+        let reason = match subscription.status {
+            ProcessSubscriptionStatus::Error => "activation_error",
+            ProcessSubscriptionStatus::Consumed => "activation_consumed",
+            _ => "recipient_closed",
+        };
+        settle_signal_receipt_on(tx, &claim.receipt_id, &claim.signal_id,
+            claim.revision, "cancelled", Some(reason), None, at_ms)?;
+        return Ok(());
+    }
+    let snapshot = runtime_snapshot_on(tx, &claim.actor, &subscription.instance_id)?;
+    let input = AcceptedInputRef::Signal {
+        signal_id: claim.signal_id.clone(), receipt_id: claim.receipt_id.clone(),
+        expected_receipt_revision: claim.revision, claim_fence: claim.fence.clone(),
+        target_subscription_id: subscription.subscription_id.clone(),
+        expected_subscription_revision: subscription.revision,
+    };
+    let plan = super::runtime::plan_signal_delivery_failure(&snapshot,
+        &subscription, at_ms, input.clone())?;
+    apply_plan_on(tx, &subscription.instance_id, &claim.actor.user_id,
+        snapshot.instance.revision, &plan, at_ms, None, EntryAuthority::Accepted(&input))?;
+    let incident_id = plan.add_incidents.iter().find(|incident|
+        incident.code == "SIGNAL_DELIVERY_FAILED"
+            && incident.scope_id == subscription.scope_id
+            && incident.node_id.as_deref() == Some(subscription.node_id.as_str()))
+        .context("exhausted signal has no factual recipient incident")?;
+    settle_signal_receipt_on(tx, &claim.receipt_id, &claim.signal_id,
+        claim.revision, "error", Some("transient_retry_exhausted"),
+        Some(&incident_id.incident_id), at_ms)?;
+    Ok(())
+}
+
+pub fn deliver_signal_receipt(
+    pool: &DbPool,
+    claim: &SignalClaim,
+    plan_input: ProcessPlanInput<'_>,
+    at_ms: i64,
+) -> Result<Option<ProcessTransitionOutcome>> {
+    if matches!(&plan_input, ProcessPlanInput::Supplied(_))
+        && !read_snapshot(pool, |conn| signal_claim_provenance_on(conn, claim))?
+    {
+        return Ok(None);
+    }
+    let instance_id = &claim.subscription.instance_id;
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (composite, conn) = prepare_call_plan(pool, &claim.actor,
+                instance_id, None, plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
+    };
+    let tx = conn.transaction()?;
+    if !signal_claim_provenance_on(&tx, claim)? { return Ok(None); }
+    let state: Option<(String, u64, Option<String>, String, String, String)> = tx.query_row(
+        "SELECT r.status,r.revision,r.claim_fence,r.recipient_subscription_id,
+                e.payload_sha256,e.source_event_id
+         FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+         WHERE r.receipt_id=?1 AND r.signal_id=?2",
+        params![claim.receipt_id,claim.signal_id], |row| Ok((row.get(0)?,
+            row_u64(row,1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
+    let Some((status, revision, fence, subscription_id, payload_sha256,
+        source_event_id)) = state else { return Ok(None) };
+    if status != "claimed" || revision != claim.revision
+        || fence.as_deref() != Some(claim.fence.as_str())
+        || subscription_id != claim.subscription.subscription_id
+        || source_event_id != claim.source_event_id
+        || hex::encode(Sha256::digest(json(&claim.payload)?.as_bytes())) != payload_sha256 {
+        return Ok(None);
+    }
+    let subscription = subscription_on(&tx, &subscription_id)?;
+    if !subscription_live_on(&tx, &subscription)?
+        || subscription.status != ProcessSubscriptionStatus::Open {
+        let reason = match subscription.status {
+            ProcessSubscriptionStatus::Error => "activation_error",
+            ProcessSubscriptionStatus::Consumed => "activation_consumed",
+            _ => "recipient_closed",
+        };
+        settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+            claim.revision, "cancelled", Some(reason), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    if subscription.revision != claim.subscription.revision { return Ok(None); }
+    if !signal_claim_authority_on(&tx, claim)? {
+        settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+            claim.revision, "denied", Some("recipient_access_revoked"), None, at_ms)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+    let canonical;
+    let expected_revision;
+    let plan = if let Some(composite) = composite.as_ref() {
+        expected_revision = claim.snapshot.instance.revision;
+        composite
+    } else {
+        let snapshot = runtime_snapshot_on(&tx, &claim.actor, instance_id)?;
+        expected_revision = snapshot.instance.revision;
+        let input = AcceptedInputRef::Signal {
+            signal_id: claim.signal_id.clone(), receipt_id: claim.receipt_id.clone(),
+            expected_receipt_revision: claim.revision, claim_fence: claim.fence.clone(),
+            target_subscription_id: subscription.subscription_id.clone(),
+            expected_subscription_revision: subscription.revision,
+        };
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            signal_admission_on(&tx, &claim.actor, instance_id, prefix, signal, accepted)
+        };
+        canonical = super::runtime::plan_signal_catch(&snapshot, &subscription,
+            &claim.payload, &claim.signal_id, &claim.source_event_id,
+            at_ms, input, Some(&resolve))?;
+        &canonical
+    };
+    let expected = AcceptedInputRef::Signal {
+        signal_id: claim.signal_id.clone(),
+        receipt_id: claim.receipt_id.clone(),
+        expected_receipt_revision: claim.revision,
+        claim_fence: claim.fence.clone(),
+        target_subscription_id: subscription_id,
+        expected_subscription_revision: subscription.revision,
+    };
+    let delivered = plan.events.iter().filter(|event|
+            event.kind == "signal_received"
+                && event.scope_id == subscription.scope_id
+                && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+                && event.data == serde_json::json!({
+                    "signal_id":claim.signal_id,
+                    "subscription_id":subscription.subscription_id,
+                    "attached_token_id":subscription.token_id,
+                    "source_event_id":claim.source_event_id,
+                })).count();
+    let mapping_failed = plan.add_incidents.iter().filter(|incident|
+        incident.code == "SIGNAL_MAPPING_FAILED"
+            && incident.scope_id == subscription.scope_id
+            && incident.node_id.as_deref() == Some(subscription.node_id.as_str())).count() == 1
+        && plan.subscription_updates.iter().any(|update|
+            update.subscription_id == subscription.subscription_id
+                && update.status == ProcessSubscriptionStatus::Error
+                && update.last_reason.as_deref() == Some("recipient_mapping_failed"));
+    ensure!(((delivered == 1 && !mapping_failed)
+            || (delivered == 0 && mapping_failed)),
+        "signal receipt plan differs from its fenced source and subscription");
+    let mut cancelled_claims = apply_plan_on(&tx, instance_id, &claim.actor.user_id,
+        expected_revision,
+        plan, at_ms, None,
+        EntryAuthority::Accepted(&expected))?;
+    settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+        claim.revision, if mapping_failed { "error" } else { "delivered" },
+        if mapping_failed { Some("recipient_mapping_failed") } else { None },
+        if mapping_failed { plan.add_incidents.iter().find(|incident|
+            incident.code == "SIGNAL_MAPPING_FAILED"
+                && incident.scope_id == subscription.scope_id
+                && incident.node_id.as_deref() == Some(subscription.node_id.as_str()))
+            .map(|incident| incident.incident_id.as_str()) } else { None }, at_ms)?;
+    if composite.is_none() {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
+            &claim.actor.user_id, plan, at_ms)?);
+    }
+    let instance = instance_on(&tx, &claim.actor, instance_id, None)?;
+    tx.commit()?;
+    Ok(Some(ProcessTransitionOutcome { instance, cancelled_claims }))
+}
+
+pub fn record_signal_attempt_failed(
+    pool: &DbPool,
+    claim: &SignalClaim,
+    error: &anyhow::Error,
+    at_ms: i64,
+) -> Result<()> {
+    if error.downcast_ref::<rusqlite::Error>().is_some() {
+        return Err(anyhow::anyhow!("{error:#}"));
+    }
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    if !signal_claim_provenance_on(&tx, claim)? { return Ok(()); }
+    if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
+        if signal_claim_authority_on(&tx, claim)? {
+            return Err(anyhow::anyhow!(
+                "signal receipt authority denial has no factual recipient revocation: {error:#}"));
+        }
+        settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+            claim.revision, "denied", Some("recipient_access_revoked"), None, at_ms)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    Err(anyhow::anyhow!("signal receipt canonical delivery failed: {error:#}"))
+}
+
+pub fn prune_signal_payloads(pool: &DbPool, at_ms: i64) -> Result<u32> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let cutoff = at_ms.checked_sub(7 * 24 * 60 * 60 * 1000)
+        .context("signal retention cutoff overflow")?;
+    let mut query = tx.prepare(
+        "SELECT signal_id,revision FROM bpmn_signal_emissions
+         WHERE status='settled' AND payload_json IS NOT NULL
+           AND settled_at_ms<=?1
+         ORDER BY settled_at_ms,signal_id LIMIT 32")?;
+    let rows = query.query_map([cutoff], |row| Ok((row.get::<_, String>(0)?,
+        row_u64(row,1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(query);
+    let mut pruned = 0;
+    for (signal_id, revision) in rows {
+        pruned += tx.execute(
+            "UPDATE bpmn_signal_emissions SET payload_json=NULL,payload_pruned_at_ms=?1,
+             revision=revision+1 WHERE signal_id=?2 AND revision=?3
+               AND status='settled' AND payload_json IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM bpmn_signal_receipts
+                   WHERE signal_id=?2 AND status IN ('pending','claimed'))",
+            params![at_ms,signal_id,sql_integer(revision)?])?;
+    }
+    tx.commit()?;
+    Ok(u32::try_from(pruned)?)
+}
+
+fn signal_recipients_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    source_instance_id: &str,
+    plan: &RuntimePlan,
+    signal: &PlannedSignal,
+) -> Result<Vec<EventSubscription>> {
+    let closed_before_admission = |subscription: &EventSubscription| -> Result<bool> {
+        let closures = plan.events.iter().enumerate()
+            .filter(|(index, event)| *index < signal.source_event_index
+                && matches!(event.kind.as_str(),
+                    "subscription_cancelled" | "signal_received")
+                && event.data["subscription_id"].as_str()
+                    == Some(subscription.subscription_id.as_str()))
+            .collect::<Vec<_>>();
+        if closures.is_empty() { return Ok(false); }
+        ensure!(closures.len() == 1,
+            "signal cohort has duplicate earlier subscription closures");
+        let (_, event) = closures[0];
+        ensure!(event.scope_id == subscription.scope_id
+            && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+            && event.data["attached_token_id"].as_str()
+                == Some(subscription.token_id.as_str()),
+            "signal cohort closure differs from its pinned activation");
+        let updates = plan.subscription_updates.iter().filter(|update|
+            update.subscription_id == subscription.subscription_id).collect::<Vec<_>>();
+        ensure!(updates.len() == 1
+            && updates[0].expected_revision == subscription.revision,
+            "signal cohort closure lacks its exact subscription revision");
+        if event.kind == "signal_received" {
+            ensure!(updates[0].status == ProcessSubscriptionStatus::Consumed
+                && updates[0].last_reason.is_none()
+                && plan.consume_token_ids.contains(&subscription.token_id)
+                && Uuid::parse_str(event.data["signal_id"].as_str().unwrap_or("")).is_ok()
+                && Uuid::parse_str(event.data["source_event_id"].as_str().unwrap_or("")).is_ok(),
+                "signal cohort received fact lacks its accepted activation");
+        } else {
+            ensure!(updates[0].status == ProcessSubscriptionStatus::Cancelled
+                && event.data["reason"].as_str()
+                    == updates[0].last_reason.as_deref()
+                && (plan.consume_token_ids.contains(&subscription.token_id)
+                    || plan.cancel_token_ids.contains(&subscription.token_id)),
+                "signal cohort cancellation lacks its factual token closure");
+        }
+        Ok(true)
+    };
+    let mut recipients = BTreeMap::new();
+    let mut cursor = String::new();
+    loop {
+        let mut query = tx.prepare(
+            "SELECT subscription_id FROM bpmn_event_subscriptions
+             WHERE org_id=?1 AND kind='signal_catch' AND status='open'
+               AND signal_namespace_uri=?2 AND signal_declaration_id=?3
+               AND subscription_id>?4 ORDER BY subscription_id LIMIT 64",
+        )?;
+        let ids = query.query_map(params![actor.org_id, signal.signal_namespace_uri,
+            signal.signal_declaration_id, cursor], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if ids.is_empty() { break; }
+        let page_len = ids.len();
+        cursor = ids.last().context("signal subscription page has no cursor")?.clone();
+        for id in ids {
+            let subscription = subscription_on(tx, &id)?;
+            if !subscription_live_on(tx, &subscription)? { continue; }
+            if closed_before_admission(&subscription)? { continue; }
+            let readable = require_instance_reader(tx, actor, &subscription.instance_id);
+            match readable {
+                Ok(_) => {},
+                Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => continue,
+                Err(error) => return Err(error),
+            }
+            let recipient: String = tx.query_row(
+                "SELECT initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+                [&subscription.instance_id], |row| row.get(0))?;
+            let recipient_actor = ProcessActor {
+                org_id: actor.org_id.clone(), user_id: recipient,
+            };
+            let authority = require_call_control_authority_on(
+                tx, &recipient_actor, &subscription.instance_id)
+                .and_then(|()| require_version_execution_on(tx, &recipient_actor,
+                    &subscription.definition_id, subscription.version));
+            match authority {
+                Ok(()) => {
+                    if recipients.len() < 65 { recipients.insert(id, subscription); }
+                },
+                Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => {},
+                Err(error) => return Err(error),
+            }
+        }
+        if page_len < 64 { break; }
+    }
+    for subscription in plan.create_subscriptions.iter().filter(|candidate|
+        candidate.kind == ProcessSubscriptionKind::SignalCatch
+            && candidate.status == ProcessSubscriptionStatus::Open
+            && candidate.signal_namespace_uri.as_deref()
+                == Some(signal.signal_namespace_uri.as_str())
+            && candidate.signal_declaration_id.as_deref()
+                == Some(signal.signal_declaration_id.as_str())) {
+        let opened = plan.events.iter().enumerate().filter(|(index, event)|
+            *index < signal.source_event_index
+                && event.kind == "signal_catch_opened"
+                && event.scope_id == subscription.scope_id
+                && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+                && event.data == serde_json::json!({
+                    "subscription_id": subscription.subscription_id,
+                    "attached_token_id": subscription.token_id,
+                    "signal_namespace_uri": subscription.signal_namespace_uri,
+                    "signal_declaration_id": subscription.signal_declaration_id,
+                })).count();
+        if opened == 0 { continue; }
+        if closed_before_admission(subscription)? { continue; }
+        ensure!(opened == 1 && subscription.org_id == actor.org_id
+            && plan.create_tokens.iter().any(|token| token.token_id == subscription.token_id
+                && token.scope_id == subscription.scope_id
+                && token.node_id == subscription.node_id && token.status == "waiting"),
+            "same-plan signal catch lacks an earlier factual arm");
+        ensure!(subscription.instance_id == source_instance_id,
+            "same-plan Signal catch belongs to another instance");
+        ensure!(!recipients.contains_key(&subscription.subscription_id),
+            "same-plan Signal catch duplicates a persisted subscription");
+        if recipients.len() < 65 {
+            recipients.insert(subscription.subscription_id.clone(), subscription.clone());
+        }
+    }
+    Ok(recipients.into_values().collect())
+}
+
+fn pending_emission_budget_on(
+    conn: &Connection,
+    org_id: &str,
+    sender_user_id: &str,
+) -> Result<(u32, u64, u32, u64)> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(sender_user_id=?2),0),
+                COALESCE(SUM(CASE WHEN sender_user_id=?2 THEN payload_bytes ELSE 0 END),0),
+                COUNT(*),COALESCE(SUM(payload_bytes),0)
+         FROM (
+           SELECT sender_user_id,payload_bytes FROM bpmn_messages
+             WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')
+           UNION ALL
+           SELECT sender_user_id,payload_bytes FROM bpmn_signal_emissions e
+             WHERE e.org_id=?1 AND EXISTS (
+               SELECT 1 FROM bpmn_signal_receipts r WHERE r.signal_id=e.signal_id
+                 AND r.status IN ('pending','claimed'))
+         )",
+        params![org_id, sender_user_id],
+        |row| Ok((row.get(0)?, row_u64(row,1)?, row.get(2)?, row_u64(row,3)?)),
+    ).map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingEntryDebit {
+    sender_count: u32,
+    sender_bytes: u64,
+    org_count: u32,
+    org_bytes: u64,
+    sender_receipts: u32,
+    org_receipts: u32,
+}
+
+fn pending_entry_debit_on(
+    tx: &Transaction<'_>, actor: &ProcessActor, instance_id: &str,
+    plan: &RuntimePlan, source_index: usize, accepted: Option<&AcceptedInputRef>,
+) -> Result<PendingEntryDebit> {
+    let Some(accepted) = accepted else { return Ok(PendingEntryDebit::default()) };
+    let message_input = match accepted {
+        AcceptedInputRef::Message { org_id, sender_user_id, message_id,
+            expected_message_revision, target_subscription_id, expected_subscription_revision } =>
+            Some((org_id, sender_user_id, message_id, *expected_message_revision,
+                target_subscription_id.as_deref(), *expected_subscription_revision, false)),
+        AcceptedInputRef::Start { instance_id: started,
+            cause: StartInputRef::Message { org_id, sender_user_id, message_id,
+                expected_message_revision } } if started == instance_id =>
+            Some((org_id, sender_user_id, message_id, *expected_message_revision,
+                None, None, true)),
+        _ => None,
+    };
+    if let Some((org_id, sender_user_id, message_id, revision,
+        subscription_id, subscription_revision, is_start)) = message_input {
+        let key = MessageKey { org_id: org_id.clone(), sender_user_id: sender_user_id.clone(),
+            message_id: message_id.clone() };
+        let message = message_on(tx, &key, true)?;
+        ensure!(org_id == &actor.org_id && message.revision == revision
+            && matches!(message.status, ProcessMessageStatus::Pending | ProcessMessageStatus::Blocked),
+            "pending entry debit differs from its live message identity");
+        let payload = message.payload.as_ref()
+            .context("pending entry message has no retained payload")?;
+        ensure!(u32::try_from(json(payload)?.len())? == message.payload_bytes
+            && hex::encode(Sha256::digest(json(payload)?.as_bytes()))
+                == message.payload_sha256,
+            "pending entry debit differs from its retained message payload");
+        let source_facts = plan.events.iter().enumerate().filter(|(index, event)|
+            *index < source_index && if is_start {
+                event.kind == "instance_started" && event.scope_id == instance_id
+                    && event.data["start_message_id"].as_str() == Some(message_id)
+            } else {
+                event.kind == "message_delivered"
+                    && event.data["message_id"].as_str() == Some(message_id)
+                    && event.data["subscription_id"].as_str() == subscription_id
+                    && &event.data["payload"] == payload
+            }).count();
+        ensure!(source_facts == 1,
+            "pending entry debit lacks its earlier authenticated message fact");
+        if let Some(subscription_id) = subscription_id {
+            let subscription = subscription_on(tx, subscription_id)?;
+            ensure!(subscription.instance_id == instance_id
+                && subscription.revision == subscription_revision.unwrap_or_default()
+                && plan.events.iter().take(source_index).any(|event|
+                    event.kind == "message_delivered"
+                        && event.scope_id == subscription.scope_id
+                        && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+                        && event.data["subscription_id"].as_str() == Some(subscription_id)
+                        && event.data["attached_token_id"].as_str()
+                            == Some(subscription.token_id.as_str())
+                        && event.data["message_id"].as_str() == Some(message_id))
+                && plan.subscription_updates.iter().filter(|update|
+                    update.subscription_id == subscription_id
+                        && update.expected_revision == subscription.revision
+                        && update.status == ProcessSubscriptionStatus::Consumed).count() == 1,
+                "pending entry debit lacks its exact message catch activation");
+        }
+        let same_sender = sender_user_id == &actor.user_id;
+        return Ok(PendingEntryDebit { sender_count: u32::from(same_sender),
+            sender_bytes: if same_sender { u64::from(message.payload_bytes) } else { 0 },
+            org_count: 1, org_bytes: u64::from(message.payload_bytes),
+            ..PendingEntryDebit::default() });
+    }
+    if let AcceptedInputRef::Signal { signal_id, receipt_id,
+        target_subscription_id, .. } = accepted {
+        let subscription = subscription_on(tx, target_subscription_id)?;
+        let (source_event_id, sender_user_id, org_id, payload_bytes,
+            nonterminal): (String, String, String, u64, u32) = tx.query_row(
+            "SELECT e.source_event_id,e.sender_user_id,e.org_id,e.payload_bytes,
+                (SELECT COUNT(*) FROM bpmn_signal_receipts sibling
+                 WHERE sibling.signal_id=e.signal_id AND sibling.status IN ('pending','claimed'))
+             FROM bpmn_signal_emissions e JOIN bpmn_signal_receipts r
+               ON r.signal_id=e.signal_id WHERE e.signal_id=?1 AND r.receipt_id=?2
+               AND r.recipient_subscription_id=?3",
+            params![signal_id,receipt_id,target_subscription_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_u64(row,3)?,row.get(4)?)))?;
+        ensure!(org_id == actor.org_id && nonterminal >= 1
+            && signal_claim_matches_on(tx, instance_id, accepted,
+                target_subscription_id, signal_id, &source_event_id)?,
+            "pending entry debit differs from its fenced Signal receipt");
+        let source_facts = plan.events.iter().enumerate().filter(|(index, event)|
+            *index < source_index && event.kind == "signal_received"
+                && event.scope_id == subscription.scope_id
+                && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+                && event.data == serde_json::json!({
+                    "signal_id":signal_id,"subscription_id":target_subscription_id,
+                    "attached_token_id":subscription.token_id,
+                    "source_event_id":source_event_id,
+                })).count();
+        ensure!(source_facts == 1
+            && plan.subscription_updates.iter().filter(|update|
+                update.subscription_id == *target_subscription_id
+                    && update.expected_revision == subscription.revision
+                    && update.status == ProcessSubscriptionStatus::Consumed).count() == 1,
+            "pending entry debit lacks its earlier accepted Signal fact");
+        let same_sender = sender_user_id == actor.user_id;
+        let final_receipt = nonterminal == 1;
+        return Ok(PendingEntryDebit {
+            sender_count: u32::from(same_sender && final_receipt),
+            sender_bytes: if same_sender && final_receipt { payload_bytes } else { 0 },
+            org_count: u32::from(final_receipt),
+            org_bytes: if final_receipt { payload_bytes } else { 0 },
+            sender_receipts: u32::from(same_sender), org_receipts: 1,
+        });
+    }
+    Ok(PendingEntryDebit::default())
+}
+
+fn apply_pending_entry_debit(
+    counts: (u32, u64, u32, u64), debit: PendingEntryDebit,
+) -> Result<(u32, u64, u32, u64)> {
+    Ok((counts.0.checked_sub(debit.sender_count).context("sender pending debit underflow")?,
+        counts.1.checked_sub(debit.sender_bytes).context("sender byte debit underflow")?,
+        counts.2.checked_sub(debit.org_count).context("organization pending debit underflow")?,
+        counts.3.checked_sub(debit.org_bytes).context("organization byte debit underflow")?))
+}
+
+fn signal_admission_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    signal: &PlannedSignal,
+    accepted: Option<&AcceptedInputRef>,
+) -> Result<super::runtime::SignalAdmissionDecision> {
+    use super::runtime::SignalAdmissionDecision;
+
+    let recipients = signal_recipients_on(tx, actor, instance_id, plan, signal)?;
+    if recipients.len() > 64 {
+        return Ok(SignalAdmissionDecision::DenyRecipients);
+    }
+    if recipients.is_empty() {
+        return Ok(SignalAdmissionDecision::Admit);
+    }
+    let debit = pending_entry_debit_on(tx, actor, instance_id, plan,
+        signal.source_event_index, accepted)?;
+    let (mut sender_count, mut sender_bytes, mut org_count, mut org_bytes) =
+        apply_pending_entry_debit(pending_emission_budget_on(tx, &actor.org_id,
+            &actor.user_id)?, debit)?;
+    let (sender_receipts, org_receipts): (u32, u32) = tx.query_row(
+        "SELECT COALESCE(SUM(e.sender_user_id=?2),0),COUNT(*)
+         FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id
+         WHERE e.org_id=?1 AND r.status IN ('pending','claimed')",
+        params![actor.org_id, actor.user_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut sender_receipts = sender_receipts.checked_sub(debit.sender_receipts)
+        .context("sender receipt debit underflow")?;
+    let mut org_receipts = org_receipts.checked_sub(debit.org_receipts)
+        .context("organization receipt debit underflow")?;
+    let mut earlier = plan.create_messages.iter().map(|message|
+        (message.source_event_index, Some(message), None))
+        .chain(plan.create_signals.iter().map(|prior|
+            (prior.source_event_index, None, Some(prior))))
+        .filter(|(index, _, _)| *index < signal.source_event_index)
+        .collect::<Vec<_>>();
+    earlier.sort_by_key(|(index, _, _)| *index);
+    ensure!(earlier.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "two admissions share a source event");
+    for (_, message, prior) in earlier {
+        let (charge, receipts) = if let Some(message) = message {
+            let event = plan.events.get(message.source_event_index)
+                .context("earlier directed admission has no source event")?;
+            ensure!(matches!(event.kind.as_str(), "message_queued" | "send_task_admitted")
+                && event.scope_id == message.source_scope_id
+                && event.node_id.as_deref() == Some(message.source_node_id.as_str())
+                && event.data == serde_json::json!({
+                    "message_id":message.message.message_id,
+                    "source_activation_id":message.source_activation_id,
+                    "target":message.message.target,
+                    "message_name":message.message.message_name,
+                    "correlation_key":message.message.correlation_key,
+                })
+                && plan.event_sources.get(&message.source_event_index)
+                    == Some(&message.source_activation_id)
+                && plan.consume_token_ids.contains(&message.source_activation_id),
+                "earlier directed admission lacks its exact source-time fact");
+            (u64::try_from(json(&message.message.payload)?.len())?, 0u32)
+        } else {
+            let prior = prior.context("admission has no message or Signal source")?;
+            let event = plan.events.get(prior.source_event_index)
+                .context("earlier Signal admission has no source event")?;
+            ensure!(event.kind == "signal_admitted"
+                && event.scope_id == prior.source_scope_id
+                && event.node_id.as_deref() == Some(prior.source_node_id.as_str())
+                && event.data == serde_json::json!({
+                    "signal_id":prior.signal_id,
+                    "source_activation_id":prior.source_activation_id,
+                    "signal_namespace_uri":prior.signal_namespace_uri,
+                    "signal_declaration_id":prior.signal_declaration_id,
+                })
+                && plan.event_sources.get(&prior.source_event_index)
+                    == Some(&prior.source_activation_id)
+                && plan.consume_token_ids.contains(&prior.source_activation_id)
+                && plan.event_ids.get(&prior.source_event_index)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok()),
+                "earlier Signal admission lacks its exact source-time fact");
+            let count = u32::try_from(signal_recipients_on(tx, actor, instance_id, plan, prior)?.len())?;
+            if count == 0 { continue; }
+            ensure!(count <= 64, "earlier Signal admission exceeds its authorized recipient bound");
+            (u64::try_from(json(&prior.payload)?.len())?, count)
+        };
+        sender_count = sender_count.checked_add(1).context("sender pending count overflow")?;
+        org_count = org_count.checked_add(1).context("organization pending count overflow")?;
+        sender_bytes = sender_bytes.checked_add(charge).context("sender pending bytes overflow")?;
+        org_bytes = org_bytes.checked_add(charge).context("organization pending bytes overflow")?;
+        sender_receipts = sender_receipts.checked_add(receipts)
+            .context("sender pending receipt count overflow")?;
+        org_receipts = org_receipts.checked_add(receipts)
+            .context("organization pending receipt count overflow")?;
+        ensure!(sender_count <= 1024 && org_count <= 4096
+            && sender_bytes <= 64 * 1024 * 1024 && org_bytes <= 256 * 1024 * 1024
+            && sender_receipts <= 1024 && org_receipts <= 4096,
+            "earlier admission exceeds its authenticated pending budget");
+    }
+    let charge = u64::try_from(json(&signal.payload)?.len())?;
+    let recipients = u32::try_from(recipients.len())?;
+    Ok(if sender_count >= 1024 || org_count >= 4096
+        || sender_bytes.checked_add(charge).is_none_or(|total| total > 64 * 1024 * 1024)
+        || org_bytes.checked_add(charge).is_none_or(|total| total > 256 * 1024 * 1024)
+        || sender_receipts.checked_add(recipients).is_none_or(|total| total > 1024)
+        || org_receipts.checked_add(recipients).is_none_or(|total| total > 4096) {
+        SignalAdmissionDecision::DenyPending
+    } else {
+        SignalAdmissionDecision::Admit
+    })
+}
+
 fn insert_message_on(
     tx: &Transaction<'_>,
     actor: &ProcessActor,
     prepared: &PreparedMessage,
     source: Option<(&str, &str, &str, &str, &str)>,
+    debit: PendingEntryDebit,
     at_ms: i64,
 ) -> Result<MessageRecord> {
     super::messages::validate_message(prepared)?;
@@ -17577,7 +19508,9 @@ fn insert_message_on(
         ensure!(version.model.nodes.iter().any(|n|matches!(&n.kind,ProcessNodeKind::MessageStart{message_ref,..}if version.model.messages.iter().any(|d|&d.message_id==message_ref&&d.name==prepared.message_name))),"message start name is not declared by the current published version");
     }
     let payload = json(&prepared.payload)?;
-    let (sender_count,sender_bytes,org_count,org_bytes):(u32,u64,u32,u64)=tx.query_row("SELECT COALESCE(SUM(sender_user_id=?2),0),COALESCE(SUM(CASE WHEN sender_user_id=?2 THEN payload_bytes ELSE 0 END),0),COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",params![actor.org_id,actor.user_id],|r|Ok((r.get(0)?,row_u64(r,1)?,r.get(2)?,row_u64(r,3)?)))?;
+    let (sender_count,sender_bytes,org_count,org_bytes) =
+        apply_pending_entry_debit(pending_emission_budget_on(tx, &actor.org_id,
+            &actor.user_id)?, debit)?;
     ensure!(
         sender_count < 1024
             && org_count < 4096
@@ -17631,7 +19564,8 @@ pub fn send_message(
         };
         return message_summary_on(&tx, actor, &message_on(&tx, &key, true)?);
     }
-    let m = insert_message_on(&tx, actor, message, None, at_ms)?;
+    let m = insert_message_on(&tx, actor, message, None,
+        PendingEntryDebit::default(), at_ms)?;
     let result = message_summary_on(&tx, actor, &m)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -18337,31 +20271,25 @@ pub fn record_message_failed(
 pub fn deliver_message(
     pool: &DbPool,
     prepared: &MessageSnapshot,
-    plan: &RuntimePlan,
+    plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<Option<MessageDeliveryOutcome>> {
-    let (actor, source_id, initial) = match &prepared.target {
-        MessageDeliveryTarget::Start {
-            actor,
-            version,
-            instance_id,
-        } => (
-            actor,
-            instance_id.as_str(),
-            Some((
-                version.definition_id.as_str(),
-                version.version,
-                plan.start_variables
-                    .as_ref()
-                    .context("message start variables missing")?,
-            )),
-        ),
-        MessageDeliveryTarget::Catch {
-            actor, snapshot, ..
-        } => (actor, snapshot.instance.instance_id.as_str(), None),
+    let (composite, mut conn) = match plan_input {
+        ProcessPlanInput::Supplied(plan) => {
+            let (actor, source_id, initial) = match &prepared.target {
+                MessageDeliveryTarget::Start { actor, version, instance_id } => (
+                    actor, instance_id.as_str(), Some((version.definition_id.as_str(),
+                        version.version, plan.start_variables.as_ref()
+                            .context("message start variables missing")?))),
+                MessageDeliveryTarget::Catch { actor, snapshot, .. } =>
+                    (actor, snapshot.instance.instance_id.as_str(), None),
+            };
+            let (composite, conn) = prepare_call_plan(pool, actor, source_id,
+                initial, plan, at_ms)?;
+            (Some(composite), conn)
+        }
+        ProcessPlanInput::Canonical => (None, pool.write()?),
     };
-    let (composite, mut conn) = prepare_call_plan(pool, actor, source_id, initial, plan, at_ms)?;
-    let plan = &composite;
     let tx = conn.transaction()?;
     let fresh = match message_selection_on(&tx, &prepared.candidate)? {
         MessageSelection::Ready(s) => s,
@@ -18370,6 +20298,24 @@ pub fn deliver_message(
     if fresh.message.expires_at_ms <= now_ms()? {
         return Ok(None);
     }
+    let canonical;
+    let plan = if let Some(composite) = composite.as_ref() {
+        composite
+    } else {
+        let (actor, source_instance) = match &fresh.target {
+            MessageDeliveryTarget::Start { actor, instance_id, .. } =>
+                (actor, instance_id.as_str()),
+            MessageDeliveryTarget::Catch { actor, snapshot, .. } =>
+                (actor, snapshot.instance.instance_id.as_str()),
+        };
+        let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+            accepted: Option<&AcceptedInputRef>| {
+            signal_admission_on(&tx, actor, source_instance, prefix, signal, accepted)
+        };
+        canonical = super::messages::plan_message_delivery(&fresh, at_ms,
+            Some(&resolve))?;
+        &canonical
+    };
     let delivered = plan
         .events
         .iter()
@@ -18413,8 +20359,9 @@ pub fn deliver_message(
         };
         ensure!(matches_message, "terminating message input differs from its accepted envelope");
     }
-    let (actor, instance, version, node_id, subscription_id, claims) = match (
-        &prepared.target,
+    let selected = if composite.is_some() { prepared } else { &fresh };
+    let (actor, instance, version, node_id, subscription_id, mut claims) = match (
+        &selected.target,
         &fresh.target,
     ) {
         (
@@ -18610,6 +20557,10 @@ pub fn deliver_message(
         serde_json::json!({"message_id":m.key.message_id,"sender_user_id":m.key.sender_user_id,"instance_id":instance.instance_id,"subscription_id":subscription_id,"version":version}),
         at_ms,
     )?;
+    if composite.is_none() {
+        claims.extend(apply_canonical_call_steps_on(&tx, &instance.instance_id,
+            &actor.user_id, plan, at_ms)?);
+    }
     let sender = ProcessActor {
         org_id: m.key.org_id.clone(),
         user_id: m.key.sender_user_id.clone(),
@@ -18743,7 +20694,7 @@ mod tests {
         let candidate = due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == timer.timer_id).unwrap();
         let timer_snapshot = timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = super::super::timers::plan_timer_fire(&timer_snapshot, due).unwrap();
+        let plan = super::super::timers::plan_timer_fire(&timer_snapshot, due, None).unwrap();
         assert!(plan.cancel_scope_roots.iter().any(|scope| scope != &started.instance_id));
         let before_rows = super::super::call_tests::transition_rows(&fixture);
         let mut connection = fixture.db.write().unwrap();
@@ -18757,7 +20708,7 @@ mod tests {
         drop(connection);
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before_rows);
         let committed = fire_timer(&fixture.db, &candidate, &fixture.owner,
-            Some(before.instance.revision), &plan, due).unwrap().unwrap();
+            Some(before.instance.revision), ProcessPlanInput::Supplied(&plan), due).unwrap().unwrap();
         assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = runtime_snapshot(&reopened, &fixture.owner, &started.instance_id).unwrap();
@@ -18868,6 +20819,7 @@ mod tests {
                 correlation_key: Some(name.clone()),
                 error_code: Some("E".repeat(64)),
                 escalation_code: None,
+                signal_name: None,
                 attached_to_id: Some(identifier.clone()),
                 race_id: Some(uuid.clone()),
                 last_reason: Some(reason.clone())
@@ -19044,8 +20996,8 @@ mod tests {
         let candidates = due_timers(&db, third_due, 32).unwrap();
         assert_eq!(candidates.len(), 1);
         let snapshot = timer_snapshot(&db, &candidates[0]).unwrap();
-        let plan = super::super::timers::plan_timer_fire(&snapshot, third_due).unwrap();
-        let fired = fire_timer(&db, &candidates[0], &actor, None, &plan, third_due)
+        let plan = super::super::timers::plan_timer_fire(&snapshot, third_due, None).unwrap();
+        let fired = fire_timer(&db, &candidates[0], &actor, None, ProcessPlanInput::Supplied(&plan), third_due)
             .unwrap().unwrap();
         assert!(fired.cancelled_claims.is_empty());
         let fired = fired.instance;
@@ -19065,7 +21017,7 @@ mod tests {
         assert_eq!(event["occurrence"], 3);
         assert_eq!(event["skipped_count"], 2);
         drop(conn);
-        assert!(fire_timer(&db, &candidates[0], &actor, None, &plan, third_due).unwrap().is_none());
+        assert!(fire_timer(&db, &candidates[0], &actor, None, ProcessPlanInput::Supplied(&plan), third_due).unwrap().is_none());
         assert!(due_timers(&db, third_due + 1, 32).unwrap().is_empty());
     }
 
@@ -19163,9 +21115,9 @@ mod tests {
         let command = stamp("start catch");
         let plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
-            super::super::runtime::test_support::manual_input(&command)).unwrap();
+            super::super::runtime::test_support::manual_input(&command), None).unwrap();
         let waiting = start_instance(&db, &actor, &command, &instance_id,
-            &draft.definition_id, 1, &json!({}), &plan, 1_000).unwrap();
+            &draft.definition_id, 1, &json!({}), ProcessPlanInput::Supplied(&plan), 1_000).unwrap();
         assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
         assert_eq!(waiting.timers.len(), 1);
         let due = due_timers(&db, 2_000, 32).unwrap();
@@ -19242,9 +21194,9 @@ mod tests {
         let command = stamp("start revocation");
         let start_plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
-            super::super::runtime::test_support::manual_input(&command)).unwrap();
+            super::super::runtime::test_support::manual_input(&command), None).unwrap();
         let started = start_instance(&db, &actor, &command, &instance_id,
-            &draft.definition_id, 1, &json!({}), &start_plan, 1_000).unwrap();
+            &draft.definition_id, 1, &json!({}), ProcessPlanInput::Supplied(&start_plan), 1_000).unwrap();
         let task_id = started.user_tasks[0].user_task_id.clone();
         let task_snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
         let completion_command = stamp("complete before timer");
@@ -19255,7 +21207,7 @@ mod tests {
             None,
             1_500,
             super::super::runtime::test_support::human_input(&task_snapshot, &task_id, &completion_command),
-        )
+        None)
         .unwrap();
         let waiting = complete_user_task(
             &db,
@@ -19266,7 +21218,7 @@ mod tests {
             started.revision,
             &json!({}),
             None,
-            &completed_plan,
+            ProcessPlanInput::Supplied(&completed_plan),
             1_500,
         )
         .unwrap()
@@ -19275,7 +21227,7 @@ mod tests {
         let due = due_timers(&db, 2_500, 32).unwrap();
         assert_eq!(due.len(), 1);
         let snapshot = timer_snapshot(&db, &due[0]).unwrap();
-        let fire_plan = super::super::timers::plan_timer_fire(&snapshot, 2_500).unwrap();
+        let fire_plan = super::super::timers::plan_timer_fire(&snapshot, 2_500, None).unwrap();
         let before: (i64, i64, i64) = db.read().unwrap().query_row(
             "SELECT (SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1),
                     (SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1),
@@ -19285,7 +21237,7 @@ mod tests {
         db.write().unwrap().execute(
             "UPDATE user_accounts SET is_active=0 WHERE id=?1", [&participant.user_id],
         ).unwrap();
-        let denied = fire_timer(&db, &due[0], &actor, Some(waiting.revision), &fire_plan, 2_500)
+        let denied = fire_timer(&db, &due[0], &actor, Some(waiting.revision), ProcessPlanInput::Supplied(&fire_plan), 2_500)
             .unwrap_err();
         assert!(denied.downcast_ref::<ProcessAuthorityDenied>().is_some(), "{denied:#}");
         let after: (i64, i64, i64) = db.read().unwrap().query_row(
@@ -19486,7 +21438,7 @@ mod tests {
             &model, &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command),
-        ).unwrap();
+        None).unwrap();
         let waiting = start_instance(
             &db,
             &actor,
@@ -19495,7 +21447,7 @@ mod tests {
             &definition.definition_id,
             1,
             &json!({}),
-            &start_plan,
+            ProcessPlanInput::Supplied(&start_plan),
             1_000,
         )
         .unwrap();
@@ -19512,7 +21464,7 @@ mod tests {
         let outputs = json!(["approved", {"case_id": "C-1"}]);
         let completion = stamp("complete");
         let plan = super::super::runtime::plan_user_completion(&snapshot, &task_id, &outputs, None, 2_000,
-            super::super::runtime::test_support::human_input(&snapshot, &task_id, &completion)).unwrap();
+            super::super::runtime::test_support::human_input(&snapshot, &task_id, &completion), None).unwrap();
         assert!(complete_user_task(
             &db,
             &participant,
@@ -19522,7 +21474,7 @@ mod tests {
             waiting.revision - 1,
             &outputs,
             None,
-            &plan,
+            ProcessPlanInput::Supplied(&plan),
             2_000,
         )
         .is_err());
@@ -19550,7 +21502,7 @@ mod tests {
             waiting.revision,
             &outputs,
             None,
-            &plan,
+            ProcessPlanInput::Supplied(&plan),
             2_000,
         )
         .unwrap()
@@ -19584,7 +21536,7 @@ mod tests {
             waiting.revision,
             &outputs,
             None,
-            &plan,
+            ProcessPlanInput::Supplied(&plan),
             2_000,
         )
         .unwrap()
@@ -19667,7 +21619,7 @@ mod tests {
             &model, &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command),
-        ).unwrap();
+        None).unwrap();
         assert!(start_instance(
             &db,
             &actor,
@@ -19676,7 +21628,7 @@ mod tests {
             &definition.definition_id,
             1,
             &json!({}),
-            &plan,
+            ProcessPlanInput::Supplied(&plan),
             1_000,
         )
         .is_err());

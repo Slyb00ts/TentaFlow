@@ -36,7 +36,7 @@ fn forged_script_result_source_and_extra_history_roll_back_all_sixteen_tables() 
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     let script_index = plan.events.iter().position(|event| event.kind == "script_completed").unwrap();
     let source_id = plan.event_sources.get(&script_index).unwrap().clone();
     let other_id = plan.create_tokens.iter().find(|token|
@@ -89,7 +89,7 @@ fn forged_script_result_source_and_extra_history_roll_back_all_sixteen_tables() 
         }
         let before = transition_rows(&fixture);
         let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, &forged,
+            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).unwrap_err();
         if variant == 5 {
             assert!(format!("{error:#}").contains("Script consumed or continued"),
@@ -98,13 +98,13 @@ fn forged_script_result_source_and_extra_history_roll_back_all_sixteen_tables() 
         assert_eq!(transition_rows(&fixture), before, "forgery {variant} changed durable rows");
     }
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.variables["answer"], 5);
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
     assert_eq!(reopened.variables, committed.variables);
     let before_replay = transition_rows(&fixture);
     repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(transition_rows(&fixture), before_replay);
 }
 
@@ -122,7 +122,7 @@ fn forged_script_failure_code_and_parked_wait_roll_back_before_real_incident() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     assert_eq!(plan.add_incidents[0].code, "SCRIPT_EVALUATION_FAILED");
     for variant in 0..2 {
         let mut forged = plan.clone();
@@ -137,12 +137,12 @@ fn forged_script_failure_code_and_parked_wait_roll_back_before_real_incident() {
         }
         let before = transition_rows(&fixture);
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, &forged,
+            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).is_err());
         assert_eq!(transition_rows(&fixture), before);
     }
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.incidents.len(), 1);
     assert_eq!(committed.incidents[0].code, "SCRIPT_EVALUATION_FAILED");
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
@@ -164,17 +164,17 @@ fn unmapped_script_output_is_replayed_from_the_pinned_body() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     let mut forged = plan.clone();
     let fact = forged.events.iter_mut().find(|event| event.kind == "script_completed").unwrap();
     fact.data = json!({"outputs":[1,2,4]});
     let before = transition_rows(&fixture);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &forged,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
         at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     let history = repository::list_events(&fixture.db, &fixture.owner,
         &instance_id, 0, 200).unwrap().0;
     assert_eq!(history.iter().find(|event| event.kind == "script_completed").unwrap().data,

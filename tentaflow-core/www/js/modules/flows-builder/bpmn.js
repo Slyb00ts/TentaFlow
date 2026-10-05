@@ -13,6 +13,8 @@ const ELEMENTS = [
   ['MessageStart', 'message_start', 'play', 'events', 56, 56],
   ['MessageCatch', 'message_catch', 'mail', 'events', 56, 56],
   ['MessageThrow', 'message_throw', 'send', 'events', 56, 56],
+  ['SignalThrow', 'signal_throw', 'send', 'events', 56, 56],
+  ['SignalCatch', 'signal_catch', 'mail', 'events', 56, 56],
   ['BoundaryMessage', 'boundary_message', 'mail', 'events', 56, 56],
   ['BoundaryError', 'boundary_error', 'alert-triangle', 'events', 56, 56],
   ['BoundaryEscalation', 'boundary_escalation', 'alert-triangle', 'events', 56, 56],
@@ -58,6 +60,8 @@ export function processNodeConfig(kind) {
   if (kind === 'MessageCatch') return { messageRef: '', correlationExpression: '', outputMapping: {} };
   if (kind === 'MessageThrow') return { messageRef: '', target: { Start: { definitionId: '' } },
     correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
+  if (kind === 'SignalThrow') return { signalRef: '', payloadExpression: '', ttlSeconds: 3600 };
+  if (kind === 'SignalCatch') return { signalRef: '', outputMapping: {} };
   if (kind === 'SendTask') return { messageRef: '', target: { Start: { definitionId: '' } },
     correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
   if (kind === 'ReceiveTask') return { messageRef: '', correlationExpression: '', outputMapping: {} };
@@ -209,6 +213,7 @@ export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
     ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
     ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
     ...(model.escalations?.length ? { escalations: structuredClone(model.escalations) } : {}),
+    ...(model.signals?.length ? { signals: structuredClone(model.signals) } : {}),
     ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
     ...graph,
   };

@@ -130,6 +130,9 @@ export function processEventText(event) {
   if (event.kind === 'receive_task_completed') return text('event_receive_task_completed', {
     node, message: event.data.message_id,
   });
+  if (event.kind === 'signal_admitted') return text('event_signal_admitted', { node });
+  if (event.kind === 'signal_catch_opened') return text('event_signal_catch_opened', { node });
+  if (event.kind === 'signal_received') return text('event_signal_received', { node });
   if (event.kind === 'inclusive_split') return text('event_inclusive_split', { node,
     count: event.data.selected_branch_edge_ids.length,
     default: event.data.default_selected ? text('inclusive_default_selected') : '' });
@@ -595,9 +598,9 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.dataset.subscriptionId = subscription.subscriptionId;
       const subject = subscription.kind === 'BoundaryEscalation'
         ? subscription.escalationCode || text('escalation_any_code')
-        : subscription.messageName || subscription.errorCode || text('element_unavailable');
+        : subscription.signalName || subscription.messageName || subscription.errorCode || text('element_unavailable');
       row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || subscription.nodeId)}</strong><p>${escapeHtml(subject)} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
-        ${subscription.kind === 'BoundaryEscalation' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}<p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
+        ${subscription.kind === 'BoundaryEscalation' || subscription.kind === 'SignalCatch' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}<p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
       subscriptions.append(row);
     }
     renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
@@ -806,6 +809,8 @@ export function openProcessDeclarations(model, readOnly, onSave) {
     ${readOnly ? '' : `<tf-button variant="secondary" data-add-error>${escapeHtml(text('add_error_declaration'))}</tf-button>`}
     <h3>${escapeHtml(text('escalation_declarations'))}</h3><div data-escalation-rows></div>
     ${readOnly ? '' : `<tf-button variant="secondary" data-add-escalation>${escapeHtml(text('add_escalation_declaration'))}</tf-button>`}
+    <h3>${escapeHtml(text('signal_declarations'))}</h3><div data-signal-rows></div>
+    ${readOnly ? '' : `<tf-button variant="secondary" data-add-signal>${escapeHtml(text('add_signal_declaration'))}</tf-button>`}
     <tf-alert data-declaration-error tone="danger" hidden></tf-alert>`;
   const addRow = (kind, declaration) => {
     const row = document.createElement('div');
@@ -813,20 +818,23 @@ export function openProcessDeclarations(model, readOnly, onSave) {
     row.dataset.declarationKind = kind;
     const message = kind === 'message';
     const escalation = kind === 'escalation';
-    row.innerHTML = `<tf-textarea data-declaration-id label="${escapeAttr(text(message ? 'message_declaration_id' : escalation ? 'escalation_declaration_id' : 'error_declaration_id'))}" value="${escapeAttr(message ? declaration.messageId : escalation ? declaration.escalationId : declaration.errorId)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+    const signal = kind === 'signal';
+    row.innerHTML = `<tf-textarea data-declaration-id label="${escapeAttr(text(message ? 'message_declaration_id' : escalation ? 'escalation_declaration_id' : signal ? 'signal_declaration_id' : 'error_declaration_id'))}" value="${escapeAttr(message ? declaration.messageId : escalation ? declaration.escalationId : signal ? declaration.signalId : declaration.errorId)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
       <tf-textarea data-declaration-name label="${escapeAttr(text('declaration_name'))}" value="${escapeAttr(declaration.name)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
-      ${message ? '' : `<tf-textarea data-declaration-code label="${escapeAttr(text(escalation ? 'escalation_code' : 'error_code'))}" value="${escapeAttr(escalation ? declaration.escalationCode : declaration.errorCode)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>`}
+      ${message || signal ? '' : `<tf-textarea data-declaration-code label="${escapeAttr(text(escalation ? 'escalation_code' : 'error_code'))}" value="${escapeAttr(escalation ? declaration.escalationCode : declaration.errorCode)}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>`}
       ${readOnly ? '' : `<tf-button variant="ghost" wrap data-remove-declaration>${escapeHtml(text('remove_declaration'))}</tf-button>`}`;
     section.querySelector(`[data-${kind}-rows]`).append(row);
   };
   (model.messages || []).forEach((item) => addRow('message', item));
   (model.errors || []).forEach((item) => addRow('error', item));
   (model.escalations || []).forEach((item) => addRow('escalation', item));
+  (model.signals || []).forEach((item) => addRow('signal', item));
   section.addEventListener('click', (event) => {
     if (readOnly) return;
     if (event.target.closest('[data-add-message]')) addRow('message', { messageId: `Message_${crypto.randomUUID().replaceAll('-', '_')}`, name: '' });
     else if (event.target.closest('[data-add-error]')) addRow('error', { errorId: `Error_${crypto.randomUUID().replaceAll('-', '_')}`, name: '', errorCode: '' });
     else if (event.target.closest('[data-add-escalation]')) addRow('escalation', { escalationId: `Escalation_${crypto.randomUUID().replaceAll('-', '_')}`, name: '', escalationCode: '' });
+    else if (event.target.closest('[data-add-signal]')) addRow('signal', { signalId: `Signal_${crypto.randomUUID().replaceAll('-', '_')}`, name: '' });
     else event.target.closest('[data-remove-declaration]')?.closest('.fb-declaration-row')?.remove();
   });
   const collect = () => {
@@ -835,9 +843,10 @@ export function openProcessDeclarations(model, readOnly, onSave) {
       const name = row.querySelector('[data-declaration-name]').value;
       return kind === 'message' ? { messageId: id, name }
         : kind === 'escalation' ? { escalationId: id, name, escalationCode: row.querySelector('[data-declaration-code]').value }
+          : kind === 'signal' ? { signalId: id, namespaceUri: section.querySelector('[data-declaration-namespace]').value, name }
           : { errorId: id, name, errorCode: row.querySelector('[data-declaration-code]').value };
     });
-    return { messages: rows('message'), errors: rows('error'), escalations: rows('escalation'),
+    return { messages: rows('message'), errors: rows('error'), escalations: rows('escalation'), signals: rows('signal'),
       targetNamespace: section.querySelector('[data-declaration-namespace]').value || null };
   };
   return openFormWindow({ title: text('declarations'), icon: 'mail', width: 720, sections: [section],

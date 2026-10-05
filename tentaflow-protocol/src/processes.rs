@@ -28,6 +28,8 @@ pub struct ProcessModel {
     pub target_namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub escalations: Vec<ProcessEscalationDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<ProcessSignalDeclaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +53,14 @@ pub struct ProcessEscalationDeclaration {
     pub escalation_id: String,
     pub name: String,
     pub escalation_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSignalDeclaration {
+    pub signal_id: String,
+    pub namespace_uri: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -340,6 +350,15 @@ pub enum ProcessNodeKind {
     ReceiveTask {
         message_ref: String,
         correlation_expression: String,
+        output_mapping: BTreeMap<String, String>,
+    },
+    SignalThrow {
+        signal_ref: String,
+        payload_expression: String,
+        ttl_seconds: u32,
+    },
+    SignalCatch {
+        signal_ref: String,
         output_mapping: BTreeMap<String, String>,
     },
 }
@@ -713,6 +732,7 @@ pub enum ProcessSubscriptionKind {
     BoundaryError,
     BoundaryEscalation,
     ReceiveTask,
+    SignalCatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -984,6 +1004,8 @@ pub struct ProcessSubscriptionSummary {
     pub scope_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1563,6 +1585,7 @@ mod tests {
             errors: Vec::new(),
             target_namespace: None,
             escalations: Vec::new(),
+            signals: Vec::new(),
         };
         assert_eq!(serde_json::to_string(&old).unwrap(),
             "{\"schema_version\":1,\"process_id\":\"P_1\",\"nodes\":[],\"sequence_flows\":[],\"variables\":{},\"diagram\":{\"shapes\":[],\"edges\":[]}}");
@@ -1660,6 +1683,7 @@ mod tests {
             errors: Vec::new(),
             target_namespace: None,
             escalations: Vec::new(),
+            signals: Vec::new(),
         };
         let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
         assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
@@ -1737,6 +1761,7 @@ mod tests {
                 errors: Vec::new(),
                 target_namespace: None,
                 escalations: Vec::new(),
+                signals: Vec::new(),
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();
@@ -1860,6 +1885,32 @@ mod tests {
         let bytes = crate::cbor::encode(&subscription).unwrap();
         assert_eq!(crate::cbor::decode::<ProcessSubscriptionKind>(&bytes).unwrap(), subscription);
         assert_eq!(serde_json::to_value(subscription).unwrap(), "ReceiveTask");
+    }
+
+    #[test]
+    fn signal_declarations_and_events_append_without_changing_older_wire_shapes() {
+        let declaration = ProcessSignalDeclaration { signal_id: "Signal_1".into(),
+            namespace_uri: "urn:orders".into(), name: "Order changed".into() };
+        let throw = ProcessNodeKind::SignalThrow { signal_ref: declaration.signal_id.clone(),
+            payload_expression: "vars.payload".into(), ttl_seconds: 3600 };
+        let catch = ProcessNodeKind::SignalCatch { signal_ref: declaration.signal_id.clone(),
+            output_mapping: BTreeMap::from([("received".into(), "outputs".into())]) };
+        for kind in [&throw, &catch] {
+            let bytes = crate::cbor::encode(kind).unwrap();
+            assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&bytes).unwrap(), *kind);
+        }
+        assert_eq!(serde_json::to_value(&throw).unwrap(), serde_json::json!({
+            "SignalThrow":{"signal_ref":"Signal_1","payload_expression":"vars.payload","ttl_seconds":3600}
+        }));
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "SignalCatch":{"signal_ref":"Signal_1"}
+        })).is_err());
+        let bytes = crate::cbor::encode(&ProcessSubscriptionKind::SignalCatch).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessSubscriptionKind>(&bytes).unwrap(), ProcessSubscriptionKind::SignalCatch);
+        assert_eq!(serde_json::to_value(ProcessSubscriptionKind::SignalCatch).unwrap(), "SignalCatch");
+        assert_eq!(serde_json::to_value(declaration).unwrap(), serde_json::json!({
+            "signal_id":"Signal_1","namespace_uri":"urn:orders","name":"Order changed"
+        }));
     }
 
     #[test]
@@ -1998,6 +2049,7 @@ mod tests {
             errors: Vec::new(),
             target_namespace: None,
             escalations: Vec::new(),
+            signals: Vec::new(),
         };
         let version = ProcessVersion {
             definition_id: "definition".into(),

@@ -59,17 +59,17 @@ fn complete_work(fixture: &Fixture, instance_id: &str, ordinal: u32, outputs: &V
     let command = stamp("complete actual repeated Work item");
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, outputs,
-        None, at_ms, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        None, at_ms, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         instance_id, &task.user_task_id, snapshot.instance.revision,
-        outputs, None, &plan, at_ms).unwrap();
+        outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let persisted = repository::runtime_snapshot(&reopened, &fixture.owner, instance_id).unwrap();
     assert_eq!(persisted.repetition_groups[0].completed_count, ordinal + 1);
     let before_replay = super::call_tests::transition_rows(fixture);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
         instance_id, &task.user_task_id, snapshot.instance.revision,
-        outputs, None, &plan, at_ms).unwrap();
+        outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(replay.instance.revision, persisted.instance.revision);
     assert_eq!(super::call_tests::transition_rows(fixture), before_replay);
 }
@@ -122,10 +122,10 @@ fn collection_null_object_and_list_items_stay_frozen_after_a_real_sibling_change
     let changed_items = json!([{"changed":"after repetition entry"}]);
     let outputs = json!({"items":changed_items});
     let plan = runtime::plan_user_completion(&before, &sibling.user_task_id, &outputs,
-        None, at_ms, human_input(&before, &sibling.user_task_id, &command)).unwrap();
+        None, at_ms, human_input(&before, &sibling.user_task_id, &command), None).unwrap();
     repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &sibling.user_task_id, before.instance.revision,
-        &outputs, None, &plan, at_ms).unwrap();
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     let changed = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();
     assert_eq!(changed.instance.variables["items"], changed_items);
@@ -140,7 +140,7 @@ fn collection_null_object_and_list_items_stay_frozen_after_a_real_sibling_change
         let command = stamp("accept frozen collection item");
         let at = chrono::Utc::now().timestamp_millis();
         let canonical = runtime::plan_user_completion(&snapshot, &task.user_task_id,
-            &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
         if ordinal < 2 {
             let next = canonical.repetition_occurrences.iter()
                 .find(|row| row.ordinal == ordinal + 1).unwrap();
@@ -152,7 +152,7 @@ fn collection_null_object_and_list_items_stay_frozen_after_a_real_sibling_change
             assert_eq!(before_rows.len(), 16);
             let error = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
                 &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-                &outputs, None, &forged, at).unwrap_err();
+                &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at).unwrap_err();
             let message = format!("{error:#}");
             assert!(message.contains("repetition occurrence changed immutable ordinal input")
                 || message.contains("repetition item differs from its frozen collection ordinal"),
@@ -161,7 +161,7 @@ fn collection_null_object_and_list_items_stay_frozen_after_a_real_sibling_change
         }
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-            &outputs, None, &canonical, at).unwrap();
+            &outputs, None, repository::ProcessPlanInput::Supplied(&canonical), at).unwrap();
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
@@ -272,18 +272,18 @@ fn nonboolean_posttest_preserves_accepted_source_and_blocks_parent_continuation(
     let command = stamp("accept ordinal before nonboolean postcondition");
     let at = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id,
-        &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let before = super::call_tests::transition_rows(&fixture);
     assert_eq!(before.len(), 16);
     let mut forged = plan.clone();
     forged.repetition_groups[0].status = ProcessRepetitionGroupStatus::Completed;
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &forged, at).is_err());
+        &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &plan, at).unwrap();
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
         &started.instance_id).unwrap();
@@ -319,18 +319,18 @@ fn loop_mapping_error_keeps_accepted_work_fact_and_no_next_ordinal() {
     let command = stamp("accept ordinal with invalid local mapping result");
     let at = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id,
-        &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let before = super::call_tests::transition_rows(&fixture);
     assert_eq!(before.len(), 16);
     let mut forged = plan.clone();
     forged.repetition_occurrences[0].item = json!("foreign loop item");
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &forged, at).is_err());
+        &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &plan, at).unwrap();
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
         &started.instance_id).unwrap();

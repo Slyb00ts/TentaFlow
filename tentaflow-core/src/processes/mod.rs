@@ -44,3 +44,7 @@ mod manual_proof_tests;
 mod send_receive_tests;
 #[cfg(test)]
 mod send_receive_proof_tests;
+#[cfg(test)]
+mod signal_tests;
+#[cfg(test)]
+mod signal_proof_tests;

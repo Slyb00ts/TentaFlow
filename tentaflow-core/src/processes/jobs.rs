@@ -442,14 +442,14 @@ pub async fn execute_claimed(
         } else {
             None
         };
-        let plan = match plan_job_result(&current, job, &result, at_ms) {
-            Ok(plan) => plan,
+        let (plan, retained_escalation_failure) = match plan_job_result(&current, job, &result, at_ms, None) {
+            Ok(plan) => (plan, false),
             Err(error) if script_infrastructure(&error) => {
                 return fail_claim(pool, worker_id, &claimed,
                     "SCRIPT_INFRASTRUCTURE_FAILED", error, Some(&result));
             }
             Err(error) if escalation_boundary.is_some() => {
-                super::runtime::plan_retained_escalation_incident(
+                (super::runtime::plan_retained_escalation_incident(
                     &current,
                     job,
                     &result,
@@ -458,7 +458,7 @@ pub async fn execute_claimed(
                         .context("selected escalation disappeared")?,
                     &error.to_string(),
                     at_ms,
-                )?
+                )?, true)
             }
             Err(error) => {
                 return fail_claim(
@@ -480,7 +480,11 @@ pub async fn execute_claimed(
             worker_id,
             &result,
             current.instance.revision,
-            &plan,
+            if retained_escalation_failure {
+                repository::ProcessPlanInput::Supplied(&plan)
+            } else {
+                repository::ProcessPlanInput::Canonical
+            },
             at_ms,
         ) {
             Ok(committed) => {
@@ -518,7 +522,7 @@ pub async fn execute_claimed(
                     worker_id,
                     &result,
                     current.instance.revision,
-                    &fallback,
+                    repository::ProcessPlanInput::Supplied(&fallback),
                     at_ms,
                 ) {
                     Ok(committed) => {
@@ -626,7 +630,7 @@ mod tests {
             expression_observation: None,
         };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert!(plan.termination_attempts.iter().any(|attempt|
             matches!(attempt, repository::TerminationAttempt::Success(_))));
         let before = super::super::call_tests::transition_rows(&fixture);
@@ -636,7 +640,7 @@ mod tests {
         assert!(missing_source.event_ids.remove(&result_index).is_some());
         let missing = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &missing_source, at).unwrap_err();
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&missing_source), at).unwrap_err();
         assert!(format!("{missing:#}").contains(
             "accepted service result lacks its required source identity"));
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
@@ -649,11 +653,11 @@ mod tests {
         };
         assert!(repository::accept_job_result(&fixture.db, &fixture.owner, &claim.job.job_id,
             claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &forged, at).is_err());
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let accepted = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &plan, at).unwrap().instance;
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap().instance;
         assert_eq!(accepted.status, ProcessInstanceStatus::Completed);
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
@@ -688,7 +692,7 @@ mod tests {
             expression_observation: None,
         };
         let at = now_ms();
-        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert!(canonical.event_ids.is_empty());
         let source_effects = canonical.variable_effects.iter().filter(|effect| matches!(effect,
             repository::VariableEffect::Mapped { accepted_input:
@@ -705,7 +709,7 @@ mod tests {
         let before = super::super::call_tests::transition_rows(&fixture);
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &forged, at).unwrap_err();
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).unwrap_err();
         assert!(format!("{error:#}").contains(
             "accepted service variable effects disagree on source identity"));
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
@@ -715,7 +719,7 @@ mod tests {
         verification.data["expression"] = serde_json::json!("false");
         assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &wrong_verification, at).is_err());
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_verification), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let mut duplicate_verification = canonical.clone();
         let verification = duplicate_verification.events.iter().find(|event|
@@ -723,11 +727,11 @@ mod tests {
         duplicate_verification.events.push(verification);
         assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &duplicate_verification, at).is_err());
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&duplicate_verification), at).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let accepted = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
-            claim.snapshot.instance.revision, &canonical, at).unwrap().instance;
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&canonical), at).unwrap().instance;
         assert_eq!(accepted.status, ProcessInstanceStatus::Completed);
         assert_eq!(accepted.variables["script_answer"], "script source");
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
@@ -842,7 +846,7 @@ mod tests {
                 expression_observation: None,
             },
             at_ms,
-        )
+        None)
         .unwrap();
         repository::accept_job_result(
             &fixture.db,
@@ -857,7 +861,7 @@ mod tests {
                 expression_observation: None,
             },
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -922,10 +926,10 @@ mod tests {
         let command = stamp("complete sibling after service retry");
         let plan = runtime::plan_user_completion(&partial, &sibling.user_task_id,
             &Value::Null, None, at_ms,
-            runtime::test_support::human_input(&partial, &sibling.user_task_id, &command)).unwrap();
+            runtime::test_support::human_input(&partial, &sibling.user_task_id, &command), None).unwrap();
         let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &started.instance_id,
-            &sibling.user_task_id, partial.instance.revision, &Value::Null, None, &plan, at_ms)
+            &sibling.user_task_id, partial.instance.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
             .unwrap().instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(crate::db::repository::list_flow_executions_for_flow(&fixture.db, &flow_id, 10)
@@ -971,7 +975,7 @@ mod tests {
             None,
             at_ms,
             runtime::test_support::human_input(&waiting, &task.user_task_id, &reject_command),
-        )
+        None)
         .is_err());
         let rejection = runtime::plan_user_completion(
             &waiting,
@@ -980,7 +984,7 @@ mod tests {
             Some(false),
             at_ms,
             runtime::test_support::human_input(&waiting, &task.user_task_id, &reject_command),
-        )
+        None)
         .unwrap();
         let rejected = repository::complete_user_task(
             &fixture.db,
@@ -991,7 +995,7 @@ mod tests {
             waiting.instance.revision,
             &json!("insufficient"),
             Some(false),
-            &rejection,
+            repository::ProcessPlanInput::Supplied(&rejection),
             at_ms,
         )
         .unwrap()
@@ -1030,7 +1034,7 @@ mod tests {
             Some(true),
             at_ms,
             runtime::test_support::human_input(&waiting, &task.user_task_id, &approve_command),
-        )
+        None)
         .unwrap();
         let completed = repository::complete_user_task(
             &fixture.db,
@@ -1041,7 +1045,7 @@ mod tests {
             waiting.instance.revision,
             &json!({"answer":"client cannot replace service output"}),
             Some(true),
-            &approval,
+            repository::ProcessPlanInput::Supplied(&approval),
             at_ms,
         )
         .unwrap()
@@ -1086,7 +1090,7 @@ mod tests {
                 expression_observation: None,
             },
             at_ms,
-        )
+        None)
         .unwrap();
         let path = fixture.directory.path().join("processes.db");
         let actor = fixture.owner.clone();
@@ -1128,7 +1132,7 @@ mod tests {
                 expression_observation: None,
             },
             claim.snapshot.instance.revision,
-            &late_plan,
+            repository::ProcessPlanInput::Supplied(&late_plan),
             at_ms
         )
         .is_err());
@@ -1237,7 +1241,7 @@ mod tests {
                 expression_observation: None,
             },
             at_ms,
-        )
+        None)
         .unwrap();
         let current =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
@@ -1277,7 +1281,7 @@ mod tests {
                 expression_observation: None,
             },
             current.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms
         )
         .is_err());
@@ -1638,7 +1642,7 @@ mod tests {
                 expression_observation: None,
             },
             at_ms,
-        )
+        None)
         .unwrap();
         assert!(repository::accept_job_result(
             &fixture.db,
@@ -1653,7 +1657,7 @@ mod tests {
                 expression_observation: None,
             },
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms
         )
         .is_err());
@@ -1743,7 +1747,7 @@ mod tests {
                         expression_observation: None,
                     },
                     now_ms(),
-                )
+                None)
                 .unwrap()
             });
             let drained =
@@ -1806,7 +1810,7 @@ mod tests {
                             expression_observation: None,
                         },
                         claim.snapshot.instance.revision,
-                        late_plan.as_ref().unwrap(),
+                        repository::ProcessPlanInput::Supplied(late_plan.as_ref().unwrap()),
                         now_ms()
                     )
                     .is_err());
@@ -2076,7 +2080,7 @@ mod tests {
                     Some(false),
                     at,
                     runtime::test_support::human_input(&current, &verification.user_task_id, &command),
-                )
+                None)
                 .unwrap();
                 let rejected = repository::complete_user_task(
                     &fixture.db,
@@ -2087,7 +2091,7 @@ mod tests {
                     current.instance.revision,
                     &json!("declined"),
                     Some(false),
-                    &rejection,
+                    repository::ProcessPlanInput::Supplied(&rejection),
                     at,
                 )
                 .unwrap()
@@ -2302,7 +2306,7 @@ mod tests {
             })
             .unwrap();
         let timer_snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let timer_plan = super::super::timers::plan_timer_fire(&timer_snapshot, due).unwrap();
+        let timer_plan = super::super::timers::plan_timer_fire(&timer_snapshot, due, None).unwrap();
         let timer_revision = match &timer_snapshot {
             repository::TimerSnapshot::Boundary { snapshot, .. } => snapshot.instance.revision,
             _ => panic!("independent timer changed its boundary kind"),
@@ -2312,7 +2316,7 @@ mod tests {
             &candidate,
             &fixture.owner,
             Some(timer_revision),
-            &timer_plan,
+            repository::ProcessPlanInput::Supplied(&timer_plan),
             due,
         )
         .unwrap();
@@ -2344,7 +2348,7 @@ mod tests {
             }),
         };
         let at = due + 1;
-        let plan = plan_job_result(&independent, &independent.jobs[0], &observed, at).unwrap();
+        let plan = plan_job_result(&independent, &independent.jobs[0], &observed, at, None).unwrap();
         assert_eq!(plan.status, ProcessInstanceStatus::Incident);
         assert_eq!(
             plan.events
@@ -2362,7 +2366,7 @@ mod tests {
             "incident-escalation-worker",
             &observed,
             independent.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -2473,7 +2477,7 @@ mod tests {
             }),
         };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert!(plan
             .events
             .iter()
@@ -2516,7 +2520,7 @@ mod tests {
             assert!(repository::accept_job_result(
                 &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
                 claim.job.fence, "fenced-escalation-worker", &observed,
-                claim.snapshot.instance.revision, &forged, at,
+                claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
             ).is_err());
             assert_eq!(rows(), before);
         }
@@ -2531,7 +2535,7 @@ mod tests {
             assert!(repository::accept_job_result(
                 &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
                 claim.job.fence, "fenced-escalation-worker", &observed,
-                claim.snapshot.instance.revision, &forged, at,
+                claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
             ).is_err());
             assert_eq!(rows(), before);
         }
@@ -2557,7 +2561,7 @@ mod tests {
             assert!(repository::accept_job_result(
                 &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
                 claim.job.fence, "fenced-escalation-worker", &observed,
-                claim.snapshot.instance.revision, &forged, at,
+                claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
             ).is_err());
             assert_eq!(rows(), before);
         }
@@ -2577,7 +2581,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -2593,7 +2597,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -2611,7 +2615,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -2632,7 +2636,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -2652,7 +2656,7 @@ mod tests {
             "fenced-escalation-worker",
             &forged_observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at
         )
         .is_err());
@@ -2672,7 +2676,7 @@ mod tests {
             "fenced-escalation-worker",
             &forged_observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at
         )
         .is_err());
@@ -2686,7 +2690,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -2700,7 +2704,7 @@ mod tests {
             "fenced-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -2786,7 +2790,7 @@ mod tests {
                 expression_observation: Some(ExpressionObservation {
                     normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
             let at = now_ms();
-            let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+            let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
             let rows = || {
                 let conn = fixture.db.read().unwrap();
                 ["bpmn_instances","bpmn_scopes","bpmn_tokens","bpmn_gateway_receipts",
@@ -2812,7 +2816,7 @@ mod tests {
             }
             assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
-                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
             assert_eq!(rows(), before);
             forged = plan.clone();
             forged.status = if route == "service" {
@@ -2822,11 +2826,11 @@ mod tests {
             };
             assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
-                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
             assert_eq!(rows(), before);
             repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, "pinned-wait-worker",
-                &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
         }
     }
 
@@ -2879,7 +2883,7 @@ mod tests {
             expression_observation: Some(ExpressionObservation {
                 normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert_eq!(plan.create_messages.len(), 1);
         let rows = || {
             let conn = fixture.db.read().unwrap();
@@ -2904,12 +2908,12 @@ mod tests {
             }
             assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, "throw-worker",
-                &observed, claim.snapshot.instance.revision, &forged, at).is_err());
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).is_err());
             assert_eq!(rows(), before);
         }
         repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, "throw-worker",
-            &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
     }
 
     #[tokio::test]
@@ -3010,7 +3014,7 @@ mod tests {
             }),
         };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         let choice = plan
             .events
             .iter()
@@ -3060,7 +3064,7 @@ mod tests {
             "inclusive-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -3090,7 +3094,7 @@ mod tests {
                 "inclusive-escalation-worker",
                 &observed,
                 claim.snapshot.instance.revision,
-                &forged,
+                repository::ProcessPlanInput::Supplied(&forged),
                 at
             )
             .is_err());
@@ -3106,7 +3110,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "inclusive-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), before);
         let committed = repository::accept_job_result(
@@ -3118,7 +3122,7 @@ mod tests {
             "inclusive-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -3258,7 +3262,7 @@ mod tests {
             }),
         };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert!(plan
             .events
             .iter()
@@ -3302,7 +3306,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "embedded-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), before);
         forged = plan.clone();
@@ -3315,7 +3319,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "embedded-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), before);
         forged = plan.clone();
@@ -3324,7 +3328,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "embedded-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), before);
         forged = plan.clone();
@@ -3334,7 +3338,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "embedded-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), before);
         let ancestor = claim.snapshot.tokens.iter()
@@ -3349,7 +3353,7 @@ mod tests {
             assert!(repository::accept_job_result(
                 &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
                 claim.job.fence, "embedded-escalation-worker", &observed,
-                claim.snapshot.instance.revision, &forged, at,
+                claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
             ).is_err());
             assert_eq!(rows(), before);
         }
@@ -3369,7 +3373,7 @@ mod tests {
             "embedded-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -3385,7 +3389,7 @@ mod tests {
             "embedded-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             at
         )
         .is_err());
@@ -3401,7 +3405,7 @@ mod tests {
         assert!(repository::accept_job_result(
             &fixture.db, &fixture.owner, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, "embedded-escalation-worker", &observed,
-            claim.snapshot.instance.revision, &forged, at,
+            claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at,
         ).is_err());
         assert_eq!(rows(), with_unrelated);
         fixture.db.write().unwrap().execute(
@@ -3417,7 +3421,7 @@ mod tests {
             "embedded-escalation-worker",
             &observed,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -3592,7 +3596,7 @@ mod tests {
             },
         };
         let at = now_ms();
-        let plan = plan_job_result(&claim.snapshot, &claim.job, &result, at).unwrap();
+        let plan = plan_job_result(&claim.snapshot, &claim.job, &result, at, None).unwrap();
         assert!(repository::accept_job_result(
             &fixture.db,
             &fixture.owner,
@@ -3602,7 +3606,7 @@ mod tests {
             "forged-result",
             &result,
             claim.snapshot.instance.revision,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at
         )
         .is_err());
@@ -3644,7 +3648,7 @@ mod tests {
             }),
         };
         let at = now_ms();
-        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         assert!(canonical.event_ids.is_empty());
         assert!(canonical.create_user_tasks.iter().any(|task|
             task.kind == ProcessUserTaskKind::Verification));
@@ -3652,27 +3656,42 @@ mod tests {
             &claim.job, &observed, "AbsentEscalation", "invented handler failure", at).unwrap();
         forged.add_incidents[0].code = "OTHER_HANDLER_FAILURE".into();
         forged.events[1].data["code"] = json!("OTHER_HANDLER_FAILURE");
-        let before = super::super::call_tests::transition_rows(&fixture);
+        let before = super::super::signal_proof_tests::all_transition_rows(&fixture);
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
-            &observed, claim.snapshot.instance.revision, &forged, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged), at).unwrap_err();
+        assert_eq!(super::super::signal_proof_tests::all_transition_rows(&fixture), before);
         assert!(format!("{error:#}").contains(
-            "unselected NeedsHuman result differs from its factual Verification wait"));
-        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+            "unselected NeedsHuman result differs from its factual Verification wait"),
+            "unexpected forged handler rejection: {error:#}");
         let mut missing_verification = canonical.clone();
         missing_verification.create_user_tasks.clear();
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
-            &observed, claim.snapshot.instance.revision, &missing_verification, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&missing_verification), at).unwrap_err();
         assert!(format!("{error:#}").contains(
             "unselected NeedsHuman result differs from its factual Verification wait"));
-        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        assert_eq!(super::super::signal_proof_tests::all_transition_rows(&fixture), before);
+        let mut caller_source = canonical.clone();
+        let result_index = caller_source.events.iter().position(|event|
+            event.kind == "service_result").unwrap();
+        caller_source.event_ids.insert(result_index, uuid::Uuid::new_v4().to_string());
+        let error = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision,
+            repository::ProcessPlanInput::Supplied(&caller_source), at).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "unselected NeedsHuman result cannot supply an event identity"),
+            "caller-supplied Service event identity rejected for another reason: {error:#}");
+        assert_eq!(super::super::signal_proof_tests::all_transition_rows(&fixture), before);
         let committed = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
-            &observed, claim.snapshot.instance.revision, &canonical, at).unwrap().instance;
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&canonical), at).unwrap().instance;
         assert!(committed.user_tasks.iter().any(|task|
             task.kind == ProcessUserTaskKind::Verification
                 && task.status == ProcessUserTaskStatus::Open));
+        let committed_rows = super::super::signal_proof_tests::all_transition_rows(&fixture);
+        assert_ne!(committed_rows, before);
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
@@ -3680,6 +3699,12 @@ mod tests {
         assert!(persisted.user_tasks.iter().any(|task|
             task.kind == ProcessUserTaskKind::Verification
                 && task.status == ProcessUserTaskStatus::Open));
+        let replay = repository::accept_job_result(&reopened, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision,
+            repository::ProcessPlanInput::Supplied(&canonical), at).unwrap();
+        assert_eq!(replay.instance, committed);
+        assert_eq!(super::super::signal_proof_tests::all_transition_rows(&fixture), committed_rows);
     }
 
     #[tokio::test]
@@ -3753,7 +3778,7 @@ mod tests {
             Some(true),
             at,
             runtime::test_support::human_input(&current, &task.user_task_id, &command),
-        )
+        None)
         .unwrap();
         repository::complete_user_task(
             &fixture.db,
@@ -3764,7 +3789,7 @@ mod tests {
             current.instance.revision,
             &json!({}),
             Some(true),
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at,
         )
         .unwrap()
@@ -3823,7 +3848,7 @@ mod tests {
                 Some(false),
                 at,
                 runtime::test_support::human_input(&snapshot, &task.user_task_id, &command),
-            )
+            None)
             .unwrap();
             let rejected = repository::complete_user_task(
                 &fixture.db,
@@ -3834,7 +3859,7 @@ mod tests {
                 snapshot.instance.revision,
                 &json!({}),
                 Some(false),
-                &plan,
+                repository::ProcessPlanInput::Supplied(&plan),
                 at,
             )
             .unwrap()

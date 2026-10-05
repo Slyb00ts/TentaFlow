@@ -399,7 +399,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         StartCause::Manual,
         1_000,
         runtime::test_support::manual_input(&command),
-    )
+    None)
     .unwrap();
     let completed = repository::start_instance(
         &fixture.db,
@@ -409,7 +409,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         &version.definition_id,
         version.version,
         &variables,
-        &first_plan,
+        repository::ProcessPlanInput::Supplied(&first_plan),
         1_000,
     )
     .unwrap();
@@ -453,7 +453,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         StartCause::Manual,
         2_000,
         runtime::test_support::manual_input(&command),
-    )
+    None)
     .unwrap();
     let replay = repository::start_instance(
         &fixture.db,
@@ -463,7 +463,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         &version.definition_id,
         version.version,
         &variables,
-        &replacement_plan,
+        repository::ProcessPlanInput::Supplied(&replacement_plan),
         2_000,
     )
     .unwrap();
@@ -549,7 +549,7 @@ fn scoped_work_uses_lexical_inputs_outputs_and_authorized_scope_detail() {
     let outputs = json!({"answer":"approved"});
     let command = stamp("scoped-complete");
     let plan = runtime::plan_user_completion(&snapshot, &task_id, &outputs, None, 2_000,
-        runtime::test_support::human_input(&snapshot, &task_id, &command)).unwrap();
+        runtime::test_support::human_input(&snapshot, &task_id, &command), None).unwrap();
     let completed = repository::complete_user_task(
         &fixture.db,
         &fixture.owner,
@@ -559,7 +559,7 @@ fn scoped_work_uses_lexical_inputs_outputs_and_authorized_scope_detail() {
         waiting.revision,
         &outputs,
         None,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         2_000,
     )
     .unwrap()
@@ -619,7 +619,7 @@ fn forged_scope_parent_or_cross_body_node_cannot_publish_a_partial_transition() 
             &fixture.owner,
             &waiting.instance_id,
             waiting.revision,
-            &forged,
+            repository::ProcessPlanInput::Supplied(&forged),
             2_000
         )
         .is_err());
@@ -682,7 +682,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
             &fixture.owner,
             &waiting.instance_id,
             waiting.revision,
-            &invalid,
+            repository::ProcessPlanInput::Supplied(&invalid),
             2_000
         )
         .is_err(),
@@ -723,7 +723,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
         &fixture.owner,
         &waiting.instance_id,
         waiting.revision,
-        &shadowed,
+        repository::ProcessPlanInput::Supplied(&shadowed),
         3_000,
     )
     .unwrap()
@@ -755,7 +755,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
             &fixture.owner,
             &waiting.instance_id,
             legal.revision,
-            &removed_shadow,
+            repository::ProcessPlanInput::Supplied(&removed_shadow),
             4_000
         )
         .is_err(),
@@ -817,7 +817,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
         &fixture.owner,
         &waiting.instance_id,
         legal.revision,
-        &simultaneous,
+        repository::ProcessPlanInput::Supplied(&simultaneous),
         5_000,
     )
     .unwrap()
@@ -916,7 +916,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
         &fixture.owner,
         &terminal_waiting.instance_id,
         terminal_waiting.revision,
-        &root_change,
+        repository::ProcessPlanInput::Supplied(&root_change),
         6_000,
     )
     .unwrap()
@@ -1050,7 +1050,7 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
         &fixture.owner,
         &initial.instance_id,
         initial.revision,
-        &expansion,
+        repository::ProcessPlanInput::Supplied(&expansion),
         2_000,
     )
     .unwrap()
@@ -1058,7 +1058,7 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
     let snapshot =
         repository::runtime_snapshot(&fixture.db, &fixture.owner, &initial.instance_id).unwrap();
     assert_eq!(snapshot.scopes.len(), 129);
-    let plan = runtime::plan_advance(&snapshot, 3_000).unwrap();
+    let plan = runtime::plan_advance(&snapshot, 3_000, None).unwrap();
     assert!(plan
         .add_incidents
         .iter()
@@ -1081,7 +1081,7 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
         &fixture.owner,
         &initial.instance_id,
         expanded.revision,
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         3_000,
     )
     .unwrap()
@@ -1158,9 +1158,10 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
     else {
         panic!("the completed descendant's first message must have a real matching start");
     };
-    let deliver_plan = messages::plan_message_delivery(&deliver_prepared, first_at_ms).unwrap();
+    let deliver_plan = messages::plan_message_delivery(&deliver_prepared, first_at_ms, None).unwrap();
     let first_delivery =
-        repository::deliver_message(&fixture.db, &deliver_prepared, &deliver_plan, first_at_ms)
+        repository::deliver_message(&fixture.db, &deliver_prepared,
+            repository::ProcessPlanInput::Supplied(&deliver_plan), first_at_ms)
             .unwrap()
             .unwrap();
     assert_eq!(
@@ -1189,8 +1190,9 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
     else {
         panic!("the actual boundary subscription must accept the stop message");
     };
-    let plan = messages::plan_message_delivery(&prepared, at_ms).unwrap();
-    let delivered = repository::deliver_message(&fixture.db, &prepared, &plan, at_ms)
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    let delivered = repository::deliver_message(&fixture.db, &prepared,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap()
         .unwrap();
     assert_eq!(delivered.message.status, ProcessMessageStatus::Delivered);
@@ -1413,11 +1415,11 @@ fn embedded_terminate_returns_mapped_locals_once_from_a_real_human_completion() 
     let at_ms = chrono::Utc::now().timestamp_millis();
     let outputs = json!({"decision":"accepted"});
     let plan = runtime::plan_user_completion(&before, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&before, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&before, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
     assert!(matches!(&plan.termination_attempts[0], repository::TerminationAttempt::Success(_)));
     let completed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, &plan, at_ms)
+        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["mapped_result"], 41);
@@ -1447,7 +1449,7 @@ fn embedded_terminate_returns_mapped_locals_once_from_a_real_human_completion() 
     assert_eq!(events.iter().filter(|event| event.kind == "instance_completed").count(), 1);
     let rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, &plan, at_ms)
+        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), rows);
@@ -1505,7 +1507,7 @@ fn embedded_human_error_end_catch_then_root_terminate_preserves_ordered_values_a
     let outputs = json!({"answer":"approved after review"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&before, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&before, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&before, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
     assert!(matches!(&plan.termination_attempts[0], repository::TerminationAttempt::Success(_)));
     let before_rows = super::call_tests::transition_rows(&fixture);
@@ -1527,12 +1529,12 @@ fn embedded_human_error_end_catch_then_root_terminate_preserves_ordered_values_a
     ] {
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None,
-            &forged, at_ms).is_err(), "{case} was accepted");
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} was accepted");
         assert_eq!(super::call_tests::transition_rows(&fixture), before_rows,
             "{case} changed persisted process rows");
     }
     let completed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, &plan, at_ms)
+        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["accepted_error_value"], "approved after review");
@@ -1570,7 +1572,7 @@ fn embedded_human_error_end_catch_then_root_terminate_preserves_ordered_values_a
     assert_eq!(events.iter().filter(|event| event.kind == "instance_completed").count(), 1);
     let rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
-        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, &plan, at_ms)
+        &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), rows);
@@ -1628,10 +1630,10 @@ fn embedded_terminate_keeps_a_foreign_sibling_incident_and_parent_join_activatio
     let peer_command = stamp("accept real sibling input with nonboolean choice");
     let at_ms = chrono::Utc::now().timestamp_millis();
     let peer_plan = runtime::plan_user_completion(&first, &peer_task.user_task_id, &json!({}), None,
-        at_ms, runtime::test_support::human_input(&first, &peer_task.user_task_id, &peer_command)).unwrap();
+        at_ms, runtime::test_support::human_input(&first, &peer_task.user_task_id, &peer_command), None).unwrap();
     let peer = repository::complete_user_task(&fixture.db, &fixture.owner, &peer_command,
         &waiting.instance_id, &peer_task.user_task_id, first.instance.revision, &json!({}), None,
-        &peer_plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&peer_plan), at_ms).unwrap().instance;
     assert_eq!(peer.status, ProcessInstanceStatus::Incident);
     let peer_incident = peer.incidents.iter().find(|incident| incident.node_id.as_deref() == Some("PeerChoice"))
         .expect("the accepted sibling input produced its own gateway incident").clone();
@@ -1642,10 +1644,10 @@ fn embedded_terminate_keeps_a_foreign_sibling_incident_and_parent_join_activatio
     let child_task = second.user_tasks.iter().find(|task| task.node_id == "ChildInput").unwrap();
     let child_command = stamp("complete child without erasing sibling incident");
     let child_plan = runtime::plan_user_completion(&second, &child_task.user_task_id, &json!({}), None,
-        at_ms + 1, runtime::test_support::human_input(&second, &child_task.user_task_id, &child_command)).unwrap();
+        at_ms + 1, runtime::test_support::human_input(&second, &child_task.user_task_id, &child_command), None).unwrap();
     let continued = repository::complete_user_task(&fixture.db, &fixture.owner, &child_command,
         &waiting.instance_id, &child_task.user_task_id, second.instance.revision, &json!({}), None,
-        &child_plan, at_ms + 1).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&child_plan), at_ms + 1).unwrap().instance;
     assert_eq!(continued.status, ProcessInstanceStatus::Incident);
     assert!(continued.incidents.iter().any(|incident| incident == &peer_incident));
     assert_eq!(continued.variables["mapped_result"], 41);
@@ -1704,10 +1706,10 @@ fn embedded_terminate_closes_a_real_open_fork_without_a_join_receipt() {
     let command = stamp("complete one real branch and terminate its scope");
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&before, &terminating.user_task_id, &json!({}), None,
-        at_ms, runtime::test_support::human_input(&before, &terminating.user_task_id, &command)).unwrap();
+        at_ms, runtime::test_support::human_input(&before, &terminating.user_task_id, &command), None).unwrap();
     let completed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &waiting.instance_id, &terminating.user_task_id, waiting.revision, &json!({}), None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id)
         .unwrap();
@@ -1749,10 +1751,10 @@ fn embedded_terminate_return_failure_parks_only_real_human_timer_or_message_inpu
                 let at_ms = chrono::Utc::now().timestamp_millis();
                 let outputs = json!({"accepted":"human"});
                 let plan = runtime::plan_user_completion(&before, &task.user_task_id, &outputs, None, at_ms,
-                    runtime::test_support::human_input(&before, &task.user_task_id, &command)).unwrap();
+                    runtime::test_support::human_input(&before, &task.user_task_id, &command), None).unwrap();
                 assert!(matches!(&plan.termination_attempts[0], repository::TerminationAttempt::ReturnFailure(_)));
                 repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-                    &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, &plan, at_ms).unwrap();
+                    &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
             }
             "timer" => {
                 let due = before.timers.iter().find(|timer| timer.node_id == "ChildInput")
@@ -1845,7 +1847,7 @@ fn embedded_termination_rejects_forged_source_prefix_and_closure_without_any_row
     let outputs = json!({"decision":"accepted"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let repository::TerminationAttempt::Success(source) = &plan.termination_attempts[0] else {
         panic!("actual human completion must produce a successful local terminal source");
     };
@@ -1890,13 +1892,13 @@ fn embedded_termination_rejects_forged_source_prefix_and_closure_without_any_row
     ] {
         let error = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &forged, at_ms);
+            repository::ProcessPlanInput::Supplied(&forged), at_ms);
         assert!(error.is_err(), "{case} must be rejected before commit");
         assert_eq!(super::call_tests::transition_rows(&fixture), before, "{case} changed persisted rows");
     }
     let accepted = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(accepted.instance.status, ProcessInstanceStatus::Completed);
     assert_eq!(accepted.instance.variables["mapped_result"], 41);
 }
@@ -1915,7 +1917,7 @@ fn embedded_termination_return_failure_rejects_false_mapping_proof_and_keeps_all
     let outputs = json!({"decision":"accepted"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert!(matches!(&plan.termination_attempts[0], repository::TerminationAttempt::ReturnFailure(_)));
     let mut wrong_pretext = plan.clone();
     let repository::TerminationAttempt::ReturnFailure(failure) = &mut wrong_pretext.termination_attempts[0] else { unreachable!() };
@@ -1934,12 +1936,12 @@ fn embedded_termination_return_failure_rejects_false_mapping_proof_and_keeps_all
     ] {
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &forged, at_ms).is_err(), "{case} must fail closed");
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must fail closed");
         assert_eq!(super::call_tests::transition_rows(&fixture), before, "{case} changed persisted rows");
     }
     let accepted = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(accepted.instance.status, ProcessInstanceStatus::Incident);
     assert!(accepted.instance.incidents.iter().any(|incident| incident.code == "SCOPE_RETURN_ERROR"
         && !incident.can_retry && incident.job_id.is_none()));
@@ -1987,7 +1989,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-        at_ms, runtime::test_support::manual_input(&command)).unwrap();
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
         repository::TerminationAttempt::Success(source) => Some(source),
         repository::TerminationAttempt::ReturnFailure(_) => None,
@@ -1997,7 +1999,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     assert_ne!(sources[0].parent_token_id, sources[1].parent_token_id);
     assert_ne!(sources[0].source_event_id, sources[1].source_event_id);
     let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables, json!({
         "parent_marker":"kept","parent_a":11,"parent_b":22,
@@ -2020,7 +2022,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     assert_eq!(persisted.scopes, completed.scopes);
     let rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), rows);
 }
@@ -2054,7 +2056,7 @@ fn child_termination_then_root_termination_in_one_start_retains_both_factual_sou
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-        at_ms, runtime::test_support::manual_input(&command)).unwrap();
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
         repository::TerminationAttempt::Success(source) => Some(source),
         repository::TerminationAttempt::ReturnFailure(_) => None,
@@ -2064,7 +2066,7 @@ fn child_termination_then_root_termination_in_one_start_retains_both_factual_sou
     assert_eq!(sources[1].source_scope_id, instance_id);
     assert_ne!(sources[0].source_event_id, sources[1].source_event_id);
     let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables, json!({"parent_marker":"kept","received":41}));
     let child = completed.scopes.iter().find(|scope| scope.subprocess_node_id.as_deref() == Some("Scope"))
@@ -2187,7 +2189,7 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
     let outputs = json!({"decision":"accepted"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&before, &terminating_task.user_task_id, &outputs, None,
-        at_ms, runtime::test_support::human_input(&before, &terminating_task.user_task_id, &command))
+        at_ms, runtime::test_support::human_input(&before, &terminating_task.user_task_id, &command), None)
         .unwrap();
     assert_eq!(plan.cancel_scope_roots, vec![terminating_scope.scope_id.clone()]);
     let source = match &plan.termination_attempts[0] {
@@ -2242,7 +2244,7 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
         ("historical sibling message queue", duplicate_message)] {
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &terminating_task.user_task_id, waiting.revision, &outputs,
-            None, &forged, at_ms).is_err(), "{case} must fail closed");
+            None, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must fail closed");
         assert_eq!(super::call_tests::transition_rows(&fixture), before_rows,
             "{case} changed one of the 14 durable process tables");
     }
@@ -2258,7 +2260,7 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
         &message_id).unwrap().message.status, ProcessMessageStatus::Pending);
     let committed = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &terminating_task.user_task_id, waiting.revision, &outputs,
-        None, &plan, at_ms).unwrap().instance;
+        None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(committed.status, ProcessInstanceStatus::Waiting);
     assert_eq!(committed.variables["mapped_result"], 41);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &waiting.instance_id)
@@ -2286,7 +2288,7 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
     let committed_rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &terminating_task.user_task_id, waiting.revision, &outputs,
-        None, &plan, at_ms).unwrap().instance;
+        None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(replay, committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -2337,13 +2339,13 @@ fn waiting_human_activation_cannot_be_recast_as_ready_termination_input() {
     let waiting_token_id = task.token_id.as_ref().unwrap();
     assert!(snapshot.tokens.iter().any(|token| token.token_id == *waiting_token_id
         && token.status == "waiting"));
-    assert!(runtime::plan_advance(&snapshot, chrono::Utc::now().timestamp_millis()).unwrap()
+    assert!(runtime::plan_advance(&snapshot, chrono::Utc::now().timestamp_millis(), None).unwrap()
         .termination_attempts.is_empty());
     let command = stamp("complete the actual human activation after rejected ready bypass");
     let outputs = json!({"decision":"accepted"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 2);
     assert!(plan.termination_attempts.iter().all(|attempt| matches!(attempt,
         repository::TerminationAttempt::Success(source)
@@ -2361,21 +2363,21 @@ fn waiting_human_activation_cannot_be_recast_as_ready_termination_input() {
     let before = super::call_tests::transition_rows(&fixture);
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-        &forged, at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     assert_eq!(repository::get_instance(&reopened, &fixture.owner, &waiting.instance_id, None)
         .unwrap().status, ProcessInstanceStatus::Waiting);
     let completed = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["parent_a"], 11);
     assert_eq!(completed.variables["parent_b"], 22);
     let committed_rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -2413,7 +2415,7 @@ fn terminating_xor_cannot_select_the_false_or_unselected_default_edge() {
         let outputs = json!({});
         let at_ms = chrono::Utc::now().timestamp_millis();
         let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None,
-            at_ms, runtime::test_support::human_input(&snapshot, &task.user_task_id, &command))
+            at_ms, runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None)
             .unwrap();
         assert_eq!(plan.termination_attempts.len(), 1);
         let selected = if take_true { "ChoiceTrue" } else { "ChoiceDefault" };
@@ -2452,18 +2454,18 @@ fn terminating_xor_cannot_select_the_false_or_unselected_default_edge() {
         let before = super::call_tests::transition_rows(&fixture);
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &extra_wait, at_ms).is_err(), "the selected XOR cannot create a same-node wait");
+            repository::ProcessPlanInput::Supplied(&extra_wait), at_ms).is_err(), "the selected XOR cannot create a same-node wait");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
         let error = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &forged, at_ms).unwrap_err();
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).unwrap_err();
         assert!(format!("{error:#}").contains("exclusive choice differs from pinned source-time CEL/default"),
             "unselected edge {forged_edge} was rejected for another reason: {error:#}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let committed = repository::complete_user_task(&reopened, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &plan, at_ms).unwrap().instance;
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         assert_eq!(committed.status, ProcessInstanceStatus::Completed);
         let history = repository::list_events(&reopened, &fixture.owner, &waiting.instance_id,
             0, 200).unwrap().0;
@@ -2474,7 +2476,7 @@ fn terminating_xor_cannot_select_the_false_or_unselected_default_edge() {
         let committed_rows = super::call_tests::transition_rows(&fixture);
         let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, snapshot.instance.revision, &outputs, None,
-            &plan, at_ms).unwrap().instance;
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         assert_eq!(replay, committed);
         assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
     }
@@ -2556,7 +2558,7 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
     let outputs = json!({});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &root_task.user_task_id, &outputs, None,
-        at_ms, runtime::test_support::human_input(&snapshot, &root_task.user_task_id, &command))
+        at_ms, runtime::test_support::human_input(&snapshot, &root_task.user_task_id, &command), None)
         .unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
     assert!(matches!(&plan.termination_attempts[0], repository::TerminationAttempt::Success(_)));
@@ -2604,7 +2606,7 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
     ] {
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &root_task.user_task_id, waiting.revision, &outputs, None,
-            &forged, at_ms).is_err(), "{case} must fail closed");
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must fail closed");
         assert_eq!(super::call_tests::transition_rows(&fixture), before,
             "{case} changed durable process rows");
     }
@@ -2612,7 +2614,7 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     let completed = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &root_task.user_task_id, waiting.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &waiting.instance_id)
         .unwrap();
@@ -2640,7 +2642,7 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
     let committed_rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &root_task.user_task_id, waiting.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -2732,7 +2734,7 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-        at_ms, runtime::test_support::manual_input(&command)).unwrap();
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let timer = plan.create_timers.iter().find(|timer| timer.node_id == "ChildTimer").unwrap();
     let race = plan.create_event_races.iter().find(|race| race.gateway_node_id == "ChildRace").unwrap();
     assert_eq!(timer.race_id.as_deref(), Some(race.race_id.as_str()));
@@ -2761,14 +2763,14 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
         ("foreign activation cancellation", foreign_cancel),
     ] {
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, &forged,
+            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).is_err(), "{case} must reject the whole start");
         assert_eq!(super::call_tests::transition_rows(&fixture), before,
             "{case} changed durable process rows");
     }
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let committed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
@@ -2783,7 +2785,7 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
         && event.data["source_event_id"] == source.event_id).count(), 1);
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap(), committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -2853,7 +2855,7 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
     let outputs = json!({"accepted":"work"});
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None,
-        at_ms, runtime::test_support::human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        at_ms, runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 2);
     let timer_events = plan.events.iter().enumerate().filter(|(_,event)|
         event.kind == "timer_cancelled" && event.data["timer_id"] == timer.timer_id)
@@ -3012,7 +3014,7 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
     ] {
         let rejected = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None,
-            &forged, at_ms).unwrap_err();
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).unwrap_err();
         if case == "completion after both factual termination sources" {
             assert!(format!("{rejected:#}").contains(
                 "termination history has an unlinked or duplicate effect fact"),
@@ -3024,7 +3026,7 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let completed = repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance;
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables["mapped_result"], 41);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &waiting.instance_id).unwrap();
@@ -3053,7 +3055,7 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::complete_user_task(&reopened, &fixture.owner, &command,
         &waiting.instance_id, &task.user_task_id, waiting.revision, &outputs, None,
-        &plan, at_ms).unwrap().instance, completed);
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
 
@@ -3221,7 +3223,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-        at_ms, runtime::test_support::manual_input(&command)).unwrap();
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
     assert_eq!(plan.create_timers.len(), 3);
     assert_eq!(plan.create_subscriptions.len(), 3);
@@ -3251,14 +3253,14 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         ("foreign activation cancellation", foreign_cancel),
     ] {
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, &forged,
+            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).is_err(), "{case} must reject the entire source plan");
         assert_eq!(super::call_tests::transition_rows(&fixture), before,
             "{case} changed durable process rows");
     }
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let committed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
@@ -3287,7 +3289,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         0, 10).unwrap().0.is_empty());
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap(), committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -3331,7 +3333,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-        at_ms, runtime::test_support::manual_input(&command)).unwrap();
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
     let selected_index = plan.events.iter().position(|event|
         event.kind == "exclusive_selected" && event.node_id.as_deref() == Some("Choice")).unwrap();
@@ -3367,7 +3369,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert_eq!(forged.events.len(), plan.events.len());
     let before = super::call_tests::transition_rows(&fixture);
     let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &forged, at_ms)
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged), at_ms)
         .unwrap_err();
     assert!(format!("{error:#}").contains(
         "termination XOR has a selected pinned flow, not a failure wait"),
@@ -3375,7 +3377,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let completed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     let events = repository::list_events(&reopened, &fixture.owner, &instance_id, 0, 200).unwrap().0;
     assert_eq!(events.iter().filter(|event| event.kind == "exclusive_selected"
@@ -3384,7 +3386,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert!(events.iter().all(|event| event.kind != "incident"));
     let committed_rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan, at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 
@@ -3418,12 +3420,12 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let fault_plan = runtime::plan_start(&fault_version.model, &fault_instance_id,
         &fault_fixture.owner, &fault_version.definition_id, fault_version.version,
         fault_variables.clone(), StartCause::Manual, fault_at_ms,
-        runtime::test_support::manual_input(&fault_command)).unwrap();
+        runtime::test_support::manual_input(&fault_command), None).unwrap();
     assert!(fault_plan.termination_attempts.is_empty());
     assert!(fault_plan.add_incidents.is_empty());
     let fault_started = repository::start_instance(&fault_fixture.db, &fault_fixture.owner,
         &fault_command, &fault_instance_id, &fault_version.definition_id, fault_version.version,
-        &fault_variables, &fault_plan, fault_at_ms).unwrap();
+        &fault_variables, repository::ProcessPlanInput::Supplied(&fault_plan), fault_at_ms).unwrap();
     assert_eq!(fault_started.status, ProcessInstanceStatus::Waiting);
     let fault_reopened = crate::db::init(&fault_fixture.directory.path().join("processes.db")).unwrap();
     let start_snapshot = repository::runtime_snapshot(&fault_reopened, &fault_fixture.owner,
@@ -3438,7 +3440,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let fault_gate_plan = runtime::plan_user_completion(&start_snapshot, &fault_gate.user_task_id,
         &fault_gate_outputs, None, fault_gate_at_ms,
         runtime::test_support::human_input(&start_snapshot, &fault_gate.user_task_id,
-            &fault_gate_command)).unwrap();
+            &fault_gate_command), None).unwrap();
     assert!(fault_gate_plan.termination_attempts.is_empty());
     assert!(fault_gate_plan.events.iter().any(|event| event.kind == "incident"
         && event.node_id.as_deref() == Some("Choice")
@@ -3452,7 +3454,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert!(!fault_gate_plan.resolve_incident_ids.contains(&fault_gate_plan.add_incidents[0].incident_id));
     let fault_incident = repository::complete_user_task(&fault_reopened, &fault_fixture.owner,
         &fault_gate_command, &fault_instance_id, &fault_gate.user_task_id,
-        start_snapshot.instance.revision, &fault_gate_outputs, None, &fault_gate_plan,
+        start_snapshot.instance.revision, &fault_gate_outputs, None, repository::ProcessPlanInput::Supplied(&fault_gate_plan),
         fault_gate_at_ms).unwrap().instance;
     assert_eq!(fault_incident.status, ProcessInstanceStatus::Incident);
     let persisted_wait_status: String = fault_reopened.read().unwrap().query_row(
@@ -3474,13 +3476,13 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let completion_plan = runtime::plan_user_completion(&fault_snapshot, &human.user_task_id,
         &completion_outputs, None, completion_at_ms,
         runtime::test_support::human_input(&fault_snapshot, &human.user_task_id,
-            &completion_command)).unwrap();
+            &completion_command), None).unwrap();
     assert_eq!(completion_plan.termination_attempts.len(), 1);
     assert!(completion_plan.cancel_token_ids.contains(&factual_wait.token_id));
     assert!(completion_plan.resolve_incident_ids.contains(&fault_gate_plan.add_incidents[0].incident_id));
     let fault_completed = repository::complete_user_task(&fault_reopened, &fault_fixture.owner,
         &completion_command, &fault_instance_id, &human.user_task_id,
-        fault_snapshot.instance.revision, &completion_outputs, None, &completion_plan,
+        fault_snapshot.instance.revision, &completion_outputs, None, repository::ProcessPlanInput::Supplied(&completion_plan),
         completion_at_ms).unwrap().instance;
     assert_eq!(fault_completed.status, ProcessInstanceStatus::Completed);
     let cancelled_wait_status: String = fault_reopened.read().unwrap().query_row(
@@ -3502,13 +3504,13 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let fault_rows = super::call_tests::transition_rows(&fault_fixture);
     let fault_gate_replay = repository::complete_user_task(&fault_reopened, &fault_fixture.owner,
         &fault_gate_command, &fault_instance_id, &fault_gate.user_task_id,
-        start_snapshot.instance.revision, &fault_gate_outputs, None, &fault_gate_plan,
+        start_snapshot.instance.revision, &fault_gate_outputs, None, repository::ProcessPlanInput::Supplied(&fault_gate_plan),
         fault_gate_at_ms).unwrap().instance;
     assert_eq!(fault_gate_replay.status, ProcessInstanceStatus::Completed);
     assert_eq!(super::call_tests::transition_rows(&fault_fixture), fault_rows);
     let fault_replay = repository::complete_user_task(&fault_reopened, &fault_fixture.owner,
         &completion_command, &fault_instance_id, &human.user_task_id,
-        fault_snapshot.instance.revision, &completion_outputs, None, &completion_plan,
+        fault_snapshot.instance.revision, &completion_outputs, None, repository::ProcessPlanInput::Supplied(&completion_plan),
         completion_at_ms).unwrap().instance;
     assert_eq!(fault_replay, fault_completed);
     assert_eq!(super::call_tests::transition_rows(&fault_fixture), fault_rows);

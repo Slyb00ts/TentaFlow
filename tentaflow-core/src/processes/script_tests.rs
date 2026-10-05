@@ -40,7 +40,7 @@ fn plan_and_start(
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     (command, instance_id, plan, variables, version, at_ms)
 }
 
@@ -53,7 +53,7 @@ fn script_success_maps_one_json_result_and_reopens_without_reexecution() {
     let fact = plan.events.iter().find(|event| event.kind == "script_completed").unwrap();
     assert_eq!(fact.data, json!({"outputs":{"value":5}}));
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     assert_eq!(committed.variables["answer"], 5);
@@ -61,7 +61,7 @@ fn script_success_maps_one_json_result_and_reopens_without_reexecution() {
     assert_eq!(persisted.variables, committed.variables);
     let before_replay = transition_rows(&fixture);
     let replay = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(replay.instance_id, instance_id);
     assert_eq!(transition_rows(&fixture), before_replay);
@@ -77,7 +77,7 @@ fn script_array_result_without_mapping_preserves_parent_variables() {
     assert!(!plan.variable_effects.iter().any(|effect| matches!(effect,
         repository::VariableEffect::Mapped { node_id, .. } if node_id == "Compute")));
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.variables, variables);
 }
@@ -98,7 +98,7 @@ fn script_body_and_mapping_failures_park_exactly_one_activation() {
         assert!(plan.create_tokens.iter().any(|token|
             token.node_id == "Compute" && token.status == "waiting"));
         let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, &plan,
+            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
             at_ms).unwrap();
         assert_eq!(committed.status, ProcessInstanceStatus::Incident);
         let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
@@ -121,7 +121,7 @@ fn script_mapping_rejects_a_cumulative_local_overrun_without_partial_write() {
     assert_eq!(plan.variables, variables);
     assert!(!plan.events.iter().any(|event| event.kind == "script_completed"));
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.variables, variables);
 }
@@ -135,7 +135,7 @@ fn script_mapping_then_terminate_retains_both_source_facts() {
     assert_eq!(plan.events.iter().filter(|event| event.kind == "script_completed").count(), 1);
     assert_eq!(plan.events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     assert_eq!(committed.variables["answer"], 5);
@@ -256,12 +256,12 @@ async fn approved_service_verification_runs_script_from_the_retained_result() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&waiting, &task.user_task_id,
         &Value::Null, Some(true), at_ms,
-        human_input(&waiting, &task.user_task_id, &command)).unwrap();
+        human_input(&waiting, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event|
         event.kind == "script_completed").count(), 1);
     let committed = repository::complete_user_task(&fixture.db, &fixture.owner,
         &command, &started.instance_id, &task.user_task_id,
-        waiting.instance.revision, &Value::Null, Some(true), &plan, at_ms).unwrap().instance;
+        waiting.instance.revision, &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     assert_eq!(committed.variables["script_answer"], "verified script");
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
@@ -297,11 +297,11 @@ fn script_result_selects_the_pinned_xor_edge_and_rejects_a_forged_choice() {
     choice.data["sequence_flow_id"] = json!("Fallback");
     let before = transition_rows(&fixture);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &forged,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
         at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     assert_eq!(committed.variables["answer"], 5);
@@ -325,11 +325,11 @@ fn embedded_script_maps_child_result_once_and_reopens() {
     script_fact.scope_id = instance_id.clone();
     let before = transition_rows(&fixture);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &forged,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
         at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let committed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, &plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.variables["answer"], 5);
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
@@ -364,11 +364,11 @@ fn script_output_selects_an_inclusive_branch_before_its_factual_join() {
     split.data["selected_branch_edge_ids"] = json!(["ToB"]);
     let before = transition_rows(&fixture);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables, &forged,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
         at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let started = repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables, &start_plan,
+        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&start_plan),
         at_ms).unwrap();
     assert_eq!(started.status, ProcessInstanceStatus::Waiting);
     let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
@@ -380,10 +380,10 @@ fn script_output_selects_an_inclusive_branch_before_its_factual_join() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None,
         at_ms,
-        human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let committed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &plan, at_ms).unwrap();
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
     let history = repository::list_events(&fixture.db, &fixture.owner,
         &started.instance_id, 0, 200).unwrap().0;
@@ -413,7 +413,7 @@ fn script_after_multi_instance_uses_the_accepted_aggregate() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None,
         at_ms,
-        human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "script_completed").count(), 1);
     let mut forged = plan.clone();
     let script = forged.events.iter_mut().find(|event| event.kind == "script_completed").unwrap();
@@ -421,11 +421,11 @@ fn script_after_multi_instance_uses_the_accepted_aggregate() {
     let before = transition_rows(&fixture);
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &forged, at_ms).is_err());
+        &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let committed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, snapshot.instance.revision,
-        &outputs, None, &plan, at_ms).unwrap();
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
     assert_eq!(committed.instance.variables["answer"], 1);
     assert_eq!(repository::get_instance(&fixture.db, &fixture.owner,

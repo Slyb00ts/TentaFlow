@@ -20,6 +20,7 @@ use super::model::{gateway_pairs, validate_variables, GatewayKind, MAX_VARIABLE_
 use super::repository::{
     AcceptedInputRef, StartInputRef, TerminationAttempt, TerminationSource, TerminationReturnFailure,
     GatewayReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
+    PlannedSignal,
     ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
     RepetitionCapacitySource, RepetitionDeniedBytes, RepetitionGroup, RepetitionOccurrence,
     ScopeUpdate, VariableEffect,
@@ -42,6 +43,41 @@ pub fn validate_output(value: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAdmissionDecision {
+    Admit,
+    DenyRecipients,
+    DenyPending,
+}
+
+pub type SignalAdmissionResolver<'a> = dyn Fn(
+    &RuntimePlan,
+    &PlannedSignal,
+    Option<&AcceptedInputRef>,
+) -> Result<SignalAdmissionDecision> + 'a;
+
+#[derive(Debug)]
+pub(super) struct SignalAdmissionQueryFailed;
+
+impl std::fmt::Display for SignalAdmissionQueryFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Signal admission query failed")
+    }
+}
+
+impl std::error::Error for SignalAdmissionQueryFailed {}
+
+#[derive(Debug)]
+pub(super) struct CallReturnMappingRejected;
+
+impl std::fmt::Display for CallReturnMappingRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("called process return mapping rejected")
+    }
+}
+
+impl std::error::Error for CallReturnMappingRejected {}
 
 pub(super) fn evaluate(
     expression: &str,
@@ -218,6 +254,7 @@ struct Transition<'a> {
     accepted_repetition_task: Option<(String, Value)>,
     escalation_continuation: bool,
     accepted_input: Option<AcceptedInputRef>,
+    signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
     token_inputs: HashMap<String, AcceptedInputRef>,
     expected_instance_revision: u64,
     plan: RuntimePlan,
@@ -233,6 +270,7 @@ impl<'a> Transition<'a> {
         version: u32,
         variables: Value,
         now_ms: i64,
+        signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
     ) -> Result<Self> {
         validate_variables(&variables)?;
         Ok(Self {
@@ -278,13 +316,18 @@ impl<'a> Transition<'a> {
             accepted_repetition_task: None,
             escalation_continuation: false,
             accepted_input: None,
+            signal_admission,
             token_inputs: HashMap::new(),
             expected_instance_revision: 1,
             plan: RuntimePlan::initial(variables),
         })
     }
 
-    fn from_snapshot(snapshot: &'a RuntimeSnapshot, now_ms: i64) -> Result<Self> {
+    fn from_snapshot(
+        snapshot: &'a RuntimeSnapshot,
+        now_ms: i64,
+        signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
+    ) -> Result<Self> {
         let mut transition = Self::new(
             &snapshot.model,
             &snapshot.instance.instance_id,
@@ -294,6 +337,7 @@ impl<'a> Transition<'a> {
             snapshot.instance.version,
             snapshot.instance.variables.clone(),
             now_ms,
+            signal_admission,
         )?;
         transition.tokens = snapshot.tokens.clone();
         transition.scopes = snapshot.scopes.clone();
@@ -2104,6 +2148,14 @@ impl<'a> Transition<'a> {
                     None,
                     None,
                 ),
+                ProcessNodeKind::SignalCatch { .. } => (
+                    K::SignalCatch,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
                 ProcessNodeKind::BoundaryMessage {
                     attached_to_id,
                     message_ref,
@@ -2175,6 +2227,10 @@ impl<'a> Transition<'a> {
                     .context("boundary escalation declaration missing")
             })
             .transpose()?;
+        let signal = if let ProcessNodeKind::SignalCatch { signal_ref, .. } = &node.kind {
+            Some(self.model.signals.iter().find(|signal| &signal.signal_id == signal_ref)
+                .context("signal catch declaration is missing")?)
+        } else { None };
         let effective = self.effective()?;
         let predicate = correlation
             .map(|expression| super::messages::evaluate_key(expression, &effective))
@@ -2202,6 +2258,8 @@ impl<'a> Transition<'a> {
             error_code: code,
             escalation_code,
             race_id,
+            signal_namespace_uri: signal.map(|declaration| declaration.namespace_uri.clone()),
+            signal_declaration_id: signal.map(|declaration| declaration.signal_id.clone()),
             revision: 1,
             status: status.clone(),
             last_reason: reason.clone(),
@@ -2225,6 +2283,11 @@ impl<'a> Transition<'a> {
                 .incident_id
                 .clone();
             self.event("message_error",Some(node.id.clone()),json!({"subscription_id":s.subscription_id,"attached_token_id":token_id,"incident_id":incident_id,"reason":reason}));
+        } else if kind == K::SignalCatch {
+            self.event("signal_catch_opened", Some(node.id.clone()), json!({
+                "subscription_id":s.subscription_id,"attached_token_id":token_id,
+                "signal_namespace_uri":s.signal_namespace_uri,"signal_declaration_id":s.signal_declaration_id,
+            }));
         } else if kind == K::BoundaryEscalation {
             let ProcessNodeKind::BoundaryEscalation {
                 cancel_activity, ..
@@ -2445,6 +2508,70 @@ impl<'a> Transition<'a> {
         for edge in self.outgoing(&node.id) {
             self.follow(token, &edge)?;
         }
+        Ok(())
+    }
+
+    fn throw_signal(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        let ProcessNodeKind::SignalThrow { signal_ref, payload_expression, ttl_seconds } = &node.kind else {
+            anyhow::bail!("signal-producing node required")
+        };
+        let declaration = self.model.signals.iter().find(|signal| &signal.signal_id == signal_ref)
+            .context("signal throw declaration is missing")?;
+        ensure!((1..=604800).contains(ttl_seconds), "signal TTL must be 1..604800 seconds");
+        let payload = match evaluate(payload_expression, &self.effective()?, &Value::Null, &[]) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.wait(token, "waiting");
+                self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
+                self.incident(&node.id, None, "SIGNAL_PAYLOAD_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                return Ok(());
+            }
+        };
+        if let Err(error) = validate_output(&payload) {
+            self.wait(token, "waiting");
+            self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
+            self.incident(&node.id, None, "SIGNAL_PAYLOAD_LIMIT",
+                super::repository::bounded_failure_message(&error.to_string()));
+            return Ok(());
+        }
+        let signal_id = Uuid::new_v4().to_string();
+        let event_index = self.plan.events.len();
+        let planned = PlannedSignal {
+            signal_id, signal_namespace_uri: declaration.namespace_uri.clone(),
+            signal_declaration_id: declaration.signal_id.clone(), payload,
+            ttl_seconds: *ttl_seconds, source_scope_id: self.current_scope.clone(),
+            source_node_id: node.id.clone(), source_activation_id: token.token_id.clone(),
+            source_event_index: event_index,
+        };
+        let decision = match self.signal_admission.as_ref() {
+            Some(resolve) => resolve(&self.plan, &planned, self.accepted_input.as_ref())
+                .map_err(|error| error.context(SignalAdmissionQueryFailed))?,
+            None => SignalAdmissionDecision::Admit,
+        };
+        if decision != SignalAdmissionDecision::Admit {
+            self.wait(token, "waiting");
+            self.plan.event_sources.insert(event_index, token.token_id.clone());
+            let (code, message) = match decision {
+                SignalAdmissionDecision::DenyRecipients => (
+                    "SIGNAL_RECIPIENT_LIMIT", "Signal has more than 64 authorized live recipients"),
+                SignalAdmissionDecision::DenyPending => (
+                    "SIGNAL_PENDING_LIMIT", "Signal shared pending capacity is exhausted"),
+                SignalAdmissionDecision::Admit => unreachable!(),
+            };
+            self.incident(&node.id, None, code, message.into());
+            return Ok(());
+        }
+        self.plan.event_sources.insert(event_index, token.token_id.clone());
+        self.plan.event_ids.insert(event_index, Uuid::new_v4().to_string());
+        self.event("signal_admitted", Some(node.id.clone()), json!({
+            "signal_id":planned.signal_id,"source_activation_id":token.token_id,
+            "signal_namespace_uri":declaration.namespace_uri,
+            "signal_declaration_id":declaration.signal_id,
+        }));
+        self.plan.create_signals.push(planned);
+        self.consume(&token.token_id);
+        for edge in self.outgoing(&node.id) { self.follow(token, &edge)?; }
         Ok(())
     }
 
@@ -2723,7 +2850,8 @@ impl<'a> Transition<'a> {
                     let token_id = self.wait(&token, "waiting");
                     self.arm_timer(&node, &token_id, ProcessTimerKind::Catch, &timer)?;
                 }
-                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. } => {
+                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::SignalCatch { .. } => {
                     let waiting = self.wait(&token, "waiting");
                     self.arm_subscription(&node, &waiting, None)?;
                 }
@@ -2740,6 +2868,9 @@ impl<'a> Transition<'a> {
                             super::repository::bounded_failure_message(&error.to_string()),
                         );
                     }
+                }
+                ProcessNodeKind::SignalThrow { .. } => {
+                    self.throw_signal(&node, &token)?;
                 }
                 ProcessNodeKind::ScriptTask { script, output_mapping } => {
                     let source_variables = self.effective()?;
@@ -3453,7 +3584,7 @@ pub(super) fn plan_call_incident(
     message: &str,
     now_ms: i64,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
     transition.current_scope = scope_id.to_owned();
     transition.node(call_node_id)?;
     transition.incident(
@@ -3471,8 +3602,9 @@ pub(super) fn plan_call_return(
     outputs: &Value,
     now_ms: i64,
     expected_child_revision: u64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(AcceptedInputRef::CallReturn {
         call_id: call.call_id.clone(),
         child_instance_id: call.child_instance_id.clone(),
@@ -3495,7 +3627,8 @@ pub(super) fn plan_call_return(
     let ProcessNodeKind::CallActivity { output_mapping, .. } = &node.kind else {
         anyhow::bail!("call return node is not CallActivity")
     };
-    transition.map_outputs(&node.id, &token.token_id, output_mapping, outputs, &[])?;
+    transition.map_outputs(&node.id, &token.token_id, output_mapping, outputs, &[])
+        .map_err(|error| error.context(CallReturnMappingRejected))?;
     transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
     transition.resolve_boundary_incidents(&token.token_id);
     transition.consume(&token.token_id);
@@ -3513,8 +3646,9 @@ pub(super) fn plan_call_error(
     source: &super::repository::BusinessErrorSource,
     now_ms: i64,
     expected_child_revision: u64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<Option<RuntimePlan>> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(AcceptedInputRef::CallReturn {
         call_id: call.call_id.clone(),
         child_instance_id: call.child_instance_id.clone(),
@@ -3610,6 +3744,7 @@ pub fn plan_start(
     cause: StartCause,
     now_ms: i64,
     start_input: StartInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     let source_matches = match (&cause, &start_input) {
         (StartCause::Manual, StartInputRef::Manual { .. } | StartInputRef::CallStart { .. }) => true,
@@ -3629,6 +3764,7 @@ pub fn plan_start(
         version,
         variables,
         now_ms,
+        signal_admission,
     )?;
     transition.accepted_input = Some(AcceptedInputRef::Start {
         instance_id: instance_id.to_owned(),
@@ -3689,8 +3825,9 @@ pub fn plan_start(
     transition.finish()
 }
 
-pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.advance()?;
     transition.finish()
 }
@@ -3701,11 +3838,12 @@ pub fn plan_manual_acknowledgment(
     actor_user_id: &str,
     now_ms: i64,
     accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     ensure!(matches!(&accepted_input,
         AcceptedInputRef::ManualAcknowledgment { task_id: selected, .. } if selected == task_id),
         "manual acknowledgment input differs from its task");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(accepted_input);
     let task = snapshot.user_tasks.iter().find(|task|
         task.user_task_id == task_id && task.status == ProcessUserTaskStatus::Open
@@ -3745,11 +3883,12 @@ pub fn plan_user_completion(
     approved: Option<bool>,
     now_ms: i64,
     accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     validate_output(outputs)?;
     ensure!(matches!(&accepted_input, AcceptedInputRef::Human { task_id: selected, .. } if selected == task_id),
         "human completion input differs from its task");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(accepted_input);
     let task = snapshot
         .user_tasks
@@ -3894,10 +4033,11 @@ pub fn plan_job_result(
     job: &ProcessJob,
     observed: &super::repository::ObservedActivityResult,
     now_ms: i64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     let result = &observed.result;
     validate_output(&result.outputs)?;
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(AcceptedInputRef::Service {
         job_id: job.job_id.clone(), attempt: job.attempt, fence: job.fence,
         result_event_id: Uuid::new_v4().to_string(),
@@ -4301,7 +4441,7 @@ pub(super) fn plan_retained_escalation_incident(
             && observed.result.outcome == ActivityOutcome::NeedsHuman,
         "retained escalation incident requires an accepted Contract NeedsHuman result"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
     transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
     ensure!(
@@ -4339,8 +4479,9 @@ pub(super) fn plan_message_catch(
     metadata: Value,
     now_ms: i64,
     accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();
@@ -4389,11 +4530,86 @@ pub(super) fn plan_message_catch(
     transition.finish()
 }
 
+pub(super) fn plan_signal_catch(
+    snapshot: &RuntimeSnapshot,
+    subscription: &super::repository::EventSubscription,
+    payload: &Value,
+    signal_id: &str,
+    source_event_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+) -> Result<RuntimePlan> {
+    ensure!(subscription.kind == tentaflow_protocol::processes::ProcessSubscriptionKind::SignalCatch,
+        "signal receipt requires its exact SignalCatch subscription");
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    transition.accepted_input = Some(accepted_input);
+    transition.current_scope = subscription.scope_id.clone();
+    let node = transition.node(&subscription.node_id)?.clone();
+    let ProcessNodeKind::SignalCatch { output_mapping, .. } = &node.kind else {
+        anyhow::bail!("signal receipt target is not a pinned SignalCatch")
+    };
+    let token = transition.tokens.iter().find(|token|
+        token.token_id == subscription.token_id && token.scope_id == subscription.scope_id
+            && token.node_id == node.id && token.status == "waiting")
+        .context("signal subscription activation is closed")?.clone();
+    let metadata = json!({"signal_id":signal_id,
+        "signal_namespace_uri":subscription.signal_namespace_uri,
+        "signal_declaration_id":subscription.signal_declaration_id,
+        "source_event_id":source_event_id});
+    if let Err(error) = transition.map_outputs(&node.id, &token.token_id,
+        output_mapping, payload, &[("signal".into(), metadata)]) {
+        transition.settle_subscription(subscription,
+            tentaflow_protocol::processes::ProcessSubscriptionStatus::Error,
+            Some("recipient_mapping_failed"));
+        transition.incident(&node.id, None, "SIGNAL_MAPPING_FAILED",
+            super::repository::bounded_failure_message(&error.to_string()));
+        return transition.finish();
+    }
+    transition.settle_subscription(subscription,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed, None);
+    transition.consume(&token.token_id);
+    transition.event("signal_received", Some(node.id.clone()), json!({
+        "signal_id":signal_id,"subscription_id":subscription.subscription_id,
+        "attached_token_id":subscription.token_id,"source_event_id":source_event_id}));
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    transition.finish()
+}
+
+pub(super) fn plan_signal_delivery_failure(
+    snapshot: &RuntimeSnapshot,
+    subscription: &super::repository::EventSubscription,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+) -> Result<RuntimePlan> {
+    ensure!(subscription.kind == tentaflow_protocol::processes::ProcessSubscriptionKind::SignalCatch,
+        "signal failure requires its exact SignalCatch subscription");
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
+    transition.accepted_input = Some(accepted_input);
+    transition.current_scope = subscription.scope_id.clone();
+    ensure!(transition.tokens.iter().any(|token|
+        token.token_id == subscription.token_id
+            && token.scope_id == subscription.scope_id
+            && token.node_id == subscription.node_id
+            && token.status == "waiting"),
+        "signal failure target is no longer waiting");
+    transition.settle_subscription(subscription,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Error,
+        Some("transient_retry_exhausted"));
+    transition.incident(&subscription.node_id, None, "SIGNAL_DELIVERY_FAILED",
+        "Signal receipt exhausted five transient delivery attempts".into());
+    transition.finish()
+}
+
 pub(super) fn plan_timer_catch(
     snapshot: &RuntimeSnapshot,
     timer: &ProcessTimer,
     now_ms: i64,
     accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Catch
@@ -4403,7 +4619,7 @@ pub(super) fn plan_timer_catch(
             && timer.version == snapshot.instance.version,
         "catch timer does not match its pinned instance"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer.scope_id.clone().context("catch timer lacks scope")?;
     let token_id = timer
@@ -4444,6 +4660,7 @@ pub(super) fn plan_timer_boundary(
     timer: &ProcessTimer,
     now_ms: i64,
     accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Boundary
@@ -4453,7 +4670,7 @@ pub(super) fn plan_timer_boundary(
             && timer.version == snapshot.instance.version,
         "boundary timer does not match its pinned instance"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer
         .scope_id
@@ -5068,7 +5285,7 @@ pub(crate) mod test_support {
             StartCause::Manual,
             at_ms,
             manual_input(&command),
-        )
+        None)
         .expect("plan actual start");
         super::super::repository::start_instance(
             &fixture.db,
@@ -5078,7 +5295,7 @@ pub(crate) mod test_support {
             &version.definition_id,
             version.version,
             &variables,
-            &plan,
+            super::super::repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .expect("commit process start")
@@ -5125,7 +5342,7 @@ mod tests {
         let command = stamp("terminate root");
         let valid = plan_start(&version.model, &instance_id, &fixture.owner,
             &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-            at_ms, manual_input(&command)).unwrap();
+            at_ms, manual_input(&command), None).unwrap();
         let source = valid.termination_attempts.iter().find_map(|attempt| match attempt {
             TerminationAttempt::Success(source) => Some(source),
             TerminationAttempt::ReturnFailure(_) => None,
@@ -5143,11 +5360,11 @@ mod tests {
         forged.create_tokens.push(extra);
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
             &instance_id, &version.definition_id, version.version, &variables,
-            &forged, at_ms).is_err());
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
             &instance_id, &version.definition_id, version.version, &variables,
-            &valid, at_ms).unwrap();
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         let events = repository::list_events(&fixture.db, &fixture.owner, &instance_id, 0, 32).unwrap().0;
         assert_eq!(events.iter().filter(|event| event.kind == "terminate_end_reached").count(), 1);
@@ -5169,7 +5386,7 @@ mod tests {
         let command = stamp("complete real human input before termination");
         let output = json!({"answer":"accepted"});
         let valid = plan_user_completion(&snapshot, &task.user_task_id, &output, None,
-            at_ms, human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            at_ms, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
         assert_eq!(valid.variable_effects.len(), 1);
         let before = super::super::call_tests::transition_rows(&fixture);
         let mut missing = valid.clone();
@@ -5195,13 +5412,13 @@ mod tests {
             ("duplicated effect", duplicate), ("wrong source-time cutoff", wrong_cutoff)] {
             assert!(repository::complete_user_task(&fixture.db, &fixture.participant, &command,
                 &waiting.instance_id, &task.user_task_id, waiting.revision, &output, None,
-                &forged, at_ms).is_err(), "{case} must roll back");
+                repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must roll back");
             assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
                 "{case} changed one of the durable process tables");
         }
         let completed = repository::complete_user_task(&fixture.db, &fixture.participant,
             &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
-            &output, None, &valid, at_ms).unwrap();
+            &output, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
         assert_eq!(completed.instance.status, ProcessInstanceStatus::Completed);
         assert_eq!(completed.instance.variables["answer"], "accepted");
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
@@ -5250,7 +5467,7 @@ mod tests {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let valid = plan_start(&version.model, &instance_id, &fixture.owner,
             &version.definition_id, version.version, variables.clone(), StartCause::Manual,
-            at_ms, manual_input(&command)).unwrap();
+            at_ms, manual_input(&command), None).unwrap();
         assert_eq!(valid.termination_attempts.len(), 2);
         assert_eq!(valid.variable_effects.len(), 2);
         let before = super::super::call_tests::transition_rows(&fixture);
@@ -5292,13 +5509,13 @@ mod tests {
             ("changed mapped result", changed_result)] {
             assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
                 &instance_id, &version.definition_id, version.version, &variables,
-                &forged, at_ms).is_err(), "{case} must fail closed");
+                repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must fail closed");
             assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
                 "{case} changed durable process rows");
         }
         let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
             &instance_id, &version.definition_id, version.version, &variables,
-            &valid, at_ms).unwrap();
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(completed.variables["received"], 41);
     }
@@ -5335,7 +5552,7 @@ mod tests {
         let output = json!({"answer":"reviewed"});
         let completion = stamp("complete evidence");
         let plan = plan_user_completion(&snapshot, &task_id, &output, None, at_ms,
-            human_input(&snapshot, &task_id, &completion)).unwrap();
+            human_input(&snapshot, &task_id, &completion), None).unwrap();
         let completed = repository::complete_user_task(
             &reopened,
             &participant,
@@ -5345,7 +5562,7 @@ mod tests {
             waiting.revision,
             &output,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -5364,7 +5581,7 @@ mod tests {
             waiting.revision,
             &output,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -5389,7 +5606,7 @@ mod tests {
             waiting.revision,
             &output,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms
         )
         .is_err());
@@ -5465,7 +5682,7 @@ mod tests {
         let left_command = stamp("left done");
         let plan =
             plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None, at_ms,
-                human_input(&snapshot, &left.user_task_id, &left_command)).unwrap();
+                human_input(&snapshot, &left.user_task_id, &left_command), None).unwrap();
         let partial = repository::complete_user_task(
             &fixture.db,
             &fixture.owner,
@@ -5475,7 +5692,7 @@ mod tests {
             waiting.revision,
             &Value::Null,
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -5511,7 +5728,7 @@ mod tests {
             None,
             at_ms,
             human_input(&snapshot, &right.user_task_id, &completion),
-        )
+        None)
         .unwrap();
         let completed = repository::complete_user_task(
             &reopened,
@@ -5522,7 +5739,7 @@ mod tests {
             partial.revision,
             &json!(["checked"]),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -5537,7 +5754,7 @@ mod tests {
             partial.revision,
             &json!(["checked"]),
             None,
-            &plan,
+            repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
         .unwrap()
@@ -5626,7 +5843,7 @@ mod tests {
             let at_ms = chrono::Utc::now().timestamp_millis();
             let left_command = stamp("first mixed gateway arrival");
             let valid = plan_user_completion(&snapshot, &left.user_task_id, &Value::Null, None,
-                at_ms, human_input(&snapshot, &left.user_task_id, &left_command)).unwrap();
+                at_ms, human_input(&snapshot, &left.user_task_id, &left_command), None).unwrap();
             assert_eq!(valid.add_gateway_receipts.len(), 1);
             let joining = valid.create_tokens.iter().find(|token| token.node_id == "Join"
                 && token.status == "joining").unwrap();
@@ -5678,14 +5895,14 @@ mod tests {
             ] {
                 assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
                     &left_command, &waiting.instance_id, &left.user_task_id,
-                    waiting.revision, &Value::Null, None, &forged, at_ms).is_err(),
+                    waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(),
                     "{case} was accepted");
                 assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
                     "{case} changed persisted process rows");
             }
             let partial = repository::complete_user_task(&fixture.db, &fixture.owner,
                 &left_command, &waiting.instance_id, &left.user_task_id,
-                waiting.revision, &Value::Null, None, &valid, at_ms).unwrap().instance;
+                waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap().instance;
             assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
             let path = fixture.directory.path().join("processes.db");
             let owner = fixture.owner.clone();
@@ -5706,15 +5923,15 @@ mod tests {
             let term_command = stamp("terminate mixed gateway activation");
             let term_plan = plan_user_completion(&resumed, &term.user_task_id,
                 &Value::Null, None, at_ms + 1,
-                human_input(&resumed, &term.user_task_id, &term_command)).unwrap();
+                human_input(&resumed, &term.user_task_id, &term_command), None).unwrap();
             let completed = repository::complete_user_task(&reopened, &owner,
                 &term_command, &waiting.instance_id, &term.user_task_id,
-                partial.revision, &Value::Null, None, &term_plan, at_ms + 1)
+                partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&term_plan), at_ms + 1)
                 .unwrap().instance;
             assert_eq!(completed.status, ProcessInstanceStatus::Completed);
             let replay = repository::complete_user_task(&reopened, &owner,
                 &term_command, &waiting.instance_id, &term.user_task_id,
-                partial.revision, &Value::Null, None, &term_plan, at_ms + 1)
+                partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&term_plan), at_ms + 1)
                 .unwrap().instance;
             assert_eq!(replay.revision, completed.revision);
             let closed = repository::runtime_snapshot(&reopened, &owner,
@@ -5866,9 +6083,9 @@ mod tests {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let first_command = stamp("inclusive first");
         let plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &first.user_task_id, &first_command)).unwrap();
+            human_input(&snapshot, &first.user_task_id, &first_command), None).unwrap();
         let partial = repository::complete_user_task(&fixture.db, &fixture.owner, &first_command,
-            &waiting.instance_id, &first.user_task_id, waiting.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+            &waiting.instance_id, &first.user_task_id, waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
         let path = fixture.directory.path().join("processes.db");
         let owner = fixture.owner.clone();
@@ -5882,12 +6099,12 @@ mod tests {
         let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
         let command = stamp("inclusive second");
         let plan = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &second.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &second.user_task_id, &command), None).unwrap();
         let completed = repository::complete_user_task(&reopened, &owner, &command,
-            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         let replay = repository::complete_user_task(&reopened, &owner, &command,
-            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+            &waiting.instance_id, &second.user_task_id, partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         assert_eq!(replay.revision, completed.revision);
         let events = repository::list_events(&reopened, &owner, &waiting.instance_id, 0, 200).unwrap().0;
         let split = events.iter().find(|event| event.kind == "inclusive_split").unwrap();
@@ -5956,10 +6173,10 @@ mod tests {
                 let at_ms = chrono::Utc::now().timestamp_millis();
                 let command = stamp(&format!("nested {node_id}"));
                 let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
-                    human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+                    human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
                 instance = repository::complete_user_task(&fixture.db, &fixture.owner,
                     &command, &instance.instance_id, &task.user_task_id,
-                    instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+                    instance.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
             }
             assert_eq!(instance.status, ProcessInstanceStatus::Completed);
             let events = repository::list_events(&fixture.db, &fixture.owner, &instance.instance_id, 0, 200).unwrap().0;
@@ -6006,10 +6223,10 @@ mod tests {
             let at_ms = chrono::Utc::now().timestamp_millis();
             let command = stamp(&format!("parallel nine branch {index}"));
             let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
-                human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+                human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
             instance = repository::complete_user_task(&fixture.db, &fixture.owner,
                 &command, &instance.instance_id,
-                &task.user_task_id, instance.revision, &Value::Null, None, &plan, at_ms).unwrap().instance;
+                &task.user_task_id, instance.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
         }
         assert_eq!(instance.status, ProcessInstanceStatus::Completed);
         let events = repository::list_events(&fixture.db, &fixture.owner, &instance.instance_id, 0, 200).unwrap().0;
@@ -6025,12 +6242,12 @@ mod tests {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let forged_command = stamp("forged selected set");
         let mut plan = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms,
-            human_input(&before, &task.user_task_id, &forged_command)).unwrap();
+            human_input(&before, &task.user_task_id, &forged_command), None).unwrap();
         let joining = plan.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
         joining.fork_stack.last_mut().unwrap().selected_branch_edge_ids = vec!["To_B".into()];
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
             &forged_command, &waiting.instance_id, &task.user_task_id,
-            waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
+            waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).is_err());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(after.instance.revision, before.instance.revision);
         assert_eq!(after.tokens.len(), before.tokens.len());
@@ -6040,12 +6257,12 @@ mod tests {
         assert!(events.iter().all(|event| event.kind != "inclusive_joined"));
         let wrong_command = stamp("wrong join incoming edge");
         let mut wrong_arrival = plan_user_completion(&before, &task.user_task_id, &Value::Null, None, at_ms,
-            human_input(&before, &task.user_task_id, &wrong_command)).unwrap();
+            human_input(&before, &task.user_task_id, &wrong_command), None).unwrap();
         let joining = wrong_arrival.create_tokens.iter_mut().find(|token| token.status == "joining").unwrap();
         joining.arrival_edge_id = Some("From_A".into());
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
             &wrong_command, &waiting.instance_id, &task.user_task_id,
-            waiting.revision, &Value::Null, None, &wrong_arrival, at_ms).is_err());
+            waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&wrong_arrival), at_ms).is_err());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(after.instance.revision, before.instance.revision);
         assert!(after.receipts.is_empty());
@@ -6060,17 +6277,17 @@ mod tests {
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         let first_command = stamp("first selected branch");
         let first_plan = plan_user_completion(&snapshot, &first.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &first.user_task_id, &first_command)).unwrap();
+            human_input(&snapshot, &first.user_task_id, &first_command), None).unwrap();
         let partial = repository::complete_user_task(&fixture.db, &fixture.owner,
             &first_command, &waiting.instance_id, &first.user_task_id,
-            waiting.revision, &Value::Null, None, &first_plan, at_ms).unwrap().instance;
+            waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&first_plan), at_ms).unwrap().instance;
         assert_eq!(partial.status, ProcessInstanceStatus::Waiting);
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         assert_eq!(snapshot.receipts.len(), 1);
         let second = snapshot.instance.user_tasks.iter().find(|task| task.node_id == "A").unwrap();
         let command = stamp("valid final selected join");
         let valid = plan_user_completion(&snapshot, &second.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &second.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &second.user_task_id, &command), None).unwrap();
         assert_eq!(valid.remove_gateway_receipts.len(), 1);
         assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
         let rows = || {
@@ -6088,23 +6305,23 @@ mod tests {
         joining.fork_stack.last_mut().unwrap().selected_branch_edge_ids = vec!["To_A".into()];
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
             &stamp("forged final selected set"), &waiting.instance_id, &second.user_task_id,
-            partial.revision, &Value::Null, None, &forged_frame, at_ms).is_err());
+            partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&forged_frame), at_ms).is_err());
         assert_eq!(rows(), before);
         let mut forged_event = valid.clone();
         forged_event.events.iter_mut().find(|event| event.kind == "inclusive_joined").unwrap()
             .data["selected_branch_edge_ids"] = json!(["To_A"]);
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
             &stamp("forged final join event"), &waiting.instance_id, &second.user_task_id,
-            partial.revision, &Value::Null, None, &forged_event, at_ms).is_err());
+            partial.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&forged_event), at_ms).is_err());
         assert_eq!(rows(), before);
         let complete = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &second.user_task_id, partial.revision,
-            &Value::Null, None, &valid, at_ms).unwrap().instance;
+            &Value::Null, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap().instance;
         assert_eq!(complete.status, ProcessInstanceStatus::Completed);
         let completed_rows = rows();
         let replay = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &second.user_task_id, partial.revision,
-            &Value::Null, None, &valid, at_ms).unwrap().instance;
+            &Value::Null, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap().instance;
         assert_eq!(replay.revision, complete.revision);
         assert_eq!(rows(), completed_rows);
         let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
@@ -6123,7 +6340,7 @@ mod tests {
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         let command = stamp("singleton factual join");
         let valid = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
         assert!(valid.remove_gateway_receipts.is_empty());
         assert_eq!(valid.events.iter().filter(|event| event.kind == "inclusive_joined").count(), 1);
         let rows = || {
@@ -6140,7 +6357,7 @@ mod tests {
         missing_event.events.retain(|event| event.kind != "inclusive_joined");
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
             &stamp("singleton omitted join event"), &waiting.instance_id, &task.user_task_id,
-            waiting.revision, &Value::Null, None, &missing_event, at_ms).err().unwrap();
+            waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&missing_event), at_ms).err().unwrap();
         assert!(format!("{error:#}").contains("gateway activation disappeared"));
         assert_eq!(rows(), before);
         let mut missing_arrival = missing_event.clone();
@@ -6150,7 +6367,7 @@ mod tests {
         missing_arrival.consume_token_ids.retain(|id| id != &joining);
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
             &stamp("singleton omitted join arrival and event"), &waiting.instance_id,
-            &task.user_task_id, waiting.revision, &Value::Null, None, &missing_arrival, at_ms)
+            &task.user_task_id, waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&missing_arrival), at_ms)
             .err().unwrap();
         assert!(format!("{error:#}").contains("gateway activation disappeared"));
         assert_eq!(rows(), before);
@@ -6163,18 +6380,18 @@ mod tests {
         changed_replacement.consume_token_ids.retain(|id| id != &replacement_id);
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
             &stamp("singleton changed replacement selection"), &waiting.instance_id,
-            &task.user_task_id, waiting.revision, &Value::Null, None, &changed_replacement,
+            &task.user_task_id, waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&changed_replacement),
             at_ms).err().unwrap();
         assert!(format!("{error:#}").contains("planned gateway frame changed"));
         assert_eq!(rows(), before);
         let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
-            &Value::Null, None, &valid, at_ms).unwrap().instance;
+            &Value::Null, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap().instance;
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         let committed_rows = rows();
         let replay = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &task.user_task_id, waiting.revision,
-            &Value::Null, None, &valid, at_ms).unwrap().instance;
+            &Value::Null, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap().instance;
         assert_eq!(replay.revision, completed.revision);
         assert_eq!(rows(), committed_rows);
         let events = repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 200).unwrap().0;
@@ -6191,7 +6408,7 @@ mod tests {
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &waiting.instance_id).unwrap();
         let command = stamp("malformed frame");
         let plan = plan_user_completion(&snapshot, &task.user_task_id, &Value::Null, None, at_ms,
-            human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+            human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
         let token_id = snapshot.tokens.iter().find(|token| token.node_id == "A").unwrap().token_id.clone();
         let original: String = fixture.db.read().unwrap().query_row(
             "SELECT fork_stack_json FROM bpmn_tokens WHERE token_id=?1", [&token_id], |row| row.get(0)).unwrap();
@@ -6210,7 +6427,7 @@ mod tests {
         };
         assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &task.user_task_id,
-            waiting.revision, &Value::Null, None, &plan, at_ms).is_err());
+            waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).is_err());
         let after = {
             let conn = fixture.db.read().unwrap();
             ["bpmn_instances", "bpmn_tokens", "bpmn_gateway_receipts", "bpmn_user_tasks",
@@ -7098,7 +7315,7 @@ mod tests {
             let command = stamp("finish scoped and joins");
             let plan =
                 plan_user_completion(&snapshot, &task_id("ChildB"), &json!({}), None, at,
-                    human_input(&snapshot, &task_id("ChildB"), &command)).unwrap();
+                    human_input(&snapshot, &task_id("ChildB"), &command), None).unwrap();
             let outcome = repository::complete_user_task(
                 &reopened,
                 &fixture.owner,
@@ -7108,7 +7325,7 @@ mod tests {
                 snapshot.instance.revision,
                 &json!({}),
                 None,
-                &plan,
+                repository::ProcessPlanInput::Supplied(&plan),
                 at,
             )
             .unwrap();
@@ -7144,7 +7361,7 @@ mod tests {
                 snapshot.instance.revision,
                 &json!({}),
                 None,
-                &plan,
+                repository::ProcessPlanInput::Supplied(&plan),
                 at,
             )
             .unwrap();
@@ -7370,7 +7587,7 @@ mod tests {
             let command = stamp("stale child completion");
             let stale =
                 plan_user_completion(&before, &work.user_task_id, &json!({}), None, due,
-                    human_input(&before, &work.user_task_id, &command)).unwrap();
+                    human_input(&before, &work.user_task_id, &command), None).unwrap();
             assert!(repository::complete_user_task(
                 &fixture.db,
                 &fixture.owner,
@@ -7380,7 +7597,7 @@ mod tests {
                 before.instance.revision,
                 &json!({}),
                 None,
-                &stale,
+                repository::ProcessPlanInput::Supplied(&stale),
                 due
             )
             .is_err());
@@ -7555,7 +7772,7 @@ mod tests {
             &source.job,
             &observed,
             chrono::Utc::now().timestamp_millis(),
-        )
+        None)
         .unwrap();
         let mut forged = canonical.clone();
         forged.cancel_job_ids.clear();
@@ -7586,7 +7803,7 @@ mod tests {
             assert!(repository::accept_job_result(
                 &fixture.db, &fixture.owner, &source.job.job_id,
                 source.job.attempt, source.job.fence, "scoped-error-worker",
-                &observed, snapshot.instance.revision, &forged,
+                &observed, snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged),
                 chrono::Utc::now().timestamp_millis(),
             ).is_err(), "{case} was accepted");
             assert_eq!(super::super::call_tests::transition_rows(&fixture), rows_before,

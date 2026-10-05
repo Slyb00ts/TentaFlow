@@ -19,7 +19,7 @@ fn manual_wait_requires_one_pinned_open_fact_before_any_acknowledgment() {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
-        at_ms, manual_input(&command)).unwrap();
+        at_ms, manual_input(&command), None).unwrap();
     let opened = plan.events.iter().position(|event| event.kind == "manual_task_opened").unwrap();
     for variant in 0..4 {
         let mut forged = plan.clone();
@@ -34,13 +34,13 @@ fn manual_wait_requires_one_pinned_open_fact_before_any_acknowledgment() {
         let before = transition_rows(&fixture);
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
             &instance_id, &version.definition_id, version.version, &variables,
-            &forged, at_ms).is_err());
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
         assert_eq!(transition_rows(&fixture), before,
             "manual open forgery {variant} changed durable rows");
     }
     repository::start_instance(&fixture.db, &fixture.owner, &command,
         &instance_id, &version.definition_id, version.version, &variables,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
     assert_eq!(reopened.user_tasks.iter().filter(|task|
         task.kind == ProcessUserTaskKind::Manual).count(), 1);
@@ -56,7 +56,7 @@ fn assert_forged_acknowledgments_roll_back(terminate: bool) {
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
         &fixture.owner.user_id, at_ms,
-        manual_entry(&snapshot, &task.user_task_id, &command)).unwrap();
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
     let ack_index = plan.events.iter().position(|event|
         event.kind == "manual_task_acknowledged").unwrap();
     let actual_token = task.token_id.as_ref().unwrap();
@@ -80,21 +80,21 @@ fn assert_forged_acknowledgments_roll_back(terminate: bool) {
         let before = transition_rows(&fixture);
         let error = repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
             &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-            &forged, at_ms).unwrap_err();
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).unwrap_err();
         assert!(!format!("{error:#}").is_empty());
         assert_eq!(transition_rows(&fixture), before,
             "manual forgery {variant} changed durable rows");
     }
     let committed = repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(committed.instance.status, ProcessInstanceStatus::Completed);
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
     assert_eq!(reopened.status, ProcessInstanceStatus::Completed);
     let before_replay = transition_rows(&fixture);
     repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
         &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
-        &plan, at_ms).unwrap();
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(transition_rows(&fixture), before_replay);
 }
 

@@ -355,6 +355,12 @@ export class FlowConfig {
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.script_task_hint'))}</p>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.script_format'))}</p>
         ${mapping('outputMapping', 'output_mapping')}`;
+    } else if (kind === 'SignalThrow' || kind === 'SignalCatch') {
+      fields += declaration('signalRef', 'signal_reference', model.signals, 'signalId', config.signalRef);
+      if (kind === 'SignalThrow') fields += `${textarea('payloadExpression', 'signal_payload_expression', config.payloadExpression, 4)}
+        ${input('ttlSeconds', 'signal_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"')}`;
+      else fields += mapping('outputMapping', 'output_mapping');
+      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(`bpmn.node_${kind === 'SignalThrow' ? 'signal_throw' : 'signal_catch'}_hint`))}</p>`;
     } else if (kind === 'SubProcess') {
       fields += `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
         <tf-button variant="secondary" data-process-enter>${escapeHtml(I18n.t('bpmn.enter_subprocess'))}</tf-button>

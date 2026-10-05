@@ -446,7 +446,8 @@ const FlowBuilderScreen = {
     }
     if (state.palette.readOnly !== readOnly) { state.palette.readOnly = readOnly; state.palette._render(); }
     state.root.querySelector('[data-role="name"]').toggleAttribute('disabled', readOnly);
-    for (const role of ['save', 'variables', 'declarations', 'publish', 'import', 'undo', 'redo', 'refresh-calendar']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
+    for (const role of ['save', 'variables', 'publish', 'import', 'undo', 'redo', 'refresh-calendar']) state.root.querySelector(`[data-role="${role}"]`).toggleAttribute('disabled', readOnly);
+    state.root.querySelector('[data-role="declarations"]').toggleAttribute('disabled', !!state.operationBusy);
     const timedVersion = state.previewVersion === null ? state.publishedTimerStart : processHasTimerStart(state.canvas.getData());
     const run = state.root.querySelector('[data-role="run"]');
     const messageVersion = state.previewVersion === null ? !!state.messageStart : processHasMessageStart(state.canvas.getData());

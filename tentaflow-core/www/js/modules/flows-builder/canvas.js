@@ -715,11 +715,13 @@ export class FlowCanvas {
     this.onChange();
   }
 
-  updateProcessDeclarations({ messages, errors, escalations, targetNamespace }) {
+  updateProcessDeclarations({ messages, errors, escalations, signals = [], targetNamespace }) {
     if (this.readOnly || this.mode !== 'bpmn') return;
     this.processModel.messages = structuredClone(messages);
     this.processModel.errors = structuredClone(errors);
     this.processModel.escalations = structuredClone(escalations);
+    if (signals.length) this.processModel.signals = structuredClone(signals);
+    else delete this.processModel.signals;
     if (targetNamespace) this.processModel.targetNamespace = targetNamespace;
     else delete this.processModel.targetNamespace;
     this._pushHistory();

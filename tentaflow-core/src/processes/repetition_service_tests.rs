@@ -180,14 +180,14 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
     assert_eq!(observed_zero.result.outcome, ActivityOutcome::NeedsHuman);
     let at = chrono::Utc::now().timestamp_millis();
     let stale_plan = runtime::plan_job_result(&shared, job_zero,
-        &observed_zero, at).unwrap();
+        &observed_zero, at, None).unwrap();
     let first_plan = runtime::plan_job_result(&shared, job_one,
-        &observed_one, at).unwrap();
+        &observed_one, at, None).unwrap();
     assert_eq!(stale_plan.status, ProcessInstanceStatus::Running);
     assert_eq!(first_plan.status, ProcessInstanceStatus::Running);
     repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim_one.job.job_id, claim_one.job.attempt, claim_one.job.fence, worker_one,
-        &observed_one, shared.instance.revision, &first_plan, at).unwrap();
+        &observed_one, shared.instance.revision, repository::ProcessPlanInput::Supplied(&first_plan), at).unwrap();
     let after_first = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();
     assert_eq!(after_first.repetition_occurrences.iter()
@@ -200,7 +200,7 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
     assert_eq!(before_stale.len(), 16);
     let error = repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim_zero.job.job_id, claim_zero.job.attempt, claim_zero.job.fence, worker_zero,
-        &observed_zero, shared.instance.revision, &stale_plan, at).unwrap_err();
+        &observed_zero, shared.instance.revision, repository::ProcessPlanInput::Supplied(&stale_plan), at).unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("process instance revision conflict or closed instance"), "{message}");
     assert_eq!(super::call_tests::transition_rows(&fixture), before_stale);
@@ -209,11 +209,11 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
         &started.instance_id).unwrap();
     let fresh_job = fresh.jobs.iter().find(|job| job.job_id == claim_zero.job.job_id).unwrap();
     assert_eq!(fresh_job.status, "running");
-    let fresh_plan = runtime::plan_job_result(&fresh, fresh_job, &observed_zero, at).unwrap();
+    let fresh_plan = runtime::plan_job_result(&fresh, fresh_job, &observed_zero, at, None).unwrap();
     assert_eq!(fresh_plan.status, ProcessInstanceStatus::Waiting);
     repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim_zero.job.job_id, claim_zero.job.attempt, claim_zero.job.fence, worker_zero,
-        &observed_zero, fresh.instance.revision, &fresh_plan, at).unwrap();
+        &observed_zero, fresh.instance.revision, repository::ProcessPlanInput::Supplied(&fresh_plan), at).unwrap();
     let both_waiting = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();
     assert_eq!(both_waiting.repetition_occurrences.iter()
@@ -240,14 +240,14 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
         assert_eq!(task.status, ProcessUserTaskStatus::Open);
         let command = stamp("approve actual parallel repeated result");
         let approval = runtime::plan_user_completion(&waiting, task_id, &Value::Null,
-            Some(true), at, runtime::test_support::human_input(&waiting, task_id, &command)).unwrap();
+            Some(true), at, runtime::test_support::human_input(&waiting, task_id, &command), None).unwrap();
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, task_id, waiting.instance.revision,
-            &Value::Null, Some(true), &approval, at).unwrap();
+            &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         let after_approval = super::call_tests::transition_rows(&fixture);
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, task_id, waiting.instance.revision,
-            &Value::Null, Some(true), &approval, at).unwrap();
+            &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         assert_eq!(super::call_tests::transition_rows(&fixture), after_approval);
     }
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
@@ -292,7 +292,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
 
         let observed = observed_flow_result(&fixture, &claim).await;
         let at = chrono::Utc::now().timestamp_millis();
-        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         let before = super::call_tests::transition_rows(&fixture);
         assert_eq!(before.len(), 16);
         let mut wrong_item = plan.clone();
@@ -301,7 +301,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
             .item = json!({"case":"foreign"});
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &wrong_item, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_item), at).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("repetition occurrence changed immutable ordinal input"), "{message}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -311,7 +311,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
             .ordinal += 1;
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &wrong_ordinal, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_ordinal), at).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("occurrence changed its group scope or ordinal"), "{message}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -321,7 +321,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
             .input_variables = json!({"items":[],"results":[]});
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &wrong_variables, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_variables), at).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("repetition occurrence changed immutable ordinal input"), "{message}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -331,7 +331,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
             .accepted_source_event_id = Some(uuid::Uuid::new_v4().to_string());
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &wrong_source, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_source), at).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("repeated Service source event differs from its fenced accepted entry"), "{message}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -341,7 +341,7 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
             .accepted_source_event_id = Some(claimed.event_id.clone());
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &wrong_kind_source, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_kind_source), at).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("repeated Service source event differs from its fenced accepted entry"), "{message}");
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -356,20 +356,20 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
                 .accepted_source_event_id = Some(source_id.clone());
             let error = repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-                &observed, claim.snapshot.instance.revision, &wrong_prior_source, at).unwrap_err();
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_prior_source), at).unwrap_err();
             let message = format!("{error:#}");
             assert!(message.contains("repeated Service source event differs from its fenced accepted entry"), "{message}");
             assert_eq!(super::call_tests::transition_rows(&fixture), before);
         }
         let error = repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence + 1, &worker,
-            &observed, claim.snapshot.instance.revision, &plan, at).unwrap_err();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap_err();
         assert!(format!("{error:#}").contains("service job fence is stale"));
         assert_eq!(super::call_tests::transition_rows(&fixture), before);
 
         repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
         let waiting = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let persisted = waiting.repetition_occurrences.iter()
@@ -387,19 +387,19 @@ async fn repeated_service_claims_bind_fence_ordinal_item_and_frozen_variables_be
         let command = stamp("approve exact repeated Service result");
         let approval = runtime::plan_user_completion(&waiting, &task.user_task_id,
             &json!({"client":"cannot replace service result"}), Some(true), at,
-            runtime::test_support::human_input(&waiting, &task.user_task_id, &command)).unwrap();
+            runtime::test_support::human_input(&waiting, &task.user_task_id, &command), None).unwrap();
         let before_approval = super::call_tests::transition_rows(&fixture);
         assert!(repository::complete_user_task(&fixture.db, &fixture.participant, &command,
             &started.instance_id, &task.user_task_id, waiting.instance.revision,
-            &json!({"client":"cannot replace service result"}), Some(true), &approval, at).is_err());
+            &json!({"client":"cannot replace service result"}), Some(true), repository::ProcessPlanInput::Supplied(&approval), at).is_err());
         assert_eq!(super::call_tests::transition_rows(&fixture), before_approval);
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, waiting.instance.revision,
-            &json!({"client":"cannot replace service result"}), Some(true), &approval, at).unwrap();
+            &json!({"client":"cannot replace service result"}), Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         let after_approval = super::call_tests::transition_rows(&fixture);
         let replay = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, waiting.instance.revision,
-            &json!({"client":"cannot replace service result"}), Some(true), &approval, at).unwrap();
+            &json!({"client":"cannot replace service result"}), Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         assert_eq!(replay.instance.revision,
             repository::get_instance(&fixture.db, &fixture.owner,
                 &started.instance_id, None).unwrap().revision);
@@ -457,7 +457,7 @@ async fn repeated_contract_result_rejects_an_earlier_equal_payload_service_sourc
         assert_eq!(observed.origin, ActivityResultOrigin::Contract);
         assert_eq!(observed.result.outputs, business["outputs"]);
         let at = chrono::Utc::now().timestamp_millis();
-        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        let plan = runtime::plan_job_result(&claim.snapshot, &claim.job, &observed, at, None).unwrap();
         let (event_index, event) = plan.events.iter().enumerate()
             .find(|(_, event)| event.kind == "service_result").unwrap();
         let current_source_id = plan.event_ids.get(&event_index).unwrap().clone();
@@ -473,7 +473,7 @@ async fn repeated_contract_result_rejects_an_earlier_equal_payload_service_sourc
                 .accepted_source_event_id = Some(previous.event_id.clone());
             let error = repository::accept_job_result(&fixture.db, &fixture.owner,
                 &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-                &observed, claim.snapshot.instance.revision, &wrong_source, at).unwrap_err();
+                &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&wrong_source), at).unwrap_err();
             let message = format!("{error:#}");
             assert!(message.contains("repeated Service source event differs from its fenced accepted entry"), "{message}");
             assert_eq!(super::call_tests::transition_rows(&fixture), before);
@@ -481,7 +481,7 @@ async fn repeated_contract_result_rejects_an_earlier_equal_payload_service_sourc
 
         repository::accept_job_result(&fixture.db, &fixture.owner,
             &claim.job.job_id, claim.job.attempt, claim.job.fence, &worker,
-            &observed, claim.snapshot.instance.revision, &plan, at).unwrap();
+            &observed, claim.snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan), at).unwrap();
         let current = history(&fixture, &started.instance_id).into_iter()
             .find(|event| event.event_id == current_source_id).unwrap();
         assert_eq!(current.kind, "service_result");
@@ -499,14 +499,14 @@ async fn repeated_contract_result_rejects_an_earlier_equal_payload_service_sourc
         let command = stamp("approve static Contract occurrence");
         let approval = runtime::plan_user_completion(&waiting, &task.user_task_id,
             &Value::Null, Some(true), at,
-            runtime::test_support::human_input(&waiting, &task.user_task_id, &command)).unwrap();
+            runtime::test_support::human_input(&waiting, &task.user_task_id, &command), None).unwrap();
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, waiting.instance.revision,
-            &Value::Null, Some(true), &approval, at).unwrap();
+            &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         let after = super::call_tests::transition_rows(&fixture);
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, waiting.instance.revision,
-            &Value::Null, Some(true), &approval, at).unwrap();
+            &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&approval), at).unwrap();
         assert_eq!(super::call_tests::transition_rows(&fixture), after);
     }
 
@@ -561,15 +561,15 @@ async fn repeated_needs_human_rejection_keeps_evidence_and_blocks_without_an_aut
     let at = chrono::Utc::now().timestamp_millis();
     let rejection = runtime::plan_user_completion(&waiting, &task.user_task_id,
         &Value::Null, Some(false), at,
-        runtime::test_support::human_input(&waiting, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&waiting, &task.user_task_id, &command), None).unwrap();
     let before = super::call_tests::transition_rows(&fixture);
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, waiting.instance.revision,
-        &Value::Null, Some(true), &rejection, at).is_err());
+        &Value::Null, Some(true), repository::ProcessPlanInput::Supplied(&rejection), at).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     let rejected = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, waiting.instance.revision,
-        &Value::Null, Some(false), &rejection, at).unwrap().instance;
+        &Value::Null, Some(false), repository::ProcessPlanInput::Supplied(&rejection), at).unwrap().instance;
     assert_eq!(rejected.status, ProcessInstanceStatus::Incident);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
@@ -584,7 +584,7 @@ async fn repeated_needs_human_rejection_keeps_evidence_and_blocks_without_an_aut
     let before_replay = super::call_tests::transition_rows(&fixture);
     let replay = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
         &started.instance_id, &task.user_task_id, waiting.instance.revision,
-        &Value::Null, Some(false), &rejection, at).unwrap().instance;
+        &Value::Null, Some(false), repository::ProcessPlanInput::Supplied(&rejection), at).unwrap().instance;
     assert_eq!(replay.revision, rejected.revision);
     assert_eq!(super::call_tests::transition_rows(&fixture), before_replay);
 
@@ -607,11 +607,11 @@ async fn repeated_needs_human_rejection_keeps_evidence_and_blocks_without_an_aut
     let approval_plan = runtime::plan_user_completion(&approval_wait,
         &approval_task.user_task_id, &json!({"client":"ignored"}), Some(true), approval_at,
         runtime::test_support::human_input(&approval_wait,
-            &approval_task.user_task_id, &approval_command)).unwrap();
+            &approval_task.user_task_id, &approval_command), None).unwrap();
     repository::complete_user_task(&fixture.db, &fixture.owner, &approval_command,
         &approved_start.instance_id, &approval_task.user_task_id,
         approval_wait.instance.revision, &json!({"client":"ignored"}), Some(true),
-        &approval_plan, approval_at).unwrap();
+        repository::ProcessPlanInput::Supplied(&approval_plan), approval_at).unwrap();
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let approved = repository::get_instance(&reopened, &fixture.owner,
         &approved_start.instance_id, None).unwrap();

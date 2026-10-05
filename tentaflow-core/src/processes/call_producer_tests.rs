@@ -168,7 +168,7 @@ async fn accepted_child_service_result_waits_for_human_verification_before_singl
     let command = runtime::test_support::stamp("approve called service result");
     let plan =
         runtime::plan_user_completion(&child, &task.user_task_id, &output, Some(true), at,
-            runtime::test_support::human_input(&child, &task.user_task_id, &command)).unwrap();
+            runtime::test_support::human_input(&child, &task.user_task_id, &command), None).unwrap();
     let approved = repository::complete_user_task(
         &fixture.db,
         &fixture.owner,
@@ -178,7 +178,7 @@ async fn accepted_child_service_result_waits_for_human_verification_before_singl
         child.instance.revision,
         &output,
         Some(true),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -199,7 +199,7 @@ async fn accepted_child_service_result_waits_for_human_verification_before_singl
         child.instance.revision,
         &output,
         Some(true),
-        &plan,
+        repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
     .unwrap();
@@ -253,9 +253,9 @@ fn human_error_end_crosses_pinned_call_boundary_before_root_termination_once() {
     let command = runtime::test_support::stamp("complete pinned child's real human error input");
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs, None, at_ms,
-        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command)).unwrap();
+        runtime::test_support::human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let accepted = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
-        &child_id, &task.user_task_id, snapshot.instance.revision, &outputs, None, &plan, at_ms)
+        &child_id, &task.user_task_id, snapshot.instance.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(accepted.status, ProcessInstanceStatus::Error);
     assert_eq!(accepted.variables["answer"], "approved review evidence");
@@ -290,7 +290,7 @@ fn human_error_end_crosses_pinned_call_boundary_before_root_termination_once() {
     assert_eq!(repository::get_instance(&reopened, &fixture.owner, &child_id, None).unwrap(), accepted);
     assert_eq!(repository::get_instance(&reopened, &fixture.owner, &parent.instance_id, None).unwrap(), completed);
     let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
-        &child_id, &task.user_task_id, snapshot.instance.revision, &outputs, None, &plan, at_ms)
+        &child_id, &task.user_task_id, snapshot.instance.revision, &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms)
         .unwrap().instance;
     assert_eq!(replay, accepted);
     assert_eq!(call_tests::transition_rows(&fixture), rows);
@@ -393,9 +393,9 @@ fn immediate_pinned_terminate_child_has_no_manual_command_and_reopens_exactly() 
     let command = runtime::test_support::stamp("immediate called termination");
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let plan = runtime::plan_start(&version.model,&instance_id,&fixture.owner,&version.definition_id,
-        version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command)).unwrap();
+        version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command), None).unwrap();
     let parent = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-        &version.definition_id,version.version,&variables,&plan,at).unwrap();
+        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(parent.status,ProcessInstanceStatus::Completed);
     assert_eq!(parent.variables["received"],json!(42));
     let child_id = call_tests::child_id(&fixture,&instance_id);
@@ -433,7 +433,7 @@ fn immediate_pinned_terminate_child_has_no_manual_command_and_reopens_exactly() 
         }
     }
     let replay = repository::start_instance(&reopened,&owner,&command,&uuid::Uuid::new_v4().to_string(),
-        &version.definition_id,version.version,&variables,&plan,at).unwrap();
+        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(replay,parent);
     assert_eq!(repository::list_events(&reopened,&owner,&child_id,0,200).unwrap().0,events);
     assert_eq!(repository::list_events(&reopened,&owner,&instance_id,0,200).unwrap().0,parent_events);
@@ -512,7 +512,7 @@ fn parent_termination_closes_active_or_completed_child_in_both_return_orders() {
         let stale_command = runtime::test_support::stamp("stale child termination after parent closure");
         let at = chrono::Utc::now().timestamp_millis();
         let stale_plan = runtime::plan_user_completion(&child_before,&child_task.user_task_id,&json!({}),None,at,
-            runtime::test_support::human_input(&child_before,&child_task.user_task_id,&stale_command)).unwrap();
+            runtime::test_support::human_input(&child_before,&child_task.user_task_id,&stale_command), None).unwrap();
         if child_first {
             let child_done = messages::test_support::complete(&fixture,&child_id,&child_task.user_task_id);
             assert_eq!(child_done.status,ProcessInstanceStatus::Completed);
@@ -529,9 +529,9 @@ fn parent_termination_closes_active_or_completed_child_in_both_return_orders() {
         let command = runtime::test_support::stamp("accepted parent TerminateEnd input");
         let now = chrono::Utc::now().timestamp_millis();
         let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&json!({}),None,now,
-            runtime::test_support::human_input(&snapshot,&task.user_task_id,&command)).unwrap();
+            runtime::test_support::human_input(&snapshot,&task.user_task_id,&command), None).unwrap();
         let terminated = repository::complete_user_task(&fixture.db,&fixture.owner,&command,&parent.instance_id,
-            &task.user_task_id,snapshot.instance.revision,&json!({}),None,&plan,now).unwrap();
+            &task.user_task_id,snapshot.instance.revision,&json!({}),None,repository::ProcessPlanInput::Supplied(&plan),now).unwrap();
         assert_eq!(terminated.instance.status,ProcessInstanceStatus::Completed);
         assert!(terminated.cancelled_claims.is_empty());
         let source = termination_event(&fixture,&parent.instance_id);
@@ -579,13 +579,13 @@ fn parent_termination_closes_active_or_completed_child_in_both_return_orders() {
         }
         let before_replay = call_tests::transition_rows(&fixture);
         let replay = repository::complete_user_task(&fixture.db,&fixture.owner,&command,&parent.instance_id,
-            &task.user_task_id,snapshot.instance.revision,&json!({}),None,&plan,now).unwrap();
+            &task.user_task_id,snapshot.instance.revision,&json!({}),None,repository::ProcessPlanInput::Supplied(&plan),now).unwrap();
         assert_eq!(replay.instance,terminated.instance);
         assert!(replay.cancelled_claims.is_empty());
         assert_eq!(call_tests::transition_rows(&fixture),before_replay);
         if !child_first {
             assert!(repository::complete_user_task(&fixture.db,&fixture.owner,&stale_command,&child_id,
-                &child_task.user_task_id,child_before.instance.revision,&json!({}),None,&stale_plan,at).is_err());
+                &child_task.user_task_id,child_before.instance.revision,&json!({}),None,repository::ProcessPlanInput::Supplied(&stale_plan),at).is_err());
             assert_eq!(call_tests::transition_rows(&fixture),before_replay);
         }
         let path = fixture.directory.path().join("processes.db");
@@ -623,7 +623,7 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
     let at = chrono::Utc::now().timestamp_millis();
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let plan = runtime::plan_start(&version.model,&instance_id,&fixture.owner,&version.definition_id,
-        version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command)).unwrap();
+        version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command), None).unwrap();
     let controls = ["call-id","called-definition","called-version","model-pin","parent-revision","step-index",
         "mapped-child-input","foreign-source-instance","foreign-source-uuid","extra-ready-token","omitted-closure","extra-variable-effect"];
     let before = call_tests::transition_rows(&fixture);
@@ -688,14 +688,14 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
             }
         })));
         let attempted = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-            &version.definition_id,version.version,&variables,&plan,at);
+            &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at);
         repository::CALL_PLAN_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
         assert!(inspected.load(std::sync::atomic::Ordering::SeqCst),"{label} inspected real canonical child plan");
         assert!(attempted.is_err(),"{label} must reject atomically");
         assert_eq!(call_tests::transition_rows(&fixture),before,"{label}: every column of all fourteen tables");
     }
     let accepted = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-        &version.definition_id,version.version,&variables,&plan,at).unwrap();
+        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(accepted.status,ProcessInstanceStatus::Completed);
     let child_id = call_tests::child_id(&fixture,&instance_id);
     assert_eq!(repository::get_instance(&fixture.db,&fixture.owner,&child_id,None).unwrap().variables["seed"],json!(9));
@@ -704,7 +704,7 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
     let committed = call_tests::transition_rows(&fixture);
     assert_ne!(committed,before);
     let replay = repository::start_instance(&fixture.db,&fixture.owner,&command,&uuid::Uuid::new_v4().to_string(),
-        &version.definition_id,version.version,&variables,&plan,at).unwrap();
+        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(replay,accepted);
     assert_eq!(call_tests::transition_rows(&fixture),committed);
 }
@@ -730,9 +730,9 @@ fn parent_termination_fences_real_child_service_in_both_commit_orders_without_re
             let command = runtime::test_support::stamp("terminate real called worker");
             let now = chrono::Utc::now().timestamp_millis();
             let plan = runtime::plan_user_completion(&snapshot,&task.user_task_id,&json!({}),None,now,
-                runtime::test_support::human_input(&snapshot,&task.user_task_id,&command)).unwrap();
+                runtime::test_support::human_input(&snapshot,&task.user_task_id,&command), None).unwrap();
             repository::complete_user_task(&fixture.db,&fixture.owner,&command,&parent.instance_id,
-                &task.user_task_id,snapshot.instance.revision,&json!({}),None,&plan,now)
+                &task.user_task_id,snapshot.instance.revision,&json!({}),None,repository::ProcessPlanInput::Supplied(&plan),now)
         };
         let outcome;
         let completed_jobs;
@@ -749,6 +749,7 @@ fn parent_termination_fences_real_child_service_in_both_commit_orders_without_re
             let (ready_tx,ready_rx) = std::sync::mpsc::sync_channel(0);
             let (resume_tx,resume_rx) = std::sync::mpsc::sync_channel(0);
             outcome = std::thread::scope(|scope| {
+                let resume_tx = resume_tx;
                 let fixture = &fixture;
                 let pending = scope.spawn(move || {
                     repository::CALL_TRANSITION_PREFLIGHT.with(|gate| *gate.borrow_mut() = Some((ready_tx,resume_rx)));

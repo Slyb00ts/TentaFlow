@@ -26236,6 +26236,32 @@ mod process_wire_tests {
     }
 
     #[test]
+    fn process_request_encoder_preserves_signal_declarations_and_distinct_event_kinds() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Signals","description":"",
+            "model":{"schema_version":1,"process_id":"P_1","target_namespace":"urn:orders",
+                "signals":[{"signal_id":"Signal_1","namespace_uri":"urn:orders","name":"Order changed"}],
+                "nodes":[
+                    {"id":"Throw_1","name":"Admit","kind":{"SignalThrow":{
+                        "signal_ref":"Signal_1","payload_expression":"vars.payload","ttl_seconds":3600}}},
+                    {"id":"Catch_1","name":"Wait","kind":{"SignalCatch":{
+                        "signal_ref":"Signal_1","output_mapping":{"received":"outputs"}}}}],
+                "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed signal save request expected");
+        };
+        assert_eq!(model.signals[0].namespace_uri, "urn:orders");
+        assert!(matches!(&model.nodes[0].kind, ProcessNodeKind::SignalThrow { signal_ref, .. } if signal_ref == "Signal_1"));
+        assert!(matches!(&model.nodes[1].kind, ProcessNodeKind::SignalCatch { signal_ref, .. } if signal_ref == "Signal_1"));
+    }
+
+    #[test]
     fn process_request_encoder_keeps_repeat_variants_and_selected_value_selector() {
         use tentaflow_protocol::processes::{ProcessMultiInstanceInput, ProcessMultiInstanceMode,
             ProcessPayload, ProcessRepeatSpec, ProcessRepetitionValueKind};

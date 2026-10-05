@@ -113,6 +113,7 @@ pub fn starter_model() -> ProcessModel {
         errors: Vec::new(),
         target_namespace: None,
         escalations: Vec::new(),
+        signals: Vec::new(),
     }
 }
 
@@ -141,7 +142,8 @@ fn validate_declarations<'a>(model: &'a ProcessModel, ids: &mut HashSet<&'a str>
         );
     }
     ensure!(
-        model.messages.len() <= 32 && model.errors.len() <= 32 && model.escalations.len() <= 32,
+        model.messages.len() <= 32 && model.errors.len() <= 32
+            && model.escalations.len() <= 32 && model.signals.len() <= 32,
         "process declaration limit exceeded"
     );
     let mut names = HashSet::new();
@@ -210,6 +212,18 @@ fn validate_declarations<'a>(model: &'a ProcessModel, ids: &mut HashSet<&'a str>
             "invalid or duplicate escalation code: {}",
             escalation.escalation_code
         );
+    }
+    if !model.signals.is_empty() {
+        ensure!(model.target_namespace.is_some(), "signal declarations require an explicit target namespace");
+    }
+    for signal in &model.signals {
+        ensure!(valid_id(&signal.signal_id) && ids.insert(signal.signal_id.as_str()),
+            "invalid or duplicate BPMN ID: {}", signal.signal_id);
+        ensure!(signal.namespace_uri == model.target_namespace.as_deref().unwrap_or_default(),
+            "signal {} namespace differs from the process target namespace", signal.signal_id);
+        ensure!(!signal.name.is_empty() && signal.name.len() <= 256
+            && !signal.name.chars().any(char::is_control),
+            "invalid signal name: {}", signal.signal_id);
     }
     Ok(())
 }
@@ -529,6 +543,14 @@ fn validate_draft_body<'a>(
                 )?;
                 validate_mapping(output_mapping, false)?;
             }
+            ProcessNodeKind::SignalCatch { output_mapping, .. } => {
+                validate_mapping(output_mapping, false)?;
+            }
+            ProcessNodeKind::SignalThrow { payload_expression, ttl_seconds, .. } => {
+                validate_expression(payload_expression, "signal payload expression", false)?;
+                ensure!((1..=604_800).contains(ttl_seconds),
+                    "signal TTL outside 1..=604800 seconds");
+            }
             ProcessNodeKind::MessageThrow { target, correlation_expression, payload_expression,
                 ttl_seconds, .. }
             | ProcessNodeKind::SendTask { target, correlation_expression, payload_expression,
@@ -616,9 +638,11 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         .iter()
         .map(|escalation| escalation.escalation_id.as_str())
         .collect();
+    let signal_ids: HashSet<_> = model.signals.iter().map(|signal| signal.signal_id.as_str()).collect();
     let mut used_messages = HashSet::new();
     let mut used_errors = HashSet::new();
     let mut used_escalations = HashSet::new();
+    let mut used_signals = HashSet::new();
     validate_body(
         &model.nodes,
         &model.sequence_flows,
@@ -628,9 +652,11 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         &message_ids,
         &error_ids,
         &escalation_ids,
+        &signal_ids,
         &mut used_messages,
         &mut used_errors,
         &mut used_escalations,
+        &mut used_signals,
     )?;
     ensure!(
         message_ids == used_messages,
@@ -641,6 +667,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         escalation_ids == used_escalations,
         "unreferenced escalation declaration"
     );
+    ensure!(signal_ids == used_signals, "unreferenced signal declaration");
     Ok(())
 }
 
@@ -653,9 +680,11 @@ fn validate_body<'a>(
     message_ids: &HashSet<&str>,
     error_ids: &HashSet<&str>,
     escalation_ids: &HashSet<&str>,
+    signal_ids: &HashSet<&str>,
     used_messages: &mut HashSet<&'a str>,
     used_errors: &mut HashSet<&'a str>,
     used_escalations: &mut HashSet<&'a str>,
+    used_signals: &mut HashSet<&'a str>,
 ) -> Result<()> {
     ensure!(
         !graph_nodes.is_empty() && !graph_flows.is_empty(),
@@ -754,6 +783,19 @@ fn validate_body<'a>(
                 validate_expression(payload_expression, "message payload expression", true)?;
                 ensure!((1..=604_800).contains(ttl_seconds), "message TTL outside 1..=604800 seconds");
             }
+            ProcessNodeKind::SignalCatch { signal_ref, output_mapping } => {
+                ensure!(signal_ids.contains(signal_ref.as_str()),
+                    "signal catch {} references an unknown declaration", node.id);
+                used_signals.insert(signal_ref.as_str());
+                validate_mapping(output_mapping, false)?;
+            }
+            ProcessNodeKind::SignalThrow { signal_ref, payload_expression, ttl_seconds } => {
+                ensure!(signal_ids.contains(signal_ref.as_str()),
+                    "signal throw {} references an unknown declaration", node.id);
+                used_signals.insert(signal_ref.as_str());
+                validate_expression(payload_expression, "signal payload expression", true)?;
+                ensure!((1..=604_800).contains(ttl_seconds), "signal TTL outside 1..=604800 seconds");
+            }
             ProcessNodeKind::BoundaryError { attached_to_id, error_ref, output_mapping } => {
                 if let Some(reference) = error_ref {
                     ensure!(error_ids.contains(reference.as_str()), "boundary error {} references an unknown declaration", node.id);
@@ -805,9 +847,11 @@ fn validate_body<'a>(
                     message_ids,
                     error_ids,
                     escalation_ids,
+                    signal_ids,
                     used_messages,
                     used_errors,
                     used_escalations,
+                    used_signals,
                 )
                 .with_context(|| format!("embedded subprocess {}", node.id))?;
             }
@@ -1267,8 +1311,10 @@ impl EscalationPrefixProof<'_> {
                 | ProcessNodeKind::TimerCatch { .. }
                 | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::SignalCatch { .. }
                 | ProcessNodeKind::EventBasedGateway => Ok(false),
                 ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. }
+                | ProcessNodeKind::SignalThrow { .. }
                 | ProcessNodeKind::ScriptTask { .. } => self.follow_one(node_id, stop_join),
                 ProcessNodeKind::ExclusiveGateway { .. } => {
                     let outgoing = self.outgoing.get(node_id).cloned().unwrap_or_default();
@@ -2668,5 +2714,42 @@ mod tests {
             *message_ref = "Missing".into();
         }
         assert!(validate_model(&model).unwrap_err().to_string().contains("unknown declaration"));
+    }
+
+    #[test]
+    fn signals_require_exact_namespace_declarations_and_exclude_direct_repeat() {
+        let mut model = starter_model();
+        model.target_namespace = Some("urn:orders".into());
+        model.signals.push(tentaflow_protocol::processes::ProcessSignalDeclaration {
+            signal_id: "Signal_1".into(), namespace_uri: "urn:orders".into(), name: "Order changed".into(),
+        });
+        model.variables.insert("payload".into(), serde_json::json!({"business_key": 1}));
+        model.nodes.insert(1, ProcessNode { id: "Throw_1".into(), name: "Admit signal".into(), repeat: None,
+            kind: ProcessNodeKind::SignalThrow { signal_ref: "Signal_1".into(),
+                payload_expression: "vars.payload".into(), ttl_seconds: 60 } });
+        model.nodes.insert(2, ProcessNode { id: "Catch_1".into(), name: "Wait for signal".into(), repeat: None,
+            kind: ProcessNodeKind::SignalCatch { signal_ref: "Signal_1".into(),
+                output_mapping: BTreeMap::new() } });
+        model.sequence_flows[0].target_id = "Throw_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Throw".into(),
+            source_id: "Throw_1".into(), target_id: "Catch_1".into(), condition: None });
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Catch".into(),
+            source_id: "Catch_1".into(), target_id: "End_1".into(), condition: None });
+        validate_model(&model).unwrap();
+        model.target_namespace = None;
+        assert!(validate_model(&model).unwrap_err().to_string().contains("explicit target namespace"));
+        model.target_namespace = Some("urn:orders".into());
+        model.signals[0].namespace_uri = "urn:foreign".into();
+        assert!(validate_model(&model).unwrap_err().to_string().contains("namespace differs"));
+        model.signals[0].namespace_uri = "urn:orders".into();
+        model.nodes[2].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
+        model.nodes[2].repeat = None;
+        if let ProcessNodeKind::SignalThrow { ttl_seconds, .. } = &mut model.nodes[1].kind { *ttl_seconds = 0; }
+        assert!(validate_model(&model).unwrap_err().to_string().contains("TTL"));
     }
 }
