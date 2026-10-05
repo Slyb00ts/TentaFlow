@@ -19,6 +19,7 @@ const ELEMENTS = [
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
   ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
   ['ScriptTask', 'script_task', 'code', 'tasks', 240, 96],
+  ['ManualTask', 'manual_task', 'check', 'tasks', 240, 96],
   ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
   ['CallActivity', 'call_activity', 'layers', 'tasks', 240, 96],
   ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
@@ -47,6 +48,7 @@ export function processNodeConfig(kind) {
   if (kind === 'UserTask') return { assigneeUserId: null, outputMapping: {} };
   if (kind === 'ServiceTask') return { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60 };
   if (kind === 'ScriptTask') return { script: '', outputMapping: {} };
+  if (kind === 'ManualTask') return { assigneeUserId: null, instructions: '' };
   if (kind === 'ExclusiveGateway' || kind === 'InclusiveGateway') return { defaultFlowId: null };
   if (kind === 'TimerStart' || kind === 'TimerCatch') return { timer: { Duration: { seconds: 60 } } };
   if (kind === 'BoundaryTimer') return { attachedToId: null, cancelActivity: true, timer: { Duration: { seconds: 60 } } };

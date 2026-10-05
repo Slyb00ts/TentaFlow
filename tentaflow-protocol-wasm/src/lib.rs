@@ -26178,6 +26178,36 @@ mod process_wire_tests {
     }
 
     #[test]
+    fn process_request_encoder_preserves_manual_instructions_and_distinct_acknowledgment() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Manual","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Manual_1","name":"External work","kind":{"ManualTask":{
+                    "assignee_user_id":null,"instructions":"Check the register.\nAcknowledge here."}}}],
+                "sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed manual save request expected");
+        };
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::ManualTask {
+            assignee_user_id: None, instructions: "Check the register.\nAcknowledge here.".into(),
+        });
+
+        let fields = serde_json::json!({"command_id":"ack","instance_id":"i1",
+            "user_task_id":"t1","expected_revision":3});
+        let bytes = encode_process_request("ManualTaskAcknowledgeRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        assert!(matches!(body, MessageBody::ProcessBody(ProcessPayload::ManualTaskAcknowledgeRequest {
+            command_id, instance_id, user_task_id, expected_revision
+        }) if command_id == "ack" && instance_id == "i1" && user_task_id == "t1" && expected_revision == 3));
+    }
+
+    #[test]
     fn process_request_encoder_keeps_repeat_variants_and_selected_value_selector() {
         use tentaflow_protocol::processes::{ProcessMultiInstanceInput, ProcessMultiInstanceMode,
             ProcessPayload, ProcessRepeatSpec, ProcessRepetitionValueKind};

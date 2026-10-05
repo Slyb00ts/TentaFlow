@@ -980,6 +980,105 @@ test('inspector selects an eligible person by stable ID and inner blur cannot cl
   graph.destroy(); config.destroy();
 });
 
+test('manual inspector saves pinned instructions and discloses assigned execution access', async () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'Manual_1', name: 'External review',
+    kind: { ManualTask: { assigneeUserId: null, instructions: '' } } });
+  model.sequenceFlows[0].targetId = 'Manual_1';
+  model.sequenceFlows.push({ id: 'ManualExit', sourceId: 'Manual_1', targetId: 'End', condition: null });
+  const state = await mount(definition('manual-draft', { model }), {
+    processDefinitionSaveRequest: (payload) => ({ definition: definition('manual-draft',
+      { model: payload.model, draftRevision: 5 }) }),
+  });
+  state.canvas.selectNode('Manual_1');
+  await flush(2);
+  const picker = state.root.querySelector('tf-person-picker');
+  const instructions = state.root.querySelector('[data-process="instructions"]');
+  assert.equal(instructions.tagName, 'TF-TEXTAREA');
+  assert.equal(state.root.querySelector('[data-process="outputMapping"]'), null);
+  assert.equal(state.root.querySelector('[data-process="repeatMode"]'), null);
+  click(picker.querySelector('[data-id="lee"]'));
+  change(instructions, 'Inspect <register> & report.\nAcknowledge outside work.');
+  assert.match(state.root.textContent, new RegExp(I18n.t('bpmn.manual_access_disclosure')));
+  assert.equal(await builder._save(), true);
+  const saved = calls.find((row) => row.kind === 'processDefinitionSaveRequest').payload.model;
+  assert.deepEqual(saved.nodes.find((node) => node.id === 'Manual_1').kind, { ManualTask: {
+    assigneeUserId: 'lee', instructions: 'Inspect <register> & report.\nAcknowledge outside work.' } });
+  state.canvas.selectNode('Manual_1');
+  const readonly = inspector(state.canvas, true);
+  readonly.show(state.canvas.nodes.find((node) => node.id === 'Manual_1'), state.canvas.templates.get('bpmn_manual_task'));
+  assert.equal(readonly.root.querySelector('[data-process="instructions"]').hasAttribute('disabled'), true);
+  assert.equal(readonly.root.querySelector('[data-process="instructions"]').value,
+    'Inspect <register> & report.\nAcknowledge outside work.');
+  assert.equal(readonly.root.querySelector('[data-process="delete"]'), null);
+  readonly.destroy();
+});
+
+test('manual acknowledgment uses its own command with pinned instructions and no outputs in five locales', async () => {
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const task = { userTaskId: 'manual-task-1', nodeId: 'Manual_1', name: 'External <&> review',
+        assigneeUserId: 'lee', kind: 'Manual', status: 'Open', outputs: null,
+        instructions: 'Inspect <register> & report.\nAcknowledge outside work.',
+        revision: 1, canComplete: true, scopeId: 'instance-one' };
+      const current = instance(`manual-${language}`, { userTasks: [task] });
+      const win = await monitor(current, {
+        processUserTaskGetRequest: { task },
+        processManualTaskAcknowledgeRequest: ({ instanceId }) => ({ instance: instance(instanceId,
+          { revision: current.revision + 1, userTasks: [] }) }),
+      });
+      assert.match(win.querySelector('[data-work]').textContent, new RegExp(I18n.t('bpmn.work_kind_manual')));
+      assert.equal(win.querySelector('[data-complete]').textContent, I18n.t('bpmn.acknowledge_manual'));
+      click(win.querySelector('[data-complete]')); await flush();
+      const form = [...document.querySelectorAll('.tf-act-window')].at(-1);
+      assert.equal(form.querySelector('tf-code-editor'), null);
+      assert.equal(form.querySelector('[data-approved]'), null);
+      assert.equal(form.querySelector('tf-textarea').value, task.instructions);
+      assert.ok(form.textContent.includes(I18n.t('bpmn.manual_acknowledgment_notice')));
+      assert.equal(form.querySelector('script'), null);
+      click(form.querySelector('[data-act="submit"]')); await flush();
+      const mutation = calls.filter((row) => row.kind === 'processManualTaskAcknowledgeRequest').at(-1).payload;
+      assert.equal(mutation.instanceId, current.instanceId);
+      assert.equal(mutation.userTaskId, task.userTaskId);
+      assert.equal(mutation.expectedRevision, current.revision);
+      assert.equal(Object.hasOwn(mutation, 'outputs'), false);
+      assert.equal(Object.hasOwn(mutation, 'approved'), false);
+      assert.ok(processEventText({ kind: 'manual_task_opened', nodeName: task.name, data: {} })
+        .includes(I18n.t('bpmn.event_manual_task_opened', { node: task.name })));
+      assert.ok(processEventText({ kind: 'manual_task_acknowledged', nodeName: task.name, data: {} })
+        .includes(I18n.t('bpmn.event_manual_task_acknowledged', { node: task.name })));
+      win.remove(); form.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('manual acknowledgment stays unavailable without pinned instructions', async () => {
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const instructions of [undefined, '']) {
+        const task = { userTaskId: 'manual-task-1', nodeId: 'Manual_1', name: 'External review',
+          assigneeUserId: 'lee', kind: 'Manual', status: 'Open', outputs: null,
+          revision: 1, canComplete: true, scopeId: 'instance-one' };
+        if (instructions !== undefined) task.instructions = instructions;
+        const current = instance(`manual-missing-${language}`, { userTasks: [task] });
+        const win = await monitor(current, { processUserTaskGetRequest: { task } });
+        const priorForms = document.querySelectorAll('.tf-act-window').length;
+        click(win.querySelector('[data-complete]')); await flush();
+        assert.equal(document.querySelectorAll('.tf-act-window').length, priorForms);
+        const error = win.querySelector('[data-error]');
+        assert.equal(error.hidden, false);
+        assert.equal(error.getAttribute('message'), I18n.t('bpmn.request_error', {
+          error: I18n.t('bpmn.manual_instructions'),
+        }));
+        assert.equal(calls.some((row) => row.kind === 'processManualTaskAcknowledgeRequest'), false);
+        win.remove();
+      }
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('service inspector edits actual flow, Human/Condition, mappings and timeout without changing mapping keys', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
@@ -1120,8 +1219,9 @@ test('repeat inspector changes survive the mounted draft save and undo/redo snap
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 22);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 23);
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_manual_task"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
   item.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientX: 1, clientY: 1 }));
@@ -1889,11 +1989,17 @@ test('run uses immutable selected version variables and blocks oversized input b
 });
 
 test('all five locales translate supported elements, current statuses and every finite event without exposing internal IDs', async () => {
-  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
+  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 22);
+    assert.equal(processTemplates().length, 23);
+    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_manual_task')?.label,
+      I18n.t('bpmn.node_manual_task'));
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
+    for (const kind of ['manual_task_opened', 'manual_task_acknowledged']) {
+      assert.equal(processEventText({ kind, nodeName: 'External work', data: {} }),
+        I18n.t(`bpmn.event_${kind}`, { node: 'External work' }));
+    }
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });
       assert.doesNotMatch(output, /bpmn\.|raw-job|raw-task|SOURCE_ACCESS_REVOKED/);

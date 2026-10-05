@@ -1146,6 +1146,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "process_activity_repetition",
             MigrationStep::Rust(process_activity_repetition),
         ),
+        (
+            190,
+            "bpmn_manual_task_acknowledgments",
+            MigrationStep::RustSelfManaged(bpmn_manual_task_acknowledgments),
+        ),
     ]
 }
 
@@ -2388,6 +2393,78 @@ fn process_activity_repetition(conn: &rusqlite::Connection) -> anyhow::Result<()
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     anyhow::ensure!(integrity == "ok", "repetition migration integrity: {integrity}");
     Ok(())
+}
+
+const BPMN_MANUAL_TASK_ACKNOWLEDGMENTS: &str = r#"
+CREATE TABLE bpmn_user_tasks_190 (
+    user_task_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    assignee_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    kind TEXT NOT NULL CHECK(kind IN ('work','verification','manual')),
+    status TEXT NOT NULL CHECK(status IN ('open','completed','cancelled')),
+    outputs_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(status<>'open' OR token_id IS NOT NULL),
+    CHECK(kind<>'manual' OR outputs_json='null')
+);
+INSERT INTO bpmn_user_tasks_190(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id)
+SELECT user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id FROM bpmn_user_tasks;
+"#;
+
+fn bpmn_manual_task_acknowledgments(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+) -> Result<()> {
+    let original_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        anyhow::ensure!(disabled == 0, "manual task migration requires foreign keys disabled");
+        let tx = conn.unchecked_transaction()?;
+        let old_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_user_tasks", [], |row| row.get(0))?;
+        tx.execute_batch(BPMN_MANUAL_TASK_ACKNOWLEDGMENTS)?;
+        let new_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_user_tasks_190", [], |row| row.get(0))?;
+        anyhow::ensure!(old_count == new_count, "manual task migration changed task count");
+        let changed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (SELECT user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id FROM bpmn_user_tasks EXCEPT SELECT user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id FROM bpmn_user_tasks_190)",
+            [], |row| row.get(0))?;
+        anyhow::ensure!(changed == 0, "manual task migration changed an existing task row");
+        tx.execute_batch("DROP TABLE bpmn_user_tasks;
+            ALTER TABLE bpmn_user_tasks_190 RENAME TO bpmn_user_tasks;
+            CREATE INDEX idx_bpmn_user_tasks_assignee ON bpmn_user_tasks(assignee_user_id,status,updated_at_ms DESC);")?;
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(violations.is_empty(),
+            "manual task migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "manual task migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations (version,name) VALUES (?1,?2)",
+            rusqlite::params![version,name])?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if original_fk == 0 { "PRAGMA foreign_keys = OFF;" }
+        else { "PRAGMA foreign_keys = ON;" };
+    let restored = conn.execute_batch(restore).and_then(|()|
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)));
+    match (result, restored) {
+        (Ok(()), Ok(mode)) if mode == original_fk => Ok(()),
+        (Ok(()), Ok(_)) => anyhow::bail!("manual task migration could not restore foreign key mode"),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Ok(mode)) if mode == original_fk => Err(error),
+        (Err(error), Ok(_)) => Err(error.context(
+            "manual task migration could not restore foreign key mode")),
+        (Err(error), Err(restore)) => Err(error.context(format!(
+            "manual task migration could not restore foreign key mode: {restore}"))),
+    }
 }
 
 fn bpmn_gateway_receipts(conn: &rusqlite::Connection) -> anyhow::Result<()> {
@@ -16178,7 +16255,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 189);
+        assert_eq!(version, 190);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -16205,7 +16282,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 189);
+        assert_eq!(version, 190);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -16309,7 +16386,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 189);
+        assert_eq!(version, 190);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(
@@ -16414,7 +16491,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            189
+            190
         );
         assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
         let receipt: (String, String, String) = conn
@@ -16803,7 +16880,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            189
+            190
         );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(
@@ -16857,7 +16934,7 @@ mod tests {
         let old_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         run(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 189);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 190);
         let new_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(new_tables.len(), old_tables.len() + 2);
@@ -16890,5 +16967,56 @@ mod tests {
         assert!(!table_exists(&conn, "bpmn_repetition_occurrences").unwrap());
         assert_eq!(conn.query_row("SELECT token_id FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'", [], |row| row.get::<_, String>(0)).unwrap(), "missing-token");
         assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    fn populated_manual_upgrade_fixture(conn: &Connection) {
+        gateway_migration_fixture(conn);
+        run_ladder_up_to(conn, 189);
+        conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES('legacy-work','and-instance','and-instance','Branch_2','Legacy work','and-owner','work','completed','{\"opaque_task\":true}',2,1,2,'token-2')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_groups(group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,output_collection_variable,entry_variables_json,total_count,created_count,completed_count,loop_state_revision,next_ordinal,retained_bytes,revision,created_at_ms,updated_at_ms) VALUES('legacy-group','and-instance','and-instance','and-nine',1,'Branch_2','mi_parallel','open','token-0','token-1','business_key','{\"business_key\":\"retained\"}',1,1,0,0,1,100,1,1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_occurrences(occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,user_task_id,item_json,input_variables_json,revision,created_at_ms,updated_at_ms) VALUES('legacy-occurrence','and-instance','and-instance','legacy-group',0,'active','token-2','legacy-work','null','{\"business_key\":\"retained\"}',1,1,1)", []).unwrap();
+    }
+
+    #[test]
+    fn manual_migration_preserves_populated_repetition_task_references_and_opaque_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("manual-upgrade.db")).unwrap();
+        populated_manual_upgrade_fixture(&conn);
+        let before: (String,String,String) = conn.query_row(
+            "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 190);
+        let after: (String,String,String) = conn.query_row(
+            "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(after, before);
+        conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES('new-manual','and-instance','and-instance','Branch_3','Manual','and-owner','manual','open','null',1,2,2,'token-3')", []).unwrap();
+        assert!(conn.execute("UPDATE bpmn_user_tasks SET outputs_json='{}' WHERE user_task_id='new-manual'", []).is_err());
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(), "ok");
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM _migrations WHERE version=190", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn manual_migration_rolls_back_invalid_repetition_task_reference_and_restores_fk_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("manual-corrupt.db")).unwrap();
+        populated_manual_upgrade_fixture(&conn);
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute("UPDATE bpmn_repetition_occurrences SET user_task_id='missing-task' WHERE occurrence_id='legacy-occurrence'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 189);
+        assert!(!table_exists(&conn, "bpmn_user_tasks_190").unwrap());
+        assert_eq!(conn.query_row("SELECT user_task_id FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "missing-task");
+        assert_eq!(conn.query_row("SELECT outputs_json FROM bpmn_user_tasks WHERE user_task_id='legacy-work'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "{\"opaque_task\":true}");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
     }
 }

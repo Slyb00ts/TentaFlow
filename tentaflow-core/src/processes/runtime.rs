@@ -571,8 +571,17 @@ impl<'a> Transition<'a> {
             revision: 1,
             can_complete: false,
             token_id: Some(token_id.to_owned()),
+            instructions: match &node.kind {
+                ProcessNodeKind::ManualTask { instructions, .. } => Some(instructions.clone()),
+                _ => None,
+            },
         };
-        self.event("user_task_opened", Some(node.id.clone()), json!({"user_task_id": task.user_task_id, "assignee_user_id": assignee, "kind": task.kind}));
+        if task.kind == ProcessUserTaskKind::Manual {
+            self.event("manual_task_opened", Some(node.id.clone()),
+                json!({"user_task_id":task.user_task_id,"assignee_user_id":assignee}));
+        } else {
+            self.event("user_task_opened", Some(node.id.clone()), json!({"user_task_id": task.user_task_id, "assignee_user_id": assignee, "kind": task.kind}));
+        }
         self.tasks.push(task.clone());
         self.plan.create_user_tasks.push(task);
     }
@@ -2692,6 +2701,12 @@ impl<'a> Transition<'a> {
                     }
                     self.arm_boundaries(&node, &token_id)?;
                 }
+                ProcessNodeKind::ManualTask { assignee_user_id, .. } => {
+                    let token_id = self.wait(&token, "waiting");
+                    self.user_task(&node, ProcessUserTaskKind::Manual,
+                        assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
+                        Value::Null, &token_id);
+                }
                 ProcessNodeKind::TimerCatch { timer } => {
                     let token_id = self.wait(&token, "waiting");
                     self.arm_timer(&node, &token_id, ProcessTimerKind::Catch, &timer)?;
@@ -3665,6 +3680,49 @@ pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64) -> Result<RuntimePl
     transition.finish()
 }
 
+pub fn plan_manual_acknowledgment(
+    snapshot: &RuntimeSnapshot,
+    task_id: &str,
+    actor_user_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+) -> Result<RuntimePlan> {
+    ensure!(matches!(&accepted_input,
+        AcceptedInputRef::ManualAcknowledgment { task_id: selected, .. } if selected == task_id),
+        "manual acknowledgment input differs from its task");
+    let mut transition = Transition::from_snapshot(snapshot, now_ms)?;
+    transition.accepted_input = Some(accepted_input);
+    let task = snapshot.user_tasks.iter().find(|task|
+        task.user_task_id == task_id && task.status == ProcessUserTaskStatus::Open
+            && task.kind == ProcessUserTaskKind::Manual)
+        .context("open manual task not found")?;
+    ensure!(task.assignee_user_id == actor_user_id && task.outputs.is_null(),
+        "manual acknowledgment differs from its assigned control");
+    transition.current_scope = task.scope_id.clone();
+    let node = transition.node(&task.node_id)?.clone();
+    ensure!(matches!(&node.kind, ProcessNodeKind::ManualTask { .. }),
+        "manual acknowledgment node is not pinned ManualTask");
+    let token = transition.tokens.iter().find(|token|
+        task.token_id.as_deref() == Some(token.token_id.as_str())
+            && token.node_id == node.id && token.scope_id == task.scope_id
+            && token.status == "waiting")
+        .context("manual task waiting token missing")?.clone();
+    transition.plan.complete_user_task_ids.push(task_id.to_owned());
+    transition.tasks.retain(|existing| existing.user_task_id != task_id);
+    transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+    transition.resolve_boundary_incidents(&token.token_id);
+    transition.consume(&token.token_id);
+    let event_index = transition.plan.events.len();
+    transition.plan.event_ids.insert(event_index, Uuid::new_v4().to_string());
+    transition.event("manual_task_acknowledged", Some(node.id.clone()),
+        json!({"user_task_id":task_id,"acknowledged_by_user_id":actor_user_id}));
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    transition.finish()
+}
+
 pub fn plan_user_completion(
     snapshot: &RuntimeSnapshot,
     task_id: &str,
@@ -3741,6 +3799,8 @@ pub fn plan_user_completion(
                 .context("verification has no persisted activity result")?;
             result.outputs
         }
+        ProcessUserTaskKind::Manual => anyhow::bail!(
+            "manual acknowledgment requires its distinct command"),
     };
     let mapping = match &node.kind {
         ProcessNodeKind::UserTask { output_mapping, .. }

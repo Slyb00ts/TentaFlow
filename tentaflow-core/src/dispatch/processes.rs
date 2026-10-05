@@ -428,6 +428,42 @@ pub fn process_dispatch(
             task: repository::get_user_task(pool, &actor, instance_id, user_task_id)
                 .map_err(error)?,
         },
+        P::ManualTaskAcknowledgeRequest {
+            command_id, instance_id, user_task_id, expected_revision,
+        } => {
+            let stamp = stamp(payload, command_id)?;
+            let instance = if let Some(prior) =
+                repository::replay_instance_command(pool, &actor, &stamp, Some(instance_id))
+                    .map_err(error)? {
+                prior
+            } else {
+                let snapshot = repository::runtime_snapshot(pool, &actor, instance_id)
+                    .map_err(error)?;
+                let task_revision = snapshot.user_tasks.iter().find(|task|
+                    task.user_task_id == *user_task_id
+                        && task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open
+                        && task.kind == tentaflow_protocol::processes::ProcessUserTaskKind::Manual)
+                    .map(|task| task.revision)
+                    .ok_or_else(|| error(anyhow::anyhow!("open manual task not found")))?;
+                let at_ms = chrono::Utc::now().timestamp_millis();
+                let plan = runtime::plan_manual_acknowledgment(&snapshot, user_task_id,
+                    &actor.user_id, at_ms,
+                    repository::AcceptedInputRef::ManualAcknowledgment {
+                        task_id: user_task_id.clone(), expected_task_revision: task_revision,
+                        expected_instance_revision: snapshot.instance.revision,
+                        command_id: stamp.command_id.clone(),
+                        request_hash: stamp.request_hash.clone(),
+                    }).map_err(error)?;
+                let outcome = repository::acknowledge_manual_task(pool, &actor, &stamp,
+                    instance_id, user_task_id, *expected_revision, &plan, at_ms)
+                    .map_err(error)?;
+                if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                    runtime::signal_cancelled_claims(executor, &outcome.cancelled_claims);
+                }
+                outcome.instance
+            };
+            P::ManualTaskAcknowledgeResponse { instance }
+        },
         P::UserTaskCompleteRequest {
             command_id,
             instance_id,
@@ -659,6 +695,7 @@ pub fn process_dispatch(
         | P::InstanceGetResponse { .. }
         | P::ScopeGetResponse { .. }
         | P::UserTaskGetResponse { .. }
+        | P::ManualTaskAcknowledgeResponse { .. }
         | P::UserTaskCompleteResponse { .. }
         | P::InstanceCancelResponse { .. }
         | P::JobRetryResponse { .. }
@@ -702,6 +739,7 @@ register_request!("ProcessInstanceGetRequest");
 register_request!("ProcessScopeGetRequest");
 register_request!("ProcessUserTaskGetRequest");
 register_request!("ProcessUserTaskCompleteRequest");
+register_request!("ProcessManualTaskAcknowledgeRequest");
 register_request!("ProcessInstanceCancelRequest");
 register_request!("ProcessJobRetryRequest");
 register_request!("ProcessHistoryRequest");

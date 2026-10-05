@@ -324,12 +324,18 @@ export class FlowConfig {
       return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}">${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>`;
     };
     let fields = `<tf-textarea data-process="name" label="${escapeAttr(I18n.t('bpmn.element_name'))}" value="${escapeAttr(node.label || '')}" autogrow rows="1" ${disabled}></tf-textarea>`;
-    if (kind === 'UserTask') {
+    if (kind === 'UserTask' || kind === 'ManualTask') {
       const available = !config.assigneeUserId || this.opts.processOptions.assignees.some((user) => user.userId === config.assigneeUserId);
       fields += `<tf-person-picker data-process="assigneeUserId" label="${escapeAttr(I18n.t('bpmn.assignee'))}" ${this.readOnly ? 'inert' : ''}></tf-person-picker>
         ${available ? '' : `<tf-alert tone="warning" message="${escapeAttr(I18n.t('bpmn.assignee_unavailable'))}"></tf-alert>`}
         ${this.readOnly ? '' : `<tf-button variant="secondary" data-initiator>${escapeHtml(I18n.t('bpmn.use_initiator'))}</tf-button>`}
-        <p class="fb-field-hint" data-assignee-hint>${escapeHtml(I18n.t(config.assigneeUserId ? 'bpmn.assignee_hint' : 'bpmn.initiator'))}</p>${mapping('outputMapping', 'output_mapping')}`;
+        <p class="fb-field-hint" data-assignee-hint>${escapeHtml(I18n.t(kind === 'ManualTask'
+          ? (config.assigneeUserId ? 'bpmn.manual_assignee_hint' : 'bpmn.manual_initiator_hint')
+          : (config.assigneeUserId ? 'bpmn.assignee_hint' : 'bpmn.initiator')))}</p>
+        ${kind === 'ManualTask' ? `${textarea('instructions', 'manual_instructions', config.instructions, 3)}
+          <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.manual_access_disclosure'))}</p>
+          <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.node_manual_task_hint'))}</p>`
+          : mapping('outputMapping', 'output_mapping')}`;
     } else if (kind === 'ServiceTask') {
       const flows = this.opts.processOptions.serviceFlows;
       const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
@@ -617,7 +623,8 @@ export class FlowConfig {
       this.root.querySelector('[data-initiator]')?.addEventListener('click', () => {
         this.opts.onConfigChange(node.id, { assigneeUserId: null });
         picker.value = null;
-        this.root.querySelector('[data-assignee-hint]').textContent = I18n.t('bpmn.initiator');
+        this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(kind === 'ManualTask'
+          ? 'bpmn.manual_initiator_hint' : 'bpmn.initiator');
       });
     }
     this.root.querySelector('.fb-process-fields').addEventListener('change', (event) => {
@@ -708,7 +715,9 @@ export class FlowConfig {
         if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });
         this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
       }
-      if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator');
+      if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(kind === 'ManualTask'
+        ? (control.value ? 'bpmn.manual_assignee_hint' : 'bpmn.manual_initiator_hint')
+        : (control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator'));
     });
     const connect = this.root.querySelector('[data-connect]');
     const add = this.root.querySelector('[data-connect-add]');

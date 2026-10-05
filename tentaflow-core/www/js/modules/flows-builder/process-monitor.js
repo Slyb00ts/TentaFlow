@@ -119,6 +119,8 @@ export function processEventText(event) {
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
   if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
   if (event.kind === 'script_completed') return text('event_script_completed', { node });
+  if (event.kind === 'manual_task_opened') return text('event_manual_task_opened', { node });
+  if (event.kind === 'manual_task_acknowledged') return text('event_manual_task_acknowledged', { node });
   if (event.kind === 'inclusive_split') return text('event_inclusive_split', { node,
     count: event.data.selected_branch_edge_ids.length,
     default: event.data.default_selected ? text('inclusive_default_selected') : '' });
@@ -428,8 +430,38 @@ export async function openProcessInstance(instanceId, initial = null) {
       task = response.task;
     } catch (error) { showError(win, error); return; }
     if (!task.canComplete || task.status !== 'Open') { await refresh(); return; }
+    if (task.kind === 'Manual' && (typeof task.instructions !== 'string' || task.instructions.length === 0)) {
+      showError(win, new Error(text('manual_instructions')));
+      return;
+    }
     selectedUserTaskId = task.userTaskId;
     let revision = instance.revision;
+    if (task.kind === 'Manual') {
+      const instructions = document.createElement('section');
+      instructions.className = 'fb-process-work';
+      instructions.innerHTML = `<tf-textarea readonly autogrow rows="3" label="${escapeAttr(text('manual_instructions'))}" value="${escapeAttr(task.instructions)}"></tf-textarea>`;
+      const command = processCommand();
+      const workWindow = openFormWindow({ title: text('acknowledge_manual'), icon: 'check', subject: task.name,
+        note: { text: text('manual_acknowledgment_notice') }, sections: [instructions],
+        submitLabel: text('acknowledge_manual'),
+        canSubmit: () => available && win.isConnected && [instance.selectedUserTask, ...instance.userTasks]
+          .some((current) => current?.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open'),
+        collect: () => ({ instanceId, userTaskId: task.userTaskId, expectedRevision: revision }),
+        onSubmit: async (payload) => {
+          try {
+            const response = await ApiBinary.one('processManualTaskAcknowledgeRequest', command(payload));
+            if (win.isConnected) { await acceptSnapshot(response.instance); await refresh(); if (historyEnded) await loadHistory(); }
+            return { message: text('manual_acknowledged') };
+          } catch (error) {
+            if (error.code === 'BadRequest') { await refresh(); revision = instance.revision; }
+            throw error;
+          }
+        },
+      });
+      workWindows.add(workWindow);
+      workWindow.addEventListener('closed', () => { workWindows.delete(workWindow); if (selectedUserTaskId === task.userTaskId) selectedUserTaskId = null; }, { once: true });
+      return;
+    }
     const outputs = jsonSection(text(task.kind === 'Verification' ? 'actual_outputs' : 'outputs'), task.outputs, task.kind !== 'Verification');
     const approval = document.createElement('div');
     if (task.kind === 'Verification') approval.innerHTML = `<tf-select label="${escapeAttr(text('review_result'))}" data-approved>
@@ -508,7 +540,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.innerHTML = `<div><strong>${escapeHtml(task.name)}</strong><p>${escapeHtml(text(`work_kind_${task.kind.toLowerCase()}`))} · ${escapeHtml(processStatusLabel(task.status))}</p><p>${escapeHtml(text('scope_id'))}: ${escapeHtml(task.scopeId)}</p></div>
-        ${task.canComplete && task.status === 'Open' ? `<tf-button variant="primary" data-complete>${escapeHtml(text(task.kind === 'Verification' ? 'review_result' : 'complete_work'))}</tf-button>` : ''}`;
+        ${task.canComplete && task.status === 'Open' ? `<tf-button variant="primary" data-complete>${escapeHtml(text(task.kind === 'Verification' ? 'review_result' : task.kind === 'Manual' ? 'acknowledge_manual' : 'complete_work'))}</tf-button>` : ''}`;
       row.querySelector('[data-complete]')?.addEventListener('click', () => complete(task));
       work.appendChild(row);
     }

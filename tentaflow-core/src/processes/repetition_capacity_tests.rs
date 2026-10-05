@@ -15,8 +15,8 @@ use uuid::Uuid;
 use super::jobs;
 use super::repetition_tests::sequential_human_model;
 use super::repository::{self, RepetitionDeniedBytes, RuntimePlan};
-use super::runtime::{self, test_support::{edge, flow, graph, human_input, service_model,
-    stamp, start_model, Fixture}};
+use super::runtime::{self, test_support::{edge, flow, graph, human_input, manual_input,
+    publish_model, service_model, stamp, start_model, Fixture}};
 
 const RETAINED_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -656,4 +656,110 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
             &Value::Null, Some(true), &canonical, at_ms).is_err());
         assert_eq!(super::call_tests::transition_rows(&fixture), after);
     }
+}
+
+#[test]
+fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner,
+        &graph("manual sibling capacity", None));
+    let mut model = verification_capacity_model(&fixture.owner.user_id, &flow_id, false);
+    model.nodes.push(ProcessNode { id: "Manual".into(), name: "Inspect external work".into(),
+        kind: ProcessNodeKind::ManualTask { assignee_user_id: None,
+            instructions: "Inspect the physical item before acknowledging it.".into() },
+        repeat: None });
+    model.sequence_flows.push(edge("OuterToManual", "OuterSplit", "Manual"));
+    model.sequence_flows.push(edge("ManualToOuterJoin", "Manual", "OuterJoin"));
+    let version = publish_model(&fixture, &model);
+    let instance_id = Uuid::new_v4().to_string();
+    let variables = serde_json::to_value(&version.model.variables).unwrap();
+    let start_command = stamp("start manual sibling capacity");
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let start_plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+        &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
+        start_ms, manual_input(&start_command)).unwrap();
+    let occurrence_event = start_plan.events.iter().find(|event|
+        event.kind == "repetition_occurrence_started").unwrap();
+    let occurrence_token_id = occurrence_event.data["token_id"].as_str().unwrap().to_owned();
+    let before_start = super::call_tests::transition_rows(&fixture);
+    assert_eq!(before_start.len(), 16);
+    let mut wrong_start_source = start_plan.clone();
+    wrong_start_source.events.iter_mut().find(|event|
+        event.kind == "repetition_occurrence_started").unwrap().data["token_id"] =
+            json!(Uuid::new_v4().to_string());
+    assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
+        &instance_id, &version.definition_id, version.version, &variables,
+        &wrong_start_source, start_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
+    let manual_wait_id = start_plan.create_user_tasks.iter().find(|task|
+        task.kind == ProcessUserTaskKind::Manual).unwrap().token_id.as_ref().unwrap().clone();
+    let mut wrong_parent = start_plan.clone();
+    wrong_parent.token_sources.insert(occurrence_token_id.clone(), manual_wait_id);
+    assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
+        &instance_id, &version.definition_id, version.version, &variables,
+        &wrong_parent, start_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
+    let mut wrong_ready = start_plan.clone();
+    wrong_ready.create_tokens.iter_mut().find(|token|
+        token.token_id == occurrence_token_id).unwrap().status = "waiting".into();
+    assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
+        &instance_id, &version.definition_id, version.version, &variables,
+        &wrong_ready, start_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
+    let started = repository::start_instance(&fixture.db, &fixture.owner, &start_command,
+        &instance_id, &version.definition_id, version.version, &variables,
+        &start_plan, start_ms).unwrap();
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let manual = snapshot.user_tasks.iter().find(|task|
+        task.node_id == "Manual" && task.kind == ProcessUserTaskKind::Manual
+            && task.status == ProcessUserTaskStatus::Open).unwrap();
+    let manual_id = manual.user_task_id.clone();
+    let manual_token_id = manual.token_id.as_ref().unwrap().clone();
+    let manual_command = stamp("late capacity manual acknowledgment");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let manual_plan = runtime::plan_manual_acknowledgment(&snapshot, &manual_id,
+        &fixture.owner.user_id, at_ms,
+        super::manual_tests::manual_entry(&snapshot, &manual_id, &manual_command)).unwrap();
+    let gate = snapshot.user_tasks.iter().find(|task|
+        task.node_id == "GateHuman" && task.status == ProcessUserTaskStatus::Open).unwrap();
+    let gate_command = stamp("release capacity against manual sibling");
+    let gate_outputs = json!({"gate":"approved"});
+    let gate_plan = planned_completion(&snapshot, &gate.user_task_id,
+        &gate_command, &gate_outputs, at_ms);
+    let capacity = gate_plan.repetition_capacity.as_ref().expect("real 65th ordinal denial");
+    assert_eq!(capacity.reason, "active_occurrences");
+    let committed = repository::complete_user_task(&fixture.db, &fixture.owner,
+        &gate_command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
+        &gate_outputs, None, &gate_plan, at_ms).unwrap();
+    assert_eq!(committed.instance.status, ProcessInstanceStatus::Cancelled);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert!(persisted.repetition_groups.iter().any(|group|
+        group.group_id == capacity.group_id
+            && group.status == ProcessRepetitionGroupStatus::Incident
+            && group.terminal_capacity));
+    assert!(persisted.user_tasks.iter().any(|task|
+        task.user_task_id == manual_id && task.status == ProcessUserTaskStatus::Cancelled));
+    assert_eq!(reopened.read().unwrap().query_row(
+        "SELECT status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+        rusqlite::params![started.instance_id, manual_token_id],
+        |row| row.get::<_,String>(0)).unwrap(), "cancelled");
+    let conn = reopened.read().unwrap();
+    let (opened, acknowledged): (i64,i64) = conn.query_row(
+        "SELECT SUM(kind='manual_task_opened'),SUM(kind='manual_task_acknowledged') FROM bpmn_events WHERE instance_id=?1",
+        [&started.instance_id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((opened, acknowledged), (1,0));
+    drop(conn);
+    let before = super::call_tests::transition_rows(&fixture);
+    assert_eq!(before.len(), 16);
+    assert!(repository::acknowledge_manual_task(&reopened, &fixture.owner,
+        &manual_command, &started.instance_id, &manual_id, snapshot.instance.revision,
+        &manual_plan, at_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before);
+    repository::complete_user_task(&reopened, &fixture.owner,
+        &gate_command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
+        &gate_outputs, None, &gate_plan, at_ms).unwrap();
+    assert_eq!(super::call_tests::transition_rows(&fixture), before);
 }

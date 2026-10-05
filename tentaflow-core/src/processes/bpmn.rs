@@ -25,11 +25,11 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
-const GRAPH_ELEMENTS: [(&str, &str); 16] = [
+const GRAPH_ELEMENTS: [(&str, &str); 17] = [
     (BPMN, "extensionElements"), (BPMN, "startEvent"),
     (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
     (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
-    (BPMN, "serviceTask"), (BPMN, "scriptTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
+    (BPMN, "serviceTask"), (BPMN, "scriptTask"), (BPMN, "manualTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
     (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
     (BPMN, "parallelGateway"), (BPMN, "inclusiveGateway"), (BPMN, "sequenceFlow"),
 ];
@@ -995,6 +995,54 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 output_mapping,
             }
         }
+        "manualTask" => {
+            element.attrs_only(&["id", "name"])?;
+            for child in &element.children {
+                if !child.is(BPMN, "documentation") && !child.is(BPMN, "extensionElements") {
+                    return Err(XmlElementError { message: format!("unsupported manual task child at byte {}", child.offset),
+                        element_id: Some(id.clone()), offset: child.offset }.into());
+                }
+            }
+            if !element.text.trim().is_empty() {
+                return Err(XmlElementError { message: format!("manual task {} has unsupported text at byte {}", id, element.offset),
+                    element_id: Some(id.clone()), offset: element.offset }.into());
+            }
+            let documentation = element.child(BPMN, "documentation")?;
+            let instructions = if let Some(doc) = documentation {
+                doc.attrs_only(&["textFormat"])?;
+                if doc.attr("textFormat").is_some_and(|format| format != "text/plain") || !doc.children.is_empty() {
+                    return Err(XmlElementError { message: format!("invalid manual documentation at byte {}", doc.offset),
+                        element_id: Some(id.clone()), offset: doc.offset }.into());
+                }
+                doc.text.clone()
+            } else { String::new() };
+            let ext = element.child(BPMN, "extensionElements")?.ok_or_else(|| XmlElementError {
+                message: format!("manual task {} requires TentaFlow manual marker at byte {}", id, element.offset),
+                element_id: Some(id.clone()), offset: element.offset,
+            })?;
+            if element.children.last().is_none_or(|last| last.is(BPMN, "documentation")) {
+                let offending = element.children.last().unwrap_or(ext);
+                return Err(XmlElementError { message: format!("manual task {} has invalid child order at byte {}", id, offending.offset),
+                    element_id: Some(id.clone()), offset: offending.offset }.into());
+            }
+            ext.attrs_only(&[])?;
+            if ext.children.len() != 1 || !ext.children[0].is(TF, "manual") {
+                let offending = ext.children.iter().find(|child| !child.is(TF, "manual"))
+                    .or_else(|| ext.children.get(1)).unwrap_or(ext);
+                return Err(XmlElementError { message: format!("manual task {} requires exactly one TentaFlow manual marker at byte {}", id, offending.offset),
+                    element_id: Some(id.clone()), offset: offending.offset }.into());
+            }
+            let marker = &ext.children[0];
+            if let Err(error) = marker.attrs_only(&["assigneeUserId"]) {
+                return Err(XmlElementError { message: format!("invalid manual marker at byte {}: {error}", marker.offset),
+                    element_id: Some(id.clone()), offset: marker.offset }.into());
+            }
+            if !marker.children.is_empty() || !marker.text.trim().is_empty() {
+                return Err(XmlElementError { message: format!("manual marker has unsupported content at byte {}", marker.offset),
+                    element_id: Some(id.clone()), offset: marker.offset }.into());
+            }
+            ProcessNodeKind::ManualTask { assignee_user_id: marker.attr("assigneeUserId").map(str::to_string), instructions }
+        }
         "scriptTask" => {
             element.attrs_only(&["id", "name", "scriptFormat"])?;
             ensure!(element.attr("scriptFormat") == Some("application/vnd.tentaflow.cel"),
@@ -1687,6 +1735,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ProcessNodeKind::UserTask { .. } => ("userTask", String::new()),
             ProcessNodeKind::ServiceTask { .. } => ("serviceTask", String::new()),
             ProcessNodeKind::ScriptTask { .. } => ("scriptTask", " scriptFormat=\"application/vnd.tentaflow.cel\"".into()),
+            ProcessNodeKind::ManualTask { .. } => ("manualTask", String::new()),
             ProcessNodeKind::SubProcess { .. } => ("subProcess", String::new()),
             ProcessNodeKind::CallActivity { called_element, .. } => {
                 let prefix = call_prefixes.get(&called_element.namespace_uri)
@@ -1818,6 +1867,17 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
                 xml.push_str(&format!("<bpmn:script>{}</bpmn:script></bpmn:{tag}>", escaped(script)));
+            }
+            ProcessNodeKind::ManualTask { assignee_user_id, instructions } => {
+                xml.push('>');
+                if !instructions.is_empty() {
+                    xml.push_str(&format!("<bpmn:documentation textFormat=\"text/plain\">{}</bpmn:documentation>", escaped(instructions)));
+                }
+                xml.push_str("<bpmn:extensionElements><tentaflow:manual");
+                if let Some(assignee) = assignee_user_id {
+                    xml.push_str(&format!(" assigneeUserId=\"{}\"", escaped(assignee)));
+                }
+                xml.push_str("/></bpmn:extensionElements></bpmn:manualTask>");
             }
             ProcessNodeKind::ServiceTask {
                 flow_id,
@@ -3154,6 +3214,47 @@ mod tests {
         let empty_xml = export_xml(&model).unwrap();
         assert!(!empty_xml.contains("<tentaflow:scriptTask>"));
         assert_eq!(import_xml(&empty_xml).0, Some(model));
+    }
+
+    #[test]
+    fn manual_task_xml_requires_explicit_marker_and_preserves_instructions_and_di() {
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].name = "Zażółć 日本語".into();
+        model.nodes.insert(1, ProcessNode { id: "Manual_1".into(), name: "External work".into(), repeat: None,
+            kind: ProcessNodeKind::ManualTask { assignee_user_id: Some("worker-2".into()),
+                instructions: "Inspect <report> & register.\nAcknowledge here.".into() } });
+        model.sequence_flows[0].target_id = "Manual_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(),
+            source_id: "Manual_1".into(), target_id: "End_1".into(), condition: None });
+        model.diagram.shapes.push(ProcessShape { element_id: "Manual_1".into(),
+            x: 180.0, y: 100.0, width: 240.0, height: 96.0 });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:manualTask id=\"Manual_1\" name=\"External work\"><bpmn:documentation textFormat=\"text/plain\">"));
+        assert!(xml.contains("Inspect &lt;report&gt; &amp; register.\nAcknowledge here.</bpmn:documentation>"));
+        assert!(xml.contains("<bpmn:extensionElements><tentaflow:manual assigneeUserId=\"worker-2\"/></bpmn:extensionElements>"));
+        assert!(xml.contains("bpmnElement=\"Manual_1\""));
+        assert_eq!(import_xml(&xml).0, Some(model.clone()));
+        for (invalid, marker) in [
+            (xml.replacen("<bpmn:extensionElements><tentaflow:manual assigneeUserId=\"worker-2\"/></bpmn:extensionElements>", "", 1), "<bpmn:manualTask"),
+            (xml.replacen("<tentaflow:manual assigneeUserId=\"worker-2\"/>",
+                "<tentaflow:manual assigneeUserId=\"worker-2\"/><tentaflow:manual/>", 1), "<tentaflow:manual/>"),
+            (xml.replacen("<tentaflow:manual assigneeUserId=\"worker-2\"/>", "<bpmn:manual/>", 1), "<bpmn:manual/>"),
+            (xml.replacen("<tentaflow:manual assigneeUserId=\"worker-2\"/>",
+                "<tentaflow:manual><bpmn:documentation>nested</bpmn:documentation></tentaflow:manual>", 1), "<tentaflow:manual>"),
+        ] {
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none());
+            let offset = invalid.find(marker).unwrap();
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some("Manual_1")
+                && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+            assert!(invalid[..offset].contains("Zażółć"));
+        }
+        let ProcessNodeKind::ManualTask { assignee_user_id, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        *assignee_user_id = None;
+        let default_xml = export_xml(&model).unwrap();
+        assert!(default_xml.contains("<tentaflow:manual/>"));
+        assert_eq!(import_xml(&default_xml).0, Some(model));
     }
 
 }

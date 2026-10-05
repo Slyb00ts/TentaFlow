@@ -504,6 +504,14 @@ function processModel(model, nested = false) {
       if (typeof body.script !== 'string' || !body.outputMapping || typeof body.outputMapping !== 'object'
         || Array.isArray(body.outputMapping)) throw new TypeError('script task requires a body and output mapping');
       fields = { script: body.script, output_mapping: body.outputMapping };
+    } else if (tag === 'ManualTask') {
+      processKnownFields(body, ['assigneeUserId', 'instructions'], 'manual task');
+      if (!Object.hasOwn(body, 'assigneeUserId') || !Object.hasOwn(body, 'instructions')
+        || typeof body.instructions !== 'string' || (body.assigneeUserId !== null
+        && typeof body.assigneeUserId !== 'string')) {
+        throw new TypeError('manual task requires instructions and optional assignee');
+      }
+      fields = { assignee_user_id: body.assigneeUserId ?? null, instructions: body.instructions };
     } else if (tag === 'ExclusiveGateway' || tag === 'InclusiveGateway') {
       if (tag === 'InclusiveGateway') processKnownFields(body, ['defaultFlowId'], 'inclusive gateway');
       fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };
@@ -637,6 +645,7 @@ function processRequestBody(variant, payload) {
     InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId', 'pages'],
     UserTaskGetRequest: ['instanceId', 'userTaskId'],
     UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
+    ManualTaskAcknowledgeRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision'],
     InstanceCancelRequest: ['commandId', 'instanceId', 'expectedRevision'],
     JobRetryRequest: ['commandId', 'instanceId', 'jobId', 'expectedRevision'],
     HistoryRequest: ['instanceId', 'afterSeq', 'limit'],
@@ -717,6 +726,9 @@ export const encode = {
   },
   processUserTaskCompleteRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'UserTaskCompleteRequest', payload);
+  },
+  processManualTaskAcknowledgeRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'ManualTaskAcknowledgeRequest', payload);
   },
   processInstanceCancelRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'InstanceCancelRequest', payload);

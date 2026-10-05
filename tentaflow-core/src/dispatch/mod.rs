@@ -2847,6 +2847,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::UserTaskGetResponse { .. } => "ProcessUserTaskGetResponse",
                 P::UserTaskCompleteRequest { .. } => "ProcessUserTaskCompleteRequest",
                 P::UserTaskCompleteResponse { .. } => "ProcessUserTaskCompleteResponse",
+                P::ManualTaskAcknowledgeRequest { .. } => "ProcessManualTaskAcknowledgeRequest",
+                P::ManualTaskAcknowledgeResponse { .. } => "ProcessManualTaskAcknowledgeResponse",
                 P::InstanceCancelRequest { .. } => "ProcessInstanceCancelRequest",
                 P::InstanceCancelResponse { .. } => "ProcessInstanceCancelResponse",
                 P::JobRetryRequest { .. } => "ProcessJobRetryRequest",

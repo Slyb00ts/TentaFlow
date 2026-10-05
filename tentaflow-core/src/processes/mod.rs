@@ -36,3 +36,7 @@ mod repetition_capacity_tests;
 mod script_tests;
 #[cfg(test)]
 mod script_proof_tests;
+#[cfg(test)]
+mod manual_tests;
+#[cfg(test)]
+mod manual_proof_tests;

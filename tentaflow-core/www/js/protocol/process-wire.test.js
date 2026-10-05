@@ -613,6 +613,42 @@ test('user task detail request keeps explicit instance and task identity', { ski
   assert.equal(Object.hasOwn(body, 'user_task_id'), false);
 });
 
+test('manual task uses a distinct acknowledgment request without work outputs', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [], variables: {},
+    diagram: { shapes: [], edges: [] } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Manual', description: '', model: { ...base, nodes: [{ id: 'Manual_1',
+      name: 'External work', kind: { ManualTask: { assigneeUserId: null,
+        instructions: 'Inspect the external register.\nAcknowledge here.' } } }] } });
+  assert.deepEqual(saved.model.nodes[0].kind, { ManualTask: { assigneeUserId: null,
+    instructions: 'Inspect the external register.\nAcknowledge here.' } });
+  assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Manual', description: '', model: { ...base, nodes: [{ id: 'Manual_1',
+      name: 'External work', kind: { ManualTask: { assigneeUserId: null, instructions: '', outputs: {} } } }] } }),
+  /unsupported|unknown/);
+  assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Manual', description: '', model: { ...base, nodes: [{ id: 'Manual_1',
+      name: 'External work', kind: { ManualTask: { instructions: 'Inspect' } } }] } }),
+  /requires instructions and optional assignee/);
+  const ack = request('processManualTaskAcknowledgeRequest', { commandId: 'ack', instanceId: 'i1',
+    userTaskId: 't1', expectedRevision: 4 });
+  assert.equal(ack.variant, 'ProcessManualTaskAcknowledgeRequest');
+  assert.equal(ack.instanceId, 'i1');
+  assert.equal(ack.userTaskId, 't1');
+  assert.equal(ack.expectedRevision, 4);
+  assert.equal(Object.hasOwn(ack, 'outputs'), false);
+  assert.equal(Object.hasOwn(ack, 'approved'), false);
+  const detail = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    UserTaskGetResponse: { task: { user_task_id: 't1', node_id: 'Manual_1',
+      name: 'External work', assignee_user_id: 'u1', kind: 'Manual', status: 'Open',
+      outputs: null, revision: 1, can_complete: true, scope_id: 'i1',
+      instructions: 'Inspect the external register.\nAcknowledge here.' } },
+  } })));
+  assert.equal(detail.task.kind, 'Manual');
+  assert.equal(detail.task.outputs, null);
+  assert.equal(detail.task.instructions, 'Inspect the external register.\nAcknowledge here.');
+});
+
 test('user task detail response preserves opaque output keys', { skip }, () => {
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     UserTaskGetResponse: { task: {

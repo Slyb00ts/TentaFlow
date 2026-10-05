@@ -592,6 +592,7 @@ pub enum AcceptedInputRef {
     Start { instance_id: String, cause: StartInputRef },
     PersistedReady { token_id: String, expected_instance_revision: u64 },
     Human { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
+    ManualAcknowledgment { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
     Timer { timer_id: String, expected_timer_revision: u64, fired_occurrence: u64 },
     Message { org_id: String, sender_user_id: String, message_id: String, expected_message_revision: u64, target_subscription_id: Option<String>, expected_subscription_revision: Option<u64> },
     Service { job_id: String, attempt: u32, fence: u64, result_event_id: String },
@@ -3779,6 +3780,7 @@ fn task_kind_text(kind: &ProcessUserTaskKind) -> &'static str {
     match kind {
         ProcessUserTaskKind::Work => "work",
         ProcessUserTaskKind::Verification => "verification",
+        ProcessUserTaskKind::Manual => "manual",
     }
 }
 
@@ -3786,6 +3788,7 @@ fn task_kind_from_text(kind: &str) -> Result<ProcessUserTaskKind> {
     match kind {
         "work" => Ok(ProcessUserTaskKind::Work),
         "verification" => Ok(ProcessUserTaskKind::Verification),
+        "manual" => Ok(ProcessUserTaskKind::Manual),
         _ => bail!("invalid user task kind"),
     }
 }
@@ -4061,6 +4064,7 @@ fn tasks_on(
                     revision,
                     can_complete,
                     token_id,
+                    instructions: None,
                     scope_id: conn.query_row(
                         "SELECT scope_id FROM bpmn_user_tasks WHERE user_task_id=?1",
                         [&user_task_id],
@@ -4685,13 +4689,26 @@ pub fn get_user_task(
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         let is_initiator = require_instance_reader(conn, actor, instance_id)?;
-        let task = tasks_on(conn, actor, instance_id, Some(user_task_id))?
+        let mut task = tasks_on(conn, actor, instance_id, Some(user_task_id))?
             .pop()
             .context("user task not found")?;
         ensure!(
             is_initiator || task.assignee_user_id == actor.user_id,
             "user task not found"
         );
+        if task.kind == ProcessUserTaskKind::Manual {
+            let (definition_id, version): (String, u32) = conn.query_row(
+                "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+                [instance_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let model = current_version_model_on(conn, &definition_id, version)?;
+            let scopes = scopes_on(conn, instance_id, &model)?;
+            let node = scope_node(&model, &scopes, instance_id,
+                &task.scope_id, &task.node_id)?;
+            let ProcessNodeKind::ManualTask { instructions, .. } = &node.kind else {
+                bail!("manual task differs from its pinned node")
+            };
+            task.instructions = Some(instructions.clone());
+        }
         let frame = tentaflow_protocol::cbor::encode(
             &tentaflow_protocol::message_body::MessageBody::ProcessBody(
                 ProcessPayload::UserTaskGetResponse { task: task.clone() },
@@ -7405,6 +7422,56 @@ fn trace_termination_source_on(
                     && event.data["parent_token_id"].as_str() == Some(token_id))
                 .collect::<Vec<_>>();
             if !completed.is_empty() {
+                if completed.len() == 1 && completed[0].1.data.get("reason").is_none() {
+                    ensure!(children.len() == 1 && completed.len() == 1
+                        && plan.consume_token_ids.iter().filter(|id| id.as_str() == token_id).count() == 1
+                        && !plan.cancel_token_ids.iter().any(|id| id == token_id),
+                        "completed child return has no unique persisted parent wait");
+                    let child = children[0];
+                    let (completed_index, completed_event) = completed[0];
+                    let expected = serde_json::json!({
+                        "scope_id":child.scope_id,"parent_scope_id":token.scope_id,
+                        "parent_token_id":token_id,"subprocess_node_id":token.node_id,
+                    });
+                    let ends = plan.events.iter().enumerate().filter(|(index, event)|
+                        *index < completed_index && event.kind == "end_reached"
+                            && event.scope_id == child.scope_id
+                            && event.node_id.as_deref().is_some_and(|node_id|
+                                scope_node(model, scopes, instance_id, &child.scope_id, node_id)
+                                    .is_ok_and(|node| node.kind == ProcessNodeKind::End))
+                            && plan.event_sources.get(index).is_some()).collect::<Vec<_>>();
+                    ensure!(ends.len() == 1
+                        && plan.scope_updates.iter().filter(|update|
+                            update.scope_id == child.scope_id
+                                && update.status == ProcessInstanceStatus::Completed).count() == 1
+                        && completed_event.scope_id == child.scope_id
+                        && completed_event.node_id.is_none()
+                        && completed_event.data == expected
+                        && plan.variable_effects.iter().filter(|effect| matches!(effect,
+                            VariableEffect::Mapped { event_index, scope_id, node_id,
+                                source_token_id, accepted_input: Some(input), outputs, .. }
+                                if *event_index == completed_index
+                                    && scope_id == &token.scope_id && node_id == &token.node_id
+                                    && source_token_id == token_id && input == accepted_input
+                                    && plan.scope_updates.iter().any(|update|
+                                        update.scope_id == child.scope_id
+                                            && update.variables.as_ref() == Some(outputs)))).count() == 1,
+                        "completed child return differs from its ordered source and mapping");
+                    let child_source_id = plan.event_sources.get(&ends[0].0)
+                        .context("completed child End lacks its source token")?;
+                    let child_source = termination_token_on(tx, instance_id, plan,
+                        child_source_id)?;
+                    ensure!(child_source.status == "ready"
+                        && child_source.scope_id == child.scope_id
+                        && ends[0].1.node_id.as_deref() == Some(child_source.node_id.as_str())
+                        && plan.consume_token_ids.iter().filter(|id|
+                            *id == child_source_id).count() == 1
+                        && plan.event_sources.iter().any(|(index, source_id)|
+                            *index > completed_index && visiting.contains(source_id)),
+                        "completed child return lacks an ordered End source and parent action");
+                    return trace_termination_source_on(tx, instance_id, model, scopes, plan,
+                        child_source_id, seed_token_id, accepted_input, visiting);
+                }
                 ensure!(children.len() == 1 && completed.len() == 1
                     && plan.consume_token_ids.iter().filter(|id| id.as_str() == token_id).count() == 1
                     && !plan.cancel_token_ids.iter().any(|id| id == token_id),
@@ -7795,6 +7862,7 @@ fn validate_termination_action_provenance_on(
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     variable_states: &[BTreeMap<String, Value>],
     call_source: Option<&BusinessErrorSource>, entry: EntryAuthority<'_>,
+    actor_id: &str,
 ) -> Result<()> {
     let mut unparented = 0;
     let mut selected_transient_join_arrivals = HashSet::new();
@@ -7836,6 +7904,21 @@ fn validate_termination_action_provenance_on(
             let (nodes, _, _) = super::model::scope_body(model, &path)?;
             let pinned = nodes.iter().find(|node| node.id == source.node_id)
                 .context("termination wait source is outside its pinned body")?;
+            if token.status == "ready" && source.status == "waiting"
+                && pinned.repeat.is_some() {
+                let groups = plan.repetition_groups.iter().filter(|group|
+                    group.scope_id == token.scope_id && group.node_id == token.node_id
+                        && group.parent_token_id == *source_id).collect::<Vec<_>>();
+                ensure!(groups.len() == 1 && token.fork_stack == source.fork_stack
+                    && plan.events.iter().filter(|event|
+                        event.kind == "repetition_occurrence_started"
+                            && event.scope_id == token.scope_id
+                            && event.node_id.as_deref() == Some(token.node_id.as_str())
+                            && event.data["group_id"] == groups[0].group_id
+                            && event.data["token_id"] == token.token_id).count() == 1,
+                    "termination occurrence token lacks its factual parked parent and start");
+                continue;
+            }
             let immediate_wait = matches!(&pinned.kind,
                 ProcessNodeKind::ExclusiveGateway { .. }
                 | ProcessNodeKind::InclusiveGateway { .. }
@@ -7862,7 +7945,8 @@ fn validate_termination_action_provenance_on(
                     plan, variable_states, &source, token)?;
             }
             let waiting = token.status == "waiting" && (matches!(&pinned.kind,
-                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
+                | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
                 || immediate_wait
@@ -7991,6 +8075,18 @@ fn validate_termination_action_provenance_on(
                             && event.node_id.as_deref() == Some(source.node_id.as_str()));
                     human || service
                 }
+                ProcessNodeKind::ManualTask { .. } => plan.complete_user_task_ids.iter().any(|id|
+                    matches!(entry, EntryAuthority::Accepted(
+                        AcceptedInputRef::ManualAcknowledgment { task_id, .. }) if task_id == id)
+                    && tx.query_row("SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND kind='manual' AND status='open'",
+                        params![instance_id,id], |row| row.get::<_,Option<String>>(0))
+                        .ok().flatten().as_deref() == Some(source_id.as_str())
+                    && plan.events.iter().filter(|event|
+                        event.kind == "manual_task_acknowledged"
+                            && event.scope_id == source.scope_id
+                            && event.node_id.as_deref() == Some(source.node_id.as_str())
+                            && event.data["user_task_id"].as_str() == Some(id.as_str()))
+                        .count() == 1),
                 ProcessNodeKind::TimerCatch { .. } => plan.timer_updates.iter().any(|update|
                     update.status == ProcessTimerStatus::Fired
                         && (matches!(entry, EntryAuthority::Accepted(
@@ -8161,7 +8257,8 @@ fn validate_termination_action_provenance_on(
                 && child.arrival_edge_id == source.arrival_edge_id
                 && child.status == "joining").count();
             match &node.kind {
-                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+                ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
+                | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. } =>
                     ensure!(waits == 1 && joins == 0,
@@ -8530,6 +8627,38 @@ fn validate_termination_action_provenance_on(
                     && node == Some(task.node_id.as_str())
                     && event.data == serde_json::json!({"user_task_id":id,
                         "assignee_user_id":task.assignee_user_id,"kind":task.kind}))),
+            "manual_task_opened" => event.data["user_task_id"].as_str().is_some_and(|id|
+                count("manual_task_opened", "user_task_id", id) == 1
+                && plan.create_user_tasks.iter().any(|task|
+                    task.user_task_id == id && task.kind == ProcessUserTaskKind::Manual
+                        && task.scope_id == event.scope_id
+                        && node == Some(task.node_id.as_str())
+                        && task.outputs.is_null()
+                        && event.data == serde_json::json!({
+                            "user_task_id":id,"assignee_user_id":task.assignee_user_id}))),
+            "manual_task_acknowledged" => {
+                let EntryAuthority::Accepted(AcceptedInputRef::ManualAcknowledgment {
+                    task_id, expected_task_revision, ..
+                }) = entry else { return Err(anyhow::anyhow!(
+                    "manual acknowledgment lacks its authenticated command")); };
+                count("manual_task_acknowledged", "user_task_id", task_id) == 1
+                    && plan.complete_user_task_ids.iter().filter(|id| *id == task_id).count() == 1
+                    && tx.query_row(
+                        "SELECT scope_id,node_id,token_id,revision,outputs_json,assignee_user_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND kind='manual' AND status='open'",
+                        params![instance_id,task_id], |row| Ok((row.get::<_,String>(0)?,
+                            row.get::<_,String>(1)?,row.get::<_,String>(2)?,row_u64(row,3)?,
+                            row.get::<_,String>(4)?,row.get::<_,String>(5)?)))
+                        .is_ok_and(|(scope,node_id,token_id,revision,outputs,assignee)|
+                            scope == event.scope_id && node == Some(node_id.as_str())
+                                && revision == *expected_task_revision
+                                && assignee == actor_id
+                                && parse::<Value>(outputs).is_ok_and(|value| value.is_null())
+                                && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1
+                                && plan.event_ids.get(&event_index).is_some_and(|id|
+                                    Uuid::parse_str(id).is_ok())
+                                && event.data == serde_json::json!({
+                                    "user_task_id":task_id,"acknowledged_by_user_id":actor_id}))
+            },
             "service_queued" => event.data["job_id"].as_str().is_some_and(|id|
                 count("service_queued", "job_id", id) == 1
                 && plan.create_jobs.iter().any(|job| job.job_id == id
@@ -8872,7 +9001,10 @@ fn validate_termination_action_provenance_on(
             "user_task_completed" | "verification_approved" | "verification_rejected" =>
                 event.data["user_task_id"].as_str().is_some_and(|id|
                     count(event.kind.as_str(), "user_task_id", id) == 1
-                    && plan.complete_user_task_ids.iter().any(|task| task == id)),
+                    && plan.complete_user_task_ids.iter().any(|task| task == id)
+                    && tx.query_row("SELECT kind FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+                        params![instance_id,id], |row| row.get::<_,String>(0))
+                        .is_ok_and(|kind| kind != "manual")),
             "service_result" => {
                 let accepted = plan.termination_attempts.iter().find_map(|attempt| {
                     let input = match attempt {
@@ -9151,7 +9283,8 @@ fn validate_termination_action_provenance_on(
             event.kind);
     }
     ensure!(plan.create_user_tasks.iter().all(|task| plan.events.iter().filter(|event|
-        event.kind == "user_task_opened"
+        event.kind == (if task.kind == ProcessUserTaskKind::Manual {
+            "manual_task_opened" } else { "user_task_opened" })
             && event.data["user_task_id"].as_str() == Some(task.user_task_id.as_str())).count() == 1)
         && plan.create_jobs.iter().all(|job| plan.events.iter().filter(|event|
             event.kind == "service_queued"
@@ -9264,7 +9397,7 @@ fn validate_termination_action_provenance_on(
     }
     ensure!(plan.complete_user_task_ids.iter().all(|id| plan.events.iter().filter(|event|
         matches!(event.kind.as_str(), "user_task_completed" | "verification_approved"
-            | "verification_rejected")
+            | "verification_rejected" | "manual_task_acknowledged")
             && event.data["user_task_id"].as_str() == Some(id.as_str())).count() == 1)
         && plan.complete_job_ids.iter().all(|_| plan.events.iter()
             .filter(|event| event.kind == "service_result").count() == 1)
@@ -9434,6 +9567,7 @@ fn validate_termination_plan_on(
     plan: &RuntimePlan,
     call_source: Option<&BusinessErrorSource>,
     entry: EntryAuthority<'_>,
+    actor_id: &str,
 ) -> Result<(HashSet<String>, Vec<BTreeMap<String, Value>>)> {
     let mut mapping_scopes = Vec::new();
     let mut has_script = false;
@@ -9458,8 +9592,15 @@ fn validate_termination_plan_on(
         VariableEffect::Mapped { scope_id, node_id, .. }
             if scope_node(model, scopes, instance_id, scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
+    let has_manual = matches!(entry,
+        EntryAuthority::Accepted(AcceptedInputRef::ManualAcknowledgment { .. }))
+        || plan.events.iter().any(|event| matches!(event.kind.as_str(),
+            "manual_task_opened" | "manual_task_acknowledged"))
+        || plan.create_user_tasks.iter().any(|task|
+            task.kind == ProcessUserTaskKind::Manual);
     let replay_variables = !plan.termination_attempts.is_empty()
         || has_script
+        || has_manual
         || plan.variable_effects.iter().any(|effect|
             matches!(effect, VariableEffect::RepetitionEntry { .. }
                 | VariableEffect::RepetitionAggregate { .. }))
@@ -9488,7 +9629,7 @@ fn validate_termination_plan_on(
         }
         validate_termination_variables_on(tx, instance_id, model, &mapping_scopes, plan, call_source, entry)?
     };
-    if has_script {
+    if has_script || has_manual {
         validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
             expected_revision, plan, &variable_states, entry)?;
         if plan.termination_attempts.is_empty() {
@@ -9499,9 +9640,9 @@ fn validate_termination_plan_on(
             }
         }
     }
-    if !plan.termination_attempts.is_empty() || has_script {
+    if !plan.termination_attempts.is_empty() || has_script || has_manual {
         validate_termination_action_provenance_on(tx, instance_id, model,
-            &mapping_scopes, plan, &variable_states, call_source, entry)?;
+            &mapping_scopes, plan, &variable_states, call_source, entry, actor_id)?;
     }
     let mut sources = HashSet::new();
     let mut successful_scopes = HashSet::new();
@@ -9698,6 +9839,18 @@ fn validate_termination_plan_on(
                     && plan.complete_user_task_ids.contains(task_id)
                     && plan.consume_token_ids.contains(&task.1),
                     "terminating human input differs from its open submitted task");
+                Some(task.1)
+            }
+            AcceptedInputRef::ManualAcknowledgment { task_id, expected_task_revision,
+                expected_instance_revision, .. } => {
+                let task: (u64, String) = tx.query_row(
+                    "SELECT revision,token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND kind='manual' AND status='open'",
+                    params![instance_id,task_id], |row| Ok((row_u64(row,0)?,row.get(1)?)))?;
+                ensure!(task.0 == *expected_task_revision
+                    && *expected_instance_revision == expected_revision
+                    && plan.complete_user_task_ids.contains(task_id)
+                    && plan.consume_token_ids.contains(&task.1),
+                    "terminating manual input differs from its acknowledged task");
                 Some(task.1)
             }
             AcceptedInputRef::Timer { timer_id, expected_timer_revision, fired_occurrence } => {
@@ -10284,6 +10437,9 @@ fn ordinary_action_source_matches_entry_on(
                 AcceptedInputRef::Start { .. } => None,
                 AcceptedInputRef::Human { task_id, .. } => Some(tx.query_row(
                     "SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+                    params![instance_id, task_id], |row| row.get::<_, String>(0))?),
+                AcceptedInputRef::ManualAcknowledgment { task_id, .. } => Some(tx.query_row(
+                    "SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND kind='manual' AND status='open'",
                     params![instance_id, task_id], |row| row.get::<_, String>(0))?),
                 AcceptedInputRef::Timer { timer_id, .. } => timer_on(tx, timer_id)?.token_id,
                 AcceptedInputRef::Message { target_subscription_id, .. } =>
@@ -11453,6 +11609,7 @@ fn apply_repetition_plan_on(
                     ProcessUserTaskKind::Work => occurrence.user_task_id.as_ref() == Some(&task.user_task_id),
                     ProcessUserTaskKind::Verification => occurrence.verification_user_task_id.as_ref()
                         == Some(&task.user_task_id),
+                    ProcessUserTaskKind::Manual => false,
                 }
                 && plan.repetition_groups.iter().chain(prior_groups.iter()).any(|group|
                     group.group_id == occurrence.group_id
@@ -11636,7 +11793,7 @@ fn apply_plan_on(
     let model = current_version_model_on(tx, &definition_id, version)?;
     validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
     let (successful_terminations, repetition_variable_states) = validate_termination_plan_on(tx, instance_id, &model, &proposed_scopes,
-        expected_revision, plan, call_source, entry)?;
+        expected_revision, plan, call_source, entry, actor_id)?;
     validate_gateway_join_plan_on(tx, instance_id, &model, &proposed_scopes, plan)?;
 
     let mut cancelled_claims = Vec::new();
@@ -11767,6 +11924,8 @@ fn apply_plan_on(
                 json(&task.outputs)?.len() <= 384 * 1024 - 4096,
                 "verification detail exceeds the process history budget"
             );
+        } else if task.kind == ProcessUserTaskKind::Manual {
+            ensure!(task.outputs.is_null(), "manual task cannot carry activity output");
         } else {
             validate_output(&task.outputs)?;
         }
@@ -11808,6 +11967,9 @@ fn apply_plan_on(
             (ProcessNodeKind::ServiceTask { .. }, ProcessUserTaskKind::Verification) => {
                 initiator.as_str()
             }
+            (ProcessNodeKind::ManualTask { assignee_user_id, instructions },
+                ProcessUserTaskKind::Manual) if task.instructions.as_deref() == Some(instructions) =>
+                assignee_user_id.as_deref().unwrap_or(&initiator),
             _ => bail!("new user task kind differs from its exact scoped activity"),
         };
         ensure!(
@@ -13256,6 +13418,94 @@ pub fn apply_transition(
         instance: result,
         cancelled_claims,
     })
+}
+
+pub fn acknowledge_manual_task(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    stamp: &CommandStamp,
+    instance_id: &str,
+    user_task_id: &str,
+    expected_revision: u64,
+    plan: &RuntimePlan,
+    at_ms: i64,
+) -> Result<ProcessTransitionOutcome> {
+    ensure!(reaches_error_end(plan) || reaches_terminate_end(plan)
+        || plan.repetition_capacity.is_some()
+        || (plan.cancel_scope_roots.is_empty()
+            && plan.cancel_token_ids.is_empty()
+            && plan.cancel_job_ids.is_empty()
+            && plan.cancel_user_task_ids.is_empty()),
+        "ordinary advancement cannot authorize interruption");
+    let (composite, mut conn) = prepare_call_plan(pool, actor, instance_id, None, plan, at_ms)?;
+    let plan = &composite;
+    let tx = conn.transaction()?;
+    require_actor(&tx, actor)?;
+    require_instance_reader(&tx, actor, instance_id)?;
+    if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
+        require_instance_reader(&tx, actor, &prior.instance_id)?;
+        return Ok(ProcessTransitionOutcome {
+            instance: reproject_instance_on(&tx, actor, &prior.instance_id)?,
+            cancelled_claims: Vec::new(),
+        });
+    }
+    let (assignee,kind,status,outputs,token_id,node_id,scope_id,task_revision):
+        (String,String,String,String,Option<String>,String,String,u64) = tx.query_row(
+        "SELECT assignee_user_id,kind,status,outputs_json,token_id,node_id,scope_id,revision FROM bpmn_user_tasks WHERE user_task_id=?1 AND instance_id=?2",
+        params![user_task_id,instance_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
+            row.get(4)?,row.get(5)?,row.get(6)?,row_u64(row,7)?)))
+        .context("manual task not found")?;
+    let token_id = token_id.context("open manual task lacks its waiting activation")?;
+    ensure!(kind == "manual" && status == "open" && assignee == actor.user_id
+        && parse::<Value>(outputs)?.is_null(),
+        "manual task is not currently acknowledgeable by this actor");
+    let live: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.scope_id=?4 AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND i.status NOT IN ('completed','cancelled','error'))",
+        params![token_id,instance_id,node_id,scope_id], |row| row.get(0))?;
+    ensure!(live && call_control_live_on(&tx, instance_id)?,
+        "manual task activation is no longer waiting");
+    let (definition_id, version, actual_revision): (String,u32,u64) = tx.query_row(
+        "SELECT definition_id,version,revision FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?)))?;
+    ensure!(actual_revision == expected_revision,
+        "process instance revision conflict or closed instance");
+    let model = current_version_model_on(&tx, &definition_id, version)?;
+    let scopes = scopes_on(&tx, instance_id, &model)?;
+    ensure!(matches!(&scope_node(&model, &scopes, instance_id, &scope_id, &node_id)?.kind,
+        ProcessNodeKind::ManualTask { .. }),
+        "manual acknowledgment differs from its pinned activity");
+    let entry = AcceptedInputRef::ManualAcknowledgment {
+        task_id: user_task_id.to_owned(), expected_task_revision: task_revision,
+        expected_instance_revision: expected_revision,
+        command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
+    };
+    ensure!(plan.complete_user_task_ids.len() == 1
+        && plan.complete_user_task_ids[0] == user_task_id
+        && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1
+        && plan.events.iter().enumerate().filter(|(_,event)|
+            event.kind == "manual_task_acknowledged"
+                && event.scope_id == scope_id
+                && event.node_id.as_deref() == Some(node_id.as_str())
+                && event.data == serde_json::json!({
+                    "user_task_id":user_task_id,"acknowledged_by_user_id":actor.user_id
+                })).count() == 1,
+        "manual acknowledgment differs from its authenticated task and actor");
+    for attempt in &plan.termination_attempts {
+        let accepted = match attempt {
+            TerminationAttempt::Success(source) => &source.accepted_input,
+            TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+        };
+        ensure!(accepted == &entry || matches!(accepted,
+            AcceptedInputRef::PersistedReady { .. }),
+            "manual acknowledgment cannot invent another terminating entry");
+    }
+    let cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id,
+        expected_revision, plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
+    let result = instance_on(&tx, actor, instance_id, None)?;
+    store_command(&tx, actor, stamp, &result, at_ms)?;
+    tx.commit()?;
+    Ok(ProcessTransitionOutcome { instance: result, cancelled_claims })
 }
 
 pub fn complete_user_task(

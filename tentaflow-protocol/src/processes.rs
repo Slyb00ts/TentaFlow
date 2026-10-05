@@ -227,6 +227,13 @@ pub struct ProcessCallableReference {
     pub process_id: String,
 }
 
+fn deserialize_manual_assignee<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ProcessNodeKind {
@@ -317,6 +324,11 @@ pub enum ProcessNodeKind {
     ScriptTask {
         script: String,
         output_mapping: BTreeMap<String, String>,
+    },
+    ManualTask {
+        #[serde(deserialize_with = "deserialize_manual_assignee")]
+        assignee_user_id: Option<String>,
+        instructions: String,
     },
 }
 
@@ -582,6 +594,7 @@ pub enum ProcessCallSummary {
 pub enum ProcessUserTaskKind {
     Work,
     Verification,
+    Manual,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -605,6 +618,8 @@ pub struct ProcessUserTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
     pub scope_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1338,6 +1353,15 @@ pub enum ProcessPayload {
         variables: Value,
         active_node_ids: Vec<String>,
     },
+    ManualTaskAcknowledgeRequest {
+        command_id: String,
+        instance_id: String,
+        user_task_id: String,
+        expected_revision: u64,
+    },
+    ManualTaskAcknowledgeResponse {
+        instance: ProcessInstance,
+    },
 }
 
 #[cfg(test)]
@@ -1751,6 +1775,7 @@ mod tests {
             can_complete: true,
             token_id: None,
             scope_id: "i1".into(),
+            instructions: None,
         };
         let summary = ProcessUserTaskSummary::from(&task);
         let summary_json = serde_json::to_value(&summary).unwrap();
@@ -1764,6 +1789,37 @@ mod tests {
             detail["UserTaskGetResponse"]["task"]["outputs"]["business_key"]["inner_value"],
             3
         );
+        assert!(detail["UserTaskGetResponse"]["task"].get("instructions").is_none());
+    }
+
+    #[test]
+    fn manual_acknowledgment_has_distinct_wire_fields_and_pinned_instructions() {
+        let kind = ProcessNodeKind::ManualTask {
+            assignee_user_id: None,
+            instructions: "Inspect the external register.\nRecord the result there.".into(),
+        };
+        let bytes = crate::cbor::encode(&kind).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&bytes).unwrap(), kind);
+        assert_eq!(serde_json::to_value(&kind).unwrap(), serde_json::json!({
+            "ManualTask": {"assignee_user_id":null,
+                "instructions":"Inspect the external register.\nRecord the result there."}
+        }));
+        assert!(serde_json::from_value::<ProcessNodeKind>(serde_json::json!({
+            "ManualTask": {"instructions":"Inspect"}
+        })).is_err());
+        let request = ProcessPayload::ManualTaskAcknowledgeRequest {
+            command_id: "command-1".into(), instance_id: "instance-1".into(),
+            user_task_id: "task-1".into(), expected_revision: 4,
+        };
+        let encoded = crate::cbor::encode(&request).unwrap();
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&encoded).unwrap(), request);
+        let body = serde_json::to_value(request).unwrap();
+        assert_eq!(body["ManualTaskAcknowledgeRequest"], serde_json::json!({
+            "command_id":"command-1","instance_id":"instance-1",
+            "user_task_id":"task-1","expected_revision":4
+        }));
+        assert!(body["ManualTaskAcknowledgeRequest"].get("outputs").is_none());
+        assert!(body["ManualTaskAcknowledgeRequest"].get("approved").is_none());
     }
 
     #[test]
@@ -1810,12 +1866,18 @@ mod tests {
             kind: ProcessUserTaskKind::Work, status: ProcessUserTaskStatus::Completed,
             outputs: Value::Null, revision: 2, can_complete: false, token_id: None,
             scope_id: "i1".into(),
+            instructions: None,
         };
         assert!(serde_json::to_value(&older_task).unwrap().get("token_id").is_none());
+        assert!(serde_json::to_value(&older_task).unwrap().get("instructions").is_none());
         let mut active = older_task;
         active.status = ProcessUserTaskStatus::Open;
         active.token_id = Some("waiting-1".into());
         assert_eq!(serde_json::to_value(&active).unwrap()["token_id"], "waiting-1");
+        active.kind = ProcessUserTaskKind::Manual;
+        active.instructions = Some("Read the external report".into());
+        assert_eq!(serde_json::to_value(&active).unwrap()["instructions"], "Read the external report");
+        assert_eq!(active.outputs, Value::Null);
     }
 
     #[test]

@@ -20,6 +20,12 @@ pub const MAX_VARIABLE_BYTES: usize = 256 * 1024;
 pub const MAX_VARIABLE_KEYS: usize = 128;
 const MAX_DI_COORDINATE: f64 = 1_000_000.0;
 
+fn valid_manual_instructions(value: &str) -> bool {
+    value.len() <= 4096 && value.chars().all(|ch| {
+        matches!(ch, '\t' | '\n' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayKind {
@@ -468,6 +474,12 @@ fn validate_draft_body<'a>(
             "invalid node name");
         validate_repeat(node, variables, false)?;
         match &node.kind {
+            ProcessNodeKind::ManualTask { assignee_user_id, instructions } => {
+                ensure!(valid_manual_instructions(instructions),
+                    "manual task {} has invalid instructions", node.id);
+                ensure!(assignee_user_id.as_ref().map_or(true, |user| !user.is_empty()),
+                    "manual task {} has empty assignee", node.id);
+            }
             ProcessNodeKind::ScriptTask { script, output_mapping } => {
                 ensure!(script.len() <= 4096, "script task {} expression is too long", node.id);
                 if !script.is_empty() {
@@ -659,6 +671,13 @@ fn validate_body<'a>(
         );
         validate_repeat(node, variables, true)?;
         match &node.kind {
+            ProcessNodeKind::ManualTask { assignee_user_id, instructions } => {
+                ensure!(!instructions.is_empty(), "manual task {} requires instructions", node.id);
+                ensure!(valid_manual_instructions(instructions),
+                    "manual task {} has invalid instructions", node.id);
+                ensure!(assignee_user_id.as_ref().map_or(true, |user| !user.is_empty()),
+                    "manual task {} has empty assignee", node.id);
+            }
             ProcessNodeKind::ScriptTask { script, output_mapping } => {
                 ensure!(!script.is_empty(), "script task {} requires an expression", node.id);
                 ensure!(script.len() <= 4096, "script task {} expression is too long", node.id);
@@ -1234,6 +1253,7 @@ impl EscalationPrefixProof<'_> {
             };
             match &node.kind {
                 ProcessNodeKind::UserTask { .. }
+                | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. }
                 | ProcessNodeKind::MessageCatch { .. }
@@ -2573,5 +2593,34 @@ mod tests {
         model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Script_Wait".into(),
             source_id: "Script_1".into(), target_id: "Wait_1".into(), condition: None });
         validate_model(&model).unwrap();
+    }
+
+    #[test]
+    fn manual_task_requires_publishable_external_instructions_without_repeat() {
+        let mut model = starter_model();
+        model.nodes.insert(1, ProcessNode { id: "Manual_1".into(), name: "External work".into(), repeat: None,
+            kind: ProcessNodeKind::ManualTask { assignee_user_id: None, instructions: String::new() } });
+        model.sequence_flows[0].target_id = "Manual_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(),
+            source_id: "Manual_1".into(), target_id: "End_1".into(), condition: None });
+        validate_draft(&model).unwrap();
+        assert!(validate_model(&model).unwrap_err().to_string().contains("requires instructions"));
+        model.nodes[1].kind = ProcessNodeKind::ManualTask { assignee_user_id: Some("worker-2".into()),
+            instructions: "Check the external register.\nAcknowledge here.".into() };
+        validate_model(&model).unwrap();
+        model.nodes[1].kind = ProcessNodeKind::ManualTask { assignee_user_id: Some("worker-2".into()),
+            instructions: "invalid\rline".into() };
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("invalid instructions"));
+        model.nodes[1].kind = ProcessNodeKind::ManualTask { assignee_user_id: Some("worker-2".into()),
+            instructions: "x".repeat(4097) };
+        assert!(validate_model(&model).unwrap_err().to_string().contains("invalid instructions"));
+        model.nodes[1].kind = ProcessNodeKind::ManualTask { assignee_user_id: Some("worker-2".into()),
+            instructions: "Check the external register".into() };
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
     }
 }
