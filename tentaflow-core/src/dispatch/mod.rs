@@ -2705,6 +2705,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::RunExportResponse { .. } => "TentaQuantRunExportResponse",
                 Tq::RunStateQueryRequest { .. } => "TentaQuantRunStateQueryRequest",
                 Tq::RunStateQueryResponse { .. } => "TentaQuantRunStateQueryResponse",
+                Tq::KataListRequest { .. } => "TentaQuantKataListRequest",
+                Tq::KataListResponse { .. } => "TentaQuantKataListResponse",
+                Tq::KataGetRequest { .. } => "TentaQuantKataGetRequest",
+                Tq::KataGetResponse { .. } => "TentaQuantKataGetResponse",
+                Tq::KataSubmitRequest { .. } => "TentaQuantKataSubmitRequest",
+                Tq::KataSubmitResponse { .. } => "TentaQuantKataSubmitResponse",
+                Tq::KataRankingRequest { .. } => "TentaQuantKataRankingRequest",
+                Tq::KataRankingResponse { .. } => "TentaQuantKataRankingResponse",
             }
         }
         // Family prefix + the variant's own name, verbatim — the browser

@@ -1,0 +1,11 @@
+id = "01-superposition-h"
+points = 60
+tier = "T0"
+
+[title]
+pl = "Superpozycja: bramka H"
+en = "Superposition: the H gate"
+
+[summary]
+pl = "jeden kubit · stan |+⟩"
+en = "one qubit · the |+⟩ state"

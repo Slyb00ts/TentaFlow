@@ -1,0 +1,9 @@
+kind = "counts_tvd_below"
+shots = 1024
+seed = 7
+max_tvd = 0.05
+exact_support = true
+
+[expected]
+"0" = 0.7
+"1" = 0.3

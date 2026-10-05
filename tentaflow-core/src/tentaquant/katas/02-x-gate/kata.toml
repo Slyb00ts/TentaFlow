@@ -1,0 +1,11 @@
+id = "02-x-gate"
+points = 60
+tier = "T0"
+
+[title]
+pl = "Bramka X i NOT"
+en = "The X gate and NOT"
+
+[summary]
+pl = "odwracanie stanu bazowego"
+en = "flipping a basis state"

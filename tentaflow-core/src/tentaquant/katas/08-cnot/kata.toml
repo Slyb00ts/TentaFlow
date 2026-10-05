@@ -1,0 +1,11 @@
+id = "08-cnot"
+points = 80
+tier = "T0"
+
+[title]
+pl = "Bramka CNOT"
+en = "The CNOT gate"
+
+[summary]
+pl = "tabela prawdy na stanach bazowych"
+en = "the truth table on basis states"

@@ -9,8 +9,8 @@
 //       (`#/tentaquant?instance=…`). Membership is that matrix in Addons — this
 //       screen never edits it and never invents a members table of its own.
 //
-//       Tabs stop at Pulpit, Projekty and Runy on purpose: Urządzenia,
-//       Przykłady, Kurs and Ustawienia arrive with their backends. Nothing here
+//       Tabs stop at Pulpit, Projekty, Runy and Kurs on purpose: Urządzenia,
+//       Przykłady and Ustawienia arrive with their backends. Nothing here
 //       renders a section whose data does not exist.
 //
 //       A project is the second level of the same screen (`?project=…&ptab=…`):
@@ -30,6 +30,7 @@ import {
 } from '/js/modules/tentaquant/format.js';
 import { drawLabs } from '/js/modules/tentaquant/labs.js';
 import { drawDashboard } from '/js/modules/tentaquant/dashboard.js';
+import { courseState, drawCourse } from '/js/modules/tentaquant/course.js';
 import { drawProjects } from '/js/modules/tentaquant/projects.js';
 import { openNewProjectWindow, openShareWindow, confirmDeleteProject } from '/js/modules/tentaquant/dialogs.js';
 import { PROJECT_TABS, drawProject, drawProjectTab } from '/js/modules/tentaquant/project.js';
@@ -57,7 +58,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-window.js';
 
-const TABS = ['dashboard', 'projects', 'runs'];
+const TABS = ['dashboard', 'projects', 'runs', 'course'];
 
 // The catalog package one laboratory is an instance of.
 const PACKAGE_ID = 'tentaquant';
@@ -84,6 +85,10 @@ const TentaQuantScreen = {
     this.files = [];
     this.notebookId = null;
     this.studio = studioState();
+    // The open kata and the drafts of the Kurs tab; a draft survives a switch
+    // to another tab and back, because losing typed work to a tab click is the
+    // one thing a course must not do.
+    this.course = courseState({ kataId: params.kata || null });
     // A project view owns a wasm simulator and an animation frame; whatever
     // draws one leaves the handle that releases them here.
     this.projectViewDispose = null;
@@ -415,6 +420,7 @@ const TentaQuantScreen = {
       if (this.projectTab !== 'notebook') q.set('ptab', this.projectTab);
     }
     if (this.runId) q.set('run', this.runId);
+    if (this.instanceId && this.tab === 'course' && this.course?.kataId) q.set('kata', this.course.kataId);
     if (this.resultRunId) {
       q.set('result', this.resultRunId);
       if (this.resultTab !== 'evolution') q.set('rtab', this.resultTab);
@@ -443,6 +449,8 @@ const TentaQuantScreen = {
     this.instanceId = instanceId;
     this.tab = 'dashboard';
     this.projectId = null;
+    // Progress belongs to the laboratory it was made in.
+    this.course = courseState();
     await this.enter();
   },
 
@@ -527,6 +535,7 @@ const TentaQuantScreen = {
         <tf-tab id="dashboard" icon="home">${escapeHtml(T('lab.tab_dashboard'))}</tf-tab>
         <tf-tab id="projects" icon="folder" count="${projectCount}">${escapeHtml(T('lab.tab_projects'))}</tf-tab>
         <tf-tab id="runs" icon="clock" count="${this.runs.length}">${escapeHtml(T('lab.tab_runs'))}</tf-tab>
+        <tf-tab id="course" icon="catalog">${escapeHtml(T('lab.tab_course'))}</tf-tab>
       </tf-tabs>
       <div id="tq-panel"></div>`;
 
@@ -553,6 +562,10 @@ const TentaQuantScreen = {
     if (this.tab !== 'runs') this.runsHost = null;
     if (this.tab === 'runs') {
       this.showRuns(panel, {});
+      return;
+    }
+    if (this.tab === 'course') {
+      drawCourse(this, panel);
       return;
     }
     if (this.tab === 'projects') {

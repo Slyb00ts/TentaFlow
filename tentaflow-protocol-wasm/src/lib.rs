@@ -24913,6 +24913,30 @@ pub fn encode_tentaquant_target_resolve_request(request_json: String) -> Result<
     encode_tentaquant_json_request("TargetResolveRequest", &request_json)
 }
 
+/// MessageBody::TentaQuantBody(KataListRequest) — the course in its fixed order with the caller's progress.
+#[wasm_bindgen(js_name = encodeTentaQuantKataListRequest)]
+pub fn encode_tentaquant_kata_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataGetRequest) — one kata with its task text and starter code.
+#[wasm_bindgen(js_name = encodeTentaQuantKataGetRequest)]
+pub fn encode_tentaquant_kata_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataSubmitRequest) — grades one OpenQASM 3 answer in Core.
+#[wasm_bindgen(js_name = encodeTentaQuantKataSubmitRequest)]
+pub fn encode_tentaquant_kata_submit_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataSubmitRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataRankingRequest) — the course ranking: top five plus the caller's own place.
+#[wasm_bindgen(js_name = encodeTentaQuantKataRankingRequest)]
+pub fn encode_tentaquant_kata_ranking_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataRankingRequest", &request_json)
+}
+
 // TentaVM — the virtualization app (`MessageBody::TentaVmBody`). Every request
 // is built from a JSON object of its fields, same as TentaNas: the dashboard
 // passes the payload it already holds, the enum is deserialized from

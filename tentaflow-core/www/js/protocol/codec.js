@@ -10745,6 +10745,40 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaQuantBody(KataListRequest). payload: { instanceId } — the course in its fixed order with the caller's progress. */
+  tentaQuantKataListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantKataListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataGetRequest). payload: { instanceId, kataId } — task text and starter code; a locked kata answers NotFound. */
+  tentaQuantKataGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqLab(payload), kata_id: csText(payload.kataId ?? payload.kata_id) };
+    const body = _wasm.encodeTentaQuantKataGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataSubmitRequest). payload: { instanceId, kataId, qasm3 } — graded in Core, deterministic. */
+  tentaQuantKataSubmitRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      kata_id: csText(payload.kataId ?? payload.kata_id),
+      qasm3: csText(payload.qasm3),
+    };
+    const body = _wasm.encodeTentaQuantKataSubmitRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataRankingRequest). payload: { instanceId } — top five with names plus the caller's own place; empty when a supervisor switched it off. */
+  tentaQuantKataRankingRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantKataRankingRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================

@@ -1,0 +1,11 @@
+id = "10-bell-state"
+points = 120
+tier = "T0"
+
+[title]
+pl = "Bramka CNOT i stan Bella"
+en = "CNOT and the Bell state"
+
+[summary]
+pl = "H + CNOT → |Φ⁺⟩; TVD od ideału < 0,05"
+en = "H + CNOT → |Φ⁺⟩; TVD from the ideal < 0.05"

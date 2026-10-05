@@ -17,6 +17,7 @@
 //   people     the matrix expansion the UI reads instead of a member list
 //   circuit    the OpenQASM 3 front end of tier T1 (validate, export, options)
 //   keyframes  the recorded evolution of a run, live and in the store
+//   kata       the course: embedded katas, grading, unlocking and the ranking
 //   runs       T1 execution: slots, cancellation, the run stream, orphans
 //   compare    the distributions of several runs on one aligned axis
 //   state      reduced quantities of a run's state, asked for after the fact
@@ -31,6 +32,7 @@ pub mod circuit;
 pub mod compare;
 pub mod db;
 pub mod export;
+pub mod kata;
 pub mod keyframes;
 pub mod people;
 pub mod runs;

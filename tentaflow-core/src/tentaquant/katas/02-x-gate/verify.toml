@@ -1,0 +1,6 @@
+kind = "state_equals"
+tolerance = 1e-9
+target = [
+  [0.0, 0.0],
+  [1.0, 0.0],
+]
