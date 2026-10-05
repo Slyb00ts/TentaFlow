@@ -1521,6 +1521,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::AddonInstancePayload::ReqUpdate(_) => "AddonInstanceUpdateRequest",
             tentaflow_protocol::AddonInstancePayload::ResUpdate(_) => "AddonInstanceUpdateResponse",
+            tentaflow_protocol::AddonInstancePayload::ReqInstallStep(_) => {
+                "AddonInstanceInstallStepRequest"
+            }
+            tentaflow_protocol::AddonInstancePayload::ResInstallStep(_) => {
+                "AddonInstanceInstallStepResponse"
+            }
         },
         MessageBody::AddonStorageBody(p) => match p {
             tentaflow_protocol::AddonStoragePayload::StatsRequest(_) => "AddonStorageStatsRequest",

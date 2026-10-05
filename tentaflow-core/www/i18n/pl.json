@@ -3692,6 +3692,17 @@
     "install_singleton_done": "Aplikacja jednoinstancyjna — już zainstalowana",
     "install_done": "Zainstalowano instancję „{name}”",
     "install_failed": "Instalacja nieudana",
+    "install_steps": {
+      "title": "Dokończ konfigurację: {name}",
+      "intro": "Instancja jest zainstalowana. Te kroki sprawdzają lub przygotowują ją; każdy można uruchomić ponownie.",
+      "run": "Uruchom",
+      "run_again": "Uruchom ponownie",
+      "retry": "Ponów",
+      "run_all": "Uruchom wszystkie kroki",
+      "finish": "Zakończ",
+      "field_required": "Pole „{field}” jest wymagane",
+      "closed_incomplete": "{name} jest zainstalowana, ale {count} {count|krok konfiguracji nie przeszedł|kroki konfiguracji nie przeszły|kroków konfiguracji nie przeszło}."
+    },
     "instance_name": "Nazwa instancji",
     "instance_name_hint": "Ten pakiet działa w wielu instancjach — każda ma własne dane i własną matrycę uprawnień.",
     "instance_name_required": "Podaj nazwę instancji",
@@ -6187,7 +6198,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Laboratorium kwantowe: notatniki, obwody, symulacja i prawdziwe QPU"
+      "desc": "Laboratorium kwantowe: notatniki, obwody, symulacja i prawdziwe QPU",
+      "install": {
+        "bell_test": {
+          "title": "Test Bella",
+          "desc": "Uruchamia dwukubitowy obwód Bella na symulatorze tego węzła i sprawdza, że mierzone są tylko stany 00 i 11."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",

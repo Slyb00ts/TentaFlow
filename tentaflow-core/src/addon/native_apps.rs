@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::addon::install_steps::{InstallStepOutcome, InstallStepRun};
+
 /// Instance-scoped context handed to lifecycle hooks. `data_dir` is the
 /// instance's own directory (orgs/<org>/addons/<addon_id>/) — the same
 /// containment every addon instance gets. `db` is the MAIN database (platform
@@ -127,6 +129,14 @@ pub struct NativeAppHooks {
     /// Drops what `arm_teardown` handed this node, whenever the flow stops
     /// before the teardown consumed it.
     pub disarm_teardown: Option<fn(&NativeAppContext)>,
+    /// Runs one `[[install_step]]` the package's manifest declares, against an
+    /// instance that already exists. Must be idempotent and re-runnable: a
+    /// failed step is shown as failed with a re-run button and the instance
+    /// stays installed. `Err` is the step's own infrastructure failure and
+    /// reaches the wizard as `failed`. `None` = the package declares no steps
+    /// (a manifest that declares some while the hook is `None` is refused when
+    /// a step is requested, and the registry test catches it at build time).
+    pub install_step: Option<fn(&NativeAppContext, &InstallStepRun) -> Result<InstallStepOutcome>>,
 }
 
 /// n18a's per-node facts that are not paths: see
@@ -370,6 +380,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: "ml-studio",
@@ -383,6 +394,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: "projekty",
@@ -396,6 +408,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: "code-studio",
@@ -409,6 +422,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: "meeting-bot",
@@ -422,6 +436,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: crate::tentanas::PACKAGE_ID,
@@ -435,6 +450,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: Some(crate::tentanas::native_teardown_node_info),
         arm_teardown: Some(crate::tentanas::native_arm_teardown),
         disarm_teardown: Some(crate::tentanas::native_disarm_teardown),
+        install_step: None,
     },
     // TentaVM's hooks are registered even though the package is not in the
     // catalog yet (the tile needs the UI shell): a hook registered late is a
@@ -457,6 +473,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
     NativeAppHooks {
         package_id: crate::tentaquant::PACKAGE_ID,
@@ -473,6 +490,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: Some(crate::tentaquant::native_install_step),
     },
     NativeAppHooks {
         package_id: crate::bus::native::PACKAGE_ID,
@@ -486,6 +504,7 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: None,
     },
 ];
 
@@ -611,6 +630,7 @@ pub fn notify_enabled(
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{data_dir_only_plan, no_external_state, NativeAppContext, NativeAppHooks};
+    use crate::addon::install_steps::{InstallStepOutcome, InstallStepRun, InstallStepStatus};
     use anyhow::Result;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -618,6 +638,7 @@ pub mod test_support {
     pub const PACKAGE_ID: &str = "test-hook-app";
     pub static ENABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
     pub static DISABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub static STEP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     /// A manifest for `PACKAGE_ID`, parseable by `lifecycle::parse_manifest_toml`.
     /// `hooks_for` only recognizes `PACKAGE_ID` itself, so every fixture
@@ -655,6 +676,34 @@ display_name = "Read"
 description = "Read the test fixture resource."
 risk = "low"
 default = "allow"
+
+[[install_step]]
+id = "pass"
+title_key = "test.step.pass"
+
+[[install_step.field]]
+id = "mode"
+type = "select"
+label_key = "test.step.mode"
+default = "fast"
+[[install_step.field.option]]
+value = "fast"
+label_key = "test.step.fast"
+[[install_step.field.option]]
+value = "slow"
+label_key = "test.step.slow"
+
+[[install_step]]
+id = "warn"
+title_key = "test.step.warn"
+
+[[install_step]]
+id = "fail"
+title_key = "test.step.fail"
+
+[[install_step]]
+id = "boom"
+title_key = "test.step.boom"
 "#
         )
     }
@@ -672,6 +721,23 @@ default = "allow"
         DISABLE_CALLS.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// The fixture's step hook: the step id picks the outcome, and the resolved
+    /// form values are echoed as details so a test sees what reached the hook.
+    fn fixture_install_step(
+        _ctx: &NativeAppContext,
+        run: &InstallStepRun,
+    ) -> Result<InstallStepOutcome> {
+        STEP_CALLS.fetch_add(1, Ordering::SeqCst);
+        let details = run.values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let status = match run.step_id {
+            "pass" => InstallStepStatus::Ok,
+            "warn" => InstallStepStatus::Warning,
+            "fail" => InstallStepStatus::Failed,
+            other => anyhow::bail!("fixture step '{other}' blew up"),
+        };
+        Ok(InstallStepOutcome { status, message: format!("{} finished", run.step_id), details })
+    }
+
     pub(super) static HOOKS: NativeAppHooks = NativeAppHooks {
         package_id: PACKAGE_ID,
         init,
@@ -684,6 +750,7 @@ default = "allow"
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: None,
+        install_step: Some(fixture_install_step),
     };
 
     /// A second fixture whose teardown can REFUSE, the way TentaNas's does
@@ -722,6 +789,7 @@ default = "allow"
         teardown_node_info: None,
         arm_teardown: None,
         disarm_teardown: Some(refusing_disarm),
+        install_step: None,
     };
 }
 

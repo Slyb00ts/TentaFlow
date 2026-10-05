@@ -3518,6 +3518,17 @@
     "install_singleton_done": "Einzelinstanz-App — bereits installiert",
     "install_done": "Instanz „{name}“ installiert",
     "install_failed": "Installation fehlgeschlagen",
+    "install_steps": {
+      "title": "Einrichtung von {name} abschließen",
+      "intro": "Die Instanz ist installiert. Diese Schritte prüfen oder bereiten sie vor; jeder kann erneut ausgeführt werden.",
+      "run": "Ausführen",
+      "run_again": "Erneut ausführen",
+      "retry": "Wiederholen",
+      "run_all": "Alle Schritte ausführen",
+      "finish": "Fertig",
+      "field_required": "Das Feld „{field}“ ist erforderlich",
+      "closed_incomplete": "{name} ist installiert, aber {count} {count|Einrichtungsschritt ist|Einrichtungsschritte sind} nicht bestanden."
+    },
     "instance_name": "Instanzname",
     "instance_name_hint": "Dieses Paket läuft in mehreren Instanzen — jede mit eigenen Daten und eigener Berechtigungsmatrix.",
     "instance_name_required": "Instanznamen eingeben",
@@ -5069,7 +5080,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Quantenlabor: Notizbücher, Schaltkreise, Simulation und echte QPUs"
+      "desc": "Quantenlabor: Notizbücher, Schaltkreise, Simulation und echte QPUs",
+      "install": {
+        "bell_test": {
+          "title": "Bell-Test",
+          "desc": "Führt einen Zwei-Qubit-Bell-Schaltkreis im Simulator dieses Knotens aus und prüft, dass nur 00 und 11 gemessen werden."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",

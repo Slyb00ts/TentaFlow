@@ -3518,6 +3518,17 @@
     "install_singleton_done": "Aplicación de instancia única — ya instalada",
     "install_done": "Instancia «{name}» instalada",
     "install_failed": "Instalación fallida",
+    "install_steps": {
+      "title": "Terminar la configuración de {name}",
+      "intro": "La instancia está instalada. Estos pasos la comprueban o la preparan; cada uno puede ejecutarse de nuevo.",
+      "run": "Ejecutar",
+      "run_again": "Ejecutar de nuevo",
+      "retry": "Reintentar",
+      "run_all": "Ejecutar todos los pasos",
+      "finish": "Terminar",
+      "field_required": "El campo «{field}» es obligatorio",
+      "closed_incomplete": "{name} está instalada, pero {count} {count|paso de configuración no se ha superado|pasos de configuración no se han superado}."
+    },
     "instance_name": "Nombre de la instancia",
     "instance_name_hint": "Este paquete admite varias instancias, cada una con sus propios datos y su propia matriz de permisos.",
     "instance_name_required": "Introduce el nombre de la instancia",
@@ -5069,7 +5080,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Laboratorio cuántico: cuadernos, circuitos, simulación y QPU reales"
+      "desc": "Laboratorio cuántico: cuadernos, circuitos, simulación y QPU reales",
+      "install": {
+        "bell_test": {
+          "title": "Prueba de Bell",
+          "desc": "Ejecuta un circuito de Bell de dos cúbits en el simulador de este nodo y comprueba que solo se miden 00 y 11."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",

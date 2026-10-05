@@ -5913,6 +5913,40 @@ pub struct AddonPackageInfo {
     /// can sign into to fill the connection params (e.g. "unitree").
     #[serde(default)]
     pub cloud_account_provider: Option<String>,
+    /// `[[install_step]]` declarations: app steps the install UI runs after the
+    /// instance exists. Empty for a package without steps, which is then
+    /// installed exactly as before.
+    #[serde(default)]
+    pub install_steps: Vec<AddonInstallStepInfo>,
+}
+
+/// One option of a `select`/`multiselect` install-step field.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstallStepOption {
+    pub value: String,
+    pub label_key: String,
+}
+
+/// One input of an install step's form. `kind` is `select`, `multiselect`,
+/// `checkbox` or `text`; a checkbox value travels as `"true"`/`"false"` and a
+/// multiselect value as its chosen option values joined by commas.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstallStepField {
+    pub id: String,
+    pub kind: String,
+    pub label_key: String,
+    pub required: bool,
+    pub default_value: Option<String>,
+    pub options: Vec<AddonInstallStepOption>,
+}
+
+/// One app step declared by a package manifest (`[[install_step]]`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstallStepInfo {
+    pub id: String,
+    pub title_key: String,
+    pub description_key: Option<String>,
+    pub fields: Vec<AddonInstallStepField>,
 }
 
 /// One declared connection parameter (`[[robot.connection_param]]`). Drives the
@@ -5982,6 +6016,32 @@ pub struct AddonInstanceUpdateResponse {
     pub error: Option<String>,
 }
 
+/// Runs one app step of an installed instance. The instance exists already;
+/// `values` are the form's answers keyed by field id.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceInstallStepRequest {
+    pub addon_id: String,
+    pub step_id: String,
+    pub values: Vec<(String, String)>,
+}
+
+/// Outcome of an install step as the wizard shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AddonInstallStepStatus {
+    Ok,
+    Warning,
+    Failed,
+}
+
+/// Result of one step run. `message` is English text for the operator; `details`
+/// are measured facts (name, value) the wizard lists under it.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonInstanceInstallStepResponse {
+    pub status: AddonInstallStepStatus,
+    pub message: String,
+    pub details: Vec<(String, String)>,
+}
+
 /// Multiplex dla operacji katalog/instancje w 1 wariancie MessageBody, wzorem
 /// `AddonUiBody`/`IamBody`. Req* przychodza z UI, Res* wracaja. Routing po
 /// inner-nazwie (`variant_name_of`) do jednego handlera
@@ -6004,6 +6064,9 @@ pub enum AddonInstancePayload {
     /// Hot-update instancji do wybranej wersji.
     ReqUpdate(AddonInstanceUpdateRequest),
     ResUpdate(AddonInstanceUpdateResponse),
+    /// Runs one app step of an installed instance.
+    ReqInstallStep(AddonInstanceInstallStepRequest),
+    ResInstallStep(AddonInstanceInstallStepResponse),
 }
 
 // =============================================================================
@@ -8692,6 +8755,59 @@ mod tests {
     fn round_trip(body: MessageBody) -> MessageBody {
         let bytes = crate::cbor::encode(&body).expect("encode");
         crate::cbor::decode::<MessageBody>(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn the_install_step_requests_round_trip_and_are_tagged_by_name() {
+        let request = MessageBody::AddonInstanceBody(AddonInstancePayload::ReqInstallStep(
+            AddonInstanceInstallStepRequest {
+                addon_id: "tentaquant-1a2b3c4d".to_string(),
+                step_id: "bell-test".to_string(),
+                values: vec![("mode".to_string(), "fast".to_string())],
+            },
+        ));
+        assert_eq!(round_trip(request.clone()), request);
+        let response = MessageBody::AddonInstanceBody(AddonInstancePayload::ResInstallStep(
+            AddonInstanceInstallStepResponse {
+                status: AddonInstallStepStatus::Warning,
+                message: "ran with a caveat".to_string(),
+                details: vec![("00".to_string(), "2051".to_string())],
+            },
+        ));
+        assert_eq!(round_trip(response.clone()), response);
+
+        // Variants are tagged by NAME, so these two spellings are the wire
+        // contract: renaming either one breaks every deployed peer.
+        let bytes = crate::cbor::encode(&request).expect("encode");
+        let value: ciborium::value::Value = ciborium::de::from_reader(bytes.as_slice()).expect("value");
+        let text = format!("{value:?}");
+        assert!(text.contains("ReqInstallStep"), "{text}");
+    }
+
+    /// A peer built before app steps existed sends a catalog row without
+    /// `install_steps`; `#[serde(default)]` keeps that frame decodable.
+    #[test]
+    fn a_catalog_row_without_install_steps_still_decodes() {
+        #[derive(SerdeSerialize)]
+        struct RowWithoutSteps {
+            package_id: String,
+            name: String,
+            latest_version: String,
+            versions: Vec<String>,
+            source: String,
+            installed_instances: i32,
+        }
+        let bytes = crate::cbor::encode(&RowWithoutSteps {
+            package_id: "tentaquant".to_string(),
+            name: "TentaQuant".to_string(),
+            latest_version: "1.0.0".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            source: "native".to_string(),
+            installed_instances: 0,
+        })
+        .expect("encode");
+        let decoded = crate::cbor::decode::<AddonPackageInfo>(&bytes).expect("decode");
+        assert!(decoded.install_steps.is_empty());
     }
 
     /// A peer built before `correlation_id` was appended sends the entry

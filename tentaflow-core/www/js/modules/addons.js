@@ -23,6 +23,7 @@ import { ToolsTab } from '/js/modules/addons/tools.js';
 import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
 import { BindingsTab } from '/js/modules/addons/bindings.js';
+import { openInstallSteps } from '/js/modules/addons/install-steps.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
 import { confirmDisable } from '/js/modules/addons/disable-dialog.js';
 import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
@@ -722,6 +723,12 @@ function openInstallInstanceModal(pkg) {
       // screen-open gate in tentanas.js `drawTab` is the backstop that catches
       // every case this misses, which is why no error handling is invented here.
       if (pkgId === TENTANAS_PACKAGE_ID) await Router.navigate('tentanas', { setup: '1' });
+      // App steps declared by the package run against the instance that now
+      // exists. A package without steps gets no extra window.
+      const steps = pkg.installSteps ?? [];
+      if (steps.length > 0) {
+        openInstallSteps({ addonId: res.addonId ?? res.addon_id, packageName: pkg.name || pkgId, steps });
+      }
       return true;
     },
   });

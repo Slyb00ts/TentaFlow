@@ -3692,6 +3692,17 @@
     "install_singleton_done": "Single-instance app — already installed",
     "install_done": "Instance \"{name}\" installed",
     "install_failed": "Installation failed",
+    "install_steps": {
+      "title": "Finish setting up {name}",
+      "intro": "The instance is installed. These steps check or prepare it; each one can be run again.",
+      "run": "Run",
+      "run_again": "Run again",
+      "retry": "Retry",
+      "run_all": "Run all steps",
+      "finish": "Finish",
+      "field_required": "Field \"{field}\" is required",
+      "closed_incomplete": "{name} is installed, but {count} {count|setup step has|setup steps have} not passed."
+    },
     "instance_name": "Instance name",
     "instance_name_hint": "This package runs as many instances — each with its own data and its own permission matrix.",
     "instance_name_required": "Enter an instance name",
@@ -6136,7 +6147,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Quantum laboratory: notebooks, circuits, simulation and real QPUs"
+      "desc": "Quantum laboratory: notebooks, circuits, simulation and real QPUs",
+      "install": {
+        "bell_test": {
+          "title": "Bell test",
+          "desc": "Runs a two-qubit Bell circuit on this node's simulator and checks that only 00 and 11 are measured."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",

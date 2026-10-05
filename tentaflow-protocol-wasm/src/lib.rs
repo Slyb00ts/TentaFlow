@@ -24,7 +24,8 @@ use tentaflow_protocol::{
         AddonAccessDecisionRequest, AddonAccessListRequest, AddonAdminOnlySetRequest,
         AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest, AddonDocumentPayload,
         AddonDocumentUploadChunkRequest, AddonInstallRequest, AddonInstanceDuplicateRequest,
-        AddonInstanceInstallRequest, AddonInstancePayload, AddonInstanceUpdateRequest,
+        AddonInstanceInstallRequest, AddonInstanceInstallStepRequest, AddonInstancePayload,
+        AddonInstanceUpdateRequest,
         AddonInstanceVersionsRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
@@ -1307,6 +1308,44 @@ pub fn encode_addon_instance_update_request(
         AddonInstanceUpdateRequest {
             addon_id,
             target_version,
+        },
+    ))
+}
+
+/// MessageBody::AddonInstanceBody(ReqInstallStep) — runs one app step of an
+/// installed instance. `values` is a JS `Array<[fieldId, value]>`.
+#[wasm_bindgen(js_name = encodeAddonInstanceInstallStepRequest)]
+pub fn encode_addon_instance_install_step_request(
+    addon_id: String,
+    step_id: String,
+    values: JsValue,
+) -> Result<Vec<u8>, JsError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if !values.is_undefined() && !values.is_null() {
+        let arr: js_sys::Array = values
+            .dyn_into()
+            .map_err(|_| JsError::new("values must be Array<[fieldId, value]>"))?;
+        for i in 0..arr.length() {
+            let pair: js_sys::Array = arr
+                .get(i)
+                .dyn_into()
+                .map_err(|_| JsError::new("values element must be [fieldId, value]"))?;
+            let key = pair
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsError::new("field id must be a string"))?;
+            let value = pair
+                .get(1)
+                .as_string()
+                .ok_or_else(|| JsError::new("field value must be a string"))?;
+            pairs.push((key, value));
+        }
+    }
+    encode_addon_instance(AddonInstancePayload::ReqInstallStep(
+        AddonInstanceInstallStepRequest {
+            addon_id,
+            step_id,
+            values: pairs,
         },
     ))
 }
@@ -7552,6 +7591,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         if let Some(provider) = pkg.cloud_account_provider {
                             set(&item, "cloudAccountProvider", provider.into());
                         }
+                        let steps = js_sys::Array::new();
+                        for step in pkg.install_steps {
+                            let sv = js_sys::Object::new();
+                            set(&sv, "id", step.id.into());
+                            set(&sv, "titleKey", step.title_key.into());
+                            if let Some(key) = step.description_key {
+                                set(&sv, "descriptionKey", key.into());
+                            }
+                            let fields = js_sys::Array::new();
+                            for field in step.fields {
+                                let fv = js_sys::Object::new();
+                                set(&fv, "id", field.id.into());
+                                set(&fv, "kind", field.kind.into());
+                                set(&fv, "labelKey", field.label_key.into());
+                                set(&fv, "required", field.required.into());
+                                if let Some(default) = field.default_value {
+                                    set(&fv, "defaultValue", default.into());
+                                }
+                                let options = js_sys::Array::new();
+                                for option in field.options {
+                                    let ov = js_sys::Object::new();
+                                    set(&ov, "value", option.value.into());
+                                    set(&ov, "labelKey", option.label_key.into());
+                                    options.push(&ov.into());
+                                }
+                                set(&fv, "options", options.into());
+                                fields.push(&fv.into());
+                            }
+                            set(&sv, "fields", fields.into());
+                            steps.push(&sv.into());
+                        }
+                        set(&item, "installSteps", steps.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());
@@ -7594,6 +7665,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     if let Some(e) = r.error {
                         set(&obj, "error", e.into());
                     }
+                }
+                AP::ReqInstallStep(_) => {
+                    set(&obj, "variant", "AddonInstanceInstallStepRequest".into());
+                }
+                AP::ResInstallStep(r) => {
+                    set(&obj, "variant", "AddonInstanceInstallStepResponse".into());
+                    let status = match r.status {
+                        tentaflow_protocol::AddonInstallStepStatus::Ok => "ok",
+                        tentaflow_protocol::AddonInstallStepStatus::Warning => "warning",
+                        tentaflow_protocol::AddonInstallStepStatus::Failed => "failed",
+                    };
+                    set(&obj, "status", status.into());
+                    set(&obj, "message", r.message.into());
+                    let details = js_sys::Array::new();
+                    for (name, value) in r.details {
+                        let dv = js_sys::Object::new();
+                        set(&dv, "name", name.into());
+                        set(&dv, "value", value.into());
+                        details.push(&dv.into());
+                    }
+                    set(&obj, "details", details.into());
                 }
             }
         }

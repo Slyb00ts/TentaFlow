@@ -239,6 +239,17 @@ fn install_native_instance(
         }
     }
 
+    // The name is what tells two instances of a multi-instance app apart on the
+    // apps grid and in the permission matrix; the install dialog already
+    // refuses a taken one, and this keeps a second client from creating it.
+    let wanted = display_name.trim().to_lowercase();
+    let taken = crate::db::repository::list_package_instances(db, package_id)?
+        .into_iter()
+        .any(|(_, _, existing)| existing.trim().to_lowercase() == wanted);
+    if taken {
+        bail!("instancja o nazwie '{display_name}' juz istnieje");
+    }
+
     let instance_id = unique_instance_id(db, package_id)?;
     let instance_manifest = rewrite_manifest_for_instance(
         package_manifest,
@@ -2499,6 +2510,11 @@ fn validate_platform_contract(manifest: &AddonManifest) -> Result<()> {
         if manifest.native.is_some() {
             bail!("[native] section requires [addon].runtime = \"native\"");
         }
+        // A step runs through `NativeAppHooks::install_step`; a WASM package
+        // has no such hook, so declaring one would be a step nobody can run.
+        if !manifest.install_steps.is_empty() {
+            bail!("[[install_step]] requires [addon].runtime = \"native\"");
+        }
         if manifest.wasm_file.is_empty() {
             bail!("addon.wasm_file is empty");
         }
@@ -3135,6 +3151,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let publisher = parse_publisher_section(top.get("publisher"))?;
     let runtime_overrides = parse_runtime_section(top.get("runtime"))?;
     let robot = parse_robot_section(top.get("robot"));
+    let install_steps = crate::addon::install_steps::parse_install_steps(top.get("install_step"))?;
 
     crate::addon::manifest::validate_manifest_extensions(
         storage.as_ref(),
@@ -3229,6 +3246,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         publisher,
         runtime_overrides,
         robot,
+        install_steps,
     };
     validate_platform_contract(&manifest)?;
     Ok(manifest)

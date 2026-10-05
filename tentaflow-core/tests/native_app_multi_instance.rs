@@ -211,6 +211,49 @@ fn non_singleton_package_installs_two_instances() {
     lifecycle::uninstall_instance(&b, &db).expect("cleanup b");
 }
 
+/// A second laboratory is allowed, but not under a name another instance of the
+/// package already carries: the name is the only thing telling them apart.
+#[test]
+fn a_second_instance_may_not_reuse_a_taken_name() {
+    let _home = test_home();
+    let db = create_test_db();
+    register_fixture_package(&db, "1.0.0-names", false);
+
+    lifecycle::install_instance(
+        &db,
+        fixture::PACKAGE_ID,
+        "1.0.0-names",
+        "Physics lab",
+        &BTreeMap::new(),
+    )
+    .expect("first instance");
+    let err = lifecycle::install_instance(
+        &db,
+        fixture::PACKAGE_ID,
+        "1.0.0-names",
+        "  physics LAB ",
+        &BTreeMap::new(),
+    )
+    .expect_err("the name is taken, whatever its case and padding");
+    assert!(err.to_string().contains("juz istnieje"), "{err}");
+    assert!(lifecycle::install_instance(
+        &db,
+        fixture::PACKAGE_ID,
+        "1.0.0-names",
+        "Chemistry lab",
+        &BTreeMap::new(),
+    )
+    .is_ok());
+    let blank = lifecycle::install_instance(&db, fixture::PACKAGE_ID, "1.0.0-names", "   ", &BTreeMap::new());
+    assert!(blank.is_err(), "a multi-instance install needs a name");
+
+    let instances = db::repository::list_package_instances(&db, fixture::PACKAGE_ID).expect("list");
+    assert_eq!(instances.len(), 2, "the refused install left no row behind");
+    for (id, _, _) in instances {
+        lifecycle::uninstall_instance(&id, &db).expect("cleanup");
+    }
+}
+
 #[test]
 fn singleton_package_still_refuses_a_second_instance() {
     let _home = test_home();

@@ -13,6 +13,7 @@ pub mod event_publish;
 pub mod flow_blocks;
 pub mod fs_sandbox;
 pub mod host_functions;
+pub mod install_steps;
 pub mod lifecycle;
 pub mod manifest;
 pub mod migrations;
@@ -230,6 +231,10 @@ pub struct AddonManifest {
     /// resolves the owning addon by this block and reads `[robot.safety]`.
     #[serde(default)]
     pub robot: Option<RobotManifestSection>,
+    /// `[[install_step]]` — app steps the install wizard runs after the
+    /// instance exists (native packages only; see `install_steps`).
+    #[serde(default)]
+    pub install_steps: Vec<install_steps::InstallStepSpec>,
 }
 
 /// `[robot]` manifest section — marks an addon as a robot controller and carries

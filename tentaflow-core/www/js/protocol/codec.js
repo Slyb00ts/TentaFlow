@@ -2495,6 +2495,23 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonInstanceBody(ReqInstallStep) — one app step of an installed
+   *  instance; `values` is an Array<[fieldId, value]>. */
+  addonInstanceInstallStepRequest(
+    correlationId,
+    { addonId, stepId, values = [] },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceInstallStepRequest(addonId, stepId, values);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji. */
   addonInstanceVersionsRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
