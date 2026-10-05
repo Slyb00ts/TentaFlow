@@ -1004,6 +1004,44 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
+test('script inspector keeps a direct CEL body and explicit mapping through mounted Save', async () => {
+  const model = emptyProcessModel();
+  model.variables.answer = null;
+  model.nodes.splice(1, 0, { id: 'Script_1', name: 'Calculate',
+    kind: { ScriptTask: { script: '', outputMapping: {} } } });
+  model.sequenceFlows[0].targetId = 'Script_1';
+  model.sequenceFlows.push({ id: 'ScriptExit', sourceId: 'Script_1', targetId: 'End', condition: null });
+  const state = await mount(definition('script-draft', { model }), {
+    processDefinitionSaveRequest: (payload) => ({ definition: definition('script-draft',
+      { model: payload.model, draftRevision: 5 }) }),
+  });
+  state.canvas.selectNode('Script_1');
+  await flush(2);
+  const script = state.root.querySelector('[data-process="script"]');
+  const mapping = state.root.querySelector('[data-process="outputMapping"]');
+  assert.equal(script.tagName, 'TF-TEXTAREA');
+  assert.ok(script.hasAttribute('autogrow'));
+  assert.equal(mapping.tagName, 'TF-KEYVALUE-EDITOR');
+  assert.equal(state.root.querySelector('[data-process="repeatMode"]'), null);
+  change(script, 'vars.amount + 1');
+  change(mapping, { answer: 'outputs' });
+  const expected = { ScriptTask: { script: 'vars.amount + 1', outputMapping: { answer: 'outputs' } } };
+  assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Script_1').kind, expected);
+  state.canvas.undo();
+  assert.notDeepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Script_1').kind, expected);
+  state.canvas.redo();
+  assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Script_1').kind, expected);
+  assert.equal(await builder._save(), true);
+  const request = calls.find((row) => row.kind === 'processDefinitionSaveRequest');
+  assert.deepEqual(request.payload.model.nodes.find((node) => node.id === 'Script_1').kind, expected);
+  state.canvas.selectNode('Script_1');
+  const readOnly = inspector(state.canvas, true);
+  readOnly.show(state.canvas.nodes.find((node) => node.id === 'Script_1'), state.canvas.templates.get('bpmn_script_task'));
+  assert.equal(readOnly.root.querySelector('[data-process="script"]').hasAttribute('disabled'), true);
+  assert.equal(readOnly.root.querySelector('[data-process="outputMapping"]').hasAttribute('disabled'), true);
+  readOnly.destroy();
+});
+
 test('repeat inspector persists MI and loop metadata outside task config and renders the standard marker', async () => {
   const graph = canvas();
   graph.processModel.variables.results = [];
@@ -1082,7 +1120,7 @@ test('repeat inspector changes survive the mounted draft save and undo/redo snap
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 21);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 22);
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.equal(root.querySelector('[data-node-type="bpmn_timer_boundary"]'), null);
   const item = root.querySelector('[data-node-type="bpmn_user_task"]');
@@ -1802,6 +1840,40 @@ test('interrupting escalation history shows the full accepted result and origin 
   } finally { await I18n.setLanguage('en'); }
 });
 
+test('script history renders arbitrary JSON results and nonretryable incidents in five locales', async () => {
+  const outputs = [null, 7, { business_key: '<img src=x onerror=alert(1)>', nested: ['Łódź', true] }];
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const events = outputs.map((value, index) => ({ seq: index + 1, atMs: 1000 + index,
+        kind: 'script_completed', nodeName: 'Calculate <&>', data: { outputs: value } }));
+      events.push({ seq: 4, atMs: 1004, kind: 'incident', nodeName: 'Calculate <&>',
+        data: { code: 'SCRIPT_MAPPING_FAILED', message: 'private business <&>' } });
+      const current = instance(`script-${language}`, { incidents: [{ incidentId: 'script-failure',
+        nodeId: 'Script_1', nodeName: 'Calculate <&>', scopeId: `script-${language}`,
+        code: 'SCRIPT_MAPPING_FAILED', message: 'private business <&>', jobId: null,
+        canRetry: false, status: 'Open' }] });
+      const win = await monitor(current, { processHistoryRequest: { events, nextSeq: 4, hasMore: false } });
+      const rows = win.querySelectorAll('[data-events] [data-process-seq]');
+      assert.equal(rows.length, 4);
+      for (let index = 0; index < outputs.length; index += 1) {
+        assert.equal(rows[index].querySelector('h3').textContent, I18n.t('bpmn.script_result'));
+        const editor = rows[index].querySelector('tf-code-editor');
+        assert.equal(editor.hasAttribute('readonly'), true);
+        assert.deepEqual(JSON.parse(editor.value), outputs[index]);
+        assert.ok(rows[index].textContent.includes('Calculate <&>'));
+      }
+      assert.equal(win.querySelector('[data-events] img'), null);
+      assert.equal(win.querySelector('[data-events] script'), null);
+      assert.equal(win.querySelector('[data-retry]'), null);
+      assert.ok(rows[3].textContent.includes(I18n.t('bpmn.incident_script_mapping_failed')));
+      assert.ok(rows[3].textContent.includes(I18n.t('bpmn.incident_script_guidance')));
+      win.dispatchEvent(new Event('closed'));
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('instance summaries paginate without fetching full opaque business values', async () => {
   fixtures({ processInstanceListRequest: ({ offset }) => ({ instances: [instance(`page-${offset}`)], total: 60, hasMore: true }) });
   const win = await openProcessInstances(); const table = win.querySelector('tf-table'); table.dispatchEvent(new CustomEvent('page-change', { detail: { page: 3 }, bubbles: true })); await flush();
@@ -1820,7 +1892,7 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 21);
+    assert.equal(processTemplates().length, 22);
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });

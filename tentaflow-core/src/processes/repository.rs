@@ -4172,7 +4172,7 @@ fn incident_on(
 ) -> Result<ProcessIncidentSelection> {
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
     let initiator = require_instance_reader(conn, actor, instance_id)?;
-    let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error') AND NOT (status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
+    let can_retry=initiator&&resolved_at_ms.is_none()&&code != "SCRIPT_INFRASTRUCTURE_FAILED"&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error') AND NOT (status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
     let scope_id: String = conn.query_row(
         "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![id, instance_id],
@@ -4722,7 +4722,7 @@ pub fn list_instances(
             params![actor.org_id, actor.user_id, definition_id],
             |row| row.get(0),
         )?;
-        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND j.status IN ('error','completed') AND NOT (j.status='completed' AND j.result_origin='contract' AND json_extract(j.result_json,'$.outcome')='NeedsHuman') AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
+        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND x.code!='SCRIPT_INFRASTRUCTURE_FAILED' AND j.status IN ('error','completed') AND NOT (j.status='completed' AND j.result_origin='contract' AND json_extract(j.result_json,'$.outcome')='NeedsHuman') AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -6960,7 +6960,8 @@ fn validate_termination_variables_on(
                     | ProcessNodeKind::BoundaryError { output_mapping, .. }
                     | ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
                     | ProcessNodeKind::MessageCatch { output_mapping, .. }
-                    | ProcessNodeKind::BoundaryMessage { output_mapping, .. } => output_mapping,
+                    | ProcessNodeKind::BoundaryMessage { output_mapping, .. }
+                    | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping,
                     _ => bail!("mapped variable effect has no pinned output mapping"),
                 };
                 let boundary_attachment = match &node.kind {
@@ -6976,6 +6977,20 @@ fn validate_termination_variables_on(
                         attached == source.node_id && source.status == "waiting"),
                     "mapped variables lack their factual local activity or boundary activation");
                 let (actual_outputs, actual_extra) = match (&node.kind, accepted) {
+                    (ProcessNodeKind::ScriptTask { script, .. }, _) => {
+                        ensure!(source.status == "ready" && source.node_id == *node_id
+                            && extra.is_empty()
+                            && plan.events.get(*event_index).is_some_and(|event|
+                                event.kind == "script_completed"
+                                    && event.scope_id == *scope_id
+                                    && event.node_id.as_deref() == Some(node_id.as_str())
+                                    && event.data == serde_json::json!({"outputs": outputs})
+                                    && plan.event_sources.get(event_index) == Some(source_token_id)),
+                            "mapped Script output lacks its exact ready action fact");
+                        let effective = effective_scope_variables(scopes, &locals, instance_id,
+                            locals.get(instance_id).context("root variables are missing")?, scope_id)?;
+                        (super::runtime::script_evaluate(script, &effective, &Value::Null)?, Vec::new())
+                    }
                     (ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. },
                         AcceptedInputRef::Human { task_id, .. }) => {
                         let (task_node, task_token, task_kind, stored):
@@ -7208,7 +7223,11 @@ fn validate_termination_variables_on(
                             && event.data["expression"].as_str() == Some(expression.as_str())),
                         "mapped service result did not pass its pinned condition");
                 }
-                let expected = super::runtime::patch_variables(mapping, local, &effective, outputs, extra)?;
+                let expected = if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                    super::runtime::patch_script_variables(mapping, local, &effective, outputs)?
+                } else {
+                    super::runtime::patch_variables(mapping, local, &effective, outputs, extra)?
+                };
                 ensure!(&expected == result,
                     "mapped variable effect differs from its pinned expression");
                 locals.insert(scope_id.clone(), expected);
@@ -7228,6 +7247,16 @@ fn validate_termination_variables_on(
         "message_delivered" if event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::MessageStart { .. }))) => true,
+        "script_completed" => event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind,
+                    ProcessNodeKind::ScriptTask { output_mapping, .. }
+                        if output_mapping.is_empty()
+                            || plan.variable_effects.iter().any(|effect| matches!(effect,
+                                VariableEffect::Mapped { event_index, scope_id, node_id: mapped_node, .. }
+                                    if plan.events.get(*event_index).is_some_and(|candidate|
+                                        std::ptr::eq(candidate, event))
+                                        && scope_id == &event.scope_id && mapped_node == node_id))))),
         "user_task_completed" | "verification_approved" | "verification_passed"
         | "call_returned" | "message_delivered" | "business_error_caught"
         | "escalation_caught" => plan.variable_effects.iter().any(|effect| matches!(effect,
@@ -7811,6 +7840,11 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::ExclusiveGateway { .. }
                 | ProcessNodeKind::InclusiveGateway { .. }
                 | ProcessNodeKind::MessageThrow { .. });
+            let script_wait = matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
+                && plan.events.iter().enumerate().any(|(index, event)|
+                    event.kind == "incident" && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(source.node_id.as_str())
+                        && plan.event_sources.get(&index) == Some(source_id));
             let repetition_wait = pinned.repeat.is_some()
                 && plan.repetition_groups.iter().filter(|group|
                     group.scope_id == token.scope_id && group.node_id == token.node_id
@@ -7832,6 +7866,7 @@ fn validate_termination_action_provenance_on(
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
                 || immediate_wait
+                || script_wait
                 || repetition_wait
                 || pinned.kind == ProcessNodeKind::TerminateEnd
                     && plan.termination_attempts.iter().any(|attempt| matches!(attempt,
@@ -7899,14 +7934,17 @@ fn validate_termination_action_provenance_on(
                             && event.data["parent_scope_id"].as_str()
                                 == Some(token.scope_id.as_str()))))
             && (matches!(&pinned.kind, ProcessNodeKind::CallActivity { .. })
-                && plan.termination_attempts.iter().any(|attempt| {
+                && (matches!(entry, EntryAuthority::Accepted(
+                    AcceptedInputRef::CallReturn { parent_token_id, .. })
+                        if parent_token_id == source_id)
+                || plan.termination_attempts.iter().any(|attempt| {
                     let input = match attempt {
                         TerminationAttempt::Success(source) => &source.accepted_input,
                         TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                     };
                     matches!(input, AcceptedInputRef::CallReturn { parent_token_id, .. }
                         if parent_token_id == source_id)
-                })
+                }))
                 || matches!(&pinned.kind, ProcessNodeKind::SubProcess { .. })
                     && plan.variable_effects.iter().any(|effect| matches!(effect,
                         VariableEffect::Mapped { source_token_id, node_id, .. }
@@ -7916,13 +7954,15 @@ fn validate_termination_action_provenance_on(
             && match &pinned.kind {
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. } => {
                     let human = plan.complete_user_task_ids.iter().any(|id|
-                        plan.termination_attempts.iter().any(|attempt| {
+                        (matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::Human { task_id, .. }) if task_id == id)
+                        || plan.termination_attempts.iter().any(|attempt| {
                             let input = match attempt {
                                 TerminationAttempt::Success(source) => &source.accepted_input,
                                 TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                             };
                             matches!(input, AcceptedInputRef::Human { task_id, .. } if task_id == id)
-                        })
+                        }))
                         &&
                         tx.query_row("SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
                             params![instance_id,id], |row| row.get::<_,Option<String>>(0))
@@ -7933,13 +7973,15 @@ fn validate_termination_action_provenance_on(
                                 && matches!(event.kind.as_str(),
                                     "user_task_completed" | "verification_approved"));
                     let service = plan.complete_job_ids.iter().any(|id|
-                        plan.termination_attempts.iter().any(|attempt| {
+                        (matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::Service { job_id, .. }) if job_id == id)
+                        || plan.termination_attempts.iter().any(|attempt| {
                             let input = match attempt {
                                 TerminationAttempt::Success(source) => &source.accepted_input,
                                 TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                             };
                             matches!(input, AcceptedInputRef::Service { job_id, .. } if job_id == id)
-                        })
+                        }))
                         &&
                         tx.query_row("SELECT token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
                             params![instance_id,id], |row| row.get::<_,String>(0))
@@ -7951,14 +7993,17 @@ fn validate_termination_action_provenance_on(
                 }
                 ProcessNodeKind::TimerCatch { .. } => plan.timer_updates.iter().any(|update|
                     update.status == ProcessTimerStatus::Fired
-                        && plan.termination_attempts.iter().any(|attempt| {
+                        && (matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::Timer { timer_id, .. })
+                                if timer_id == &update.timer_id)
+                        || plan.termination_attempts.iter().any(|attempt| {
                             let input = match attempt {
                                 TerminationAttempt::Success(source) => &source.accepted_input,
                                 TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                             };
                             matches!(input, AcceptedInputRef::Timer { timer_id, .. }
                                 if timer_id == &update.timer_id)
-                        })
+                        }))
                         && timer_on(tx, &update.timer_id).is_ok_and(|timer|
                             timer.instance_id.as_deref() == Some(instance_id)
                                 && timer.scope_id.as_deref() == Some(source.scope_id.as_str())
@@ -7966,7 +8011,10 @@ fn validate_termination_action_provenance_on(
                                 && timer.node_id == source.node_id)),
                 ProcessNodeKind::MessageCatch { .. } => plan.subscription_updates.iter().any(|update|
                     update.status == ProcessSubscriptionStatus::Consumed
-                        && plan.termination_attempts.iter().any(|attempt| {
+                        && (matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::Message { target_subscription_id: Some(id), .. })
+                                if id == &update.subscription_id)
+                        || plan.termination_attempts.iter().any(|attempt| {
                             let input = match attempt {
                                 TerminationAttempt::Success(source) => &source.accepted_input,
                                 TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
@@ -7974,7 +8022,7 @@ fn validate_termination_action_provenance_on(
                             matches!(input, AcceptedInputRef::Message {
                                 target_subscription_id: Some(id), .. }
                                 if id == &update.subscription_id)
-                        })
+                        }))
                         && subscription_on(tx, &update.subscription_id).is_ok_and(|subscription|
                             subscription.instance_id == instance_id
                                 && subscription.scope_id == source.scope_id
@@ -8065,7 +8113,7 @@ fn validate_termination_action_provenance_on(
                     && occurrence.approval_event_id.as_ref()
                         .or(occurrence.accepted_source_event_id.as_ref())
                         .is_some_and(|event_id| plan.event_ids.values().any(|id| id == event_id))
-                    && plan.termination_attempts.iter().any(|attempt| {
+                    && (plan.termination_attempts.iter().any(|attempt| {
                         let accepted = match attempt {
                             TerminationAttempt::Success(source) => &source.accepted_input,
                             TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
@@ -8077,7 +8125,11 @@ fn validate_termination_action_provenance_on(
                             || matches!(accepted,
                                 AcceptedInputRef::Service { job_id, .. }
                                     if occurrence.job_id.as_ref() == Some(job_id))
-                    }))),
+                    }) || matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Human {
+                        task_id, .. }) if occurrence.user_task_id.as_ref() == Some(task_id)
+                            || occurrence.verification_user_task_id.as_ref() == Some(task_id))
+                    || matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Service {
+                        job_id, .. }) if occurrence.job_id.as_ref() == Some(job_id))))),
         "termination consumed a token outside its factual selected prefix");
     for source_id in plan.token_sources.values().collect::<HashSet<_>>() {
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
@@ -8090,7 +8142,8 @@ fn validate_termination_action_provenance_on(
                 };
                 matches!(input, AcceptedInputRef::PersistedReady { token_id, .. }
                     if token_id == &source.token_id)
-            }), "termination advanced an unrelated retained ready token");
+            }) || plan.event_sources.values().any(|id| id == &source.token_id),
+                "termination advanced an unrelated retained ready token");
         }
         let path = scope_path(scopes, instance_id, &source.scope_id)?;
         let (nodes, flows, _) = super::model::scope_body(model, &path)?;
@@ -8135,7 +8188,8 @@ fn validate_termination_action_provenance_on(
                         && incident_count == waits && (!is_join || waits == 0),
                         "termination gateway added an unauthenticated wait or join");
                 }
-                ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. } => {
+                ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. }
+                | ProcessNodeKind::ScriptTask { .. } => {
                     let incident_count = plan.add_incidents.iter().filter(|incident|
                         incident.scope_id == source.scope_id
                             && incident.node_id.as_deref() == Some(source.node_id.as_str()))
@@ -8187,7 +8241,11 @@ fn validate_termination_action_provenance_on(
     let mandatory = |event: &PlannedEvent| matches!(event.kind.as_str(),
         "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
         | "parallel_joined" | "inclusive_joined" | "end_reached"
-        | "error_end_reached" | "terminate_end_reached" | "message_queued")
+        | "error_end_reached" | "terminate_end_reached" | "message_queued"
+        | "script_completed")
+        || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })))
         || event.kind == "incident" && event.data["source_kind"] == "terminate_end_return_failure";
     ensure!(plan.event_sources.len() == plan.events.iter().filter(|event| mandatory(event)).count()
         && plan.events.iter().enumerate().all(|(index,event)|
@@ -8205,7 +8263,8 @@ fn validate_termination_action_provenance_on(
                 };
                 matches!(input, AcceptedInputRef::PersistedReady { token_id, .. }
                     if token_id == source_id)
-            }), "termination history advanced an unrelated retained ready token");
+            }) || plan.event_sources.values().any(|id| id == source_id),
+                "termination history advanced an unrelated retained ready token");
         }
         ensure!(acted.insert(source_id.clone()) && source.status == "ready"
             && source.scope_id == event.scope_id
@@ -8386,6 +8445,9 @@ fn validate_termination_action_provenance_on(
                     "termination message throw lacks its actual queued row");
                 outgoing.iter().map(|edge| edge.id.clone()).collect()
             }
+            (ProcessNodeKind::ScriptTask { .. }, "script_completed") =>
+                outgoing.iter().map(|edge| edge.id.clone()).collect(),
+            (ProcessNodeKind::ScriptTask { .. }, "incident") => Vec::new(),
             _ => bail!("termination action history differs from its pinned source node"),
         };
         if !matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined") {
@@ -8417,7 +8479,12 @@ fn validate_termination_action_provenance_on(
                         (&failure.accepted_input, failure.source_event_index),
                 };
                 (accepted == human_input).then_some(index)
-            }).min();
+            }).min().or_else(|| plan.events.iter().any(|event|
+                event.kind == "script_completed"
+                    || event.kind == "incident" && event.node_id.as_deref().is_some_and(|id|
+                        scope_node(model, scopes, instance_id, &event.scope_id, id)
+                            .is_ok_and(|node| matches!(&node.kind,
+                                ProcessNodeKind::ScriptTask { .. })))).then_some(plan.events.len()));
             Some((task_id.clone(), token_id, scope_id, node_id, first_source_index))
         }
         _ => None,
@@ -8813,18 +8880,29 @@ fn validate_termination_action_provenance_on(
                         TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                     };
                     match input {
-                        AcceptedInputRef::Service { job_id, .. } => Some(job_id),
+                        AcceptedInputRef::Service { .. } => Some(input),
                         _ => None,
                     }
+                }).or_else(|| match entry {
+                    EntryAuthority::Accepted(input @ AcceptedInputRef::Service { .. })
+                        if plan.termination_attempts.is_empty() => Some(input),
+                    _ => None,
                 });
-                accepted.is_some_and(|job_id|
-                    plan.complete_job_ids.iter().any(|id| id == job_id)
-                    && tx.query_row("SELECT scope_id,node_id,result_json,result_origin FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                matches!(accepted, Some(AcceptedInputRef::Service {
+                    job_id, attempt, fence, result_event_id,
+                }) if plan.complete_job_ids.iter().filter(|id| *id == job_id).count() == 1
+                    && plan.event_ids.get(&event_index) == Some(result_event_id)
+                    && tx.query_row("SELECT scope_id,node_id,attempt,fence,result_json,result_origin FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
                         params![instance_id, job_id], |row| Ok((row.get::<_,String>(0)?,
-                            row.get::<_,String>(1)?, row.get::<_,String>(2)?,
-                            row.get::<_,String>(3)?)))
-                        .is_ok_and(|(scope,node_id,result,origin)| scope == event.scope_id
+                            row.get::<_,String>(1)?, row.get::<_,u32>(2)?,
+                            row_u64(row,3)?, row.get::<_,String>(4)?, row.get::<_,String>(5)?)))
+                        .is_ok_and(|(scope,node_id,stored_attempt,stored_fence,result,origin)|
+                            scope == event.scope_id && stored_attempt == *attempt
+                            && stored_fence == *fence
                             && node == Some(node_id.as_str())
+                            && scope_node(model, scopes, instance_id, &scope, &node_id)
+                                .is_ok_and(|pinned| matches!(&pinned.kind,
+                                    ProcessNodeKind::ServiceTask { .. }))
                             && parse::<ActivityResult>(result).is_ok_and(|actual|
                                 serde_json::to_value(actual).is_ok_and(|mut expected| {
                                     expected["result_origin"] = serde_json::json!(origin);
@@ -8832,13 +8910,18 @@ fn validate_termination_action_provenance_on(
                                 })))
                     && plan.events.iter().filter(|candidate| candidate.kind == "service_result").count() == 1)
             }
-            "verification_passed" => plan.termination_attempts.iter().any(|attempt| {
+            "verification_passed" => (plan.termination_attempts.iter().any(|attempt| {
                 let input = match attempt {
                     TerminationAttempt::Success(source) => &source.accepted_input,
                     TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                 };
                 matches!(input, AcceptedInputRef::Service { .. })
-            }) && plan.events.iter().filter(|candidate| candidate.kind == "verification_passed"
+            }) || plan.termination_attempts.is_empty()
+                && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. })))
+                && plan.events.iter().enumerate().any(|(index, prior)|
+                    index < event_index && prior.kind == "service_result"
+                        && prior.scope_id == event.scope_id && prior.node_id == event.node_id)
+                && plan.events.iter().filter(|candidate| candidate.kind == "verification_passed"
                 && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id).count() == 1
                 && node.is_some_and(|node_id| scope_node(model, scopes, instance_id,
                     &event.scope_id, node_id).is_ok_and(|pinned| matches!(&pinned.kind,
@@ -9216,6 +9299,132 @@ fn validate_termination_action_provenance_on(
     Ok(())
 }
 
+fn validate_script_actions_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], expected_revision: u64, plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let mut sources = HashSet::new();
+    for (index, event) in plan.events.iter().enumerate() {
+        if !matches!(event.kind.as_str(), "script_completed" | "incident") { continue; }
+        let Some(node_id) = event.node_id.as_deref() else {
+            ensure!(event.kind != "script_completed", "Script completion has no pinned node");
+            continue;
+        };
+        let node = scope_node(model, scopes, instance_id, &event.scope_id, node_id)?;
+        let ProcessNodeKind::ScriptTask { script, output_mapping } = &node.kind else {
+            ensure!(event.kind != "script_completed", "Script completion named a non-Script node");
+            continue;
+        };
+        let source_id = plan.event_sources.get(&index)
+            .context("Script action has no exact token source")?;
+        ensure!(sources.insert(source_id.clone())
+            && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+            "Script action did not consume one unique ready activation");
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        ensure!(source.status == "ready" && source.scope_id == event.scope_id
+            && source.node_id == node.id
+            && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                plan, source_id, expected_revision, entry, false)?,
+            "Script action is outside its authenticated entry lineage");
+        let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+            VariableEffect::Mapped { event_index, .. }
+            | VariableEffect::ScopeEntry { event_index, .. }
+            | VariableEffect::RepetitionAggregate { event_index, .. }
+            | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < index,
+        }).count();
+        let locals = variable_states.get(effect_count)
+            .context("Script source-time variables are missing")?;
+        let effective = effective_scope_variables(scopes, locals, instance_id,
+            locals.get(instance_id).context("Script root variables are missing")?, &source.scope_id)?;
+        let effects = plan.variable_effects.iter().filter_map(|effect| match effect {
+            VariableEffect::Mapped { event_index, scope_id, node_id, source_token_id,
+                outputs, extra, .. }
+                if *event_index == index && scope_id == &event.scope_id
+                    && node_id == &node.id && source_token_id == source_id
+                    && extra.is_empty() => Some(outputs),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let path = scope_path(scopes, instance_id, &source.scope_id)?;
+        let (_, flows, _) = super::model::scope_body(model, &path)?;
+        let outgoing = flows.iter().filter(|flow| flow.source_id == node.id)
+            .collect::<Vec<_>>();
+        let children = plan.create_tokens.iter().filter(|token|
+            plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
+        ensure!(outgoing.len() == 1, "Script has no pinned single successor");
+        if event.kind == "script_completed" {
+            ensure!(effects.len() == usize::from(!output_mapping.is_empty()),
+                "Script completion has an extra or missing mapped effect");
+            let outputs = if let Some(output) = effects.first() {
+                (*output).clone()
+            } else {
+                super::runtime::script_evaluate(script, &effective, &Value::Null)?
+            };
+            ensure!(event.data == serde_json::json!({"outputs":outputs})
+                && children.len() == 1 && children[0].status == "ready"
+                && children[0].scope_id == source.scope_id
+                && children[0].node_id == outgoing[0].target_id
+                && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
+                && children[0].fork_stack == source.fork_stack,
+                "Script completion changed its result or single pinned continuation");
+        } else {
+            ensure!(effects.is_empty(), "failed Script wrote a mapped variable effect");
+            let body = super::runtime::script_evaluate(script, &effective, &Value::Null);
+            let (code, failure) = match body {
+                Err(error) => ("SCRIPT_EVALUATION_FAILED", error),
+                Ok(outputs) => {
+                    let local = locals.get(&source.scope_id)
+                        .context("Script failure local variables are missing")?;
+                    let failure = super::runtime::patch_script_variables(
+                        output_mapping, local, &effective, &outputs)
+                        .err().context("Script mapping succeeded but an incident was claimed")?;
+                    ("SCRIPT_MAPPING_FAILED", failure)
+                }
+            };
+            ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>().is_none(),
+                "Script infrastructure failure cannot be recorded as a deterministic incident");
+            ensure!(event.data == serde_json::json!({"code":code,"message":failure.to_string()})
+                && plan.add_incidents.iter().any(|incident|
+                    incident.scope_id == event.scope_id && incident.node_id.as_deref() == Some(node_id)
+                        && incident.code == code && incident.message == failure.to_string()
+                        && !incident.can_retry)
+                && children.len() == 1 && children[0].status == "waiting"
+                && children[0].scope_id == source.scope_id
+                && children[0].node_id == source.node_id
+                && children[0].arrival_edge_id == source.arrival_edge_id
+                && children[0].fork_stack == source.fork_stack,
+                "Script failure differs from its replayed body, mapping, or parked wait");
+        }
+    }
+    for source_id in plan.consume_token_ids.iter().chain(plan.token_sources.values()) {
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        let node = scope_node(model, scopes, instance_id, &source.scope_id, &source.node_id)?;
+        if source.status == "ready" && matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+            ensure!(sources.contains(source_id)
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                "Script consumed or continued without one authenticated action fact");
+        }
+    }
+    for incident in &plan.add_incidents {
+        let Some(node_id) = incident.node_id.as_deref() else { continue; };
+        let node = scope_node(model, scopes, instance_id, &incident.scope_id, node_id)?;
+        if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+            let events = plan.events.iter().filter(|event|
+                event.kind == "incident" && event.scope_id == incident.scope_id
+                    && event.node_id.as_deref() == Some(node_id)
+                    && event.data == serde_json::json!({"code":incident.code,
+                        "message":incident.message})).count();
+            let rows = plan.add_incidents.iter().filter(|row|
+                row.scope_id == incident.scope_id && row.node_id == incident.node_id
+                    && row.code == incident.code && row.message == incident.message
+                    && !row.can_retry).count();
+            ensure!(events == rows,
+                "Script incident rows and exact sourced history differ");
+        }
+    }
+    Ok(())
+}
+
 fn validate_termination_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -9227,7 +9436,30 @@ fn validate_termination_plan_on(
     entry: EntryAuthority<'_>,
 ) -> Result<(HashSet<String>, Vec<BTreeMap<String, Value>>)> {
     let mut mapping_scopes = Vec::new();
+    let mut has_script = false;
+    for source_id in plan.consume_token_ids.iter().chain(plan.token_sources.values()) {
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        if source.status == "ready" && scope_node(model, scopes, instance_id,
+            &source.scope_id, &source.node_id)
+            .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })) {
+            has_script = true;
+            break;
+        }
+    }
+    has_script |= plan.events.iter().any(|event| event.kind == "script_completed"
+        || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
+    has_script |= plan.add_incidents.iter().any(|incident|
+        incident.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, scopes, instance_id, &incident.scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
+    has_script |= plan.variable_effects.iter().any(|effect| matches!(effect,
+        VariableEffect::Mapped { scope_id, node_id, .. }
+            if scope_node(model, scopes, instance_id, scope_id, node_id)
+                .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
     let replay_variables = !plan.termination_attempts.is_empty()
+        || has_script
         || plan.variable_effects.iter().any(|effect|
             matches!(effect, VariableEffect::RepetitionEntry { .. }
                 | VariableEffect::RepetitionAggregate { .. }))
@@ -9256,7 +9488,18 @@ fn validate_termination_plan_on(
         }
         validate_termination_variables_on(tx, instance_id, model, &mapping_scopes, plan, call_source, entry)?
     };
-    if !plan.termination_attempts.is_empty() {
+    if has_script {
+        validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
+            expected_revision, plan, &variable_states, entry)?;
+        if plan.termination_attempts.is_empty() {
+            for source_id in plan.event_sources.values() {
+                ensure!(ordinary_action_source_matches_entry_on(tx, instance_id, model,
+                    &mapping_scopes, plan, source_id, expected_revision, entry, false)?,
+                    "Script reduction advanced an action outside its accepted input");
+            }
+        }
+    }
+    if !plan.termination_attempts.is_empty() || has_script {
         validate_termination_action_provenance_on(tx, instance_id, model,
             &mapping_scopes, plan, &variable_states, call_source, entry)?;
     }
@@ -9810,9 +10053,9 @@ fn validate_termination_plan_on(
                     && event.node_id.as_deref() == Some(fact.source_node_id.as_str())
                     && plan.event_ids.get(&index) == Some(&fact.source_event_id)
                     && plan.event_sources.get(&index).is_some_and(|source_token_id|
-                        ordinary_error_source_matches_entry_on(tx, instance_id,
+                        ordinary_action_source_matches_entry_on(tx, instance_id,
                             model, scopes, plan, source_token_id,
-                            expected_revision, entry).unwrap_or(false))),
+                            expected_revision, entry, true).unwrap_or(false))),
                 "ordinary root closure changed its ErrorEnd source");
             authorized_roots.insert(root.clone());
             continue;
@@ -9928,9 +10171,9 @@ fn validate_termination_plan_on(
                             source.kind == "error_end_reached"
                                 && plan.event_ids.get(&index).is_some_and(|actual| actual == id)
                                 && plan.event_sources.get(&index).is_some_and(|source_token_id|
-                                    ordinary_error_source_matches_entry_on(tx, instance_id,
+                                    ordinary_action_source_matches_entry_on(tx, instance_id,
                                         model, scopes, plan, source_token_id,
-                                        expected_revision, entry).unwrap_or(false))));
+                                        expected_revision, entry, true).unwrap_or(false))));
                     let accepted_job = accepted_error_service(event)
                         .unwrap_or(false);
                     let accepted_call = event.data["source_instance_id"].as_str().is_some_and(|id|
@@ -10029,10 +10272,11 @@ enum EntryAuthority<'a> {
     CallAdmission,
 }
 
-fn ordinary_error_source_matches_entry_on(
+fn ordinary_action_source_matches_entry_on(
     tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     source_token_id: &str, expected_revision: u64, entry: EntryAuthority<'_>,
+    allow_other_persisted_ready: bool,
 ) -> Result<bool> {
     match entry {
         EntryAuthority::Accepted(accepted) => {
@@ -10054,6 +10298,9 @@ fn ordinary_error_source_matches_entry_on(
             if trace_termination_source_on(tx, instance_id, model, scopes, plan,
                 source_token_id, seed.as_deref(), accepted, &mut HashSet::new()).is_ok() {
                 return Ok(true);
+            }
+            if !allow_other_persisted_ready {
+                return Ok(false);
             }
         }
         EntryAuthority::PersistedReady => {}
@@ -15326,7 +15573,27 @@ pub fn accept_job_result(
     }
     let mut prepared = plan.clone();
     if !retained_failure && !prepared.event_ids.contains_key(&result_index) {
-        prepared.event_ids.insert(result_index, Uuid::new_v4().to_string());
+        let result_event_id = Uuid::new_v4().to_string();
+        prepared.event_ids.insert(result_index, result_event_id.clone());
+        let mut planned_source_id: Option<String> = None;
+        for effect in &mut prepared.variable_effects {
+            let accepted = match effect {
+                VariableEffect::Mapped { accepted_input, .. }
+                | VariableEffect::ScopeEntry { accepted_input, .. }
+                | VariableEffect::RepetitionEntry { accepted_input, .. }
+                | VariableEffect::RepetitionAggregate { accepted_input, .. } => accepted_input,
+            };
+            let Some(AcceptedInputRef::Service {
+                job_id: source_job, attempt: source_attempt, fence: source_fence,
+                result_event_id: source_event_id,
+            }) = accepted else { continue };
+            if source_job == job_id && *source_attempt == attempt && *source_fence == fence {
+                ensure!(planned_source_id.as_ref().is_none_or(|id| id.as_str() == source_event_id.as_str()),
+                    "accepted service variable effects disagree on source identity");
+                planned_source_id = Some(source_event_id.clone());
+                *source_event_id = result_event_id.clone();
+            }
+        }
     }
     let (mut composite, mut conn) =
         prepare_call_plan(pool, actor, &source_id, None, &prepared, at_ms)?;
@@ -15474,6 +15741,12 @@ pub fn retry_job(
         !accepted_needs_human,
         "accepted Contract NeedsHuman service job cannot be retried"
     );
+    let retained_script_failure: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id WHERE x.instance_id=?1 AND x.job_id=?2 AND x.resolved_at_ms IS NULL AND x.code='SCRIPT_INFRASTRUCTURE_FAILED' AND j.result_json IS NOT NULL)",
+        params![instance_id,job_id], |row| row.get(0),
+    )?;
+    ensure!(!retained_script_failure,
+        "observed Service result retained after Script infrastructure failure cannot be retried");
     let (node_id,scope_id):(String,String)=tx.query_row("SELECT j.node_id,j.scope_id FROM bpmn_jobs j JOIN bpmn_incidents x ON x.job_id=j.job_id AND x.instance_id=j.instance_id AND x.resolved_at_ms IS NULL WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status IN ('error','completed')",params![job_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?))).context("retryable job not found")?;
     require_call_control_authority_on(&tx, actor, instance_id)?;
     let flow_id = job_flow_id_on(&tx, job_id)?;

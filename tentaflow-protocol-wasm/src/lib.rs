@@ -26153,6 +26153,31 @@ mod process_wire_tests {
     }
 
     #[test]
+    fn process_request_encoder_keeps_script_body_and_opaque_mapping_keys() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessPayload};
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Script","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Script_1","name":"Script","kind":{"ScriptTask":{
+                    "script":"vars.amount + 1","output_mapping":{"business_key":"outputs"}}}}],
+                "sequence_flows":[],"variables":{"amount":2,"business_key":null},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::ScriptTask {
+            script: "vars.amount + 1".into(),
+            output_mapping: std::collections::BTreeMap::from([("business_key".into(), "outputs".into())]),
+        });
+        assert_eq!(model.variables["business_key"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn process_request_encoder_keeps_repeat_variants_and_selected_value_selector() {
         use tentaflow_protocol::processes::{ProcessMultiInstanceInput, ProcessMultiInstanceMode,
             ProcessPayload, ProcessRepeatSpec, ProcessRepetitionValueKind};

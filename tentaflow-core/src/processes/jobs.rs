@@ -16,7 +16,7 @@ use super::runtime::{plan_job_result, validate_output};
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::{FlowDispatcher, PinnedFlowSnapshot};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowExecutionOutcome, FlowValue};
-use crate::flow_engine::expr::flow_value_to_json;
+use crate::flow_engine::expr::{flow_value_to_json, InfrastructureExprError};
 
 pub const LEASE_RENEWAL: Duration = Duration::from_secs(10);
 
@@ -177,6 +177,10 @@ fn fail_claim(
         observed,
     )?;
     Ok(())
+}
+
+fn script_infrastructure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<InfrastructureExprError>())
 }
 
 pub async fn execute_claimed(
@@ -440,6 +444,10 @@ pub async fn execute_claimed(
         };
         let plan = match plan_job_result(&current, job, &result, at_ms) {
             Ok(plan) => plan,
+            Err(error) if script_infrastructure(&error) => {
+                return fail_claim(pool, worker_id, &claimed,
+                    "SCRIPT_INFRASTRUCTURE_FAILED", error, Some(&result));
+            }
             Err(error) if escalation_boundary.is_some() => {
                 super::runtime::plan_retained_escalation_incident(
                     &current,
@@ -480,6 +488,10 @@ pub async fn execute_claimed(
                 return Ok(());
             }
             Err(error) if error.to_string().contains("revision conflict") => continue,
+            Err(error) if script_infrastructure(&error) => {
+                return fail_claim(pool, worker_id, &claimed,
+                    "SCRIPT_INFRASTRUCTURE_FAILED", error, Some(&result));
+            }
             Err(error)
                 if escalation_boundary.is_some()
                     && plan
@@ -517,6 +529,10 @@ pub async fn execute_claimed(
                         return Ok(());
                     }
                     Err(conflict) if conflict.to_string().contains("revision conflict") => continue,
+                    Err(failure) if script_infrastructure(&failure) => {
+                        return fail_claim(pool, worker_id, &claimed,
+                            "SCRIPT_INFRASTRUCTURE_FAILED", failure, Some(&result));
+                    }
                     Err(failure) => {
                         return fail_claim(
                             pool,
@@ -643,6 +659,80 @@ mod tests {
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
         assert_eq!(persisted.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(persisted.instance.variables, accepted.variables);
+    }
+
+    #[tokio::test]
+    async fn writer_minted_service_result_keeps_script_effects_on_one_fenced_source() {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("script source", None));
+        let mut model = service_model(&flow_id, ActivityVerification::Condition {
+            expression: "true".into(),
+        });
+        model.variables.insert("script_answer".into(), Value::Null);
+        model.nodes.insert(2, ProcessNode {
+            id: "Compute".into(), name: "Compute".into(),
+            kind: ProcessNodeKind::ScriptTask {
+                script: "vars.answer".into(),
+                output_mapping: BTreeMap::from([("script_answer".into(), "outputs".into())]),
+            }, repeat: None,
+        });
+        model.sequence_flows = vec![edge("ToService", "Start_1", "Service"),
+            edge("ToScript", "Service", "Compute"), edge("ToEnd", "Compute", "End_1")];
+        let started = start_model(&fixture, &model);
+        let worker = "script-source-worker";
+        let claim = repository::claim_job(&fixture.db, worker, now_ms()).unwrap().unwrap();
+        let observed = ObservedActivityResult {
+            result: observe_effect(&fixture, &claim).await,
+            origin: ActivityResultOrigin::Envelope,
+            expression_observation: None,
+        };
+        let at = now_ms();
+        let canonical = plan_job_result(&claim.snapshot, &claim.job, &observed, at).unwrap();
+        assert!(canonical.event_ids.is_empty());
+        let source_effects = canonical.variable_effects.iter().filter(|effect| matches!(effect,
+            repository::VariableEffect::Mapped { accepted_input:
+                Some(repository::AcceptedInputRef::Service { job_id, .. }), .. }
+                if job_id == &claim.job.job_id)).count();
+        assert_eq!(source_effects, 2);
+        let mut forged = canonical.clone();
+        let script_effect = forged.variable_effects.iter_mut().find(|effect| matches!(effect,
+            repository::VariableEffect::Mapped { node_id, .. } if node_id == "Compute")).unwrap();
+        let repository::VariableEffect::Mapped { accepted_input:
+            Some(repository::AcceptedInputRef::Service { result_event_id, .. }), .. } = script_effect
+            else { panic!("Script effect lost its fenced Service source") };
+        *result_event_id = uuid::Uuid::new_v4().to_string();
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let error = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &forged, at).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "accepted service variable effects disagree on source identity"));
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut wrong_verification = canonical.clone();
+        let verification = wrong_verification.events.iter_mut().find(|event|
+            event.kind == "verification_passed").unwrap();
+        verification.data["expression"] = serde_json::json!("false");
+        assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &wrong_verification, at).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut duplicate_verification = canonical.clone();
+        let verification = duplicate_verification.events.iter().find(|event|
+            event.kind == "verification_passed").unwrap().clone();
+        duplicate_verification.events.push(verification);
+        assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &duplicate_verification, at).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let accepted = repository::accept_job_result(&fixture.db, &fixture.owner,
+            &claim.job.job_id, claim.job.attempt, claim.job.fence, worker, &observed,
+            claim.snapshot.instance.revision, &canonical, at).unwrap().instance;
+        assert_eq!(accepted.status, ProcessInstanceStatus::Completed);
+        assert_eq!(accepted.variables["script_answer"], "script source");
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &started.instance_id).unwrap();
         assert_eq!(persisted.instance.variables, accepted.variables);
     }
 

@@ -344,6 +344,11 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
+    } else if (kind === 'ScriptTask') {
+      fields += `${textarea('script', 'script_body', config.script, 3)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.script_task_hint'))}</p>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.script_format'))}</p>
+        ${mapping('outputMapping', 'output_mapping')}`;
     } else if (kind === 'SubProcess') {
       fields += `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
         <tf-button variant="secondary" data-process-enter>${escapeHtml(I18n.t('bpmn.enter_subprocess'))}</tf-button>

@@ -314,6 +314,10 @@ pub enum ProcessNodeKind {
         output_mapping: BTreeMap<String, String>,
     },
     TerminateEnd,
+    ScriptTask {
+        script: String,
+        output_mapping: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1481,6 +1485,29 @@ mod tests {
         let terminate = ProcessNodeKind::TerminateEnd;
         assert_eq!(serde_json::to_vec(&terminate).unwrap(), br#""TerminateEnd""#);
         assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&terminate).unwrap()).unwrap(), terminate);
+    }
+
+    #[test]
+    fn script_task_appends_required_fields_without_changing_old_node_bytes() {
+        let old_end = serde_json::to_vec(&ProcessNodeKind::End).unwrap();
+        let old_terminate = serde_json::to_vec(&ProcessNodeKind::TerminateEnd).unwrap();
+        let script = ProcessNodeKind::ScriptTask {
+            script: "null".into(), output_mapping: BTreeMap::new(),
+        };
+        assert_eq!(old_end, br#""End""#);
+        assert_eq!(old_terminate, br#""TerminateEnd""#);
+        assert_eq!(serde_json::to_vec(&script).unwrap(),
+            br#"{"ScriptTask":{"script":"null","output_mapping":{}}}"#);
+        let encoded = crate::cbor::encode(&script).unwrap();
+        assert_eq!(encoded, b"\xa1\x6aScriptTask\xa2\x66script\x64null\x6eoutput_mapping\xa0");
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&encoded).unwrap(), script);
+        for invalid in [
+            serde_json::json!({"ScriptTask": {"script": "null"}}),
+            serde_json::json!({"ScriptTask": {"output_mapping": {}}}),
+            serde_json::json!({"ScriptTask": {"script": "null", "output_mapping": {}, "unknown": 1}}),
+        ] {
+            assert!(serde_json::from_value::<ProcessNodeKind>(invalid).is_err());
+        }
     }
 
     #[test]

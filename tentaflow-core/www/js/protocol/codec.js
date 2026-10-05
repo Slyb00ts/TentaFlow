@@ -499,6 +499,11 @@ function processModel(model, nested = false) {
         verification: verified ?? 'Human',
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
         ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }) };
+    } else if (tag === 'ScriptTask') {
+      processKnownFields(body, ['script', 'outputMapping'], 'script task');
+      if (typeof body.script !== 'string' || !body.outputMapping || typeof body.outputMapping !== 'object'
+        || Array.isArray(body.outputMapping)) throw new TypeError('script task requires a body and output mapping');
+      fields = { script: body.script, output_mapping: body.outputMapping };
     } else if (tag === 'ExclusiveGateway' || tag === 'InclusiveGateway') {
       if (tag === 'InclusiveGateway') processKnownFields(body, ['defaultFlowId'], 'inclusive gateway');
       fields = { default_flow_id: processField(body, 'defaultFlowId') ?? null };

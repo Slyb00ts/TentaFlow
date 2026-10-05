@@ -468,12 +468,20 @@ fn validate_draft_body<'a>(
             "invalid node name");
         validate_repeat(node, variables, false)?;
         match &node.kind {
+            ProcessNodeKind::ScriptTask { script, output_mapping } => {
+                ensure!(script.len() <= 4096, "script task {} expression is too long", node.id);
+                if !script.is_empty() {
+                    expr::validate_script_profile(script)
+                        .with_context(|| format!("script task {} expression", node.id))?;
+                }
+                validate_mapping(output_mapping, true)?;
+            }
             ProcessNodeKind::ServiceTask { input_mapping, output_mapping, verification,
                 timeout_seconds, result_expression, .. } => {
                 ensure!((1..=600).contains(timeout_seconds),
                     "service timeout outside 1..=600 seconds");
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
                 if let tentaflow_protocol::processes::ActivityVerification::Condition { expression } = verification {
                     expr::validate_syntax(expression, None)?;
                 }
@@ -485,7 +493,7 @@ fn validate_draft_body<'a>(
             | ProcessNodeKind::UserTask { output_mapping, .. }
             | ProcessNodeKind::MessageStart { output_mapping, .. }
             | ProcessNodeKind::BoundaryError { output_mapping, .. } => {
-                validate_mapping(output_mapping)?
+                validate_mapping(output_mapping, false)?
             }
             ProcessNodeKind::MessageCatch {
                 correlation_expression,
@@ -502,7 +510,7 @@ fn validate_draft_body<'a>(
                     "message correlation expression",
                     false,
                 )?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageThrow { target, correlation_expression, payload_expression,
                 ttl_seconds, .. } => {
@@ -513,8 +521,8 @@ fn validate_draft_body<'a>(
                     "message TTL outside 1..=604800 seconds");
             }
             ProcessNodeKind::SubProcess { body, input_mapping, output_mapping } => {
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
                 validate_draft_body(&body.nodes, &body.sequence_flows, &body.variables,
                     &body.diagram, depth + 1, all_ids, node_count, flow_count)?;
             }
@@ -536,8 +544,8 @@ fn validate_draft_body<'a>(
                 }
                 ensure!(called_element.process_id.is_empty() || valid_id(&called_element.process_id),
                     "call activity {} has invalid process ID", node.id);
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
             }
             _ => {}
         }
@@ -651,6 +659,13 @@ fn validate_body<'a>(
         );
         validate_repeat(node, variables, true)?;
         match &node.kind {
+            ProcessNodeKind::ScriptTask { script, output_mapping } => {
+                ensure!(!script.is_empty(), "script task {} requires an expression", node.id);
+                ensure!(script.len() <= 4096, "script task {} expression is too long", node.id);
+                expr::validate_script_profile(script)
+                    .with_context(|| format!("script task {} expression", node.id))?;
+                validate_mapping(output_mapping, true)?;
+            }
             ProcessNodeKind::ServiceTask {
                 flow_id,
                 input_mapping,
@@ -665,8 +680,8 @@ fn validate_body<'a>(
                     "service task {} timeout is outside 1..=600 seconds",
                     node.id
                 );
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
                 if let tentaflow_protocol::processes::ActivityVerification::Condition {
                     expression,
                 } = verification
@@ -689,19 +704,19 @@ fn validate_body<'a>(
                         node.id
                     );
                 }
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageStart { message_ref, output_mapping } => {
                 ensure!(message_ids.contains(message_ref.as_str()), "message start {} references an unknown declaration", node.id);
                 used_messages.insert(message_ref.as_str());
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageCatch { message_ref, correlation_expression, output_mapping }
             | ProcessNodeKind::BoundaryMessage { message_ref, correlation_expression, output_mapping, .. } => {
                 ensure!(message_ids.contains(message_ref.as_str()), "message event {} references an unknown declaration", node.id);
                 used_messages.insert(message_ref.as_str());
                 validate_expression(correlation_expression, "message correlation expression", true)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
                 ensure!(message_ids.contains(message_ref.as_str()), "message throw {} references an unknown declaration", node.id);
@@ -721,7 +736,7 @@ fn validate_body<'a>(
                     "duplicate boundary error handler on {}",
                     attached_to_id
                 );
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::BoundaryEscalation {
                 attached_to_id,
@@ -743,7 +758,7 @@ fn validate_body<'a>(
                     "duplicate boundary escalation handler on {}",
                     attached_to_id
                 );
-                validate_mapping(output_mapping)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::SubProcess {
                 body,
@@ -751,8 +766,8 @@ fn validate_body<'a>(
                 output_mapping,
             } => {
                 ensure!(depth < 3, "embedded subprocess depth exceeds three levels");
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
                 validate_body(
                     &body.nodes,
                     &body.sequence_flows,
@@ -785,8 +800,8 @@ fn validate_body<'a>(
                     "call activity {} requires an exact published target QName and version",
                     node.id
                 );
-                validate_mapping(input_mapping)?;
-                validate_mapping(output_mapping)?;
+                validate_mapping(input_mapping, false)?;
+                validate_mapping(output_mapping, false)?;
             }
             ProcessNodeKind::ErrorEnd { error_ref } => {
                 ensure!(error_ids.contains(error_ref.as_str()),
@@ -1223,7 +1238,7 @@ impl EscalationPrefixProof<'_> {
                 | ProcessNodeKind::TimerCatch { .. }
                 | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::EventBasedGateway => Ok(false),
-                ProcessNodeKind::MessageThrow { .. } => self.follow_one(node_id, stop_join),
+                ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::ScriptTask { .. } => self.follow_one(node_id, stop_join),
                 ProcessNodeKind::ExclusiveGateway { .. } => {
                     let outgoing = self.outgoing.get(node_id).cloned().unwrap_or_default();
                     if outgoing.is_empty() && !self.complete {
@@ -1435,14 +1450,18 @@ fn validate_event_gateway_regions<'a>(
     Ok(())
 }
 
-fn validate_mapping(mapping: &std::collections::BTreeMap<String, String>) -> Result<()> {
+fn validate_mapping(mapping: &std::collections::BTreeMap<String, String>, script_profile: bool) -> Result<()> {
     ensure!(
         mapping.len() <= MAX_VARIABLE_KEYS,
         "mapping exceeds 128 keys"
     );
     for (key, expression) in mapping {
         ensure!(valid_id(key), "invalid mapping key: {key}");
-        expr::validate_syntax(expression, None).with_context(|| format!("mapping {key}"))?;
+        if script_profile {
+            expr::validate_script_profile(expression).with_context(|| format!("mapping {key}"))?;
+        } else {
+            expr::validate_syntax(expression, None).with_context(|| format!("mapping {key}"))?;
+        }
     }
     Ok(())
 }
@@ -2507,5 +2526,52 @@ mod tests {
         let error = validate_model(&embedded).unwrap_err();
         assert!(error.to_string().contains("embedded subprocess"));
         assert!(format!("{error:#}").contains("output collection variable is undeclared"));
+    }
+
+    #[test]
+    fn script_task_draft_publish_and_mapping_use_the_joined_script_profile() {
+        let mut model = starter_model();
+        model.variables.insert("amount".into(), serde_json::json!(2));
+        model.variables.insert("answer".into(), serde_json::Value::Null);
+        model.nodes.insert(1, ProcessNode {
+            id: "Script_1".into(), name: "Calculate".into(), repeat: None,
+            kind: ProcessNodeKind::ScriptTask { script: String::new(), output_mapping: BTreeMap::new() },
+        });
+        model.sequence_flows[0].target_id = "Script_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(),
+            source_id: "Script_1".into(), target_id: "End_1".into(), condition: None });
+        validate_draft(&model).unwrap();
+        assert!(validate_model(&model).unwrap_err().to_string().contains("requires an expression"));
+        let ProcessNodeKind::ScriptTask { script, output_mapping } = &mut model.nodes[1].kind else { unreachable!() };
+        *script = "vars.amount + 1".into();
+        output_mapping.insert("answer".into(), "outputs".into());
+        validate_model(&model).unwrap();
+        let ProcessNodeKind::ScriptTask { script, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        *script = "[".into();
+        assert!(validate_draft(&model).is_err(), "a provided invalid body cannot be saved");
+        let ProcessNodeKind::ScriptTask { script, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        *script = "vars.amount + 1".into();
+        let ProcessNodeKind::ScriptTask { output_mapping, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        output_mapping.insert("answer".into(), "[".into());
+        assert!(validate_draft(&model).is_err(), "a provided invalid mapping cannot be saved");
+        let ProcessNodeKind::ScriptTask { output_mapping, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        output_mapping.insert("answer".into(), "outputs".into());
+        model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 1 },
+            output_collection_variable: "answer".into(),
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
+    }
+
+    #[test]
+    fn script_task_is_immediate_before_a_real_escalation_wait() {
+        let mut model = escalation_model();
+        model.nodes.push(ProcessNode { id: "Script_1".into(), name: "Prepare".into(), repeat: None,
+            kind: ProcessNodeKind::ScriptTask { script: "null".into(), output_mapping: BTreeMap::new() } });
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_Escalation").unwrap().target_id = "Script_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Script_Wait".into(),
+            source_id: "Script_1".into(), target_id: "Wait_1".into(), condition: None });
+        validate_model(&model).unwrap();
     }
 }

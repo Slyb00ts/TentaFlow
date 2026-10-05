@@ -26,6 +26,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use cel::{Context, Program, Value as CelValue};
+use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr};
 
 use super::blob_store::BlobRef;
 use super::envelope::FlowValue;
@@ -74,6 +75,41 @@ const PROGRAM_CACHE_CAP: usize = 256;
 /// `MAX_EXPR_CHARS` (see there for the operator-chain depth math) with ~2x
 /// headroom; the reservation is address space, committed lazily.
 const EVAL_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+const MAX_SCRIPT_BYTES: usize = 4096;
+const MAX_SCRIPT_AST_NODES: usize = 64;
+const MAX_SCRIPT_ADDITIONS: usize = 8;
+const MAX_SCRIPT_LITERAL_ITEMS: usize = 16;
+const MAX_SCRIPT_CONTEXT_BYTES: usize = 1024 * 1024;
+
+#[cfg(test)]
+static SCRIPT_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn inject_script_infrastructure_failure(expression: &str) {
+    let slot = SCRIPT_FAILURE.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(expression.to_owned());
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("script expression infrastructure failed: {cause}")]
+pub struct InfrastructureExprError {
+    pub cause: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ScriptExprError {
+    #[error(transparent)]
+    Expression(#[from] ExprError),
+    #[error(transparent)]
+    Infrastructure(#[from] InfrastructureExprError),
+}
+
+#[derive(Clone, Copy)]
+enum EvalPolicy {
+    General(Duration),
+    ScriptJoined,
+}
 
 /// Expression failure carrying the offending expression text and a
 /// human-readable cause. The caller prepends the node name when building the
@@ -190,14 +226,25 @@ fn blob_descriptor(kind: &str, mime: &str, blob_ref: &BlobRef) -> serde_json::Va
 /// `compiled`'s doc), shared by `evaluate_cel` (which goes on to execute the
 /// program against a scope) and `validate_syntax` (which does not have one).
 fn compile_checked(expr: &str, timeout: Option<Duration>) -> Result<Arc<Program>, ExprError> {
+    compile_with_policy(
+        expr,
+        EvalPolicy::General(timeout.unwrap_or(Duration::from_millis(DEFAULT_EVAL_TIMEOUT_MS))),
+    )
+    .map_err(|error| match error {
+        ScriptExprError::Expression(error) => error,
+        ScriptExprError::Infrastructure(error) => ExprError::new(expr, error.cause),
+    })
+}
+
+fn compile_with_policy(expr: &str, policy: EvalPolicy) -> Result<Arc<Program>, ScriptExprError> {
     if expr.trim().is_empty() {
-        return Err(ExprError::new(expr, "expression is empty"));
+        return Err(ExprError::new(expr, "expression is empty").into());
     }
     if expr.chars().count() > MAX_EXPR_CHARS {
         return Err(ExprError::new(
             expr,
             format!("expression exceeds the {MAX_EXPR_CHARS}-character limit"),
-        ));
+        ).into());
     }
     if nesting_depth(expr) > MAX_EXPR_NESTING {
         return Err(ExprError::new(
@@ -207,10 +254,75 @@ fn compile_checked(expr: &str, timeout: Option<Duration>) -> Result<Arc<Program>
                  (`?` ternaries count toward this limit, and so do brackets and `?` \
                  inside string literals)"
             ),
-        ));
+        ).into());
     }
-    let timeout = timeout.unwrap_or(Duration::from_millis(DEFAULT_EVAL_TIMEOUT_MS));
-    compiled(expr, timeout)
+    if matches!(policy, EvalPolicy::ScriptJoined) && expr.len() > MAX_SCRIPT_BYTES {
+        return Err(ExprError::new(expr, format!("expression exceeds the {MAX_SCRIPT_BYTES}-byte Script limit")).into());
+    }
+    let program = compiled(expr, policy)?;
+    if matches!(policy, EvalPolicy::ScriptJoined) {
+        validate_script_ast(expr, program.expression())?;
+    }
+    Ok(program)
+}
+
+/// Validates the bounded CEL subset used by BPMN ScriptTask before any
+/// general deadline-based expression validation can dispatch a worker.
+pub fn validate_script_profile(expression: &str) -> Result<(), ExprError> {
+    compile_with_policy(expression, EvalPolicy::ScriptJoined)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ScriptExprError::Expression(error) => error,
+            ScriptExprError::Infrastructure(error) => ExprError::new(expression, error.to_string()),
+        })
+}
+
+/// Evaluates a ScriptTask body or mapping on the joined bounded worker.
+pub fn evaluate_script(expression: &str, scope: &ExprScope) -> Result<serde_json::Value, ScriptExprError> {
+    #[cfg(test)]
+    {
+        if let Some(slot) = SCRIPT_FAILURE.get() {
+            let mut pending = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            if pending.as_deref() == Some(expression) {
+                pending.take();
+                return Err(InfrastructureExprError {
+                    cause: "injected joined worker failure".into(),
+                }.into());
+            }
+        }
+    }
+    let program = compile_with_policy(expression, EvalPolicy::ScriptJoined)?;
+    let context = serde_json::json!({
+        "vars": scope.vars.iter().map(|(key, value)| (key.clone(), flow_value_to_json(value))).collect::<BTreeMap<_, _>>(),
+        "payload": flow_value_to_json(scope.payload),
+        "artifacts": scope.artifacts.iter().map(|(key, value)| (key.clone(), flow_value_to_json(value))).collect::<BTreeMap<_, _>>(),
+        "meta": scope.meta,
+        "outputs": scope.extras.iter().find(|(key, _)| *key == "outputs")
+            .map(|(_, value)| value.clone()).unwrap_or(serde_json::Value::Null),
+        "extra": scope.extras.iter().filter(|(key, _)| *key != "outputs")
+            .map(|(key, value)| ((*key).to_string(), value.clone())).collect::<BTreeMap<_, _>>(),
+    });
+    let context_bytes = serde_json::to_vec(&context)
+        .map_err(|error| ExprError::new(expression, format!("cannot serialize Script context: {error}")))?;
+    if context_bytes.len() > MAX_SCRIPT_CONTEXT_BYTES {
+        return Err(ExprError::new(expression, "Script context exceeds the 1 MiB limit").into());
+    }
+    let bindings = referenced_bindings(&program, scope);
+    let outcome = run_on_eval_stack(
+        {
+            let program = Arc::clone(&program);
+            move || {
+                let mut context = Context::default();
+                for (name, value) in bindings {
+                    context.add_variable_from_value(name, value);
+                }
+                program.execute(&context).map_err(|error| format!("evaluation failed: {error}"))
+            }
+        },
+        EvalPolicy::ScriptJoined,
+    )?;
+    let value = outcome.map_err(|cause| ExprError::new(expression, cause))?;
+    value.json().map_err(|error| ExprError::new(expression, format!("result is not representable as JSON: {error}"))).map_err(Into::into)
 }
 
 /// Validates that `expr` is syntactically well-formed CEL — the same
@@ -254,12 +366,12 @@ fn evaluate_cel(
                     .map_err(|e| format!("evaluation failed: {e}"))
             }
         },
-        timeout,
+        EvalPolicy::General(timeout),
     );
     match outcome {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(cause)) => Err(ExprError::new(expr, cause)),
-        Err(cause) => Err(ExprError::new(expr, cause)),
+        Err(cause) => Err(ExprError::new(expr, cause.cause)),
     }
 }
 
@@ -274,8 +386,8 @@ fn evaluate_cel(
 /// pin panic-freedom instead of relying on this translation.
 fn run_on_eval_stack<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
-    timeout: Duration,
-) -> Result<T, String> {
+    policy: EvalPolicy,
+) -> Result<T, InfrastructureExprError> {
     let (tx, rx) = mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("cel-eval".into())
@@ -285,26 +397,30 @@ fn run_on_eval_stack<T: Send + 'static>(
                 .map_err(|panic| format!("internal evaluator panic: {}", panic_message(&*panic)));
             let _ = tx.send(outcome);
         })
-        .map_err(|e| format!("cannot spawn evaluation thread: {e}"))?;
-    match rx.recv_timeout(timeout) {
+        .map_err(|e| InfrastructureExprError { cause: format!("cannot spawn evaluation thread: {e}") })?;
+    let received = match policy {
+        EvalPolicy::General(timeout) => rx.recv_timeout(timeout).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => format!("evaluation deadline exceeded ({} ms)", timeout.as_millis()),
+            mpsc::RecvTimeoutError::Disconnected => "evaluation thread terminated without a result".into(),
+        }),
+        EvalPolicy::ScriptJoined => rx.recv().map_err(|_| "evaluation thread terminated without a result".to_string()),
+    };
+    match received {
         Ok(outcome) => {
-            // The worker already sent its result, so this join is bounded.
-            let _ = handle.join();
-            outcome
+            handle.join().map_err(|panic| InfrastructureExprError { cause: format!("evaluation thread failed: {}", panic_message(&*panic)) })?;
+            outcome.map_err(|cause| InfrastructureExprError { cause })
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        Err(cause) if matches!(policy, EvalPolicy::General(_)) && cause.starts_with("evaluation deadline") => {
             // Deliberate leak: detach the runaway worker instead of joining.
             // The thread (and the bindings moved into it) dies on its own
             // when the polynomial evaluation finally finishes; the caller
             // must return now, not block behind it.
             drop(handle);
-            Err(format!(
-                "evaluation deadline exceeded ({} ms)",
-                timeout.as_millis()
-            ))
+            Err(InfrastructureExprError { cause })
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err("evaluation thread terminated without a result".into())
+        Err(cause) => {
+            let _ = handle.join();
+            Err(InfrastructureExprError { cause })
         }
     }
 }
@@ -328,6 +444,73 @@ fn nesting_depth(expr: &str) -> usize {
         }
     }
     max_depth
+}
+
+fn validate_script_ast(expression: &str, root: &IdedExpr) -> Result<(), ExprError> {
+    fn walk(node: &IdedExpr, nodes: &mut usize, additions: &mut usize) -> Result<(), &'static str> {
+        *nodes += 1;
+        if *nodes > MAX_SCRIPT_AST_NODES {
+            return Err("Script expression exceeds 64 AST nodes");
+        }
+        match &node.expr {
+            Expr::Unspecified | Expr::Comprehension(_) | Expr::Struct(_) => {
+                Err("Script expression uses an unsupported CEL construct")
+            }
+            Expr::Ident(_) | Expr::Literal(_) => Ok(()),
+            Expr::Select(select) => walk(&select.operand, nodes, additions),
+            Expr::List(list) => {
+                if list.elements.len() > MAX_SCRIPT_LITERAL_ITEMS {
+                    return Err("Script list literal exceeds 16 entries");
+                }
+                for item in &list.elements {
+                    walk(item, nodes, additions)?;
+                }
+                Ok(())
+            }
+            Expr::Map(map) => {
+                if map.entries.len() > MAX_SCRIPT_LITERAL_ITEMS {
+                    return Err("Script map literal exceeds 16 entries");
+                }
+                for entry in &map.entries {
+                    let EntryExpr::MapEntry(entry) = &entry.expr else {
+                        return Err("Script struct literal is unsupported");
+                    };
+                    walk(&entry.key, nodes, additions)?;
+                    walk(&entry.value, nodes, additions)?;
+                }
+                Ok(())
+            }
+            Expr::Call(call) => {
+                let allowed_operator = matches!(
+                    call.func_name.as_str(),
+                    operators::CONDITIONAL | operators::LOGICAL_AND | operators::LOGICAL_OR
+                        | operators::LOGICAL_NOT | operators::SUBSTRACT | operators::ADD
+                        | operators::MULTIPLY | operators::DIVIDE | operators::MODULO
+                        | operators::EQUALS | operators::NOT_EQUALS | operators::GREATER_EQUALS
+                        | operators::LESS_EQUALS | operators::GREATER | operators::LESS
+                        | operators::NEGATE | operators::INDEX | operators::OPT_INDEX
+                        | operators::OPT_SELECT | operators::IN
+                );
+                if !allowed_operator && call.func_name != "size" {
+                    return Err("Script expression calls an unsupported function");
+                }
+                if call.func_name == operators::ADD {
+                    *additions += 1;
+                    if *additions > MAX_SCRIPT_ADDITIONS {
+                        return Err("Script expression exceeds 8 additions");
+                    }
+                }
+                if let Some(target) = &call.target {
+                    walk(target, nodes, additions)?;
+                }
+                for arg in &call.args {
+                    walk(arg, nodes, additions)?;
+                }
+                Ok(())
+            }
+        }
+    }
+    walk(root, &mut 0, &mut 0).map_err(|cause| ExprError::new(expression, cause))
 }
 
 /// Converts only the scope variables the compiled program actually references
@@ -417,18 +600,17 @@ fn json_to_cel(value: &serde_json::Value) -> CelValue {
 /// for expressions re-evaluated per loop/map iteration, hence the cache.
 /// Failures are not cached: hostile unique expressions would only thrash the
 /// (cheaply failing) parser, while poisoning the cache with garbage keys.
-fn compiled(expr: &str, timeout: Duration) -> Result<Arc<Program>, ExprError> {
+fn compiled(expr: &str, policy: EvalPolicy) -> Result<Arc<Program>, ScriptExprError> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<Program>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(program) = lock_cache(cache).get(expr) {
         return Ok(Arc::clone(program));
     }
     let source = expr.to_string();
-    let compile_outcome = run_on_eval_stack(move || Program::compile(&source), timeout);
+    let compile_outcome = run_on_eval_stack(move || Program::compile(&source), policy)?;
     let program = match compile_outcome {
-        Ok(Ok(program)) => Arc::new(program),
-        Ok(Err(e)) => return Err(ExprError::new(expr, format!("parse error: {e}"))),
-        Err(cause) => return Err(ExprError::new(expr, cause)),
+        Ok(program) => Arc::new(program),
+        Err(e) => return Err(ExprError::new(expr, format!("parse error: {e}")).into()),
     };
     let mut guard = lock_cache(cache);
     if guard.len() >= PROGRAM_CACHE_CAP {
@@ -1104,5 +1286,33 @@ mod tests {
         assert!(validate_syntax(&too_long, None).is_err());
         let too_nested: String = "(".repeat(MAX_EXPR_NESTING + 1);
         assert!(validate_syntax(&too_nested, None).is_err());
+    }
+
+    #[test]
+    fn script_profile_admits_json_results_and_rejects_unbounded_ast_constructs() {
+        let fixture = Fixture::new();
+        let scope = fixture.scope(&[("outputs", json!(null))]);
+        assert_eq!(evaluate_script("{\"items\":[1,2],\"n\":size([1,2])}", &scope).unwrap(),
+            json!({"items":[1,2],"n":2}));
+        for expression in [
+            "[1,2].map(x,x+1)", "[1,2].filter(x,x>0)",
+            "matches(\"a\",\"a\")", "int(1)",
+            "1+1+1+1+1+1+1+1+1+1",
+        ] {
+            assert!(validate_script_profile(expression).is_err(), "{expression}");
+        }
+        let literal = format!("[{}]", vec!["1"; 17].join(","));
+        assert!(validate_script_profile(&literal).is_err());
+        assert!(validate_script_profile(&"1+".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn script_profile_checks_the_full_serialized_binding_context() {
+        let mut fixture = Fixture::new();
+        fixture.vars.insert("large".into(), FlowValue::Text("x".repeat(700_000)));
+        let extras = [("outputs", json!("y".repeat(400_000)))];
+        let scope = fixture.scope(&extras);
+        let error = evaluate_script("1", &scope).unwrap_err();
+        assert!(error.to_string().contains("Script context exceeds"));
     }
 }

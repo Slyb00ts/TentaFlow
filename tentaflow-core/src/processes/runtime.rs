@@ -82,6 +82,36 @@ pub(super) fn condition(expression: &str, variables: &Value, outputs: &Value) ->
         .context("process condition must evaluate to a boolean")
 }
 
+pub(super) fn script_evaluate(expression: &str, variables: &Value, outputs: &Value) -> Result<Value> {
+    let vars = variables.as_object().context("process variables must be an object")?
+        .iter().map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let payload = FlowValue::Json(variables.clone());
+    let extras = [("outputs", outputs.clone())];
+    let scope = ExprScope {
+        vars: &vars, payload: &payload, artifacts: &HashMap::new(),
+        meta: &BTreeMap::new(), extras: &extras,
+    };
+    let result = expr::evaluate_script(expression, &scope).map_err(|error| match error {
+        expr::ScriptExprError::Expression(error) => anyhow::Error::new(error),
+        expr::ScriptExprError::Infrastructure(error) => anyhow::Error::new(error),
+    })?;
+    validate_output(&result)?;
+    Ok(result)
+}
+
+pub(super) fn patch_script_variables(
+    mapping: &BTreeMap<String, String>, local: &Value, effective: &Value, outputs: &Value,
+) -> Result<Value> {
+    let mut patched = local.as_object().context("process variables must be an object")?.clone();
+    for (key, expression) in mapping {
+        let mapped = script_evaluate(expression, effective, outputs)?;
+        patched.insert(key.clone(), mapped);
+        validate_variables(&Value::Object(patched.clone()))?;
+    }
+    Ok(Value::Object(patched))
+}
+
 pub fn prepare_service_input(
     mapping: &BTreeMap<String, String>,
     variables: &Value,
@@ -407,6 +437,28 @@ impl<'a> Transition<'a> {
             outputs: outputs.clone(),
             extra: extra.to_vec(),
             result: result.clone(),
+        };
+        self.set_variables(result)?;
+        self.plan.variable_effects.push(effect);
+        Ok(())
+    }
+
+    fn map_script_outputs(
+        &mut self, node_id: &str, source_token_id: &str,
+        mapping: &BTreeMap<String, String>, outputs: &Value,
+    ) -> Result<()> {
+        if mapping.is_empty() {
+            return Ok(());
+        }
+        let result = patch_script_variables(mapping, self.local()?, &self.effective()?, outputs)?;
+        let scope = self.scopes.iter().find(|scope| scope.scope_id == self.current_scope)
+            .context("mapped Script scope is missing")?;
+        let effect = VariableEffect::Mapped {
+            event_index: self.plan.events.len(), scope_id: self.current_scope.clone(),
+            parent_token_id: scope.parent_token_id.clone(), node_id: node_id.to_owned(),
+            source_token_id: source_token_id.to_owned(),
+            accepted_input: self.accepted_input.clone(), outputs: outputs.clone(),
+            extra: Vec::new(), result: result.clone(),
         };
         self.set_variables(result)?;
         self.plan.variable_effects.push(effect);
@@ -2657,6 +2709,37 @@ impl<'a> Transition<'a> {
                             "MESSAGE_EXPRESSION_ERROR",
                             super::repository::bounded_failure_message(&error.to_string()),
                         );
+                    }
+                }
+                ProcessNodeKind::ScriptTask { script, output_mapping } => {
+                    let source_variables = self.effective()?;
+                    match script_evaluate(&script, &source_variables, &Value::Null) {
+                        Ok(outputs) => match self.map_script_outputs(&node.id, &id, &output_mapping, &outputs) {
+                            Ok(()) => {
+                                self.consume(&id);
+                                self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                                self.event("script_completed", Some(node.id.clone()), json!({"outputs": outputs}));
+                                for edge in outgoing {
+                                    self.follow(&token, &edge)?;
+                                }
+                            }
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.wait(&token, "waiting");
+                                self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                                self.incident(&node.id, None, "SCRIPT_MAPPING_FAILED", error.to_string());
+                            }
+                        },
+                        Err(error) => {
+                            if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                return Err(error);
+                            }
+                            self.wait(&token, "waiting");
+                            self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                            self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED", error.to_string());
+                        }
                     }
                 }
                 ProcessNodeKind::EventBasedGateway => {

@@ -25,11 +25,11 @@ const DC: &str = "http://www.omg.org/spec/DD/20100524/DC";
 const DI: &str = "http://www.omg.org/spec/DD/20100524/DI";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const TF: &str = "https://tentaflow.app/bpmn/1";
-const GRAPH_ELEMENTS: [(&str, &str); 15] = [
+const GRAPH_ELEMENTS: [(&str, &str); 16] = [
     (BPMN, "extensionElements"), (BPMN, "startEvent"),
     (BPMN, "intermediateCatchEvent"), (BPMN, "intermediateThrowEvent"),
     (BPMN, "boundaryEvent"), (BPMN, "endEvent"), (BPMN, "userTask"),
-    (BPMN, "serviceTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
+    (BPMN, "serviceTask"), (BPMN, "scriptTask"), (BPMN, "subProcess"), (BPMN, "callActivity"),
     (BPMN, "exclusiveGateway"), (BPMN, "eventBasedGateway"),
     (BPMN, "parallelGateway"), (BPMN, "inclusiveGateway"), (BPMN, "sequenceFlow"),
 ];
@@ -995,6 +995,73 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 output_mapping,
             }
         }
+        "scriptTask" => {
+            element.attrs_only(&["id", "name", "scriptFormat"])?;
+            ensure!(element.attr("scriptFormat") == Some("application/vnd.tentaflow.cel"),
+                "script task {} requires application/vnd.tentaflow.cel at byte {}", id, element.offset);
+            for child in &element.children {
+                if !child.is(BPMN, "extensionElements") && !child.is(BPMN, "script") {
+                    return Err(XmlElementError {
+                        message: format!("unsupported script task child at byte {}", child.offset),
+                        element_id: Some(id.clone()), offset: child.offset,
+                    }.into());
+                }
+            }
+            ensure!(element.text.trim().is_empty(), "script task {} has text outside its body", id);
+            let body = element.child(BPMN, "script")?
+                .with_context(|| format!("script task {} requires a script body", id))?;
+            if element.children.last().is_none_or(|last| !last.is(BPMN, "script")) {
+                let offending = element.children.last().expect("script body exists");
+                return Err(XmlElementError {
+                    message: format!("script task {} has invalid child order at byte {}", id, offending.offset),
+                    element_id: Some(id.clone()), offset: offending.offset,
+                }.into());
+            }
+            body.attrs_only(&[])?;
+            if let Some(child) = body.children.first() {
+                return Err(XmlElementError {
+                    message: format!("script task {} body must contain only text at byte {}", id, child.offset),
+                    element_id: Some(id.clone()), offset: child.offset,
+                }.into());
+            }
+            ensure!(!body.text.trim().is_empty(), "script task {} requires a nonempty body", id);
+            let output_mapping = if let Some(ext) = element.child(BPMN, "extensionElements")? {
+                ext.attrs_only(&[])?;
+                for child in &ext.children {
+                    if !child.is(TF, "scriptTask") {
+                        return Err(XmlElementError { message: format!("unsupported script extension at byte {}", child.offset),
+                            element_id: Some(id.clone()), offset: child.offset }.into());
+                    }
+                }
+                if let Some(duplicate) = ext.children.get(1) {
+                    return Err(XmlElementError { message: format!("duplicate script extension at byte {}", duplicate.offset),
+                        element_id: Some(id.clone()), offset: duplicate.offset }.into());
+                }
+                ensure!(ext.children.len() == 1, "script task {} needs one TentaFlow extension", id);
+                let config = ext.child(TF, "scriptTask")?.expect("validated script extension");
+                config.attrs_only(&[])?;
+                for child in &config.children {
+                    if !child.is(TF, "outputMapping") {
+                        return Err(XmlElementError { message: format!("unsupported script mapping at byte {}", child.offset),
+                            element_id: Some(id.clone()), offset: child.offset }.into());
+                    }
+                }
+                if let Some(duplicate) = config.children.get(1) {
+                    return Err(XmlElementError { message: format!("duplicate script mapping at byte {}", duplicate.offset),
+                        element_id: Some(id.clone()), offset: duplicate.offset }.into());
+                }
+                ensure!(config.children.len() == 1, "script task {} needs one output mapping", id);
+                let mapping_element = config.child(TF, "outputMapping")?.expect("validated script mapping");
+                mapping(config, "outputMapping").map_err(|error| {
+                    if error.downcast_ref::<XmlElementError>().is_some() { error }
+                    else { XmlElementError { message: format!("invalid script mapping at byte {}: {error}", mapping_element.offset),
+                        element_id: Some(id.clone()), offset: mapping_element.offset }.into() }
+                })?
+            } else {
+                BTreeMap::new()
+            };
+            ProcessNodeKind::ScriptTask { script: body.text.clone(), output_mapping }
+        }
         "serviceTask" => {
             element.attrs_only(&["id", "name"])?;
             element.children_only(&[(BPMN, "extensionElements"), (BPMN, "ioSpecification"),
@@ -1619,6 +1686,7 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             ),
             ProcessNodeKind::UserTask { .. } => ("userTask", String::new()),
             ProcessNodeKind::ServiceTask { .. } => ("serviceTask", String::new()),
+            ProcessNodeKind::ScriptTask { .. } => ("scriptTask", " scriptFormat=\"application/vnd.tentaflow.cel\"".into()),
             ProcessNodeKind::SubProcess { .. } => ("subProcess", String::new()),
             ProcessNodeKind::CallActivity { called_element, .. } => {
                 let prefix = call_prefixes.get(&called_element.namespace_uri)
@@ -1742,6 +1810,14 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                     write_repeat_xml(xml, node, used_ids)?;
                     xml.push_str(&format!("</bpmn:{tag}>"));
                 }
+            }
+            ProcessNodeKind::ScriptTask { script, output_mapping } => {
+                xml.push('>');
+                if !output_mapping.is_empty() {
+                    xml.push_str(&format!("<bpmn:extensionElements><tentaflow:scriptTask><tentaflow:outputMapping>{}</tentaflow:outputMapping></tentaflow:scriptTask></bpmn:extensionElements>",
+                        escaped(&serde_json::to_string(output_mapping)?)));
+                }
+                xml.push_str(&format!("<bpmn:script>{}</bpmn:script></bpmn:{tag}>", escaped(script)));
             }
             ProcessNodeKind::ServiceTask {
                 flow_id,
@@ -3033,6 +3109,51 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
             && diagnostic.element_id.as_deref() == Some("Review")
             && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn script_task_xml_preserves_mime_body_mapping_and_di_with_utf8_diagnostics() {
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].name = "Zażółć 日本語".into();
+        model.variables.insert("amount".into(), serde_json::json!(2));
+        model.variables.insert("answer".into(), serde_json::Value::Null);
+        model.nodes.insert(1, ProcessNode { id: "Script_1".into(), name: "Calculate".into(), repeat: None,
+            kind: ProcessNodeKind::ScriptTask { script: "vars.amount + 1".into(),
+                output_mapping: BTreeMap::from([("answer".into(), "outputs".into())]) } });
+        model.sequence_flows[0].target_id = "Script_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_2".into(),
+            source_id: "Script_1".into(), target_id: "End_1".into(), condition: None });
+        model.diagram.shapes.push(ProcessShape { element_id: "Script_1".into(),
+            x: 180.0, y: 100.0, width: 240.0, height: 96.0 });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:scriptTask id=\"Script_1\" name=\"Calculate\" scriptFormat=\"application/vnd.tentaflow.cel\">"));
+        assert!(xml.contains("<tentaflow:scriptTask><tentaflow:outputMapping>{&quot;answer&quot;:&quot;outputs&quot;}</tentaflow:outputMapping></tentaflow:scriptTask>"));
+        assert!(xml.contains("<bpmn:script>vars.amount + 1</bpmn:script>"));
+        assert!(xml.contains("bpmnElement=\"Script_1\""));
+        assert_eq!(import_xml(&xml).0, Some(model.clone()));
+
+        for (invalid, marker) in [
+            (xml.replacen("application/vnd.tentaflow.cel", "text/javascript", 1), "<bpmn:scriptTask"),
+            (xml.replacen("<bpmn:script>vars.amount + 1</bpmn:script>", "", 1), "<bpmn:scriptTask"),
+            (xml.replacen("<bpmn:script>vars.amount + 1</bpmn:script>",
+                "<bpmn:script>vars.amount + 1</bpmn:script><bpmn:script>7</bpmn:script>", 1), "<bpmn:script>7"),
+            (xml.replacen("vars.amount + 1</bpmn:script>",
+                "<bpmn:documentation>nested</bpmn:documentation></bpmn:script>", 1), "<bpmn:documentation>nested"),
+            (xml.replacen("{&quot;answer&quot;:&quot;outputs&quot;}", "not-json", 1), "<tentaflow:outputMapping>"),
+        ] {
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none());
+            let offset = invalid.find(marker).unwrap();
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some("Script_1")
+                && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+            assert!(invalid[..offset].contains("Zażółć"));
+        }
+        let ProcessNodeKind::ScriptTask { output_mapping, .. } = &mut model.nodes[1].kind else { unreachable!() };
+        output_mapping.clear();
+        let empty_xml = export_xml(&model).unwrap();
+        assert!(!empty_xml.contains("<tentaflow:scriptTask>"));
+        assert_eq!(import_xml(&empty_xml).0, Some(model));
     }
 
 }

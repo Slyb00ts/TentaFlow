@@ -107,6 +107,28 @@ test('terminate end save keeps a unit node kind and opaque business keys', { ski
   assert.deepEqual(saved.model.variables, model.variables);
 });
 
+test('script task save keeps exact body and explicit opaque output mapping', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [],
+    variables: { amount: 2, business_key: null }, diagram: { shapes: [], edges: [] } };
+  const kind = { ScriptTask: { script: 'vars.amount + 1', outputMapping: { business_key: 'outputs' } } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Script', description: '', model: { ...base,
+      nodes: [{ id: 'Script_1', name: 'Script', kind }] } });
+  assert.deepEqual(saved.model.nodes[0].kind.ScriptTask,
+    { script: 'vars.amount + 1', outputMapping: { business_key: 'outputs' } });
+  assert.deepEqual(saved.model.variables, base.variables);
+  for (const invalid of [
+    { script: 'null' },
+    { outputMapping: {} },
+    { script: 'null', outputMapping: {}, unknown: true },
+  ]) {
+    assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+      expectedRevision: 0, name: 'Script', description: '', model: { ...base,
+        nodes: [{ id: 'Script_1', name: 'Script', kind: { ScriptTask: invalid } }] } }),
+    /required|unsupported|unknown|script task/i);
+  }
+});
+
 test('repeated task save preserves typed input, loop metadata, and opaque variables', { skip }, () => {
   const base = { schemaVersion: 1, processId: 'P_1', sequenceFlows: [],
     variables: { results: [], items: [{ business_key: 'Łódź & <ok>' }] }, diagram: { shapes: [], edges: [] } };

@@ -32,3 +32,7 @@ mod repetition_loop_tests;
 mod repetition_projection_tests;
 #[cfg(test)]
 mod repetition_capacity_tests;
+#[cfg(test)]
+mod script_tests;
+#[cfg(test)]
+mod script_proof_tests;
