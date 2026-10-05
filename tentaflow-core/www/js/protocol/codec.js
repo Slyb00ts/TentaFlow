@@ -10796,23 +10796,6 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-};
-
-// =============================================================================
-// Decode helpery
-// =============================================================================
-
-/**
- * Dekoduje binary WebSocket frame.
- * Zwraca `{envelope, body}` gdzie:
- *  - envelope: widok primitives (correlation_id BigInt, sequence u32, flags, ...)
- *  - body: plain JS object z pole `variant` i polami wariantu
- *
- * Rzuca Error na malformed frame — call site powinien logowac i disconnectowac.
- */
-export function decodeFrame(bytes) {
-  assertReady();
-  const view = _wasm.decodeEnvelope(bytes);
   /** MessageBody::TentaQuantBody(ExampleListRequest). payload: { instanceId } — the shipped examples in their fixed order. */
   tentaQuantExampleListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -10845,6 +10828,23 @@ export function decodeFrame(bytes) {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+};
+
+// =============================================================================
+// Decode helpery
+// =============================================================================
+
+/**
+ * Dekoduje binary WebSocket frame.
+ * Zwraca `{envelope, body}` gdzie:
+ *  - envelope: widok primitives (correlation_id BigInt, sequence u32, flags, ...)
+ *  - body: plain JS object z pole `variant` i polami wariantu
+ *
+ * Rzuca Error na malformed frame — call site powinien logowac i disconnectowac.
+ */
+export function decodeFrame(bytes) {
+  assertReady();
+  const view = _wasm.decodeEnvelope(bytes);
   const body = _wasm.decodeMessageBody(view.body);
   return {
     envelope: {

@@ -2719,18 +2719,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::KataSubmitResponse { .. } => "TentaQuantKataSubmitResponse",
                 Tq::KataRankingRequest { .. } => "TentaQuantKataRankingRequest",
                 Tq::KataRankingResponse { .. } => "TentaQuantKataRankingResponse",
-            }
-        }
-        // Family prefix + the variant's own name, verbatim — the browser
-        // decoder builds the same string by concatenation
-        // (`decode_provider_account_payload`), so a variant has ONE name on
-        // both sides even where that repeats the word "Account".
                 Tq::ExampleListRequest { .. } => "TentaQuantExampleListRequest",
                 Tq::ExampleListResponse { .. } => "TentaQuantExampleListResponse",
                 Tq::ExampleGetRequest { .. } => "TentaQuantExampleGetRequest",
                 Tq::ExampleGetResponse { .. } => "TentaQuantExampleGetResponse",
                 Tq::ExampleForkRequest { .. } => "TentaQuantExampleForkRequest",
                 Tq::ExampleForkResponse { .. } => "TentaQuantExampleForkResponse",
+            }
+        }
+        // Family prefix + the variant's own name, verbatim — the browser
+        // decoder builds the same string by concatenation
+        // (`decode_provider_account_payload`), so a variant has ONE name on
+        // both sides even where that repeats the word "Account".
         MessageBody::ProviderAccountBody(p) => {
             use tentaflow_protocol::provider_account::ProviderAccountPayload as Pa;
             match p {
