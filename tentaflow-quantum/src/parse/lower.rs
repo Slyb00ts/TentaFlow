@@ -278,7 +278,7 @@ impl Lowerer<'_> {
                 })?;
                 (start..start + size).collect::<Vec<_>>()
             }
-            asg::LValue::IndexedIdentifier(indexed) => vec![self.indexed_clbit(indexed)?],
+            asg::LValue::IndexedIdentifier(indexed) => self.indexed_clbits(indexed)?,
         };
         if clbits.len() != qubits.len() {
             return Err(invalid(format!(
@@ -580,9 +580,7 @@ impl Lowerer<'_> {
         };
         match operand {
             GateOperand::Identifier(id) => self.resolve_qubit_symbol(&self.symbol(id)?),
-            GateOperand::IndexedIdentifier(indexed) => {
-                Ok(vec![self.resolve_indexed_qubit(indexed)?])
-            }
+            GateOperand::IndexedIdentifier(indexed) => self.resolve_indexed_qubits(indexed),
             GateOperand::HardwareQubit(_) => Err(invalid(
                 "hardware qubits ($0) are outside the supported subset",
             )),
@@ -592,7 +590,7 @@ impl Lowerer<'_> {
     fn resolve_qubit_expression(&self, expr: &Expr) -> Result<Vec<usize>> {
         match expr {
             Expr::Identifier(id) => self.resolve_qubit_symbol(&self.symbol(id)?),
-            Expr::IndexedIdentifier(indexed) => Ok(vec![self.resolve_indexed_qubit(indexed)?]),
+            Expr::IndexedIdentifier(indexed) => self.resolve_indexed_qubits(indexed),
             other => Err(invalid(format!("{other:?} is not a qubit operand"))),
         }
     }
@@ -607,12 +605,12 @@ impl Lowerer<'_> {
         }
     }
 
-    fn resolve_indexed_qubit(&self, indexed: &asg::IndexedIdentifier) -> Result<usize> {
+    fn resolve_indexed_qubits(&self, indexed: &asg::IndexedIdentifier) -> Result<Vec<usize>> {
         let id = self.symbol(indexed.identifier())?;
-        let offset = self.single_index(indexed.indexes())?;
         if let Some(qubit) = self.qubit_bindings.get(&id) {
-            return if offset == 0 {
-                Ok(*qubit)
+            let offsets = self.index_offsets(indexed.indexes(), 1)?;
+            return if offsets == [0] {
+                Ok(vec![*qubit])
             } else {
                 Err(invalid("a gate parameter qubit cannot be indexed"))
             };
@@ -621,44 +619,89 @@ impl Lowerer<'_> {
             .qubit_registers
             .get(&id)
             .ok_or_else(|| invalid(format!("`{}` is not a qubit register", self.name_of(&id))))?;
-        if offset >= size {
-            return Err(invalid(format!(
-                "index {offset} is out of range for `{}` of size {size}",
-                self.name_of(&id)
-            )));
-        }
-        Ok(start + offset)
+        let offsets = self.index_offsets(indexed.indexes(), size)?;
+        Ok(offsets.into_iter().map(|offset| start + offset).collect())
     }
 
-    fn indexed_clbit(&self, indexed: &asg::IndexedIdentifier) -> Result<usize> {
+    fn indexed_clbits(&self, indexed: &asg::IndexedIdentifier) -> Result<Vec<usize>> {
         let id = self.symbol(indexed.identifier())?;
-        let offset = self.single_index(indexed.indexes())?;
         let (_, start, size) = *self
             .clbit_registers
             .get(&id)
             .ok_or_else(|| invalid(format!("`{}` is not a bit register", self.name_of(&id))))?;
-        if offset >= size {
-            return Err(invalid(format!(
-                "index {offset} is out of range for `{}` of size {size}",
-                self.name_of(&id)
-            )));
-        }
-        Ok(start + offset)
+        let offsets = self.index_offsets(indexed.indexes(), size)?;
+        Ok(offsets.into_iter().map(|offset| start + offset).collect())
     }
 
-    fn single_index(&self, indexes: &[asg::IndexOperator]) -> Result<usize> {
+    /// A bit that a condition or a single-bit assignment names; a slice has no
+    /// meaning there.
+    fn indexed_clbit(&self, indexed: &asg::IndexedIdentifier) -> Result<usize> {
+        match self.indexed_clbits(indexed)?.as_slice() {
+            [clbit] => Ok(*clbit),
+            _ => Err(invalid("a condition needs a single bit, not a slice")),
+        }
+    }
+
+    /// Offsets inside a register of `size` that one index operator selects: a
+    /// single index, an inclusive range `a:b` / `a:step:b` (OpenQASM 3 ranges
+    /// include the stop) or a set `{a, b, c}`. Order is preserved, because
+    /// `measure q[{2, 0}]` pairs bits with qubits positionally.
+    fn index_offsets(&self, indexes: &[asg::IndexOperator], size: usize) -> Result<Vec<usize>> {
         if indexes.len() != 1 {
             return Err(invalid("only a single index is supported"));
         }
-        match &indexes[0] {
+        let values = match &indexes[0] {
             asg::IndexOperator::ExpressionList(list) if list.expressions.len() == 1 => {
-                let value = self.eval(&list.expressions[0])?.as_i64()?;
-                usize::try_from(value).map_err(|_| invalid("a register index cannot be negative"))
+                match list.expressions[0].expression() {
+                    Expr::RangeExpression(range) => {
+                        let bound = |value: i64| -> Result<i64> {
+                            Ok(if value < 0 { value + size as i64 } else { value })
+                        };
+                        let start = bound(self.eval(range.start())?.as_i64()?)?;
+                        let stop = bound(self.eval(range.stop())?.as_i64()?)?;
+                        let step = match range.step() {
+                            Some(step) => self.eval(step)?.as_i64()?,
+                            None => 1,
+                        };
+                        if step == 0 {
+                            return Err(invalid("a register slice needs a non-zero step"));
+                        }
+                        let mut values = Vec::new();
+                        let mut current = start;
+                        while (step > 0 && current <= stop) || (step < 0 && current >= stop) {
+                            values.push(current);
+                            current += step;
+                        }
+                        values
+                    }
+                    _ => vec![self.eval(&list.expressions[0])?.as_i64()?],
+                }
             }
-            _ => Err(invalid(
-                "slices and index sets are outside the supported subset",
-            )),
+            asg::IndexOperator::SetExpression(set) => set
+                .expressions()
+                .iter()
+                .map(|e| self.eval(e).and_then(Value::as_i64))
+                .collect::<Result<Vec<_>>>()?,
+            asg::IndexOperator::ExpressionList(_) => {
+                return Err(invalid("only a single index is supported"))
+            }
+        };
+        if values.is_empty() {
+            return Err(invalid("a register slice selects no elements"));
         }
+        values
+            .into_iter()
+            .map(|value| {
+                let offset = usize::try_from(value)
+                    .map_err(|_| invalid("a register index cannot be negative"))?;
+                if offset >= size {
+                    return Err(invalid(format!(
+                        "index {offset} is out of range for a register of size {size}"
+                    )));
+                }
+                Ok(offset)
+            })
+            .collect()
     }
 
     fn condition(&self, expr: &TExpr) -> Result<Condition> {

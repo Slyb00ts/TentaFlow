@@ -463,3 +463,25 @@ fn a_condition_on_a_register_wider_than_the_compared_value_is_refused() {
     );
     assert_eq!(error.position().unwrap().line, 5);
 }
+
+#[test]
+fn register_slices_and_index_sets_select_qubits_in_order() {
+    let circuit = parse(
+        "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[5] q;\nbit[3] c;\nh q[1:3];\nc = measure q[{4, 0, 2}];\n",
+    );
+    let measured: Vec<(usize, usize)> = circuit
+        .ops()
+        .iter()
+        .filter_map(|op| match op.kind {
+            OpKind::Measure { qubit, clbit } => Some((qubit, clbit)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(measured, vec![(4, 0), (0, 1), (2, 2)]);
+    let hadamards = circuit
+        .ops()
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Gate { gate: Gate::H, .. }))
+        .count();
+    assert_eq!(hadamards, 3, "`q[1:3]` includes both ends");
+}
