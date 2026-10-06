@@ -119,10 +119,22 @@ enum EvalPolicy {
 pub struct ExprError {
     pub expression: String,
     pub cause: String,
+    pub kind: ExprErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprErrorKind {
+    Configuration,
+    Evaluation,
+    Infrastructure,
 }
 
 impl ExprError {
     fn new(expression: &str, cause: impl Into<String>) -> Self {
+        Self::with_kind(expression, cause, ExprErrorKind::Evaluation)
+    }
+
+    fn with_kind(expression: &str, cause: impl Into<String>, kind: ExprErrorKind) -> Self {
         // Over-limit hostile input must not be copied verbatim into error
         // messages; valid expressions (<= MAX_EXPR_CHARS) stay untruncated.
         let expression = if expression.chars().count() > MAX_EXPR_CHARS {
@@ -135,6 +147,7 @@ impl ExprError {
         Self {
             expression,
             cause: cause.into(),
+            kind,
         }
     }
 }
@@ -232,32 +245,34 @@ fn compile_checked(expr: &str, timeout: Option<Duration>) -> Result<Arc<Program>
     )
     .map_err(|error| match error {
         ScriptExprError::Expression(error) => error,
-        ScriptExprError::Infrastructure(error) => ExprError::new(expr, error.cause),
+        ScriptExprError::Infrastructure(error) => ExprError::with_kind(expr, error.cause, ExprErrorKind::Infrastructure),
     })
 }
 
 fn compile_with_policy(expr: &str, policy: EvalPolicy) -> Result<Arc<Program>, ScriptExprError> {
     if expr.trim().is_empty() {
-        return Err(ExprError::new(expr, "expression is empty").into());
+        return Err(ExprError::with_kind(expr, "expression is empty", ExprErrorKind::Configuration).into());
     }
     if expr.chars().count() > MAX_EXPR_CHARS {
-        return Err(ExprError::new(
+        return Err(ExprError::with_kind(
             expr,
             format!("expression exceeds the {MAX_EXPR_CHARS}-character limit"),
+            ExprErrorKind::Configuration,
         ).into());
     }
     if nesting_depth(expr) > MAX_EXPR_NESTING {
-        return Err(ExprError::new(
+        return Err(ExprError::with_kind(
             expr,
             format!(
                 "expression exceeds the nesting depth limit of {MAX_EXPR_NESTING} \
                  (`?` ternaries count toward this limit, and so do brackets and `?` \
                  inside string literals)"
             ),
+            ExprErrorKind::Configuration,
         ).into());
     }
     if matches!(policy, EvalPolicy::ScriptJoined) && expr.len() > MAX_SCRIPT_BYTES {
-        return Err(ExprError::new(expr, format!("expression exceeds the {MAX_SCRIPT_BYTES}-byte Script limit")).into());
+        return Err(ExprError::with_kind(expr, format!("expression exceeds the {MAX_SCRIPT_BYTES}-byte Script limit"), ExprErrorKind::Configuration).into());
     }
     let program = compiled(expr, policy)?;
     if matches!(policy, EvalPolicy::ScriptJoined) {
@@ -273,7 +288,7 @@ pub fn validate_script_profile(expression: &str) -> Result<(), ExprError> {
         .map(|_| ())
         .map_err(|error| match error {
             ScriptExprError::Expression(error) => error,
-            ScriptExprError::Infrastructure(error) => ExprError::new(expression, error.to_string()),
+        ScriptExprError::Infrastructure(error) => ExprError::with_kind(expression, error.to_string(), ExprErrorKind::Infrastructure),
         })
 }
 
@@ -371,7 +386,7 @@ fn evaluate_cel(
     match outcome {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(cause)) => Err(ExprError::new(expr, cause)),
-        Err(cause) => Err(ExprError::new(expr, cause.cause)),
+        Err(cause) => Err(ExprError::with_kind(expr, cause.cause, ExprErrorKind::Infrastructure)),
     }
 }
 
@@ -510,7 +525,9 @@ fn validate_script_ast(expression: &str, root: &IdedExpr) -> Result<(), ExprErro
             }
         }
     }
-    walk(root, &mut 0, &mut 0).map_err(|cause| ExprError::new(expression, cause))
+    walk(root, &mut 0, &mut 0).map_err(|cause| {
+        ExprError::with_kind(expression, cause, ExprErrorKind::Configuration)
+    })
 }
 
 /// Converts only the scope variables the compiled program actually references
@@ -610,7 +627,7 @@ fn compiled(expr: &str, policy: EvalPolicy) -> Result<Arc<Program>, ScriptExprEr
     let compile_outcome = run_on_eval_stack(move || Program::compile(&source), policy)?;
     let program = match compile_outcome {
         Ok(program) => Arc::new(program),
-        Err(e) => return Err(ExprError::new(expr, format!("parse error: {e}")).into()),
+        Err(e) => return Err(ExprError::with_kind(expr, format!("parse error: {e}"), ExprErrorKind::Configuration).into()),
     };
     let mut guard = lock_cache(cache);
     if guard.len() >= PROGRAM_CACHE_CAP {
@@ -721,6 +738,7 @@ mod tests {
     fn division_by_zero_is_error() {
         let err = eval("1 / 0").unwrap_err();
         assert!(err.cause.contains("evaluation failed"), "{}", err.cause);
+        assert_eq!(err.kind, ExprErrorKind::Evaluation);
     }
 
     // --- vars (incl. nested json) ---
@@ -1275,9 +1293,12 @@ mod tests {
 
     #[test]
     fn validate_syntax_rejects_a_parse_error() {
-        assert!(validate_syntax("1 +", None).is_err());
-        assert!(validate_syntax("", None).is_err());
-        assert!(validate_syntax("   ", None).is_err());
+        for expression in ["1 +", "", "   "] {
+            assert_eq!(
+                validate_syntax(expression, None).unwrap_err().kind,
+                ExprErrorKind::Configuration
+            );
+        }
     }
 
     #[test]
@@ -1314,5 +1335,33 @@ mod tests {
         let scope = fixture.scope(&extras);
         let error = evaluate_script("1", &scope).unwrap_err();
         assert!(error.to_string().contains("Script context exceeds"));
+    }
+
+    #[test]
+    fn script_profile_refusal_and_joined_worker_failure_keep_distinct_categories() {
+        let profile_error = validate_script_profile("[1,2].map(x,x+1)").unwrap_err();
+        assert_eq!(profile_error.kind, ExprErrorKind::Configuration);
+
+        let fixture = Fixture::new();
+        let expression = "41 + 1";
+        inject_script_infrastructure_failure(expression);
+        let error = evaluate_script(expression, &fixture.scope(&[])).unwrap_err();
+        assert!(matches!(error, ScriptExprError::Infrastructure(_)));
+        assert_eq!(
+            evaluate_script(expression, &fixture.scope(&[])).unwrap(),
+            json!(42)
+        );
+    }
+
+    #[test]
+    fn general_worker_deadline_is_an_infrastructure_failure() {
+        let (release, wait) = mpsc::channel();
+        let error = run_on_eval_stack(
+            move || wait.recv().unwrap(),
+            EvalPolicy::General(Duration::from_millis(1)),
+        )
+        .unwrap_err();
+        assert!(error.cause.contains("evaluation deadline exceeded"));
+        release.send(()).unwrap();
     }
 }

@@ -13,6 +13,60 @@ use super::repository::{
 };
 use crate::db::DbPool;
 
+#[derive(Default)]
+pub(super) struct SendCursor {
+    pub(super) after_rowid: i64,
+    pub(super) high_water: i64,
+}
+
+pub(super) fn drain_pending_sends(
+    pool: &DbPool, cursor: &mut SendCursor, at_ms: i64,
+) -> Result<usize> {
+    if cursor.high_water == 0 {
+        cursor.high_water = repository::pending_send_high_water(pool)?;
+    }
+    let page = repository::pending_send_page(pool, cursor.after_rowid, cursor.high_water)?;
+    if page.is_empty() {
+        cursor.after_rowid = 0;
+        cursor.high_water = repository::pending_send_high_water(pool)?;
+        return Ok(0);
+    }
+    let mut attempts = 0;
+    let mut admitted = 0;
+    for (rowid, token_id) in page {
+        let result = repository::admit_pending_send(
+            pool, &token_id, at_ms, repository::ProcessPlanInput::Canonical);
+        cursor.after_rowid = rowid;
+        attempts += 1;
+        match result {
+            Ok(Some(_)) => admitted += 1,
+            Ok(None) => {},
+            Err(error) => {
+                tracing::error!(token_id, error = %error,
+                    "pending Send admission failed without committing a business result");
+            }
+        }
+        if attempts == 32 { break; }
+    }
+    Ok(admitted)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub(super) struct MessageExpressionFailed {
+    pub cause: String,
+}
+
+fn dynamic_expression_error(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<crate::flow_engine::expr::ExprError>()
+        .is_some_and(|expression| expression.kind == crate::flow_engine::expr::ExprErrorKind::Evaluation)
+    {
+        MessageExpressionFailed { cause: error.to_string() }.into()
+    } else {
+        error
+    }
+}
+
 pub fn validate_key(key: &str) -> Result<()> {
     ensure!(
         !key.is_empty() && key.len() <= 256 && !key.chars().any(char::is_control),
@@ -61,22 +115,23 @@ pub fn validate_message(message: &PreparedMessage) -> Result<()> {
     Ok(())
 }
 pub fn evaluate_key(expression: &str, variables: &Value) -> Result<String> {
-    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])?;
+    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])
+        .map_err(dynamic_expression_error)?;
     let key = value
         .as_str()
-        .context("message correlation expression must return a string")?;
-    validate_key(key)?;
+        .ok_or_else(|| MessageExpressionFailed { cause: "message correlation expression must return a string".into() })?;
+    validate_key(key).map_err(|error| MessageExpressionFailed { cause: error.to_string() })?;
     Ok(key.to_owned())
 }
 fn expression_uuid(expression: &str, variables: &Value) -> Result<String> {
-    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])?;
+    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])
+        .map_err(dynamic_expression_error)?;
     let id = value
         .as_str()
-        .context("message address expression must return a UUID string")?;
-    ensure!(
-        Uuid::parse_str(id).is_ok(),
-        "message address expression must return a UUID string"
-    );
+        .ok_or_else(|| MessageExpressionFailed { cause: "message address expression must return a UUID string".into() })?;
+    if Uuid::parse_str(id).is_err() {
+        return Err(MessageExpressionFailed { cause: "message address expression must return a UUID string".into() }.into());
+    }
     Ok(id.to_owned())
 }
 pub fn prepare_throw(
@@ -123,9 +178,12 @@ pub fn prepare_throw(
         target,
         message_name,
         correlation_key: evaluate_key(correlation_expression, variables)?,
-        payload: super::runtime::evaluate(payload_expression, variables, &Value::Null, &[])?,
+        payload: super::runtime::evaluate(payload_expression, variables, &Value::Null, &[])
+            .map_err(dynamic_expression_error)?,
         ttl_seconds: *ttl_seconds,
     };
+    super::runtime::validate_output(&message.payload)
+        .map_err(|error| MessageExpressionFailed { cause: error.to_string() })?;
     validate_message(&message)?;
     Ok(message)
 }

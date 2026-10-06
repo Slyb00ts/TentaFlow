@@ -1481,6 +1481,7 @@ fn partition_body_diagram(body: &mut ProcessSubProcess, diagram: &mut ProcessDia
 fn graph_from_xml(element: &Element, namespace: &str) -> Result<(Vec<ProcessNode>, Vec<ProcessSequenceFlow>)> {
     let mut nodes = Vec::new();
     let mut sequence_flows = Vec::new();
+    let mut boundary_references = Vec::new();
     for child in &element.children {
         if child.is(BPMN, "extensionElements") { continue; }
         if child.is(BPMN, "sequenceFlow") {
@@ -1501,13 +1502,29 @@ fn graph_from_xml(element: &Element, namespace: &str) -> Result<(Vec<ProcessNode
                 target_id: child.required("targetRef")?, condition,
             });
         } else {
-            nodes.push(node_from_xml(child, namespace).map_err(|error| {
+            let node = node_from_xml(child, namespace).map_err(|error| {
                 if error.downcast_ref::<XmlElementError>().is_some() { error }
                 else { XmlElementError {
                     message: format!("invalid BPMN element {} at byte {}: {error}", child.local, child.offset),
                     element_id: child.attr("id").map(str::to_string), offset: child.offset,
                 }.into() }
-            })?);
+            })?;
+            if let ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } = &node.kind {
+                boundary_references.push((node.id.clone(), attached_to_id.clone(), child.offset));
+            }
+            nodes.push(node);
+        }
+    }
+    let node_ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    for (boundary_id, attached_to_id, offset) in boundary_references {
+        if !node_ids.contains(attached_to_id.as_str()) {
+            return Err(XmlElementError {
+                message: format!("boundary event {boundary_id} references unknown attachment {attached_to_id} at byte {offset}"),
+                element_id: Some(boundary_id), offset,
+            }.into());
         }
     }
     Ok((nodes, sequence_flows))
@@ -1914,20 +1931,20 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
             }
             ProcessNodeKind::MessageStart { message_ref, output_mapping } => {
                 let config = serde_json::json!({ "output_mapping": output_mapping });
-                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
-                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements><bpmn:messageEventDefinition messageRef=\"tns:{}\"/></bpmn:{tag}>",
+                    escaped(&serde_json::to_string(&config)?), escaped(message_ref)));
             }
             ProcessNodeKind::MessageCatch { message_ref, correlation_expression, output_mapping }
             | ProcessNodeKind::BoundaryMessage { message_ref, correlation_expression, output_mapping, .. } => {
                 let config = serde_json::json!({ "correlation_expression": correlation_expression, "output_mapping": output_mapping });
-                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
-                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements><bpmn:messageEventDefinition messageRef=\"tns:{}\"/></bpmn:{tag}>",
+                    escaped(&serde_json::to_string(&config)?), escaped(message_ref)));
             }
             ProcessNodeKind::MessageThrow { message_ref, target, correlation_expression, payload_expression, ttl_seconds } => {
                 let config = serde_json::json!({ "target": target, "correlation_expression": correlation_expression,
                     "payload_expression": payload_expression, "ttl_seconds": ttl_seconds });
-                xml.push_str(&format!("><bpmn:messageEventDefinition messageRef=\"tns:{}\"/><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements></bpmn:{tag}>",
-                    escaped(message_ref), escaped(&serde_json::to_string(&config)?)));
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:message>{}</tentaflow:message></bpmn:extensionElements><bpmn:messageEventDefinition messageRef=\"tns:{}\"/></bpmn:{tag}>",
+                    escaped(&serde_json::to_string(&config)?), escaped(message_ref)));
             }
             ProcessNodeKind::SignalCatch { signal_ref, output_mapping } => {
                 let config = serde_json::json!({ "output_mapping": output_mapping });
@@ -1948,11 +1965,12 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                     .as_ref()
                     .map(|id| format!(" errorRef=\"tns:{}\"", escaped(id)))
                     .unwrap_or_default();
-                xml.push_str(&format!("><bpmn:errorEventDefinition{reference}/>"));
+                xml.push('>');
                 if !output_mapping.is_empty() {
                     xml.push_str(&format!("<bpmn:extensionElements><tentaflow:outputMapping>{}</tentaflow:outputMapping></bpmn:extensionElements>",
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
+                xml.push_str(&format!("<bpmn:errorEventDefinition{reference}/>"));
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
             ProcessNodeKind::BoundaryEscalation {
@@ -1964,11 +1982,12 @@ fn write_graph(xml: &mut String, nodes: &[ProcessNode], flows: &[ProcessSequence
                     .as_ref()
                     .map(|id| format!(" escalationRef=\"tns:{}\"", escaped(id)))
                     .unwrap_or_default();
-                xml.push_str(&format!("><bpmn:escalationEventDefinition{reference}/>"));
+                xml.push('>');
                 if !output_mapping.is_empty() {
                     xml.push_str(&format!("<bpmn:extensionElements><tentaflow:outputMapping>{}</tentaflow:outputMapping></bpmn:extensionElements>",
                         escaped(&serde_json::to_string(output_mapping)?)));
                 }
+                xml.push_str(&format!("<bpmn:escalationEventDefinition{reference}/>"));
                 xml.push_str(&format!("</bpmn:{tag}>"));
             }
             ProcessNodeKind::ErrorEnd { error_ref } => {
@@ -2339,6 +2358,7 @@ mod tests {
     fn message_and_error_xml_round_trip_preserves_custom_namespace_qnames_and_business_keys() {
         let mut model = super::super::model::starter_model();
         model.target_namespace = Some("urn:example:orders:v1".into());
+        model.variables.insert("review_result".into(), serde_json::Value::Null);
         model.messages = vec![
             ProcessMessageDeclaration { message_id: "Message_Start".into(), name: "order.received".into() },
             ProcessMessageDeclaration { message_id: "Message_Throw".into(), name: "order.sent".into() },
@@ -2358,7 +2378,8 @@ mod tests {
             }, correlation_expression: "vars.customer_ID".into(), payload_expression: "vars.payload".into(), ttl_seconds: 60,
         } });
         model.nodes.push(ProcessNode { repeat: None, id: "Boundary_Error".into(), name: "Error".into(), kind: ProcessNodeKind::BoundaryError {
-            attached_to_id: "Service_1".into(), error_ref: Some("Error_Validation".into()), output_mapping: BTreeMap::new(),
+            attached_to_id: "Service_1".into(), error_ref: Some("Error_Validation".into()),
+            output_mapping: BTreeMap::from([("review_result".into(), "outputs.result".into())]),
         } });
         model.sequence_flows[0].target_id = "Service_1".into();
         for (id, source, target) in [
@@ -2373,6 +2394,18 @@ mod tests {
         assert!(xml.contains("messageRef=\"tns:Message_Start\""));
         assert!(xml.contains("errorRef=\"tns:Error_Validation\""));
         assert!(xml.contains("<tentaflow:resultExpression>vars.business_result</tentaflow:resultExpression>"));
+        for (tag, id, definition) in [
+            ("startEvent", model.nodes[0].id.as_str(), "messageEventDefinition"),
+            ("intermediateThrowEvent", "Throw_1", "messageEventDefinition"),
+            ("boundaryEvent", "Boundary_Error", "errorEventDefinition"),
+        ] {
+            let opening = format!("<bpmn:{tag} id=\"{id}\"");
+            let start = xml.find(&opening).unwrap();
+            let end = start + xml[start..].find(&format!("</bpmn:{tag}>")).unwrap();
+            let event = &xml[start..end];
+            assert!(event.find("<bpmn:extensionElements>").unwrap()
+                < event.find(&format!("<bpmn:{definition}")).unwrap(), "{id} has invalid BPMN element order");
+        }
         let (restored, diagnostics) = import_xml(&xml);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(restored, Some(model.clone()));
@@ -2395,6 +2428,31 @@ mod tests {
                 "{diagnostics:?}"
             );
         }
+    }
+
+    #[test]
+    fn message_catch_extension_precedes_event_definition_and_preserves_di() {
+        let mut model = super::super::model::starter_model();
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+        model.nodes.insert(1, ProcessNode { id: "Catch_1".into(), name: "Wait <&>".into(), repeat: None,
+            kind: ProcessNodeKind::MessageCatch { message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() } });
+        model.sequence_flows[0].target_id = "Catch_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Catch".into(),
+            source_id: "Catch_1".into(), target_id: "End_1".into(), condition: None });
+        model.diagram.shapes.push(ProcessShape { element_id: "Catch_1".into(),
+            x: 180.0, y: 100.0, width: 56.0, height: 56.0 });
+        let xml = export_xml(&model).unwrap();
+        let start = xml.find("<bpmn:intermediateCatchEvent id=\"Catch_1\"").unwrap();
+        let end = start + xml[start..].find("</bpmn:intermediateCatchEvent>").unwrap();
+        let event = &xml[start..end];
+        assert!(event.find("<bpmn:extensionElements>").unwrap()
+            < event.find("<bpmn:messageEventDefinition").unwrap());
+        assert!(xml.contains("bpmnElement=\"Catch_1\""));
+        assert_eq!(import_xml(&xml).0, Some(model));
     }
 
     #[test]
@@ -2457,6 +2515,11 @@ mod tests {
         let xml = export_xml(&model).unwrap();
         assert!(xml.contains("<bpmn:escalation id=\"Escalation_1\""));
         assert!(xml.contains("escalationRef=\"tns:Escalation_1\""));
+        let start = xml.find("<bpmn:boundaryEvent id=\"Boundary_1\"").unwrap();
+        let end = start + xml[start..].find("</bpmn:boundaryEvent>").unwrap();
+        let boundary = &xml[start..end];
+        assert!(boundary.find("<bpmn:extensionElements>").unwrap()
+            < boundary.find("<bpmn:escalationEventDefinition").unwrap());
         assert_eq!(import_xml(&xml).0, Some(model));
         let wrong_type = xml.replace(
             "escalationRef=\"tns:Escalation_1\"",
@@ -3431,6 +3494,7 @@ mod tests {
     fn send_receive_task_xml_requires_distinct_markers_and_preserves_di() {
         let mut model = super::super::model::starter_model();
         model.nodes[0].name = "Zażółć 日本語".into();
+        model.timer_timezone = Some("UTC".into());
         model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
             message_id: "Message_1".into(), name: "order.received".into(),
         });
@@ -3442,23 +3506,66 @@ mod tests {
         model.nodes.insert(2, ProcessNode { id: "Receive_1".into(), name: "Wait <&>".into(), repeat: None,
             kind: ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
                 correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() } });
+        model.nodes.push(ProcessNode { id: "Send_Timer".into(), name: "Deadline".into(), repeat: None,
+            kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Send_1".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 60 } } });
+        model.nodes.push(ProcessNode { id: "Send_Message".into(), name: "Reply".into(), repeat: None,
+            kind: ProcessNodeKind::BoundaryMessage { attached_to_id: "Send_1".into(), cancel_activity: false,
+                message_ref: "Message_1".into(), correlation_expression: "vars.case_key".into(),
+                output_mapping: BTreeMap::new() } });
         model.sequence_flows[0].target_id = "Send_1".into();
         model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Send".into(),
             source_id: "Send_1".into(), target_id: "Receive_1".into(), condition: None });
         model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Receive".into(),
             source_id: "Receive_1".into(), target_id: "End_1".into(), condition: None });
+        for (id, source_id) in [("Flow_Timer", "Send_Timer"), ("Flow_Message", "Send_Message")] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source_id.into(),
+                target_id: "End_1".into(), condition: None });
+        }
         model.variables.insert("case_key".into(), serde_json::json!("case-1"));
         model.variables.insert("payload".into(), serde_json::json!({"business_key": 1}));
         model.diagram.shapes.push(ProcessShape { element_id: "Send_1".into(),
             x: 180.0, y: 100.0, width: 240.0, height: 96.0 });
         model.diagram.shapes.push(ProcessShape { element_id: "Receive_1".into(),
             x: 460.0, y: 100.0, width: 240.0, height: 96.0 });
+        model.diagram.shapes.push(ProcessShape { element_id: "Send_Timer".into(),
+            x: 360.0, y: 170.0, width: 56.0, height: 56.0 });
+        model.diagram.shapes.push(ProcessShape { element_id: "Send_Message".into(),
+            x: 180.0, y: 170.0, width: 56.0, height: 56.0 });
         let xml = export_xml(&model).unwrap();
         assert!(xml.contains("<bpmn:sendTask id=\"Send_1\" name=\"Admit &lt;&amp;&gt;\" messageRef=\"tns:Message_1\" implementation=\"##unspecified\">"));
         assert!(xml.contains("<bpmn:receiveTask id=\"Receive_1\" name=\"Wait &lt;&amp;&gt;\" messageRef=\"tns:Message_1\" implementation=\"##unspecified\" instantiate=\"false\">"));
         assert!(xml.contains("<tentaflow:sendTask>") && xml.contains("<tentaflow:receiveTask>"));
         assert!(xml.contains("bpmnElement=\"Send_1\"") && xml.contains("bpmnElement=\"Receive_1\""));
+        assert!(xml.contains("bpmnElement=\"Send_Timer\"") && xml.contains("bpmnElement=\"Send_Message\""));
+        for (id, definition) in [("Send_Message", "messageEventDefinition"),
+            ("Send_Timer", "timerEventDefinition")] {
+            let start = xml.find(&format!("<bpmn:boundaryEvent id=\"{id}\"")).unwrap();
+            let end = start + xml[start..].find("</bpmn:boundaryEvent>").unwrap();
+            let event = &xml[start..end];
+            if id == "Send_Message" {
+                assert!(event.find("<bpmn:extensionElements>").unwrap()
+                    < event.find(&format!("<bpmn:{definition}")).unwrap());
+            }
+            assert!(event.contains("attachedToRef=\"Send_1\""));
+        }
         assert_eq!(import_xml(&xml).0, Some(model));
+        for invalid_attachment in [
+            xml.replacen(" attachedToRef=\"Send_1\"", "", 1),
+            xml.replacen("attachedToRef=\"Send_1\"", "attachedToRef=\"MissingActivity\"", 1),
+        ] {
+            let expected_offset = invalid_attachment.find("<bpmn:boundaryEvent id=\"Send_Timer\"").unwrap();
+            assert!(invalid_attachment[..expected_offset].contains("Zażółć 日本語"));
+            assert!(invalid_attachment[..expected_offset].chars().count() < expected_offset);
+            let (restored, diagnostics) = import_xml(&invalid_attachment);
+            assert!(restored.is_none());
+            assert_eq!(diagnostics.len(), 1);
+            let diagnostic = &diagnostics[0];
+            assert!(diagnostic.fatal);
+            assert_eq!(diagnostic.code, "UNSUPPORTED_OR_INVALID_BPMN");
+            assert_eq!(diagnostic.element_id.as_deref(), Some("Send_Timer"));
+            assert_eq!(diagnostic.offset, Some(expected_offset));
+        }
         let send_extension_start = xml.find("<bpmn:extensionElements><tentaflow:sendTask>").unwrap();
         let send_extension_end = send_extension_start
             + xml[send_extension_start..].find("</bpmn:extensionElements>").unwrap()

@@ -398,6 +398,58 @@ test('boundary siblings retain stable attachment, modes, DI and reject incoming 
   graph.destroy();
 });
 
+test('mounted Send boundaries clear both host ports and remain selectable after the host is raised', async () => {
+  const model = boundaryModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.nodes.find((node) => node.id === 'Review').kind = { SendTask: {
+    messageRef: 'Message_1', target: { Start: { definitionId: 'target-definition' } },
+    correlationExpression: 'vars.case_key', payloadExpression: 'vars.payload', ttlSeconds: 60,
+  } };
+  model.variables.case_key = 'case-1';
+  model.variables.payload = { case_key: 'case-1' };
+  const parentShape = model.diagram.shapes.find((shape) => shape.elementId === 'Review');
+  for (const [id, portX] of [['Timer_A', parentShape.x + parentShape.width], ['Timer_B', parentShape.x]]) {
+    const shape = model.diagram.shapes.find((entry) => entry.elementId === id);
+    shape.x = portX - shape.width / 2;
+    shape.y = parentShape.y + parentShape.height / 2 - shape.height / 2;
+  }
+  const state = await mount(definition('send-boundary-port-clearance', { model }));
+  state.canvas.view.zoom = 0.34;
+  for (const id of ['Timer_A', 'Timer_B']) {
+    state.canvas.updateNodeConfig(id, { attachedToId: null });
+    state.canvas.updateNodeConfig(id, { attachedToId: 'Review' });
+  }
+  const parent = state.canvas.nodes.find((node) => node.id === 'Review');
+  const boundaries = ['Timer_A', 'Timer_B'].map((id) => state.canvas.nodes.find((node) => node.id === id));
+  const ports = [state.canvas._getPortWorldPos('Review', 'in', 'in'), state.canvas._getPortWorldPos('Review', 'full', 'out')];
+  for (const boundary of boundaries) {
+    const center = { x: boundary.x + boundary.width / 2, y: boundary.y + boundary.height / 2 };
+    assert.ok(center.x === parent.x || center.x === parent.x + parent.width
+      || center.y === parent.y || center.y === parent.y + parent.height);
+    assert.ok(ports.every((port) => Math.hypot(center.x - port.x, center.y - port.y) >= boundary.width / 2 + 16));
+    assert.equal(state.canvas.getData().nodes.find((node) => node.id === boundary.id).kind.BoundaryTimer.attachedToId, 'Review');
+    assert.equal(state.canvas.getData().diagram.shapes.find((shape) => shape.elementId === boundary.id).x, boundary.x);
+  }
+  assert.ok(Math.hypot(boundaries[0].x - boundaries[1].x, boundaries[0].y - boundaries[1].y) >= boundaries[0].width);
+  const host = state.canvas.nodesLayer.querySelector('[data-node-id="Review"]');
+  host.querySelector('.fb-process-symbol').dispatchEvent(new window.PointerEvent('pointerdown', {
+    bubbles: true, pointerId: 81, button: 0, clientX: 200, clientY: 200,
+  }));
+  window.dispatchEvent(new window.PointerEvent('pointerup', { pointerId: 81, button: 0 }));
+  const hostLayer = Number(host.style.zIndex);
+  for (const boundary of boundaries) {
+    const element = state.canvas.nodesLayer.querySelector(`[data-node-id="${boundary.id}"]`);
+    assert.ok(Number(element.style.zIndex) > hostLayer);
+  }
+  click(state.canvas.nodesLayer.querySelector('[data-node-id="Timer_A"] .fb-process-symbol'));
+  assert.deepEqual([...state.canvas.selectedIds], ['Timer_A']);
+  state.canvas.updateNodeLabel('Timer_A', 'Revised deadline');
+  const selected = state.canvas.nodesLayer.querySelector('[data-node-id="Timer_A"]');
+  assert.ok(Number(selected.style.zIndex) > Number(host.style.zIndex));
+  click(selected.querySelector('.fb-process-symbol'));
+  assert.deepEqual([...state.canvas.selectedIds], ['Timer_A']);
+});
+
 test('boundary inspector uses stable activity selection and an actual checked toggle', async () => {
   const graph = canvas(boundaryModel());
   const boundary = graph.nodes.find((node) => node.id === 'Timer_A');
@@ -830,6 +882,146 @@ test('distinct send and receive task inspectors save exact message fields and di
   assert.equal(readonly.root.querySelector('[data-process="correlationExpression"]').hasAttribute('disabled'), true);
   readonly.destroy();
   assert.ok(encode.processDefinitionSaveRequest(17, saved).byteLength > 0);
+});
+
+test('root Send timer and message boundaries save, publish and retain their pinned read-only version', async () => {
+  const model = emptyProcessModel();
+  const namePrefix = 'Admit <&> Żółć ';
+  const sendName = namePrefix + 'A'.repeat(256 - Buffer.byteLength(namePrefix));
+  assert.equal(Buffer.byteLength(sendName), 256);
+  model.timerTimezone = 'Europe/Warsaw';
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.variables = { case_key: 'case-1', payload: { opaque_key: 'R&D <Łódź>' } };
+  model.nodes.splice(1, 0,
+    { id: 'Send_1', name: sendName, kind: { SendTask: { messageRef: 'Message_1',
+      target: { Start: { definitionId: 'target-definition' } }, correlationExpression: 'vars.case_key',
+      payloadExpression: 'vars.payload', ttlSeconds: 60 } } },
+    { id: 'Send_Timer', name: 'Deadline', kind: { BoundaryTimer: { attachedToId: 'Send_1',
+      cancelActivity: true, timer: { Duration: { seconds: 60 } } } } },
+    { id: 'Send_Message', name: 'Reply', kind: { BoundaryMessage: { attachedToId: 'Send_1',
+      cancelActivity: false, messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {} } } });
+  model.sequenceFlows = [
+    { id: 'Flow_Start', sourceId: 'Start', targetId: 'Send_1', condition: null },
+    { id: 'Flow_Send', sourceId: 'Send_1', targetId: 'End', condition: null },
+    { id: 'Flow_Timer', sourceId: 'Send_Timer', targetId: 'End', condition: null },
+    { id: 'Flow_Message', sourceId: 'Send_Message', targetId: 'End', condition: null },
+  ];
+  const current = definition('send-boundary', { model });
+  let published = 0;
+  let pinned;
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: saved }) => ({ definition: { ...current, model: saved, draftRevision: 5 } }),
+    processDefinitionPublishRequest: () => {
+      published += 1;
+      const version = { version: published, model: structuredClone(state.canvas.getData()) };
+      if (published === 1) pinned = structuredClone(version.model);
+      return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
+    },
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+  });
+  for (const [nodeId, kind] of [['Send_Timer', 'BoundaryTimer'], ['Send_Message', 'BoundaryMessage']]) {
+    state.canvas.selectNode(nodeId); await flush(2);
+    const select = state.config.root.querySelector('[data-process="attachedToId"]');
+    assert.equal(select.value, 'Send_1');
+    assert.equal(select.querySelector('option[value="Send_1"]').textContent.includes(sendName), true);
+    assert.equal(state.canvas.getData().nodes.find((node) => node.id === nodeId).kind[kind].attachedToId, 'Send_1');
+  }
+  assert.deepEqual(state.canvas.validate(), []);
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 1);
+  assert.equal(pinned.nodes.find((node) => node.id === 'Send_1').name, sendName);
+  assert.deepEqual(pinned.nodes.find((node) => node.id === 'Send_Timer').kind.BoundaryTimer,
+    model.nodes.find((node) => node.id === 'Send_Timer').kind.BoundaryTimer);
+  assert.deepEqual(pinned.nodes.find((node) => node.id === 'Send_Message').kind.BoundaryMessage,
+    model.nodes.find((node) => node.id === 'Send_Message').kind.BoundaryMessage);
+  state.canvas.updateNodeLabel('Send_1', 'Revised Send');
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 2);
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush(2);
+  assert.equal(state.previewVersion, 1);
+  assert.equal(state.canvas.readOnly, true);
+  assert.deepEqual(state.canvas.getData(), pinned);
+  state.canvas.selectNode('Send_Message'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="attachedToId"]').hasAttribute('disabled'), true);
+  assert.equal(state.config.root.querySelector('[data-process="messageRef"]').hasAttribute('disabled'), true);
+});
+
+test('duplicated Send boundary clears sibling overlap and selects the clone inspector', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.timerTimezone = 'Europe/Warsaw';
+  model.nodes.splice(1, 0,
+    { id: 'Send_1', name: 'Admit <&>', kind: { SendTask: { messageRef: 'Message_1',
+      target: { Start: { definitionId: 'target-definition' } },
+      correlationExpression: 'vars.case_key', payloadExpression: 'vars.payload', ttlSeconds: 60 } } },
+    { id: 'Timer_1', name: 'Deadline', kind: { BoundaryTimer: {
+      attachedToId: 'Send_1', cancelActivity: true, timer: { Duration: { seconds: 60 } },
+    } } },
+    { id: 'Message_1', name: 'Reply', kind: { BoundaryMessage: {
+      attachedToId: 'Send_1', cancelActivity: false, messageRef: 'Message_1',
+      correlationExpression: 'vars.case_key', outputMapping: {},
+    } } });
+  model.sequenceFlows = [
+    { id: 'Flow_Start', sourceId: 'Start', targetId: 'Send_1', condition: null },
+    { id: 'Flow_Send', sourceId: 'Send_1', targetId: 'End', condition: null },
+    { id: 'Flow_Timer', sourceId: 'Timer_1', targetId: 'End', condition: null },
+    { id: 'Flow_Message', sourceId: 'Message_1', targetId: 'End', condition: null },
+  ];
+  model.diagram.shapes.push(
+    { elementId: 'Send_1', x: 240, y: 160, width: 240, height: 96 },
+    { elementId: 'Timer_1', x: 420, y: 230, width: 56, height: 56 },
+    { elementId: 'Message_1', x: 420, y: 190, width: 56, height: 56 },
+  );
+  const state = await mount(definition('boundary-clone-selection', { model }));
+  const timer = state.canvas.nodes.find((node) => node.id === 'Timer_1');
+  const original = state.canvas.nodes.find((node) => node.id === 'Message_1');
+  const parent = state.canvas.nodes.find((node) => node.id === 'Send_1');
+  state.canvas.selectNode('Message_1');
+  assert.equal(state.config.node.id, 'Message_1');
+  state.canvas.duplicateNodes(['Message_1']);
+  const clone = state.canvas.nodes.find((node) => state.canvas.selectedIds.has(node.id));
+  assert.ok(clone && clone.id !== 'Message_1');
+  assert.equal(clone.config.attachedToId, 'Send_1');
+  const center = (node) => [node.x + node.width / 2, node.y + node.height / 2];
+  const [cloneX, cloneY] = center(clone);
+  assert.ok(cloneX === parent.x || cloneX === parent.x + parent.width
+    || cloneY === parent.y || cloneY === parent.y + parent.height);
+  for (const neighbor of [original, timer]) {
+    const [neighborX, neighborY] = center(neighbor);
+    assert.ok(Math.hypot(cloneX - neighborX, cloneY - neighborY) >= clone.width);
+  }
+  assert.equal(state.config.node.id, clone.id);
+  assert.equal(state.config.root.querySelector('.fb-config-title').textContent, clone.label);
+  click(state.config.root.querySelector('[data-process="delete"]'));
+  assert.equal(state.canvas.nodes.some((node) => node.id === clone.id), false);
+  assert.equal(state.canvas.nodes.some((node) => node.id === 'Message_1'), true);
+});
+
+test('embedded Send boundaries are unavailable to the editor and blocked before save', () => {
+  const model = embeddedModel();
+  model.timerTimezone = 'Europe/Warsaw';
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  const body = model.nodes.find((node) => node.id === 'Scope_Review').kind.SubProcess.body;
+  body.nodes[1] = { id: 'Local_Review', name: 'Embedded Send', kind: { SendTask: {
+    messageRef: 'Message_1', target: { Start: { definitionId: 'target-definition' } },
+    correlationExpression: 'vars.local_ID', payloadExpression: 'vars.local_ID', ttlSeconds: 60,
+  } } };
+  body.nodes.push({ id: 'Local_Timer', name: 'Deadline', kind: { BoundaryTimer: {
+    attachedToId: 'Local_Review', cancelActivity: true, timer: { Duration: { seconds: 60 } },
+  } } });
+  body.sequenceFlows.push({ id: 'Local_Timer_Flow', sourceId: 'Local_Timer', targetId: 'Local_End', condition: null });
+  const graph = canvas(model);
+  graph.navigateProcessBody(['Scope_Review']);
+  const config = inspector(graph);
+  config.show(graph.nodes.find((node) => node.id === 'Local_Timer'), graph.templates.get('bpmn_boundary_timer'));
+  assert.equal(config.root.querySelector('[data-process="attachedToId"] option[value="Local_Review"]').disabled, true);
+  assert.ok(graph.validate().includes(I18n.t('bpmn.boundary_required')));
+  config.destroy(); graph.root.remove();
 });
 
 test('signal throw and catch inspectors preserve exact declarations, expressions and source history', async () => {
@@ -2221,6 +2413,20 @@ test('all five locales translate supported elements, current statuses and every 
       assert.equal(output, I18n.t(`bpmn.event_${kind}`, {
         node: 'Message task', message: data.message_name || data.message_id, key: data.correlation_key,
       }));
+    }
+    const pending = processEventText({ kind: 'send_task_pending', nodeName: 'Admit <&>',
+      data: { source_activation_id: 'private-source', pending_token_id: 'private-wait' } });
+    assert.equal(pending, I18n.t('bpmn.event_send_task_pending', { node: 'Admit <&>' }));
+    assert.doesNotMatch(pending, /private-source|private-wait|bpmn\./);
+    for (const code of ['MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED',
+      'SEND_ADMISSION_TARGET_UNAVAILABLE']) {
+      const failure = processEventText({ kind: 'send_admission_failed', nodeName: 'Admit <&>',
+        data: { pending_token_id: 'private-wait', pending_event_id: 'private-event',
+          incident_id: 'private-incident', code, reason: 'private raw reason' } });
+      assert.equal(failure, I18n.t('bpmn.event_send_admission_failed', {
+        node: 'Admit <&>', reason: I18n.t(`bpmn.incident_${code.toLowerCase()}`),
+      }));
+      assert.doesNotMatch(failure, /private-wait|private-event|private-incident|private raw reason|bpmn\./);
     }
     for (const kind of events) {
       const output = processEventText({ kind, nodeName: '<Contract>', data: { summary: 'Actual result', code: 'SOURCE_ACCESS_REVOKED', message: 'Access revoked', job_id: 'raw-job-uuid', user_task_id: 'raw-task-uuid', selected_branch_edge_ids: ['Flow_A', 'Flow_B'], default_selected: false } });

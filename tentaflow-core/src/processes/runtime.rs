@@ -222,6 +222,11 @@ pub(super) fn patch_variables(
     Ok(value)
 }
 
+pub(super) struct SendAdmissionFailure {
+    pub code: &'static str,
+    pub reason: String,
+}
+
 #[derive(Clone)]
 struct Transition<'a> {
     model: &'a ProcessModel,
@@ -593,6 +598,25 @@ impl<'a> Transition<'a> {
             Some(node_id.to_owned()),
             json!({"code": code, "message": message}),
         );
+    }
+
+    fn fail_send_admission(
+        &mut self, node: &ProcessNode, token: &ProcessToken,
+        pending_event_id: &str, code: &'static str, reason: String,
+    ) -> Result<()> {
+        ensure!(matches!(code, "MESSAGE_EXPRESSION_ERROR"
+            | "SEND_ADMISSION_AUTHORITY_DENIED" | "SEND_ADMISSION_TARGET_UNAVAILABLE"),
+            "pending Send failure code is outside its finite profile");
+        self.incident(&node.id, None, code, reason.clone());
+        let incident_id = self.plan.add_incidents.last()
+            .context("pending Send failure incident was not created")?.incident_id.clone();
+        self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
+        self.plan.event_ids.insert(self.plan.events.len(), Uuid::new_v4().to_string());
+        self.event("send_admission_failed", Some(node.id.clone()), json!({
+            "pending_token_id":token.token_id,"pending_event_id":pending_event_id,
+            "incident_id":incident_id,"code":code,"reason":reason,
+        }));
+        Ok(())
     }
 
     fn user_task(
@@ -2855,6 +2879,19 @@ impl<'a> Transition<'a> {
                     let waiting = self.wait(&token, "waiting");
                     self.arm_subscription(&node, &waiting, None)?;
                 }
+                ProcessNodeKind::SendTask { .. } if self.body()?.0.iter().any(|boundary| match &boundary.kind {
+                    ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                    | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } => attached_to_id == &node.id,
+                    _ => false,
+                }) => {
+                    let pending_token_id = self.wait(&token, "waiting");
+                    self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                    self.plan.event_ids.insert(self.plan.events.len(), Uuid::new_v4().to_string());
+                    self.event("send_task_pending", Some(node.id.clone()), json!({
+                        "source_activation_id":id,"pending_token_id":pending_token_id,
+                    }));
+                    self.arm_boundaries(&node, &pending_token_id)?;
+                }
                 ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
                     if let Err(error) = self.throw_message(&node, &token) {
                         self.wait(&token, "waiting");
@@ -3829,6 +3866,61 @@ pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64,
     signal_admission: Option<&SignalAdmissionResolver<'_>>) -> Result<RuntimePlan> {
     let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.advance()?;
+    transition.finish()
+}
+
+pub(super) fn plan_send_admission(
+    snapshot: &RuntimeSnapshot,
+    pending_token_id: &str,
+    pending_event_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+    finite_failure: Option<SendAdmissionFailure>,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+) -> Result<RuntimePlan> {
+    let AcceptedInputRef::SendAdmission { instance_id, scope_id, node_id,
+        pending_token_id: selected, pending_event_id: selected_event,
+        expected_instance_revision } = &accepted_input else {
+        anyhow::bail!("pending Send admission requires its typed input")
+    };
+    ensure!(instance_id == &snapshot.instance.instance_id
+        && *expected_instance_revision == snapshot.instance.revision
+        && selected == pending_token_id && selected_event == pending_event_id,
+        "pending Send admission input differs from its selected activation");
+    let selected_scope = scope_id.clone();
+    let selected_node = node_id.clone();
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    transition.accepted_input = Some(accepted_input);
+    let token = transition.tokens.iter().find(|token| token.token_id == pending_token_id
+        && token.status == "waiting" && token.scope_id == selected_scope
+        && token.node_id == selected_node)
+        .context("pending Send waiting activation is missing")?.clone();
+    transition.current_scope = token.scope_id.clone();
+    let node = transition.node(&token.node_id)?.clone();
+    ensure!(matches!(&node.kind, ProcessNodeKind::SendTask { .. }),
+        "pending Send activation differs from its pinned node");
+    if let Some(failure) = finite_failure {
+        transition.fail_send_admission(&node, &token, pending_event_id,
+            failure.code, failure.reason)?;
+        return transition.finish();
+    }
+    match transition.throw_message(&node, &token) {
+        Ok(()) => {
+            let admitted = transition.plan.events.iter().position(|event|
+                event.kind == "send_task_admitted" && event.scope_id == token.scope_id
+                    && event.node_id.as_deref() == Some(node.id.as_str()))
+                .context("pending Send did not create its admission event")?;
+            transition.plan.event_ids.insert(admitted, Uuid::new_v4().to_string());
+            transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+            transition.advance()?;
+        }
+        Err(error) if error.downcast_ref::<super::messages::MessageExpressionFailed>().is_some() => {
+            transition.fail_send_admission(&node, &token, pending_event_id,
+                "MESSAGE_EXPRESSION_ERROR",
+                super::repository::bounded_failure_message(&error.to_string()))?;
+        }
+        Err(error) => return Err(error),
+    }
     transition.finish()
 }
 
@@ -4815,6 +4907,7 @@ impl ProcessRuntime {
 
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut jobs = tokio::task::JoinSet::new();
+        let mut send_cursor = super::messages::SendCursor::default();
         loop {
             if self.stop.is_cancelled() {
                 break;
@@ -4826,6 +4919,10 @@ impl ProcessRuntime {
             self.signal_cancelled_claims(&messages.cancelled_claims);
             if let Err(error) = messages.completion {
                 tracing::error!(error=%error,"process message drain failed");
+            }
+            if let Err(error) = super::messages::drain_pending_sends(
+                &self.db, &mut send_cursor, chrono::Utc::now().timestamp_millis()) {
+                tracing::error!(error = %error, "pending Send page scan failed");
             }
             while jobs.len() < 4 && !self.stop.is_cancelled() {
                 let Some(dispatcher) = self.dispatcher.upgrade() else {

@@ -606,6 +606,9 @@ fn validate_draft_body<'a>(
         } {
             ensure!(!nodes.iter().any(|attached| attached.id == *attached_to_id && attached.repeat.is_some()),
                 "repeat {} cannot have a boundary event", attached_to_id);
+            ensure!(depth == 0 || !nodes.iter().any(|attached| attached.id == *attached_to_id
+                && matches!(attached.kind, ProcessNodeKind::SendTask { .. })),
+                "boundary event {} on SendTask requires a root process", node.id);
         }
     }
     let mut flow_ids = HashSet::new();
@@ -966,6 +969,12 @@ fn validate_body<'a>(
                     ) && matches!(
                         nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                         Some(ProcessNodeKind::UserTask { .. })
+                    )) || (depth == 0 && matches!(
+                        node.kind,
+                        ProcessNodeKind::BoundaryTimer { .. } | ProcessNodeKind::BoundaryMessage { .. }
+                    ) && matches!(
+                        nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::SendTask { .. })
                     )),
                     "boundary event {} has an unsupported attachment",
                     node.id
@@ -2714,6 +2723,79 @@ mod tests {
             *message_ref = "Missing".into();
         }
         assert!(validate_model(&model).unwrap_err().to_string().contains("unknown declaration"));
+    }
+
+    #[test]
+    fn send_boundaries_require_a_nonrepeated_root_activity() {
+        let mut model = starter_model();
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+        model.variables.insert("payload".into(), serde_json::json!({"business_key": 1}));
+        model.nodes.push(ProcessNode { id: "Send_1".into(), name: "Admit".into(), repeat: None,
+            kind: ProcessNodeKind::SendTask { message_ref: "Message_1".into(),
+                target: ProcessMessageTargetSpec::Start { definition_id: uuid::Uuid::nil().to_string() },
+                correlation_expression: "vars.case_key".into(), payload_expression: "vars.payload".into(), ttl_seconds: 60 } });
+        model.nodes.push(ProcessNode { id: "Boundary_Timer".into(), name: "Deadline".into(), repeat: None,
+            kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Send_1".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 60 } } });
+        model.nodes.push(ProcessNode { id: "Boundary_Message".into(), name: "Reply".into(), repeat: None,
+            kind: ProcessNodeKind::BoundaryMessage { attached_to_id: "Send_1".into(), cancel_activity: false,
+                message_ref: "Message_1".into(), correlation_expression: "vars.case_key".into(),
+                output_mapping: BTreeMap::new() } });
+        model.sequence_flows[0].target_id = "Send_1".into();
+        for (id, source_id) in [("Flow_Send", "Send_1"), ("Flow_Timer", "Boundary_Timer"),
+            ("Flow_Message", "Boundary_Message")] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(), source_id: source_id.into(),
+                target_id: "End_1".into(), condition: None });
+        }
+        validate_model(&model).unwrap();
+        model.nodes[4].kind = ProcessNodeKind::BoundaryError { attached_to_id: "Send_1".into(),
+            error_ref: None, output_mapping: BTreeMap::new() };
+        let error = validate_model(&model).unwrap_err();
+        assert!(error.to_string().contains("unsupported attachment"), "{error:#}");
+        model.nodes[4].kind = ProcessNodeKind::BoundaryEscalation { attached_to_id: "Send_1".into(),
+            escalation_ref: None, cancel_activity: false, output_mapping: BTreeMap::new() };
+        model.nodes.push(ProcessNode { id: "Escalation_Wait".into(), name: "Review".into(), repeat: None,
+            kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() } });
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_Message").unwrap().target_id = "Escalation_Wait".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "Flow_Escalation_Wait".into(),
+            source_id: "Escalation_Wait".into(), target_id: "End_1".into(), condition: None });
+        let error = validate_model(&model).unwrap_err();
+        assert!(error.to_string().contains("unsupported attachment"), "{error:#}");
+        model.sequence_flows.pop();
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_Message").unwrap().target_id = "End_1".into();
+        model.nodes.pop();
+        model.nodes[4].kind = ProcessNodeKind::BoundaryMessage { attached_to_id: "Send_1".into(),
+            cancel_activity: false, message_ref: "Message_1".into(),
+            correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() };
+        validate_model(&model).unwrap();
+        model.nodes[2].repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+        assert!(validate_draft(&model).unwrap_err().to_string().contains("requires a UserTask or ServiceTask"));
+
+        let mut embedded = embedded_model();
+        embedded.timer_timezone = Some("UTC".into());
+        embedded.messages = model.messages.clone();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
+            body.nodes[1].kind = model.nodes[2].kind.clone();
+            body.nodes[1].repeat = None;
+            body.nodes[1].id = "Send_1".into();
+            body.nodes.push(ProcessNode { id: "Local_Timer".into(), name: "Deadline".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Send_1".into(), cancel_activity: true,
+                    timer: ProcessTimerSpec::Duration { seconds: 60 } } });
+            body.sequence_flows[0].target_id = "Send_1".into();
+            body.sequence_flows[1].source_id = "Send_1".into();
+            body.sequence_flows.push(ProcessSequenceFlow { id: "Local_Timer_Flow".into(),
+                source_id: "Local_Timer".into(), target_id: "LocalEnd".into(), condition: None });
+        }
+        let error = validate_draft(&embedded).unwrap_err();
+        assert!(error.to_string().contains("requires a root process"), "{error:#}");
     }
 
     #[test]

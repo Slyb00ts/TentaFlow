@@ -124,6 +124,10 @@ export function processEventText(event) {
   if (event.kind === 'send_task_admitted') return text('event_send_task_admitted', {
     node, message: event.data.message_name, key: event.data.correlation_key,
   });
+  if (event.kind === 'send_task_pending') return text('event_send_task_pending', { node });
+  if (event.kind === 'send_admission_failed') return text('event_send_admission_failed', {
+    node, reason: processIncidentText({ code: event.data.code, message: event.data.reason }),
+  });
   if (event.kind === 'receive_task_opened') return text('event_receive_task_opened', {
     node, message: event.data.message_name, key: event.data.correlation_key,
   });
@@ -292,7 +296,7 @@ function processIncidentText(incident) {
   if (incident.code === 'SCRIPT_EVALUATION_FAILED' || incident.code === 'SCRIPT_MAPPING_FAILED') {
     return `${text(`incident_${incident.code.toLowerCase()}`)} ${text('incident_script_guidance')}`;
   }
-  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED'];
+  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 

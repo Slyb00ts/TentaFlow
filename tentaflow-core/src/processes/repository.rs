@@ -35,6 +35,7 @@ thread_local! {
     pub(super) static PUBLICATION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     pub(super) static CALL_VERSION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static CALL_TRANSITION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+    pub(super) static SEND_ADMISSION_PREFLIGHT: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     pub(super) static CALL_PLAN_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnOnce(&mut RuntimePlan)>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -619,6 +620,9 @@ pub enum StartInputRef {
 pub enum AcceptedInputRef {
     Start { instance_id: String, cause: StartInputRef },
     PersistedReady { token_id: String, expected_instance_revision: u64 },
+    SendAdmission { instance_id: String, scope_id: String, node_id: String,
+        pending_token_id: String, pending_event_id: String,
+        expected_instance_revision: u64 },
     Human { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
     ManualAcknowledgment { task_id: String, expected_task_revision: u64, expected_instance_revision: u64, command_id: String, request_hash: String },
     Timer { timer_id: String, expected_timer_revision: u64, fired_occurrence: u64 },
@@ -1132,6 +1136,7 @@ fn timer_activation_node<'a>(
                     && matches!(
                         node.kind,
                         ProcessNodeKind::UserTask { .. }
+                            | ProcessNodeKind::SendTask { .. }
                             | ProcessNodeKind::ServiceTask { .. }
                             | ProcessNodeKind::SubProcess { .. }
                             | ProcessNodeKind::CallActivity { .. }
@@ -8065,7 +8070,13 @@ fn validate_termination_action_provenance_on(
                                 && event.data["group_id"] == group.group_id
                                 && event.data["parent_token_id"] == token.token_id)
                             .count() == 1).count() == 1;
-            if token.status == "waiting" && immediate_wait {
+            let pending_send = matches!(&pinned.kind, ProcessNodeKind::SendTask { .. })
+                && plan.events.iter().enumerate().any(|(index, event)|
+                    event.kind == "send_task_pending" && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(source.node_id.as_str())
+                        && plan.event_sources.get(&index) == Some(source_id)
+                        && event.data["pending_token_id"] == token.token_id);
+            if token.status == "waiting" && immediate_wait && !pending_send {
                 validate_termination_immediate_failure_on(instance_id, model, scopes,
                     plan, variable_states, &source, token)?;
             }
@@ -8256,6 +8267,16 @@ fn validate_termination_action_provenance_on(
                                 && subscription.node_id == source.node_id)),
                 _ => false,
             };
+        let completed_send = source.node_id == edge.source_id
+            && source.status == "waiting" && source_live
+            && matches!(&pinned.kind, ProcessNodeKind::SendTask { .. })
+            && matches!(entry, EntryAuthority::Accepted(
+                AcceptedInputRef::SendAdmission { pending_token_id, .. })
+                    if pending_token_id == source_id)
+            && plan.events.iter().enumerate().filter(|(index, event)|
+                event.kind == "send_task_admitted" && event.scope_id == source.scope_id
+                    && event.node_id.as_deref() == Some(source.node_id.as_str())
+                    && plan.event_sources.get(index) == Some(source_id)).count() == 1;
         let completed_repeat = source.node_id == edge.source_id
             && source.status == "waiting" && source_live
             && plan.repetition_groups.iter().any(|group|
@@ -8286,7 +8307,8 @@ fn validate_termination_action_provenance_on(
                     && event.data["attached_token_id"].as_str() == Some(source_id.as_str())
                     && matches!(event.kind.as_str(), "timer_fired" | "message_delivered"
                         | "business_error_caught" | "escalation_caught"));
-        ensure!(ordinary || returned || completed_wait || completed_repeat || boundary,
+        ensure!(ordinary || returned || completed_wait || completed_send
+            || completed_repeat || boundary,
             "termination successor has no authenticated predecessor transition");
         ensure!(token.status == "ready" || pinned.kind == ProcessNodeKind::EventBasedGateway
             && token.status == "waiting", "termination successor has an invalid status");
@@ -8387,6 +8409,14 @@ fn validate_termination_action_provenance_on(
                 && child.arrival_edge_id == source.arrival_edge_id
                 && child.status == "joining").count();
             match &node.kind {
+                ProcessNodeKind::SendTask { .. } if plan.events.iter().enumerate().any(|(index, event)|
+                    event.kind == "send_task_pending" && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(source.node_id.as_str())
+                        && plan.event_sources.get(&index) == Some(source_id)) =>
+                    ensure!(waits == 1 && joins == 0 && plan.add_incidents.iter().all(|incident|
+                        incident.scope_id != source.scope_id
+                            || incident.node_id.as_deref() != Some(source.node_id.as_str())),
+                        "pending Send lacks its unique factual wait"),
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
@@ -8471,9 +8501,13 @@ fn validate_termination_action_provenance_on(
         "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
         | "parallel_joined" | "inclusive_joined" | "end_reached"
         | "error_end_reached" | "terminate_end_reached" | "message_queued"
-        | "send_task_admitted" | "signal_admitted"
+        | "send_task_pending" | "send_task_admitted" | "send_admission_failed"
+        | "signal_admitted"
         | "script_completed")
-        || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
+        || event.kind == "incident" && !plan.events.iter().any(|failure|
+            failure.kind == "send_admission_failed" && failure.scope_id == event.scope_id
+                && failure.node_id == event.node_id)
+            && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
                     ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
@@ -8498,10 +8532,17 @@ fn validate_termination_action_provenance_on(
             }) || plan.event_sources.values().any(|id| id == source_id),
                 "termination history advanced an unrelated retained ready token");
         }
-        ensure!(acted.insert(source_id.clone()) && source.status == "ready"
+        let pending_send = matches!(entry, EntryAuthority::Accepted(
+            AcceptedInputRef::SendAdmission { pending_token_id, .. })
+                if pending_token_id == source_id)
+            && matches!(event.kind.as_str(), "send_task_admitted" | "send_admission_failed");
+        ensure!(acted.insert(source_id.clone())
+            && (source.status == "ready" && !pending_send
+                || source.status == "waiting" && pending_send)
             && source.scope_id == event.scope_id
             && event.node_id.as_deref() == Some(source.node_id.as_str())
-            && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+            && plan.consume_token_ids.iter().filter(|id| *id == source_id).count()
+                == usize::from(event.kind != "send_admission_failed"),
             "termination action did not consume one factual ready token");
         let path = scope_path(scopes, instance_id, &source.scope_id)?;
         let (nodes, flows, _) = super::model::scope_body(model, &path)?;
@@ -8664,6 +8705,15 @@ fn validate_termination_action_provenance_on(
             (ProcessNodeKind::TerminateEnd, "terminate_end_reached") => Vec::new(),
             (ProcessNodeKind::TerminateEnd, "incident")
                 if event.data["source_kind"] == "terminate_end_return_failure" => Vec::new(),
+            (ProcessNodeKind::SendTask { .. }, "send_task_pending") => {
+                ensure!(children.len() == 1 && children[0].status == "waiting"
+                    && event.data == serde_json::json!({
+                        "source_activation_id":source_id,
+                        "pending_token_id":children[0].token_id,
+                    }), "pending Send changed its factual parked activation");
+                Vec::new()
+            }
+            (ProcessNodeKind::SendTask { .. }, "send_admission_failed") => Vec::new(),
             (ProcessNodeKind::MessageThrow { .. }, "message_queued")
             | (ProcessNodeKind::SendTask { .. }, "send_task_admitted") => {
                 let queued = plan.create_messages.iter().filter(|message|
@@ -9454,11 +9504,13 @@ fn validate_termination_action_provenance_on(
             },
             "timer_fired" => event.data["timer_id"].as_str().is_some_and(|id|
                 count("timer_fired", "timer_id", id) == 1
-                && plan.termination_attempts.iter().any(|attempt| {
-                    let input = match attempt {
-                        TerminationAttempt::Success(source) => &source.accepted_input,
-                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
-                    };
+                && plan.termination_attempts.iter().map(|attempt| match attempt {
+                    TerminationAttempt::Success(source) => &source.accepted_input,
+                    TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                }).chain(match entry {
+                    EntryAuthority::Accepted(input) => Some(input),
+                    _ => None,
+                }).any(|input| {
                     matches!(input, AcceptedInputRef::Timer { timer_id, .. } if timer_id == id)
                         || matches!(input, AcceptedInputRef::Start {
                             cause: StartInputRef::Timer { timer_id, .. }, .. }
@@ -9673,11 +9725,13 @@ fn validate_script_actions_on(
 ) -> Result<()> {
     let mut sources = HashSet::new();
     for (index, event) in plan.events.iter().enumerate() {
-        if !matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"
-            | "signal_admitted" | "incident") { continue; }
+        if !matches!(event.kind.as_str(), "script_completed" | "send_task_pending"
+            | "send_task_admitted" | "send_admission_failed" | "signal_admitted"
+            | "incident") { continue; }
         let Some(node_id) = event.node_id.as_deref() else {
             ensure!(!matches!(event.kind.as_str(), "script_completed"
-                | "send_task_admitted" | "signal_admitted"),
+                | "send_task_pending" | "send_task_admitted" | "send_admission_failed"
+                | "signal_admitted"),
                 "immediate activity completion has no pinned node");
             continue;
         };
@@ -9804,13 +9858,122 @@ fn validate_script_actions_on(
             continue;
         }
         if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
+            if event.kind == "send_task_pending" {
+                let source_id = plan.event_sources.get(&index)
+                    .context("pending Send has no exact ready-token source")?;
+                ensure!(sources.insert(source_id.clone())
+                    && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                    "pending Send did not consume one unique ready activation");
+                let source = termination_token_on(tx, instance_id, plan, source_id)?;
+                let children = plan.create_tokens.iter().filter(|token|
+                    plan.token_sources.get(&token.token_id) == Some(source_id))
+                    .collect::<Vec<_>>();
+                ensure!(source.status == "ready" && source.scope_id == event.scope_id
+                    && source.node_id == node.id
+                    && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                        plan, source_id, expected_revision, entry, false)?
+                    && children.len() == 1 && children[0].status == "waiting"
+                    && children[0].scope_id == source.scope_id
+                    && children[0].node_id == source.node_id
+                    && children[0].arrival_edge_id == source.arrival_edge_id
+                    && children[0].fork_stack == source.fork_stack
+                    && event.data == serde_json::json!({
+                        "source_activation_id":source_id,
+                        "pending_token_id":children[0].token_id,
+                    })
+                    && plan.event_ids.get(&index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok())
+                    && plan.create_messages.iter().all(|message|
+                        message.source_activation_id != *source_id),
+                    "pending Send lacks its exact factual parked activation");
+                let path = scope_path(scopes, instance_id, &source.scope_id)?;
+                let (nodes, _, _) = super::model::scope_body(model, &path)?;
+                let attached = nodes.iter().filter(|candidate| match &candidate.kind {
+                    ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                    | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } =>
+                        attached_to_id == &node.id,
+                    _ => false,
+                }).collect::<Vec<_>>();
+                let waiting_id = &children[0].token_id;
+                ensure!(!attached.is_empty()
+                    && attached.iter().all(|boundary| match &boundary.kind {
+                        ProcessNodeKind::BoundaryTimer { .. } =>
+                            plan.create_timers.iter().filter(|timer|
+                                timer.token_id.as_deref() == Some(waiting_id.as_str())
+                                    && timer.node_id == boundary.id
+                                    && timer.kind == ProcessTimerKind::Boundary).count() == 1,
+                        ProcessNodeKind::BoundaryMessage { .. } =>
+                            plan.create_subscriptions.iter().filter(|subscription|
+                                subscription.token_id == *waiting_id
+                                    && subscription.node_id == boundary.id
+                                    && subscription.kind == ProcessSubscriptionKind::BoundaryMessage)
+                                .count() == 1,
+                        _ => false,
+                    })
+                    && plan.create_timers.iter().filter(|timer|
+                        timer.token_id.as_deref() == Some(waiting_id.as_str())).count()
+                        == attached.iter().filter(|boundary|
+                            matches!(&boundary.kind, ProcessNodeKind::BoundaryTimer { .. })).count()
+                    && plan.create_subscriptions.iter().filter(|subscription|
+                        subscription.token_id == *waiting_id).count()
+                        == attached.iter().filter(|boundary|
+                            matches!(&boundary.kind, ProcessNodeKind::BoundaryMessage { .. })).count(),
+                    "pending Send did not arm its exact pinned boundary set");
+                continue;
+            }
+            if event.kind == "incident" && plan.events.iter().any(|failure|
+                failure.kind == "send_admission_failed"
+                    && failure.scope_id == event.scope_id
+                    && failure.node_id == event.node_id) {
+                ensure!(!plan.event_sources.contains_key(&index),
+                    "pending Send failure incident has an extra action source");
+                continue;
+            }
             let source_id = plan.event_sources.get(&index)
-                .context("Send action has no exact ready-token source")?;
+                .context("Send action has no exact activation source")?;
             ensure!(sources.insert(source_id.clone())
-                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count()
+                    == usize::from(event.kind != "send_admission_failed"),
                 "Send action did not consume one unique ready activation");
             let source = termination_token_on(tx, instance_id, plan, source_id)?;
-            ensure!(source.status == "ready" && source.scope_id == event.scope_id
+            let pending = matches!(entry, EntryAuthority::Accepted(
+                AcceptedInputRef::SendAdmission { pending_token_id, .. })
+                    if pending_token_id == source_id);
+            if pending {
+                let EntryAuthority::Accepted(AcceptedInputRef::SendAdmission {
+                    instance_id: selected_instance, scope_id: selected_scope,
+                    node_id: selected_node, pending_event_id,
+                    expected_instance_revision, ..
+                }) = entry else { unreachable!() };
+                let (kind, event_node, data): (String, Option<String>, String) = tx.query_row(
+                    "SELECT kind,node_id,data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND event_id=?3",
+                    params![instance_id,source.scope_id,pending_event_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                let data: Value = parse(data)?;
+                let predecessor = data["source_activation_id"].as_str()
+                    .context("pending Send source has no prior activation")?;
+                let (prior_scope, prior_node, prior_status): (String,String,String) = tx.query_row(
+                    "SELECT scope_id,node_id,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+                    params![instance_id,predecessor],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                let prior_failure: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND kind='send_admission_failed' AND json_extract(data_json,'$.pending_token_id')=?4)",
+                    params![instance_id,source.scope_id,source.node_id,source_id],
+                    |row| row.get(0))?;
+                ensure!(selected_instance == instance_id && selected_scope == &source.scope_id
+                    && selected_node == &source.node_id
+                    && *expected_instance_revision == expected_revision
+                    && kind == "send_task_pending" && event_node.as_deref() == Some(node_id)
+                    && data == serde_json::json!({
+                        "source_activation_id":predecessor,"pending_token_id":source_id,
+                    }) && Uuid::parse_str(pending_event_id).is_ok()
+                    && prior_scope == source.scope_id && prior_node == source.node_id
+                    && prior_status == "consumed" && !prior_failure,
+                    "pending Send admission lacks its authenticated prior event and live wait");
+            }
+            ensure!((source.status == "ready" && !pending
+                    || source.status == "waiting" && pending)
+                && source.scope_id == event.scope_id
                 && source.node_id == node.id
                 && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
                     plan, source_id, expected_revision, entry, false)?,
@@ -9831,9 +9994,25 @@ fn validate_script_actions_on(
             let children = plan.create_tokens.iter().filter(|token|
                 plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
             ensure!(outgoing.len() == 1, "SendTask has no pinned single successor");
-            let prepared = super::messages::prepare_throw(model, node, &effective);
+            let prepared = if pending {
+                let (org_id, initiator): (String, String) = tx.query_row(
+                    "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+                    [instance_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+                Some(send_admission_evaluation_on(tx,
+                    &ProcessActor { org_id, user_id: initiator }, instance_id,
+                    model, node, &effective)?)
+            } else { None };
             if event.kind == "send_task_admitted" {
-                let expected = prepared.context("Send admission has no valid pinned message")?;
+                let expected = if let Some(result) = prepared {
+                    match result {
+                        SendAdmissionEvaluation::Admit(message) => message,
+                        SendAdmissionEvaluation::Fail(_) =>
+                            bail!("Send admission has a factual finite failure"),
+                    }
+                } else {
+                    super::messages::prepare_throw(model, node, &effective)
+                        .context("Send admission has no valid pinned message")?
+                };
                 let rows = plan.create_messages.iter().filter(|message|
                     message.source_event_index == index
                         && message.source_scope_id == event.scope_id
@@ -9851,6 +10030,8 @@ fn validate_script_actions_on(
                         "target":rows[0].message.target,
                         "message_name":rows[0].message.message_name,
                         "correlation_key":rows[0].message.correlation_key})
+                    && (!pending || plan.event_ids.get(&index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok()))
                     && children.len() == 1 && children[0].status == "ready"
                     && children[0].scope_id == source.scope_id
                     && children[0].node_id == outgoing[0].target_id
@@ -9859,8 +10040,51 @@ fn validate_script_actions_on(
                     && plan.event_sources.iter().all(|(child_index, child_source)|
                         child_source != &children[0].token_id || *child_index > index),
                     "Send admission differs from its pinned message or single successor");
+            } else if event.kind == "send_admission_failed" && pending {
+                let SendAdmissionEvaluation::Fail(failure) = prepared
+                    .context("pending Send lacks its source-time decision")? else {
+                    bail!("pending Send has no factual finite failure")
+                };
+                let failures = plan.add_incidents.iter().filter(|incident|
+                    incident.scope_id == event.scope_id
+                        && incident.node_id.as_deref() == Some(node_id)
+                        && incident.code == failure.code
+                        && incident.message == failure.reason).collect::<Vec<_>>();
+                ensure!(failures.len() == 1
+                    && event.data == serde_json::json!({
+                        "pending_token_id":source_id,
+                        "pending_event_id":match entry {
+                            EntryAuthority::Accepted(AcceptedInputRef::SendAdmission {
+                                pending_event_id, .. }) => pending_event_id,
+                            _ => unreachable!(),
+                        },
+                        "incident_id":failures[0].incident_id,
+                        "code":failure.code,
+                        "reason":failure.reason,
+                    })
+                    && plan.event_ids.get(&index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok())
+                    && plan.events.iter().filter(|candidate|
+                        candidate.kind == "incident"
+                            && candidate.scope_id == event.scope_id
+                            && candidate.node_id == event.node_id
+                            && candidate.data == serde_json::json!({
+                                "code":failure.code,"message":failure.reason,
+                            })).count() == 1
+                    && plan.events.iter().filter(|candidate|
+                        candidate.kind == "incident"
+                            && candidate.scope_id == event.scope_id
+                            && candidate.node_id == event.node_id).count() == 1
+                    && plan.add_incidents.iter().filter(|candidate|
+                        candidate.scope_id == event.scope_id
+                            && candidate.node_id.as_deref() == Some(node_id)).count() == 1
+                    && plan.create_messages.iter().all(|message|
+                        message.source_activation_id != *source_id)
+                    && children.is_empty(),
+                    "pending Send failure differs from its factual expression and parked wait");
             } else {
-                let error = prepared.err().context("Send incident has a valid pinned message")?;
+                let error = super::messages::prepare_throw(model, node, &effective)
+                    .err().context("Send incident has a valid pinned message")?;
                 let message = bounded_failure_message(&error.to_string());
                 ensure!(event.kind == "incident"
                     && event.data == serde_json::json!({
@@ -9880,8 +10104,8 @@ fn validate_script_actions_on(
             continue;
         }
         let ProcessNodeKind::ScriptTask { script, output_mapping } = &node.kind else {
-            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_admitted"
-                | "signal_admitted"),
+            ensure!(!matches!(event.kind.as_str(), "script_completed" | "send_task_pending"
+                | "send_task_admitted" | "send_admission_failed" | "signal_admitted"),
                 "immediate completion named another pinned node");
             continue;
         };
@@ -10218,8 +10442,10 @@ fn validate_termination_plan_on(
             break;
         }
     }
-    has_script |= plan.events.iter().any(|event| matches!(event.kind.as_str(),
-            "script_completed" | "send_task_admitted" | "signal_admitted")
+    has_script |= matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::SendAdmission { .. }))
+        || plan.events.iter().any(|event| matches!(event.kind.as_str(),
+            "script_completed" | "send_task_pending" | "send_task_admitted"
+            | "send_admission_failed" | "signal_admitted")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
             scope_node(model, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
@@ -10491,6 +10717,47 @@ fn validate_termination_plan_on(
                     && !plan.create_tokens.iter().any(|token| token.token_id == *token_id),
                     "persisted termination input changed its ready source or revision");
                 Some(token_id.clone())
+            }
+            AcceptedInputRef::SendAdmission { instance_id: selected_instance, scope_id,
+                node_id, pending_token_id, pending_event_id, expected_instance_revision } => {
+                let pending = termination_token_on(tx, instance_id, plan, pending_token_id)?;
+                let (kind, event_scope, event_node, data):
+                    (String, String, Option<String>, String) = tx.query_row(
+                    "SELECT kind,scope_id,node_id,data_json FROM bpmn_events \
+                     WHERE instance_id=?1 AND event_id=?2",
+                    params![instance_id,pending_event_id], |row| Ok((
+                        row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+                let data: Value = parse(data)?;
+                let predecessor = data["source_activation_id"].as_str()
+                    .context("terminating Send input has no prior activation")?;
+                let (prior_scope, prior_node, prior_status): (String,String,String) = tx.query_row(
+                    "SELECT scope_id,node_id,status FROM bpmn_tokens \
+                     WHERE instance_id=?1 AND token_id=?2",
+                    params![instance_id,predecessor], |row| Ok((
+                        row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                let failed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 \
+                     AND scope_id=?2 AND node_id=?3 AND kind='send_admission_failed' \
+                     AND json_extract(data_json,'$.pending_token_id')=?4)",
+                    params![instance_id,scope_id,node_id,pending_token_id], |row| row.get(0))?;
+                ensure!(selected_instance == instance_id
+                    && *expected_instance_revision == expected_revision
+                    && pending.status == "waiting" && pending.scope_id == *scope_id
+                    && pending.node_id == *node_id
+                    && kind == "send_task_pending" && event_scope == *scope_id
+                    && event_node.as_deref() == Some(node_id.as_str())
+                    && data == serde_json::json!({
+                        "source_activation_id":predecessor,
+                        "pending_token_id":pending_token_id,
+                    }) && prior_scope == *scope_id && prior_node == *node_id
+                    && prior_status == "consumed" && !failed
+                    && plan.consume_token_ids.iter().filter(|id| *id == pending_token_id).count() == 1
+                    && plan.events.iter().enumerate().filter(|(index,event)|
+                        event.kind == "send_task_admitted" && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && plan.event_sources.get(index) == Some(pending_token_id)).count() == 1,
+                    "terminating Send input differs from its immutable pending wait and admission");
+                Some(pending_token_id.clone())
             }
             AcceptedInputRef::Start { instance_id: started, .. } => {
                 ensure!(started == instance_id && plan.start_instance_id.as_deref() == Some(instance_id),
@@ -11136,6 +11403,7 @@ fn ordinary_action_source_matches_entry_on(
                     "SELECT token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
                     params![instance_id, job_id], |row| row.get::<_, String>(0))?),
                 AcceptedInputRef::CallReturn { parent_token_id, .. } => Some(parent_token_id.clone()),
+                AcceptedInputRef::SendAdmission { pending_token_id, .. } => Some(pending_token_id.clone()),
                 AcceptedInputRef::PersistedReady { .. } => return Ok(false),
             };
             if trace_termination_source_on(tx, instance_id, model, scopes, plan,
@@ -13564,6 +13832,15 @@ fn prepare_call_steps(
                 })
                 .context("immutable called process version missing")?
                 .clone();
+            ensure!(!target.version.model.nodes.iter().any(|candidate|
+                matches!(&candidate.kind, ProcessNodeKind::SendTask { .. })
+                    && target.version.model.nodes.iter().any(|boundary| match &boundary.kind {
+                        ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                        | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } =>
+                            attached_to_id == &candidate.id,
+                        _ => false,
+                    })),
+                "boundary-attached Send in a called process requires a proved call admission profile");
             let mut depth = 1;
             let mut current = instance_id.to_owned();
             while let Some(call) = snapshots
@@ -14347,6 +14624,133 @@ pub fn apply_transition(
         instance: result,
         cancelled_claims,
     })
+}
+
+pub(super) fn pending_send_high_water(pool: &DbPool) -> Result<i64> {
+    read_snapshot(pool, |conn| Ok(conn.query_row(
+        "SELECT COALESCE(MAX(rowid),0) FROM bpmn_tokens", [], |row| row.get(0))?))
+}
+
+pub(super) fn pending_send_page(
+    pool: &DbPool, after_rowid: i64, high_water: i64,
+) -> Result<Vec<(i64, String)>> {
+    read_snapshot(pool, |conn| {
+        let mut query = conn.prepare(
+            "SELECT rowid,token_id FROM bpmn_tokens WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 64")?;
+        let rows = query.query_map(params![after_rowid,high_water], |row|
+            Ok((row.get::<_, i64>(0)?,row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+}
+
+pub(super) fn admit_pending_send(
+    pool: &DbPool, pending_token_id: &str, at_ms: i64,
+    plan_input: ProcessPlanInput<'_>,
+) -> Result<Option<ProcessTransitionOutcome>> {
+    #[cfg(test)]
+    SEND_ADMISSION_PREFLIGHT.with(|gate| {
+        if let Some((ready, resume)) = gate.borrow_mut().take() {
+            ready.send(()).expect("pending Send prewrite barrier");
+            resume.recv().expect("pending Send writer release");
+        }
+    });
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let row: Option<(String, String, String, String)> = tx.query_row(
+        "SELECT instance_id,scope_id,node_id,status FROM bpmn_tokens WHERE token_id=?1",
+        [pending_token_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let Some((instance_id,scope_id,node_id,status)) = row else { return Ok(None) };
+    if status != "waiting" || scope_id != instance_id { return Ok(None); }
+    let (org_id, initiator, definition_id, version, instance_status):
+        (String,String,String,u32,String) = tx.query_row(
+        "SELECT org_id,initiator_user_id,definition_id,version,status FROM bpmn_instances WHERE instance_id=?1",
+        [&instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+    if matches!(instance_status.as_str(), "completed" | "cancelled" | "error") {
+        return Ok(None);
+    }
+    let model = current_version_model_on(&tx, &definition_id, version)?;
+    let node = model.nodes.iter().find(|node| node.id == node_id)
+        .context("waiting Send node is outside its pinned root model")?;
+    if !matches!(&node.kind, ProcessNodeKind::SendTask { .. })
+        || !model.nodes.iter().any(|candidate| match &candidate.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } => attached_to_id == &node_id,
+            _ => false,
+        }) { return Ok(None); }
+    let mut events = tx.prepare(
+        "SELECT event_id,data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 \
+         AND node_id=?3 AND kind='send_task_pending' ORDER BY seq")?;
+    let facts = events.query_map(params![instance_id,scope_id,node_id], |row|
+        Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut pending = Vec::new();
+    for (id, data) in facts {
+        let data: Value = parse(data)?;
+        if data["pending_token_id"].as_str() == Some(pending_token_id) {
+            pending.push((id, data));
+        }
+    }
+    ensure!(pending.len() == 1 && Uuid::parse_str(&pending[0].0).is_ok(),
+        "waiting Send lacks one immutable pending source event");
+    let (pending_event_id, data) = &pending[0];
+    let source_id = data["source_activation_id"].as_str()
+        .context("pending Send has no prior activation identity")?;
+    let (source_scope,source_node,source_status): (String,String,String) = tx.query_row(
+        "SELECT scope_id,node_id,status FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2",
+        params![instance_id,source_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    ensure!(source_scope == scope_id && source_node == node_id && source_status == "consumed"
+        && *data == serde_json::json!({
+            "source_activation_id":source_id,"pending_token_id":pending_token_id,
+        }), "pending Send event differs from its factual consumed activation");
+    let failed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 \
+         AND node_id=?3 AND kind='send_admission_failed' \
+         AND json_extract(data_json,'$.pending_token_id')=?4)",
+        params![instance_id,scope_id,node_id,pending_token_id], |row| row.get(0))?;
+    if failed { return Ok(None); }
+    drop(events);
+    let actor = ProcessActor { org_id, user_id: initiator };
+    let snapshot = runtime_snapshot_on(&tx, &actor, &instance_id)?;
+    let entry = AcceptedInputRef::SendAdmission {
+        instance_id: instance_id.clone(), scope_id: scope_id.clone(), node_id: node_id.clone(),
+        pending_token_id: pending_token_id.to_owned(),
+        pending_event_id: pending_event_id.clone(),
+        expected_instance_revision: snapshot.instance.revision,
+    };
+    let canonical_mode = matches!(&plan_input, ProcessPlanInput::Canonical);
+    let canonical;
+    let plan = match plan_input {
+        ProcessPlanInput::Supplied(plan) => plan,
+        ProcessPlanInput::Canonical => {
+            let effective = effective_scope_variables(&snapshot.scopes,
+                &snapshot.scope_variables, &instance_id, &snapshot.instance.variables, &scope_id)?;
+            let decision = send_admission_evaluation_on(&tx, &actor, &instance_id,
+                &model, node, &effective)?;
+            let finite = match decision {
+                SendAdmissionEvaluation::Admit(_) => None,
+                SendAdmissionEvaluation::Fail(failure) => Some(failure),
+            };
+            let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
+                accepted: Option<&AcceptedInputRef>| {
+                signal_admission_on(&tx, &actor, &instance_id, prefix, signal, accepted)
+            };
+            canonical = super::runtime::plan_send_admission(&snapshot,
+                pending_token_id, pending_event_id, at_ms, entry.clone(), finite,
+                Some(&resolve))?;
+            &canonical
+        }
+    };
+    let mut cancelled_claims = apply_plan_on(&tx, &instance_id, &actor.user_id,
+        snapshot.instance.revision, plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
+    if canonical_mode {
+        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
+            &actor.user_id, plan, at_ms)?);
+    }
+    let instance = instance_on(&tx, &actor, &instance_id, None)?;
+    tx.commit()?;
+    Ok(Some(ProcessTransitionOutcome { instance, cancelled_claims }))
 }
 
 pub fn acknowledge_manual_task(
@@ -18184,6 +18588,85 @@ fn require_message_target_on(
             Ok(())
         }
     }
+}
+
+enum SendAdmissionEvaluation {
+    Admit(PreparedMessage),
+    Fail(super::runtime::SendAdmissionFailure),
+}
+
+fn send_admission_evaluation_on(
+    tx: &Transaction<'_>, actor: &ProcessActor, instance_id: &str,
+    model: &ProcessModel, node: &ProcessNode, variables: &Value,
+) -> Result<SendAdmissionEvaluation> {
+    let (definition_id, version): (String, u32) = tx.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
+        params![instance_id,actor.org_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    let authority = |check: Result<()>| -> Result<Option<SendAdmissionEvaluation>> {
+        if let Err(error) = check {
+            if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
+                return Ok(Some(SendAdmissionEvaluation::Fail(super::runtime::SendAdmissionFailure {
+                    code: "SEND_ADMISSION_AUTHORITY_DENIED",
+                    reason: "Send admission authority is unavailable.".into(),
+                })));
+            }
+            return Err(error);
+        }
+        Ok(None)
+    };
+    if let Some(denied) = authority(require_actor(tx, actor))? { return Ok(denied); }
+    if let Some(denied) = authority(require_call_control_authority_on(tx, actor, instance_id))? {
+        return Ok(denied);
+    }
+    if let Some(denied) = authority(require_version_execution_on(tx, actor, &definition_id, version))? {
+        return Ok(denied);
+    }
+    let prepared = match super::messages::prepare_throw(model, node, variables) {
+        Ok(prepared) => prepared,
+        Err(error) if error.downcast_ref::<super::messages::MessageExpressionFailed>().is_some() =>
+            return Ok(SendAdmissionEvaluation::Fail(super::runtime::SendAdmissionFailure {
+                code: "MESSAGE_EXPRESSION_ERROR",
+                reason: bounded_failure_message(&error.to_string()),
+            })),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = require_message_target_on(tx, actor, &prepared.target) {
+        if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
+            return Ok(SendAdmissionEvaluation::Fail(super::runtime::SendAdmissionFailure {
+                code: "SEND_ADMISSION_AUTHORITY_DENIED",
+                reason: "Send admission authority is unavailable.".into(),
+            }));
+        }
+        return Err(error);
+    }
+    let unavailable = match &prepared.target {
+        ProcessMessageTarget::Start { definition_id } => {
+            let definition = definition_on(tx, definition_id)?;
+            if definition.archived || definition.published_version.is_none() {
+                true
+            } else {
+                let published = current_version_model_on(tx, definition_id,
+                    definition.published_version.context("published version missing")?)?;
+                !published.nodes.iter().any(|candidate| matches!(&candidate.kind,
+                    ProcessNodeKind::MessageStart { message_ref, .. }
+                        if published.messages.iter().any(|declaration|
+                            &declaration.message_id == message_ref
+                                && declaration.name == prepared.message_name)))
+            }
+        }
+        ProcessMessageTarget::Catch { instance_id: Some(target), .. } => {
+            tx.query_row("SELECT status IN ('completed','cancelled','error') FROM bpmn_instances WHERE instance_id=?1",
+                [target], |row| row.get::<_, bool>(0))?
+        }
+        ProcessMessageTarget::Catch { instance_id: None, .. } => false,
+    };
+    if unavailable {
+        return Ok(SendAdmissionEvaluation::Fail(super::runtime::SendAdmissionFailure {
+            code: "SEND_ADMISSION_TARGET_UNAVAILABLE",
+            reason: "Send admission target is unavailable.".into(),
+        }));
+    }
+    Ok(SendAdmissionEvaluation::Admit(prepared))
 }
 fn require_version_execution_on(
     conn: &Connection,

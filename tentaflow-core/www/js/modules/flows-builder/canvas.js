@@ -461,7 +461,8 @@ export class FlowCanvas {
         }
         if (processBoundaryKind(node.type)) {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
-          if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)) {
+          if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
+            || (this.processPath.length === 0 && parent.type === 'bpmn_send_task' && !parent.repeat))) {
             errors.push(I18n.t('bpmn.boundary_required'));
           }
           if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
@@ -479,6 +480,13 @@ export class FlowCanvas {
           if (!Number.isInteger(timer[field]) || timer[field] < min || timer[field] > max) {
             errors.push(I18n.t('bpmn.timer_number_invalid', { node: node.label || node.id, field: I18n.t(`bpmn.${label}`), min, max }));
           }
+        }
+      }
+      for (const node of this.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_message')) {
+        const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
+        if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
+          || (this.processPath.length === 0 && parent.type === 'bpmn_send_task' && !parent.repeat))) {
+          errors.push(I18n.t('bpmn.boundary_required'));
         }
       }
       return errors;
@@ -799,7 +807,9 @@ export class FlowCanvas {
 
   _positionBoundary(node) {
     const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
-    if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)) return;
+    if (!parent || !['bpmn_user_task', 'bpmn_manual_task', 'bpmn_service_task', 'bpmn_send_task', 'bpmn_receive_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)) return;
+    const ports = [this._getPortWorldPos(parent.id, 'in', 'in'), this._getPortWorldPos(parent.id, 'full', 'out')];
+    const clearsPorts = (x, y) => ports.every((port) => Math.hypot(x - port.x, y - port.y) >= Math.max(node.width, node.height) / 2 + 16);
     const centerX = node.x + node.width / 2;
     const centerY = node.y + node.height / 2;
     let x = Math.max(parent.x, Math.min(centerX, parent.x + parent.width));
@@ -816,7 +826,7 @@ export class FlowCanvas {
     }
     const occupied = this.nodes.filter((candidate) => candidate !== node && processBoundaryKind(candidate.type)
       && candidate.config.attachedToId === parent.id);
-    if (occupied.some((candidate) => Math.hypot(candidate.x + candidate.width / 2 - x, candidate.y + candidate.height / 2 - y) < node.width)) {
+    if (!clearsPorts(x, y) || occupied.some((candidate) => Math.hypot(candidate.x + candidate.width / 2 - x, candidate.y + candidate.height / 2 - y) < node.width)) {
       const positions = [];
       for (let offset = 0; offset <= parent.width; offset += node.width) {
         positions.push([parent.x + offset, parent.y], [parent.x + offset, parent.y + parent.height]);
@@ -826,7 +836,7 @@ export class FlowCanvas {
         positions.push([parent.x, parent.y + offset], [parent.x + parent.width, parent.y + offset]);
       }
       positions.sort((left, right) => Math.hypot(left[0] - x, left[1] - y) - Math.hypot(right[0] - x, right[1] - y));
-      const free = positions.find(([candidateX, candidateY]) => occupied.every((candidate) => Math.hypot(
+      const free = positions.find(([candidateX, candidateY]) => clearsPorts(candidateX, candidateY) && occupied.every((candidate) => Math.hypot(
         candidate.x + candidate.width / 2 - candidateX,
         candidate.y + candidate.height / 2 - candidateY,
       ) >= node.width));
@@ -910,6 +920,8 @@ export class FlowCanvas {
     this._pushHistory();
     this.render();
     this.onChange();
+    if (clones.length === 1) this.selectNode(clones[0].id);
+    else this.onSelect(null);
   }
 
   // Czy dodanie krawedzi from→to zamknie cykl? Sprawdzamy czy `from` jest juz
@@ -1149,7 +1161,9 @@ export class FlowCanvas {
         ...this.nodes.filter((node) => processBoundaryKind(node.type))]
       : this.nodes;
     for (const n of ordered) {
-      this.nodesLayer.appendChild(this._buildNodeEl(n));
+      const element = this._buildNodeEl(n);
+      this.nodesLayer.appendChild(element);
+      if (this.mode === 'bpmn' && processBoundaryKind(n.type)) this._bringToFront(element);
     }
     this._applySelectionClasses();
   }
@@ -1159,6 +1173,7 @@ export class FlowCanvas {
     const fresh = this._buildNodeEl(n);
     if (old) old.replaceWith(fresh);
     else this.nodesLayer.appendChild(fresh);
+    if (this.mode === 'bpmn' && processBoundaryKind(n.type)) this._bringToFront(fresh);
     this._layoutProcessLabels();
     this._applySelectionClasses();
     this._renderRegions();
