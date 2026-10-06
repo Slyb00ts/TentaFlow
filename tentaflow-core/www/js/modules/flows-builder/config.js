@@ -317,10 +317,14 @@ export class FlowConfig {
     const model = this.opts.getCanvas().processModel;
     const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
     const boundary = () => {
-      const activities = this.opts.getCanvas().nodes.filter((candidate) => (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
-        || (this.opts.getCanvas().processPath.length === 0 && ['BoundaryTimer', 'BoundaryMessage'].includes(kind) && candidate.type === 'bpmn_send_task' && !candidate.repeat))
+      const graph = this.opts.getCanvas();
+      const activities = graph.nodes.filter((candidate) => (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
+        || (['BoundaryTimer', 'BoundaryMessage'].includes(kind) && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(candidate.type) && !candidate.repeat))
         && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
-        && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task' && !!candidate.config.resultExpression)));
+        && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task' && !!candidate.config.resultExpression))
+        && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
+          edge.to_node === candidate.id && graph.nodes.some((source) =>
+            source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
       return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>`;
     };

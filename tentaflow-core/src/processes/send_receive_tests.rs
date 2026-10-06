@@ -423,3 +423,548 @@ fn called_receive_returns_to_its_pinned_parent_and_cancelled_child_refuses_late_
         &cancelled_child_id, 0, 200).unwrap().0;
     assert_eq!(child_events.iter().filter(|event| event.kind == "receive_task_completed").count(), 0);
 }
+
+pub(super) fn receive_boundary_model(message: bool, interrupt: bool)
+    -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = receive_model();
+    let (id, kind) = if message {
+        ("ReceiveMessage", ProcessNodeKind::BoundaryMessage {
+            attached_to_id: "Catch_1".into(), cancel_activity: interrupt,
+            message_ref: "Message_1".into(), correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::new(),
+        })
+    } else {
+        model.timer_timezone = Some("UTC".into());
+        ("ReceiveTimer", ProcessNodeKind::BoundaryTimer {
+            attached_to_id: "Catch_1".into(), cancel_activity: interrupt,
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 1 },
+        })
+    };
+    model.nodes.push(ProcessNode { id: id.into(), name: "Receive boundary".into(),
+        kind, repeat: None });
+    model.nodes.push(ProcessNode { id: "BoundaryEnd".into(), name: "Boundary end".into(),
+        kind: ProcessNodeKind::End, repeat: None });
+    model.sequence_flows.push(edge("BoundaryFlow", id, "BoundaryEnd"));
+    model
+}
+
+#[test]
+fn receive_first_consumes_own_subscription_then_disarms_timer_and_message_siblings() {
+    for message_boundary in [false,true] {
+        let fixture = Fixture::new();
+        let version = publish_model(&fixture, &receive_boundary_model(message_boundary, true));
+        let started = start_version(&fixture, &version);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let own = snapshot.subscriptions.iter().find(|sub|
+            sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+        let message = envelope(catch_target(&version, Some(&started.instance_id),
+            Some(&own.subscription_id)), json!({"source":"receive-first"}));
+        send(&fixture, &message);
+        let drained = messages::drain_pending(&fixture.db, chrono::Utc::now().timestamp_millis());
+        drained.completion.unwrap();
+        assert_eq!(drained.delivered, 1);
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.instance.variables["received"], json!({"source":"receive-first"}));
+        assert_eq!(after.subscriptions.iter().find(|sub|
+            sub.subscription_id == own.subscription_id).unwrap().status,
+            ProcessSubscriptionStatus::Consumed);
+        if message_boundary {
+            assert_eq!(after.subscriptions.iter().find(|sub|
+                sub.node_id == "ReceiveMessage").unwrap().status,
+                ProcessSubscriptionStatus::Cancelled);
+        } else {
+            let timer = snapshot.timers.iter().find(|timer|
+                timer.node_id == "ReceiveTimer").unwrap();
+            assert_eq!(after.timers.iter().find(|row| row.timer_id == timer.timer_id)
+                .unwrap().status, tentaflow_protocol::processes::ProcessTimerStatus::Cancelled);
+            let stale = super::timers::drain_due(&fixture.db, timer.due_at_ms.unwrap() + 1);
+            stale.completion.unwrap();
+            assert_eq!(stale.fired, 0);
+        }
+        let events = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        let delivered = events.iter().position(|event| event.kind == "message_delivered"
+            && event.data["subscription_id"] == own.subscription_id).unwrap();
+        let completed = events.iter().position(|event| event.kind == "receive_task_completed")
+            .unwrap();
+        assert!(delivered < completed);
+        assert_eq!(events.iter().filter(|event| event.kind == "receive_task_completed")
+            .count(), 1);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let replay = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis());
+        replay.completion.unwrap();
+        assert_eq!(replay.delivered, 0);
+    }
+}
+
+#[test]
+fn interrupting_receive_boundary_cancels_only_its_own_receive_subscription() {
+    for message_boundary in [false,true] {
+        let fixture = Fixture::new();
+        let version = publish_model(&fixture, &receive_boundary_model(message_boundary, true));
+        let started = start_version(&fixture, &version);
+        let independent_version = publish_model(&fixture, &receive_model());
+        let independent = start_version(&fixture, &independent_version);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let own = snapshot.subscriptions.iter().find(|sub|
+            sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+        let stale = envelope(catch_target(&version, Some(&started.instance_id),
+            Some(&own.subscription_id)), json!({"late":true}));
+        send(&fixture, &stale);
+        if message_boundary {
+            let boundary = snapshot.subscriptions.iter().find(|sub|
+                sub.node_id == "ReceiveMessage").unwrap();
+            let message = envelope(catch_target(&version, Some(&started.instance_id),
+                Some(&boundary.subscription_id)), Value::Null);
+            send(&fixture, &message);
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap()
+                .into_iter().find(|row| row.key.message_id == message.message_id).unwrap();
+            let MessageSelection::Ready(selected) =
+                repository::message_snapshot(&fixture.db, &candidate).unwrap()
+                else { panic!("the selected boundary must remain open") };
+            repository::deliver_message(&fixture.db, &selected,
+                repository::ProcessPlanInput::Canonical, at_ms).unwrap().unwrap();
+        } else {
+            let timer = snapshot.timers.iter().find(|timer|
+                timer.node_id == "ReceiveTimer").unwrap();
+            let drained = super::timers::drain_due(&fixture.db, timer.due_at_ms.unwrap() + 1);
+            drained.completion.unwrap();
+            assert_eq!(drained.fired, 1);
+        }
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.subscriptions.iter().find(|sub|
+            sub.subscription_id == own.subscription_id).unwrap().status,
+            ProcessSubscriptionStatus::Cancelled);
+        let independent_after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &independent.instance_id).unwrap();
+        assert_eq!(independent_after.subscriptions.iter().find(|sub|
+            sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap().status,
+            ProcessSubscriptionStatus::Open);
+        let events = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        assert!(events.iter().all(|event| event.kind != "receive_task_completed"));
+        let drained = messages::drain_pending(&fixture.db,
+            chrono::Utc::now().timestamp_millis());
+        drained.completion.unwrap();
+        assert_eq!(drained.delivered, 0);
+        assert_eq!(repository::get_message(&fixture.db, &fixture.owner,
+            &fixture.owner.user_id, &stale.message_id).unwrap().message.status,
+            ProcessMessageStatus::Cancelled);
+        let late = envelope(catch_target(&version, Some(&started.instance_id),
+            Some(&own.subscription_id)), json!({"after closure":true}));
+        let before_rejected = super::signal_proof_tests::all_transition_rows(&fixture);
+        assert!(repository::send_message(&fixture.db, &fixture.owner,
+            &stamp("late Receive envelope"), &late,
+            chrono::Utc::now().timestamp_millis()).is_err());
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before_rejected);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+            &started.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+    }
+}
+
+#[test]
+fn noninterrupting_receive_boundary_keeps_own_wait_until_exact_delivery() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture, &receive_boundary_model(true, false));
+    let started = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().find(|sub|
+        sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let boundary = snapshot.subscriptions.iter().find(|sub|
+        sub.node_id == "ReceiveMessage").unwrap();
+    let first = envelope(catch_target(&version, Some(&started.instance_id),
+        Some(&boundary.subscription_id)), json!({"boundary":true}));
+    send(&fixture, &first);
+    let fired = messages::drain_pending(&fixture.db, chrono::Utc::now().timestamp_millis());
+    fired.completion.unwrap();
+    assert_eq!(fired.delivered, 1);
+    let intermediate = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(intermediate.subscriptions.iter().find(|sub|
+        sub.subscription_id == own.subscription_id).unwrap().status,
+        ProcessSubscriptionStatus::Open);
+    assert!(intermediate.tokens.iter().any(|token|
+        token.token_id == own.token_id && token.status == "waiting"));
+    let second = envelope(catch_target(&version, Some(&started.instance_id),
+        Some(&own.subscription_id)), json!({"receive":true}));
+    send(&fixture, &second);
+    let delivered = messages::drain_pending(&fixture.db, chrono::Utc::now().timestamp_millis());
+    delivered.completion.unwrap();
+    assert_eq!(delivered.delivered, 1);
+    let after = repository::get_instance(&fixture.db, &fixture.owner,
+        &started.instance_id, None).unwrap();
+    assert_eq!(after.status, ProcessInstanceStatus::Completed);
+    assert_eq!(after.variables["received"], json!({"receive":true}));
+    let events = repository::list_events(&fixture.db, &fixture.owner,
+        &started.instance_id, 0, 200).unwrap().0;
+    assert_eq!(events.iter().filter(|event| event.kind == "receive_task_completed").count(), 1);
+}
+
+#[test]
+fn noninterrupting_receive_timer_preserves_own_subscription_for_later_delivery() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture, &receive_boundary_model(false, false));
+    let started = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let timer = snapshot.timers.iter().find(|row|
+        row.node_id == "ReceiveTimer").unwrap();
+    let due = timer.due_at_ms.unwrap() + 1;
+    let fired = super::timers::drain_due(&fixture.db, due);
+    fired.completion.unwrap();
+    assert_eq!(fired.fired, 1);
+    let intermediate = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(intermediate.subscriptions.iter().find(|row|
+        row.subscription_id == own.subscription_id).unwrap().status,
+        ProcessSubscriptionStatus::Open);
+    let message = envelope(catch_target(&version, Some(&started.instance_id),
+        Some(&own.subscription_id)), json!({"later":true}));
+    send(&fixture, &message);
+    let delivered = messages::drain_pending(&fixture.db, due + 1);
+    delivered.completion.unwrap();
+    assert_eq!(delivered.delivered, 1);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::get_instance(&reopened, &fixture.owner,
+        &started.instance_id, None).unwrap();
+    assert_eq!(after.status, ProcessInstanceStatus::Completed);
+    assert_eq!(after.variables["received"], json!({"later":true}));
+}
+
+#[test]
+fn noninterrupting_receive_message_maps_its_payload_without_replacing_later_receive_input() {
+    let fixture = Fixture::new();
+    let mut model = receive_boundary_model(true, false);
+    model.variables.insert("boundary_payload".into(), Value::Null);
+    let boundary_node = model.nodes.iter_mut().find(|node|
+        node.id == "ReceiveMessage").unwrap();
+    let ProcessNodeKind::BoundaryMessage { output_mapping, .. } =
+        &mut boundary_node.kind else { unreachable!() };
+    output_mapping.insert("boundary_payload".into(), "outputs".into());
+    let version = publish_model(&fixture, &model);
+    let started = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let boundary = snapshot.subscriptions.iter().find(|row|
+        row.node_id == "ReceiveMessage").unwrap();
+    let first = envelope(catch_target(&version, Some(&started.instance_id),
+        Some(&boundary.subscription_id)), json!({"boundary":1}));
+    send(&fixture, &first);
+    let first_drain = messages::drain_pending(&fixture.db,
+        chrono::Utc::now().timestamp_millis());
+    first_drain.completion.unwrap();
+    assert_eq!(first_drain.delivered, 1);
+    let between = repository::get_instance(&fixture.db, &fixture.owner,
+        &started.instance_id, None).unwrap();
+    assert_eq!(between.variables["boundary_payload"], json!({"boundary":1}));
+    assert_eq!(between.variables["received"], Value::Null);
+    let second = envelope(catch_target(&version, Some(&started.instance_id),
+        Some(&own.subscription_id)), json!({"receive":2}));
+    send(&fixture, &second);
+    let second_drain = messages::drain_pending(&fixture.db,
+        chrono::Utc::now().timestamp_millis());
+    second_drain.completion.unwrap();
+    assert_eq!(second_drain.delivered, 1);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::get_instance(&reopened, &fixture.owner,
+        &started.instance_id, None).unwrap();
+    assert_eq!(after.variables["boundary_payload"], json!({"boundary":1}));
+    assert_eq!(after.variables["received"], json!({"receive":2}));
+}
+
+#[test]
+fn broad_message_to_receive_and_its_boundary_remains_ambiguous() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture, &receive_boundary_model(true, true));
+    let started = start_version(&fixture, &version);
+    let message = envelope(catch_target(&version, Some(&started.instance_id), None), Value::Null);
+    send(&fixture, &message);
+    let candidate = repository::due_messages(&fixture.db,
+        chrono::Utc::now().timestamp_millis(), 32).unwrap().into_iter()
+        .find(|candidate| candidate.key.message_id == message.message_id).unwrap();
+    assert!(matches!(repository::message_snapshot(&fixture.db, &candidate).unwrap(),
+        MessageSelection::Ambiguous));
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(snapshot.subscriptions.iter().filter(|sub|
+        sub.status == ProcessSubscriptionStatus::Open).count(), 2);
+}
+
+#[test]
+fn embedded_and_called_receive_message_winners_bind_child_scope_and_parent_return() {
+    for called in [false,true] {
+        for receive_first in [false,true] {
+            let fixture = Fixture::new();
+            let model = embedded_model(receive_boundary_model(true, true), "InnerScope");
+            let version = publish_model(&fixture, &model);
+            let parent = if called {
+                let caller = publish_model(&fixture,
+                    &super::call_tests::caller(&version, BTreeMap::new()));
+                start_version(&fixture, &caller)
+            } else { start_version(&fixture, &version) };
+            let child_id = if called {
+                super::call_tests::child_id(&fixture, &parent.instance_id)
+            } else { parent.instance_id.clone() };
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &child_id).unwrap();
+            if called {
+                let original = repository::get_definition(&fixture.db, &fixture.owner,
+                    &version.definition_id).unwrap().0;
+                let mut newer = version.model.clone();
+                newer.nodes.iter_mut().find(|node| node.id == "InnerScope").unwrap().name =
+                    "Later Receive body".into();
+                let draft = repository::save_definition(&fixture.db, &fixture.owner,
+                    &stamp("change Receive child version"), Some(&version.definition_id),
+                    original.draft_revision, "Receive child", "", &newer).unwrap();
+                let latest = repository::publish_definition(&fixture.db, &fixture.owner,
+                    &stamp("publish Receive child version"), &version.definition_id,
+                    draft.draft_revision, &[], None).unwrap().1;
+                assert!(latest.version > version.version);
+                assert_eq!(snapshot.instance.version, version.version);
+            }
+            let own = snapshot.subscriptions.iter().find(|sub|
+                sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+            let boundary = snapshot.subscriptions.iter().find(|sub|
+                sub.node_id == "ReceiveMessage").unwrap();
+            assert_ne!(own.scope_id, child_id);
+            assert_eq!(own.scope_id, boundary.scope_id);
+            assert_eq!(own.token_id, boundary.token_id);
+            let selected = if receive_first { own } else { boundary };
+            let message = envelope(catch_target(&version, Some(&child_id),
+                Some(&selected.subscription_id)), json!({"factual":true}));
+            send(&fixture, &message);
+            let drained = messages::drain_pending(&fixture.db,
+                chrono::Utc::now().timestamp_millis());
+            drained.completion.unwrap();
+            assert_eq!(drained.delivered, 1);
+            let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &child_id).unwrap();
+            assert_eq!(after.subscriptions.iter().find(|row|
+                row.subscription_id == own.subscription_id).unwrap().status,
+                if receive_first { ProcessSubscriptionStatus::Consumed }
+                else { ProcessSubscriptionStatus::Cancelled });
+            let events = repository::list_events(&fixture.db, &fixture.owner,
+                &child_id, 0, 200).unwrap().0;
+            assert_eq!(events.iter().filter(|event| event.kind == "receive_task_completed"
+                && event.scope_id == own.scope_id).count(), usize::from(receive_first));
+            let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+            assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+                &parent.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+            let replay = messages::drain_pending(&reopened,
+                chrono::Utc::now().timestamp_millis());
+            replay.completion.unwrap();
+            assert_eq!(replay.delivered, 0);
+        }
+    }
+}
+
+#[test]
+fn parent_cancel_fences_called_embedded_receive_and_both_open_subscriptions() {
+    let fixture = Fixture::new();
+    let child_version = publish_model(&fixture,
+        &embedded_model(receive_boundary_model(true, true), "InnerScope"));
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&child_version, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let before_child = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &child_id).unwrap();
+    let own = before_child.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let boundary = before_child.subscriptions.iter().find(|row|
+        row.node_id == "ReceiveMessage").unwrap();
+    let before_parent = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &parent.instance_id).unwrap();
+    let late = envelope(catch_target(&child_version, Some(&child_id),
+        Some(&own.subscription_id)), json!({"late":true}));
+    send(&fixture, &late);
+    repository::cancel_instance(&fixture.db, &fixture.owner, &stamp("cancel parent Receive"),
+        &parent.instance_id, before_parent.instance.revision).unwrap();
+    let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Cancelled);
+    for id in [&own.subscription_id, &boundary.subscription_id] {
+        assert_eq!(after.subscriptions.iter().find(|row| &row.subscription_id == id)
+            .unwrap().status, ProcessSubscriptionStatus::Cancelled);
+    }
+    let drained = messages::drain_pending(&fixture.db,
+        chrono::Utc::now().timestamp_millis());
+    drained.completion.unwrap();
+    assert_eq!(drained.delivered, 0);
+    assert_eq!(repository::get_message(&fixture.db, &fixture.owner,
+        &fixture.owner.user_id, &late.message_id).unwrap().message.status,
+        ProcessMessageStatus::Cancelled);
+    let child_events = repository::list_events(&fixture.db, &fixture.owner,
+        &child_id, 0, 200).unwrap().0;
+    assert_eq!(child_events.iter().filter(|event|
+        event.kind == "receive_task_completed").count(), 0);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+        &child_id, None).unwrap().status, ProcessInstanceStatus::Cancelled);
+}
+
+pub(super) fn receive_race_model() -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = super::messages::test_support::race_model();
+    model.nodes.iter_mut().find(|node| node.id == "Catch_1").unwrap().kind =
+        ProcessNodeKind::ReceiveTask {
+            message_ref: "Message_1".into(),
+            correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
+        };
+    model
+}
+
+#[test]
+fn direct_receive_and_timer_race_each_winner_closes_only_its_sibling() {
+    for called in [false, true] {
+        for receive_first in [false, true] {
+            let fixture = Fixture::new();
+            let child_version = publish_model(&fixture,
+                &embedded_model(receive_race_model(), "InnerScope"));
+            let parent = if called {
+                let caller = publish_model(&fixture,
+                    &super::call_tests::caller(&child_version, BTreeMap::new()));
+                start_version(&fixture, &caller)
+            } else { start_version(&fixture, &child_version) };
+            let child_id = if called {
+                super::call_tests::child_id(&fixture, &parent.instance_id)
+            } else { parent.instance_id.clone() };
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &child_id).unwrap();
+            let own = snapshot.subscriptions.iter().find(|row|
+                row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+            let timer = snapshot.timers.iter().find(|row|
+                row.node_id == "Timer_1").unwrap();
+            if called {
+                let original = repository::get_definition(&fixture.db, &fixture.owner,
+                    &child_version.definition_id).unwrap().0;
+                let mut newer = child_version.model.clone();
+                newer.nodes.iter_mut().find(|node| node.id == "InnerScope").unwrap().name =
+                    "Later gateway child".into();
+                let draft = repository::save_definition(&fixture.db, &fixture.owner,
+                    &stamp("change gateway child"), Some(&child_version.definition_id),
+                    original.draft_revision, "Gateway child", "", &newer).unwrap();
+                let latest = repository::publish_definition(&fixture.db, &fixture.owner,
+                    &stamp("publish gateway child"), &child_version.definition_id,
+                    draft.draft_revision, &[], None).unwrap().1;
+                assert!(latest.version > child_version.version);
+                assert_eq!(snapshot.instance.version, child_version.version);
+            }
+            let race = snapshot.event_races.iter().find(|row|
+                row.race_id == own.race_id.as_ref().unwrap().as_str()).unwrap();
+            assert_eq!(timer.race_id.as_deref(), Some(race.race_id.as_str()));
+            assert_eq!(own.scope_id, race.scope_id);
+            let message = envelope(catch_target(&child_version, Some(&child_id),
+                Some(&own.subscription_id)), json!({"winner":"Receive"}));
+            send(&fixture, &message);
+            if receive_first {
+                let delivered = messages::drain_pending(&fixture.db,
+                    chrono::Utc::now().timestamp_millis());
+                delivered.completion.unwrap();
+                assert_eq!(delivered.delivered, 1);
+                let late = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                late.completion.unwrap();
+                assert_eq!(late.fired, 0);
+            } else {
+                let fired = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                fired.completion.unwrap();
+                assert_eq!(fired.fired, 1);
+                let late = messages::drain_pending(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                late.completion.unwrap();
+                assert_eq!(late.delivered, 0);
+            }
+            let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+            let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+                &child_id).unwrap();
+            assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+            assert_eq!(after.subscriptions.iter().find(|row|
+                row.subscription_id == own.subscription_id).unwrap().status,
+                if receive_first { ProcessSubscriptionStatus::Consumed }
+                else { ProcessSubscriptionStatus::Cancelled });
+            assert_eq!(after.event_races.iter().find(|row|
+                row.race_id == race.race_id).unwrap().status,
+                tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+            let events = repository::list_events(&reopened, &fixture.owner,
+                &child_id, 0, 200).unwrap().0;
+            assert_eq!(events.iter().filter(|event| event.kind == "event_race_won"
+                && event.scope_id == race.scope_id).count(), 1);
+            assert_eq!(events.iter().filter(|event| event.kind == "receive_task_completed")
+                .count(), usize::from(receive_first));
+            assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+                &parent.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+        }
+    }
+}
+
+#[test]
+fn two_direct_receives_are_ambiguous_broadly_but_exact_target_has_one_winner() {
+    let fixture = Fixture::new();
+    let mut model = receive_race_model();
+    let second = model.nodes.iter_mut().find(|node| node.id == "Timer_1").unwrap();
+    second.id = "Receive_2".into();
+    second.name = "Other Receive".into();
+    second.kind = ProcessNodeKind::ReceiveTask {
+        message_ref: "Message_1".into(),
+        correlation_expression: "'case-1'".into(),
+        output_mapping: BTreeMap::new(),
+    };
+    for edge in &mut model.sequence_flows {
+        if edge.target_id == "Timer_1" { edge.target_id = "Receive_2".into(); }
+        if edge.source_id == "Timer_1" { edge.source_id = "Receive_2".into(); }
+    }
+    model.timer_timezone = None;
+    let version = publish_model(&fixture, &model);
+    let receiver = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().filter(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).collect::<Vec<_>>();
+    assert_eq!(own.len(), 2);
+    let broad = envelope(catch_target(&version, Some(&receiver.instance_id), None),
+        json!({"ambiguous":true}));
+    send(&fixture, &broad);
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap().into_iter()
+        .find(|row| row.key.message_id == broad.message_id).unwrap();
+    assert!(matches!(repository::message_snapshot(&fixture.db, &candidate).unwrap(),
+        MessageSelection::Ambiguous));
+    let exact = envelope(catch_target(&version, Some(&receiver.instance_id),
+        Some(&own[0].subscription_id)), json!({"exact":true}));
+    send(&fixture, &exact);
+    let candidate = repository::due_messages(&fixture.db,
+        chrono::Utc::now().timestamp_millis(), 32).unwrap().into_iter()
+        .find(|row| row.key.message_id == exact.message_id).unwrap();
+    let MessageSelection::Ready(prepared) =
+        repository::message_snapshot(&fixture.db, &candidate).unwrap()
+        else { panic!("the exact Receive alternative must be ready") };
+    repository::deliver_message(&fixture.db, &prepared,
+        repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis()).unwrap().unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(after.subscriptions.iter().filter(|row|
+        row.status == ProcessSubscriptionStatus::Consumed).count(), 1);
+    assert_eq!(after.subscriptions.iter().filter(|row|
+        row.status == ProcessSubscriptionStatus::Cancelled).count(), 1);
+    let stale = messages::drain_pending(&reopened,
+        chrono::Utc::now().timestamp_millis() + 1);
+    stale.completion.unwrap();
+    assert_eq!(stale.delivered, 0);
+}

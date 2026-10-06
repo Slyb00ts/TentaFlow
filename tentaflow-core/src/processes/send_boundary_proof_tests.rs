@@ -522,3 +522,297 @@ fn nonexistent_factual_subscription_aborts_without_minting_a_finite_send_failure
         .iter()
         .any(|token| token.token_id == waiting.token_id && token.status == "waiting"));
 }
+
+#[test]
+fn embedded_pending_send_rejects_foreign_scope_and_boundary_facts_before_canonical_commit() {
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &super::send_receive_tests::receive_model());
+    let receiver = start_version(&fixture, &target);
+    let model = super::runtime::test_support::embedded_model(
+        super::send_boundary_tests::timer_bound_send_model(
+            &target.definition_id, &receiver.instance_id), "InnerScope");
+    let source = publish_model(&fixture, &model);
+    let instance = start_version(&fixture, &source);
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let (waiting_id, plan) = pending_send_plan(&fixture, &instance.instance_id, at_ms);
+    let child_scope = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &instance.instance_id).unwrap().tokens.into_iter()
+        .find(|token| token.token_id == waiting_id).unwrap().scope_id;
+    assert_ne!(child_scope, instance.instance_id);
+    let admitted = plan.events.iter().position(|event|
+        event.kind == "send_task_admitted").unwrap();
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    let mut cases = Vec::new();
+    let mut foreign_event_scope = plan.clone();
+    foreign_event_scope.events[admitted].scope_id = instance.instance_id.clone();
+    cases.push(("foreign admission scope", foreign_event_scope));
+    let mut foreign_outbox_scope = plan.clone();
+    foreign_outbox_scope.create_messages[0].source_scope_id = instance.instance_id.clone();
+    cases.push(("foreign outbox source scope", foreign_outbox_scope));
+    let mut moved_source = plan.clone();
+    moved_source.event_sources.insert(admitted, Uuid::new_v4().to_string());
+    cases.push(("foreign child activation", moved_source));
+    let mut omitted_child_arm = plan.clone();
+    omitted_child_arm.timer_updates.clear();
+    cases.push(("omitted child boundary closure", omitted_child_arm));
+    let mut foreign_successor = plan.clone();
+    let successor = foreign_successor.create_tokens.iter_mut().find(|token|
+        token.status == "ready").unwrap();
+    successor.scope_id = instance.instance_id.clone();
+    cases.push(("foreign successor scope", foreign_successor));
+    for (name, forged) in cases {
+        let error = repository::admit_pending_send(&fixture.db, &waiting_id, at_ms,
+            ProcessPlanInput::Supplied(&forged)).unwrap_err();
+        assert!(!format!("{error:#}").is_empty(), "{name} has no specific rejection");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+            "{name} changed factual rows");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let committed = repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().unwrap();
+    assert_eq!(committed.instance.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed);
+    assert!(repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().is_none());
+}
+
+#[test]
+fn called_pending_send_rejects_foreign_child_source_before_actual_parent_return() {
+    use std::collections::BTreeMap;
+
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &super::send_receive_tests::receive_model());
+    let receiver = start_version(&fixture, &target);
+    let called = publish_model(&fixture,
+        &super::send_boundary_tests::timer_bound_send_model(
+            &target.definition_id, &receiver.instance_id));
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&called, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let (waiting_id, plan) = pending_send_plan(&fixture, &child_id, at_ms);
+    let admitted = plan.events.iter().position(|event|
+        event.kind == "send_task_admitted").unwrap();
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    let mut cases = Vec::new();
+    let mut wrong_source = plan.clone();
+    wrong_source.event_sources.insert(admitted, Uuid::new_v4().to_string());
+    cases.push(("foreign child source", wrong_source));
+    let mut wrong_token = plan.clone();
+    wrong_token.consume_token_ids[0] = Uuid::new_v4().to_string();
+    cases.push(("foreign child wait", wrong_token));
+    let mut missing_disarm = plan.clone();
+    missing_disarm.timer_updates.clear();
+    cases.push(("missing called child boundary closure", missing_disarm));
+    for (name, forged) in cases {
+        let error = repository::admit_pending_send(&fixture.db, &waiting_id, at_ms,
+            ProcessPlanInput::Supplied(&forged)).unwrap_err();
+        assert!(!format!("{error:#}").is_empty(), "{name} has no rejection");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+            "{name} changed factual rows");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let committed = repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().unwrap();
+    assert_eq!(committed.instance.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed);
+    assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+        &parent.instance_id, None).unwrap().status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed);
+    assert!(repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().is_none());
+}
+
+#[test]
+fn called_embedded_send_rejects_foreign_grandchild_facts_before_pinned_parent_return() {
+    use std::collections::BTreeMap;
+
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &super::send_receive_tests::receive_model());
+    let receiver = start_version(&fixture, &target);
+    let called = publish_model(&fixture,
+        &super::send_boundary_tests::called_embedded_send_model(
+            &target.definition_id, &receiver.instance_id, false));
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&called, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let (waiting_id, plan) = pending_send_plan(&fixture, &child_id, at_ms);
+    let child = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    let scope_id = child.tokens.iter().find(|token| token.token_id == waiting_id)
+        .unwrap().scope_id.clone();
+    assert_ne!(scope_id, child_id);
+    let admission = plan.events.iter().position(|event|
+        event.kind == "send_task_admitted").unwrap();
+    assert_eq!(plan.events[admission].scope_id, scope_id);
+    assert_eq!(plan.create_messages.len(), 1);
+    let mut cases = Vec::new();
+    let mut foreign_scope = plan.clone();
+    foreign_scope.events[admission].scope_id = child_id.clone();
+    cases.push(("parent scope substituted for grandchild", foreign_scope));
+    let mut foreign_outbox_scope = plan.clone();
+    foreign_outbox_scope.create_messages[0].source_scope_id = child_id.clone();
+    cases.push(("parent scope substituted for outbox source", foreign_outbox_scope));
+    let mut foreign_activation = plan.clone();
+    foreign_activation.event_sources.insert(admission, Uuid::new_v4().to_string());
+    cases.push(("foreign activation under valid Call", foreign_activation));
+    let mut foreign_wait = plan.clone();
+    foreign_wait.consume_token_ids[0] = Uuid::new_v4().to_string();
+    cases.push(("foreign nested pending wait", foreign_wait));
+    let mut missing_arm = plan.clone();
+    missing_arm.timer_updates.clear();
+    cases.push(("missing nested boundary closure", missing_arm));
+    let mut foreign_successor = plan.clone();
+    foreign_successor.create_tokens.iter_mut().find(|token| token.status == "ready")
+        .unwrap().scope_id = child_id.clone();
+    cases.push(("foreign successor scope", foreign_successor));
+    let mut wrong_outbox_source = plan.clone();
+    wrong_outbox_source.create_messages[0].source_activation_id = Uuid::new_v4().to_string();
+    cases.push(("foreign durable outbox source", wrong_outbox_source));
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (name, forged) in cases {
+        let error = repository::admit_pending_send(&fixture.db, &waiting_id, at_ms,
+            ProcessPlanInput::Supplied(&forged)).unwrap_err();
+        assert!(!format!("{error:#}").is_empty(), "{name} had no rejection reason");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+            "{name} changed factual Call, child scope or outbox rows");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let committed = repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().unwrap();
+    assert_eq!(committed.instance.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed);
+    assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+        &parent.instance_id, None).unwrap().status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed);
+    let events = repository::list_events(&reopened, &fixture.owner, &child_id, 0, 200).unwrap().0;
+    let admitted = events.iter().find(|event| event.kind == "send_task_admitted").unwrap();
+    assert_eq!(admitted.scope_id, scope_id);
+    let message_id = admitted.data["message_id"].as_str().unwrap();
+    assert_eq!(repository::get_message(&reopened, &fixture.owner,
+        &fixture.owner.user_id, message_id).unwrap().message.source_instance_id.as_deref(),
+        Some(child_id.as_str()));
+    let settled = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::admit_pending_send(&reopened, &waiting_id, at_ms,
+        ProcessPlanInput::Canonical).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), settled);
+}
+
+#[test]
+fn uncaught_called_embedded_error_end_requires_its_exact_terminal_scope_source() {
+    use std::collections::BTreeMap;
+    use tentaflow_protocol::processes::{
+        ProcessErrorDeclaration, ProcessInstanceStatus, ProcessNodeKind, ProcessMessageStatus,
+    };
+
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &super::send_receive_tests::receive_model());
+    let receiver = start_version(&fixture, &target);
+    let mut model = super::send_boundary_tests::called_embedded_send_model(
+        &target.definition_id, &receiver.instance_id, false);
+    let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes.iter_mut()
+        .find(|node| node.id == "InnerScope").unwrap().kind else { unreachable!() };
+    body.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+        ProcessNodeKind::ErrorEnd { error_ref: "Rejected".into() };
+    model.errors.push(ProcessErrorDeclaration {
+        error_id: "Rejected".into(), name: "Rejected".into(),
+        error_code: "REJECTED".into(),
+    });
+    let called = publish_model(&fixture, &model);
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&called, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let (waiting_id, plan) = pending_send_plan(&fixture, &child_id, at_ms);
+    let source_index = plan.events.iter().position(|event|
+        event.kind == "error_end_reached").unwrap();
+    let closure_index = plan.events.iter().position(|event|
+        event.kind == "scope_cancelled").unwrap();
+    let scope_id = plan.events[closure_index].scope_id.clone();
+    assert!(source_index < closure_index);
+    assert_eq!(plan.events[source_index].scope_id, scope_id);
+    assert_eq!(plan.events[closure_index].data["boundary_id"], "error_end");
+    assert_eq!(plan.scope_updates.iter().find(|update|
+        update.scope_id == scope_id).unwrap().status, ProcessInstanceStatus::Error);
+    assert_eq!(plan.terminal_error.as_ref(), plan.scope_terminal_errors.get(&scope_id));
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    let mut cases = Vec::new();
+    let mut foreign_source = plan.clone();
+    foreign_source.event_sources.insert(source_index, Uuid::new_v4().to_string());
+    cases.push(("foreign End activation", foreign_source));
+    let mut wrong_event_id = plan.clone();
+    wrong_event_id.event_ids.insert(source_index, Uuid::new_v4().to_string());
+    cases.push(("foreign ErrorEnd event", wrong_event_id));
+    let mut wrong_terminal_scope = plan.clone();
+    wrong_terminal_scope.terminal_error.as_mut().unwrap().source_scope_id = child_id.clone();
+    cases.push(("foreign terminal scope", wrong_terminal_scope));
+    let mut wrong_scope_fact = plan.clone();
+    wrong_scope_fact.scope_terminal_errors.get_mut(&scope_id).unwrap().source_event_id =
+        Uuid::new_v4().to_string();
+    cases.push(("foreign child terminal fact", wrong_scope_fact));
+    let mut wrong_source_node = plan.clone();
+    wrong_source_node.scope_terminal_errors.get_mut(&scope_id).unwrap().source_node_id =
+        "Send_1".into();
+    cases.push(("foreign terminal node", wrong_source_node));
+    let mut wrong_error_code = plan.clone();
+    wrong_error_code.events[source_index].data["error_code"] =
+        serde_json::json!("FOREIGN");
+    cases.push(("foreign pinned error code", wrong_error_code));
+    let mut wrong_closure = plan.clone();
+    wrong_closure.events[closure_index].data["boundary_id"] =
+        serde_json::json!("foreign boundary");
+    cases.push(("foreign closure cause", wrong_closure));
+    let mut wrong_parent = plan.clone();
+    wrong_parent.events[closure_index].data["parent_token_id"] =
+        serde_json::json!(Uuid::new_v4().to_string());
+    cases.push(("foreign embedded parent wait", wrong_parent));
+    let mut duplicate_closure = plan.clone();
+    duplicate_closure.events.push(plan.events[closure_index].clone());
+    cases.push(("duplicate scope closure", duplicate_closure));
+    let mut wrong_final_status = plan.clone();
+    wrong_final_status.scope_updates.iter_mut().find(|update|
+        update.scope_id == scope_id).unwrap().status = ProcessInstanceStatus::Cancelled;
+    cases.push(("terminal scope status substituted", wrong_final_status));
+    for (case, forged) in cases {
+        let rejected = repository::admit_pending_send(&fixture.db, &waiting_id,
+            at_ms, ProcessPlanInput::Supplied(&forged)).unwrap_err();
+        assert!(!format!("{rejected:#}").is_empty(), "{case} lacked a rejection reason");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+            "{case} changed durable process rows");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let committed = repository::admit_pending_send(&reopened, &waiting_id,
+        at_ms, ProcessPlanInput::Canonical).unwrap().unwrap();
+    assert_eq!(committed.instance.status, ProcessInstanceStatus::Error);
+    let parent_after = repository::get_instance(&reopened, &fixture.owner,
+        &parent.instance_id, None).unwrap();
+    assert_eq!(parent_after.status, ProcessInstanceStatus::Incident);
+    assert_eq!(parent_after.incidents[0].code, "CALL_CHILD_ERROR");
+    let history = repository::list_events(&reopened, &fixture.owner, &child_id, 0, 200)
+        .unwrap().0;
+    assert_eq!(history.iter().filter(|event| event.kind == "error_end_reached"
+        && event.scope_id == scope_id).count(), 1);
+    assert_eq!(history.iter().filter(|event| event.kind == "scope_cancelled"
+        && event.scope_id == scope_id).count(), 1);
+    let admitted = history.iter().find(|event|
+        event.kind == "send_task_admitted").unwrap();
+    let outbox_id = admitted.data["message_id"].as_str().unwrap();
+    assert_eq!(repository::get_message(&reopened, &fixture.owner,
+        &fixture.owner.user_id, outbox_id).unwrap().message.status,
+        ProcessMessageStatus::Pending);
+    let drained = super::messages::drain_pending(&reopened, at_ms + 1);
+    drained.completion.unwrap();
+    assert_eq!(drained.delivered, 1);
+    assert_eq!(repository::get_message(&reopened, &fixture.owner,
+        &fixture.owner.user_id, outbox_id).unwrap().message.status,
+        ProcessMessageStatus::Delivered);
+    assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+        &receiver.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+    let settled = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::admit_pending_send(&reopened, &waiting_id,
+        at_ms, ProcessPlanInput::Canonical).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), settled);
+}

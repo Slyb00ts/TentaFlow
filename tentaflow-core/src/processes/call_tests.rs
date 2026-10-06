@@ -1253,7 +1253,7 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
 }
 
 #[test]
-fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_pending_on_interrupt(
+fn completed_called_descendant_outbox_survives_normal_return_and_parent_interrupt(
 ) {
     use messages::test_support as support;
     for interrupt in [false, true] {
@@ -1339,6 +1339,17 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
         let before = repository::get_instance(&f.db, &f.owner, &source_id, None).unwrap();
         assert_eq!(before.status, ProcessInstanceStatus::Completed);
         assert_eq!(before.outgoing_messages.len(), 2);
+        let pending = before.outgoing_messages.iter().find(|message|
+            message.source_node_id.as_deref() == Some("ThrowPending")).unwrap();
+        let pending_id = pending.message_id.clone();
+        let pending_digest = pending.payload_sha256.clone();
+        let pending_bytes = pending.payload_bytes;
+        let source_fact = events(&f, &source_id).into_iter().find(|event|
+            event.kind == "message_queued" && event.data["message_id"] == pending_id).unwrap();
+        let source_event_id: String = f.db.read().unwrap().query_row(
+            "SELECT source_event_id FROM bpmn_messages WHERE message_id=?1",
+            [&pending_id], |row| row.get(0)).unwrap();
+        assert_eq!(source_event_id, source_fact.event_id);
         let drain = messages::drain_pending(&f.db, chrono::Utc::now().timestamp_millis());
         assert!(drain.completion.is_ok());
         assert_eq!(drain.delivered, 1);
@@ -1368,7 +1379,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
                 terminal
                     .outgoing_messages
                     .iter()
-                    .filter(|message| message.status == ProcessMessageStatus::Cancelled)
+                    .filter(|message| message.status == ProcessMessageStatus::Pending)
                     .count(),
                 1
             );
@@ -1386,6 +1397,14 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
                     .status,
                 ProcessInstanceStatus::Cancelled
             );
+            let retained = terminal.outgoing_messages.iter().find(|message|
+                message.message_id == pending_id).unwrap();
+            assert_eq!(retained.last_reason, None);
+            assert_eq!(retained.payload_sha256, pending_digest);
+            assert_eq!(retained.payload_bytes, pending_bytes);
+            assert_eq!(events(&f, &source_id).iter().filter(|event|
+                event.kind == "message_cancelled"
+                    && event.data["message_id"] == pending_id).count(), 0);
         } else {
             complete(&f, &f.owner, &middle_id, json!({}));
             assert_eq!(
@@ -1402,22 +1421,52 @@ fn completed_called_descendant_outbox_survives_normal_return_and_retracts_only_p
             &receiver.instance_id,
             &waiting.user_tasks[0].user_task_id,
         );
-        let drain = messages::drain_pending(&f.db, chrono::Utc::now().timestamp_millis() + 2_000);
+        let reopened = crate::db::init(&f.directory.path().join("processes.db")).unwrap();
+        let still_pending = repository::get_message(&reopened, &f.owner,
+            &f.owner.user_id, &pending_id).unwrap().message;
+        assert_eq!(still_pending.status, ProcessMessageStatus::Pending);
+        assert_eq!(still_pending.payload_sha256, pending_digest);
+        assert_eq!(still_pending.payload_bytes, pending_bytes);
+        assert_eq!(still_pending.target, pending.target);
+        assert_eq!(still_pending.message_name, pending.message_name);
+        assert_eq!(still_pending.correlation_key, pending.correlation_key);
+        let pending_budget: (i64, i64) = reopened.read().unwrap().query_row(
+            "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+             WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+            [&f.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(pending_budget, (1, i64::from(pending_bytes)));
+        let drain = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis() + 2_000);
         assert!(drain.completion.is_ok());
-        assert_eq!(drain.delivered, u32::from(!interrupt));
+        assert_eq!(drain.delivered, 1);
         let receiver_after =
-            repository::get_instance(&f.db, &f.owner, &receiver.instance_id, None).unwrap();
-        assert_eq!(
-            receiver_after.status,
-            if interrupt {
-                ProcessInstanceStatus::Waiting
-            } else {
-                ProcessInstanceStatus::Completed
-            }
-        );
-        if !interrupt {
-            assert_eq!(receiver_after.variables["received"]["real"], 42);
-        }
+            repository::get_instance(&reopened, &f.owner, &receiver.instance_id, None).unwrap();
+        assert_eq!(receiver_after.status, ProcessInstanceStatus::Completed);
+        assert_eq!(receiver_after.variables["received"]["real"], 42);
+        let receipt = repository::get_message(&reopened, &f.owner,
+            &f.owner.user_id, &pending_id).unwrap().message;
+        assert_eq!(receipt.status, ProcessMessageStatus::Delivered);
+        assert_eq!(receipt.matched_instance_id.as_deref(), Some(receiver.instance_id.as_str()));
+        assert_eq!(receipt.payload_sha256, pending_digest);
+        assert_eq!(receipt.payload_bytes, pending_bytes);
+        assert_eq!(receipt.target, pending.target);
+        assert_eq!(receipt.message_name, pending.message_name);
+        assert_eq!(receipt.correlation_key, pending.correlation_key);
+        let cleared_budget: (i64, i64) = reopened.read().unwrap().query_row(
+            "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+             WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+            [&f.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(cleared_budget, (0, 0));
+        let source_history = repository::list_events(&reopened, &f.owner,
+            &source_id, 0, 100).unwrap().0;
+        assert_eq!(source_history.iter().filter(|event| event.kind == "message_queued"
+            && event.event_id == source_event_id).count(), 1);
+        assert_eq!(source_history.iter().filter(|event| event.kind == "message_delivered"
+            && event.data["message_id"] == pending_id).count(), 1);
+        assert_eq!(source_history.iter().filter(|event| event.kind == "message_cancelled"
+            && event.data["message_id"] == pending_id).count(), 0);
+        let second = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis() + 2_001);
+        second.completion.unwrap();
+        assert_eq!(second.delivered, 0);
     }
 }
 

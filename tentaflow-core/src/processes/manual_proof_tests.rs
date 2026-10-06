@@ -107,3 +107,202 @@ fn ordinary_manual_acknowledgment_rejects_forged_facts_with_full_rollback() {
 fn terminating_manual_acknowledgment_rejects_forged_facts_with_full_rollback() {
     assert_forged_acknowledgments_roll_back(true);
 }
+
+#[test]
+fn manual_acknowledgment_disarms_only_its_factual_boundary_before_commit() {
+    let fixture = Fixture::new();
+    let model = super::manual_tests::manual_boundary_model(false, true);
+    let (instance_id, _, _) = start_manual(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+    let task = snapshot.user_tasks.iter().find(|task| task.kind == ProcessUserTaskKind::Manual).unwrap();
+    let timer = snapshot.timers.iter().find(|timer| timer.node_id == "ManualTimer").unwrap();
+    let command = stamp("manual boundary proof");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
+        &fixture.owner.user_id, at_ms,
+        manual_entry(&snapshot, &task.user_task_id, &command), None).unwrap();
+    assert!(plan.timer_updates.iter().any(|update| update.timer_id == timer.timer_id));
+    let cancellation = plan.events.iter().position(|event|
+        event.kind == "timer_cancelled" && event.data["timer_id"] == timer.timer_id).unwrap();
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("omitted disarm", {
+            let mut plan = plan.clone();
+            plan.timer_updates.clear();
+            plan
+        }),
+        ("foreign timer", {
+            let mut plan = plan.clone();
+            plan.events[cancellation].data["timer_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("foreign attached token", {
+            let mut plan = plan.clone();
+            plan.events[cancellation].data["attached_token_id"] =
+                json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("missing cancellation event", {
+            let mut plan = plan.clone();
+            plan.events.remove(cancellation);
+            plan
+        }),
+        ("wrong acknowledged task", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "manual_task_acknowledged")
+                .unwrap().data["user_task_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+    ] {
+        assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+            &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before, "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::acknowledge_manual_task(&reopened, &fixture.owner,
+        &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    repository::acknowledge_manual_task(&reopened, &fixture.owner,
+        &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+}
+
+#[test]
+fn interrupting_manual_timer_requires_exact_wait_cancellation_and_source() {
+    let fixture = Fixture::new();
+    let model = super::manual_tests::manual_boundary_model(false, true);
+    let (instance_id, _, _) = start_manual(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+    let task = snapshot.user_tasks.iter().find(|task| task.kind == ProcessUserTaskKind::Manual).unwrap();
+    let timer = snapshot.timers.iter().find(|timer| timer.node_id == "ManualTimer").unwrap();
+    let at_ms = timer.due_at_ms.unwrap() + 1;
+    let candidate = repository::due_timers(&fixture.db, at_ms, 32).unwrap().into_iter()
+        .find(|row| row.timer_id == timer.timer_id).unwrap();
+    let selected = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+    let plan = super::timers::plan_timer_fire(&selected, at_ms, None).unwrap();
+    assert!(plan.cancel_user_task_ids.contains(&task.user_task_id));
+    let fired = plan.events.iter().position(|event| event.kind == "timer_fired").unwrap();
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("missing Manual cancellation", {
+            let mut plan = plan.clone();
+            plan.cancel_user_task_ids.clear();
+            plan
+        }),
+        ("foreign Manual cancellation", {
+            let mut plan = plan.clone();
+            plan.cancel_user_task_ids[0] = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("wrong timer fact", {
+            let mut plan = plan.clone();
+            plan.events[fired].data["timer_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("wrong attached scope", {
+            let mut plan = plan.clone();
+            plan.events[fired].scope_id = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("foreign source activation", {
+            let mut plan = plan.clone();
+            plan.event_sources.insert(fired, Uuid::new_v4().to_string());
+            plan
+        }),
+        ("extra Manual acknowledgment", {
+            let mut plan = plan.clone();
+            plan.complete_user_task_ids.push(task.user_task_id.clone());
+            plan
+        }),
+    ] {
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&forged),
+            at_ms).is_err(), "{case}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before, "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::fire_timer(&reopened, &candidate, &fixture.owner,
+        Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&plan),
+        at_ms).unwrap().unwrap();
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::fire_timer(&reopened, &candidate, &fixture.owner,
+        Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&plan),
+        at_ms).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+}
+
+#[test]
+fn interrupting_manual_message_requires_exact_accepted_envelope_and_wait() {
+    use super::messages::{self, test_support::{catch_target, envelope, send}};
+    use super::repository::MessageSelection;
+
+    let fixture = Fixture::new();
+    let model = super::manual_tests::manual_boundary_model(true, true);
+    let (instance_id, version, _) = start_manual(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+    let task = snapshot.user_tasks.iter().find(|task| task.kind == ProcessUserTaskKind::Manual).unwrap();
+    let boundary = snapshot.subscriptions.iter().find(|sub|
+        sub.node_id == "ManualMessage").unwrap();
+    let envelope = envelope(catch_target(&version, Some(&instance_id),
+        Some(&boundary.subscription_id)), json!({"physical":true}));
+    let sent = send(&fixture, &envelope);
+    let at_ms = sent.received_at_ms;
+    let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap().into_iter()
+        .find(|row| row.key.message_id == envelope.message_id).unwrap();
+    let MessageSelection::Ready(prepared) =
+        repository::message_snapshot(&fixture.db, &candidate).unwrap()
+        else { panic!("the actual Manual boundary must be selected") };
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    assert!(plan.cancel_user_task_ids.contains(&task.user_task_id));
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("omitted Manual cancellation", {
+            let mut plan = plan.clone();
+            plan.cancel_user_task_ids.clear();
+            plan
+        }),
+        ("wrong cancelled task", {
+            let mut plan = plan.clone();
+            plan.cancel_user_task_ids[0] = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("wrong envelope UUID", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "message_delivered")
+                .unwrap().data["message_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("wrong selected scope", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "message_delivered")
+                .unwrap().scope_id = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("foreign accepted source", {
+            let mut plan = plan.clone();
+            let index = plan.events.iter().position(|event|
+                event.kind == "message_delivered").unwrap();
+            plan.event_sources.insert(index, Uuid::new_v4().to_string());
+            plan
+        }),
+        ("fabricated Manual acknowledgment", {
+            let mut plan = plan.clone();
+            plan.complete_user_task_ids.push(task.user_task_id.clone());
+            plan
+        }),
+    ] {
+        assert!(repository::deliver_message(&fixture.db, &prepared,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before, "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::deliver_message(&reopened, &prepared,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::deliver_message(&reopened, &prepared,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+}

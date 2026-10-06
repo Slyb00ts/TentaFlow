@@ -290,3 +290,279 @@ fn owner_cancel_closes_manual_wait_and_denies_late_acknowledgment() {
         &instance_id, &task.user_task_id).unwrap();
     assert_eq!(detail.status, ProcessUserTaskStatus::Cancelled);
 }
+
+pub(super) fn manual_boundary_model(message: bool, interrupt: bool) -> ProcessModel {
+    let mut model = manual_model(None, false);
+    let (id, kind) = if message {
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "EvidenceReady".into(),
+        });
+        ("ManualMessage", ProcessNodeKind::BoundaryMessage {
+            attached_to_id: "Manual".into(), cancel_activity: interrupt,
+            message_ref: "Message_1".into(), correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::new(),
+        })
+    } else {
+        model.timer_timezone = Some("UTC".into());
+        ("ManualTimer", ProcessNodeKind::BoundaryTimer {
+            attached_to_id: "Manual".into(), cancel_activity: interrupt,
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 1 },
+        })
+    };
+    model.nodes.push(ProcessNode { id: id.into(), name: "Manual boundary".into(),
+        kind, repeat: None });
+    model.nodes.push(ProcessNode { id: "BoundaryEnd".into(), name: "Boundary end".into(),
+        kind: ProcessNodeKind::End, repeat: None });
+    model.sequence_flows.push(edge("BoundaryFlow", id, "BoundaryEnd"));
+    model
+}
+
+#[test]
+fn manual_timer_boundary_and_acknowledgment_keep_exact_winner_and_null_output() {
+    for (interrupt, timer_first) in [(true,false),(true,true),(false,true)] {
+        let fixture = Fixture::new();
+        let model = manual_boundary_model(false, interrupt);
+        let (instance_id, _, _) = start_manual(&fixture, &model);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+        let task = snapshot.user_tasks.iter().find(|task|
+            task.kind == ProcessUserTaskKind::Manual).unwrap();
+        let timer = snapshot.timers.iter().find(|timer|
+            timer.node_id == "ManualTimer").unwrap();
+        let due = timer.due_at_ms.unwrap();
+        let command = stamp("manual timer acknowledgment");
+        if timer_first {
+            let drained = super::timers::drain_due(&fixture.db, due + 1);
+            drained.completion.unwrap();
+            assert_eq!(drained.fired, 1);
+            let after = repository::get_instance(&fixture.db, &fixture.owner,
+                &instance_id, None).unwrap();
+            let task_after = after.user_tasks.iter().find(|row|
+                row.user_task_id == task.user_task_id).unwrap();
+            assert_eq!(task_after.status, if interrupt {
+                ProcessUserTaskStatus::Cancelled
+            } else { ProcessUserTaskStatus::Open });
+            let task_detail = repository::get_user_task(&fixture.db, &fixture.owner,
+                &instance_id, &task.user_task_id).unwrap();
+            assert_eq!(task_detail.outputs, Value::Null);
+            if interrupt {
+                assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                    &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+                    repository::ProcessPlanInput::Canonical, due + 2).is_err());
+            } else {
+                let current = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                    &instance_id).unwrap();
+                repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                    &command, &instance_id, &task.user_task_id, current.instance.revision,
+                    repository::ProcessPlanInput::Canonical, due + 2).unwrap();
+            }
+        } else {
+            repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+                repository::ProcessPlanInput::Canonical, due).unwrap();
+            let drained = super::timers::drain_due(&fixture.db, due + 1);
+            drained.completion.unwrap();
+            assert_eq!(drained.fired, 0);
+        }
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let events = repository::list_events(&reopened, &fixture.owner, &instance_id, 0, 200)
+            .unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "manual_task_acknowledged")
+            .count(), usize::from(!interrupt || !timer_first));
+        assert_eq!(events.iter().filter(|event| event.kind == "timer_fired")
+            .count(), usize::from(timer_first));
+        assert_eq!(reopened.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1", [&instance_id],
+            |row| row.get::<_,i64>(0)).unwrap(), 0);
+    }
+}
+
+#[test]
+fn manual_message_boundary_wins_or_leaves_the_real_acknowledgment_open() {
+    use super::messages::test_support::{catch_target,envelope,send};
+
+    for interrupt in [true,false] {
+        let fixture = Fixture::new();
+        let model = manual_boundary_model(true, interrupt);
+        let (instance_id, version, _) = start_manual(&fixture, &model);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+        let task = snapshot.user_tasks.iter().find(|task|
+            task.kind == ProcessUserTaskKind::Manual).unwrap();
+        let sub = snapshot.subscriptions.iter().find(|sub|
+            sub.node_id == "ManualMessage").unwrap();
+        let message = envelope(catch_target(&version, Some(&instance_id),
+            Some(&sub.subscription_id)), json!(null));
+        send(&fixture, &message);
+        let drained = super::messages::drain_pending(&fixture.db,
+            chrono::Utc::now().timestamp_millis());
+        drained.completion.unwrap();
+        assert_eq!(drained.delivered, 1);
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+        let actual_task = after.user_tasks.iter().find(|row|
+            row.user_task_id == task.user_task_id).unwrap();
+        assert_eq!(actual_task.status, if interrupt {
+            ProcessUserTaskStatus::Cancelled
+        } else { ProcessUserTaskStatus::Open });
+        assert_eq!(actual_task.outputs, Value::Null);
+        let command = stamp("manual after boundary message");
+        if interrupt {
+            assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                &command, &instance_id, &task.user_task_id, after.instance.revision,
+                repository::ProcessPlanInput::Canonical,
+                chrono::Utc::now().timestamp_millis()).is_err());
+        } else {
+            repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                &command, &instance_id, &task.user_task_id, after.instance.revision,
+                repository::ProcessPlanInput::Canonical,
+                chrono::Utc::now().timestamp_millis()).unwrap();
+        }
+        let events = repository::list_events(&fixture.db, &fixture.owner,
+            &instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "manual_task_acknowledged")
+            .count(), usize::from(!interrupt));
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+            &instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+    }
+}
+
+#[test]
+fn manual_acknowledgment_first_cancels_its_message_boundary_without_a_fake_delivery() {
+    let fixture = Fixture::new();
+    let model = manual_boundary_model(true, true);
+    let (instance_id, _, _) = start_manual(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+    let task = snapshot.user_tasks.iter().find(|row|
+        row.kind == ProcessUserTaskKind::Manual).unwrap();
+    let boundary = snapshot.subscriptions.iter().find(|row|
+        row.node_id == "ManualMessage").unwrap();
+    let command = stamp("Manual wins Message boundary");
+    repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+        &command, &instance_id, &task.user_task_id, snapshot.instance.revision,
+        repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis()).unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(after.subscriptions.iter().find(|row|
+        row.subscription_id == boundary.subscription_id).unwrap().status,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled);
+    let events = repository::list_events(&reopened, &fixture.owner, &instance_id,
+        0, 200).unwrap().0;
+    assert_eq!(events.iter().filter(|event|
+        event.kind == "manual_task_acknowledged").count(), 1);
+    assert_eq!(events.iter().filter(|event|
+        event.kind == "message_delivered").count(), 0);
+}
+
+#[test]
+fn embedded_and_called_manual_timer_winners_close_only_the_factual_child_wait() {
+    use super::messages::test_support::start_version;
+
+    for called in [false,true] {
+        for timer_first in [false,true] {
+            let fixture = Fixture::new();
+            let model = embedded_model(manual_boundary_model(false, true), "InnerScope");
+            let version = publish_model(&fixture, &model);
+            let parent = if called {
+                let caller = publish_model(&fixture,
+                    &super::call_tests::caller(&version, BTreeMap::new()));
+                start_version(&fixture, &caller)
+            } else { start_version(&fixture, &version) };
+            let child_id = if called {
+                super::call_tests::child_id(&fixture, &parent.instance_id)
+            } else { parent.instance_id.clone() };
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &child_id).unwrap();
+            if called {
+                let original = repository::get_definition(&fixture.db, &fixture.owner,
+                    &version.definition_id).unwrap().0;
+                let mut newer = version.model.clone();
+                newer.nodes.iter_mut().find(|node| node.id == "InnerScope").unwrap().name =
+                    "Later Manual body".into();
+                let draft = repository::save_definition(&fixture.db, &fixture.owner,
+                    &stamp("change Manual child version"), Some(&version.definition_id),
+                    original.draft_revision, "Manual child", "", &newer).unwrap();
+                let latest = repository::publish_definition(&fixture.db, &fixture.owner,
+                    &stamp("publish Manual child version"), &version.definition_id,
+                    draft.draft_revision, &[], None).unwrap().1;
+                assert!(latest.version > version.version);
+                assert_eq!(snapshot.instance.version, version.version);
+            }
+            let task = snapshot.user_tasks.iter().find(|task|
+                task.kind == ProcessUserTaskKind::Manual).unwrap();
+            let timer = snapshot.timers.iter().find(|timer|
+                timer.node_id == "ManualTimer").unwrap();
+            assert_ne!(task.scope_id, child_id);
+            assert_eq!(timer.scope_id.as_deref(), Some(task.scope_id.as_str()));
+            let command = stamp("nested manual timer winner");
+            if timer_first {
+                let drained = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                drained.completion.unwrap();
+                assert_eq!(drained.fired, 1);
+                let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                    &child_id).unwrap();
+                assert_eq!(after.user_tasks.iter().find(|row|
+                    row.user_task_id == task.user_task_id).unwrap().status,
+                    ProcessUserTaskStatus::Cancelled);
+            } else {
+                repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                    &command, &child_id, &task.user_task_id, snapshot.instance.revision,
+                    repository::ProcessPlanInput::Canonical,
+                    chrono::Utc::now().timestamp_millis()).unwrap();
+                let drained = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                drained.completion.unwrap();
+                assert_eq!(drained.fired, 0);
+            }
+            let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+            assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+                &parent.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+            let events = repository::list_events(&reopened, &fixture.owner,
+                &child_id, 0, 200).unwrap().0;
+            assert_eq!(events.iter().filter(|event| event.kind == "manual_task_acknowledged"
+                && event.scope_id == task.scope_id).count(), usize::from(!timer_first));
+            assert_eq!(events.iter().filter(|event| event.kind == "timer_fired"
+                && event.scope_id == task.scope_id).count(), usize::from(timer_first));
+        }
+    }
+}
+
+#[test]
+fn parent_cancel_fences_called_embedded_manual_and_its_boundary_resources() {
+    use super::messages::test_support::start_version;
+
+    let fixture = Fixture::new();
+    let child_version = publish_model(&fixture,
+        &embedded_model(manual_boundary_model(true, true), "InnerScope"));
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&child_version, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let child = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    let task = child.user_tasks.iter().find(|row|
+        row.kind == ProcessUserTaskKind::Manual).unwrap();
+    let boundary = child.subscriptions.iter().find(|row|
+        row.node_id == "ManualMessage").unwrap();
+    let parent_before = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &parent.instance_id).unwrap();
+    repository::cancel_instance(&fixture.db, &fixture.owner, &stamp("cancel parent Manual"),
+        &parent.instance_id, parent_before.instance.revision).unwrap();
+    let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Cancelled);
+    assert_eq!(after.user_tasks.iter().find(|row|
+        row.user_task_id == task.user_task_id).unwrap().status,
+        ProcessUserTaskStatus::Cancelled);
+    assert_eq!(after.subscriptions.iter().find(|row|
+        row.subscription_id == boundary.subscription_id).unwrap().status,
+        tentaflow_protocol::processes::ProcessSubscriptionStatus::Cancelled);
+    let before_late = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+        &stamp("late child Manual"), &child_id, &task.user_task_id, child.instance.revision,
+        repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis()).is_err());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before_late);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+        &child_id, None).unwrap().status, ProcessInstanceStatus::Cancelled);
+}

@@ -2494,7 +2494,9 @@ impl<'a> Transition<'a> {
                 status: "waiting".into(),
             }, Some(&token.token_id));
             match &child.kind {
-                ProcessNodeKind::MessageCatch { .. } => {
+                ProcessNodeKind::MessageCatch { .. }
+                | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::SignalCatch { .. } => {
                     self.arm_subscription(&child, &waiting, Some(id.clone()))?
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
@@ -2869,6 +2871,7 @@ impl<'a> Transition<'a> {
                     self.user_task(&node, ProcessUserTaskKind::Manual,
                         assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
                         Value::Null, &token_id);
+                    self.arm_boundaries(&node, &token_id)?;
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
                     let token_id = self.wait(&token, "waiting");
@@ -2878,6 +2881,9 @@ impl<'a> Transition<'a> {
                 | ProcessNodeKind::SignalCatch { .. } => {
                     let waiting = self.wait(&token, "waiting");
                     self.arm_subscription(&node, &waiting, None)?;
+                    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                        self.arm_boundaries(&node, &waiting)?;
+                    }
                 }
                 ProcessNodeKind::SendTask { .. } if self.body()?.0.iter().any(|boundary| match &boundary.kind {
                     ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
@@ -4614,6 +4620,8 @@ pub(super) fn plan_message_catch(
     if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
         transition.event("receive_task_completed", Some(node.id.clone()),
             json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":message_id}));
+        transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+        transition.resolve_boundary_incidents(&token.token_id);
     }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
@@ -4660,6 +4668,9 @@ pub(super) fn plan_signal_catch(
     }
     transition.settle_subscription(subscription,
         tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed, None);
+    if let Some(race_id) = &subscription.race_id {
+        transition.win_race(race_id, &node.id, Some(&subscription.subscription_id), None)?;
+    }
     transition.consume(&token.token_id);
     transition.event("signal_received", Some(node.id.clone()), json!({
         "signal_id":signal_id,"subscription_id":subscription.subscription_id,
@@ -6451,11 +6462,40 @@ mod tests {
         };
         let before = rows();
         let mut missing_event = valid.clone();
-        missing_event.events.retain(|event| event.kind != "inclusive_joined");
+        let join_index = missing_event.events.iter().position(|event|
+            event.kind == "inclusive_joined").unwrap();
+        missing_event.events.remove(join_index);
+        missing_event.event_ids = valid.event_ids.iter().filter_map(|(index, id)|
+            (*index != join_index).then(||
+                (if *index > join_index { *index - 1 } else { *index }, id.clone()))).collect();
+        missing_event.event_sources = valid.event_sources.iter().filter_map(|(index, source)|
+            (*index != join_index).then(||
+                (if *index > join_index { *index - 1 } else { *index }, source.clone()))).collect();
+        for effect in &mut missing_event.variable_effects {
+            let event_index = match effect {
+                repository::VariableEffect::Mapped { event_index, .. }
+                | repository::VariableEffect::ScopeEntry { event_index, .. }
+                | repository::VariableEffect::RepetitionEntry { event_index, .. }
+                | repository::VariableEffect::RepetitionAggregate { event_index, .. } => event_index,
+            };
+            if *event_index > join_index {
+                *event_index -= 1;
+            }
+        }
+        for attempt in &mut missing_event.termination_attempts {
+            let source_event_index = match attempt {
+                repository::TerminationAttempt::Success(source) => &mut source.source_event_index,
+                repository::TerminationAttempt::ReturnFailure(failure) => &mut failure.source_event_index,
+            };
+            assert_ne!(*source_event_index, join_index);
+            if *source_event_index > join_index {
+                *source_event_index -= 1;
+            }
+        }
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("singleton omitted join event"), &waiting.instance_id, &task.user_task_id,
+            &command, &waiting.instance_id, &task.user_task_id,
             waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&missing_event), at_ms).err().unwrap();
-        assert!(format!("{error:#}").contains("gateway activation disappeared"));
+        assert!(format!("{error:#}").contains("gateway activation disappeared"), "{error:#}");
         assert_eq!(rows(), before);
         let mut missing_arrival = missing_event.clone();
         let joining = missing_arrival.create_tokens.iter().find(|token| token.status == "joining")
@@ -6463,10 +6503,10 @@ mod tests {
         missing_arrival.create_tokens.retain(|token| token.token_id != joining);
         missing_arrival.consume_token_ids.retain(|id| id != &joining);
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("singleton omitted join arrival and event"), &waiting.instance_id,
+            &command, &waiting.instance_id,
             &task.user_task_id, waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&missing_arrival), at_ms)
             .err().unwrap();
-        assert!(format!("{error:#}").contains("gateway activation disappeared"));
+        assert!(format!("{error:#}").contains("gateway activation disappeared"), "{error:#}");
         assert_eq!(rows(), before);
         let mut changed_replacement = valid.clone();
         let replacement = changed_replacement.create_tokens.iter_mut()
@@ -6476,10 +6516,10 @@ mod tests {
         let replacement_id = replacement.token_id.clone();
         changed_replacement.consume_token_ids.retain(|id| id != &replacement_id);
         let error = repository::complete_user_task(&fixture.db, &fixture.owner,
-            &stamp("singleton changed replacement selection"), &waiting.instance_id,
+            &command, &waiting.instance_id,
             &task.user_task_id, waiting.revision, &Value::Null, None, repository::ProcessPlanInput::Supplied(&changed_replacement),
             at_ms).err().unwrap();
-        assert!(format!("{error:#}").contains("planned gateway frame changed"));
+        assert!(format!("{error:#}").contains("planned gateway frame changed"), "{error:#}");
         assert_eq!(rows(), before);
         let completed = repository::complete_user_task(&fixture.db, &fixture.owner,
             &command, &waiting.instance_id, &task.user_task_id, waiting.revision,

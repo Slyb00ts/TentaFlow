@@ -77,6 +77,29 @@ pub(super) fn signal_throw_model() -> tentaflow_protocol::processes::ProcessMode
     model
 }
 
+pub(super) fn signal_timer_race_model() -> ProcessModel {
+    let mut model = signal_catch_model();
+    model.timer_timezone = Some("UTC".into());
+    model.nodes.push(ProcessNode {
+        id: "Race_1".into(), name: "First event".into(),
+        kind: ProcessNodeKind::EventBasedGateway, repeat: None,
+    });
+    model.nodes.push(ProcessNode {
+        id: "Timer_1".into(), name: "Deadline".into(),
+        kind: ProcessNodeKind::TimerCatch {
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 2 },
+        }, repeat: None,
+    });
+    model.sequence_flows = vec![
+        edge("ToRace", "Start_1", "Race_1"),
+        edge("ToSignal", "Race_1", "Catch_1"),
+        edge("ToTimer", "Race_1", "Timer_1"),
+        edge("SignalEnd", "Catch_1", "End_1"),
+        edge("TimerEnd", "Timer_1", "End_1"),
+    ];
+    model
+}
+
 pub(super) fn parallel_signal_catches(
     branches: usize,
 ) -> tentaflow_protocol::processes::ProcessModel {
@@ -2099,4 +2122,507 @@ fn signal_delivered_receipt_and_source_history_survive_payload_pruning_and_repla
         .collect();
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].data["source_event_id"], source_event_id);
+}
+
+#[test]
+fn signal_and_timer_direct_race_each_winner_settles_one_factual_receipt() {
+    for called in [false, true] {
+        for signal_first in [false, true] {
+            let fixture = Fixture::new();
+            let child_version = publish_model(&fixture,
+                &super::runtime::test_support::embedded_model(
+                    signal_timer_race_model(), "InnerScope"));
+            let parent = if called {
+                let caller = publish_model(&fixture,
+                    &super::call_tests::caller(&child_version, BTreeMap::new()));
+                start_version(&fixture, &caller)
+            } else { start_version(&fixture, &child_version) };
+            let child_id = if called {
+                super::call_tests::child_id(&fixture, &parent.instance_id)
+            } else { parent.instance_id.clone() };
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &child_id).unwrap();
+            let catch = snapshot.subscriptions.iter().find(|row|
+                row.kind == ProcessSubscriptionKind::SignalCatch).unwrap();
+            let timer = snapshot.timers.iter().find(|row| row.node_id == "Timer_1").unwrap();
+            if called {
+                let original = repository::get_definition(&fixture.db, &fixture.owner,
+                    &child_version.definition_id).unwrap().0;
+                let mut newer = child_version.model.clone();
+                newer.nodes.iter_mut().find(|node| node.id == "InnerScope").unwrap().name =
+                    "Later signal race child".into();
+                let draft = repository::save_definition(&fixture.db, &fixture.owner,
+                    &stamp("change signal race child"), Some(&child_version.definition_id),
+                    original.draft_revision, "Signal race child", "", &newer).unwrap();
+                let latest = repository::publish_definition(&fixture.db, &fixture.owner,
+                    &stamp("publish signal race child"), &child_version.definition_id,
+                    draft.draft_revision, &[], None).unwrap().1;
+                assert!(latest.version > child_version.version);
+                assert_eq!(snapshot.instance.version, child_version.version);
+            }
+            let race = snapshot.event_races.iter().find(|row|
+                Some(row.race_id.as_str()) == catch.race_id.as_deref()).unwrap();
+            assert_eq!(timer.race_id.as_deref(), Some(race.race_id.as_str()));
+            assert_eq!(catch.scope_id, race.scope_id);
+            let emitter = publish_model(&fixture, &signal_throw_model());
+            let sender = start_version(&fixture, &emitter);
+            assert_eq!(sender.status, ProcessInstanceStatus::Completed);
+            if signal_first {
+                let delivered = messages::drain_pending(&fixture.db,
+                    chrono::Utc::now().timestamp_millis() + 1);
+                delivered.completion.unwrap();
+                assert_eq!(delivered.delivered, 1);
+                let stale = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                stale.completion.unwrap();
+                assert_eq!(stale.fired, 0);
+            } else {
+                let fired = super::timers::drain_due(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                fired.completion.unwrap();
+                assert_eq!(fired.fired, 1);
+                let stale = messages::drain_pending(&fixture.db,
+                    timer.due_at_ms.unwrap() + 1);
+                stale.completion.unwrap();
+                assert_eq!(stale.delivered, 0);
+            }
+            let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+            let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+                &child_id).unwrap();
+            assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+            assert_eq!(after.subscriptions.iter().find(|row|
+                row.subscription_id == catch.subscription_id).unwrap().status,
+                if signal_first { ProcessSubscriptionStatus::Consumed }
+                else { ProcessSubscriptionStatus::Cancelled });
+            assert_eq!(after.event_races.iter().find(|row|
+                row.race_id == race.race_id).unwrap().status,
+                tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+            let events = repository::list_events(&reopened, &fixture.owner,
+                &child_id, 0, 200).unwrap().0;
+            assert_eq!(events.iter().filter(|event| event.kind == "event_race_won"
+                && event.scope_id == race.scope_id).count(), 1);
+            assert_eq!(events.iter().filter(|event| event.kind == "signal_received")
+                .count(), usize::from(signal_first));
+            assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+                &parent.instance_id, None).unwrap().status, ProcessInstanceStatus::Completed);
+            let repeat = messages::drain_pending(&reopened,
+                timer.due_at_ms.unwrap() + 2);
+            repeat.completion.unwrap();
+            assert_eq!(repeat.delivered, 0);
+        }
+    }
+}
+
+#[test]
+fn one_emission_to_two_signal_race_alternatives_has_one_winner_and_two_receipt_fates() {
+    let fixture = Fixture::new();
+    let mut model = signal_timer_race_model();
+    let second = model.nodes.iter_mut().find(|node| node.id == "Timer_1").unwrap();
+    second.id = "Catch_2".into();
+    second.name = "Other signal alternative".into();
+    second.kind = ProcessNodeKind::SignalCatch {
+        signal_ref: "Signal_1".into(), output_mapping: BTreeMap::new(),
+    };
+    for edge in &mut model.sequence_flows {
+        if edge.target_id == "Timer_1" { edge.target_id = "Catch_2".into(); }
+        if edge.source_id == "Timer_1" { edge.source_id = "Catch_2".into(); }
+    }
+    model.timer_timezone = None;
+    let version = publish_model(&fixture, &model);
+    let receiver = start_version(&fixture, &version);
+    let before = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    let branches = before.subscriptions.iter().filter(|row|
+        row.kind == ProcessSubscriptionKind::SignalCatch).collect::<Vec<_>>();
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0].race_id, branches[1].race_id);
+    let emitter = publish_model(&fixture, &signal_throw_model());
+    let sender = start_version(&fixture, &emitter);
+    assert_eq!(sender.status, ProcessInstanceStatus::Completed);
+    let admitted: i64 = fixture.db.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id WHERE e.source_instance_id=?1",
+        [&sender.instance_id], |row| row.get(0)).unwrap();
+    assert_eq!(admitted, 2);
+    let drained = messages::drain_pending(&fixture.db,
+        chrono::Utc::now().timestamp_millis() + 1);
+    drained.completion.unwrap();
+    assert_eq!(drained.delivered, 1);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(after.event_races.len(), 1);
+    assert_eq!(after.event_races[0].status,
+        tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+    assert_eq!(after.subscriptions.iter().filter(|row|
+        row.kind == ProcessSubscriptionKind::SignalCatch
+            && row.status == ProcessSubscriptionStatus::Consumed).count(), 1);
+    assert_eq!(after.subscriptions.iter().filter(|row|
+        row.kind == ProcessSubscriptionKind::SignalCatch
+            && row.status == ProcessSubscriptionStatus::Cancelled).count(), 1);
+    let (delivered, cancelled): (i64,i64) = reopened.read().unwrap().query_row(
+        "SELECT SUM(r.status='delivered'),SUM(r.status='cancelled') FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e ON e.signal_id=r.signal_id WHERE e.source_instance_id=?1", [&sender.instance_id],
+        |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((delivered,cancelled), (1,1));
+    let events = repository::list_events(&reopened, &fixture.owner,
+        &receiver.instance_id, 0, 200).unwrap().0;
+    assert_eq!(events.iter().filter(|event| event.kind == "signal_received").count(), 1);
+    assert_eq!(events.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+    let replay = messages::drain_pending(&reopened,
+        chrono::Utc::now().timestamp_millis() + 2);
+    replay.completion.unwrap();
+    assert_eq!(replay.delivered, 0);
+}
+
+#[test]
+fn direct_receive_and_signal_race_uses_only_the_first_fenced_source() {
+    use super::messages::test_support::{catch_target, envelope, send};
+    use super::repository::MessageSelection;
+    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::time::Duration;
+    struct ResumeOnDrop(Option<SyncSender<()>>);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() { let _ = tx.send(()); }
+        }
+    }
+
+    for signal_first in [false, true] {
+        let fixture = Fixture::new();
+        let mut model = signal_timer_race_model();
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "EvidenceReady".into(),
+        });
+        model.variables.insert("received_message".into(), serde_json::Value::Null);
+        let receive = model.nodes.iter_mut().find(|node| node.id == "Timer_1").unwrap();
+        receive.id = "Receive_2".into();
+        receive.name = "Other incoming evidence".into();
+        receive.kind = ProcessNodeKind::ReceiveTask {
+            message_ref: "Message_1".into(),
+            correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::from([("received_message".into(), "outputs".into())]),
+        };
+        for edge in &mut model.sequence_flows {
+            if edge.target_id == "Timer_1" { edge.target_id = "Receive_2".into(); }
+            if edge.source_id == "Timer_1" { edge.source_id = "Receive_2".into(); }
+        }
+        model.timer_timezone = None;
+        let version = publish_model(&fixture, &model);
+        let receiver = start_version(&fixture, &version);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        let signal = snapshot.subscriptions.iter().find(|row|
+            row.kind == ProcessSubscriptionKind::SignalCatch).unwrap();
+        let own = snapshot.subscriptions.iter().find(|row|
+            row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+        assert_eq!(signal.race_id, own.race_id);
+        let directed = envelope(catch_target(&version, Some(&receiver.instance_id),
+            Some(&own.subscription_id)), json!({"business_key":"message"}));
+        let sent = send(&fixture, &directed);
+        let emitter = publish_model(&fixture, &signal_throw_model());
+        let sender = start_version(&fixture, &emitter);
+        assert_eq!(sender.status, ProcessInstanceStatus::Completed);
+        let at_ms = chrono::Utc::now().timestamp_millis() + 10;
+        let receipt_id = repository::due_signal_receipts(&fixture.db, at_ms).unwrap()
+            .into_iter().next().unwrap();
+        let claim = repository::claim_signal_receipt(&fixture.db, &receipt_id, at_ms)
+            .unwrap().unwrap();
+        let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap()
+            .into_iter().find(|row| row.key.message_id == directed.message_id).unwrap();
+        let MessageSelection::Ready(prepared) =
+            repository::message_snapshot(&fixture.db, &candidate).unwrap()
+            else { panic!("the factual Receive alternative must be ready") };
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        let db = fixture.db.clone();
+        if signal_first {
+            std::thread::scope(|scope| {
+                let mut release = ResumeOnDrop(Some(resume_tx));
+                let worker = scope.spawn(move || {
+                    repository::RACE_DELIVERY_PREFLIGHT.with(|gate|
+                        *gate.borrow_mut() = Some((ready_tx, resume_rx)));
+                    repository::deliver_message(&db, &prepared,
+                        repository::ProcessPlanInput::Canonical, at_ms)
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let winner = repository::deliver_signal_receipt(&fixture.db, &claim,
+                    repository::ProcessPlanInput::Canonical, at_ms).unwrap();
+                let after_winner = super::signal_proof_tests::all_transition_rows(&fixture);
+                release.0.take().unwrap().send(()).unwrap();
+                assert!(winner.is_some());
+                let stale = worker.join().unwrap();
+                let error = stale.err().expect("closed Receive activation must reject stale delivery");
+                assert!(matches!(error.downcast_ref::<repository::MessageClosed>(),
+                    Some(repository::MessageClosed::Activation)), "{error:#}");
+                assert_eq!(error.to_string(), "activation_closed");
+                assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), after_winner);
+            });
+        } else {
+            use rusqlite::types::Value as SqlValue;
+            let stale_receipt_id = claim.receipt_id.clone();
+            let stale_signal_id = claim.signal_id.clone();
+            let stale_fence = claim.fence.clone();
+            let stale_revision = claim.revision;
+            std::thread::scope(|scope| {
+                let mut release = ResumeOnDrop(Some(resume_tx));
+                let worker = scope.spawn(move || {
+                    repository::RACE_DELIVERY_PREFLIGHT.with(|gate|
+                        *gate.borrow_mut() = Some((ready_tx, resume_rx)));
+                    repository::deliver_signal_receipt(&db, &claim,
+                        repository::ProcessPlanInput::Canonical, at_ms)
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let winner = repository::deliver_message(&fixture.db, &prepared,
+                    repository::ProcessPlanInput::Canonical, at_ms).unwrap();
+                let after_winner = super::signal_proof_tests::all_transition_rows(&fixture);
+                release.0.take().unwrap().send(()).unwrap();
+                assert!(winner.is_some());
+                assert!(worker.join().unwrap().unwrap().is_none());
+                let after_stale = super::signal_proof_tests::all_transition_rows(&fixture);
+                let mut expected = after_winner.clone();
+                let emission = expected[16].iter_mut().find(|row|
+                    row[0] == SqlValue::Text(stale_signal_id.clone())).unwrap();
+                assert_eq!(emission[18], SqlValue::Text("pending".into()));
+                assert_eq!(emission[19], SqlValue::Integer(1));
+                assert_eq!(emission[20], SqlValue::Null);
+                emission[18] = SqlValue::Text("settled".into());
+                emission[19] = SqlValue::Integer(2);
+                emission[20] = SqlValue::Integer(at_ms);
+                let receipt = expected[17].iter_mut().find(|row|
+                    row[0] == SqlValue::Text(stale_receipt_id.clone())).unwrap();
+                assert_eq!(receipt[1], SqlValue::Text(stale_signal_id));
+                assert_eq!(receipt[13], SqlValue::Text("claimed".into()));
+                assert_eq!(receipt[14], SqlValue::Null);
+                assert_eq!(receipt[15], SqlValue::Integer(stale_revision as i64));
+                assert_eq!(receipt[17], SqlValue::Text(stale_fence));
+                assert!(matches!(receipt[18], SqlValue::Text(_)));
+                assert!(matches!(receipt[19], SqlValue::Integer(_)));
+                assert_eq!(receipt[20], SqlValue::Null);
+                assert_eq!(receipt[22], SqlValue::Null);
+                receipt[13] = SqlValue::Text("cancelled".into());
+                receipt[14] = SqlValue::Text("recipient_closed".into());
+                receipt[15] = SqlValue::Integer((stale_revision + 1) as i64);
+                receipt[17] = SqlValue::Null;
+                receipt[18] = SqlValue::Null;
+                receipt[19] = SqlValue::Null;
+                receipt[22] = SqlValue::Integer(at_ms);
+                assert_eq!(after_stale, expected);
+            });
+        }
+        let late = messages::drain_pending(&fixture.db, at_ms + 1);
+        late.completion.unwrap();
+        assert_eq!(late.delivered, 0);
+        let terminal_message = repository::get_message(&fixture.db, &fixture.owner,
+            &fixture.owner.user_id, &directed.message_id).unwrap();
+        assert_eq!(terminal_message.message.message_id, directed.message_id);
+        assert_eq!(terminal_message.message.sender_user_id, fixture.owner.user_id);
+        assert_eq!(terminal_message.message.origin,
+            tentaflow_protocol::processes::ProcessMessageOrigin::Api);
+        assert_eq!(terminal_message.message.target, directed.target);
+        assert_eq!(terminal_message.message.message_name, directed.message_name);
+        assert_eq!(terminal_message.message.correlation_key, directed.correlation_key);
+        assert_eq!(terminal_message.message.payload_sha256, sent.payload_sha256);
+        assert_eq!(terminal_message.message.payload_bytes, sent.payload_bytes);
+        assert_eq!(terminal_message.payload, Some(directed.payload.clone()));
+        assert_eq!(terminal_message.message.source_instance_id, None);
+        assert_eq!(terminal_message.message.source_node_id, None);
+        assert_eq!(terminal_message.message.revision, sent.revision + 1);
+        if signal_first {
+            assert_eq!(terminal_message.message.status,
+                tentaflow_protocol::processes::ProcessMessageStatus::Cancelled);
+            assert_eq!(terminal_message.message.last_reason.as_deref(),
+                Some("activation_closed"));
+            assert_eq!(terminal_message.message.matched_instance_id, None);
+            assert_eq!(terminal_message.message.matched_subscription_id, None);
+            assert_eq!(terminal_message.message.delivered_at_ms, None);
+        } else {
+            assert_eq!(terminal_message.message.status,
+                tentaflow_protocol::processes::ProcessMessageStatus::Delivered);
+            assert_eq!(terminal_message.message.last_reason, None);
+            assert_eq!(terminal_message.message.matched_instance_id.as_deref(),
+                Some(receiver.instance_id.as_str()));
+            assert_eq!(terminal_message.message.matched_subscription_id.as_deref(),
+                Some(own.subscription_id.as_str()));
+        }
+        let after_terminal_rows = super::signal_proof_tests::all_transition_rows(&fixture);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.event_races[0].status,
+            tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+        assert_eq!(after.subscriptions.iter().find(|row|
+            row.subscription_id == signal.subscription_id).unwrap().status,
+            if signal_first { ProcessSubscriptionStatus::Consumed }
+            else { ProcessSubscriptionStatus::Cancelled });
+        assert_eq!(after.subscriptions.iter().find(|row|
+            row.subscription_id == own.subscription_id).unwrap().status,
+            if signal_first { ProcessSubscriptionStatus::Cancelled }
+            else { ProcessSubscriptionStatus::Consumed });
+        let events = repository::list_events(&reopened, &fixture.owner,
+            &receiver.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "signal_received").count(),
+            usize::from(signal_first));
+        assert_eq!(events.iter().filter(|event| event.kind == "receive_task_completed").count(),
+            usize::from(!signal_first));
+        if !signal_first {
+            assert_eq!(after.instance.variables["received"], serde_json::Value::Null);
+            assert_eq!(after.instance.variables["received_message"]["business_key"], "message");
+        }
+        let fate: (String, Option<String>, i64, String, i64) = reopened.read().unwrap()
+            .query_row(
+                "SELECT r.status,r.terminal_reason,r.revision,e.status,e.revision
+                 FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e
+                   ON e.signal_id=r.signal_id WHERE r.receipt_id=?1",
+                [&receipt_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                    row.get(3)?, row.get(4)?))).unwrap();
+        assert_eq!(fate, if signal_first {
+            ("delivered".into(), None, 3, "settled".into(), 2)
+        } else {
+            ("cancelled".into(), Some("recipient_closed".into()), 3,
+                "settled".into(), 2)
+        });
+        let repeat = messages::drain_pending(&reopened, at_ms + 2);
+        repeat.completion.unwrap();
+        assert_eq!(repeat.delivered, 0);
+        let replay_fate: (String, Option<String>, i64, String, i64) = reopened.read().unwrap()
+            .query_row(
+                "SELECT r.status,r.terminal_reason,r.revision,e.status,e.revision
+                 FROM bpmn_signal_receipts r JOIN bpmn_signal_emissions e
+                   ON e.signal_id=r.signal_id WHERE r.receipt_id=?1",
+                [&receipt_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                    row.get(3)?, row.get(4)?))).unwrap();
+        assert_eq!(replay_fate, fate);
+        assert_eq!(repository::get_message(&reopened, &fixture.owner,
+            &fixture.owner.user_id, &directed.message_id).unwrap(), terminal_message);
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture),
+            after_terminal_rows);
+    }
+}
+
+#[test]
+fn signal_and_message_catch_direct_race_preserves_factual_winner_order() {
+    use super::messages::test_support::{catch_target, envelope, send};
+    use super::repository::MessageSelection;
+
+    for signal_first in [false, true] {
+        let fixture = Fixture::new();
+        let mut model = signal_timer_race_model();
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "EvidenceReady".into(),
+        });
+        let catch = model.nodes.iter_mut().find(|node| node.id == "Timer_1").unwrap();
+        catch.id = "Message_2".into();
+        catch.kind = ProcessNodeKind::MessageCatch {
+            message_ref: "Message_1".into(),
+            correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::new(),
+        };
+        for edge in &mut model.sequence_flows {
+            if edge.target_id == "Timer_1" { edge.target_id = "Message_2".into(); }
+            if edge.source_id == "Timer_1" { edge.source_id = "Message_2".into(); }
+        }
+        model.timer_timezone = None;
+        let version = publish_model(&fixture, &model);
+        let receiver = start_version(&fixture, &version);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        let signal = snapshot.subscriptions.iter().find(|row|
+            row.kind == ProcessSubscriptionKind::SignalCatch).unwrap();
+        let message = snapshot.subscriptions.iter().find(|row|
+            row.kind == ProcessSubscriptionKind::MessageCatch).unwrap();
+        assert_eq!(signal.race_id, message.race_id);
+        let directed = envelope(catch_target(&version, Some(&receiver.instance_id),
+            Some(&message.subscription_id)), json!({"message":true}));
+        send(&fixture, &directed);
+        let emitter = publish_model(&fixture, &signal_throw_model());
+        start_version(&fixture, &emitter);
+        let at_ms = chrono::Utc::now().timestamp_millis() + 10;
+        if signal_first {
+            let receipt_id = repository::due_signal_receipts(&fixture.db, at_ms).unwrap()
+                .into_iter().next().unwrap();
+            let claim = repository::claim_signal_receipt(&fixture.db, &receipt_id, at_ms)
+                .unwrap().unwrap();
+            repository::deliver_signal_receipt(&fixture.db, &claim,
+                repository::ProcessPlanInput::Canonical, at_ms).unwrap().unwrap();
+        } else {
+            let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap()
+                .into_iter().find(|row| row.key.message_id == directed.message_id).unwrap();
+            let MessageSelection::Ready(prepared) =
+                repository::message_snapshot(&fixture.db, &candidate).unwrap()
+                else { panic!("the factual MessageCatch alternative must be ready") };
+            repository::deliver_message(&fixture.db, &prepared,
+                repository::ProcessPlanInput::Canonical, at_ms).unwrap().unwrap();
+        }
+        let late = messages::drain_pending(&fixture.db, at_ms + 1);
+        late.completion.unwrap();
+        assert_eq!(late.delivered, 0);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        assert_eq!(after.instance.status, ProcessInstanceStatus::Completed);
+        assert_eq!(after.event_races[0].status,
+            tentaflow_protocol::processes::ProcessEventRaceStatus::Won);
+        assert_eq!(after.subscriptions.iter().find(|row|
+            row.subscription_id == signal.subscription_id).unwrap().status,
+            if signal_first { ProcessSubscriptionStatus::Consumed }
+            else { ProcessSubscriptionStatus::Cancelled });
+        assert_eq!(after.subscriptions.iter().find(|row|
+            row.subscription_id == message.subscription_id).unwrap().status,
+            if signal_first { ProcessSubscriptionStatus::Cancelled }
+            else { ProcessSubscriptionStatus::Consumed });
+        let events = repository::list_events(&reopened, &fixture.owner,
+            &receiver.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "event_race_won").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "signal_received").count(),
+            usize::from(signal_first));
+        assert_eq!(events.iter().filter(|event| event.kind == "message_delivered").count(),
+            usize::from(!signal_first));
+    }
+}
+
+#[test]
+fn parent_cancel_fences_a_claimed_signal_race_branch_in_the_called_scope() {
+    let fixture = Fixture::new();
+    let child_version = publish_model(&fixture,
+        &super::runtime::test_support::embedded_model(
+            signal_timer_race_model(), "InnerScope"));
+    let caller = publish_model(&fixture,
+        &super::call_tests::caller(&child_version, BTreeMap::new()));
+    let parent = start_version(&fixture, &caller);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let child = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    let catch = child.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::SignalCatch).unwrap();
+    let emitter = publish_model(&fixture, &signal_throw_model());
+    start_version(&fixture, &emitter);
+    let at_ms = chrono::Utc::now().timestamp_millis() + 10;
+    let receipt_id = repository::due_signal_receipts(&fixture.db, at_ms).unwrap()
+        .into_iter().next().unwrap();
+    let claim = repository::claim_signal_receipt(&fixture.db, &receipt_id, at_ms)
+        .unwrap().unwrap();
+    assert_eq!(claim.subscription.subscription_id, catch.subscription_id);
+    let parent_before = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &parent.instance_id).unwrap();
+    repository::cancel_instance(&fixture.db, &fixture.owner,
+        &stamp("cancel called signal race"), &parent.instance_id,
+        parent_before.instance.revision).unwrap();
+    let stale = repository::deliver_signal_receipt(&fixture.db, &claim,
+        repository::ProcessPlanInput::Canonical, at_ms + 1);
+    assert!(!matches!(stale, Ok(Some(_))));
+    let drained = messages::drain_pending(&fixture.db, at_ms + 2);
+    drained.completion.unwrap();
+    assert_eq!(drained.delivered, 0);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let after = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &child_id).unwrap();
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Cancelled);
+    assert_eq!(after.subscriptions.iter().find(|row|
+        row.subscription_id == catch.subscription_id).unwrap().status,
+        ProcessSubscriptionStatus::Cancelled);
+    let events = repository::list_events(&reopened, &fixture.owner,
+        &child_id, 0, 200).unwrap().0;
+    assert_eq!(events.iter().filter(|event| event.kind == "signal_received").count(), 0);
+    assert_eq!(events.iter().filter(|event| event.kind == "event_race_won").count(), 0);
 }

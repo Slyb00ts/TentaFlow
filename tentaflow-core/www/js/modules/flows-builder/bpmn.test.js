@@ -1002,26 +1002,293 @@ test('duplicated Send boundary clears sibling overlap and selects the clone insp
   assert.equal(state.canvas.nodes.some((node) => node.id === 'Message_1'), true);
 });
 
-test('embedded Send boundaries are unavailable to the editor and blocked before save', () => {
+test('embedded Send timer and message attachments survive authoring and pinned read-only versions', async () => {
   const model = embeddedModel();
+  const namePrefix = 'Embedded admission <&> Żółć ';
+  const sendName = namePrefix + 'A'.repeat(256 - Buffer.byteLength(namePrefix));
+  assert.equal(Buffer.byteLength(sendName), 256);
   model.timerTimezone = 'Europe/Warsaw';
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.variables = { source_ID: { business_key: 'kept' } };
   const body = model.nodes.find((node) => node.id === 'Scope_Review').kind.SubProcess.body;
-  body.nodes[1] = { id: 'Local_Review', name: 'Embedded Send', kind: { SendTask: {
+  body.nodes[1] = { id: 'Local_Review', name: sendName, kind: { SendTask: {
     messageRef: 'Message_1', target: { Start: { definitionId: 'target-definition' } },
-    correlationExpression: 'vars.local_ID', payloadExpression: 'vars.local_ID', ttlSeconds: 60,
+    correlationExpression: 'vars.local_ID.business_key', payloadExpression: 'vars.local_ID', ttlSeconds: 60,
   } } };
   body.nodes.push({ id: 'Local_Timer', name: 'Deadline', kind: { BoundaryTimer: {
     attachedToId: 'Local_Review', cancelActivity: true, timer: { Duration: { seconds: 60 } },
+  } } }, { id: 'Local_Message', name: 'Reply', kind: { BoundaryMessage: {
+    attachedToId: 'Local_Review', cancelActivity: false, messageRef: 'Message_1',
+    correlationExpression: 'vars.local_ID.business_key', outputMapping: {},
   } } });
-  body.sequenceFlows.push({ id: 'Local_Timer_Flow', sourceId: 'Local_Timer', targetId: 'Local_End', condition: null });
-  const graph = canvas(model);
-  graph.navigateProcessBody(['Scope_Review']);
-  const config = inspector(graph);
-  config.show(graph.nodes.find((node) => node.id === 'Local_Timer'), graph.templates.get('bpmn_boundary_timer'));
-  assert.equal(config.root.querySelector('[data-process="attachedToId"] option[value="Local_Review"]').disabled, true);
-  assert.ok(graph.validate().includes(I18n.t('bpmn.boundary_required')));
-  config.destroy(); graph.root.remove();
+  body.sequenceFlows.push({ id: 'Local_Timer_Flow', sourceId: 'Local_Timer', targetId: 'Local_End', condition: null },
+    { id: 'Local_Message_Flow', sourceId: 'Local_Message', targetId: 'Local_End', condition: null });
+  body.diagram.shapes.push({ elementId: 'Local_Timer', x: 380, y: 218, width: 56, height: 56 },
+    { elementId: 'Local_Message', x: 180, y: 218, width: 56, height: 56 });
+  body.diagram.edges.push({ sequenceFlowId: 'Local_Timer_Flow',
+    waypoints: [{ x: 408, y: 246 }, { x: 500, y: 188 }] },
+    { sequenceFlowId: 'Local_Message_Flow', waypoints: [{ x: 208, y: 246 }, { x: 500, y: 188 }] });
+  const current = definition('embedded-send-boundary', { model });
+  let published = 0;
+  let pinned;
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: saved }) => ({ definition: { ...current, model: saved, draftRevision: 5 } }),
+    processDefinitionPublishRequest: () => {
+      published += 1;
+      const version = { version: published, model: structuredClone(state.canvas.getData()) };
+      if (published === 1) pinned = structuredClone(version.model);
+      return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
+    },
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+  });
+  state.canvas.selectNode('Scope_Review'); await flush(2);
+  click(state.config.root.querySelector('[data-process-enter]'));
+  assert.deepEqual(state.canvas.processPath, ['Scope_Review']);
+  for (const [nodeId, kind] of [['Local_Timer', 'BoundaryTimer'], ['Local_Message', 'BoundaryMessage']]) {
+    state.canvas.selectNode(nodeId); await flush(2);
+    const attachment = state.config.root.querySelector('[data-process="attachedToId"]');
+    assert.equal(attachment.value, 'Local_Review');
+    assert.equal(attachment.querySelector('option[value="Local_Review"]').disabled, false);
+    assert.equal(attachment.querySelector('option[value="Local_Review"]').textContent.includes(sendName), true);
+    assert.equal(state.canvas.getData().nodes[1].kind.SubProcess.body.nodes.find((node) => node.id === nodeId)
+      .kind[kind].attachedToId, 'Local_Review');
+  }
+  assert.deepEqual(state.canvas.validate(), []);
+  click(state.root.querySelector('[data-role="scope-up"]'));
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 1);
+  assert.deepEqual(pinned.nodes[1].kind.SubProcess.body, body);
+  state.canvas.navigateProcessBody(['Scope_Review']);
+  state.canvas.updateNodeLabel('Local_Review', 'Revised admission');
+  state.canvas.navigateProcessBody([]);
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 2);
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush(2);
+  assert.equal(state.previewVersion, 1);
+  assert.equal(state.canvas.readOnly, true);
+  assert.deepEqual(state.canvas.getData(), pinned);
+  state.canvas.navigateProcessBody(['Scope_Review']);
+  state.canvas.selectNode('Local_Message'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="attachedToId"]').hasAttribute('disabled'), true);
+  assert.equal(state.config.root.querySelector('[data-process="messageRef"]').hasAttribute('disabled'), true);
+});
+
+test('embedded manual and receive boundaries save, publish and retain their pinned read-only task details', async () => {
+  for (const kind of ['ManualTask', 'ReceiveTask']) {
+    const model = embeddedModel();
+    const namePrefix = `${kind} <&> Żółć `;
+    const taskName = namePrefix + 'A'.repeat(256 - Buffer.byteLength(namePrefix));
+    assert.equal(Buffer.byteLength(taskName), 256);
+    model.timerTimezone = 'Europe/Warsaw';
+    model.messages = [{ messageId: 'Message_1', name: 'work.received' }];
+    model.variables = { source_ID: { business_key: 'case-1' } };
+    const body = model.nodes.find((node) => node.id === 'Scope_Review').kind.SubProcess.body;
+    body.variables = { local_ID: { business_key: 'case-1' }, received_payload: null, boundary_payload: null };
+    const task = kind === 'ManualTask'
+      ? { assigneeUserId: 'anna', instructions: 'Complete the external work, then acknowledge it <&> Żółć.' }
+      : { messageRef: 'Message_1', correlationExpression: 'vars.local_ID.business_key',
+        outputMapping: { received_payload: 'outputs' } };
+    body.nodes[1] = { id: 'Local_Review', name: taskName, kind: { [kind]: task } };
+    body.nodes.push(
+      { id: 'Local_Timer', name: 'Deadline', kind: { BoundaryTimer: {
+        attachedToId: 'Local_Review', cancelActivity: true, timer: { Duration: { seconds: 60 } },
+      } } },
+      { id: 'Local_Message', name: 'Alternative', kind: { BoundaryMessage: {
+        attachedToId: 'Local_Review', cancelActivity: false, messageRef: 'Message_1',
+        correlationExpression: 'vars.local_ID.business_key',
+        outputMapping: { boundary_payload: 'outputs' },
+      } } },
+    );
+    body.sequenceFlows.push(
+      { id: 'Local_Timer_Flow', sourceId: 'Local_Timer', targetId: 'Local_End', condition: null },
+      { id: 'Local_Message_Flow', sourceId: 'Local_Message', targetId: 'Local_End', condition: null },
+    );
+    body.diagram.shapes.push(
+      { elementId: 'Local_Timer', x: 380, y: 218, width: 56, height: 56 },
+      { elementId: 'Local_Message', x: 180, y: 218, width: 56, height: 56 },
+    );
+    body.diagram.edges.push(
+      { sequenceFlowId: 'Local_Timer_Flow', waypoints: [{ x: 408, y: 246 }, { x: 500, y: 188 }] },
+      { sequenceFlowId: 'Local_Message_Flow', waypoints: [{ x: 208, y: 246 }, { x: 500, y: 188 }] },
+    );
+    const current = definition(`embedded-${kind}-boundary`, { model });
+    let published = 0;
+    let pinned;
+    const state = await mount(current, {
+      processDefinitionSaveRequest: ({ model: saved }) => ({
+        definition: { ...current, model: saved, draftRevision: 5 },
+      }),
+      processDefinitionPublishRequest: () => {
+        published += 1;
+        const version = { version: published, model: structuredClone(state.canvas.getData()) };
+        if (published === 1) pinned = structuredClone(version.model);
+        return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
+      },
+      processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+      processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+    });
+    state.canvas.selectNode('Scope_Review'); await flush(2);
+    click(state.config.root.querySelector('[data-process-enter]'));
+    assert.deepEqual(state.canvas.processPath, ['Scope_Review']);
+    for (const [nodeId, boundaryKind] of [['Local_Timer', 'BoundaryTimer'], ['Local_Message', 'BoundaryMessage']]) {
+      state.canvas.selectNode(nodeId); await flush(2);
+      const attachment = state.config.root.querySelector('[data-process="attachedToId"]');
+      assert.equal(attachment.value, 'Local_Review');
+      assert.equal(attachment.querySelector('option[value="Local_Review"]').disabled, false);
+      assert.equal(attachment.querySelector('option[value="Local_Review"]').textContent.includes(taskName), true);
+      assert.equal(state.canvas.getData().nodes[1].kind.SubProcess.body.nodes.find((node) => node.id === nodeId)
+        .kind[boundaryKind].attachedToId, 'Local_Review');
+    }
+    assert.deepEqual(state.canvas.validate(), []);
+    click(state.root.querySelector('[data-role="scope-up"]'));
+    assert.equal(await builder._save(), true);
+    await builder._publish();
+    assert.equal(published, 1);
+    assert.deepEqual(pinned.nodes[1].kind.SubProcess.body, body);
+    state.canvas.navigateProcessBody(['Scope_Review']);
+    state.canvas.updateNodeLabel('Local_Review', 'Revised external wait');
+    state.canvas.navigateProcessBody([]);
+    assert.equal(await builder._save(), true);
+    await builder._publish();
+    assert.equal(published, 2);
+    await builder._openProcessVersions();
+    click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+    await flush(2);
+    assert.equal(state.previewVersion, 1);
+    assert.equal(state.canvas.readOnly, true);
+    assert.deepEqual(state.canvas.getData(), pinned);
+    state.canvas.navigateProcessBody(['Scope_Review']);
+    state.canvas.selectNode('Local_Review'); await flush(2);
+    const detail = state.config.root.querySelector(`[data-process="${kind === 'ManualTask' ? 'instructions' : 'correlationExpression'}"]`);
+    assert.equal(detail.hasAttribute('disabled'), true);
+    assert.equal(detail.value, kind === 'ManualTask' ? task.instructions : task.correlationExpression);
+    state.canvas.selectNode('Local_Message'); await flush(2);
+    assert.equal(state.config.root.querySelector('[data-process="attachedToId"]').hasAttribute('disabled'), true);
+    assert.equal(state.config.root.querySelector('[data-process="messageRef"]').hasAttribute('disabled'), true);
+  }
+});
+
+test('event gateway receive and signal alternatives save, publish and retain pinned read-only configuration', async () => {
+  const model = emptyProcessModel();
+  const namePrefix = 'Receive <&> Żółć ';
+  const receiveName = namePrefix + 'A'.repeat(256 - Buffer.byteLength(namePrefix));
+  assert.equal(Buffer.byteLength(receiveName), 256);
+  model.targetNamespace = 'urn:orders';
+  model.timerTimezone = 'Europe/Warsaw';
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  model.signals = [{ signalId: 'Signal_1', namespaceUri: 'urn:orders', name: 'Order changed' }];
+  model.variables = { case_key: 'case-1', received: null };
+  model.nodes.splice(1, 0,
+    { id: 'Race_1', name: 'First arrival', kind: 'EventBasedGateway' },
+    { id: 'Receive_1', name: receiveName, kind: { ReceiveTask: {
+      messageRef: 'Message_1', correlationExpression: 'vars.case_key',
+      outputMapping: { received: 'outputs' },
+    } } },
+    { id: 'Signal_1_Catch', name: 'Signal alternative', kind: { SignalCatch: {
+      signalRef: 'Signal_1', outputMapping: {},
+    } } },
+    { id: 'Timer_1', name: 'Timeout', kind: { TimerCatch: { timer: { Duration: { seconds: 60 } } } } });
+  model.sequenceFlows = [
+    { id: 'Start_Race', sourceId: 'Start', targetId: 'Race_1', condition: null },
+    { id: 'To_Receive', sourceId: 'Race_1', targetId: 'Receive_1', condition: null },
+    { id: 'To_Signal', sourceId: 'Race_1', targetId: 'Signal_1_Catch', condition: null },
+    { id: 'To_Timer', sourceId: 'Race_1', targetId: 'Timer_1', condition: null },
+    { id: 'From_Receive', sourceId: 'Receive_1', targetId: 'End', condition: null },
+    { id: 'From_Signal', sourceId: 'Signal_1_Catch', targetId: 'End', condition: null },
+    { id: 'From_Timer', sourceId: 'Timer_1', targetId: 'End', condition: null },
+  ];
+  model.diagram.shapes.splice(1, 0,
+    { elementId: 'Race_1', x: 180, y: 160, width: 72, height: 72 },
+    { elementId: 'Receive_1', x: 320, y: 100, width: 240, height: 96 },
+    { elementId: 'Signal_1_Catch', x: 320, y: 220, width: 56, height: 56 },
+    { elementId: 'Timer_1', x: 420, y: 220, width: 56, height: 56 });
+  model.diagram.edges = model.sequenceFlows.map((flow) => ({
+    sequenceFlowId: flow.id, waypoints: [{ x: 120, y: 180 }, { x: 300, y: 180 }],
+  }));
+  const current = definition('event-receive-signal', { model });
+  let published = 0;
+  let pinned;
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: saved }) => ({
+      definition: { ...current, model: saved, draftRevision: 5 },
+    }),
+    processDefinitionPublishRequest: () => {
+      published += 1;
+      const version = { version: published, model: structuredClone(state.canvas.getData()) };
+      if (published === 1) pinned = structuredClone(version.model);
+      return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
+    },
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+  });
+  assert.deepEqual(state.canvas.validate(), []);
+  state.canvas.selectNode('Receive_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="messageRef"]').value, 'Message_1');
+  assert.equal(state.config.root.querySelector('[data-process="correlationExpression"]').value, 'vars.case_key');
+  state.canvas.selectNode('Signal_1_Catch'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="signalRef"]').value, 'Signal_1');
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 1);
+  assert.equal(pinned.nodes.find((node) => node.id === 'Receive_1').name, receiveName);
+  assert.deepEqual(pinned.diagram, model.diagram);
+
+  const mixed = structuredClone(pinned);
+  mixed.nodes.find((node) => node.id === 'Timer_1').kind = { MessageCatch: {
+    messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {},
+  } };
+  state.canvas.setData(mixed);
+  assert.deepEqual(state.canvas.validate(), [
+    I18n.t('bpmn.event_gateway_receive_message_mix', { node: 'First arrival' }),
+  ]);
+  assert.equal(await builder._save(), false);
+  assert.equal(published, 1);
+
+  const attached = structuredClone(pinned);
+  attached.nodes.push({ id: 'Receive_Boundary', name: 'Deadline', kind: { BoundaryTimer: {
+    attachedToId: 'Receive_1', cancelActivity: true, timer: { Duration: { seconds: 30 } },
+  } } });
+  attached.sequenceFlows.push({ id: 'Boundary_End', sourceId: 'Receive_Boundary', targetId: 'End', condition: null });
+  state.canvas.setData(attached);
+  state.canvas.selectNode('Receive_Boundary'); await flush(2);
+  assert.equal(state.config.root.querySelector('option[value="Receive_1"]').disabled, true);
+  assert.deepEqual(state.canvas.validate(), [
+    I18n.t('bpmn.event_gateway_receive_boundary', { node: receiveName }),
+  ]);
+  assert.equal(await builder._save(), false);
+  assert.equal(published, 1);
+
+  const extra = structuredClone(pinned);
+  extra.sequenceFlows.push({ id: 'Extra_Receive', sourceId: 'Signal_1_Catch', targetId: 'Receive_1', condition: null });
+  state.canvas.setData(extra);
+  assert.deepEqual(state.canvas.validate(), [
+    I18n.t('bpmn.event_gateway_branch_incoming', { node: receiveName }),
+    I18n.t('bpmn.event_gateway_branch_incoming', { node: 'Signal alternative' }),
+  ]);
+  assert.equal(await builder._save(), false);
+  assert.equal(published, 1);
+
+  state.canvas.setData(pinned);
+  state.canvas.updateNodeLabel('Receive_1', 'Revised receive');
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(published, 2);
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush(2);
+  assert.equal(state.previewVersion, 1);
+  assert.equal(state.canvas.readOnly, true);
+  assert.deepEqual(state.canvas.getData(), pinned);
+  state.canvas.selectNode('Receive_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="messageRef"]').hasAttribute('disabled'), true);
+  assert.equal(state.config.root.querySelector('[data-process="correlationExpression"]').value, 'vars.case_key');
+  state.canvas.selectNode('Signal_1_Catch'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="signalRef"]').hasAttribute('disabled'), true);
 });
 
 test('signal throw and catch inspectors preserve exact declarations, expressions and source history', async () => {
@@ -2394,6 +2661,12 @@ test('all five locales translate supported elements, current statuses and every 
     for (const name of ['signal_throw', 'signal_catch']) assert.equal(
       processTemplates().find((template) => template.node_type === `bpmn_${name}`)?.label,
       I18n.t(`bpmn.node_${name}`));
+    for (const key of ['event_gateway_receive_message_mix', 'event_gateway_receive_boundary',
+      'event_gateway_branch_incoming']) {
+      const message = I18n.t(`bpmn.${key}`, { node: 'Receive <&>' });
+      assert.match(message, /Receive <&>/);
+      assert.doesNotMatch(message, /bpmn\.|\{node\}/);
+    }
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
     for (const kind of ['manual_task_opened', 'manual_task_acknowledged']) {
       assert.equal(processEventText({ kind, nodeName: 'External work', data: {} }),
@@ -2925,10 +3198,59 @@ test('BPMN full task and sibling boundary names occupy separate measured regions
   assert.deepEqual(graph.getData(), original);
   graph.updateNodeLabel('Review', 'Review contract');
   const shortTask = graph.nodesLayer.querySelector('[data-node-id="Review"]');
-  assert.equal(shortTask.classList.contains('fb-external-label'), false);
-  assert.equal(shortTask.querySelector('.fb-process-label').hidden, true);
-  assert.equal(shortTask.querySelector('.fb-process-symbol > span').textContent.trim(), 'Review contract');
+  assert.equal(shortTask.classList.contains('fb-external-label'), true);
+  assert.equal(shortTask.querySelector('.fb-process-label').hidden, false);
+  graph.removeNodes(['Timer_A', 'Timer_B']);
+  const unencumberedTask = graph.nodesLayer.querySelector('[data-node-id="Review"]');
+  assert.equal(unencumberedTask.classList.contains('fb-external-label'), false);
+  assert.equal(unencumberedTask.querySelector('.fb-process-label').hidden, true);
+  assert.equal(unencumberedTask.querySelector('.fb-process-symbol > span').textContent.trim(), 'Review contract');
   graph.destroy();
+});
+
+test('short Manual and Receive task labels clear attached boundary symbols without changing DI', () => {
+  for (const kind of ['ManualTask', 'ReceiveTask']) {
+    const model = emptyProcessModel();
+    model.targetNamespace = 'urn:example:boundary-labels';
+    model.messages = [{ messageId: 'Message_1', name: 'Update' }];
+    model.nodes.splice(1, 0,
+      { id: 'Work', name: `Short ${kind} label`, kind: { [kind]: kind === 'ManualTask'
+        ? { assigneeUserId: null, instructions: 'Acknowledge external work' }
+        : { messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {} } } },
+      { id: 'Attached', name: 'Update', kind: { BoundaryMessage: { attachedToId: 'Work',
+        cancelActivity: true, messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {} } } });
+    model.sequenceFlows = [
+      { id: 'Flow_start_work', sourceId: 'Start', targetId: 'Work', condition: null },
+      { id: 'Flow_work_end', sourceId: 'Work', targetId: 'End', condition: null },
+      { id: 'Flow_boundary_end', sourceId: 'Attached', targetId: 'End', condition: null },
+    ];
+    model.diagram.shapes.splice(1, 0,
+      { elementId: 'Work', x: 200, y: 160, width: 240, height: 96 },
+      { elementId: 'Attached', x: 228, y: 230, width: 56, height: 56 });
+    model.diagram.shapes.find((shape) => shape.elementId === 'End').x = 580;
+    const graph = canvas(model);
+    const before = graph.getData();
+    const element = graph.nodesLayer.querySelector('[data-node-id="Work"]');
+    const title = element.querySelector('.fb-process-symbol > span');
+    Object.defineProperties(title, { clientHeight: { value: 60 }, scrollHeight: { value: 36 },
+      clientWidth: { value: 190 }, scrollWidth: { value: 120 } });
+    const label = element.querySelector('.fb-process-label');
+    Object.defineProperties(label, { offsetWidth: { value: 180 }, offsetHeight: { value: 38 } });
+    graph._layoutProcessLabels();
+    assert.equal(element.classList.contains('fb-external-label'), true, kind);
+    assert.equal(label.hidden, false, kind);
+    assert.equal(label.textContent, `Short ${kind} label`);
+    const work = graph.nodes.find((node) => node.id === 'Work');
+    const boundary = graph.nodes.find((node) => node.id === 'Attached');
+    const left = work.x + Number.parseFloat(label.style.left);
+    const top = work.y + Number.parseFloat(label.style.top);
+    assert.ok(left + label.offsetWidth <= boundary.x || left >= boundary.x + boundary.width
+      || top + label.offsetHeight <= boundary.y || top >= boundary.y + boundary.height, kind);
+    graph.fitToContent();
+    assert.equal(element.classList.contains('fb-external-label'), true, kind);
+    assert.deepEqual(graph.getData(), before);
+    graph.destroy();
+  }
 });
 
 test('BPMN minimap confines its real viewport to the measured map area', async () => {

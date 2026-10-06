@@ -285,6 +285,22 @@ fn parallel_human_occurrences_wait_independently_and_join_once() {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id, &outputs,
             None, at_ms, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
+        if completed == 0 {
+            let foreign = snapshot.repetition_occurrences.iter().find(|row|
+                row.ordinal != ordinal).unwrap();
+            let before = super::signal_proof_tests::all_transition_rows(&fixture);
+            assert_eq!(before.len(), 18);
+            let mut wrong_ordinal_source = plan.clone();
+            *wrong_ordinal_source.consume_token_ids.iter_mut().find(|token_id|
+                token_id.as_str() == occurrence.token_id.as_str())
+                .expect("factual ordinal consumption") =
+                foreign.token_id.clone();
+            repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+                &started.instance_id, &task.user_task_id, snapshot.instance.revision,
+                &outputs, None, repository::ProcessPlanInput::Supplied(&wrong_ordinal_source),
+                at_ms).unwrap_err();
+            assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before);
+        }
         repository::complete_user_task(&fixture.db, &fixture.owner, &command,
             &started.instance_id, &task.user_task_id, snapshot.instance.revision,
             &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
@@ -292,6 +308,13 @@ fn parallel_human_occurrences_wait_independently_and_join_once() {
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
         assert_eq!(persisted.repetition_groups[0].completed_count, completed as u32 + 1);
+        if completed == 0 {
+            let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+            repository::complete_user_task(&reopened, &fixture.owner, &command,
+                &started.instance_id, &task.user_task_id, snapshot.instance.revision,
+                &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+            assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+        }
     }
     let final_state = repository::get_instance(&fixture.db, &fixture.owner,
         &started.instance_id, None).unwrap();

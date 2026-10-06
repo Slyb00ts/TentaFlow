@@ -16,7 +16,8 @@ use tentaflow_protocol::processes::{
 };
 
 use super::model::{
-    validate_model, validate_timer_spec, validate_variables, EscalationPathError, MAX_MODEL_BYTES,
+    validate_model, validate_timer_spec, validate_variables, EscalationPathError,
+    EventGatewayProfileError, MAX_MODEL_BYTES,
     MAX_VARIABLE_BYTES,
 };
 
@@ -1727,7 +1728,16 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         signals,
     };
     validate_model(&model).map_err(|error| {
-        if let Some(path) = error.downcast_ref::<EscalationPathError>() {
+        if let Some(profile) = error.downcast_ref::<EventGatewayProfileError>() {
+            let offset = root.find_id(&profile.node_id)
+                .map_or(process.offset, |element| element.offset);
+            let context = XmlElementError {
+                message: profile.reason.clone(),
+                element_id: Some(profile.node_id.clone()),
+                offset,
+            };
+            error.context(context)
+        } else if let Some(path) = error.downcast_ref::<EscalationPathError>() {
             let element_id = path
                 .flow_id
                 .as_ref()
@@ -3191,6 +3201,78 @@ mod tests {
         let event_subprocess = xml.replacen("<bpmn:subProcess id=\"Sub_1\"",
             "<bpmn:subProcess triggeredByEvent=\"true\" id=\"Sub_1\"", 1);
         assert!(import_xml(&event_subprocess).0.is_none());
+
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "Message_Local".into(), name: "local.reply".into(),
+        });
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut model.nodes[1].kind {
+            body.nodes.insert(1, ProcessNode { repeat: None, id: "LocalSend".into(),
+                name: "Zażółć 日本語 — Admit & wait".into(), kind: ProcessNodeKind::SendTask {
+                    message_ref: "Message_Local".into(),
+                    target: ProcessMessageTargetSpec::Start {
+                        definition_id: uuid::Uuid::nil().to_string(),
+                    },
+                    correlation_expression: "vars.local_ID".into(),
+                    payload_expression: "vars.local_ID".into(), ttl_seconds: 60,
+                } });
+            body.nodes.push(ProcessNode { repeat: None, id: "LocalTimer".into(),
+                name: "Deadline".into(), kind: ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: "LocalSend".into(), cancel_activity: true,
+                    timer: ProcessTimerSpec::Duration { seconds: 60 },
+                } });
+            body.nodes.push(ProcessNode { repeat: None, id: "LocalMessage".into(),
+                name: "Reply".into(), kind: ProcessNodeKind::BoundaryMessage {
+                    attached_to_id: "LocalSend".into(), cancel_activity: false,
+                    message_ref: "Message_Local".into(),
+                    correlation_expression: "vars.local_ID".into(),
+                    output_mapping: BTreeMap::new(),
+                } });
+            body.sequence_flows[0].target_id = "LocalSend".into();
+            for (id, source_id) in [("LocalSendFlow", "LocalSend"),
+                ("LocalTimerFlow", "LocalTimer"), ("LocalMessageFlow", "LocalMessage")] {
+                body.sequence_flows.push(ProcessSequenceFlow {
+                    id: id.into(), source_id: source_id.into(), target_id: "LocalEnd".into(),
+                    condition: None,
+                });
+            }
+            for (id, x, y, width, height) in [
+                ("LocalSend", 130.0, 40.0, 160.0, 96.0),
+                ("LocalTimer", 260.0, 115.0, 56.0, 56.0),
+                ("LocalMessage", 120.0, 115.0, 56.0, 56.0),
+            ] {
+                body.diagram.shapes.push(ProcessShape {
+                    element_id: id.into(), x, y, width, height,
+                });
+            }
+            for id in ["LocalSendFlow", "LocalTimerFlow", "LocalMessageFlow"] {
+                body.diagram.edges.push(ProcessEdgeDiagram {
+                    sequence_flow_id: id.into(), waypoints: vec![
+                        ProcessPoint { x: 290.0, y: 88.0 },
+                        ProcessPoint { x: 360.0, y: 88.0 },
+                    ],
+                });
+            }
+        }
+        let embedded_xml = export_xml(&model).unwrap();
+        assert!(embedded_xml.contains("<bpmn:sendTask id=\"LocalSend\""));
+        assert!(embedded_xml.contains("attachedToRef=\"LocalSend\""));
+        assert!(embedded_xml.contains("bpmnElement=\"LocalTimer\""));
+        assert!(embedded_xml.contains("bpmnElement=\"LocalMessage\""));
+        assert_eq!(import_xml(&embedded_xml).0, Some(model));
+        for invalid in [
+            embedded_xml.replacen(" attachedToRef=\"LocalSend\"", "", 1),
+            embedded_xml.replacen("attachedToRef=\"LocalSend\"",
+                "attachedToRef=\"MissingLocalActivity\"", 1),
+        ] {
+            let offset = invalid.find("<bpmn:boundaryEvent id=\"LocalTimer\"").unwrap();
+            assert!(invalid[..offset].chars().count() < offset);
+            let (restored, diagnostics) = import_xml(&invalid);
+            assert!(restored.is_none());
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                && diagnostic.element_id.as_deref() == Some("LocalTimer")
+                && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+        }
     }
 
     #[test]
@@ -3491,6 +3573,116 @@ mod tests {
     }
 
     #[test]
+    fn embedded_manual_and_receive_boundaries_preserve_markers_qnames_di_and_causal_offsets() {
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].name = "Zażółć 日本語".into();
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        let nodes = vec![
+            ProcessNode { id: "LocalStart".into(), name: "Start".into(), repeat: None,
+                kind: ProcessNodeKind::Start },
+            ProcessNode { id: "Manual_1".into(), name: "External work".into(), repeat: None,
+                kind: ProcessNodeKind::ManualTask { assignee_user_id: None,
+                    instructions: "Check <register> & acknowledge".into() } },
+            ProcessNode { id: "Receive_1".into(), name: "Wait for delivery".into(), repeat: None,
+                kind: ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("received_payload".into(), "outputs".into())]) } },
+            ProcessNode { id: "LocalEnd".into(), name: "End".into(), repeat: None,
+                kind: ProcessNodeKind::End },
+            ProcessNode { id: "Manual_Timer".into(), name: "Manual deadline".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Manual_1".into(),
+                    cancel_activity: true, timer: ProcessTimerSpec::Duration { seconds: 60 } } },
+            ProcessNode { id: "Manual_Message".into(), name: "Manual reply".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryMessage { attached_to_id: "Manual_1".into(),
+                    cancel_activity: false, message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("boundary_payload".into(), "outputs".into())]) } },
+            ProcessNode { id: "Receive_Timer".into(), name: "Receive deadline".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Receive_1".into(),
+                    cancel_activity: true, timer: ProcessTimerSpec::Duration { seconds: 90 } } },
+            ProcessNode { id: "Receive_Message".into(), name: "Receive reply".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryMessage { attached_to_id: "Receive_1".into(),
+                    cancel_activity: false, message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("boundary_payload".into(), "outputs".into())]) } },
+        ];
+        let mut flows = Vec::new();
+        for (id, source_id, target_id) in [
+            ("LocalFlow1", "LocalStart", "Manual_1"),
+            ("LocalFlow2", "Manual_1", "Receive_1"),
+            ("LocalFlow3", "Receive_1", "LocalEnd"),
+            ("ManualTimerFlow", "Manual_Timer", "LocalEnd"),
+            ("ManualMessageFlow", "Manual_Message", "LocalEnd"),
+            ("ReceiveTimerFlow", "Receive_Timer", "LocalEnd"),
+            ("ReceiveMessageFlow", "Receive_Message", "LocalEnd"),
+        ] {
+            flows.push(ProcessSequenceFlow { id: id.into(), source_id: source_id.into(),
+                target_id: target_id.into(), condition: None });
+        }
+        let shapes = nodes.iter().enumerate().map(|(index, node)| {
+            let event = matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::End
+                | ProcessNodeKind::BoundaryTimer { .. } | ProcessNodeKind::BoundaryMessage { .. });
+            ProcessShape { element_id: node.id.clone(), x: 40.0 + index as f64 * 60.0, y: 60.0,
+                width: if event { 56.0 } else { 160.0 },
+                height: if event { 56.0 } else { 96.0 } }
+        }).collect();
+        let edges = flows.iter().map(|flow| ProcessEdgeDiagram {
+            sequence_flow_id: flow.id.clone(), waypoints: vec![
+                ProcessPoint { x: 100.0, y: 108.0 }, ProcessPoint { x: 160.0, y: 108.0 },
+            ],
+        }).collect();
+        model.nodes.insert(1, ProcessNode { id: "Sub_1".into(), name: "External & wait".into(),
+            repeat: None, kind: ProcessNodeKind::SubProcess {
+                body: ProcessSubProcess { nodes, sequence_flows: flows,
+                    variables: BTreeMap::from([
+                        ("case_key".into(), serde_json::json!("case-1")),
+                        ("received_payload".into(), serde_json::Value::Null),
+                        ("boundary_payload".into(), serde_json::Value::Null),
+                    ]), diagram: ProcessDiagram { shapes, edges } },
+                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+            } });
+        model.sequence_flows[0].target_id = "Sub_1".into();
+        model.sequence_flows.push(ProcessSequenceFlow { id: "RootFlow2".into(),
+            source_id: "Sub_1".into(), target_id: "End_1".into(), condition: None });
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<tentaflow:manual/>"));
+        assert!(xml.contains("Check &lt;register&gt; &amp; acknowledge"));
+        assert!(xml.contains("<tentaflow:receiveTask>"));
+        assert!(xml.contains("messageRef=\"tns:Message_1\""));
+        for (id, target) in [("Manual_Timer", "Manual_1"),
+            ("Manual_Message", "Manual_1"), ("Receive_Timer", "Receive_1"),
+            ("Receive_Message", "Receive_1")] {
+            let start = xml.find(&format!("<bpmn:boundaryEvent id=\"{id}\"")).unwrap();
+            let end = start + xml[start..].find("</bpmn:boundaryEvent>").unwrap();
+            assert!(xml[start..end].contains(&format!("attachedToRef=\"{target}\"")));
+            assert!(xml.contains(&format!("bpmnElement=\"{id}\"")));
+        }
+        assert_eq!(import_xml(&xml).0, Some(model));
+        for (id, target) in [("Manual_Timer", "Manual_1"),
+            ("Receive_Timer", "Receive_1")] {
+            let opening = format!("<bpmn:boundaryEvent id=\"{id}\"");
+            let start = xml.find(&opening).unwrap();
+            let old = format!("attachedToRef=\"{target}\"");
+            for replacement in ["", "attachedToRef=\"MissingActivity\""] {
+                let mut invalid = xml.clone();
+                let local = start + invalid[start..].find(&old).unwrap();
+                invalid.replace_range(local..local + old.len(), replacement);
+                let offset = invalid.find(&opening).unwrap();
+                assert!(invalid[..offset].contains("Zażółć 日本語"));
+                assert!(invalid[..offset].chars().count() < offset);
+                let (restored, diagnostics) = import_xml(&invalid);
+                assert!(restored.is_none());
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+                    && diagnostic.element_id.as_deref() == Some(id)
+                    && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+            }
+        }
+    }
+
+    #[test]
     fn send_receive_task_xml_requires_distinct_markers_and_preserves_di() {
         let mut model = super::super::model::starter_model();
         model.nodes[0].name = "Zażółć 日本語".into();
@@ -3733,6 +3925,128 @@ mod tests {
                 && diagnostic.element_id.as_deref() == Some(id)
                 && diagnostic.offset == Some(offset)), "{diagnostics:?}");
         }
+    }
+
+    #[test]
+    fn event_gateway_receive_signal_and_timer_xml_round_trips_with_causal_profile_diagnostics() {
+        let mut model = super::super::model::starter_model();
+        model.nodes[0].name = "Zażółć 日本語".into();
+        model.target_namespace = Some("urn:orders".into());
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.signals.push(ProcessSignalDeclaration {
+            signal_id: "Signal_1".into(), namespace_uri: "urn:orders".into(),
+            name: "Order changed".into(),
+        });
+        model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+        model.variables.insert("received".into(), serde_json::Value::Null);
+        model.nodes.extend([
+            ProcessNode { id: "Race_1".into(), name: "First event".into(), repeat: None,
+                kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { id: "Receive_1".into(), name: "Receive".into(), repeat: None,
+                kind: ProcessNodeKind::ReceiveTask {
+                    message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
+                } },
+            ProcessNode { id: "Signal_1_Catch".into(), name: "Signal".into(), repeat: None,
+                kind: ProcessNodeKind::SignalCatch { signal_ref: "Signal_1".into(),
+                    output_mapping: BTreeMap::new() } },
+            ProcessNode { id: "Timer_1".into(), name: "Timeout".into(), repeat: None,
+                kind: ProcessNodeKind::TimerCatch {
+                    timer: ProcessTimerSpec::Duration { seconds: 60 },
+                } },
+        ]);
+        model.sequence_flows[0].target_id = "Race_1".into();
+        for (id, source, target) in [
+            ("To_Receive", "Race_1", "Receive_1"),
+            ("To_Signal", "Race_1", "Signal_1_Catch"),
+            ("To_Timer", "Race_1", "Timer_1"),
+            ("From_Receive", "Receive_1", "End_1"),
+            ("From_Signal", "Signal_1_Catch", "End_1"),
+            ("From_Timer", "Timer_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(),
+                source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        for (index, id) in ["Race_1", "Receive_1", "Signal_1_Catch", "Timer_1"].iter().enumerate() {
+            model.diagram.shapes.push(ProcessShape { element_id: (*id).into(),
+                x: 160.0 + index as f64 * 120.0, y: 140.0,
+                width: if *id == "Race_1" { 72.0 } else { 56.0 }, height: 56.0 });
+        }
+        model.diagram.edges = model.sequence_flows.iter().map(|flow| ProcessEdgeDiagram {
+            sequence_flow_id: flow.id.clone(), waypoints: vec![
+                ProcessPoint { x: 100.0, y: 188.0 }, ProcessPoint { x: 220.0, y: 188.0 },
+            ],
+        }).collect();
+        let xml = export_xml(&model).unwrap();
+        assert!(xml.contains("<bpmn:eventBasedGateway id=\"Race_1\""));
+        assert!(xml.contains("messageRef=\"tns:Message_1\""));
+        assert!(xml.contains("signalRef=\"tns:Signal_1\""));
+        for id in ["Race_1", "Receive_1", "Signal_1_Catch", "Timer_1"] {
+            assert!(xml.contains(&format!("bpmnElement=\"{id}\"")));
+        }
+        for flow in &model.sequence_flows {
+            assert!(xml.contains(&format!("bpmnElement=\"{}\"", flow.id)));
+        }
+        assert_eq!(import_xml(&xml).0, Some(model));
+        let malformed_qname = xml.replacen("signalRef=\"tns:Signal_1\"",
+            "signalRef=\"Signal_1\"", 1);
+        let (restored, diagnostics) = import_xml(&malformed_qname);
+        assert!(restored.is_none());
+        let offset = malformed_qname.find("<bpmn:signalEventDefinition").unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+            && diagnostic.element_id.as_deref() == Some("Signal_1_Catch")
+            && diagnostic.offset == Some(offset)), "{diagnostics:?}");
+
+        let opening = "<bpmn:intermediateCatchEvent id=\"Signal_1_Catch\"";
+        let start = xml.find(opening).unwrap();
+        let end = start + xml[start..].find("</bpmn:intermediateCatchEvent>").unwrap()
+            + "</bpmn:intermediateCatchEvent>".len();
+        let message_config = escaped(&serde_json::to_string(&serde_json::json!({
+            "correlation_expression": "vars.case_key", "output_mapping": {},
+        })).unwrap());
+        let message_catch = format!(
+            "<bpmn:intermediateCatchEvent id=\"Signal_1_Catch\" name=\"Signal\"><bpmn:extensionElements><tentaflow:message>{message_config}</tentaflow:message></bpmn:extensionElements><bpmn:messageEventDefinition messageRef=\"tns:Message_1\"/></bpmn:intermediateCatchEvent>"
+        );
+        let mut mixed = xml.clone();
+        mixed.replace_range(start..end, &message_catch);
+        mixed = mixed.replace("<bpmn:signal id=\"Signal_1\" name=\"Order changed\"/>", "");
+        let (restored, diagnostics) = import_xml(&mixed);
+        assert!(restored.is_none());
+        let offset = mixed.find("<bpmn:eventBasedGateway id=\"Race_1\"").unwrap();
+        assert!(mixed[..offset].chars().count() < offset);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+            && diagnostic.element_id.as_deref() == Some("Race_1")
+            && diagnostic.offset == Some(offset)
+            && diagnostic.message.contains("cannot mix ReceiveTask with MessageCatch")),
+            "{diagnostics:?}");
+
+        let boundary = "<bpmn:boundaryEvent id=\"Receive_Boundary\" attachedToRef=\"Receive_1\" cancelActivity=\"true\"><bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>";
+        let boundary_flow = "<bpmn:sequenceFlow id=\"Boundary_End\" sourceRef=\"Receive_Boundary\" targetRef=\"End_1\"/>";
+        let attached = xml.replacen("</bpmn:process>",
+            &format!("{boundary}{boundary_flow}</bpmn:process>"), 1);
+        let (restored, diagnostics) = import_xml(&attached);
+        assert!(restored.is_none());
+        let offset = attached.find("<bpmn:boundaryEvent id=\"Receive_Boundary\"").unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+            && diagnostic.element_id.as_deref() == Some("Receive_Boundary")
+            && diagnostic.offset == Some(offset)
+            && diagnostic.message.contains("cannot have attached boundary")),
+            "{diagnostics:?}");
+
+        let extra = xml.replacen("</bpmn:process>",
+            "<bpmn:sequenceFlow id=\"Extra_Receive\" sourceRef=\"Signal_1_Catch\" targetRef=\"Receive_1\"/></bpmn:process>", 1);
+        let (restored, diagnostics) = import_xml(&extra);
+        assert!(restored.is_none());
+        let offset = extra.find("<bpmn:receiveTask id=\"Receive_1\"").unwrap();
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal
+            && diagnostic.element_id.as_deref() == Some("Receive_1")
+            && diagnostic.offset == Some(offset)
+            && diagnostic.message.contains("must have one incoming and outgoing flow")),
+            "{diagnostics:?}");
     }
 
 }

@@ -606,9 +606,6 @@ fn validate_draft_body<'a>(
         } {
             ensure!(!nodes.iter().any(|attached| attached.id == *attached_to_id && attached.repeat.is_some()),
                 "repeat {} cannot have a boundary event", attached_to_id);
-            ensure!(depth == 0 || !nodes.iter().any(|attached| attached.id == *attached_to_id
-                && matches!(attached.kind, ProcessNodeKind::SendTask { .. })),
-                "boundary event {} on SendTask requires a root process", node.id);
         }
     }
     let mut flow_ids = HashSet::new();
@@ -969,12 +966,13 @@ fn validate_body<'a>(
                     ) && matches!(
                         nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                         Some(ProcessNodeKind::UserTask { .. })
-                    )) || (depth == 0 && matches!(
+                    )) || (matches!(
                         node.kind,
                         ProcessNodeKind::BoundaryTimer { .. } | ProcessNodeKind::BoundaryMessage { .. }
                     ) && matches!(
                         nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
-                        Some(ProcessNodeKind::SendTask { .. })
+                        Some(ProcessNodeKind::SendTask { .. } | ProcessNodeKind::ManualTask { .. }
+                            | ProcessNodeKind::ReceiveTask { .. })
                     )),
                     "boundary event {} has an unsupported attachment",
                     node.id
@@ -995,20 +993,45 @@ fn validate_body<'a>(
                     "event gateway {} needs one incoming and 2..=8 outgoing flows",
                     node.id
                 );
+                let branches: Vec<_> = graph_flows.iter().filter(|flow| flow.source_id == node.id)
+                    .map(|flow| nodes[flow.target_id.as_str()]).collect();
+                if branches.iter().any(|branch| matches!(branch.kind, ProcessNodeKind::ReceiveTask { .. }))
+                    && branches.iter().any(|branch| matches!(branch.kind, ProcessNodeKind::MessageCatch { .. })) {
+                    bail!(EventGatewayProfileError { node_id: node.id.clone(),
+                        reason: format!("event gateway {} cannot mix ReceiveTask with MessageCatch", node.id) });
+                }
                 for flow in graph_flows.iter().filter(|flow| flow.source_id == node.id) {
                     ensure!(flow.condition.is_none(), "event gateway {} cannot have conditions", node.id);
                     let branch = nodes[flow.target_id.as_str()];
-                    ensure!(
-                        matches!(branch.kind, ProcessNodeKind::MessageCatch { .. })
-                            || matches!(&branch.kind, ProcessNodeKind::TimerCatch { timer } if matches!(timer, ProcessTimerSpec::Date { .. } | ProcessTimerSpec::Duration { .. } | ProcessTimerSpec::WorkingDuration { .. })),
-                        "event gateway {} must branch directly to one-shot catches",
-                        node.id
-                    );
-                    ensure!(incoming.get(branch.id.as_str()).map_or(0, Vec::len) == 1
-                        && outgoing.get(branch.id.as_str()).map_or(0, Vec::len) == 1,
-                        "event gateway child {} must have one incoming and outgoing flow",
-                        branch.id
-                    );
+                    if !matches!(branch.kind, ProcessNodeKind::MessageCatch { .. }
+                        | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SignalCatch { .. })
+                        && !matches!(&branch.kind, ProcessNodeKind::TimerCatch { timer }
+                            if matches!(timer, ProcessTimerSpec::Date { .. } | ProcessTimerSpec::Duration { .. }
+                                | ProcessTimerSpec::WorkingDuration { .. })) {
+                        bail!(EventGatewayProfileError { node_id: branch.id.clone(),
+                            reason: format!("event gateway {} must branch directly to one-shot catches or ReceiveTask",
+                                node.id) });
+                    }
+                    if incoming.get(branch.id.as_str()).map_or(0, Vec::len) != 1
+                        || outgoing.get(branch.id.as_str()).map_or(0, Vec::len) != 1 {
+                        bail!(EventGatewayProfileError { node_id: branch.id.clone(),
+                            reason: format!("event gateway child {} must have one incoming and outgoing flow",
+                                branch.id) });
+                    }
+                    if matches!(branch.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                        if let Some(boundary) = graph_nodes.iter().find(|candidate| match &candidate.kind {
+                            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+                            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+                            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+                            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } =>
+                                attached_to_id == &branch.id,
+                            _ => false,
+                        }) {
+                            bail!(EventGatewayProfileError { node_id: boundary.id.clone(),
+                                reason: format!("event gateway target ReceiveTask {} cannot have attached boundary {}",
+                                    branch.id, boundary.id) });
+                        }
+                    }
                 }
             }
             ProcessNodeKind::End | ProcessNodeKind::ErrorEnd { .. } | ProcessNodeKind::TerminateEnd => ensure!(
@@ -1197,6 +1220,20 @@ fn validate_body<'a>(
     validate_diagram(diagram, graph_nodes, graph_flows, &nodes, &flow_ids)?;
     Ok(())
 }
+
+#[derive(Debug)]
+pub(super) struct EventGatewayProfileError {
+    pub node_id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for EventGatewayProfileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for EventGatewayProfileError {}
 
 #[derive(Debug)]
 pub(super) struct EscalationPathError {
@@ -2114,6 +2151,114 @@ mod tests {
     }
 
     #[test]
+    fn event_race_accepts_receive_and_signal_but_refuses_message_mixing_attached_boundaries_and_extra_incoming() {
+        let mut model = starter_model();
+        model.target_namespace = Some("urn:orders".into());
+        model.timer_timezone = Some("UTC".into());
+        model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "Message_1".into(), name: "order.received".into(),
+        });
+        model.signals.push(tentaflow_protocol::processes::ProcessSignalDeclaration {
+            signal_id: "Signal_1".into(), namespace_uri: "urn:orders".into(),
+            name: "Order changed".into(),
+        });
+        model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+        model.variables.insert("received".into(), serde_json::Value::Null);
+        model.nodes.extend([
+            ProcessNode { id: "Race_1".into(), name: "First event".into(), repeat: None,
+                kind: ProcessNodeKind::EventBasedGateway },
+            ProcessNode { id: "Receive_1".into(), name: "Receive".into(), repeat: None,
+                kind: ProcessNodeKind::ReceiveTask {
+                    message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
+                } },
+            ProcessNode { id: "Signal_1_Catch".into(), name: "Signal".into(), repeat: None,
+                kind: ProcessNodeKind::SignalCatch { signal_ref: "Signal_1".into(),
+                    output_mapping: BTreeMap::from([("received".into(), "outputs".into())]) } },
+            ProcessNode { id: "Timer_1".into(), name: "Timeout".into(), repeat: None,
+                kind: ProcessNodeKind::TimerCatch {
+                    timer: ProcessTimerSpec::Duration { seconds: 60 },
+                } },
+        ]);
+        model.sequence_flows[0].target_id = "Race_1".into();
+        for (id, source, target) in [
+            ("To_Receive", "Race_1", "Receive_1"),
+            ("To_Signal", "Race_1", "Signal_1_Catch"),
+            ("To_Timer", "Race_1", "Timer_1"),
+            ("From_Receive", "Receive_1", "End_1"),
+            ("From_Signal", "Signal_1_Catch", "End_1"),
+            ("From_Timer", "Timer_1", "End_1"),
+        ] {
+            model.sequence_flows.push(ProcessSequenceFlow { id: id.into(),
+                source_id: source.into(), target_id: target.into(), condition: None });
+        }
+        validate_model(&model).unwrap();
+        let mut mixed = model.clone();
+        mixed.nodes.iter_mut().find(|node| node.id == "Timer_1").unwrap().kind =
+            ProcessNodeKind::MessageCatch { message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_key".into(), output_mapping: BTreeMap::new() };
+        mixed.timer_timezone = None;
+        for candidate in [mixed.clone(), {
+            mixed.sequence_flows.reverse();
+            mixed
+        }] {
+            let error = validate_model(&candidate).unwrap_err();
+            let profile = error.downcast_ref::<EventGatewayProfileError>().unwrap();
+            assert_eq!(profile.node_id, "Race_1");
+            assert!(profile.reason.contains("cannot mix ReceiveTask with MessageCatch"));
+        }
+        let mut attached = model.clone();
+        attached.nodes.push(ProcessNode { id: "Receive_Boundary".into(), name: "Deadline".into(),
+            repeat: None, kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Receive_1".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 30 },
+            } });
+        attached.sequence_flows.push(ProcessSequenceFlow { id: "Boundary_End".into(),
+            source_id: "Receive_Boundary".into(), target_id: "End_1".into(), condition: None });
+        let error = validate_model(&attached).unwrap_err();
+        let profile = error.downcast_ref::<EventGatewayProfileError>().unwrap();
+        assert_eq!(profile.node_id, "Receive_Boundary");
+        assert!(profile.reason.contains("cannot have attached boundary"));
+        let mut extra = model.clone();
+        extra.sequence_flows.push(ProcessSequenceFlow { id: "Extra_Receive".into(),
+            source_id: "Signal_1_Catch".into(), target_id: "Receive_1".into(), condition: None });
+        let error = validate_model(&extra).unwrap_err();
+        let profile = error.downcast_ref::<EventGatewayProfileError>().unwrap();
+        assert_eq!(profile.node_id, "Receive_1");
+        assert!(profile.reason.contains("must have one incoming and outgoing flow"));
+
+        let mut child_nodes = model.nodes.clone();
+        for node in &mut child_nodes {
+            if node.id == "Start_1" { node.id = "LocalStart".into(); }
+            if node.id == "End_1" { node.id = "LocalEnd".into(); }
+        }
+        let mut child_flows = model.sequence_flows.clone();
+        for flow in &mut child_flows {
+            if flow.id == "Flow_1" { flow.id = "LocalFlow_1".into(); }
+            if flow.source_id == "Start_1" { flow.source_id = "LocalStart".into(); }
+            if flow.target_id == "End_1" { flow.target_id = "LocalEnd".into(); }
+        }
+        let mut embedded = starter_model();
+        embedded.target_namespace = model.target_namespace.clone();
+        embedded.timer_timezone = model.timer_timezone.clone();
+        embedded.messages = model.messages.clone();
+        embedded.signals = model.signals.clone();
+        embedded.nodes.insert(1, ProcessNode { id: "Scope_1".into(), name: "Event scope".into(),
+            repeat: None, kind: ProcessNodeKind::SubProcess {
+                body: tentaflow_protocol::processes::ProcessSubProcess {
+                    nodes: child_nodes, sequence_flows: child_flows,
+                    variables: model.variables.clone(), diagram: ProcessDiagram::default(),
+                },
+                input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+            } });
+        embedded.sequence_flows[0].target_id = "Scope_1".into();
+        embedded.sequence_flows.push(ProcessSequenceFlow { id: "Scope_End".into(),
+            source_id: "Scope_1".into(), target_id: "End_1".into(), condition: None });
+        validate_model(&embedded).unwrap();
+    }
+
+    #[test]
     fn call_activity_and_error_end_require_exact_binding_and_closed_parallel_path() {
         use tentaflow_protocol::processes::{
             ProcessCallableReference, ProcessErrorDeclaration, ProcessNode, ProcessSequenceFlow,
@@ -2726,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn send_boundaries_require_a_nonrepeated_root_activity() {
+    fn send_boundaries_require_a_nonrepeated_supported_activity() {
         let mut model = starter_model();
         model.timer_timezone = Some("UTC".into());
         model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
@@ -2782,6 +2927,7 @@ mod tests {
         let mut embedded = embedded_model();
         embedded.timer_timezone = Some("UTC".into());
         embedded.messages = model.messages.clone();
+        embedded.variables = model.variables.clone();
         if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
             body.nodes[1].kind = model.nodes[2].kind.clone();
             body.nodes[1].repeat = None;
@@ -2789,13 +2935,117 @@ mod tests {
             body.nodes.push(ProcessNode { id: "Local_Timer".into(), name: "Deadline".into(), repeat: None,
                 kind: ProcessNodeKind::BoundaryTimer { attached_to_id: "Send_1".into(), cancel_activity: true,
                     timer: ProcessTimerSpec::Duration { seconds: 60 } } });
+            body.nodes.push(ProcessNode { id: "Local_Message".into(), name: "Reply".into(), repeat: None,
+                kind: ProcessNodeKind::BoundaryMessage { attached_to_id: "Send_1".into(), cancel_activity: false,
+                    message_ref: "Message_1".into(), correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::new() } });
             body.sequence_flows[0].target_id = "Send_1".into();
             body.sequence_flows[1].source_id = "Send_1".into();
-            body.sequence_flows.push(ProcessSequenceFlow { id: "Local_Timer_Flow".into(),
-                source_id: "Local_Timer".into(), target_id: "LocalEnd".into(), condition: None });
+            for (id, source_id) in [("Local_Timer_Flow", "Local_Timer"),
+                ("Local_Message_Flow", "Local_Message")] {
+                body.sequence_flows.push(ProcessSequenceFlow { id: id.into(),
+                    source_id: source_id.into(), target_id: "LocalEnd".into(), condition: None });
+            }
+        }
+        validate_model(&embedded).unwrap();
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
+            body.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
+                mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "results".into(),
+            });
         }
         let error = validate_draft(&embedded).unwrap_err();
-        assert!(error.to_string().contains("requires a root process"), "{error:#}");
+        assert!(error.to_string().contains("requires a UserTask or ServiceTask"), "{error:#}");
+    }
+
+    #[test]
+    fn manual_and_receive_waits_accept_nonrepeated_timer_and_message_boundaries_in_root_and_child() {
+        for kind in [
+            ProcessNodeKind::ManualTask { assignee_user_id: None,
+                instructions: "Complete the external check, then acknowledge it".into() },
+            ProcessNodeKind::ReceiveTask { message_ref: "Message_1".into(),
+                correlation_expression: "vars.case_key".into(),
+                output_mapping: BTreeMap::from([("received_payload".into(), "outputs".into())]) },
+        ] {
+            let mut model = starter_model();
+            model.timer_timezone = Some("UTC".into());
+            model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+                message_id: "Message_1".into(), name: "order.received".into(),
+            });
+            model.variables.insert("case_key".into(), serde_json::json!("case-1"));
+            model.variables.insert("received_payload".into(), serde_json::Value::Null);
+            model.variables.insert("boundary_payload".into(), serde_json::Value::Null);
+            model.nodes.push(ProcessNode { id: "Wait_1".into(), name: "External wait".into(),
+                repeat: None, kind: kind.clone() });
+            model.nodes.push(ProcessNode { id: "Boundary_Timer".into(), name: "Deadline".into(),
+                repeat: None, kind: ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: "Wait_1".into(), cancel_activity: true,
+                    timer: ProcessTimerSpec::Duration { seconds: 60 },
+                } });
+            model.nodes.push(ProcessNode { id: "Boundary_Message".into(), name: "Reply".into(),
+                repeat: None, kind: ProcessNodeKind::BoundaryMessage {
+                    attached_to_id: "Wait_1".into(), cancel_activity: false,
+                    message_ref: "Message_1".into(),
+                    correlation_expression: "vars.case_key".into(),
+                    output_mapping: BTreeMap::from([("boundary_payload".into(), "outputs".into())]),
+                } });
+            model.sequence_flows[0].target_id = "Wait_1".into();
+            for (id, source_id) in [("Flow_Wait", "Wait_1"),
+                ("Flow_Timer", "Boundary_Timer"), ("Flow_Message", "Boundary_Message")] {
+                model.sequence_flows.push(ProcessSequenceFlow { id: id.into(),
+                    source_id: source_id.into(), target_id: "End_1".into(), condition: None });
+            }
+            validate_model(&model).unwrap();
+            model.nodes[2].repeat = Some(ProcessRepeatSpec::MultiInstance {
+                mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "results".into(),
+            });
+            let error = validate_draft(&model).unwrap_err();
+            assert!(error.to_string().contains("requires a UserTask or ServiceTask"), "{error:#}");
+            model.nodes[2].repeat = None;
+            model.nodes[3].kind = ProcessNodeKind::BoundaryError {
+                attached_to_id: "Wait_1".into(), error_ref: None,
+                output_mapping: BTreeMap::new(),
+            };
+            model.timer_timezone = None;
+            validate_draft(&model).unwrap();
+            let error = validate_model(&model).unwrap_err();
+            assert!(error.to_string().contains("unsupported attachment"), "{error:#}");
+
+            let mut embedded = embedded_model();
+            embedded.timer_timezone = Some("UTC".into());
+            embedded.messages = model.messages.clone();
+            embedded.variables = model.variables.clone();
+            if let ProcessNodeKind::SubProcess { body, .. } = &mut embedded.nodes[1].kind {
+                body.variables.insert("case_key".into(), serde_json::json!("case-1"));
+                body.variables.insert("received_payload".into(), serde_json::Value::Null);
+                body.variables.insert("boundary_payload".into(), serde_json::Value::Null);
+                body.nodes[1].kind = kind;
+                body.nodes[1].id = "Local_Wait".into();
+                body.nodes.push(ProcessNode { id: "Local_Timer".into(), name: "Deadline".into(),
+                    repeat: None, kind: ProcessNodeKind::BoundaryTimer {
+                        attached_to_id: "Local_Wait".into(), cancel_activity: true,
+                        timer: ProcessTimerSpec::Duration { seconds: 60 },
+                    } });
+                body.nodes.push(ProcessNode { id: "Local_Message".into(), name: "Reply".into(),
+                    repeat: None, kind: ProcessNodeKind::BoundaryMessage {
+                        attached_to_id: "Local_Wait".into(), cancel_activity: false,
+                        message_ref: "Message_1".into(),
+                        correlation_expression: "vars.case_key".into(),
+                        output_mapping: BTreeMap::from([("boundary_payload".into(), "outputs".into())]),
+                    } });
+                body.sequence_flows[0].target_id = "Local_Wait".into();
+                body.sequence_flows[1].source_id = "Local_Wait".into();
+                for (id, source_id) in [("Local_Timer_Flow", "Local_Timer"),
+                    ("Local_Message_Flow", "Local_Message")] {
+                    body.sequence_flows.push(ProcessSequenceFlow { id: id.into(),
+                        source_id: source_id.into(), target_id: "LocalEnd".into(), condition: None });
+                }
+            }
+            validate_model(&embedded).unwrap();
+        }
     }
 
     #[test]

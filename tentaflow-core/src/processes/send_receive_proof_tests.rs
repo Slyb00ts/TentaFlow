@@ -5,7 +5,8 @@ use super::messages::{self, test_support::*};
 use super::repository::{self, MessageSelection, TerminationAttempt, VariableEffect};
 use super::runtime::{self, test_support::*};
 use serde_json::json;
-use tentaflow_protocol::processes::{ProcessInstanceStatus, ProcessNodeKind};
+use tentaflow_protocol::processes::{ProcessInstanceStatus, ProcessNodeKind,
+    ProcessSubscriptionKind, ProcessSubscriptionStatus};
 use uuid::Uuid;
 
 #[test]
@@ -76,6 +77,262 @@ fn send_task_rejects_omitted_or_forged_admission_before_canonical_commit() {
     repository::start_instance(&fixture.db, &fixture.owner, &command,
         &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_ne!(transition_rows(&fixture), before);
+}
+
+#[test]
+fn receive_or_its_message_boundary_requires_exact_own_subscription_fate() {
+    for receive_first in [true, false] {
+        let fixture = Fixture::new();
+        let version = publish_model(&fixture,
+            &super::send_receive_tests::receive_boundary_model(true, true));
+        let receiver = start_version(&fixture, &version);
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        let own = snapshot.subscriptions.iter().find(|sub|
+            sub.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+        let boundary = snapshot.subscriptions.iter().find(|sub|
+            sub.node_id == "ReceiveMessage").unwrap();
+        let selected_sub = if receive_first { own } else { boundary };
+        let message = envelope(catch_target(&version, Some(&receiver.instance_id),
+            Some(&selected_sub.subscription_id)), json!({"source":"real envelope"}));
+        let sent = send(&fixture, &message);
+        let at_ms = sent.received_at_ms;
+        let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap().into_iter()
+            .find(|row| row.key.message_id == message.message_id).unwrap();
+        let MessageSelection::Ready(prepared) =
+            repository::message_snapshot(&fixture.db, &candidate).unwrap()
+            else { panic!("the selected Receive path must be ready") };
+        let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+        assert_eq!(plan.subscription_updates.iter().filter(|update|
+            update.subscription_id == own.subscription_id
+                && update.status == if receive_first {
+                    ProcessSubscriptionStatus::Consumed
+                } else { ProcessSubscriptionStatus::Cancelled }).count(), 1);
+        let before = super::signal_proof_tests::all_transition_rows(&fixture);
+        for (case, forged) in [
+            ("missing own subscription update", {
+                let mut plan = plan.clone();
+                plan.subscription_updates.retain(|update|
+                    update.subscription_id != own.subscription_id);
+                plan
+            }),
+            ("foreign own subscription update", {
+                let mut plan = plan.clone();
+                plan.subscription_updates.iter_mut().find(|update|
+                    update.subscription_id == own.subscription_id).unwrap().subscription_id =
+                    Uuid::new_v4().to_string();
+                plan
+            }),
+            ("wrong envelope source", {
+                let mut plan = plan.clone();
+                plan.events.iter_mut().find(|event| event.kind == "message_delivered")
+                    .unwrap().data["message_id"] = json!(Uuid::new_v4().to_string());
+                plan
+            }),
+            ("wrong selected scope", {
+                let mut plan = plan.clone();
+                plan.events.iter_mut().find(|event| event.kind == "message_delivered")
+                    .unwrap().scope_id = Uuid::new_v4().to_string();
+                plan
+            }),
+            ("wrong source activation", {
+                let mut plan = plan.clone();
+                let index = plan.events.iter().position(|event|
+                    event.kind == "message_delivered").unwrap();
+                plan.event_sources.insert(index, Uuid::new_v4().to_string());
+                plan
+            }),
+            ("wrong activity completion", {
+                let mut plan = plan.clone();
+                if receive_first {
+                    plan.events.iter_mut().find(|event|
+                        event.kind == "receive_task_completed").unwrap()
+                        .data["subscription_id"] = json!(Uuid::new_v4().to_string());
+                } else {
+                    plan.events.push(super::repository::PlannedEvent {
+                        kind: "receive_task_completed".into(),
+                        scope_id: own.scope_id.clone(),
+                        node_id: Some(own.node_id.clone()),
+                        data: json!({"subscription_id":own.subscription_id,
+                            "attached_token_id":own.token_id,
+                            "message_id":message.message_id}),
+                    });
+                }
+                plan
+            }),
+        ] {
+            assert!(repository::deliver_message(&fixture.db, &prepared,
+                repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case}");
+            assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+                "{case}");
+        }
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        repository::deliver_message(&reopened, &prepared,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
+        let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+        assert!(repository::deliver_message(&reopened, &prepared,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+    }
+}
+
+#[test]
+fn interrupting_receive_timer_cancels_only_the_pinned_own_subscription() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture,
+        &super::send_receive_tests::receive_boundary_model(false, true));
+    let receiver = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let timer = snapshot.timers.iter().find(|row| row.node_id == "ReceiveTimer").unwrap();
+    let at_ms = timer.due_at_ms.unwrap() + 1;
+    let candidate = repository::due_timers(&fixture.db, at_ms, 32).unwrap().into_iter()
+        .find(|row| row.timer_id == timer.timer_id).unwrap();
+    let selected = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+    let plan = super::timers::plan_timer_fire(&selected, at_ms, None).unwrap();
+    assert_eq!(plan.subscription_updates.iter().filter(|update|
+        update.subscription_id == own.subscription_id
+            && update.status == ProcessSubscriptionStatus::Cancelled).count(), 1);
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("missing own cancellation", {
+            let mut plan = plan.clone();
+            plan.subscription_updates.retain(|update|
+                update.subscription_id != own.subscription_id);
+            plan
+        }),
+        ("foreign own cancellation", {
+            let mut plan = plan.clone();
+            plan.subscription_updates.iter_mut().find(|update|
+                update.subscription_id == own.subscription_id).unwrap().subscription_id =
+                Uuid::new_v4().to_string();
+            plan
+        }),
+        ("wrong timer UUID", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "timer_fired")
+                .unwrap().data["timer_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("wrong source scope", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "timer_fired")
+                .unwrap().scope_id = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("wrong timer source", {
+            let mut plan = plan.clone();
+            let index = plan.events.iter().position(|event|
+                event.kind == "timer_fired").unwrap();
+            plan.event_sources.insert(index, Uuid::new_v4().to_string());
+            plan
+        }),
+        ("fabricated Receive completion", {
+            let mut plan = plan.clone();
+            plan.events.push(repository::PlannedEvent {
+                scope_id: own.scope_id.clone(),
+                kind: "receive_task_completed".into(),
+                node_id: Some(own.node_id.clone()),
+                data: json!({"subscription_id":own.subscription_id,
+                    "attached_token_id":own.token_id,
+                    "message_id":Uuid::new_v4().to_string()}),
+            });
+            plan
+        }),
+    ] {
+        assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+            Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&forged),
+            at_ms).is_err(), "{case}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before, "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::fire_timer(&reopened, &candidate, &fixture.owner,
+        Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&plan),
+        at_ms).unwrap().unwrap();
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::fire_timer(&reopened, &candidate, &fixture.owner,
+        Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&plan),
+        at_ms).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
+}
+
+#[test]
+fn direct_receive_race_rejects_swapped_winner_loser_and_source_before_commit() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture,
+        &super::send_receive_tests::receive_race_model());
+    let receiver = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &receiver.instance_id).unwrap();
+    let own = snapshot.subscriptions.iter().find(|row|
+        row.kind == ProcessSubscriptionKind::ReceiveTask).unwrap();
+    let timer = snapshot.timers.iter().find(|row| row.node_id == "Timer_1").unwrap();
+    let message = envelope(catch_target(&version, Some(&receiver.instance_id),
+        Some(&own.subscription_id)), json!({"actual":true}));
+    let sent = send(&fixture, &message);
+    let at_ms = sent.received_at_ms;
+    let candidate = repository::due_messages(&fixture.db, at_ms, 32).unwrap().into_iter()
+        .find(|row| row.key.message_id == message.message_id).unwrap();
+    let MessageSelection::Ready(prepared) =
+        repository::message_snapshot(&fixture.db, &candidate).unwrap()
+        else { panic!("Receive winner requires its open branch") };
+    let plan = messages::plan_message_delivery(&prepared, at_ms, None).unwrap();
+    assert_eq!(plan.race_updates.len(), 1);
+    assert_eq!(plan.timer_updates.iter().filter(|update|
+        update.timer_id == timer.timer_id).count(), 1);
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("foreign race", {
+            let mut plan = plan.clone();
+            plan.race_updates[0].race_id = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("wrong winner subscription", {
+            let mut plan = plan.clone();
+            plan.race_updates[0].winner_subscription_id =
+                Some(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("missing loser timer closure", {
+            let mut plan = plan.clone();
+            plan.timer_updates.retain(|update| update.timer_id != timer.timer_id);
+            plan
+        }),
+        ("missing loser activation", {
+            let mut plan = plan.clone();
+            plan.cancel_token_ids.retain(|id|
+                Some(id.as_str()) != timer.token_id.as_deref());
+            plan
+        }),
+        ("foreign source event", {
+            let mut plan = plan.clone();
+            let index = plan.events.iter().position(|event|
+                event.kind == "message_delivered").unwrap();
+            plan.event_sources.insert(index, Uuid::new_v4().to_string());
+            plan
+        }),
+        ("missing Receive completion", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event|
+                event.kind == "receive_task_completed").unwrap().kind =
+                "node_completed".into();
+            plan
+        }),
+    ] {
+        assert!(repository::deliver_message(&fixture.db, &prepared,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before,
+            "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::deliver_message(&reopened, &prepared,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert!(repository::deliver_message(&reopened, &prepared,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
 }
 
 #[test]

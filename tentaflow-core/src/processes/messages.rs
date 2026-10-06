@@ -650,12 +650,91 @@ mod tests {
     use std::collections::BTreeMap;
     use crate::processes::runtime::{
         self,
-        test_support::{publish_model, stamp, user_model, Fixture},
+        test_support::{edge, publish_model, stamp, user_model, Fixture},
     };
     use tentaflow_protocol::processes::{
         ProcessEventRaceStatus as R, ProcessInstanceStatus as I, ProcessMessageStatus as M,
         ProcessSubscriptionStatus as S, ProcessTimerStatus as T,
     };
+
+    #[test]
+    fn committed_message_throw_outbox_survives_source_cancellation_until_delivery() {
+        let fixture = Fixture::new();
+        let target = published(&fixture, &receiving_model(false, false));
+        let receiver = start_version(&fixture, &target);
+        let mut source = crate::processes::model::starter_model();
+        source.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+            message_id: "ThrowDecl".into(), name: "EvidenceReady".into(),
+        });
+        source.nodes.insert(1, tentaflow_protocol::processes::ProcessNode {
+            id: "Throw".into(), name: "Admit evidence".into(), repeat: None,
+            kind: ProcessNodeKind::MessageThrow {
+                message_ref: "ThrowDecl".into(),
+                target: ProcessMessageTargetSpec::Catch {
+                    definition_id: target.definition_id.clone(),
+                    instance_id_expression: Some(format!("'{}'", receiver.instance_id)),
+                    subscription_id_expression: None,
+                },
+                correlation_expression: "'case-1'".into(),
+                payload_expression: "null".into(), ttl_seconds: 120,
+            },
+        });
+        source.nodes.insert(2, tentaflow_protocol::processes::ProcessNode {
+            id: "Wait".into(), name: "Wait after admission".into(), repeat: None,
+            kind: ProcessNodeKind::UserTask {
+                assignee_user_id: None, output_mapping: BTreeMap::new(),
+            },
+        });
+        source.sequence_flows = vec![
+            edge("ToThrow", "Start_1", "Throw"),
+            edge("ToWait", "Throw", "Wait"),
+            edge("WaitEnd", "Wait", "End_1"),
+        ];
+        let version = published(&fixture, &source);
+        let started = start_version(&fixture, &version);
+        assert_eq!(started.status, I::Waiting);
+        let events = repository::list_events(&fixture.db, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        let admitted = events.iter().find(|event| event.kind == "message_queued"
+            && event.node_id.as_deref() == Some("Throw")).unwrap();
+        let message_id = admitted.data["message_id"].as_str().unwrap();
+        let pending = repository::get_message(&fixture.db, &fixture.owner,
+            &fixture.owner.user_id, message_id).unwrap().message;
+        assert_eq!(pending.status, M::Pending);
+        let pending_budget = |pool: &crate::db::DbPool| -> (i64, i64, i64, i64) {
+            pool.read().unwrap().query_row(
+                "SELECT COALESCE(SUM(sender_user_id=?2),0),
+                        COALESCE(SUM(CASE WHEN sender_user_id=?2 THEN payload_bytes ELSE 0 END),0),
+                        COUNT(*),COALESCE(SUM(payload_bytes),0)
+                 FROM bpmn_messages WHERE org_id=?1
+                   AND status IN ('pending','blocked','ambiguous')",
+                rusqlite::params![fixture.owner.org_id, fixture.owner.user_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap()
+        };
+        assert_eq!(pending_budget(&fixture.db), (1, 4, 1, 4));
+        let cancelled = repository::cancel_instance(&fixture.db, &fixture.owner,
+            &stamp("cancel committed throw source"), &started.instance_id,
+            started.revision).unwrap();
+        assert_eq!(cancelled.instance.status, I::Cancelled);
+        assert_eq!(pending_budget(&fixture.db), (1, 4, 1, 4));
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::get_message(&reopened, &fixture.owner,
+            &fixture.owner.user_id, message_id).unwrap().message.status, M::Pending);
+        assert_eq!(pending_budget(&reopened), (1, 4, 1, 4));
+        let drained = drain_pending(&reopened, chrono::Utc::now().timestamp_millis());
+        drained.completion.unwrap();
+        assert_eq!(drained.delivered, 1);
+        assert_eq!(repository::get_message(&reopened, &fixture.owner,
+            &fixture.owner.user_id, message_id).unwrap().message.status, M::Delivered);
+        assert_eq!(pending_budget(&reopened), (0, 0, 0, 0));
+        assert_eq!(repository::get_instance(&reopened, &fixture.owner,
+            &receiver.instance_id, None).unwrap().status, I::Completed);
+        let after = repository::list_events(&reopened, &fixture.owner,
+            &started.instance_id, 0, 200).unwrap().0;
+        assert_eq!(after.iter().filter(|event| event.kind == "message_queued"
+            && event.event_id == admitted.event_id).count(), 1);
+    }
 
     #[test]
     fn unmatched_retries_preserve_public_receipt_and_cancel_fences_stale_internal_candidates() {
@@ -1079,7 +1158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_throw_rechecks_pinned_source_acl_at_enqueue_and_delivery_without_effect_replay(
+    async fn process_throw_checks_source_access_before_enqueue_and_retains_admission_after_revoke(
     ) {
         use crate::processes::runtime::test_support::{edge, flow, graph, service_model};
         use tentaflow_protocol::processes::{
@@ -1248,102 +1327,18 @@ mod tests {
             "deny",
         )
         .unwrap();
-        let receiver_ready = complete(
+        complete(
             &f,
             &receiver.instance_id,
             &receiver.user_tasks[0].user_task_id,
         );
-        let blocked = drain_pending(&f.db, at + 1);
-        blocked.completion.unwrap();
-        assert_eq!(blocked.delivered, 0);
-        let receipt =
-            repository::get_message(&f.db, &f.owner, &f.owner.user_id, &message_id).unwrap();
-        assert_eq!(receipt.message.status, M::Blocked);
-        assert_eq!(receipt.payload, Some(json!({"customer_ID": 17})));
-        let source_events = repository::list_events(&f.db, &f.owner, &source.instance_id, 0, 100)
-            .unwrap()
-            .0;
-        assert_eq!(
-            source_events
-                .iter()
-                .filter(|event| event.kind == "message_blocked")
-                .count(),
-            1
-        );
-        drain_pending(&f.db, at + 59_000).completion.unwrap();
-        assert_eq!(
-            repository::get_message(&f.db, &f.owner, &f.owner.user_id, &message_id)
-                .unwrap()
-                .message
-                .revision,
-            receipt.message.revision
-        );
-        let waiting =
-            repository::get_instance(&f.db, &f.owner, &receiver.instance_id, None).unwrap();
-        assert_eq!(waiting.revision, receiver_ready.revision);
-        assert_eq!(waiting.subscriptions[0].status, S::Open);
         assert_eq!(
             crate::db::repository::list_flow_executions_for_flow(&f.db, &flow_id, 10)
                 .unwrap()
                 .len(),
             1
         );
-        crate::db::repository::resource_permissions::set(
-            &f.db,
-            "flow",
-            &flow_id,
-            "user",
-            &f.owner.user_id,
-            "allow",
-        )
-        .unwrap();
-        let candidate = repository::due_messages(&f.db, at + 60_002, 32)
-            .unwrap()
-            .remove(0);
-        let MessageSelection::Ready(prepared) =
-            repository::message_snapshot(&f.db, &candidate).unwrap()
-        else {
-            panic!("actual restored source message is ready");
-        };
-        let delivery_plan = plan_message_delivery(&prepared, at + 60_002, None).unwrap();
-        crate::db::repository::resource_permissions::set(
-            &f.db,
-            "flow",
-            &flow_id,
-            "user",
-            &f.owner.user_id,
-            "deny",
-        )
-        .unwrap();
-        assert!(
-            repository::deliver_message(&f.db, &prepared, repository::ProcessPlanInput::Supplied(&delivery_plan), at + 60_002)
-                .unwrap_err()
-                .downcast_ref::<repository::ProcessAuthorityDenied>()
-                .is_some()
-        );
-        assert_eq!(
-            repository::get_instance(&f.db, &f.owner, &receiver.instance_id, None)
-                .unwrap()
-                .revision,
-            receiver_ready.revision
-        );
-        assert_eq!(
-            repository::get_message(&f.db, &f.owner, &f.owner.user_id, &message_id)
-                .unwrap()
-                .message
-                .revision,
-            receipt.message.revision
-        );
-        crate::db::repository::resource_permissions::set(
-            &f.db,
-            "flow",
-            &flow_id,
-            "user",
-            &f.owner.user_id,
-            "allow",
-        )
-        .unwrap();
-        let delivered = drain_pending(&f.db, at + 60_002);
+        let delivered = drain_pending(&f.db, at + 1);
         delivered.completion.unwrap();
         assert_eq!(delivered.delivered, 1);
         assert_eq!(
@@ -1357,6 +1352,12 @@ mod tests {
             repository::get_instance(&f.db, &f.owner, &receiver.instance_id, None).unwrap();
         assert_eq!(received.status, I::Completed);
         assert_eq!(received.variables["received"], json!({"customer_ID": 17}));
+        let source_events = repository::list_events(&f.db, &f.owner, &source.instance_id, 0, 100)
+            .unwrap().0;
+        assert_eq!(source_events.iter().filter(|event| event.kind == "message_queued"
+            && event.data["message_id"].as_str() == Some(message_id.as_str())).count(), 1);
+        assert_eq!(source_events.iter().filter(|event| event.kind == "message_delivered"
+            && event.data["message_id"].as_str() == Some(message_id.as_str())).count(), 1);
         assert_eq!(
             repository::get_instance(&f.db, &f.owner, &source.instance_id, None)
                 .unwrap()

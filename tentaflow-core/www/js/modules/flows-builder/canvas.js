@@ -462,7 +462,7 @@ export class FlowCanvas {
         if (processBoundaryKind(node.type)) {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
           if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
-            || (this.processPath.length === 0 && parent.type === 'bpmn_send_task' && !parent.repeat))) {
+            || (['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type) && !parent.repeat))) {
             errors.push(I18n.t('bpmn.boundary_required'));
           }
           if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
@@ -485,8 +485,26 @@ export class FlowCanvas {
       for (const node of this.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_message')) {
         const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
         if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
-          || (this.processPath.length === 0 && parent.type === 'bpmn_send_task' && !parent.repeat))) {
+          || (['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type) && !parent.repeat))) {
           errors.push(I18n.t('bpmn.boundary_required'));
+        }
+      }
+      for (const gateway of this.nodes.filter((candidate) => candidate.type === 'bpmn_event_based_gateway')) {
+        const branches = this.edges.filter((edge) => edge.from_node === gateway.id)
+          .map((edge) => this.nodes.find((node) => node.id === edge.to_node)).filter(Boolean);
+        if (branches.some((node) => node.type === 'bpmn_receive_task')
+          && branches.some((node) => node.type === 'bpmn_message_catch')) {
+          errors.push(I18n.t('bpmn.event_gateway_receive_message_mix', { node: gateway.label || gateway.id }));
+        }
+        for (const branch of branches) {
+          if (this.edges.filter((edge) => edge.to_node === branch.id).length !== 1
+            || this.edges.filter((edge) => edge.from_node === branch.id).length !== 1) {
+            errors.push(I18n.t('bpmn.event_gateway_branch_incoming', { node: branch.label || branch.id }));
+          }
+          if (branch.type === 'bpmn_receive_task'
+            && this.nodes.some((node) => processBoundaryKind(node.type) && node.config.attachedToId === branch.id)) {
+            errors.push(I18n.t('bpmn.event_gateway_receive_boundary', { node: branch.label || branch.id }));
+          }
         }
       }
       return errors;
@@ -807,7 +825,8 @@ export class FlowCanvas {
 
   _positionBoundary(node) {
     const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
-    if (!parent || !['bpmn_user_task', 'bpmn_manual_task', 'bpmn_service_task', 'bpmn_send_task', 'bpmn_receive_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)) return;
+    if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity',
+      'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type)) return;
     const ports = [this._getPortWorldPos(parent.id, 'in', 'in'), this._getPortWorldPos(parent.id, 'full', 'out')];
     const clearsPorts = (x, y) => ports.every((port) => Math.hypot(x - port.x, y - port.y) >= Math.max(node.width, node.height) / 2 + 16);
     const centerX = node.x + node.width / 2;
@@ -1269,6 +1288,8 @@ export class FlowCanvas {
     const nodeRects = this.nodes.map((node) => ({
       left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
     }));
+    const attachedParents = new Set(this.nodes.filter((node) => processBoundaryKind(node.type))
+      .map((node) => node.config.attachedToId));
     const labels = [];
     for (const node of this.nodes) {
       const element = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
@@ -1276,7 +1297,8 @@ export class FlowCanvas {
       if (!label) continue;
       const title = element.querySelector('.fb-process-symbol > span');
       element.classList.remove('fb-external-label');
-      const outside = !title || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
+      const outside = !title || attachedParents.has(node.id)
+        || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
       element.classList.toggle('fb-external-label', outside && !!title);
       label.hidden = !outside;
       const leader = element.querySelector('.fb-process-label-leader');

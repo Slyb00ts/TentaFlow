@@ -979,90 +979,74 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
         .clone();
     let mut outer_variables = original.scope_variables[&outer_scope_id].clone();
     outer_variables["inner_answer"] = json!("completed");
-    let mut expansion = RuntimePlan::initial(initial.variables.clone());
-    expansion.status = initial.status.clone();
-    for _ in 0..126 {
-        let scope_id = Uuid::new_v4().to_string();
-        let parent_token_id = Uuid::new_v4().to_string();
-        let end_token_id = Uuid::new_v4().to_string();
-        expansion.create_tokens.push(ProcessToken {
-            token_id: parent_token_id.clone(),
-            scope_id: initial.instance_id.clone(),
-            node_id: "Outer".into(),
-            arrival_edge_id: None,
-            fork_stack: Vec::new(),
-            status: "waiting".into(),
-        });
-        expansion.create_tokens.push(ProcessToken {
-            token_id: end_token_id.clone(),
-            scope_id: scope_id.clone(),
-            node_id: "OuterEnd".into(),
-            arrival_edge_id: Some("OuterFlow2".into()),
-            fork_stack: Vec::new(),
-            status: "ready".into(),
-        });
-        expansion.create_scopes.push(PlannedScope {
-            scope_id: scope_id.clone(),
-            parent_scope_id: initial.instance_id.clone(),
-            parent_token_id: parent_token_id.clone(),
-            subprocess_node_id: "Outer".into(),
-            variables: outer_variables.clone(),
-        });
-        expansion.events.push(PlannedEvent {
-            scope_id: scope_id.clone(),
-            kind: "scope_entered".into(),
-            node_id: None,
-            data: json!({"scope_id":scope_id,"parent_scope_id":initial.instance_id.clone(),
-                "parent_token_id":parent_token_id,"subprocess_node_id":"Outer"}),
-        });
-        expansion.events.push(PlannedEvent {
-            scope_id: scope_id.clone(),
-            kind: "end_reached".into(),
-            node_id: Some("OuterEnd".into()),
-            data: Value::Null,
-        });
-        expansion.events.push(PlannedEvent {
-            scope_id: scope_id.clone(),
-            kind: "scope_completed".into(),
-            node_id: None,
-            data: json!({"scope_id":scope_id,"parent_scope_id":initial.instance_id.clone(),
-                "parent_token_id":parent_token_id,"subprocess_node_id":"Outer"}),
-        });
-        expansion.consume_token_ids.push(parent_token_id);
-        expansion.consume_token_ids.push(end_token_id);
-        expansion.scope_updates.push(ScopeUpdate {
-            scope_id,
-            expected_revision: 1,
-            status: ProcessInstanceStatus::Completed,
-            variables: None,
-        });
+    // This isolated history supplies the retained threshold, not a claimed public transition.
+    let ready_token_id = Uuid::new_v4().to_string();
+    let history_at_ms = initial.updated_at_ms + 1;
+    {
+        let mut conn = fixture.db.write().unwrap();
+        let tx = conn.transaction().unwrap();
+        let mut seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM bpmn_events WHERE instance_id=?1",
+            [&initial.instance_id],
+            |row| row.get(0),
+        ).unwrap();
+        let variables_json = serde_json::to_string(&outer_variables).unwrap();
+        for _ in 0..126 {
+            let scope_id = Uuid::new_v4().to_string();
+            let parent_token_id = Uuid::new_v4().to_string();
+            let end_token_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?2,'Outer','RootFlow1','[]','consumed',?3)",
+                rusqlite::params![parent_token_id, initial.instance_id, history_at_ms],
+            ).unwrap();
+            tx.execute(
+                "INSERT INTO bpmn_scopes(scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms) VALUES(?1,?2,?2,'Outer',?3,2,'completed',?4,?5,?5)",
+                rusqlite::params![scope_id, initial.instance_id, parent_token_id, variables_json, history_at_ms],
+            ).unwrap();
+            tx.execute(
+                "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?3,'OuterEnd','OuterFlow2','[]','consumed',?4)",
+                rusqlite::params![end_token_id, initial.instance_id, scope_id, history_at_ms],
+            ).unwrap();
+            let scope_data = json!({"scope_id":scope_id,"parent_scope_id":initial.instance_id,
+                "parent_token_id":parent_token_id,"subprocess_node_id":"Outer"});
+            for (kind, node_id, data) in [
+                ("scope_entered", None, scope_data.clone()),
+                ("end_reached", Some("OuterEnd"), Value::Null),
+                ("scope_completed", None, scope_data),
+            ] {
+                seq += 1;
+                tx.execute(
+                    "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    rusqlite::params![Uuid::new_v4().to_string(), initial.instance_id, scope_id,
+                        seq, history_at_ms, kind, node_id, fixture.owner.user_id,
+                        serde_json::to_string(&data).unwrap()],
+                ).unwrap();
+            }
+        }
+        tx.execute(
+            "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?2,'Outer','RootFlow1','[]','ready',?3)",
+            rusqlite::params![ready_token_id, initial.instance_id, history_at_ms],
+        ).unwrap();
+        let foreign_keys: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(foreign_keys, 0, "retained history must satisfy every foreign key");
+        tx.commit().unwrap();
     }
-    expansion.create_tokens.push(ProcessToken {
-        token_id: Uuid::new_v4().to_string(),
-        scope_id: initial.instance_id.clone(),
-        node_id: "Outer".into(),
-        arrival_edge_id: None,
-        fork_stack: Vec::new(),
-        status: "ready".into(),
-    });
-    let expanded = repository::apply_transition(
-        &fixture.db,
-        &fixture.owner,
-        &initial.instance_id,
-        initial.revision,
-        repository::ProcessPlanInput::Supplied(&expansion),
-        2_000,
-    )
-    .unwrap()
-    .instance;
     let snapshot =
         repository::runtime_snapshot(&fixture.db, &fixture.owner, &initial.instance_id).unwrap();
     assert_eq!(snapshot.scopes.len(), 129);
-    let plan = runtime::plan_advance(&snapshot, 3_000, None).unwrap();
+    assert_eq!(snapshot.retained_scope_count, 129);
+    assert_eq!(snapshot.instance.revision, initial.revision);
+    assert!(original.scopes.iter().all(|scope| snapshot.scopes.contains(scope)));
+    assert!(snapshot.tokens.iter().any(|token| token.token_id == ready_token_id
+        && token.scope_id == initial.instance_id && token.status == "ready"));
+    let plan = runtime::plan_advance(&snapshot, history_at_ms + 1, None).unwrap();
     assert!(plan
         .add_incidents
         .iter()
         .any(|incident| incident.code == "SCOPE_LIMIT"));
+    let failed_index = plan.events.iter().position(|event| event.kind == "scope_entry_failed").unwrap();
     let failed = plan
         .events
         .iter()
@@ -1076,13 +1060,24 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
             && token.scope_id == initial.instance_id
             && token.node_id == "Outer"
             && token.status == "waiting"));
+    let before_forgery = super::signal_proof_tests::all_transition_rows(&fixture);
+    let events_before = event_count(&fixture, &initial.instance_id);
+    let mut forged = plan.clone();
+    forged.event_sources.insert(failed_index, ready_token_id.clone());
+    let error = repository::apply_transition(
+        &fixture.db, &fixture.owner, &initial.instance_id, initial.revision,
+        repository::ProcessPlanInput::Supplied(&forged), history_at_ms + 1,
+    ).unwrap_err();
+    assert!(error.to_string().contains("termination history has an extra or missing token action source"),
+        "{error:#}");
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before_forgery);
     let result = repository::apply_transition(
         &fixture.db,
         &fixture.owner,
         &initial.instance_id,
-        expanded.revision,
+        initial.revision,
         repository::ProcessPlanInput::Supplied(&plan),
-        3_000,
+        history_at_ms + 1,
     )
     .unwrap()
     .instance;
@@ -1100,12 +1095,31 @@ fn scope_lifetime_limit_records_an_incident_and_retains_the_waiting_parent_activ
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(persisted, (initial.instance_id, "waiting".into()));
-    assert!(event_count(&fixture, &result.instance_id) > 0);
+    assert_eq!(persisted, (initial.instance_id.clone(), "waiting".into()));
+    let retained_scopes: i64 = fixture.db.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_scopes WHERE instance_id=?1",
+        [&initial.instance_id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(retained_scopes, 129);
+    assert_eq!(result.incidents.iter().filter(|incident| incident.code == "SCOPE_LIMIT").count(), 1);
+    assert_eq!(event_count(&fixture, &result.instance_id), events_before + plan.events.len() as i64);
+    let committed = super::signal_proof_tests::all_transition_rows(&fixture);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let durable = repository::runtime_snapshot(&reopened, &fixture.owner, &initial.instance_id).unwrap();
+    assert_eq!(durable.retained_scope_count, 129);
+    assert!(durable.tokens.iter().any(|token| token.token_id == retained_token
+        && token.status == "waiting"));
+    let stale = repository::apply_transition(
+        &reopened, &fixture.owner, &initial.instance_id, initial.revision,
+        repository::ProcessPlanInput::Supplied(&plan), history_at_ms + 1,
+    ).unwrap_err();
+    assert!(stale.to_string().contains("process instance revision conflict or closed instance"),
+        "{stale:#}");
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), committed);
 }
 
 #[test]
-fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_facts() {
+fn interrupted_ancestor_retains_completed_descendant_outbox_until_delivery() {
     let fixture = Fixture::new();
     let receiver = publish_model(&fixture, &message_support::receiving_model(true, false));
     let mut pending_receiver_model = message_support::receiving_model(true, false);
@@ -1147,6 +1161,11 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
     assert_eq!(pending.status, ProcessMessageStatus::Pending);
     assert_eq!(pending.source_scope_id.as_deref(), Some(inner_id.as_str()));
     let pending_id = pending.message_id.clone();
+    let pending_digest = pending.payload_sha256.clone();
+    let pending_bytes = pending.payload_bytes;
+    let pending_source = repository::list_events(&fixture.db, &fixture.owner,
+        &waiting.instance_id, 0, 100).unwrap().0.into_iter().find(|event|
+        event.kind == "message_queued" && event.data["message_id"] == pending_id).unwrap();
     let first_at_ms = chrono::Utc::now().timestamp_millis();
     let deliver_candidate = repository::due_messages(&fixture.db, first_at_ms, 32)
         .unwrap()
@@ -1211,22 +1230,33 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
             .1,
         before_detail.1
     );
-    let cancelled = repository::get_message(
+    let retained = repository::get_message(
         &fixture.db,
         &fixture.owner,
         &fixture.owner.user_id,
         &pending_id,
     )
     .unwrap();
-    assert_eq!(cancelled.message.status, ProcessMessageStatus::Cancelled);
+    assert_eq!(retained.message.status, ProcessMessageStatus::Pending);
+    assert_eq!(retained.message.last_reason, None);
     assert_eq!(
-        cancelled.message.last_reason.as_deref(),
-        Some("scope_cancelled")
-    );
-    assert_eq!(
-        cancelled.message.source_scope_id.as_deref(),
+        retained.message.source_scope_id.as_deref(),
         Some(inner_id.as_str())
     );
+    assert_eq!(retained.message.payload_sha256, pending_digest);
+    assert_eq!(retained.message.payload_bytes, pending_bytes);
+    assert_eq!(retained.message.target, pending.target);
+    assert_eq!(retained.message.message_name, pending.message_name);
+    assert_eq!(retained.message.correlation_key, pending.correlation_key);
+    let pending_budget: (i64, i64) = fixture.db.read().unwrap().query_row(
+        "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+         WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+        [&fixture.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(pending_budget, (1, i64::from(pending_bytes)));
+    let retained_source: String = fixture.db.read().unwrap().query_row(
+        "SELECT source_event_id FROM bpmn_messages WHERE message_id=?1",
+        [&pending_id], |row| row.get(0)).unwrap();
+    assert_eq!(retained_source, pending_source.event_id);
     let after_events =
         repository::list_events(&fixture.db, &fixture.owner, &waiting.instance_id, 0, 100)
             .unwrap()
@@ -1260,13 +1290,8 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
             .count(),
         1
     );
-    assert_eq!(
-        after_events
-            .iter()
-            .filter(|event| event.kind == "message_cancelled" && event.scope_id == inner_id)
-            .count(),
-        1
-    );
+    assert_eq!(after_events.iter().filter(|event| event.kind == "message_cancelled"
+        && event.data["message_id"] == pending_id).count(), 0);
     assert_eq!(
         after_events
             .iter()
@@ -1274,6 +1299,35 @@ fn interrupted_ancestor_retracts_completed_descendant_outbox_without_erasing_fac
             .count(),
         1
     );
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let delivered = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis());
+    delivered.completion.unwrap();
+    assert_eq!(delivered.delivered, 1);
+    let receipt = repository::get_message(&reopened, &fixture.owner,
+        &fixture.owner.user_id, &pending_id).unwrap().message;
+    assert_eq!(receipt.status, ProcessMessageStatus::Delivered);
+    assert_eq!(receipt.payload_sha256, pending_digest);
+    assert_eq!(receipt.payload_bytes, pending_bytes);
+    assert_eq!(receipt.target, pending.target);
+    assert_eq!(receipt.message_name, pending.message_name);
+    assert_eq!(receipt.correlation_key, pending.correlation_key);
+    let cleared_budget: (i64, i64) = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+         WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+        [&fixture.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(cleared_budget, (0, 0));
+    assert_eq!(receipt.matched_version, Some(pending_receiver.version));
+    let recipients = repository::list_instances(&reopened, &fixture.owner,
+        Some(&pending_receiver.definition_id), 0, 10).unwrap().0;
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(receipt.matched_instance_id.as_deref(),
+        Some(recipients[0].instance_id.as_str()));
+    assert_eq!(messages::drain_pending(&reopened,
+        chrono::Utc::now().timestamp_millis()).delivered, 0);
+    let final_events = repository::list_events(&reopened, &fixture.owner,
+        &waiting.instance_id, 0, 100).unwrap().0;
+    assert_eq!(final_events.iter().filter(|event| event.kind == "message_delivered"
+        && event.data["message_id"] == pending_id && event.scope_id == inner_id).count(), 1);
 }
 
 #[test]
@@ -3271,7 +3325,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
     assert!(actual.user_tasks.iter().all(|task| task.status == ProcessUserTaskStatus::Cancelled));
     let queued = actual.instance.outgoing_messages.iter().find(|message|
         message.source_node_id.as_deref() == Some("RootThrow")).unwrap();
-    assert_eq!(queued.status, ProcessMessageStatus::Cancelled);
+    assert_eq!(queued.status, ProcessMessageStatus::Pending);
     let history = repository::list_events(&reopened, &fixture.owner, &instance_id, 0, 200).unwrap().0;
     let source = history.iter().find(|event| event.kind == "terminate_end_reached").unwrap();
     assert_eq!(history.iter().filter(|event| event.kind == "timer_cancelled"
@@ -3284,7 +3338,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
     assert_eq!(history.iter().filter(|event| event.kind == "message_queued"
         && event.node_id.as_deref() == Some("RootThrow")).count(), 1);
     assert_eq!(history.iter().filter(|event| event.kind == "message_cancelled"
-        && event.data["source_event_id"] == source.event_id).count(), 1);
+        && event.data["message_id"] == queued.message_id).count(), 0);
     assert!(repository::list_instances(&reopened, &fixture.owner, Some(&receiver.definition_id),
         0, 10).unwrap().0.is_empty());
     let committed_rows = super::call_tests::transition_rows(&fixture);
@@ -3292,6 +3346,42 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap(), committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
+    let queued_source = history.iter().find(|event| event.kind == "message_queued"
+        && event.data["message_id"] == queued.message_id).unwrap();
+    let persisted_source: String = reopened.read().unwrap().query_row(
+        "SELECT source_event_id FROM bpmn_messages WHERE message_id=?1",
+        [&queued.message_id], |row| row.get(0)).unwrap();
+    assert_eq!(persisted_source, queued_source.event_id);
+    let pending_budget: (i64, i64) = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+         WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+        [&fixture.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(pending_budget, (1, i64::from(queued.payload_bytes)));
+    let delivery = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis());
+    delivery.completion.unwrap();
+    assert_eq!(delivery.delivered, 1);
+    let receipt = repository::get_message(&reopened, &fixture.owner,
+        &fixture.owner.user_id, &queued.message_id).unwrap().message;
+    assert_eq!(receipt.status, ProcessMessageStatus::Delivered);
+    assert_eq!(receipt.payload_sha256, queued.payload_sha256);
+    assert_eq!(receipt.payload_bytes, queued.payload_bytes);
+    assert_eq!(receipt.target, queued.target);
+    assert_eq!(receipt.message_name, queued.message_name);
+    assert_eq!(receipt.correlation_key, queued.correlation_key);
+    let cleared_budget: (i64, i64) = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM bpmn_messages
+         WHERE org_id=?1 AND status IN ('pending','blocked','ambiguous')",
+        [&fixture.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(cleared_budget, (0, 0));
+    assert_eq!(repository::list_instances(&reopened, &fixture.owner,
+        Some(&receiver.definition_id), 0, 10).unwrap().0.len(), 1);
+    let final_history = repository::list_events(&reopened, &fixture.owner,
+        &instance_id, 0, 200).unwrap().0;
+    assert_eq!(final_history.iter().filter(|event| event.kind == "message_delivered"
+        && event.data["message_id"] == queued.message_id).count(), 1);
+    let second = messages::drain_pending(&reopened, chrono::Utc::now().timestamp_millis());
+    second.completion.unwrap();
+    assert_eq!(second.delivered, 0);
 }
 
 #[test]

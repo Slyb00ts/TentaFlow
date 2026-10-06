@@ -21,6 +21,99 @@ pub(super) fn all_transition_rows(fixture: &Fixture) -> Vec<Vec<Vec<rusqlite::ty
     rows
 }
 
+#[test]
+fn signal_race_requires_exact_fenced_receipt_winner_and_loser_closure() {
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture,
+        &super::signal_tests::signal_timer_race_model());
+    let recipient = start_version(&fixture, &version);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &recipient.instance_id).unwrap();
+    let catch = snapshot.subscriptions.iter().find(|row|
+        row.node_id == "Catch_1").unwrap();
+    let timer = snapshot.timers.iter().find(|row|
+        row.node_id == "Timer_1").unwrap();
+    let emitter = publish_model(&fixture,
+        &super::signal_tests::signal_throw_model());
+    start_version(&fixture, &emitter);
+    let at_ms = chrono::Utc::now().timestamp_millis() + 10;
+    let receipt_id = repository::due_signal_receipts(&fixture.db, at_ms).unwrap()
+        .into_iter().next().unwrap();
+    let claim = repository::claim_signal_receipt(&fixture.db, &receipt_id, at_ms)
+        .unwrap().unwrap();
+    let input = repository::AcceptedInputRef::Signal {
+        signal_id: claim.signal_id.clone(),
+        receipt_id: claim.receipt_id.clone(),
+        expected_receipt_revision: claim.revision,
+        claim_fence: claim.fence.clone(),
+        target_subscription_id: claim.subscription.subscription_id.clone(),
+        expected_subscription_revision: claim.subscription.revision,
+    };
+    let plan = runtime::plan_signal_catch(&claim.snapshot, &claim.subscription,
+        &claim.payload, &claim.signal_id, &claim.source_event_id,
+        at_ms, input, None).unwrap();
+    assert_eq!(plan.race_updates.len(), 1);
+    assert_eq!(plan.race_updates[0].winner_subscription_id.as_deref(),
+        Some(catch.subscription_id.as_str()));
+    assert!(plan.timer_updates.iter().any(|update| update.timer_id == timer.timer_id));
+    let before = all_transition_rows(&fixture);
+    for (case, forged) in [
+        ("foreign race", {
+            let mut plan = plan.clone();
+            plan.race_updates[0].race_id = Uuid::new_v4().to_string();
+            plan
+        }),
+        ("foreign winner subscription", {
+            let mut plan = plan.clone();
+            plan.race_updates[0].winner_subscription_id =
+                Some(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("omitted timer loser", {
+            let mut plan = plan.clone();
+            plan.timer_updates.retain(|update| update.timer_id != timer.timer_id);
+            plan
+        }),
+        ("omitted loser token", {
+            let mut plan = plan.clone();
+            plan.cancel_token_ids.retain(|id|
+                Some(id.as_str()) != timer.token_id.as_deref());
+            plan
+        }),
+        ("forged admitted source event", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "signal_received")
+                .unwrap().data["source_event_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("forged receipt subscription", {
+            let mut plan = plan.clone();
+            plan.events.iter_mut().find(|event| event.kind == "signal_received")
+                .unwrap().data["subscription_id"] = json!(Uuid::new_v4().to_string());
+            plan
+        }),
+        ("extra winner continuation", {
+            let mut plan = plan.clone();
+            let mut extra = plan.create_tokens.iter().find(|token|
+                token.node_id == "End_1").unwrap().clone();
+            extra.token_id = Uuid::new_v4().to_string();
+            plan.create_tokens.push(extra);
+            plan
+        }),
+    ] {
+        assert!(repository::deliver_signal_receipt(&fixture.db, &claim,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case}");
+        assert_eq!(all_transition_rows(&fixture), before, "{case}");
+    }
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    repository::deliver_signal_receipt(&reopened, &claim,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().unwrap();
+    let committed = all_transition_rows(&fixture);
+    assert!(repository::deliver_signal_receipt(&reopened, &claim,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().is_none());
+    assert_eq!(all_transition_rows(&fixture), committed);
+}
+
 fn mixed_message_signal_model(
     message_definition_id: &str,
     message_first: bool,
