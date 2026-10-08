@@ -10000,7 +10000,10 @@
         "same_title": "No se añadió ninguna versión nueva",
         "same_text": "La versión {version} ya tiene el mismo texto. No cambió nada.",
         "load_failed": "No se pudo cargar el texto de la versión {version}.",
-        "discard_kept": "Esta versión aún no se ha añadido. El texto se conserva y vuelve cuando abras otra vez esta ventana. Cierra la ventana otra vez o vuelve a editar."
+        "discard_kept": "Esta versión aún no se ha añadido. El texto se conserva y vuelve cuando abras otra vez esta ventana. Cierra la ventana otra vez o vuelve a editar.",
+        "diff_segment_added": "segmento nuevo y obligatorio «{segment}»",
+        "diff_segment_removed": "el segmento «{segment}» ya no es obligatorio",
+        "drop_and_add": "Quitar {items} y añadir la versión"
       },
       "incompat": {
         "lead": "Este patrón tiene la compatibilidad «{compat}», y {reason}.",
@@ -10105,7 +10108,13 @@
         "error_title": "No se pudo cargar el patrón",
         "show": "Mostrar",
         "withdrawn_used_reader": "No se pueden añadir versiones nuevas ni elegirlo para un topic nuevo. {n|El topic|Los topics} {topics} {n|sigue|siguen} comprobando los mensajes con la última versión ({version}) hasta que un administrador elija allí otro patrón.",
-        "withdrawn_unused_reader": "No se pueden añadir versiones nuevas ni elegirlo para un topic. Ningún topic lo usa."
+        "withdrawn_unused_reader": "No se pueden añadir versiones nuevas ni elegirlo para un topic. Ningún topic lo usa.",
+        "profile_segments": "Segmentos obligatorios",
+        "profile_segments_hint": "Un segmento es una línea de un mensaje HL7 v2; PID, por ejemplo, contiene los datos del paciente.",
+        "profile_fields": "Campos obligatorios",
+        "profile_field": "Campo",
+        "profile_contains": "Qué contiene",
+        "profile_none": "Este perfil no exige ningún segmento: solo comprueba que el mensaje se pueda leer."
       },
       "added_existing_title": "El patrón {name} ya existía",
       "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",

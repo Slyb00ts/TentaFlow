@@ -46,14 +46,14 @@ fn split_segments(text: &str) -> Vec<&str> {
 
 /// Extracts a segment's 3-character id and its ordinary (non-MSH) fields.
 /// `fields[0]` is `SEG-1`, `fields[1]` is `SEG-2`, etc.
-fn segment_fields<'a>(seg: &'a str, fsep: char) -> Result<(String, Vec<&'a str>), FormatError> {
-    let id: String = seg.chars().take(3).collect();
-    if id.chars().count() != 3 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+fn segment_fields<'a>(seg: &'a str, fsep: char) -> Result<(&'a str, Vec<&'a str>), FormatError> {
+    let probe: String = seg.chars().take(3).collect();
+    if probe.chars().count() != 3 || !probe.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(FormatError(format!(
-            "hl7: '{id}' is not a valid segment id"
+            "hl7: '{probe}' is not a valid segment id"
         )));
     }
-    let rest = &seg[id.len()..]; // safe: id is 3 single-byte ASCII chars
+    let (id, rest) = seg.split_at(3); // safe: the id is 3 single-byte ASCII chars
     let fields: Vec<&str> = if rest.is_empty() {
         Vec::new()
     } else if let Some(stripped) = rest.strip_prefix(fsep) {
@@ -84,6 +84,31 @@ fn parse_msh<'a>(msh_segment: &'a str) -> Result<(char, Vec<&'a str>), FormatErr
     let after_fsep = &rest[fsep.len_utf8()..];
     let msh_fields: Vec<&str> = after_fsep.split(fsep).collect();
     Ok((fsep, msh_fields))
+}
+
+/// Walks every segment of an ER7 message in order, handing the visitor the
+/// segment id, its field values and the number of the FIRST field in that
+/// slice (`fields[i]` is field `first_number + i`; MSH starts at 3 because
+/// MSH-1/MSH-2 are structural). Shares the segment/MSH parsing with
+/// `list_fields`/`project`, so profile validation and field policies can
+/// never disagree about what a message contains.
+pub(crate) fn for_each_segment<'a>(
+    payload: &'a [u8],
+    mut visit: impl FnMut(&'a str, &[&'a str], usize) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
+    let segments = split_segments(text);
+    let Some(first) = segments.first() else {
+        return Err(FormatError("hl7: empty message".to_string()));
+    };
+    let (fsep, msh_fields) = parse_msh(first)?;
+    visit("MSH", &msh_fields[1..], 3)?;
+    for seg in &segments[1..] {
+        let (id, fields) = segment_fields(seg, fsep)?;
+        visit(id, &fields, 1)?;
+    }
+    Ok(())
 }
 
 pub struct Hl7V2Format;
@@ -154,7 +179,7 @@ impl PayloadFieldFormat for Hl7V2Format {
                 })
                 .collect();
             if rendered.is_empty() {
-                out_segments.push(id);
+                out_segments.push(id.to_string());
             } else {
                 out_segments.push(format!("{id}{fsep}{}", rendered.join(&fsep.to_string())));
             }

@@ -19358,63 +19358,270 @@ mod tests {
         }
     }
 
+    const ADT_PROFILE: &str = r#"{"required_segments":["PID"],"required_fields":["PID-3"]}"#;
+
     #[test]
-    fn enabling_validation_on_a_subject_without_a_validator_is_refused_for_the_new_kinds() {
+    fn enabling_validation_is_accepted_for_hl7_profiles_and_refused_for_xsd_until_it_has_a_validator(
+    ) {
         use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
-        for (kind, text, ct) in [
-            (Xsd, "<xs:schema/>", "application/xml"),
-            (
-                Hl7v2Profile,
-                r#"{"required_segments":[]}"#,
-                "application/hl7-v2",
-            ),
-        ] {
-            let err =
-                bind_stored_subject_at_create(kind, text, ct, Some(topics::ValidationMode::Warn))
-                    .unwrap_err();
-            assert!(
-                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
-                    if reason.contains("no validator")),
-                "{kind:?}: {err:?}"
+        for mode in [topics::ValidationMode::Warn, topics::ValidationMode::Dlq] {
+            assert_eq!(
+                bind_stored_subject_at_create(
+                    Hl7v2Profile,
+                    r#"{"required_segments":[]}"#,
+                    "application/hl7-v2",
+                    Some(mode)
+                )
+                .unwrap(),
+                mode
             );
         }
+        let err = bind_stored_subject_at_create(
+            Xsd,
+            "<xs:schema/>",
+            "application/xml",
+            Some(topics::ValidationMode::Warn),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                if reason.contains("no validator")),
+            "{err:?}"
+        );
     }
 
     #[test]
-    fn xsd_and_profile_subjects_are_stored_only_like_the_binary_kinds() {
+    fn xsd_subjects_are_stored_only_like_the_binary_kinds() {
         let (_tmp, svc) = test_service();
-        for (kind, text) in [
-            (schema_registry::SchemaType::Xsd, "<xs:schema/>"),
-            (
-                schema_registry::SchemaType::Hl7v2Profile,
-                r#"{"required_segments":["PID"]}"#,
-            ),
-        ] {
-            let register = |compat| {
-                schema_registry::registry::register(
-                    &svc.db,
-                    svc.instance_id(),
-                    "org-1",
-                    kind.as_str(),
-                    kind,
-                    text,
-                    compat,
-                    None,
-                )
-            };
-            // The default `backward` mode needs a compatibility check no
-            // stored-only kind can perform: refused, not waved through.
-            let err = register(None).unwrap_err();
-            assert!(
-                matches!(err, BusServiceError::SchemaTypeUnsupported { .. }),
-                "{kind:?}: {err:?}"
-            );
-            // Explicitly unchecked, the subject is stored and versioned.
-            let outcome = register(Some(schema_registry::Compatibility::None)).unwrap();
-            assert_eq!(outcome.version, 1, "{kind:?}");
-        }
+        let register = |compat| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "xsd",
+                schema_registry::SchemaType::Xsd,
+                "<xs:schema/>",
+                compat,
+                None,
+            )
+        };
+        // The default `backward` mode needs a compatibility check no
+        // stored-only kind can perform: refused, not waved through.
+        let err = register(None).unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::SchemaTypeUnsupported { .. }),
+            "{err:?}"
+        );
+        // Explicitly unchecked, the subject is stored and versioned.
+        let outcome = register(Some(schema_registry::Compatibility::None)).unwrap();
+        assert_eq!(outcome.version, 1);
     }
 
+    #[test]
+    fn hl7_profile_subjects_register_under_the_default_backward_check() {
+        let (_tmp, svc) = test_service();
+        let register = |text: &str| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "adt",
+                schema_registry::SchemaType::Hl7v2Profile,
+                text,
+                None,
+                None,
+            )
+        };
+        assert_eq!(register(ADT_PROFILE).unwrap().version, 1);
+        let err = register(r#"{"required_segments":["PID"],"required_fields":["PID-3","PID-5"]}"#)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::SchemaIncompatible {
+                    mode: "backward",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            register(r#"{"required_segments":["PID"]}"#)
+                .unwrap()
+                .version,
+            2
+        );
+    }
+
+    #[test]
+    fn registering_a_malformed_profile_is_refused() {
+        let (_tmp, svc) = test_service();
+        let err = schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "bad",
+            schema_registry::SchemaType::Hl7v2Profile,
+            r#"{"required_fields":["MSH-1"]}"#,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+
+    /// Creates a topic of `content_type` bound to a registered `kind` subject
+    /// in `mode`, publishes `payloads` as one batch, and returns the
+    /// service, the context, and the publish result.
+    fn publish_validated(
+        kind: schema_registry::SchemaType,
+        schema_text: &str,
+        content_type: &str,
+        mode: topics::ValidationMode,
+        payloads: &[&str],
+    ) -> (tempfile::TempDir, BusService, BusCallContext, PublishResult) {
+        let (tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "subject",
+            kind,
+            schema_text,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "validated.events",
+            topics::TopicOptions {
+                content_type: Some(content_type.to_string()),
+                schema_id: Some("subject".to_string()),
+                validation: Some(mode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = svc
+            .publish(
+                &ctx,
+                "validated.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: payloads.iter().map(|p| record(p)).collect(),
+                },
+            )
+            .unwrap();
+        (tmp, svc, ctx, result)
+    }
+
+    fn fetch_all(svc: &BusService, ctx: &BusCallContext, topic: &str) -> Vec<Vec<u8>> {
+        let group = if topic.starts_with("__dlq.") {
+            "dlq-reader"
+        } else {
+            "topic-reader"
+        };
+        let handle = svc
+            .open_consumer(
+                ctx,
+                group,
+                &[topic.to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        handle
+            .fetch(1024, 20)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.payload.to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn hl7_profile_dlq_mode_diverts_messages_missing_a_required_field() {
+        let good = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1||MRN1\r";
+        let bad = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1\r";
+        let not_hl7 = "{\"json\":true}";
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Hl7v2Profile,
+            ADT_PROFILE,
+            "application/hl7-v2",
+            topics::ValidationMode::Dlq,
+            &[good, bad, not_hl7],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 2));
+        assert_eq!(
+            fetch_all(&svc, &ctx, "validated.events"),
+            vec![good.as_bytes().to_vec()]
+        );
+        assert_eq!(
+            fetch_all(&svc, &ctx, "__dlq.validated.events"),
+            vec![bad.as_bytes().to_vec(), not_hl7.as_bytes().to_vec()]
+        );
+    }
+
+    #[test]
+    fn schema_derived_get_projects_an_hl7_profile_through_a_read_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "p-adt",
+            schema_registry::SchemaType::Hl7v2Profile,
+            ADT_PROFILE,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "hl7.events",
+            topics::TopicOptions {
+                content_type: Some("application/hl7-v2".to_string()),
+                schema_id: Some("p-adt".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "hl7.events",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["PID-5"]),
+            &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        let derived = svc
+            .schema_derived_get(
+                &ctx,
+                "p-adt",
+                None,
+                "hl7.events",
+                "any",
+                field_policies::SUBJECT_ANY,
+                field_policies::Direction::Read,
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&derived).unwrap();
+        assert_eq!(v["required_fields"], serde_json::json!([]), "{derived}");
+        assert_eq!(v["required_segments"], serde_json::json!(["PID"]));
+    }
     #[test]
     fn update_topic_rejects_binding_a_schema_to_a_dlq_topic() {
         let (_tmp, svc) = test_service();

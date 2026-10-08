@@ -2222,8 +2222,12 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   await schemasSlot(page).locator('[data-go="add"]').first().click();
   const win = schemaWindow(page);
   await expect(win.locator('[slot="body"]')).toBeVisible();
-  await expect(win.locator('tf-choice-card')).toHaveAttribute('heading', 'JSON Schema');
+  // The formats offered are the ones this server can validate.
+  await expect(win.locator('tf-choice-card')).toHaveCount(2);
+  await expect(win.locator('tf-choice-card').first()).toHaveAttribute('heading', 'JSON Schema');
+  await expect(win.locator('tf-choice-card[value="hl7v2_profile"]')).toHaveAttribute('heading', 'profil HL7 v2');
   const save = win.locator('[data-act="save"]');
+
   await win.locator('[data-role="name"] input').fill('wizyta');
   await expect(win.locator('[data-role="name"]')).toHaveAttribute('error', /już jest/);
   await expect(win.locator('[data-role="impact"]')).toContainText('Popraw zaznaczone pole');
@@ -2479,6 +2483,124 @@ async function settled(page) {
 async function pickSegment(win, selector, label) {
   await win.locator(`${selector} .tf-seg-opt`, { hasText: label }).click();
 }
+
+const PROFILE_NAME = `profil-wyniku-${RUN}`;
+const PROFILE_V1 = JSON.stringify({ description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.', required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
+const PROFILE_WITH_OBX8 = JSON.stringify({ ...JSON.parse(PROFILE_V1), required_fields: [...JSON.parse(PROFILE_V1).required_fields, 'OBX-8'] });
+const HL7_GOOD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG1|P|2.5\rPID|1||MRN123||Kowalski^Jan\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
+const HL7_BAD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG2|P|2.5\rPID|1\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
+
+test('F4 an HL7 profile: added from "Dodaj wzór", spelled out on the page, a refused profile fixed in one click, a topic that rejects a bad message', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  const addPattern = async (name, format, text) => {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator(`tf-choice-card[value="${format}"]`).click();
+    await win.locator('[data-role="name"] input').fill(name);
+    await win.locator('[data-role="text"] textarea').fill(text);
+    return win.locator('[data-act="save"]');
+  };
+  const topics = [];
+  const cleanup = async () => {
+    for (const name of topics.splice(0)) await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name }).catch(() => {});
+    for (const name of [PROFILE_NAME]) {
+      await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
+    }
+  };
+  try {
+    // HL7 v2 profile: JSON text, checked before it is sent.
+    let save = await addPattern(PROFILE_NAME, 'hl7v2_profile', '{"required_segments": ');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('error', /To nie jest poprawny JSON/);
+    await expect(save).toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill(PROFILE_V1);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${PROFILE_NAME} (profil HL7 v2), wersja 1`);
+    await save.click();
+    await expect(win).toHaveCount(0);
+    await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', `Dodano wzór ${PROFILE_NAME}`);
+    await expect(schemaRow(page, PROFILE_NAME)).toContainText('profil HL7 v2');
+
+    // Its page spells the profile out with the dictionary names of the fields.
+    await schemaRow(page, PROFILE_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(PROFILE_NAME, { timeout: 15000 });
+    await expect(p.locator('[data-role="about"]')).toHaveText('Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+    await expect(p.locator('[data-role="profile-segments"] tf-chip')).toHaveCount(4);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr').first()).toContainText('PID-3');
+    await expect(p.locator('[data-role="profile-fields"] tbody tr').first()).toContainText('Lista identyfikatorów pacjenta');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-profil-hl7.png'), fullPage: true });
+
+    // A new required field breaks "nowe programy przeczytają stare wiadomości"; one click removes it.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(PROFILE_WITH_OBX8);
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowe, wymagane pole „OBX-8”.');
+    await win.locator('[data-act="save"]').click();
+    const refusal = win.locator('[data-role="error"]');
+    await expect(refusal).toContainText('a nowa wersja wymaga pola „OBX-8”, którego stare wiadomości mogą nie mieć. Usuń „OBX-8” z pól wymaganych albo zmień zgodność wzoru.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-profil-odmowa.png') });
+    const fix = refusal.locator('[data-act="drop-required"]');
+    await expect(fix).toHaveText('Usuń OBX-8 i dodaj wersję');
+    await fix.click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+    expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: PROFILE_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
+    await expect.poll(() => editorText(page)).not.toContain('OBX-8');
+
+    // A topic of the right format takes the profile and rejects what does not fit.
+    const topicFor = async (name, contentType, subject) => {
+      topics.push(name);
+      await busCall(page, 'busTopicCreateRequest', { instanceId: instance, name, options: { partitions: 1, contentType, schemaId: subject, validation: 'dlq' } });
+      const detail = (await busCall(page, 'busTopicDetailRequest', { instanceId: instance, name })).topic;
+      expect(detail.schemaId).toBe(subject);
+      expect(detail.validation).toBe('dlq');
+    };
+    const hl7Topic = `e2e-hl7-${RUN}`;
+    await topicFor(hl7Topic, 'application/hl7-v2', PROFILE_NAME);
+
+    // The dashboard cannot publish, so a key with the right to send does it over REST.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=topics&topic=${hl7Topic}&section=access`);
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji', { timeout: 20000 });
+    await s.locator('tf-button[data-go="key-issue"]').click();
+    const issue = accessWindow(page);
+    await issue.locator('[data-role="name"] input').fill(`Pracownia ${RUN}`);
+    await issue.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+    await issue.locator('[data-act="save"]').click();
+    const issued = page.locator('tf-window.tb-key-issued');
+    await expect(issued).toHaveCount(1);
+    const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+    const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+    const group = (await issued.locator('[data-role="group"]').textContent()).trim();
+    await issued.locator('[data-act="done"]').click();
+    const keyId = group.slice(2);
+    try {
+      const publish = async (target, text) => {
+        const line = JSON.stringify({ payload_b64: Buffer.from(text).toString('base64') });
+        const res = await request.post(target, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+        expect(res.status(), await res.text()).toBe(200);
+        return res.json();
+      };
+      expect(await publish(url, HL7_GOOD)).toMatchObject({ published: 1, schema_rejected: 0 });
+      expect(await publish(url, HL7_BAD)).toMatchObject({ published: 0, schema_rejected: 1 });
+      expect(await publish(url, 'to nie jest wiadomość HL7')).toMatchObject({ published: 0, schema_rejected: 1 });
+      expect(await serverUnprocessed(page, instance, hl7Topic)).toHaveLength(2);
+    } finally {
+      await page.evaluate(async (id) => {
+        const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+        await ApiBinary.action('apiKeyRevokeRequest', { keyId: id }).catch(() => {});
+      }, keyId);
+    }
+  } finally {
+    await cleanup();
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
 
 test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {
   const errors = trackErrors(page);

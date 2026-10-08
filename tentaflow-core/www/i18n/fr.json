@@ -10000,7 +10000,10 @@
         "same_title": "Aucune nouvelle version ajoutée",
         "same_text": "La version {version} a déjà le même texte. Rien n’a changé.",
         "load_failed": "Impossible de charger le texte de la version {version}.",
-        "discard_kept": "Cette version n’est pas encore ajoutée. Le texte est conservé et revient quand vous rouvrez cette fenêtre. Refermez la fenêtre, ou reprenez la saisie."
+        "discard_kept": "Cette version n’est pas encore ajoutée. Le texte est conservé et revient quand vous rouvrez cette fenêtre. Refermez la fenêtre, ou reprenez la saisie.",
+        "diff_segment_added": "nouveau segment obligatoire « {segment} »",
+        "diff_segment_removed": "le segment « {segment} » n’est plus obligatoire",
+        "drop_and_add": "Retirer {items} et ajouter la version"
       },
       "incompat": {
         "lead": "Ce modèle a la compatibilité « {compat} », et {reason}.",
@@ -10105,7 +10108,13 @@
         "error_title": "Impossible de charger le modèle",
         "show": "Afficher",
         "withdrawn_used_reader": "On ne peut plus ajouter de versions ni le choisir pour un nouveau topic. {n|Le topic|Les topics} {topics} {n|continue|continuent} à vérifier les messages selon la dernière version ({version}) jusqu’à ce qu’un administrateur y choisisse un autre modèle.",
-        "withdrawn_unused_reader": "On ne peut plus ajouter de versions ni le choisir pour un topic. Aucun topic ne l’utilise."
+        "withdrawn_unused_reader": "On ne peut plus ajouter de versions ni le choisir pour un topic. Aucun topic ne l’utilise.",
+        "profile_segments": "Segments obligatoires",
+        "profile_segments_hint": "Un segment est une ligne d’un message HL7 v2 ; PID, par exemple, contient les données du patient.",
+        "profile_fields": "Champs obligatoires",
+        "profile_field": "Champ",
+        "profile_contains": "Ce qu’il contient",
+        "profile_none": "Ce profil n’exige aucun segment : il vérifie seulement que le message est lisible."
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",

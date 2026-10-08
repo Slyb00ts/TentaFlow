@@ -19,6 +19,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
+  profileChanges, hl7DropOffer, dropRequired,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
@@ -441,4 +442,135 @@ test('"Dodaj wzór" hands on what the server did when the name was taken meanwhi
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(added, [{ subject: 'wizyta', schemaType: 'json_schema', version: 4, deduplicated: true }]);
+});
+
+// ---------------------------------------------------------------------------
+// HL7 v2 profiles (F4 B5)
+// ---------------------------------------------------------------------------
+
+const PROFILE_V3 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
+const PROFILE_V4 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5', 'OBX-8'] });
+const wynik = { subject: 'wynik-badania', schemaType: 'hl7v2_profile', compatibility: 'backward', latestVersion: 3, deprecatedAtMs: null, usedByTopics: ['wyniki-badan'] };
+const BACKWARD_OBX8 = 'backward (the new profile requires more than the old one guarantees): fields [OBX-8] are not guaranteed';
+
+test('a profile text must be JSON', () => {
+  assert.equal(schemaTextProblem('{"required_segments": ', 'hl7v2_profile'), 'not_json');
+  assert.equal(schemaTextProblem(PROFILE_V3, 'hl7v2_profile'), null);
+});
+
+test('the difference of a new profile from the newest one, in words', () => {
+  assert.equal(profileChanges(PROFILE_V3, PROFILE_V3, 3), 'Tekst jest taki sam jak wersja 3.');
+  assert.equal(profileChanges(PROFILE_V3, PROFILE_V4, 3), 'Różnica względem wersji 3: nowe, wymagane pole „OBX-8”.');
+  const noObr = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBX-3', 'OBX-5'] });
+  assert.equal(profileChanges(PROFILE_V3, noObr, 3), 'Różnica względem wersji 3: segment „OBR” nie jest już wymagany i pole „OBR-4” nie jest już wymagane.');
+  const withNte = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX', 'NTE'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5', 'NTE-3'] });
+  assert.equal(profileChanges(PROFILE_V3, withNte, 3), 'Różnica względem wersji 3: nowy wymagany segment „NTE” i nowe, wymagane pole „NTE-3”.');
+  assert.match(profileChanges(PROFILE_V3, JSON.stringify({ ...JSON.parse(PROFILE_V3), description: 'x' }), 3), /nie dotyczą/);
+  assert.equal(profileChanges(PROFILE_V3, 'not json', 3), null);
+});
+
+test('the profile checker\'s sentences have plain words, in both directions', () => {
+  const backward = incompatibilityReason({ mode: 'backward', detail: BACKWARD_OBX8, newText: PROFILE_V4 });
+  assert.equal(backward.reason, 'nowa wersja wymaga pola „OBX-8”, którego stare wiadomości mogą nie mieć');
+  assert.equal(backward.fix, 'Usuń „OBX-8” z pól wymaganych albo zmień zgodność wzoru.');
+  const full = incompatibilityReason({ mode: 'full', detail: 'forward (the old profile requires more than the new one guarantees): segments [OBR] are not guaranteed; fields [OBR-4] are not guaranteed', newText: PROFILE_V3 });
+  assert.equal(full.reason, 'nowa wersja nie gwarantuje pola „OBR-4”, którego wymagają stare programy');
+  const segmentOnly = incompatibilityReason({ mode: 'backward', detail: 'backward (the new profile requires more than the old one guarantees): segments [NTE] are not guaranteed', newText: PROFILE_V4 });
+  assert.match(segmentOnly.reason, /„NTE”/);
+});
+
+test('what a refused profile can drop, and the text without it', () => {
+  assert.deepEqual(hl7DropOffer(BACKWARD_OBX8), { segments: [], fields: ['OBX-8'], items: ['OBX-8'] });
+  assert.deepEqual(
+    hl7DropOffer('backward (the new profile requires more than the old one guarantees): segments [NTE, OBX] are not guaranteed; fields [OBX-8] are not guaranteed'),
+    { segments: ['NTE', 'OBX'], fields: ['OBX-8'], items: ['OBX-8', 'NTE'] },
+    'a segment only a dropped field needs is not offered separately',
+  );
+  assert.equal(hl7DropOffer('forward (the old profile requires more than the new one guarantees): fields [PID-3] are not guaranteed'), null, 'the other direction has no one-click fix');
+  assert.equal(hl7DropOffer('something else'), null);
+  const next = JSON.parse(dropRequired(PROFILE_V4, { segments: [], fields: ['OBX-8'] }));
+  assert.deepEqual(next, JSON.parse(PROFILE_V3));
+  assert.deepEqual(Object.keys(next), ['required_segments', 'required_fields']);
+  assert.equal(dropRequired('not json', { fields: ['OBX-8'] }), null);
+});
+
+test('the refusal box offers the one-click fix only for an HL7 profile and only when asked', () => {
+  const err = incompatible('backward', BACKWARD_OBX8);
+  const box = (extra) => {
+    const el = document.createElement('div');
+    el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 4.', compatibility: 'backward', schemaType: 'hl7v2_profile', newText: PROFILE_V4, describeError: String, ...extra });
+    return el;
+  };
+  assert.match(norm(box({}).textContent), /^Nie dodano wersji 4\. Ten wzór ma zgodność „nowe programy przeczytają stare wiadomości”, a nowa wersja wymaga pola „OBX-8”, którego stare wiadomości mogą nie mieć\. Usuń „OBX-8” z pól wymaganych albo zmień zgodność wzoru\.$/);
+  assert.equal(box({}).querySelector('[data-act="drop-required"]'), null);
+  const offered = box({ offerDrop: true }).querySelector('[data-act="drop-required"]');
+  assert.equal(norm(offered.textContent), 'Usuń OBX-8 i dodaj wersję');
+  assert.deepEqual(JSON.parse(offered.dataset.drop), { segments: [], fields: ['OBX-8'] });
+  assert.equal(box({ offerDrop: true, schemaType: 'json_schema' }).querySelector('[data-act="drop-required"]'), null);
+});
+
+test('"Nowa wersja" of an HL7 profile: "Usuń OBX-8 i dodaj wersję" removes the field and adds the version in one click', async () => {
+  closeAll();
+  const sent = [];
+  const added = [];
+  const win = openSchemaVersion({
+    instanceId: 'i',
+    subject: wynik,
+    latestText: PROFILE_V3,
+    draftText: null,
+    register: async (request) => {
+      sent.push(request.schemaText);
+      if (JSON.parse(request.schemaText).required_fields.includes('OBX-8')) throw incompatible('backward', BACKWARD_OBX8);
+      return { version: 4, deduplicated: false };
+    },
+    describeError: String,
+    onAdded: (a) => added.push(a),
+    onDraft: () => {},
+  });
+  const text = win.querySelector('[data-role="text"]');
+  type(text, PROFILE_V4);
+  assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 3: nowe, wymagane pole „OBX-8”.');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  const button = win.querySelector('[data-act="drop-required"]');
+  assert.ok(button, 'the refusal offers the fix');
+  assert.equal(norm(button.textContent), 'Usuń OBX-8 i dodaj wersję');
+  button.click();
+  await tick();
+  assert.equal(sent.length, 2);
+  assert.deepEqual(JSON.parse(sent[1]), JSON.parse(PROFILE_V3), 'the field is gone from the text that was sent');
+  assert.deepEqual(added, [{ version: 4, deduplicated: false }]);
+  closeAll();
+});
+
+test('"Dodaj wzór" offers an HL7 profile when the server validates it, and checks its text as JSON', async () => {
+  closeAll();
+  const sent = [];
+  const win = openSchemaAdd({
+    instanceId: 'i',
+    schemaTypes: ['json_schema', 'hl7v2_profile'],
+    existingNames: () => [],
+    register: async (request) => { sent.push(request); return { version: 1, deduplicated: false }; },
+    describeError: String,
+    onAdded: () => {},
+  });
+  const cards = [...win.querySelectorAll('tf-choice-card')];
+  assert.deepEqual(cards.map((c) => c.getAttribute('heading')), ['JSON Schema', 'profil HL7 v2']);
+  assert.deepEqual(cards.map((c) => c.getAttribute('description')), ['dane JSON', 'wiadomości HL7 v2']);
+  type(win.querySelector('[data-role="name"]'), 'wynik-badania');
+  const format = win.querySelector('[data-role="format"]');
+  const text = win.querySelector('[data-role="text"]');
+  pick(format, 'hl7v2_profile');
+  type(text, '{"required_segments": ');
+  assert.match(text.getAttribute('error'), /To nie jest poprawny JSON/);
+  type(text, PROFILE_V3);
+  assert.equal(text.hasAttribute('error'), false);
+  const save = win.querySelector('[data-act="save"]');
+  assert.equal(save.hasAttribute('disabled'), false);
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /powstanie wzór wynik-badania \(profil HL7 v2\), wersja 1/);
+  save.click();
+  await tick();
+  assert.equal(sent[0].schemaType, 'hl7v2_profile');
+  assert.equal(sent[0].schemaText, PROFILE_V3);
+  closeAll();
 });

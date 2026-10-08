@@ -1,9 +1,9 @@
 // =============================================================================
 // File: bus/schema_registry/stored_only.rs — kinds without a validator yet
 // =============================================================================
-// `avro` / `protobuf` / `thrift` / `xsd` / `hl7v2_profile` subjects can be
-// registered and versioned so integrators can stage schemas ahead of F4, but
-// nothing in this build can evaluate a payload against them. `compile` is a
+// `avro` / `protobuf` / `thrift` / `xsd` subjects can be registered and
+// versioned so integrators can stage schemas ahead of F4, but nothing in
+// this build can evaluate a payload against them. `compile` is a
 // shape smoke-check only; every other operation returns
 // `SchemaError::Unsupported` (a version check under any compatibility mode
 // but `none` therefore refuses too — there is no comparison to pretend
@@ -69,7 +69,6 @@ pub(super) static AVRO_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Avro);
 pub(super) static PROTOBUF_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Protobuf);
 pub(super) static THRIFT_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Thrift);
 pub(super) static XSD_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Xsd);
-pub(super) static HL7V2_PROFILE_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Hl7v2Profile);
 
 #[cfg(test)]
 mod tests {
@@ -89,7 +88,7 @@ mod tests {
 
     #[test]
     fn every_other_operation_is_unsupported_until_f4() {
-        for ops in [&PROTOBUF_OPS, &XSD_OPS, &HL7V2_PROFILE_OPS] {
+        for ops in [&PROTOBUF_OPS, &XSD_OPS] {
             let compiled = ops.compile("message X {}").unwrap();
             assert!(matches!(
                 ops.validate(&compiled, b"{}"),
@@ -110,12 +109,8 @@ mod tests {
     }
 
     #[test]
-    fn xsd_and_hl7_profile_smoke_check_rejects_blank_text() {
+    fn xsd_smoke_check_rejects_blank_text() {
         assert!(XSD_OPS.compile("<xs:schema/>").is_ok());
         assert!(XSD_OPS.compile("  \n").is_err());
-        assert!(HL7V2_PROFILE_OPS
-            .compile("{\"required_segments\":[]}")
-            .is_ok());
-        assert!(HL7V2_PROFILE_OPS.compile("").is_err());
     }
 }

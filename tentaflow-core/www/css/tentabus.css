@@ -440,6 +440,9 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-schema-text .tb-state { justify-content: flex-start; padding: 16px 0; }
 .tb-schema-text .tb-state .icon { color: var(--tf-danger); }
 .tb-schema-text [data-role="text-note"] { margin: -4px 0 8px; }
+.tb-schema-text .tb-profile { margin: 4px 0 14px; }
+.tb-schema-text .tb-profile-label { display: block; margin-bottom: 6px; font-size: 12.5px; font-weight: 600; color: var(--tf-text-2); }
+.tb-schema-text .tb-profile > .stack > div + div { margin-top: 14px; }
 .tb-schema-window .stack { display: flex; flex-direction: column; gap: 14px; }
 .tb-schema-window .tb-window-error { margin-top: 0; }
 .tb-window .tb-mono-input textarea { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }

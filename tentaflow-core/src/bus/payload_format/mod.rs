@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 
-mod hl7v2;
+pub(crate) mod hl7v2;
 mod json;
 mod xml;
 

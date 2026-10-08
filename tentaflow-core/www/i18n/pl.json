@@ -11235,7 +11235,10 @@
         "same_title": "Nie dodano nowej wersji",
         "same_text": "Taki sam tekst ma już wersja {version}. Nic się nie zmieniło.",
         "load_failed": "Nie udało się wczytać tekstu wersji {version}.",
-        "discard_kept": "Ta wersja nie jest jeszcze dodana. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie. Zamknij okno jeszcze raz albo wróć do edycji."
+        "discard_kept": "Ta wersja nie jest jeszcze dodana. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie. Zamknij okno jeszcze raz albo wróć do edycji.",
+        "diff_segment_added": "nowy wymagany segment „{segment}”",
+        "diff_segment_removed": "segment „{segment}” nie jest już wymagany",
+        "drop_and_add": "Usuń {items} i dodaj wersję"
       },
       "incompat": {
         "lead": "Ten wzór ma zgodność „{compat}”, a {reason}.",
@@ -11340,7 +11343,13 @@
         "error_title": "Nie udało się wczytać wzoru",
         "show": "Pokaż",
         "withdrawn_used_reader": "Nowych wersji nie da się dodać i nie można go wybrać dla nowego topiku. {n|Topik|Topiki|Topiki} {topics} nadal {n|sprawdza|sprawdzają|sprawdzają} wiadomości według ostatniej wersji ({version}), dopóki administrator nie wybierze w {n|nim|nich|nich} innego wzoru.",
-        "withdrawn_unused_reader": "Nowych wersji nie da się dodać i nie można go wybrać dla topiku. Żaden topik go nie używa."
+        "withdrawn_unused_reader": "Nowych wersji nie da się dodać i nie można go wybrać dla topiku. Żaden topik go nie używa.",
+        "profile_segments": "Wymagane segmenty",
+        "profile_segments_hint": "Segment to jeden wiersz wiadomości HL7 v2, np. PID to dane pacjenta.",
+        "profile_fields": "Wymagane pola",
+        "profile_field": "Pole",
+        "profile_contains": "Co zawiera",
+        "profile_none": "Ten profil nie wymaga żadnego segmentu — sprawdza tylko, czy wiadomość da się odczytać."
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",

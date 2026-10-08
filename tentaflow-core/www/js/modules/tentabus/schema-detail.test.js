@@ -17,7 +17,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText,
+  drawSchemaDetail, shareShownText, hl7ProfileView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -240,4 +240,51 @@ test('a reader\'s page of a withdrawn pattern gets the reader\'s warning', () =>
   const message = body.querySelector('[data-role="warning"] tf-alert').getAttribute('message');
   assert.match(message, /dopóki administrator nie wybierze w nim innego wzoru/);
   assert.doesNotMatch(message, /wybierzesz/);
+});
+
+const PROFILE = JSON.stringify({
+  description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.',
+  required_segments: ['MSH', 'PID'],
+  required_fields: ['PID-3', 'PID-5', 'OBX-8', 'ZZZ-1'],
+});
+const wynik = { ...wizyta, subject: 'wynik-badania', schemaType: 'hl7v2_profile', usedByTopics: ['wyniki-badan'] };
+
+test('an HL7 profile\'s description is its description key', () => {
+  assert.equal(schemaDescription('hl7v2_profile', PROFILE), 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+  assert.equal(schemaDescription('hl7v2_profile', '{"required_segments":[]}'), '');
+});
+
+test('file names and editor languages of an HL7 profile', () => {
+  assert.equal(downloadName('wynik', 4, 'hl7v2_profile'), 'wynik-v4.json');
+  assert.equal(editorLanguage('hl7v2_profile'), 'json');
+  assert.equal(displayText('hl7v2_profile', '{"required_segments":["PID"]}'), '{\n  "required_segments": [\n    "PID"\n  ]\n}');
+});
+
+test('a profile spelled out: its segments (listed, then those only a field names) and fields with their names', () => {
+  const view = hl7ProfileView(PROFILE);
+  assert.deepEqual(view.segments, ['MSH', 'PID', 'OBX', 'ZZZ']);
+  assert.deepEqual(view.fields.map((f) => f.address), ['PID-3', 'PID-5', 'OBX-8', 'ZZZ-1']);
+  assert.equal(view.fields[0].label, 'Lista identyfikatorów pacjenta');
+  assert.equal(view.fields[3].label, '', 'a field outside the dictionary has no name');
+  assert.equal(hl7ProfileView('not json'), null);
+  assert.equal(hl7ProfileView('[1]'), null);
+  assert.deepEqual(hl7ProfileView('{}'), { segments: [], fields: [] });
+});
+
+test('an HL7 profile\'s page shows its segments and fields in plain words above the text', () => {
+  const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text: PROFILE, error: null } });
+  assert.deepEqual([...body.querySelectorAll('[data-role="chips"] tf-chip')].map((c) => c.getAttribute('label')).slice(0, 1), ['profil HL7 v2']);
+  assert.equal(body.querySelector('[data-role="about"]').textContent, 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+  const profile = body.querySelector('[data-role="profile"]');
+  assert.equal(profile.hidden, false);
+  assert.deepEqual([...profile.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')), ['MSH', 'PID', 'OBX', 'ZZZ']);
+  assert.match(norm(profile.textContent), /Wymagane segmenty .* Segment to jeden wiersz wiadomości HL7 v2/);
+  const rows = body.querySelector('[data-role="profile-fields"]').rows;
+  assert.equal(rows.length, 4);
+  assert.match(rows[0].field, />PID-3</);
+  assert.equal(rows[0].contains, 'Lista identyfikatorów pacjenta');
+  assert.equal(body.querySelector('tf-code-editor').getAttribute('language'), 'json');
+  // Another format shows no profile.
+  const plain = mount({});
+  assert.equal(plain.body.querySelector('[data-role="profile"]').hidden, true);
 });

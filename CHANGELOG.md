@@ -62,13 +62,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 - Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
   `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
-  i znaczniki usunięcia bez zmian). Na razie są tylko przechowywane, jak
-  `avro`/`protobuf`/`thrift`: nie mają walidatora, więc `GET capabilities`
-  nadal wymienia wyłącznie `json_schema`, włączenie walidacji na takim wzorcu
-  jest odrzucane, a druga wersja przy zgodności innej niż `none` także
-  (brak porównania, którego można by udawać). Rejestracja wersji `xsd` lub
-  `hl7v2_profile` wymaga `compatibility: none`: przy domyślnym `backward`
-  odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
+  i znaczniki usunięcia bez zmian). Profil `hl7v2_profile` ma walidator (opis niżej): `GET capabilities`
+  wymienia `json_schema` i `hl7v2_profile`, temat może mieć `validation =
+  warn|dlq` z takim wzorcem, a domyślna zgodność `backward` działa. `xsd` jest
+  na razie tylko przechowywany, jak `avro`/`protobuf`/`thrift`: nie ma
+  walidatora, włączenie walidacji na takim wzorcu jest odrzucane, a druga
+  wersja przy zgodności innej niż `none` także (brak porównania, którego
+  można by udawać). Rejestracja wersji `xsd` wymaga `compatibility: none`:
+  przy domyślnym `backward` odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
   z tematem `application/xml` albo `text/xml`, `hl7v2_profile` tylko
   z `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema`
   nadal tylko z JSON-em; formaty binarne wiążą się niezależnie od
@@ -82,6 +83,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   z tym podmiotem. Uaktualnij wszystkie węzły sieci razem, zanim ktoś
   zarejestruje wzorzec XSD lub profil HL7; B4 i B5 zakładają to jako warunek
   wstępny.
+
+- Profil HL7 v2 (`hl7v2_profile`) to JSON `{"description"?, "required_segments",
+  "required_fields"}`: wiadomość ER7 musi się dać odczytać tym samym parserem,
+  co polityki pól, zawierać każdy wymagany segment, a wymagane pole
+  (`PID-3`) musi być niepuste w każdym wystąpieniu swojego segmentu (pole
+  wymagane wymusza też swój segment). `MSH-1`/`MSH-2`, nieznane klucze,
+  powtórzenia i listy powyżej 512 wpisów są odrzucane przy rejestracji.
+  Zgodność: `backward` — nowa wersja nie wymaga niczego ponad starą,
+  `forward` — odwrotnie, `full` — równe zbiory.
+- Dashboard: „Dodaj wzór” oferuje profil HL7 v2 (kafelek z listy formatów
+  serwera), a strona wzorca opisuje go w zwykłych słowach (wymagane segmenty
+  i pola z nazwami ze słownika). Odmowa nowej wersji profilu, która wymaga
+  czegoś ponad starą wersję, ma przycisk „Usuń OBX-8 i dodaj wersję”.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

@@ -5,10 +5,11 @@
 // and when, the topics that check with it and its compatibility; the actions
 // in the header ("Wycofaj", "Usuń…", "Nowa wersja"). Beside it the text of
 // one version, read-only in tf-code-editor with "Kopiuj" and "Pobierz" and
-// the pattern's own description (`description` of a JSON Schema, `doc` of an
-// Avro record), the versions with "Wycofaj" per row, and the compatibility
-// card with "Zmień". Every change goes through a window (schema-windows.js)
-// and comes back as a note over the page.
+// the pattern's own description (`description` of a JSON Schema or an HL7
+// profile, `doc` of an Avro record), an HL7 profile spelled out as required
+// segments and fields, the versions with "Wycofaj" per row, and the
+// compatibility card with "Zmień". Every change goes through a window
+// (schema-windows.js) and comes back as a note over the page.
 //
 // What topics check with is the server's rule (`registry::effective_version`):
 // the newest version not withdrawn, else the newest. A withdrawn pattern
@@ -23,6 +24,7 @@ import { T, fmtCount, fmtDate } from '/js/modules/tentabus/format.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { schemaFormatLabel, schemaState, compatLabel, deleteBlocker, listText } from '/js/modules/tentabus/schemas.js';
 import { effectiveVersion } from '/js/modules/tentabus/schema-windows.js';
+import { hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
 import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
 import '/js/components/tf-button.js';
@@ -35,9 +37,9 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json' };
-const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift' };
-const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json' };
+const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json', hl7v2_profile: 'json' };
+const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift', hl7v2_profile: 'json' };
+const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json', hl7v2_profile: 'application/json' };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -55,11 +57,11 @@ export function downloadName(subject, version, type) {
 
 /**
  * The pattern's own description, from its text: `description` at the root of
- * a JSON Schema, `doc` of an Avro record. `''` when it has none (or the text
- * is not JSON).
+ * a JSON Schema or an HL7 v2 profile, `doc` of an Avro record. `''` when it
+ * has none (or the text is not JSON).
  */
 export function schemaDescription(type, text) {
-  if (type !== 'json_schema' && type !== 'avro') return '';
+  if (type !== 'json_schema' && type !== 'avro' && type !== 'hl7v2_profile') return '';
   try {
     const root = JSON.parse(String(text || ''));
     const value = type === 'avro' ? root?.doc : root?.description;
@@ -67,6 +69,31 @@ export function schemaDescription(type, text) {
   } catch {
     return '';
   }
+}
+
+/**
+ * An HL7 v2 profile spelled out: `{ segments, fields: [{ address, label }] }`.
+ * Like the server, a required field also makes its segment required, so the
+ * segment list is the listed segments followed by those only a field names.
+ * `label` is the dictionary name of the field ("numer pacjenta") or `''`.
+ * `null` when the text is not a profile.
+ */
+export function hl7ProfileView(text) {
+  let root;
+  try {
+    root = JSON.parse(String(text || ''));
+  } catch {
+    return null;
+  }
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return null;
+  const list = (value) => (Array.isArray(value) ? value.filter((v) => typeof v === 'string') : []);
+  const fields = list(root.required_fields);
+  const segments = [...list(root.required_segments)];
+  for (const f of fields) {
+    const segment = f.split('-')[0];
+    if (segment && !segments.includes(segment)) segments.push(segment);
+  }
+  return { segments, fields: fields.map((address) => ({ address, label: hl7FieldLabel(address) })) };
 }
 
 /**
@@ -158,6 +185,22 @@ function pageHtml(name) {
             </div>
           </div>
           <div class="section-sub" data-role="about"></div>
+          <div class="tb-profile" data-role="profile" hidden>
+            <div class="stack">
+              <div>
+                <label class="tb-profile-label">${escapeHtml(T('schemas.detail.profile_segments'))}</label>
+                <div class="tb-head-chips" data-role="profile-segments"></div>
+                <div class="tb-vr-hint">${escapeHtml(T('schemas.detail.profile_segments_hint'))}</div>
+              </div>
+              <div data-role="profile-fields-wrap">
+                <label class="tb-profile-label">${escapeHtml(T('schemas.detail.profile_fields'))}</label>
+                <tf-table data-role="profile-fields">
+                  <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
+                  <tf-column key="contains" label="${escapeAttr(T('schemas.detail.profile_contains'))}" renderer="html" fill></tf-column>
+                </tf-table>
+              </div>
+            </div>
+          </div>
           <div class="muted" data-role="text-note"></div>
           <tf-code-editor data-role="code" readonly aria-label="${escapeAttr(T('schemas.detail.text_label'))}"></tf-code-editor>
           <div class="tb-state" data-role="text-state" hidden></div>
@@ -361,11 +404,27 @@ function paintText(body, view, effective) {
   const aboutEl = body.querySelector('[data-role="about"]');
   setText(aboutEl, about);
   aboutEl.hidden = !about;
+  paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
     editor.value = displayText(info.schemaType, shown.text);
   }
+}
+
+function paintProfile(body, profile) {
+  const el = body.querySelector('[data-role="profile"]');
+  el.hidden = !profile;
+  if (!profile) return;
+  patchHtml(body.querySelector('[data-role="profile-segments"]'), profile.segments.length
+    ? profile.segments.map((s) => `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(s)}"></tf-chip>`).join('')
+    : `<span class="muted">${escapeHtml(T('schemas.detail.profile_none'))}</span>`);
+  body.querySelector('[data-role="profile-fields-wrap"]').hidden = !profile.fields.length;
+  setRowsIfChanged(body.querySelector('[data-role="profile-fields"]'), profile.fields.map((f) => ({
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.address)}</span></span>`,
+    contains: f.label ? escapeHtml(f.label) : '<span class="tf-table__cell-sub">—</span>',
+    _key: f.address,
+  })));
 }
 
 /** "Kopiuj" / "Pobierz" of the version on the page. */

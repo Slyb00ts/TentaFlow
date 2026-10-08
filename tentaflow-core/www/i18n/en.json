@@ -11235,7 +11235,10 @@
         "same_title": "No new version added",
         "same_text": "Version {version} already has the same text. Nothing changed.",
         "load_failed": "Could not load the text of version {version}.",
-        "discard_kept": "This version has not been added yet. The text is kept and comes back when you open this window again. Close the window again, or go back to editing."
+        "discard_kept": "This version has not been added yet. The text is kept and comes back when you open this window again. Close the window again, or go back to editing.",
+        "diff_segment_added": "new required segment “{segment}”",
+        "diff_segment_removed": "segment “{segment}” is no longer required",
+        "drop_and_add": "Remove {items} and add the version"
       },
       "incompat": {
         "lead": "This pattern has compatibility “{compat}”, and {reason}.",
@@ -11340,7 +11343,13 @@
         "error_title": "Could not load the pattern",
         "show": "Show",
         "withdrawn_used_reader": "No new versions can be added and it cannot be chosen for a new topic. {n|Topic|Topics} {topics} {n|keeps|keep} checking messages against the last version ({version}) until an administrator chooses another pattern there.",
-        "withdrawn_unused_reader": "No new versions can be added and it cannot be chosen for a topic. No topic uses it."
+        "withdrawn_unused_reader": "No new versions can be added and it cannot be chosen for a topic. No topic uses it.",
+        "profile_segments": "Required segments",
+        "profile_segments_hint": "A segment is one line of an HL7 v2 message; PID, for example, holds the patient’s details.",
+        "profile_fields": "Required fields",
+        "profile_field": "Field",
+        "profile_contains": "What it holds",
+        "profile_none": "This profile requires no segment — it only checks that the message can be read."
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",

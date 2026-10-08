@@ -6088,7 +6088,10 @@ mod tests {
                     capabilities.content_types,
                     vec!["application/json", "application/xml", "application/hl7-v2"]
                 );
-                assert_eq!(capabilities.schema_types, vec!["json_schema"]);
+                assert_eq!(
+                    capabilities.schema_types,
+                    vec!["json_schema", "hl7v2_profile"]
+                );
                 assert_eq!(capabilities.field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
                 // (see its own doc) — this is the SEPARATE

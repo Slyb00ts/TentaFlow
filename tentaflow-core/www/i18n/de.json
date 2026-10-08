@@ -10000,7 +10000,10 @@
         "same_title": "Keine neue Version hinzugefügt",
         "same_text": "Version {version} hat bereits denselben Text. Nichts hat sich geändert.",
         "load_failed": "Der Text von Version {version} konnte nicht geladen werden.",
-        "discard_kept": "Diese Version wurde noch nicht hinzugefügt. Der Text bleibt erhalten und erscheint wieder, wenn Sie dieses Fenster erneut öffnen. Schließen Sie das Fenster noch einmal oder bearbeiten Sie weiter."
+        "discard_kept": "Diese Version wurde noch nicht hinzugefügt. Der Text bleibt erhalten und erscheint wieder, wenn Sie dieses Fenster erneut öffnen. Schließen Sie das Fenster noch einmal oder bearbeiten Sie weiter.",
+        "diff_segment_added": "neues Pflichtsegment „{segment}“",
+        "diff_segment_removed": "Segment „{segment}“ ist keine Pflicht mehr",
+        "drop_and_add": "{items} entfernen und Version hinzufügen"
       },
       "incompat": {
         "lead": "Dieses Muster hat die Kompatibilität „{compat}“, und {reason}.",
@@ -10105,7 +10108,13 @@
         "error_title": "Muster konnte nicht geladen werden",
         "show": "Anzeigen",
         "withdrawn_used_reader": "Neue Versionen lassen sich nicht hinzufügen und es lässt sich nicht für ein neues Topic wählen. {n|Topic|Topics} {topics} {n|prüft|prüfen} Nachrichten weiter nach der letzten Version ({version}), bis ein Administrator dort ein anderes Muster wählt.",
-        "withdrawn_unused_reader": "Neue Versionen lassen sich nicht hinzufügen und es lässt sich nicht für ein Topic wählen. Kein Topic verwendet es."
+        "withdrawn_unused_reader": "Neue Versionen lassen sich nicht hinzufügen und es lässt sich nicht für ein Topic wählen. Kein Topic verwendet es.",
+        "profile_segments": "Pflichtsegmente",
+        "profile_segments_hint": "Ein Segment ist eine Zeile einer HL7-v2-Nachricht; PID enthält zum Beispiel die Patientendaten.",
+        "profile_fields": "Pflichtfelder",
+        "profile_field": "Feld",
+        "profile_contains": "Was es enthält",
+        "profile_none": "Dieses Profil verlangt kein Segment – es prüft nur, ob sich die Nachricht lesen lässt."
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",

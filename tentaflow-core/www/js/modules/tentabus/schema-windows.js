@@ -40,7 +40,7 @@ export const TEXT_MAX_BYTES = 256 * 1024;
 /** What a new pattern checks unless the adding person picks otherwise (the server's own default). */
 export const DEFAULT_COMPATIBILITY = 'backward';
 /** Formats whose text is a JSON document, checked here before it is sent. */
-const JSON_TEXT_TYPES = new Set(['json_schema', 'avro']);
+const JSON_TEXT_TYPES = new Set(['json_schema', 'avro', 'hl7v2_profile']);
 
 const byteLength = (text) => new TextEncoder().encode(String(text)).length;
 
@@ -144,6 +144,89 @@ export function jsonSchemaChanges(oldText, newText, version) {
 }
 
 /**
+ * An HL7 v2 profile as sets, the way the server compares them: a required
+ * field also makes its segment required. `null` when the text is not a profile object.
+ */
+function profileSets(text) {
+  const profile = parseObject(text);
+  if (!profile) return null;
+  const list = (value) => (Array.isArray(value) ? value.filter((v) => typeof v === 'string') : []);
+  const fields = new Set(list(profile.required_fields));
+  const segments = new Set(list(profile.required_segments));
+  for (const f of fields) segments.add(f.split('-')[0]);
+  return { segments, fields };
+}
+
+/**
+ * How a new HL7 v2 profile text differs from the newest version, in words —
+ * the required segments and fields added and removed (a required field makes
+ * its segment required, so both are named). `null` when either text is not a
+ * profile object.
+ */
+export function profileChanges(oldText, newText, version) {
+  const before = profileSets(oldText);
+  const after = profileSets(newText);
+  if (!before || !after) return null;
+  const v = fmtCount(version);
+  const gained = (a, b) => [...a].filter((x) => !b.has(x));
+  const addedFields = gained(after.fields, before.fields);
+  const removedFields = gained(before.fields, after.fields);
+  const addedSegments = gained(after.segments, before.segments);
+  const removedSegments = gained(before.segments, after.segments);
+  const parts = [
+    ...addedSegments.map((segment) => T('schemas.version.diff_segment_added', { segment })),
+    ...removedSegments.map((segment) => T('schemas.version.diff_segment_removed', { segment })),
+    ...addedFields.map((field) => T('schemas.version.diff_added_required', { field })),
+    ...removedFields.map((field) => T('schemas.version.diff_now_optional', { field })),
+  ];
+  if (!parts.length) {
+    return deepEqual(parseObject(oldText), parseObject(newText))
+      ? T('schemas.version.same_as', { version: v })
+      : T('schemas.version.diff_other', { version: v });
+  }
+  return T('schemas.version.diff', { version: v, changes: listText(parts) });
+}
+
+// The sentences of the HL7 v2 profile checker (hl7v2_profile.rs): which side
+// asks for more, then `segments [A, B] are not guaranteed; fields [X] are not guaranteed`.
+const HL7_BACKWARD = /^backward \(the new profile requires more than the old one guarantees\): ([\s\S]*)$/;
+const HL7_FORWARD = /^forward \(the old profile requires more than the new one guarantees\): ([\s\S]*)$/;
+
+function hl7Items(rest) {
+  const grab = (kind) => {
+    const m = new RegExp(`${kind} \\[([^\\]]*)\\] are not guaranteed`).exec(rest);
+    return m ? m[1].split(',').map((x) => x.trim()).filter(Boolean) : [];
+  };
+  const segments = grab('segments');
+  const fields = grab('fields');
+  return { segments, fields, items: [...fields, ...segments.filter((s) => !fields.some((f) => f.startsWith(`${s}-`)))] };
+}
+
+/**
+ * What the new version of an HL7 v2 profile asks for beyond the old one — the
+ * server's refusal under "nowe programy przeczytają stare wiadomości" —
+ * `{ segments, fields, items }`, or `null` for any other refusal. Dropping
+ * these from the required lists is the fix `dropRequired` applies.
+ */
+export function hl7DropOffer(detail) {
+  const m = HL7_BACKWARD.exec(String(detail || ''));
+  if (!m) return null;
+  const offer = hl7Items(m[1]);
+  return offer.items.length ? offer : null;
+}
+
+/** The profile text without the given required segments and fields, laid out for editing; `null` when it is not a JSON object. */
+export function dropRequired(text, { segments = [], fields = [] }) {
+  const profile = parseObject(text);
+  if (!profile) return null;
+  const without = (list, drop) => (Array.isArray(list) ? list.filter((x) => !drop.includes(x)) : list);
+  const next = { ...profile };
+  if ('required_segments' in profile) next.required_segments = without(profile.required_segments, segments);
+  if ('required_fields' in profile) next.required_fields = without(profile.required_fields, fields);
+  return JSON.stringify(next, null, 2);
+}
+
+/**
  * The server's refusal of a new version, taken apart: `{ mode, detail }` from
  * `bus.schema_incompatible: '<subject>' mode=<mode>: <detail>`, `null` for any
  * other error.
@@ -183,6 +266,15 @@ export function incompatibilityReason({ mode, detail, newText }) {
   const after = parseObject(newText);
   const quoted = (re) => re.exec(detail)?.[1] ?? null;
   const generic = T('schemas.incompat.fix_generic');
+  // An HL7 v2 profile: the sentence itself says which side asks for more.
+  const profileNew = HL7_BACKWARD.exec(detail);
+  const profileOld = HL7_FORWARD.exec(detail);
+  if (profileNew || profileOld) {
+    const field = hl7Items((profileNew || profileOld)[1]).items.join(', ');
+    return profileNew
+      ? { reason: T('schemas.incompat.required_new', { field }), fix: T('schemas.incompat.fix_required_new', { field }) }
+      : { reason: T('schemas.incompat.required_old', { field }), fix: T('schemas.incompat.fix_required_old', { field }) };
+  }
   let field = quoted(/^property '([^']+)' is required by the reader schema but not guaranteed present by the writer schema/);
   if (field != null) {
     // The reader is the new version under "backward", the old one under "forward".
@@ -224,7 +316,7 @@ export function incompatibilityReason({ mode, detail, newText }) {
  * put in words, or a text the server could not read — the server's own
  * sentence in a folded block. `compatibility` is the pattern's.
  */
-export function refusalHtml({ err, title, compatibility, schemaType, newText, describeError }) {
+export function refusalHtml({ err, title, compatibility, schemaType, newText, describeError, offerDrop = false }) {
   const message = String(err?.message || err || '');
   const technical = (text) => `<details class="tb-tech"><summary>${escapeHtml(T('schemas.incompat.technical'))}</summary><pre>${escapeHtml(text)}</pre></details>`;
   const head = `<b>${escapeHtml(title)}</b>`;
@@ -233,7 +325,12 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
     const compat = compatLabel(incompatible.mode || compatibility);
     const known = incompatibilityReason({ ...incompatible, newText });
     if (known) {
-      return `<div>${head} ${escapeHtml(T('schemas.incompat.lead', { compat, reason: known.reason }))} ${escapeHtml(known.fix)}</div>`;
+      // One click on a refused HL7 profile: take out what the old messages cannot satisfy and add the version.
+      const drop = offerDrop && schemaType === 'hl7v2_profile' ? hl7DropOffer(incompatible.detail) : null;
+      const dropButton = drop
+        ? `<div class="tb-window-actions"><tf-button variant="primary" size="sm" icon="plus" data-act="drop-required" data-drop="${escapeAttr(JSON.stringify({ segments: drop.segments, fields: drop.fields }))}">${escapeHtml(T('schemas.version.drop_and_add', { items: listText(drop.items) }))}</tf-button></div>`
+        : '';
+      return `<div>${head} ${escapeHtml(T('schemas.incompat.lead', { compat, reason: known.reason }))} ${escapeHtml(known.fix)}</div>${dropButton}`;
     }
     return `<div>${head} ${escapeHtml(T('schemas.incompat.unknown', { compat }))} ${escapeHtml(T('schemas.incompat.fix_generic'))}</div>${technical(incompatible.detail)}`;
   }
@@ -465,7 +562,8 @@ export function openSchemaVersion(ctx) {
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');
       const paintDiff = () => {
-        const text = info.schemaType === 'json_schema' ? jsonSchemaChanges(ctx.latestText, win.querySelector('[data-role="text"]').value, latest) : null;
+        const changes = { json_schema: jsonSchemaChanges, hl7v2_profile: profileChanges }[info.schemaType];
+        const text = changes ? changes(ctx.latestText, win.querySelector('[data-role="text"]').value, latest) : null;
         diff.textContent = text || '';
         diff.hidden = !text;
       };
@@ -486,12 +584,29 @@ export function openSchemaVersion(ctx) {
       schemaType: info.schemaType,
       newText: d.schemaText,
       describeError: ctx.describeError,
+      offerDrop: true,
     }),
     describeError: ctx.describeError,
     onSaved: (d, resp) => {
       added = true;
       ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true });
     },
+  });
+  win.addEventListener('click', (e) => {
+    const button = e.target.closest?.('[data-act="drop-required"]');
+    if (!button) return;
+    let drop;
+    try {
+      drop = JSON.parse(button.dataset.drop);
+    } catch {
+      return;
+    }
+    const field = win.querySelector('[data-role="text"]');
+    const next = dropRequired(field.value, drop);
+    if (next == null) return;
+    field.value = next;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    win.querySelector('[data-act="save"]')?.click();
   });
   win.addEventListener('closed', () => {
     if (added) return;
