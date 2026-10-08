@@ -48,7 +48,10 @@ const LATENCY_ALERT_MS: i64 = 500;
 const BATTERY_ALERT_PCT: i64 = 20;
 // Watchdogs (seconds). Validation must complete promptly; an online connection
 // that stops advancing telemetry (persistent drain/state errors) is declared dead.
-const CONNECT_TIMEOUT_SECS: i64 = 20;
+// Connecting runs on a worker while the tick keeps going, so its watchdog must
+// outlast the slowest legitimate connect: ICE gathering (8 s) plus two signaling
+// calls of up to 12 s connect + 15 s answer each — 62 s.
+const CONNECT_TIMEOUT_SECS: i64 = 75;
 const VALIDATION_TIMEOUT_SECS: i64 = 20;
 // Auto-connect backoff: when offline with connect-intent on, the tick retries a
 // connect with exponential backoff so an unreachable robot is not hammered every
@@ -133,6 +136,7 @@ extern "C" {
     fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn lidar_publish_v1(in_ptr: i32, in_len: i32) -> i32;
     fn robot_pose_publish_v1(in_ptr: i32, in_len: i32) -> i32;
+    fn tool_run_in_background_v1(tool_ptr: i32, tool_len: i32, params_ptr: i32, params_len: i32) -> i32;
 }
 
 /// Hand the robot's latest odometry pose to the host scene, where it places the
@@ -2165,6 +2169,106 @@ std::thread_local! {
     // Consecutive failed auto-connect attempts — drives the exponential backoff
     // delay. Reset to 0 when the link reaches `online`.
     static RECONNECT_FAILS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    // Latest lowstate receipt `(unix secs, battery %)`, kept in memory: it arrives
+    // on nearly every tick and feeds the liveness watchdog here, so writing it to
+    // SQLite each time cost a write per tick. It is persisted once a second for
+    // the other workers (see the status block of the tick).
+    static LOWSTATE_SEEN: core::cell::Cell<(i64, i64)> = const { core::cell::Cell::new((0, -1)) };
+    // Receipt time of the telemetry last written to the database.
+    static TELEMETRY_PERSISTED: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    // Second of the last status publish: the status block runs once per second.
+    static STATUS_SECS: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    static TICK_PHASES: core::cell::RefCell<TickPhases> = core::cell::RefCell::new(TickPhases::default());
+}
+
+/// How often the per-phase tick timing is logged.
+const PHASE_LOG_SECS: u64 = 10;
+
+#[derive(Default, Clone, Copy)]
+struct PhaseStat {
+    sum_us: u64,
+    max_us: u64,
+}
+
+impl PhaseStat {
+    fn add(&mut self, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        self.sum_us += us;
+        self.max_us = self.max_us.max(us);
+    }
+
+    fn describe(&self, ticks: u64) -> String {
+        alloc::format!(
+            "{:.2}/{:.1}ms",
+            self.sum_us as f64 / ticks.max(1) as f64 / 1000.0,
+            self.max_us as f64 / 1000.0
+        )
+    }
+}
+
+/// Where a tick's time goes, logged every `PHASE_LOG_SECS`: when the host's
+/// `addon.tick` rate shows slow ticks, this line names the phase. A tick that
+/// skips a phase counts as zero for it, so means are per tick.
+#[derive(Default)]
+struct TickPhases {
+    window_start: Option<std::time::Instant>,
+    ticks: u64,
+    drain: PhaseStat,
+    telemetry: PhaseStat,
+    lidar: PhaseStat,
+    status: PhaseStat,
+    total: PhaseStat,
+}
+
+/// Times `f` into one phase of the current tick.
+fn timed<T>(phase: fn(&mut TickPhases) -> &mut PhaseStat, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let took = started.elapsed();
+    TICK_PHASES.with(|p| phase(&mut p.borrow_mut()).add(took));
+    out
+}
+
+/// Closes one tick's timing and logs the window when it is due.
+fn finish_tick_timing(took: std::time::Duration) {
+    TICK_PHASES.with(|cell| {
+        let mut p = cell.borrow_mut();
+        let start = *p.window_start.get_or_insert_with(std::time::Instant::now);
+        p.ticks += 1;
+        p.total.add(took);
+        if start.elapsed().as_secs() < PHASE_LOG_SECS {
+            return;
+        }
+        let n = p.ticks;
+        log::info(&alloc::format!(
+            "go2 tick phases over {n} ticks (mean/max): total {}, drain {}, telemetry {}, lidar {}, status {}",
+            p.total.describe(n),
+            p.drain.describe(n),
+            p.telemetry.describe(n),
+            p.lidar.describe(n),
+            p.status.describe(n),
+        ));
+        *p = TickPhases::default();
+    });
+}
+
+/// Hands `go2.connect` to a host worker. Not started again while a previous
+/// connect is still running — the backoff above spaces the attempts anyway.
+fn start_background_connect() {
+    const TOOL: &str = "go2.connect";
+    let params = b"{}";
+    let code = unsafe {
+        tool_run_in_background_v1(
+            TOOL.as_ptr() as i32,
+            TOOL.len() as i32,
+            params.as_ptr() as i32,
+            params.len() as i32,
+        )
+    };
+    // -4: a connect from an earlier attempt is still in flight.
+    if code != 0 && code != -4 {
+        log::warn(&alloc::format!("go2: background connect not started: abi error {code}"));
+    }
 }
 
 /// Current backoff delay (seconds) for `fails` consecutive failures:
@@ -2317,15 +2421,14 @@ fn tick() {
             // continuously, so if no fresh lowstate has arrived within the window
             // the link is dead (a stalled-but-open data channel, or persistent
             // drain failure). last_telemetry advances ONLY on actual lowstate.
-            if db::now_secs() - robot.last_telemetry > ONLINE_STALE_SECS {
+            let (seen_secs, seen_battery) = LOWSTATE_SEEN.with(core::cell::Cell::get);
+            if db::now_secs() - robot.last_telemetry.max(seen_secs) > ONLINE_STALE_SECS {
                 wc_close(&robot.channel_id);
                 lidar_reset_session();
                 let _ = set_offline_mirrored("error", "telemetry stalled");
                 publish_event("go2.offline", json!({ "reason": "telemetry stalled" }));
                 return;
             }
-            db::bump_tick();
-            let tick_n = robot.tick_count + 1;
             // The operator enable INTENT lives in the shared DB (toggled from any
             // worker via go2.lidar_on/off). The service instance reads it each tick
             // and drives the actual switch + subscription against the live channel,
@@ -2380,7 +2483,7 @@ fn tick() {
                     }
                 }
             }
-            let drained = match wc_drain(&robot.channel_id, 64) {
+            let drained = match timed(|p| &mut p.drain, || wc_drain(&robot.channel_id, 64)) {
                 Ok(d) => d,
                 Err(_) => return,
             };
@@ -2390,8 +2493,9 @@ fn tick() {
                 publish_event("go2.offline", json!({ "reason": "channel closed" }));
                 return;
             }
-            let mut battery = robot.battery_pct;
+            let mut battery = if seen_secs > 0 { seen_battery } else { robot.battery_pct };
             let mut got_telemetry = false;
+            let telemetry_started = std::time::Instant::now();
             // The single latest binary (voxel) frame is copied OUT of the scratch
             // here and ingested AFTER the DECODE_BUF borrow is released. This is the
             // connection-saving invariant: ingest_voxel_map -> decode can abort the
@@ -2461,7 +2565,7 @@ fn tick() {
                 // lidar work this drain, so the link's liveness is updated regardless
                 // of a (possibly malformed) voxel frame in the same drain.
                 if got_telemetry {
-                    let _ = db::record_lowstate(battery);
+                    LOWSTATE_SEEN.with(|t| t.set((db::now_secs(), battery)));
                 }
                 // Decode the single latest binary frame from base64 into the scratch
                 // and COPY the bytes into an owned Vec. ingest is intentionally NOT
@@ -2485,19 +2589,28 @@ fn tick() {
             // cascade into a permanent per-tick abort. Telemetry is already recorded.
             // A frame still in flight after the operator turned the stream off is
             // dropped, so nothing is published once the toggle reads off.
+            TICK_PHASES.with(|p| p.borrow_mut().telemetry.add(telemetry_started.elapsed()));
             if let Some(payload) = voxel_payload {
                 if LIDAR.with(|cell| cell.borrow().enabled) {
-                    ingest_voxel_map(&payload);
+                    timed(|p| &mut p.lidar, || ingest_voxel_map(&payload));
                 }
             }
             if let Some((position, quat, received_ms)) = PENDING_POSE.with(core::cell::Cell::take) {
                 publish_robot_pose(position, quat, received_ms as i64 * 1000);
             }
-            // Throttle RTT poll + publish + telemetry DB persist to ~1s (every 5
-            // ticks @200ms) so the high-rate stream never hammers SQLite. The
-            // shared-DB snapshot is the source of truth cross-worker go2.status
-            // reads; the thread_local is only the in-tick accumulator.
-            if tick_n % 5 == 0 {
+            // Once per second: persist the telemetry, poll RTT, publish status —
+            // the high-rate stream never hammers SQLite. The shared-DB snapshot is
+            // the source of truth for cross-worker go2.status reads; the
+            // thread_locals are only the in-tick accumulators.
+            let now = db::now_secs();
+            if STATUS_SECS.with(|c| c.replace(now)) != now {
+                let status_started = std::time::Instant::now();
+                let (seen, latest_battery) = LOWSTATE_SEEN.with(core::cell::Cell::get);
+                if seen > TELEMETRY_PERSISTED.with(core::cell::Cell::get)
+                    && db::record_lowstate(latest_battery).is_ok()
+                {
+                    TELEMETRY_PERSISTED.with(|c| c.set(seen));
+                }
                 let snapshot = telemetry_json();
                 if !snapshot.is_null() {
                     let _ = state::set_ephemeral(
@@ -2538,6 +2651,7 @@ fn tick() {
                 if rtt > LATENCY_ALERT_MS {
                     publish_event("go2.latency_high", json!({ "rtt_ms": rtt }));
                 }
+                TICK_PHASES.with(|p| p.borrow_mut().status.add(status_started.elapsed()));
             }
         }
         // offline / error / unknown → AUTO-CONNECT. When the operator intent is
@@ -2556,7 +2670,12 @@ fn tick() {
                     // the robot actually answers, so a persistently-down robot
                     // keeps widening the gap instead of retrying every few seconds.
                     RECONNECT_FAILS.with(|c| c.set(fails.saturating_add(1)));
-                    let _ = do_connect();
+                    // The connect waits on the robot for up to a minute (ICE
+                    // gathering, two signaling calls with network timeouts); run
+                    // inside the tick it froze telemetry, LiDAR and every watchdog
+                    // for that long. A worker runs it; this tick and the next go on,
+                    // watching the `connecting` row it leaves.
+                    start_background_connect();
                 }
             }
         }
@@ -2942,7 +3061,9 @@ pub extern "C" fn on_tick(ts_ms: i64) -> i32 {
     // Seed the cached clock from the host timestamp so the tick never issues a
     // SQL roundtrip just to read wall-clock time.
     db::set_now_secs(ts_ms / 1000);
+    let started = std::time::Instant::now();
     tick();
+    finish_tick_timing(started.elapsed());
     0
 }
 
@@ -2997,6 +3118,8 @@ mod host_stubs {
     extern "C" fn lidar_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
     #[no_mangle]
     extern "C" fn robot_pose_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn tool_run_in_background_v1(_a: i32, _b: i32, _c: i32, _d: i32) -> i32 { 0 }
     // Native tests can't round-trip the host SQL ABI: it passes pointers as i32,
     // which truncates 64-bit stack addresses → SIGSEGV. Under `#[cfg(test)]` the
     // `db` module routes SQL to an inert in-process test backend instead, so
@@ -3878,6 +4001,9 @@ pub extern "C" fn on_request(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    // Requests run on workers that never tick, so the cached clock there is
+    // whatever an earlier request left — read the real time first.
+    db::resync_now_secs();
     let input = read_string(input_ptr, input_len);
     let req: JsonValue = serde_json::from_str(&input).unwrap_or(JsonValue::Null);
     let raw_tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");

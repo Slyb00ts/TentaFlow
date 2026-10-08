@@ -49,11 +49,11 @@ const WAVE_REVERSALS: usize = 3;
 /// change. A real wave swings ±0.5 or more; keypoint jitter of a still arm stays
 /// around 0.1, so this sits well clear of it.
 const WAVE_MIN_SWING: f32 = 0.3;
-/// Raw offsets averaged into one sample, to damp per-frame keypoint jitter.
-const WAVE_SMOOTHING: usize = 3;
-/// A wrist missing for this long ends the raise. Shorter gaps are a fast swing
-/// motion-blurring the wrist for a few frames — they must not restart the count.
-const WAVE_LOST_MS: u64 = 400;
+/// A hand lowered or lost for this long ends the raise. Shorter gaps are a fast
+/// swing blurring the hand, or a keypoint misread for a few frames — at the
+/// camera's full frame rate those come every few frames during a real wave and
+/// must not restart the count.
+const WAVE_GAP_MS: u64 = 400;
 /// How long a heart shape must be held.
 const HEART_HOLD_MS: u64 = 600;
 /// Minimum gap between two reactions of the same gesture on one robot.
@@ -247,34 +247,83 @@ fn heart_shape(body: Option<&Body>, hands: &[Hand]) -> bool {
 /// What one arm does on this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Arm {
-    /// Hand raised; its sideways position relative to the elbow, in shoulder widths.
-    Raised(f32),
+    /// Hand raised: its sideways position `x` and the length `unit` that one
+    /// shoulder width spans, both in pixels. Only the movement counts, so `x`
+    /// may be relative to anything that stays put during a wave.
+    Raised { x: f32, unit: f32 },
     /// Hand seen, not raised.
     Lowered,
     /// The wrist (or the arm) was not found on this frame.
     Lost,
 }
 
-/// One arm's pose. The wrist is the pose model's, or — when a fast swing blurred
-/// it away — the wrist of the tracked hand next to that elbow.
+/// One arm's pose. The hand position is the palm center of this arm's tracked
+/// hand: the hand tracker follows a swinging hand on every frame, while the pose
+/// model's wrist lags and blurs away on a fast swing. Without a tracked hand the
+/// pose model's wrist is used.
 fn arm(body: &Body, hands: &[Hand], wrist: usize, elbow: usize, shoulder: usize) -> Arm {
     let (Some(e), Some(s), Some(sw)) = (body[elbow], body[shoulder], shoulder_width(body)) else {
         return Arm::Lost;
     };
-    let w = body[wrist].or_else(|| {
-        hands
-            .iter()
-            .map(|h| h.landmarks[H_WRIST])
-            .filter(|p| dist(*p, e) < 1.2 * sw)
-            .min_by(|a, b| dist(*a, e).total_cmp(&dist(*b, e)))
-    });
-    let Some(w) = w else { return Arm::Lost };
+    // This arm's hand: its wrist next to the pose model's (lagging) wrist, or —
+    // with that wrist lost — within a forearm of the elbow.
+    let (anchor, reach) = match body[wrist] {
+        Some(w) => (w, sw),
+        None => (e, 1.2 * sw),
+    };
+    let hand = hands
+        .iter()
+        .filter(|h| dist(h.landmarks[H_WRIST], anchor) < reach)
+        .min_by(|a, b| {
+            dist(a.landmarks[H_WRIST], anchor).total_cmp(&dist(b.landmarks[H_WRIST], anchor))
+        });
+    let Some(w) = hand.map(|h| h.landmarks[H_MIDDLE_MCP]).or(body[wrist]) else {
+        return Arm::Lost;
+    };
     // Raised: the hand above the elbow AND the shoulder — a hand at the ear or the
     // chin (a phone call, a thinking pose) stays below the shoulder line.
     if w.y < e.y && w.y < s.y {
-        Arm::Raised((w.x - e.x) / sw)
+        Arm::Raised { x: w.x - e.x, unit: sw }
     } else {
         Arm::Lowered
+    }
+}
+
+/// Hand widths per shoulder width: scales a hand-only swing to the same unit as
+/// an arm's.
+const HAND_SIZES_PER_SHOULDER: f32 = 4.0;
+
+/// An open hand with the fingers up — the waving hand.
+fn open_upright(h: &Hand) -> bool {
+    let (w, m) = (h.landmarks[H_WRIST], h.landmarks[H_MIDDLE_MCP]);
+    let size = hand_size(h);
+    let extended = [(H_INDEX_TIP, H_INDEX_MCP), (H_MIDDLE_TIP, H_MIDDLE_MCP), (H_RING_TIP, H_RING_MCP), (H_PINKY_TIP, H_PINKY_MCP)]
+        .iter()
+        .filter(|&&(tip, mcp)| dist(h.landmarks[tip], w) > dist(h.landmarks[mcp], w) * 1.4)
+        .count();
+    w.y - m.y > 0.5 * size && extended >= 3
+}
+
+/// The wave read from the hand alone — an open hand, fingers up, moving side to
+/// side — whether or not the pose model sees the person. Of several such hands
+/// the one nearest the hand followed so far is taken, so two hands are never
+/// mixed into one swing; otherwise the highest one.
+fn waving_hand(hands: &[Hand], previous_x: Option<f32>) -> Arm {
+    if hands.is_empty() {
+        return Arm::Lost;
+    }
+    let palm = |h: &Hand| h.landmarks[H_MIDDLE_MCP];
+    let open = hands.iter().filter(|h| open_upright(h));
+    let chosen = match previous_x {
+        Some(px) => open.min_by(|a, b| (palm(a).x - px).abs().total_cmp(&(palm(b).x - px).abs())),
+        None => open.min_by(|a, b| palm(a).y.total_cmp(&palm(b).y)),
+    };
+    match chosen {
+        Some(h) => Arm::Raised {
+            x: palm(h).x,
+            unit: HAND_SIZES_PER_SHOULDER * hand_size(h),
+        },
+        None => Arm::Lowered,
     }
 }
 
@@ -330,66 +379,89 @@ fn count_reversals(offsets: impl Iterator<Item = f32>) -> usize {
     reversals
 }
 
-/// One arm's recent swing: smoothed offsets of an UNBROKEN raise. Lowering the
-/// hand clears it, so two separate raises never join into one wave; losing the
-/// wrist clears it only after `WAVE_LOST_MS`.
+/// One arm's recent swing: the hand's offsets during one raise. A hand lowered or lost
+/// for longer than `WAVE_GAP_MS` clears it, so two separate raises never join
+/// into one wave.
 #[derive(Default)]
 struct ArmSeries {
-    raw: VecDeque<f32>,
-    smoothed: VecDeque<(u64, f32)>,
+    samples: VecDeque<(u64, f32)>,
+    /// Direction changes in the current series.
+    reversals: usize,
+    /// Position and unit of the raise's first sample: later samples are
+    /// measured from it in that unit, so a unit that jitters frame to frame (a
+    /// hand's size) never turns into a swing.
+    origin: Option<(f32, f32)>,
+    /// Last raw position, pixels.
+    last_x: Option<f32>,
 }
 
 impl ArmSeries {
     /// Add this frame's arm pose; true when the series now holds a wave.
     fn push(&mut self, ts_ms: u64, arm: Arm) -> bool {
         let x = match arm {
-            Arm::Raised(x) => x,
-            Arm::Lowered => {
-                self.clear();
-                return false;
+            Arm::Raised { x, unit } => {
+                let (x0, u0) = *self.origin.get_or_insert((x, unit.max(1.0)));
+                self.last_x = Some(x);
+                (x - x0) / u0
             }
-            Arm::Lost => {
+            Arm::Lowered | Arm::Lost => {
                 if self
-                    .smoothed
+                    .samples
                     .back()
-                    .is_some_and(|(t, _)| ts_ms.saturating_sub(*t) > WAVE_LOST_MS)
+                    .is_some_and(|(t, _)| ts_ms.saturating_sub(*t) > WAVE_GAP_MS)
                 {
                     self.clear();
                 }
                 return false;
             }
         };
-        self.raw.push_back(x);
-        if self.raw.len() > WAVE_SMOOTHING {
-            self.raw.pop_front();
-        }
-        let mean = self.raw.iter().sum::<f32>() / self.raw.len() as f32;
-        self.smoothed.push_back((ts_ms, mean));
+        // No averaging: a normal wave swings in ~2 frames per direction, and an
+        // average of those flattens the very swing being counted. Keypoint
+        // jitter is already ignored by WAVE_MIN_SWING's hysteresis.
+        self.samples.push_back((ts_ms, x));
         while self
-            .smoothed
+            .samples
             .front()
             .is_some_and(|(t, _)| ts_ms.saturating_sub(*t) > WAVE_WINDOW_MS)
         {
-            self.smoothed.pop_front();
+            self.samples.pop_front();
         }
-        count_reversals(self.smoothed.iter().map(|(_, x)| *x)) >= WAVE_REVERSALS
+        self.reversals = count_reversals(self.samples.iter().map(|(_, x)| *x));
+        self.reversals >= WAVE_REVERSALS
     }
 
     fn clear(&mut self) {
-        self.raw.clear();
-        self.smoothed.clear();
+        self.samples.clear();
+        self.reversals = 0;
+        self.origin = None;
+        self.last_x = None;
     }
 }
 
 /// Gesture recognition over time for one camera.
 #[derive(Default)]
 pub struct Recognizer {
+    /// The waving hand itself, read from the hand tracker.
+    hand: ArmSeries,
+    /// The arms of the pose model — for a hand too far or too blurred to track.
     left: ArmSeries,
     right: ArmSeries,
     heart_since: Option<u64>,
+    /// Frames with a raised hand and the most swings one raise reached, since
+    /// the last [`Recognizer::take_wave_stats`] — how close people come to a wave.
+    raised_frames: u32,
+    peak_reversals: usize,
 }
 
 impl Recognizer {
+    /// `(raised frames, most swings)` since the previous call; resets both.
+    fn take_wave_stats(&mut self) -> (u32, usize) {
+        let stats = (self.raised_frames, self.peak_reversals);
+        self.raised_frames = 0;
+        self.peak_reversals = 0;
+        stats
+    }
+
     /// Feed one analyzed frame; returns a gesture when one completes. The state
     /// that produced it is cleared, so one gesture fires once.
     pub fn update(&mut self, ts_ms: u64, body: Option<&Body>, hands: &[Hand]) -> Option<Gesture> {
@@ -397,6 +469,7 @@ impl Recognizer {
             let since = *self.heart_since.get_or_insert(ts_ms);
             if ts_ms.saturating_sub(since) >= HEART_HOLD_MS {
                 self.heart_since = None;
+                self.hand.clear();
                 self.left.clear();
                 self.right.clear();
                 return Some(Gesture::Heart);
@@ -412,9 +485,30 @@ impl Recognizer {
             ),
             None => (Arm::Lost, Arm::Lost),
         };
+        let hand = waving_hand(hands, self.hand.last_x);
+        tracing::debug!(
+            ?hand,
+            ?left,
+            ?right,
+            hand_swings = self.hand.reversals,
+            left_swings = self.left.reversals,
+            right_swings = self.right.reversals,
+            hands = hands.len(),
+            "[gesture] wave"
+        );
+        let hand_waved = self.hand.push(ts_ms, hand);
         let left_waved = self.left.push(ts_ms, left);
         let right_waved = self.right.push(ts_ms, right);
-        if left_waved || right_waved {
+        if [hand, left, right].iter().any(|a| matches!(a, Arm::Raised { .. })) {
+            self.raised_frames += 1;
+        }
+        self.peak_reversals = self
+            .peak_reversals
+            .max(self.hand.reversals)
+            .max(self.left.reversals)
+            .max(self.right.reversals);
+        if hand_waved || left_waved || right_waved {
+            self.hand.clear();
             self.left.clear();
             self.right.clear();
             self.heart_since = None;
@@ -572,22 +666,12 @@ fn square_crop_rgb(rgb: &[u8], w: u32, h: u32, region: Region, n: u32) -> Vec<u8
     out
 }
 
-/// One frame: the person (in the tracking crop from the previous frame), then the
-/// hands — first re-found from the previous frame's landmarks (cheap, every
-/// frame), then searched with the palm detector only in wrist regions still
-/// missing a hand.
-fn analyze(
-    models: &Models,
-    rgb: &[u8],
-    w: u32,
-    h: u32,
-    pose_region: Option<Region>,
-    previous_hands: &[Hand],
-) -> anyhow::Result<Analysis> {
-    let region = pose_region.unwrap_or_else(|| full_frame_region(w, h));
+/// The person in `region` of the frame (the previous frame's tracking crop),
+/// keypoints in frame pixels.
+fn estimate_pose(models: &Models, rgb: &[u8], w: u32, h: u32, region: Region) -> anyhow::Result<Option<PoseDetection>> {
     let crop = square_crop_rgb(rgb, w, h, region, POSE_CROP);
     let scale = region.size / POSE_CROP as f32;
-    let det = models
+    Ok(models
         .pose
         .estimate(&crop, POSE_CROP, POSE_CROP)?
         .into_iter()
@@ -598,21 +682,79 @@ fn analyze(
                 k.y = region.y + k.y * scale;
             }
             d
-        });
+        }))
+}
+
+/// Runs `jobs` at once, one thread each — the models sit in separate session
+/// pools, so a pose, two hand trackings or two palm searches overlap on the GPU
+/// instead of queuing. Results keep the order of `jobs`.
+fn run_parallel<T, F>(jobs: Vec<F>) -> Vec<T>
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs.into_iter().map(|job| scope.spawn(job)).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect()
+    })
+}
+
+/// One frame. The person (in the tracking crop from the previous frame) and the
+/// hands of the previous frame, re-found from their landmarks, are read at the
+/// same time; then the palm detector searches, in parallel, only the wrist
+/// regions still missing a hand.
+fn analyze(
+    models: &Models,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    pose_region: Option<Region>,
+    previous_hands: &[Hand],
+) -> anyhow::Result<Analysis> {
+    let region = pose_region.unwrap_or_else(|| full_frame_region(w, h));
+    let (det, tracked) = std::thread::scope(|scope| {
+        let pose = scope.spawn(|| estimate_pose(models, rgb, w, h, region));
+        let tracked = run_parallel(
+            previous_hands
+                .iter()
+                .map(|previous| move || models.hands.track(rgb, w, h, previous))
+                .collect(),
+        );
+        let pose = pose.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (pose, tracked)
+    });
+    let det = det?;
     let body = det.as_ref().and_then(body_from);
-    let mut tracked = Vec::with_capacity(previous_hands.len());
-    for previous in previous_hands {
-        tracked.extend(models.hands.track(rgb, w, h, previous)?);
+    let mut hands = Vec::with_capacity(tracked.len());
+    for hand in tracked {
+        hands.extend(hand?);
     }
-    let mut hands = dedupe_hands(tracked);
+    let mut hands = dedupe_hands(hands);
     let regions = body.as_ref().map(hand_regions).unwrap_or_default();
-    let mut searched = 0;
-    for (region, expected) in &regions {
-        let inside = hands.iter().filter(|h| contains(region, h.landmarks[H_WRIST])).count();
-        if inside < *expected {
-            searched += 1;
-            hands.extend(models.hands.hands_in(rgb, w, h, *region)?);
-        }
+    let mut missing: Vec<Region> = regions
+        .iter()
+        .filter(|(region, expected)| {
+            hands.iter().filter(|h| contains(region, h.landmarks[H_WRIST])).count() < *expected
+        })
+        .map(|(region, _)| *region)
+        .collect();
+    // No person and no hand: someone close to the camera shows hands without a
+    // body the pose model can read — search the whole frame, where such hands
+    // are large enough for the palm detector.
+    if body.is_none() && hands.is_empty() {
+        missing.push(full_frame_region(w, h));
+    }
+    let searched = missing.len();
+    for found in run_parallel(
+        missing
+            .into_iter()
+            .map(|region| move || models.hands.hands_in(rgb, w, h, region))
+            .collect(),
+    ) {
+        hands.extend(found?);
     }
     if searched > 0 {
         hands = dedupe_hands(hands);
@@ -655,11 +797,14 @@ fn analyze(
 #[derive(Default)]
 struct CameraState {
     recognizer: Recognizer,
-    last_frame_ms: u64,
     last_reaction: HashMap<Gesture, u64>,
     last_any_reaction: u64,
     label: Option<(Gesture, u64)>,
     timed_frames: u32,
+    /// Start of the current timing window: frames per second actually analyzed.
+    timed_since: Option<std::time::Instant>,
+    /// Time spent getting frames (snapshot, GPU download, NV12 → RGB).
+    timed_fetch: Duration,
     timed_total: Duration,
     timed_max: Duration,
     /// Tracking crop for the pose model; `None` = search the whole frame.
@@ -672,20 +817,29 @@ struct CameraState {
 const TIMING_LOG_EVERY: u32 = 100;
 
 impl CameraState {
-    /// Log the analysis cost now and then — it is the CPU this camera's
-    /// gestures cost the node.
-    fn note_timing(&mut self, camera_id: &str, took: Duration, hands: usize) {
+    /// Log the cost and the rate now and then: what this camera's gestures cost
+    /// the node, how many frames per second they really see, and how close the
+    /// people in view come to a wave.
+    fn note_timing(&mut self, camera_id: &str, fetch: Duration, took: Duration, hands: usize) {
+        let since = *self.timed_since.get_or_insert_with(std::time::Instant::now);
         self.timed_frames += 1;
+        self.timed_fetch += fetch;
         self.timed_total += took;
         self.timed_max = self.timed_max.max(took);
         if self.timed_frames == TIMING_LOG_EVERY {
+            let n = f64::from(self.timed_frames);
+            let (raised, swings) = self.recognizer.take_wave_stats();
             info!(
-                "[gesture] {camera_id}: analysis mean={:.0}ms max={:.0}ms over {} frames (hands now: {hands})",
-                self.timed_total.as_secs_f64() * 1000.0 / f64::from(self.timed_frames),
+                "[gesture] {camera_id}: {:.1} fps, frame fetch mean={:.0}ms, analysis mean={:.0}ms max={:.0}ms over {} frames (hands now: {hands}; raised-hand frames: {raised}, most swings: {swings}/{WAVE_REVERSALS})",
+                n / since.elapsed().as_secs_f64().max(1e-3),
+                self.timed_fetch.as_secs_f64() * 1000.0 / n,
+                self.timed_total.as_secs_f64() * 1000.0 / n,
                 self.timed_max.as_secs_f64() * 1000.0,
                 self.timed_frames
             );
             self.timed_frames = 0;
+            self.timed_since = Some(std::time::Instant::now());
+            self.timed_fetch = Duration::ZERO;
             self.timed_total = Duration::ZERO;
             self.timed_max = Duration::ZERO;
         }
@@ -708,24 +862,27 @@ pub fn spawn_worker() {
     });
 }
 
-/// Every new camera frame is analyzed, so the overlay and the recognition run at
-/// the camera's rate. The worker waits this long when no camera has a new frame.
+/// The fetcher waits this long before asking the camera again for a new frame.
 const FRAME_POLL: Duration = Duration::from_millis(4);
-/// Check for robots with gestures on (or retry the models) this often when idle.
+/// Check for robots with gestures on (or retry the models) this often.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
+/// Starts and stops one analysis task per camera of a local robot with gestures
+/// on, so cameras never wait for each other.
 async fn worker() {
     let mut models: Option<Arc<Models>> = None;
     let mut models_retry_at = 0u64;
-    let mut states: HashMap<String, CameraState> = HashMap::new();
+    let mut running: HashMap<(String, String), tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
         let robots = crate::mesh::robot_dispatch::local_gesture_cameras();
-        states.retain(|cam, _| robots.iter().any(|(_, c)| c == cam));
-        if robots.is_empty() {
-            tokio::time::sleep(IDLE_POLL).await;
-            continue;
-        }
-        if models.is_none() && now_ms() >= models_retry_at {
+        running.retain(|key, task| {
+            let keep = robots.contains(key) && !task.is_finished();
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        if !robots.is_empty() && models.is_none() && now_ms() >= models_retry_at {
             if let Err(e) = install_models().await {
                 warn!("[gesture] model download failed: {e:#}");
             }
@@ -734,74 +891,104 @@ async fn worker() {
                 models_retry_at = now_ms() + 60_000;
             }
         }
-        let Some(m) = models.clone() else {
-            tokio::time::sleep(IDLE_POLL).await;
-            continue;
-        };
-        let mut analyzed = false;
-        for (robot_id, camera_id) in robots {
-            let s = states.entry(camera_id.clone()).or_default();
-            let Some(frame) =
-                crate::addon::host_functions::camera::latest_rgb_frame_global(&camera_id, s.last_frame_ms)
-                    .await
-            else {
-                continue;
-            };
-            analyzed = true;
-            // Marked before the analysis: a frame that fails is not retried.
-            s.last_frame_ms = frame.captured_ms;
-            let (m2, pose_region, previous_hands) = (m.clone(), s.pose_region, s.hands.clone());
-            let rgb = frame.rgb.clone();
-            let (w, h) = (frame.width, frame.height);
-            let started = std::time::Instant::now();
-            let analysis = match tokio::task::spawn_blocking(move || {
-                analyze(&m2, &rgb, w, h, pose_region, &previous_hands)
-            })
-            .await
-            {
-                Ok(Ok(a)) => a,
-                Ok(Err(e)) => {
-                    warn!("[gesture] analysis failed for {camera_id}: {e:#}");
-                    s.pose_region = None;
-                    s.hands.clear();
-                    continue;
+        if let Some(m) = &models {
+            for key in robots {
+                if !running.contains_key(&key) {
+                    let (robot_id, camera_id) = key.clone();
+                    running.insert(key, tokio::spawn(camera_task(m.clone(), robot_id, camera_id)));
                 }
-                Err(e) => {
-                    warn!("[gesture] analysis task dropped for {camera_id}: {e}");
-                    s.pose_region = None;
-                    s.hands.clear();
-                    continue;
-                }
-            };
-            let took = started.elapsed();
-            s.pose_region = analysis.next_pose_region;
-            s.hands = analysis.hands.clone();
-            s.note_timing(&camera_id, took, analysis.hands.len());
-            let now = now_ms();
-            let gesture = s
-                .recognizer
-                .update(frame.captured_ms, analysis.body.as_ref(), &analysis.hands);
-            let operator_busy =
-                crate::mesh::robot_dispatch::manual_control_within(&robot_id, MANUAL_CONTROL_QUIET);
-            let reaction = gesture.filter(|g| !operator_busy && s.may_react(*g, now));
-            if let Some(g) = gesture {
-                s.label = Some((g, now));
-            }
-            if let Some(g) = reaction {
-                s.last_reaction.insert(g, now);
-                s.last_any_reaction = now;
-            }
-            let label = s
-                .label
-                .filter(|(_, at)| now.saturating_sub(*at) < LABEL_MS)
-                .map(|(g, _)| g);
-            publish_overlay(&camera_id, &frame, took, &analysis, label);
-            if let Some(g) = reaction {
-                react(robot_id, g);
             }
         }
-        if !analyzed {
-            tokio::time::sleep(FRAME_POLL).await;
+        tokio::time::sleep(IDLE_POLL).await;
+    }
+}
+
+/// A frame and the time it took to get it.
+type Fetched = Option<(Arc<crate::addon::host_functions::camera::RgbFrame>, Duration)>;
+
+/// One camera: getting the next frame (snapshot, GPU download, NV12 → RGB)
+/// overlaps with analyzing the current one, so neither waits for the other.
+async fn camera_task(models: Arc<Models>, robot_id: String, camera_id: String) {
+    let (tx, rx) = tokio::sync::watch::channel::<Fetched>(None);
+    tokio::join!(fetch_frames(&camera_id, tx), analyze_frames(models, &robot_id, &camera_id, rx));
+}
+
+/// Publishes every new frame of the camera; the analysis takes the newest one
+/// and skips any it had no time for.
+async fn fetch_frames(camera_id: &str, tx: tokio::sync::watch::Sender<Fetched>) {
+    let mut last_ms = 0u64;
+    loop {
+        let started = std::time::Instant::now();
+        match crate::addon::host_functions::camera::latest_rgb_frame_global(camera_id, last_ms).await {
+            Some(frame) => {
+                last_ms = frame.captured_ms;
+                if tx.send(Some((Arc::new(frame), started.elapsed()))).is_err() {
+                    return;
+                }
+            }
+            None => tokio::time::sleep(FRAME_POLL).await,
+        }
+    }
+}
+
+async fn analyze_frames(
+    models: Arc<Models>,
+    robot_id: &str,
+    camera_id: &str,
+    mut rx: tokio::sync::watch::Receiver<Fetched>,
+) {
+    let mut s = CameraState::default();
+    while rx.changed().await.is_ok() {
+        let Some((frame, fetch)) = rx.borrow_and_update().clone() else {
+            continue;
+        };
+        let (m, f, pose_region, previous_hands) =
+            (models.clone(), frame.clone(), s.pose_region, s.hands.clone());
+        let started = std::time::Instant::now();
+        let analysis = match tokio::task::spawn_blocking(move || {
+            analyze(&m, &f.rgb, f.width, f.height, pose_region, &previous_hands)
+        })
+        .await
+        {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                warn!("[gesture] analysis failed for {camera_id}: {e:#}");
+                s.pose_region = None;
+                s.hands.clear();
+                continue;
+            }
+            Err(e) => {
+                warn!("[gesture] analysis task dropped for {camera_id}: {e}");
+                s.pose_region = None;
+                s.hands.clear();
+                continue;
+            }
+        };
+        let took = started.elapsed();
+        s.pose_region = analysis.next_pose_region;
+        s.hands = analysis.hands.clone();
+        s.note_timing(camera_id, fetch, took, analysis.hands.len());
+        let now = now_ms();
+        let gesture = s
+            .recognizer
+            .update(frame.captured_ms, analysis.body.as_ref(), &analysis.hands);
+        let operator_busy =
+            crate::mesh::robot_dispatch::manual_control_within(robot_id, MANUAL_CONTROL_QUIET);
+        let reaction = gesture.filter(|g| !operator_busy && s.may_react(*g, now));
+        if let Some(g) = gesture {
+            s.label = Some((g, now));
+        }
+        if let Some(g) = reaction {
+            s.last_reaction.insert(g, now);
+            s.last_any_reaction = now;
+        }
+        let label = s
+            .label
+            .filter(|(_, at)| now.saturating_sub(*at) < LABEL_MS)
+            .map(|(g, _)| g);
+        publish_overlay(camera_id, &frame, took, &analysis, label);
+        if let Some(g) = reaction {
+            react(robot_id.to_string(), g);
         }
     }
 }
@@ -965,16 +1152,35 @@ mod tests {
 
     #[test]
     fn lowering_the_hand_between_swings_starts_over() {
+        // Raises of one swing each (right, left, right), every one followed by
+        // the hand down for longer than the gap: no single raise holds a wave.
         let mut r = Recognizer::default();
-        for i in 0..40u64 {
-            let t = i * 100;
-            // Every third frame the hand drops: no unbroken raise long enough.
+        let mut t = 0;
+        for _ in 0..6 {
+            for dx in [60.0, -60.0, 60.0] {
+                assert_eq!(r.update(t, Some(&raised_right(dx)), &[]), None);
+                t += 100;
+            }
+            let mut down = raised_right(0.0);
+            down[R_WRIST] = Some(Pt { x: 120.0, y: 220.0 });
+            for _ in 0..5 {
+                assert_eq!(r.update(t, Some(&down), &[]), None);
+                t += 100;
+            }
+        }
+    }
+
+    #[test]
+    fn a_hand_misread_as_lowered_for_a_frame_mid_wave_does_not_restart_it() {
+        let mut r = Recognizer::default();
+        let fired = (0..60u64).map(|i| i * 33).find_map(|t| {
             let mut b = raised_right(wave_dx(t));
-            if i % 3 == 2 {
+            if (t / 33) % 4 == 3 {
                 b[R_WRIST] = Some(Pt { x: 120.0, y: 220.0 });
             }
-            assert_eq!(r.update(t, Some(&b), &[]), None);
-        }
+            r.update(t, Some(&b), &[])
+        });
+        assert_eq!(fired, Some(Gesture::Wave));
     }
 
     #[test]
@@ -992,12 +1198,96 @@ mod tests {
     }
 
     #[test]
+    fn a_wave_seen_at_a_low_frame_rate_is_still_a_wave() {
+        // 5 frames per second against 2.5 swings per second.
+        let mut r = Recognizer::default();
+        let fired = (0..15u64)
+            .map(|i| i * 200 + 50)
+            .find_map(|t| r.update(t, Some(&raised_right(wave_dx(t))), &[]));
+        assert_eq!(fired, Some(Gesture::Wave));
+    }
+
+    #[test]
+    fn the_tracked_palm_drives_the_wave_when_the_pose_wrist_lags() {
+        // The pose model's wrist stays put; the tracked hand swings.
+        let mut r = Recognizer::default();
+        let fired = (0..60u64).map(|i| i * 33).find_map(|t| {
+            let b = raised_right(0.0);
+            r.update(t, Some(&b), &[hand_at(120.0 + wave_dx(t), 80.0)])
+        });
+        assert_eq!(fired, Some(Gesture::Wave));
+    }
+
+    #[test]
+    fn an_open_hand_swinging_without_a_body_in_view_is_a_wave() {
+        let mut r = Recognizer::default();
+        let fired = (0..60u64)
+            .map(|i| i * 33)
+            .find_map(|t| r.update(t, None, &[hand_at(300.0 + 2.0 * wave_dx(t), 200.0)]));
+        assert_eq!(fired, Some(Gesture::Wave));
+        // A fist moving the same way is not.
+        let mut r = Recognizer::default();
+        let mut fist = hand_at(300.0, 200.0);
+        for tip in [H_INDEX_TIP, H_MIDDLE_TIP, H_RING_TIP, H_PINKY_TIP] {
+            fist.landmarks[tip] = Pt { x: 300.0, y: 175.0 };
+        }
+        for i in 0..60u64 {
+            let t = i * 33;
+            let mut h = fist.clone();
+            for p in h.landmarks.iter_mut() {
+                p.x += 2.0 * wave_dx(t);
+            }
+            assert_eq!(r.update(t, None, &[h]), None);
+        }
+    }
+
+    #[test]
+    fn a_waving_hand_counts_even_when_the_pose_model_sees_the_arm_lowered() {
+        // Elbow and wrist of the pose model below the shoulder (a low wave the
+        // pose model misreads), the tracked hand open and swinging.
+        let mut r = Recognizer::default();
+        let fired = (0..60u64).map(|i| i * 33).find_map(|t| {
+            let mut b = raised_right(0.0);
+            b[R_WRIST] = Some(Pt { x: 120.0, y: 230.0 });
+            b[R_ELBOW] = Some(Pt { x: 120.0, y: 300.0 });
+            r.update(t, Some(&b), &[hand_at(400.0 + 2.0 * wave_dx(t), 200.0)])
+        });
+        assert_eq!(fired, Some(Gesture::Wave));
+    }
+
+    #[test]
+    fn a_still_open_hand_whose_size_jitters_is_not_a_wave() {
+        let mut r = Recognizer::default();
+        for i in 0..90u64 {
+            // Far right of the frame, the detected hand size breathing ±10 %.
+            let s = if i % 2 == 0 { 1.1 } else { 0.9 };
+            let mut h = hand_at(1200.0, 400.0);
+            let w = h.landmarks[H_WRIST];
+            for p in h.landmarks.iter_mut() {
+                p.x = w.x + (p.x - w.x) * s;
+                p.y = w.y + (p.y - w.y) * s;
+            }
+            assert_eq!(r.update(i * 33, None, &[h]), None);
+        }
+    }
+
+    #[test]
+    fn two_still_open_hands_listed_in_changing_order_are_not_a_wave() {
+        let mut r = Recognizer::default();
+        let (a, b) = (hand_at(200.0, 200.0), hand_at(600.0, 200.0));
+        for i in 0..90u64 {
+            let hands = if i % 2 == 0 { [a.clone(), b.clone()] } else { [b.clone(), a.clone()] };
+            assert_eq!(r.update(i * 33, None, &hands), None);
+        }
+    }
+
+    #[test]
     fn a_wrist_lost_for_long_ends_the_raise() {
         let mut series = ArmSeries::default();
-        assert!(!series.push(0, Arm::Raised(0.6)));
-        assert!(!series.push(100, Arm::Raised(-0.6)));
-        assert!(!series.push(200 + WAVE_LOST_MS, Arm::Lost));
-        assert!(series.smoothed.is_empty());
+        assert!(!series.push(0, Arm::Raised { x: 60.0, unit: 100.0 }));
+        assert!(!series.push(100, Arm::Raised { x: -60.0, unit: 100.0 }));
+        assert!(!series.push(200 + WAVE_GAP_MS, Arm::Lost));
+        assert!(series.samples.is_empty());
     }
 
     #[test]
@@ -1006,10 +1296,10 @@ mod tests {
         b[R_WRIST] = None;
         let hand = hand_at(170.0, 80.0);
         assert_eq!(arm(&b, &[], R_WRIST, R_ELBOW, R_SHOULDER), Arm::Lost);
-        let Arm::Raised(x) = arm(&b, &[hand], R_WRIST, R_ELBOW, R_SHOULDER) else {
+        let Arm::Raised { x, unit } = arm(&b, &[hand], R_WRIST, R_ELBOW, R_SHOULDER) else {
             panic!("the hand next to the elbow is the wrist");
         };
-        assert!((x - 0.5).abs() < 1e-5);
+        assert!((x / unit - 0.5).abs() < 1e-5);
         // A hand far from this elbow (the other arm's) is not used.
         assert_eq!(arm(&b, &[hand_at(400.0, 80.0)], R_WRIST, R_ELBOW, R_SHOULDER), Arm::Lost);
     }
@@ -1037,7 +1327,7 @@ mod tests {
         l[H_INDEX_DIP] = Pt { x: x - 8.0, y: y - 62.0 };
         l[H_THUMB_MCP] = Pt { x: x - 20.0, y: y - 15.0 };
         l[H_THUMB_TIP] = Pt { x: x - 30.0, y: y - 25.0 };
-        Hand { landmarks: l, presence: 0.95 }
+        Hand { landmarks: l, presence: 0.95, motion: Pt { x: 0.0, y: 0.0 } }
     }
 
     /// Finger heart: index bent back over itself, thumb tip poking across it.

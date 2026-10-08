@@ -205,6 +205,14 @@ extern "C" {
         payload_json_ptr: i32, payload_json_len: i32,
     ) -> i32;
 
+    /// Runs one of this addon's own tools on a host worker, off the calling thread.
+    /// ABI: (tool_ptr, tool_len, params_json_ptr, params_json_len) -> i32
+    /// Matches host_functions/background.rs::tool_run_in_background_v1
+    fn tool_run_in_background_v1(
+        tool_ptr: i32, tool_len: i32,
+        params_json_ptr: i32, params_json_len: i32,
+    ) -> i32;
+
     /// Subskrypcja eventu — Core wywola guest export `on_event(ptr, len)` przy dostarczeniu.
     /// ABI: (event_type_ptr, event_type_len, filter_json_ptr, filter_json_len) -> i32
     /// Zwraca: subscription_id (>0) lub kod bledu (<0). Filtr opcjonalny — przekaz (0,0).
@@ -1529,6 +1537,23 @@ pub fn publish_event(event_type: &str, payload: serde_json::Value) -> Result<(),
         return Err(format!("Blad publikacji eventu: {}", result));
     }
     Ok(())
+}
+
+/// Starts one of this addon's own tools on a host worker and returns at once —
+/// for work too slow for a service tick (a network handshake that may time out).
+/// `Ok(true)`: started; `Ok(false)`: that tool is still running from an earlier call.
+pub fn run_own_tool_in_background(tool: &str, params: &serde_json::Value) -> Result<bool, String> {
+    let params_json = serde_json::to_string(params)
+        .map_err(|e| format!("encode params of {tool}: {e}"))?;
+    let (t, p) = (tool.as_bytes(), params_json.as_bytes());
+    let result = unsafe {
+        tool_run_in_background_v1(t.as_ptr() as i32, t.len() as i32, p.as_ptr() as i32, p.len() as i32)
+    };
+    match result {
+        0 => Ok(true),
+        -4 => Ok(false),
+        code => Err(format!("run {tool} in background: abi error {code}")),
+    }
 }
 
 /// Subskrybuje event — Core wywola guest export `on_event(ptr, len)` przy dostarczeniu.

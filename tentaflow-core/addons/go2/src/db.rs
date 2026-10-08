@@ -204,22 +204,20 @@ pub const ROBOT_ID: &str = "go2";
 
 #[derive(Debug, Clone, Default)]
 pub struct Robot {
-    pub ip: String,
     pub status: String,
     pub channel_id: String,
     pub camera_id: String,
     pub battery_pct: i64,
     pub rtt_ms: i64,
     pub estop_active: bool,
-    pub tick_count: i64,
     pub last_update: i64,
     pub last_telemetry: i64,
 }
 
 // Full single-row SELECT as one const literal — no per-call format! alloc.
 const ROBOT_SELECT: &str =
-    "SELECT ip, status, COALESCE(channel_id,''), COALESCE(camera_id,''), \
-     COALESCE(battery_pct,-1), COALESCE(rtt_ms,-1), estop_active, tick_count, \
+    "SELECT status, COALESCE(channel_id,''), COALESCE(camera_id,''), \
+     COALESCE(battery_pct,-1), COALESCE(rtt_ms,-1), estop_active, \
      COALESCE(last_update,0), COALESCE(last_telemetry,0) FROM robot WHERE id = ?1";
 
 pub fn get_robot() -> Result<Robot, AbiError> {
@@ -229,16 +227,14 @@ pub fn get_robot() -> Result<Robot, AbiError> {
         .map(|r| {
             let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
             Robot {
-                ip: g(0).as_str().into(),
-                status: g(1).as_str().into(),
-                channel_id: g(2).as_str().into(),
-                camera_id: g(3).as_str().into(),
-                battery_pct: g(4).as_i64(),
-                rtt_ms: g(5).as_i64(),
-                estop_active: g(6).as_i64() != 0,
-                tick_count: g(7).as_i64(),
-                last_update: g(8).as_i64(),
-                last_telemetry: g(9).as_i64(),
+                status: g(0).as_str().into(),
+                channel_id: g(1).as_str().into(),
+                camera_id: g(2).as_str().into(),
+                battery_pct: g(3).as_i64(),
+                rtt_ms: g(4).as_i64(),
+                estop_active: g(5).as_i64() != 0,
+                last_update: g(6).as_i64(),
+                last_telemetry: g(7).as_i64(),
             }
         })
         .unwrap_or_default())
@@ -341,13 +337,6 @@ pub fn set_offline(status: &str, msg: &str) -> Result<(), AbiError> {
 
 /// Increment the tick counter (UPDATE only — the caller already holds the prior
 /// count from get_robot(), so no read-back SELECT).
-pub fn bump_tick() {
-    let _ = exec(
-        "UPDATE robot SET tick_count = tick_count + 1 WHERE id=?1",
-        &[SqlValue::Text(ROBOT_ID.into())],
-    );
-}
-
 #[cfg(test)]
 mod test_backend {
     use super::{SqlValue, AbiError};

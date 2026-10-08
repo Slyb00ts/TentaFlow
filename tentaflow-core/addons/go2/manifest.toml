@@ -20,8 +20,9 @@ platforms = ["linux"]
 wasm_file = "addon.wasm"
 
 # Service tick drives the connection state machine (validation handshake) and
-# continuous telemetry (battery + RTT). 200ms so the validation challenge is
-# answered promptly; telemetry/publish is throttled inside on_tick.
+# continuous telemetry (battery + RTT); status/publish is throttled to once a
+# second inside on_tick. Connecting itself runs on a worker (go2.connect started
+# in the background), so a robot that does not answer never stalls the tick.
 [service]
 enabled = true
 # 100ms = sweet spot for LiDAR: the Go2 firmware publishes the voxel map at only
@@ -36,10 +37,6 @@ tick_interval_ms = 100
 # publishes). 50M is generous headroom and still a hard anti-runaway bound
 # (a tick is a few ms even at this budget).
 tick_fuel_budget = 50000000
-# Connecting runs inside a tick: two signaling calls to the robot, each up to
-# ~27 s (connect 12 s + answer 15 s) when the robot is busy. The default 30 s
-# tick deadline would trap the second one mid-handshake.
-tick_timeout_ms = 60000
 
 # LAN signaling to the robot (con_notify / con_ing). `${ip}` is a per-install
 # placeholder: at install time the entered `ip` connection_param is substituted

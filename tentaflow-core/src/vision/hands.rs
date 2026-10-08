@@ -17,6 +17,7 @@
 // mapped back to frame pixels here.
 
 use std::path::Path;
+#[cfg(not(feature = "vision-ort"))]
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -30,8 +31,13 @@ const LANDMARK_INPUT: usize = 224;
 /// Palm score (after sigmoid) a detection must reach; the upstream demo's value.
 const PALM_SCORE: f32 = 0.5;
 const PALM_NMS_IOU: f32 = 0.3;
-/// Hand presence the landmarker must report; the upstream demo's value.
+/// Hand presence the landmarker must report for a hand the palm detector just
+/// found; the upstream demo's value.
 const HAND_PRESENCE: f32 = 0.8;
+/// …and for a hand followed from the previous frame — MediaPipe's default
+/// `min_tracking_confidence`. A swinging hand is motion-blurred; holding it to
+/// the detection bar drops it mid-wave.
+const TRACKING_PRESENCE: f32 = 0.5;
 /// Upper bound of palms kept per region: a heart is made with two hands.
 const MAX_PALMS: usize = 2;
 
@@ -39,7 +45,7 @@ const MAX_PALMS: usize = 2;
 #[cfg(feature = "vision-ort")]
 type Net = crate::vision::ort_common::SessionPool;
 #[cfg(not(feature = "vision-ort"))]
-type Net = RunnableModel<TypedFact, Box<dyn TypedOp>>;
+type Net = Arc<RunnableModel<TypedFact, Box<dyn TypedOp>>>;
 
 /// One model output: shape and values, in the graph's output order.
 type Output = (Vec<usize>, Vec<f32>);
@@ -63,6 +69,9 @@ impl Pt {
 pub struct Hand {
     pub landmarks: [Pt; 21],
     pub presence: f32,
+    /// Wrist movement since the previous frame (zero for a newly found hand):
+    /// where to expect the hand on the next frame.
+    pub motion: Pt,
 }
 
 /// A detected palm in frame pixels: box center, box size and the 7 palm keypoints
@@ -110,16 +119,16 @@ impl Roi {
 }
 
 pub struct HandTracker {
-    palm: Arc<Net>,
-    landmark: Arc<Net>,
+    palm: Net,
+    landmark: Net,
     anchors: Vec<Pt>,
 }
 
 impl HandTracker {
     pub fn load(palm_path: &Path, landmark_path: &Path) -> Result<Self> {
         Ok(Self {
-            palm: Arc::new(load_nhwc(palm_path, PALM_INPUT)?),
-            landmark: Arc::new(load_nhwc(landmark_path, LANDMARK_INPUT)?),
+            palm: load_nhwc(palm_path, PALM_INPUT)?,
+            landmark: load_nhwc(landmark_path, LANDMARK_INPUT)?,
             anchors: palm_anchors(),
         })
     }
@@ -129,7 +138,7 @@ impl HandTracker {
         let palms = self.palms_in(rgb, w, h, region)?;
         let mut hands = Vec::with_capacity(palms.len());
         for palm in palms {
-            if let Some(hand) = self.landmarks_in(rgb, w, h, &hand_roi(&palm))? {
+            if let Some(hand) = self.landmarks_in(rgb, w, h, &hand_roi(&palm), HAND_PRESENCE)? {
                 hands.push(hand);
             }
         }
@@ -137,24 +146,43 @@ impl HandTracker {
     }
 
     /// Re-locates a hand seen on the previous frame from its landmarks alone,
-    /// without the palm detector — the MediaPipe tracking step. `None` when the
-    /// landmarker no longer sees a hand there (it moved too far, or left).
+    /// without the palm detector — the MediaPipe tracking step. The crop is moved
+    /// by the hand's last movement, so a fast swing stays inside it. `None` when
+    /// the landmarker no longer sees a hand there (it moved too far, or left).
     pub fn track(&self, rgb: &[u8], w: u32, h: u32, previous: &Hand) -> Result<Option<Hand>> {
-        self.landmarks_in(rgb, w, h, &tracking_roi(previous))
+        let mut roi = tracking_roi(previous);
+        roi.center = Pt::new(roi.center.x + previous.motion.x, roi.center.y + previous.motion.y);
+        let found = self.landmarks_in(rgb, w, h, &roi, TRACKING_PRESENCE)?;
+        Ok(found.map(|mut hand| {
+            let (a, b) = (previous.landmarks[0], hand.landmarks[0]);
+            hand.motion = Pt::new(b.x - a.x, b.y - a.y);
+            hand
+        }))
     }
 
-    fn landmarks_in(&self, rgb: &[u8], w: u32, h: u32, roi: &Roi) -> Result<Option<Hand>> {
+    fn landmarks_in(
+        &self,
+        rgb: &[u8],
+        w: u32,
+        h: u32,
+        roi: &Roi,
+        min_presence: f32,
+    ) -> Result<Option<Hand>> {
         let input = sample_crop(rgb, w, h, roi, LANDMARK_INPUT);
         let out = forward(&self.landmark, input, LANDMARK_INPUT, "hand landmarks")?;
         let (lm, presence) = landmark_outputs(&out)?;
-        if presence < HAND_PRESENCE {
+        if presence < min_presence {
             return Ok(None);
         }
         let mut landmarks = [Pt::new(0.0, 0.0); 21];
         for (i, p) in landmarks.iter_mut().enumerate() {
             *p = roi.to_frame(lm[i * 3], lm[i * 3 + 1], LANDMARK_INPUT);
         }
-        Ok(Some(Hand { landmarks, presence }))
+        Ok(Some(Hand {
+            landmarks,
+            presence,
+            motion: Pt::new(0.0, 0.0),
+        }))
     }
 
     fn palms_in(&self, rgb: &[u8], w: u32, h: u32, region: Region) -> Result<Vec<Palm>> {
@@ -212,7 +240,8 @@ fn load_nhwc(path: &Path, _n: usize) -> Result<Net> {
         path,
         &path.with_file_name(format!("trt-cache-{stem}")),
         None,
-        1,
+        // Two hands are tracked (or two wrist regions searched) at once.
+        2,
         false,
         // Tiny static graphs: an engine build would cost more than it saves.
         crate::vision::ort_common::EpChain::CudaOnly,
@@ -590,7 +619,11 @@ mod tests {
         for (i, x) in [(2, 82.0), (3, 80.0), (6, 90.0), (10, 100.0), (14, 110.0), (18, 118.0)] {
             landmarks[i] = Pt::new(x, 85.0);
         }
-        let roi = tracking_roi(&Hand { landmarks, presence: 1.0 });
+        let roi = tracking_roi(&Hand {
+            landmarks,
+            presence: 1.0,
+            motion: Pt::new(0.0, 0.0),
+        });
         assert!((roi.u.x - 1.0).abs() < 1e-5 && roi.u.y.abs() < 1e-5, "u = {:?}", roi.u);
         assert!(roi.v.x.abs() < 1e-5 && (roi.v.y - 1.0).abs() < 1e-5, "v = {:?}", roi.v);
         // Stable box: x 80..118, y 85..140 → side 2·55, center shifted 5.5 up from 112.5.
