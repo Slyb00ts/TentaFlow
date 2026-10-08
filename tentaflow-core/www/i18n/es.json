@@ -10118,7 +10118,8 @@
       },
       "added_existing_title": "El patrón {name} ya existía",
       "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",
-      "added_existing_same": "Alguien lo añadió mientras tanto con el mismo texto (versión {version}): no cambió nada."
+      "added_existing_same": "Alguien lo añadió mientras tanto con el mismo texto (versión {version}): no cambió nada.",
+      "text_not_xml": "No es un documento XML válido, y este formato se escribe en XML."
     },
     "topics": {
       "title": "Tópicos",

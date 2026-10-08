@@ -19,12 +19,11 @@
 //   - `avro` / `protobuf` / `thrift` are storage-only until F4
 //     (`stored_only`): `compile` is a shape smoke-check, every other
 //     operation returns `SchemaError::Unsupported`.
-//   - `xsd` and `hl7v2_profile` (F4 B0) are a hand-written XSD subset (no
-//     pure-Rust validator exists; libxml2 would be a native dependency) and a
-//     JSON profile over the HL7 v2 parser. Unlike the binary kinds they are
-//     bound to ONE payload format each (`required_payload_format`).
-//     `hl7v2_profile` is fully implemented (F4 B5: validate, derive,
-//     compatibility); `xsd` is stored-only until its validator lands.
+//   - `xsd` (F4 B4) and `hl7v2_profile` (F4 B5) are a hand-written XSD subset
+//     (no pure-Rust validator exists; libxml2 would be a native dependency)
+//     and a JSON profile over the HL7 v2 parser. Unlike the binary kinds they
+//     are bound to ONE payload format each (`required_payload_format`).
+//     Both are fully implemented (validate, derive, compatibility).
 //
 // Everything expensive or rejectable happens in `compile` (admin time).
 // `validate` runs on the publish hot path for opted-in topics only and must
@@ -40,6 +39,7 @@ mod hl7v2_profile;
 mod json_schema;
 pub mod registry;
 mod stored_only;
+mod xsd;
 
 #[cfg(test)]
 mod fixtures;
@@ -107,7 +107,10 @@ impl SchemaType {
     /// of this type — gates `bus_topics.validation != off` (PLAN-F3 §3
     /// rule 3). F4 flips each kind to `true` by adding its validator.
     pub fn has_validator(self) -> bool {
-        matches!(self, SchemaType::JsonSchema | SchemaType::Hl7v2Profile)
+        matches!(
+            self,
+            SchemaType::JsonSchema | SchemaType::Xsd | SchemaType::Hl7v2Profile
+        )
     }
 
     pub fn ops(self) -> &'static dyn SchemaKindOps {
@@ -116,7 +119,7 @@ impl SchemaType {
             SchemaType::Avro => &stored_only::AVRO_OPS,
             SchemaType::Protobuf => &stored_only::PROTOBUF_OPS,
             SchemaType::Thrift => &stored_only::THRIFT_OPS,
-            SchemaType::Xsd => &stored_only::XSD_OPS,
+            SchemaType::Xsd => &xsd::XSD_OPS,
             SchemaType::Hl7v2Profile => &hl7v2_profile::HL7V2_PROFILE_OPS,
         }
     }
@@ -210,6 +213,7 @@ impl std::fmt::Display for SchemaError {
 #[derive(Debug)]
 pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
+    Xsd(xsd::Compiled),
     Hl7v2Profile(hl7v2_profile::Compiled),
     /// Kinds without a validator yet carry no compiled form — the variant exists so
     /// a stored-only subject still yields a `CompiledSchema` from
@@ -404,10 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn json_schema_and_hl7_profile_have_a_validator_the_other_kinds_do_not_yet() {
+    fn text_kinds_have_a_validator_and_binary_kinds_do_not_yet() {
         assert!(SchemaType::JsonSchema.has_validator());
+        assert!(SchemaType::Xsd.has_validator());
         assert!(SchemaType::Hl7v2Profile.has_validator());
-        assert!(!SchemaType::Xsd.has_validator());
         assert!(!SchemaType::Avro.has_validator());
         assert!(!SchemaType::Protobuf.has_validator());
         assert!(!SchemaType::Thrift.has_validator());

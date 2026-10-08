@@ -11353,7 +11353,8 @@
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
-      "added_existing_same": "Someone added it meanwhile with the same text (version {version}) — nothing changed."
+      "added_existing_same": "Someone added it meanwhile with the same text (version {version}) — nothing changed.",
+      "text_not_xml": "This is not a valid XML document, and this format is written in XML."
     },
     "topics": {
       "title": "Topics",

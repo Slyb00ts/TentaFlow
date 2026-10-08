@@ -6,10 +6,11 @@
 // in the header ("Wycofaj", "Usuń…", "Nowa wersja"). Beside it the text of
 // one version, read-only in tf-code-editor with "Kopiuj" and "Pobierz" and
 // the pattern's own description (`description` of a JSON Schema or an HL7
-// profile, `doc` of an Avro record), an HL7 profile spelled out as required
-// segments and fields, the versions with "Wycofaj" per row, and the
-// compatibility card with "Zmień". Every change goes through a window
-// (schema-windows.js) and comes back as a note over the page.
+// profile, `doc` of an Avro record, `xs:annotation/xs:documentation` of an
+// XSD), an HL7 profile spelled out as required segments and fields, the
+// versions with "Wycofaj" per row, and the compatibility card with "Zmień".
+// Every change goes through a window (schema-windows.js) and comes back as a
+// note over the page.
 //
 // What topics check with is the server's rule (`registry::effective_version`):
 // the newest version not withdrawn, else the newest. A withdrawn pattern
@@ -37,9 +38,10 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json', hl7v2_profile: 'json' };
-const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift', hl7v2_profile: 'json' };
-const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json', hl7v2_profile: 'application/json' };
+// tf-code-editor has no XML highlighter of its own; its markup one reads an XSD well.
+const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json', hl7v2_profile: 'json', xsd: 'html' };
+const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift', xsd: 'xsd', hl7v2_profile: 'json' };
+const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json', xsd: 'application/xml', hl7v2_profile: 'application/json' };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -55,12 +57,33 @@ export function downloadName(subject, version, type) {
   return `${subject}-v${version}.${FILE_EXTENSION[type] || 'txt'}`;
 }
 
+/** The first `annotation/documentation` directly under the root of an XSD, or `''`. */
+function xsdDocumentation(text) {
+  if (typeof DOMParser === 'undefined') return '';
+  try {
+    const doc = new DOMParser().parseFromString(String(text || ''), 'application/xml');
+    const root = doc.documentElement;
+    if (!root || root.localName !== 'schema' || doc.getElementsByTagName('parsererror').length) return '';
+    for (const annotation of Array.from(root.children).filter((c) => c.localName === 'annotation')) {
+      for (const documentation of Array.from(annotation.children).filter((c) => c.localName === 'documentation')) {
+        const value = (documentation.textContent || '').trim();
+        if (value) return value;
+      }
+    }
+  } catch {
+    return '';
+  }
+  return '';
+}
+
 /**
  * The pattern's own description, from its text: `description` at the root of
- * a JSON Schema or an HL7 v2 profile, `doc` of an Avro record. `''` when it
- * has none (or the text is not JSON).
+ * a JSON Schema or an HL7 v2 profile, `doc` of an Avro record, the first
+ * `xs:annotation/xs:documentation` of an XSD. `''` when it has none (or the
+ * text cannot be read).
  */
 export function schemaDescription(type, text) {
+  if (type === 'xsd') return xsdDocumentation(text);
   if (type !== 'json_schema' && type !== 'avro' && type !== 'hl7v2_profile') return '';
   try {
     const root = JSON.parse(String(text || ''));

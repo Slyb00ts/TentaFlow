@@ -10118,7 +10118,8 @@
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
-      "added_existing_same": "Jemand hat es inzwischen mit demselben Text hinzugefügt (Version {version}) — nichts hat sich geändert."
+      "added_existing_same": "Jemand hat es inzwischen mit demselben Text hinzugefügt (Version {version}) — nichts hat sich geändert.",
+      "text_not_xml": "Das ist kein gültiges XML-Dokument, und dieses Format wird in XML geschrieben."
     },
     "topics": {
       "title": "Topics",

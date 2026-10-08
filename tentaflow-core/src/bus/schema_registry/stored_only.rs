@@ -1,9 +1,9 @@
 // =============================================================================
 // File: bus/schema_registry/stored_only.rs — kinds without a validator yet
 // =============================================================================
-// `avro` / `protobuf` / `thrift` / `xsd` subjects can be registered and
-// versioned so integrators can stage schemas ahead of F4, but nothing in
-// this build can evaluate a payload against them. `compile` is a
+// `avro` / `protobuf` / `thrift` subjects can be
+// registered and versioned so integrators can stage schemas ahead of F4, but
+// nothing in this build can evaluate a payload against them. `compile` is a
 // shape smoke-check only; every other operation returns
 // `SchemaError::Unsupported` (a version check under any compatibility mode
 // but `none` therefore refuses too — there is no comparison to pretend
@@ -68,7 +68,6 @@ impl SchemaKindOps for StoredOnlyOps {
 pub(super) static AVRO_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Avro);
 pub(super) static PROTOBUF_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Protobuf);
 pub(super) static THRIFT_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Thrift);
-pub(super) static XSD_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Xsd);
 
 #[cfg(test)]
 mod tests {
@@ -88,29 +87,22 @@ mod tests {
 
     #[test]
     fn every_other_operation_is_unsupported_until_f4() {
-        for ops in [&PROTOBUF_OPS, &XSD_OPS] {
-            let compiled = ops.compile("message X {}").unwrap();
-            assert!(matches!(
-                ops.validate(&compiled, b"{}"),
-                Err(SchemaError::Unsupported { .. })
-            ));
-            assert!(matches!(
-                ops.derive_subschema("message X {}", &BTreeSet::new()),
-                Err(SchemaError::Unsupported { .. })
-            ));
-            assert!(ops
-                .check_compatibility("a", "b", Compatibility::None)
-                .is_ok());
-            assert!(matches!(
-                ops.check_compatibility("a", "b", Compatibility::Backward),
-                Err(SchemaError::Unsupported { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn xsd_smoke_check_rejects_blank_text() {
-        assert!(XSD_OPS.compile("<xs:schema/>").is_ok());
-        assert!(XSD_OPS.compile("  \n").is_err());
+        let ops = &PROTOBUF_OPS;
+        let compiled = ops.compile("message X {}").unwrap();
+        assert!(matches!(
+            ops.validate(&compiled, b"{}"),
+            Err(SchemaError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            ops.derive_subschema("message X {}", &BTreeSet::new()),
+            Err(SchemaError::Unsupported { .. })
+        ));
+        assert!(ops
+            .check_compatibility("a", "b", Compatibility::None)
+            .is_ok());
+        assert!(matches!(
+            ops.check_compatibility("a", "b", Compatibility::Backward),
+            Err(SchemaError::Unsupported { .. })
+        ));
     }
 }

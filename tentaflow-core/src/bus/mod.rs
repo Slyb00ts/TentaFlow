@@ -19235,6 +19235,13 @@ mod tests {
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
     }
 
+    const PATIENT_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="patient"><xs:complexType><xs:sequence>
+          <xs:element name="mrn" type="xs:string"/>
+        </xs:sequence></xs:complexType></xs:element></xs:schema>"#;
+
+    const ADT_PROFILE: &str = r#"{"required_segments":["PID"],"required_fields":["PID-3"]}"#;
+
     /// Registers a subject of a kind without a validator and tries to bind it
     /// to a fresh topic of `content_type` through `create_topic`; returns the
     /// resulting validation mode or the refusal.
@@ -19275,7 +19282,7 @@ mod tests {
         use schema_registry::SchemaType::Xsd;
         for ct in ["application/xml", "text/xml"] {
             assert_eq!(
-                bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap(),
+                bind_stored_subject_at_create(Xsd, PATIENT_XSD, ct, None).unwrap(),
                 topics::ValidationMode::Off,
                 "{ct}: an xsd subject binds to an XML topic with validation staying off"
             );
@@ -19285,7 +19292,7 @@ mod tests {
             "application/octet-stream",
             "application/hl7-v2",
         ] {
-            let err = bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap_err();
+            let err = bind_stored_subject_at_create(Xsd, PATIENT_XSD, ct, None).unwrap_err();
             assert!(
                 matches!(&err, BusServiceError::InvalidTopicConfig { reason }
                     if reason.contains("is xsd but")),
@@ -19358,28 +19365,29 @@ mod tests {
         }
     }
 
-    const ADT_PROFILE: &str = r#"{"required_segments":["PID"],"required_fields":["PID-3"]}"#;
-
     #[test]
-    fn enabling_validation_is_accepted_for_hl7_profiles_and_refused_for_xsd_until_it_has_a_validator(
-    ) {
-        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
-        for mode in [topics::ValidationMode::Warn, topics::ValidationMode::Dlq] {
-            assert_eq!(
-                bind_stored_subject_at_create(
-                    Hl7v2Profile,
-                    r#"{"required_segments":[]}"#,
-                    "application/hl7-v2",
-                    Some(mode)
-                )
-                .unwrap(),
-                mode
-            );
+    fn enabling_validation_is_accepted_for_xsd_and_profile_subjects_and_refused_for_binary_kinds() {
+        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Xsd};
+        for (kind, text, ct) in [
+            (Xsd, PATIENT_XSD, "application/xml"),
+            (
+                Hl7v2Profile,
+                r#"{"required_segments":[]}"#,
+                "application/hl7-v2",
+            ),
+        ] {
+            for mode in [topics::ValidationMode::Warn, topics::ValidationMode::Dlq] {
+                assert_eq!(
+                    bind_stored_subject_at_create(kind, text, ct, Some(mode)).unwrap(),
+                    mode,
+                    "{kind:?}"
+                );
+            }
         }
         let err = bind_stored_subject_at_create(
-            Xsd,
-            "<xs:schema/>",
-            "application/xml",
+            Avro,
+            r#"{"type":"record","name":"X","fields":[]}"#,
+            "application/octet-stream",
             Some(topics::ValidationMode::Warn),
         )
         .unwrap_err();
@@ -19391,50 +19399,56 @@ mod tests {
     }
 
     #[test]
-    fn xsd_subjects_are_stored_only_like_the_binary_kinds() {
+    fn xsd_and_profile_subjects_register_under_the_default_backward_check() {
         let (_tmp, svc) = test_service();
-        let register = |compat| {
+        let register = |subject: &str, kind: schema_registry::SchemaType, text: &str| {
             schema_registry::registry::register(
                 &svc.db,
                 svc.instance_id(),
                 "org-1",
-                "xsd",
-                schema_registry::SchemaType::Xsd,
-                "<xs:schema/>",
-                compat,
-                None,
-            )
-        };
-        // The default `backward` mode needs a compatibility check no
-        // stored-only kind can perform: refused, not waved through.
-        let err = register(None).unwrap_err();
-        assert!(
-            matches!(err, BusServiceError::SchemaTypeUnsupported { .. }),
-            "{err:?}"
-        );
-        // Explicitly unchecked, the subject is stored and versioned.
-        let outcome = register(Some(schema_registry::Compatibility::None)).unwrap();
-        assert_eq!(outcome.version, 1);
-    }
-
-    #[test]
-    fn hl7_profile_subjects_register_under_the_default_backward_check() {
-        let (_tmp, svc) = test_service();
-        let register = |text: &str| {
-            schema_registry::registry::register(
-                &svc.db,
-                svc.instance_id(),
-                "org-1",
-                "adt",
-                schema_registry::SchemaType::Hl7v2Profile,
+                subject,
+                kind,
                 text,
                 None,
                 None,
             )
         };
-        assert_eq!(register(ADT_PROFILE).unwrap().version, 1);
-        let err = register(r#"{"required_segments":["PID"],"required_fields":["PID-3","PID-5"]}"#)
-            .unwrap_err();
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        assert_eq!(
+            register("patients-xsd", Xsd, PATIENT_XSD).unwrap().version,
+            1
+        );
+        let stricter = PATIENT_XSD.replace(
+            r#"<xs:element name="mrn" type="xs:string"/>"#,
+            r#"<xs:element name="mrn" type="xs:string"/><xs:element name="extra" type="xs:string"/>"#,
+        );
+        let err = register("patients-xsd", Xsd, &stricter).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::SchemaIncompatible {
+                    mode: "backward",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let looser = PATIENT_XSD.replace(
+            r#"<xs:element name="mrn" type="xs:string"/>"#,
+            r#"<xs:element name="mrn" type="xs:string"/><xs:element name="extra" type="xs:string" minOccurs="0"/>"#,
+        );
+        assert_eq!(register("patients-xsd", Xsd, &looser).unwrap().version, 2);
+
+        assert_eq!(
+            register("adt", Hl7v2Profile, ADT_PROFILE).unwrap().version,
+            1
+        );
+        let err = register(
+            "adt",
+            Hl7v2Profile,
+            r#"{"required_segments":["PID"],"required_fields":["PID-3","PID-5"]}"#,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -19446,7 +19460,7 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(
-            register(r#"{"required_segments":["PID"]}"#)
+            register("adt", Hl7v2Profile, r#"{"required_segments":["PID"]}"#)
                 .unwrap()
                 .version,
             2
@@ -19454,23 +19468,32 @@ mod tests {
     }
 
     #[test]
-    fn registering_a_malformed_profile_is_refused() {
+    fn registering_an_unsupported_xsd_or_a_malformed_profile_is_refused() {
         let (_tmp, svc) = test_service();
-        let err = schema_registry::registry::register(
-            &svc.db,
-            svc.instance_id(),
-            "org-1",
-            "bad",
-            schema_registry::SchemaType::Hl7v2Profile,
-            r#"{"required_fields":["MSH-1"]}"#,
-            Some(schema_registry::Compatibility::None),
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, BusServiceError::InvalidArgument(_)),
-            "{err:?}"
-        );
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        for (kind, text) in [
+            (
+                Xsd,
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:include schemaLocation="a.xsd"/></xs:schema>"#,
+            ),
+            (Hl7v2Profile, r#"{"required_fields":["MSH-1"]}"#),
+        ] {
+            let err = schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "bad",
+                kind,
+                text,
+                Some(schema_registry::Compatibility::None),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, BusServiceError::InvalidArgument(_)),
+                "{kind:?}: {err:?}"
+            );
+        }
     }
 
     /// Creates a topic of `content_type` bound to a registered `kind` subject
@@ -19547,6 +19570,81 @@ mod tests {
     }
 
     #[test]
+    fn xsd_dlq_mode_diverts_only_the_invalid_xml_record() {
+        let good = "<patient><mrn>AB1</mrn></patient>";
+        let bad = "<patient><mrn>SECRETVALUE</mrn><unexpected/></patient>";
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            PATIENT_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[good, bad],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        assert_eq!(
+            fetch_all(&svc, &ctx, "validated.events"),
+            vec![good.as_bytes().to_vec()]
+        );
+        assert_eq!(
+            fetch_all(&svc, &ctx, "__dlq.validated.events"),
+            vec![bad.as_bytes().to_vec()]
+        );
+
+        // The violation detail names the path, never the payload's text.
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-headers",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        for (name, value) in &dlq.records[0].headers {
+            assert!(
+                !String::from_utf8_lossy(value).contains("SECRETVALUE"),
+                "header {} leaks the payload",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn xsd_warn_mode_keeps_the_invalid_record_unstamped() {
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            PATIENT_XSD,
+            "application/xml",
+            topics::ValidationMode::Warn,
+            &["<patient/>", "<patient><mrn>1</mrn></patient>"],
+        );
+        assert_eq!(result.accepted, 2);
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "warn-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let records = handle.fetch(1024, 20).unwrap().records;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].schema_id, 0,
+            "a warn-mode violation is never stamped"
+        );
+        assert_ne!(
+            records[1].schema_id, 0,
+            "a validated record carries the schema id"
+        );
+    }
+
+    #[test]
     fn hl7_profile_dlq_mode_diverts_messages_missing_a_required_field() {
         let good = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1||MRN1\r";
         let bad = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1\r";
@@ -19570,57 +19668,88 @@ mod tests {
     }
 
     #[test]
-    fn schema_derived_get_projects_an_hl7_profile_through_a_read_policy() {
+    fn schema_derived_get_projects_xsd_and_profile_subjects_through_a_read_policy() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        schema_registry::registry::register(
-            &svc.db,
-            svc.instance_id(),
-            "org-1",
-            "p-adt",
-            schema_registry::SchemaType::Hl7v2Profile,
-            ADT_PROFILE,
-            None,
-            None,
-        )
-        .unwrap();
-        svc.create_topic(
-            &ctx,
-            "hl7.events",
-            topics::TopicOptions {
-                content_type: Some("application/hl7-v2".to_string()),
-                schema_id: Some("p-adt".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        field_policies::set_policy(
-            &svc.db,
-            svc.instance_id(),
-            "org-1",
-            "hl7.events",
-            "any",
-            field_policies::SUBJECT_ANY,
-            field_policies::Direction::Read,
-            &set_field_set(&["PID-5"]),
-            &set_field_set(&[]),
-            field_policies::BusFieldPolicyExpect::Any,
-        )
-        .unwrap();
-        let derived = svc
-            .schema_derived_get(
-                &ctx,
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="patient"><xs:complexType><xs:sequence>
+              <xs:element name="mrn" type="xs:string"/>
+              <xs:element name="ssn" type="xs:string"/>
+            </xs:sequence></xs:complexType></xs:element></xs:schema>"#;
+        for (subject, kind, text, topic, content_type, fields) in [
+            (
+                "p-xsd",
+                schema_registry::SchemaType::Xsd,
+                xsd,
+                "xml.events",
+                "application/xml",
+                ["mrn", "mrn"],
+            ),
+            (
                 "p-adt",
-                None,
+                schema_registry::SchemaType::Hl7v2Profile,
+                ADT_PROFILE,
                 "hl7.events",
+                "application/hl7-v2",
+                ["PID-5", "PID-5"],
+            ),
+        ] {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                subject,
+                kind,
+                text,
+                None,
+                None,
+            )
+            .unwrap();
+            svc.create_topic(
+                &ctx,
+                topic,
+                topics::TopicOptions {
+                    content_type: Some(content_type.to_string()),
+                    schema_id: Some(subject.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            field_policies::set_policy(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                topic,
                 "any",
                 field_policies::SUBJECT_ANY,
                 field_policies::Direction::Read,
+                &set_field_set(&fields),
+                &set_field_set(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
             )
             .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&derived).unwrap();
-        assert_eq!(v["required_fields"], serde_json::json!([]), "{derived}");
-        assert_eq!(v["required_segments"], serde_json::json!(["PID"]));
+            let derived = svc
+                .schema_derived_get(
+                    &ctx,
+                    subject,
+                    None,
+                    topic,
+                    "any",
+                    field_policies::SUBJECT_ANY,
+                    field_policies::Direction::Read,
+                )
+                .unwrap();
+            if kind == schema_registry::SchemaType::Xsd {
+                assert!(
+                    derived.contains(r#"name="mrn""#) && !derived.contains("ssn"),
+                    "{derived}"
+                );
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&derived).unwrap();
+                assert_eq!(v["required_fields"], serde_json::json!([]), "{derived}");
+                assert_eq!(v["required_segments"], serde_json::json!(["PID"]));
+            }
+        }
     }
     #[test]
     fn update_topic_rejects_binding_a_schema_to_a_dlq_topic() {
@@ -19659,7 +19788,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         for (subject, kind, text) in [
-            ("patients-xsd", Xsd, "<xs:schema/>"),
+            ("patients-xsd", Xsd, PATIENT_XSD),
             (
                 "adt-profile",
                 Hl7v2Profile,
@@ -19720,7 +19849,7 @@ mod tests {
             "org-1",
             "patients-xsd",
             schema_registry::SchemaType::Xsd,
-            "<xs:schema/>",
+            PATIENT_XSD,
             Some(schema_registry::Compatibility::None),
             None,
         )

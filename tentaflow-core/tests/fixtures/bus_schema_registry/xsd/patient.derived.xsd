@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:annotation>
+    <xs:documentation>Patient registration message used by the admissions desk.</xs:documentation>
+  </xs:annotation>
+  <xs:element name="patient">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="mrn" type="Mrn"/>
+        <xs:element name="birthDate" type="xs:date"/>
+        <xs:choice minOccurs="0">
+          <xs:element name="phone" type="xs:string"/>
+        </xs:choice>
+        <xs:element name="visit" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:simpleContent>
+              <xs:extension base="xs:string">
+                <xs:attribute name="ward" type="xs:int" use="required"/>
+                <xs:attribute name="at" type="xs:dateTime"/>
+              </xs:extension>
+            </xs:simpleContent>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="active" type="xs:boolean"/>
+    </xs:complexType>
+  </xs:element>
+  <xs:simpleType name="Mrn">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[A-Z]{2}[0-9]{6}"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>

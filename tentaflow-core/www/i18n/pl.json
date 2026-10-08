@@ -11353,7 +11353,8 @@
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
-      "added_existing_same": "Ktoś dodał go w międzyczasie z takim samym tekstem (wersja {version}) — nic się nie zmieniło."
+      "added_existing_same": "Ktoś dodał go w międzyczasie z takim samym tekstem (wersja {version}) — nic się nie zmieniło.",
+      "text_not_xml": "To nie jest poprawny dokument XML, a ten format zapisuje się w XML."
     },
     "topics": {
       "title": "Topiki",

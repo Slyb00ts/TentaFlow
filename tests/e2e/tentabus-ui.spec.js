@@ -2223,8 +2223,9 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   const win = schemaWindow(page);
   await expect(win.locator('[slot="body"]')).toBeVisible();
   // The formats offered are the ones this server can validate.
-  await expect(win.locator('tf-choice-card')).toHaveCount(2);
+  await expect(win.locator('tf-choice-card')).toHaveCount(3);
   await expect(win.locator('tf-choice-card').first()).toHaveAttribute('heading', 'JSON Schema');
+  await expect(win.locator('tf-choice-card[value="xsd"]')).toHaveAttribute('heading', 'XSD');
   await expect(win.locator('tf-choice-card[value="hl7v2_profile"]')).toHaveAttribute('heading', 'profil HL7 v2');
   const save = win.locator('[data-act="save"]');
 
@@ -2485,12 +2486,25 @@ async function pickSegment(win, selector, label) {
 }
 
 const PROFILE_NAME = `profil-wyniku-${RUN}`;
+const XSD_NAME = `zgloszenie-${RUN}`;
 const PROFILE_V1 = JSON.stringify({ description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.', required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
 const PROFILE_WITH_OBX8 = JSON.stringify({ ...JSON.parse(PROFILE_V1), required_fields: [...JSON.parse(PROFILE_V1).required_fields, 'OBX-8'] });
+const XSD_V1 = `<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:annotation><xs:documentation>Zgłoszenie pacjenta w rejestracji.</xs:documentation></xs:annotation>
+  <xs:element name="zgloszenie">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="pesel" type="xs:string"/>
+        <xs:element name="uwagi" type="xs:string" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>`;
 const HL7_GOOD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG1|P|2.5\rPID|1||MRN123||Kowalski^Jan\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
 const HL7_BAD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG2|P|2.5\rPID|1\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
 
-test('F4 an HL7 profile: added from "Dodaj wzór", spelled out on the page, a refused profile fixed in one click, a topic that rejects a bad message', async ({ page, request }) => {
+test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the page, a refused profile fixed in one click, topics that reject a bad message', async ({ page, request }) => {
   const errors = trackErrors(page);
   await page.setViewportSize(DESKTOP);
   await login(page);
@@ -2509,7 +2523,7 @@ test('F4 an HL7 profile: added from "Dodaj wzór", spelled out on the page, a re
   const topics = [];
   const cleanup = async () => {
     for (const name of topics.splice(0)) await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name }).catch(() => {});
-    for (const name of [PROFILE_NAME]) {
+    for (const name of [PROFILE_NAME, XSD_NAME]) {
       await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
     }
   };
@@ -2552,7 +2566,34 @@ test('F4 an HL7 profile: added from "Dodaj wzór", spelled out on the page, a re
     await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
     await expect.poll(() => editorText(page)).not.toContain('OBX-8');
 
-    // A topic of the right format takes the profile and rejects what does not fit.
+    // XSD: the text is checked as XML, its documentation is the description.
+    await p.locator('[data-go="back"]').first().click();
+    await expect(schemaTable(page).locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+    save = await addPattern(XSD_NAME, 'xsd', '<xs:schema');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('error', /To nie jest poprawny dokument XML/);
+    await expect(save).toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill(XSD_V1);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${XSD_NAME} (XSD), wersja 1`);
+    await save.click();
+    await expect(win).toHaveCount(0);
+    await expect(schemaRow(page, XSD_NAME)).toContainText('XSD');
+    await schemaRow(page, XSD_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(XSD_NAME, { timeout: 15000 });
+    await expect(p.locator('[data-role="about"]')).toHaveText('Zgłoszenie pacjenta w rejestracji.');
+    await expect(p.locator('[data-role="profile"]')).toBeHidden();
+    await expect.poll(() => editorText(page)).toContain('<xs:element name="zgloszenie">');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-xsd.png'), fullPage: true });
+
+    // Unsupported XSD is refused by the server with a reason, not stored.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(XSD_V1.replace('<xs:element name="zgloszenie">', '<xs:import namespace="urn:x"/><xs:element name="zgloszenie">'));
+    await win.locator('[data-act="save"]').click();
+    await expect(win.locator('[data-role="error"]')).toContainText('Serwer nie przyjął tekstu', { timeout: 15000 });
+    await expect(win.locator('[data-role="error"] details pre')).toContainText('schema composition is not supported');
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+
+    // Topics of the right format take the new patterns and reject what does not fit.
     const topicFor = async (name, contentType, subject) => {
       topics.push(name);
       await busCall(page, 'busTopicCreateRequest', { instanceId: instance, name, options: { partitions: 1, contentType, schemaId: subject, validation: 'dlq' } });
@@ -2561,7 +2602,9 @@ test('F4 an HL7 profile: added from "Dodaj wzór", spelled out on the page, a re
       expect(detail.validation).toBe('dlq');
     };
     const hl7Topic = `e2e-hl7-${RUN}`;
+    const xmlTopic = `e2e-xml-${RUN}`;
     await topicFor(hl7Topic, 'application/hl7-v2', PROFILE_NAME);
+    await topicFor(xmlTopic, 'application/xml', XSD_NAME);
 
     // The dashboard cannot publish, so a key with the right to send does it over REST.
     await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=topics&topic=${hl7Topic}&section=access`);

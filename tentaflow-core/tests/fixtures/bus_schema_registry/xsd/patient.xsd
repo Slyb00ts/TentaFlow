@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:tns="urn:example:patient"
+           targetNamespace="urn:example:patient"
+           elementFormDefault="qualified">
+  <xs:annotation>
+    <xs:documentation>Patient registration message used by the admissions desk.</xs:documentation>
+  </xs:annotation>
+
+  <xs:element name="patient" type="tns:PatientType"/>
+
+  <xs:simpleType name="Mrn">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[A-Z]{2}[0-9]{6}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Sex">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="F"/>
+      <xs:enumeration value="M"/>
+      <xs:enumeration value="U"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="PatientType">
+    <xs:sequence>
+      <xs:element name="mrn" type="tns:Mrn"/>
+      <xs:element name="name">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="family">
+              <xs:simpleType>
+                <xs:restriction base="xs:string">
+                  <xs:minLength value="1"/>
+                  <xs:maxLength value="40"/>
+                </xs:restriction>
+              </xs:simpleType>
+            </xs:element>
+            <xs:element name="given" type="xs:string" maxOccurs="3"/>
+          </xs:sequence>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="birthDate" type="xs:date"/>
+      <xs:element name="sex" type="tns:Sex" minOccurs="0"/>
+      <xs:choice minOccurs="0">
+        <xs:element name="phone" type="xs:string"/>
+        <xs:element name="email" type="xs:string"/>
+      </xs:choice>
+      <xs:element name="visit" minOccurs="0" maxOccurs="unbounded">
+        <xs:complexType>
+          <xs:simpleContent>
+            <xs:extension base="xs:string">
+              <xs:attribute name="ward" type="xs:int" use="required"/>
+              <xs:attribute name="at" type="xs:dateTime"/>
+            </xs:extension>
+          </xs:simpleContent>
+        </xs:complexType>
+      </xs:element>
+    </xs:sequence>
+    <xs:attribute name="active" type="xs:boolean"/>
+  </xs:complexType>
+</xs:schema>

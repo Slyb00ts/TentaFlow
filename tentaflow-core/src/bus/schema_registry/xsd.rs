@@ -1,0 +1,4598 @@
+// =============================================================================
+// File: bus/schema_registry/xsd.rs — XSD subset validator (F4 B4)
+// =============================================================================
+// SUM/tentabus/PLAN-F4-REST.md §B.4 and DECYZJE-2026-09-22 (XSD row): no
+// maintained pure-Rust XSD validator exists and libxml2 would be a native
+// dependency, so this is a HAND-WRITTEN SUBSET on `quick-xml` (already a
+// dependency) and `regex` (already a dependency). As with `json_schema`,
+// anything outside the subset is REJECTED at `compile` (registration) time
+// with a message naming the construct — never silently ignored.
+//
+// Supported subset
+//   - One schema document. Top level: `element` (the permitted document
+//     roots, at least one), named `complexType` / `simpleType`, `annotation`.
+//   - `element` with `name`, `type` or an inline type, `minOccurs`,
+//     `maxOccurs` (non-negative integer or `unbounded`, capped at 100000).
+//   - `complexType` with ONE of `sequence` / `choice` / `all` (nested
+//     `sequence`/`choice` allowed, each with its own occurrence bounds;
+//     `all` only as the top group, children occur at most once), or
+//     `simpleContent/extension` (text with attributes), or empty content,
+//     followed by `attribute` (`use` = required | optional).
+//   - Simple types `xs:string`, `xs:int`, `xs:integer`, `xs:decimal`,
+//     `xs:boolean`, `xs:date`, `xs:dateTime` and `simpleType/restriction`
+//     with `minLength`, `maxLength` (string only), `pattern`, `enumeration`.
+//     Several `pattern`s (or `enumeration`s) in ONE restriction are
+//     alternatives; restrictions stacked through named bases all apply.
+//   - Rejected with a clear error: `import`/`include`/`redefine`/`override`,
+//     `group`/`attributeGroup`, `any`/`anyAttribute`, `key`/`keyref`/`unique`,
+//     `complexContent`, `list`/`union`, `mixed="true"`, `element ref=`,
+//     `default`/`fixed`/`nillable`/`abstract`/`substitutionGroup`, other
+//     facets, other built-in types, DTDs, namespace declarations anywhere but
+//     on `xs:schema`, and an element without a type (that is `xs:anyType`).
+//     Two child elements of one content model with the same name are
+//     rejected too (they would need type disambiguation by position).
+//
+// Namespaces: a schema may carry ONE `targetNamespace`; types are referenced
+// through the prefixes declared on `xs:schema`. Instance documents are NOT
+// namespace-checked: elements are matched by LOCAL name (the prefix is
+// dropped), attributes by their literal name, `xmlns`/`xmlns:*` and
+// `xsi:schemaLocation`/`xsi:noNamespaceSchemaLocation` are ignored, other
+// `xsi:` attributes (`xsi:type`, `xsi:nil`) are violations. This mirrors
+// `payload_format::xml`, which also never resolves namespaces. `elementForm*`
+// is accepted and has no effect for the same reason.
+//
+// Values: every built-in except `xs:string` is whitespace-collapsed before
+// checking. `xs:decimal` has no exponent form; `xs:date`/`xs:dateTime` accept
+// an optional `Z` / `±hh:mm` zone, years of at least four digits and reject
+// `24:00:00` and leap seconds. `enumeration` compares the CANONICAL value for
+// numbers and booleans (`01` equals `1`, `1` equals `true`), the literal text
+// for everything else.
+//
+// `pattern` is translated from the XSD regex dialect to the Rust `regex`
+// crate and wrapped in `\A(?:…)\z` (XSD patterns are implicitly anchored, and
+// `^`/`$` are ordinary characters in XSD, so they are escaped). Differences
+// that remain: `.` excludes `\n` and `\r` (as in XSD); `\d` is `\p{Nd}` and
+// `\s` is `[ \t\n\r]` (as in XSD); constructs that mean something different
+// or do not exist in XSD (`\i \I \c \C \w \W`, character-class subtraction,
+// `\p{IsBlock}`, `(?…)` groups, lazy quantifiers, `\b`) are rejected at
+// compile time. The `regex` crate matches in linear time, so a hostile
+// pattern cannot cause catastrophic backtracking; compile size is bounded by
+// a 256 KiB program limit, a nesting limit and a pattern count cap.
+//
+// Content models compile to an NFA (Thompson construction; counted
+// occurrences are expanded, bounded by a state budget) and are simulated with
+// state sets, so validation is linear in children x active states with a hard
+// step budget (a hostile document fails closed with a violation). Violation
+// messages are PATH + CONSTRAINT only: never element text, attribute values
+// or a pattern's text — they reach audit rows, warn logs and DLQ headers.
+//
+// `derive_subschema` works on the parsed declarations: it removes the
+// declarations of the root's DIRECT CHILD elements that the field policy does
+// not allow (the same addresses `payload_format::xml` projects: literal child
+// names, a `p:name` policy entry also matches the declared `name`), keeps the
+// root's attributes, makes a `choice` optional when a whole alternative
+// disappears, and drops declarations that become unreachable. The result is
+// itself an XSD in the supported subset (namespace-free, `xs:` prefix) and is
+// deterministic for the same inputs.
+//
+// `check_compatibility` decides language INCLUSION conservatively on the
+// compiled schemas: backward = every document valid under the old schema is
+// valid under the new one, forward = the reverse, full = both. Roots, element
+// content models (exact NFA inclusion by product construction, child types
+// compared recursively), attributes and simple types (built-in widening
+// int < integer < decimal < string, length bounds, enumerations, identical
+// patterns) are compared; whenever inclusion cannot be PROVEN the change is
+// refused, never waved through.
+// =============================================================================
+
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
+
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::{Decoder, Reader, XmlVersion};
+use regex::{Regex, RegexBuilder};
+
+use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, MAX_SCHEMA_TEXT_BYTES};
+
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
+const XSI_PREFIX: &str = "xsi:";
+const MAX_SCHEMA_DEPTH: usize = 32;
+const MAX_SCHEMA_NODES: usize = 20_000;
+const MAX_OCCURS: u32 = 100_000;
+const MAX_NFA_STATES: usize = 10_000;
+const MAX_TOTAL_NFA_STATES: usize = 50_000;
+const MAX_PATTERNS: usize = 256;
+const MAX_PATTERN_CHARS: usize = 1024;
+const MAX_ENUMERATION_VALUES: usize = 4096;
+const MAX_NAME_CHARS: usize = 128;
+const PATTERN_SIZE_LIMIT: usize = 256 * 1024;
+const PATTERN_NEST_LIMIT: u32 = 32;
+const MAX_DOC_DEPTH: usize = 128;
+const MAX_VALIDATION_STEPS: u64 = 20_000_000;
+const MAX_COMPAT_PAIRS: usize = 50_000;
+
+const SUPPORTED_BUILTINS: &str = "string, int, integer, decimal, boolean, date, dateTime";
+
+fn invalid(msg: impl Into<String>) -> SchemaError {
+    SchemaError::Invalid(msg.into())
+}
+
+// =============================================================================
+// Built-in simple types and lexical checks
+// =============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Builtin {
+    String,
+    Boolean,
+    Decimal,
+    Integer,
+    Int,
+    Date,
+    DateTime,
+}
+
+impl Builtin {
+    fn from_local(local: &str) -> Option<Builtin> {
+        Some(match local {
+            "string" => Builtin::String,
+            "boolean" => Builtin::Boolean,
+            "decimal" => Builtin::Decimal,
+            "integer" => Builtin::Integer,
+            "int" => Builtin::Int,
+            "date" => Builtin::Date,
+            "dateTime" => Builtin::DateTime,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Builtin::String => "string",
+            Builtin::Boolean => "boolean",
+            Builtin::Decimal => "decimal",
+            Builtin::Integer => "integer",
+            Builtin::Int => "int",
+            Builtin::Date => "date",
+            Builtin::DateTime => "dateTime",
+        }
+    }
+
+    fn is_string(self) -> bool {
+        self == Builtin::String
+    }
+
+    /// Whether every lexical value of `self` is also a valid lexical value of
+    /// `target` (the order used for compatibility: int < integer < decimal,
+    /// everything < string).
+    fn widens_to(self, target: Builtin) -> bool {
+        self == target
+            || target == Builtin::String
+            || matches!(
+                (self, target),
+                (Builtin::Int, Builtin::Integer)
+                    | (Builtin::Int, Builtin::Decimal)
+                    | (Builtin::Integer, Builtin::Decimal)
+            )
+    }
+}
+
+fn is_xml_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn valid_integer(s: &str) -> bool {
+    all_digits(s.strip_prefix(['+', '-']).unwrap_or(s))
+}
+
+fn valid_decimal(s: &str) -> bool {
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    match s.split_once('.') {
+        None => all_digits(s),
+        Some((int, frac)) => {
+            (int.is_empty() || all_digits(int))
+                && (frac.is_empty() || all_digits(frac))
+                && !(int.is_empty() && frac.is_empty())
+        }
+    }
+}
+
+fn valid_int(s: &str) -> bool {
+    if !valid_integer(s) {
+        return false;
+    }
+    let negative = s.starts_with('-');
+    let digits = s.trim_start_matches(['+', '-']).trim_start_matches('0');
+    if digits.len() > 10 {
+        return false;
+    }
+    let magnitude: i64 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().unwrap_or(i64::MAX)
+    };
+    if negative {
+        magnitude <= 2_147_483_648
+    } else {
+        magnitude <= 2_147_483_647
+    }
+}
+
+/// Length of a valid `YYYY-MM-DD` prefix of `s` (year of at least four
+/// digits), or `None`.
+fn date_prefix_len(s: &str) -> Option<usize> {
+    let year_len = s.bytes().take_while(u8::is_ascii_digit).count();
+    if !(4..=6).contains(&year_len) {
+        return None;
+    }
+    let rest = s.get(year_len..)?;
+    let bytes = rest.as_bytes();
+    if bytes.len() < 6 || bytes[0] != b'-' || bytes[3] != b'-' {
+        return None;
+    }
+    let month = rest.get(1..3)?;
+    let day = rest.get(4..6)?;
+    if !(all_digits(month) && all_digits(day)) {
+        return None;
+    }
+    let year: i32 = s[..year_len].parse().ok()?;
+    // XSD 1.0 has no year 0000.
+    if year == 0 {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(year, month.parse().ok()?, day.parse().ok()?)?;
+    Some(year_len + 6)
+}
+
+fn valid_timezone(s: &str) -> bool {
+    if s.is_empty() || s == "Z" {
+        return true;
+    }
+    let Some(zone) = s.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    let Some((h, m)) = zone.split_once(':') else {
+        return false;
+    };
+    if h.len() != 2 || m.len() != 2 || !all_digits(h) || !all_digits(m) {
+        return false;
+    }
+    let (h, m): (u32, u32) = (h.parse().unwrap_or(99), m.parse().unwrap_or(99));
+    m <= 59 && (h < 14 || (h == 14 && m == 0))
+}
+
+fn valid_date(s: &str) -> bool {
+    date_prefix_len(s).is_some_and(|n| valid_timezone(&s[n..]))
+}
+
+fn valid_date_time(s: &str) -> bool {
+    let Some(n) = date_prefix_len(s) else {
+        return false;
+    };
+    let Some(time) = s[n..].strip_prefix('T') else {
+        return false;
+    };
+    let Some(clock) = time.get(..8) else {
+        return false;
+    };
+    let b = clock.as_bytes();
+    if b[2] != b':' || b[5] != b':' {
+        return false;
+    }
+    let part = |range: std::ops::Range<usize>| {
+        let p = &clock[range];
+        if all_digits(p) {
+            p.parse::<u32>().ok()
+        } else {
+            None
+        }
+    };
+    let (Some(h), Some(m), Some(sec)) = (part(0..2), part(3..5), part(6..8)) else {
+        return false;
+    };
+    if h > 23 || m > 59 || sec > 59 {
+        return false;
+    }
+    let mut rest = &time[8..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &frac[digits..];
+    }
+    valid_timezone(rest)
+}
+
+/// `value` is already trimmed for every built-in except `xs:string`.
+fn valid_lexical(builtin: Builtin, value: &str) -> bool {
+    match builtin {
+        Builtin::String => true,
+        Builtin::Boolean => matches!(value, "true" | "false" | "1" | "0"),
+        Builtin::Decimal => valid_decimal(value),
+        Builtin::Integer => valid_integer(value),
+        Builtin::Int => valid_int(value),
+        Builtin::Date => valid_date(value),
+        Builtin::DateTime => valid_date_time(value),
+    }
+}
+
+/// Value-space form used to compare enumeration members: `01` and `+1` are
+/// the same integer, `1` and `true` the same boolean.
+fn canonical(builtin: Builtin, value: &str) -> String {
+    match builtin {
+        Builtin::Boolean => match value {
+            "1" | "true" => "true".to_string(),
+            _ => "false".to_string(),
+        },
+        Builtin::Integer | Builtin::Int => {
+            let negative = value.starts_with('-');
+            let digits = value.trim_start_matches(['+', '-']).trim_start_matches('0');
+            if digits.is_empty() {
+                "0".to_string()
+            } else if negative {
+                format!("-{digits}")
+            } else {
+                digits.to_string()
+            }
+        }
+        Builtin::Decimal => {
+            let negative = value.starts_with('-');
+            let body = value.trim_start_matches(['+', '-']);
+            let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+            let int = int.trim_start_matches('0');
+            let frac = frac.trim_end_matches('0');
+            let int = if int.is_empty() { "0" } else { int };
+            let mut out = String::new();
+            if negative && !(int == "0" && frac.is_empty()) {
+                out.push('-');
+            }
+            out.push_str(int);
+            if !frac.is_empty() {
+                out.push('.');
+                out.push_str(frac);
+            }
+            out
+        }
+        Builtin::String | Builtin::Date | Builtin::DateTime => value.to_string(),
+    }
+}
+
+// =============================================================================
+// XSD regex dialect -> Rust regex
+// =============================================================================
+
+/// Translates an XSD `pattern` to an anchored Rust regex source. See the
+/// module header for the list of deliberate differences.
+fn translate_pattern(pattern: &str) -> Result<String, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::from("\\A(?:");
+    let mut i = 0;
+    let mut in_class = false;
+    let mut prev_quantifier = false;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                let Some(&n) = chars.get(i + 1) else {
+                    return Err("pattern ends with a lone backslash".to_string());
+                };
+                i += 2;
+                match n {
+                    'n' | 'r' | 't' | '\\' | '|' | '.' | '-' | '^' | '?' | '*' | '+' | '{'
+                    | '}' | '(' | ')' | '[' | ']' => {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                    'd' => out.push_str("\\p{Nd}"),
+                    'D' => out.push_str("\\P{Nd}"),
+                    's' => out.push_str(if in_class {
+                        " \\t\\n\\r"
+                    } else {
+                        "[ \\t\\n\\r]"
+                    }),
+                    'S' => {
+                        if in_class {
+                            return Err("\\S inside a character class is not supported".into());
+                        }
+                        out.push_str("[^ \\t\\n\\r]");
+                    }
+                    'p' | 'P' => {
+                        if chars.get(i) != Some(&'{') {
+                            return Err("\\p must be followed by {Category}".to_string());
+                        }
+                        let close = chars[i..]
+                            .iter()
+                            .position(|&c| c == '}')
+                            .ok_or("unterminated \\p{...}")?;
+                        let name: String = chars[i + 1..i + close].iter().collect();
+                        if name.is_empty()
+                            || name.len() > 2
+                            || !name.chars().all(|c| c.is_ascii_alphabetic())
+                        {
+                            return Err(format!(
+                                "\\{n}{{{name}}} is not supported (only general categories like \
+                                 \\p{{L}} or \\p{{Lu}}, no Unicode blocks)"
+                            ));
+                        }
+                        out.push('\\');
+                        out.push(n);
+                        out.push('{');
+                        out.push_str(&name);
+                        out.push('}');
+                        i += close + 1;
+                    }
+                    other => {
+                        return Err(format!(
+                            "escape \\{other} is not supported in an XSD pattern"
+                        ));
+                    }
+                }
+                prev_quantifier = false;
+                continue;
+            }
+            '[' if in_class => {
+                return Err("'[' inside a character class must be escaped".to_string());
+            }
+            '[' => {
+                in_class = true;
+                out.push('[');
+                if chars.get(i + 1) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                prev_quantifier = false;
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+            }
+            '-' if in_class && chars.get(i + 1) == Some(&'[') => {
+                return Err("character class subtraction is not supported".to_string());
+            }
+            '-' if in_class && chars.get(i + 1) == Some(&'-') => {
+                return Err("'--' inside a character class is not supported".to_string());
+            }
+            '&' | '~' if in_class => {
+                out.push('\\');
+                out.push(c);
+            }
+            '^' | '$' if !in_class => {
+                out.push('\\');
+                out.push(c);
+                prev_quantifier = false;
+            }
+            '.' if !in_class => {
+                out.push_str("[^\\n\\r]");
+                prev_quantifier = false;
+            }
+            '(' if !in_class => {
+                if chars.get(i + 1) == Some(&'?') {
+                    return Err("'(?' groups are not part of the XSD regex dialect".to_string());
+                }
+                out.push('(');
+                prev_quantifier = false;
+            }
+            '?' | '*' | '+' if !in_class => {
+                if prev_quantifier {
+                    return Err("a quantifier cannot follow another quantifier".to_string());
+                }
+                out.push(c);
+                prev_quantifier = true;
+            }
+            '}' if !in_class => {
+                out.push('}');
+                prev_quantifier = true;
+            }
+            _ => {
+                out.push(c);
+                if !in_class {
+                    prev_quantifier = false;
+                }
+            }
+        }
+        i += 1;
+    }
+    if in_class {
+        return Err("unterminated character class".to_string());
+    }
+    out.push_str(")\\z");
+    Ok(out)
+}
+
+fn build_pattern(source: &str) -> Result<Regex, String> {
+    if source.chars().count() > MAX_PATTERN_CHARS {
+        return Err(format!("pattern exceeds {MAX_PATTERN_CHARS} characters"));
+    }
+    let translated = translate_pattern(source)?;
+    RegexBuilder::new(&translated)
+        .size_limit(PATTERN_SIZE_LIMIT)
+        .dfa_size_limit(PATTERN_SIZE_LIMIT)
+        .nest_limit(PATTERN_NEST_LIMIT)
+        .build()
+        .map_err(|e| format!("pattern is not a valid or supported regular expression: {e}"))
+}
+
+// =============================================================================
+// Declarations (parsed form; also the source of `derive_subschema`)
+// =============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Max {
+    Bounded(u32),
+    Unbounded,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SimpleBase {
+    Builtin(Builtin),
+    Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TypeUse {
+    Builtin(Builtin),
+    Named(String),
+    Simple(Box<SimpleDef>),
+    Complex(Box<ComplexDef>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct FacetDef {
+    min_length: Option<u32>,
+    max_length: Option<u32>,
+    patterns: Vec<String>,
+    enumeration: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SimpleDef {
+    base: SimpleBase,
+    facets: FacetDef,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AttrDef {
+    name: String,
+    ty: TypeUse,
+    required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupKind {
+    Sequence,
+    Choice,
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ElementDef {
+    name: String,
+    ty: TypeUse,
+    min: u32,
+    max: Max,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Item {
+    Element(ElementDef),
+    Group(GroupDef),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GroupDef {
+    kind: GroupKind,
+    min: u32,
+    max: Max,
+    items: Vec<Item>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ComplexContent {
+    Empty,
+    Text(SimpleBase),
+    Group(GroupDef),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ComplexDef {
+    content: ComplexContent,
+    attributes: Vec<AttrDef>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Doc {
+    description: Option<String>,
+    elements: Vec<ElementDef>,
+    simple_types: Vec<(String, SimpleDef)>,
+    complex_types: Vec<(String, ComplexDef)>,
+}
+
+// =============================================================================
+// Schema text -> element tree
+// =============================================================================
+
+struct XNode {
+    local: String,
+    xsd: bool,
+    attrs: Vec<(String, String)>,
+    children: Vec<XNode>,
+    text: String,
+}
+
+impl XNode {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn check_attrs(&self, allowed: &[&str]) -> Result<(), SchemaError> {
+        for (key, _) in &self.attrs {
+            if key == "id" || allowed.contains(&key.as_str()) {
+                continue;
+            }
+            if key == "ref" {
+                return Err(invalid(format!(
+                    "xs:{} ref= is not supported; declare it in place",
+                    self.local
+                )));
+            }
+            return Err(invalid(format!(
+                "attribute '{key}' on xs:{} is not supported in this XSD subset",
+                self.local
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct Namespaces {
+    default: Option<String>,
+    prefixes: HashMap<String, String>,
+}
+
+impl Namespaces {
+    fn resolve(&self, prefix: Option<&str>) -> Option<&str> {
+        match prefix {
+            Some(p) => self.prefixes.get(p).map(String::as_str),
+            None => self.default.as_deref(),
+        }
+    }
+}
+
+fn utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, SchemaError> {
+    std::str::from_utf8(bytes).map_err(|_| invalid(format!("{what} is not valid UTF-8")))
+}
+
+fn append_ref(r: &BytesRef, out: &mut String) -> Result<(), String> {
+    match r.resolve_char_ref() {
+        Ok(Some(c)) => {
+            out.push(c);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("invalid character reference: {e}")),
+    }
+    let name = r.decode().map_err(|e| e.to_string())?;
+    match resolve_predefined_entity(&name) {
+        Some(s) => {
+            out.push_str(s);
+            Ok(())
+        }
+        None => Err(format!("entity reference '&{name};' is not supported")),
+    }
+}
+
+fn build_tree(text: &str) -> Result<(XNode, Namespaces), SchemaError> {
+    let mut reader = Reader::from_str(text);
+    let mut stack: Vec<XNode> = Vec::new();
+    let mut root: Option<XNode> = None;
+    let mut namespaces: Option<Namespaces> = None;
+    let mut annotation_depth: Option<usize> = None;
+    let mut nodes = 0usize;
+
+    let attach = |stack: &mut Vec<XNode>,
+                  root: &mut Option<XNode>,
+                  node: XNode|
+     -> Result<(), SchemaError> {
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(node);
+        } else if root.is_some() {
+            return Err(invalid("more than one root element"));
+        } else {
+            *root = Some(node);
+        }
+        Ok(())
+    };
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| invalid(format!("not well-formed XML: {e}")))?;
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                nodes += 1;
+                if nodes > MAX_SCHEMA_NODES {
+                    return Err(invalid(format!(
+                        "schema has more than {MAX_SCHEMA_NODES} elements"
+                    )));
+                }
+                if stack.len() + 1 > MAX_SCHEMA_DEPTH {
+                    return Err(invalid(format!(
+                        "schema is nested deeper than {MAX_SCHEMA_DEPTH} levels"
+                    )));
+                }
+                let qname = utf8(e.name().as_ref(), "element name")?.to_string();
+                let mut attrs = Vec::new();
+                let mut declared = Namespaces {
+                    default: None,
+                    prefixes: HashMap::new(),
+                };
+                for a in e.attributes() {
+                    let a = a.map_err(|e| invalid(format!("malformed attribute: {e}")))?;
+                    let key = utf8(a.key.as_ref(), "attribute name")?.to_string();
+                    let value = a
+                        .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                        .map_err(|e| invalid(format!("malformed attribute value: {e}")))?
+                        .into_owned();
+                    if key == "xmlns" || key.starts_with("xmlns:") {
+                        if !stack.is_empty() && annotation_depth.is_none() {
+                            return Err(invalid(
+                                "namespace declarations are only supported on xs:schema",
+                            ));
+                        }
+                        if stack.is_empty() {
+                            match key.strip_prefix("xmlns:") {
+                                Some(p) => {
+                                    declared.prefixes.insert(p.to_string(), value);
+                                }
+                                None => declared.default = Some(value),
+                            }
+                        }
+                    } else {
+                        attrs.push((key, value));
+                    }
+                }
+                if stack.is_empty() && namespaces.is_none() {
+                    namespaces = Some(declared);
+                }
+                let ns = namespaces
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing root element"))?;
+                let (prefix, local) = match qname.split_once(':') {
+                    Some((p, l)) => (Some(p), l),
+                    None => (None, qname.as_str()),
+                };
+                let xsd = match ns.resolve(prefix) {
+                    Some(uri) => uri == XSD_NS,
+                    None if prefix.is_some() && annotation_depth.is_none() => {
+                        return Err(invalid(format!(
+                            "namespace prefix '{}' is not declared on xs:schema",
+                            prefix.unwrap_or_default()
+                        )));
+                    }
+                    None => false,
+                };
+                let node = XNode {
+                    local: local.to_string(),
+                    xsd,
+                    attrs,
+                    children: Vec::new(),
+                    text: String::new(),
+                };
+                if annotation_depth.is_none() && xsd && node.local == "annotation" {
+                    annotation_depth = Some(stack.len());
+                }
+                if matches!(event, Event::Start(_)) {
+                    stack.push(node);
+                } else {
+                    if annotation_depth == Some(stack.len()) {
+                        annotation_depth = None;
+                    }
+                    attach(&mut stack, &mut root, node)?;
+                }
+            }
+            Event::End(_) => {
+                let node = stack.pop().ok_or_else(|| invalid("unmatched end tag"))?;
+                if annotation_depth == Some(stack.len()) {
+                    annotation_depth = None;
+                }
+                attach(&mut stack, &mut root, node)?;
+            }
+            Event::Text(ref t) => {
+                let s = t
+                    .decode()
+                    .map_err(|e| invalid(format!("invalid text: {e}")))?;
+                push_text(&mut stack, &s)?;
+            }
+            Event::CData(ref c) => {
+                let s = c
+                    .decode()
+                    .map_err(|e| invalid(format!("invalid CDATA: {e}")))?;
+                push_text(&mut stack, &s)?;
+            }
+            Event::GeneralRef(ref r) => {
+                let mut s = String::new();
+                append_ref(r, &mut s).map_err(invalid)?;
+                push_text(&mut stack, &s)?;
+            }
+            Event::DocType(_) => {
+                return Err(invalid("DOCTYPE declarations are not supported"));
+            }
+            Event::Eof => break,
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err(invalid("unexpected end of document inside an open element"));
+    }
+    let root = root.ok_or_else(|| invalid("no root element"))?;
+    let namespaces = namespaces.expect("set together with the root element");
+    Ok((root, namespaces))
+}
+
+fn push_text(stack: &mut [XNode], s: &str) -> Result<(), SchemaError> {
+    match stack.last_mut() {
+        Some(node) => node.text.push_str(s),
+        None if s.chars().all(is_xml_ws) => {}
+        None => return Err(invalid("text outside the root element")),
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Element tree -> declarations
+// =============================================================================
+
+fn unsupported_construct(local: &str) -> SchemaError {
+    let why = match local {
+        "import" | "include" | "redefine" | "override" => {
+            "schema composition is not supported; put every declaration in one document"
+        }
+        "group" | "attributeGroup" => "named groups are not supported; declare the content inline",
+        "any" | "anyAttribute" => {
+            "wildcards are not supported; declare the allowed elements and attributes explicitly"
+        }
+        "key" | "keyref" | "unique" | "selector" | "field" => {
+            "identity constraints are not supported"
+        }
+        "complexContent" => {
+            "type derivation (extension/restriction of complex types) is not supported"
+        }
+        "list" | "union" => "list and union simple types are not supported",
+        "attribute" => {
+            "global attributes are not supported; declare attributes inside a complexType"
+        }
+        "notation" => "notations are not supported",
+        _ => "this construct is not part of the supported XSD subset",
+    };
+    invalid(format!("xs:{local}: {why}"))
+}
+
+fn is_ncname(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    s.chars().count() <= MAX_NAME_CHARS
+        && (first.is_alphabetic() || first == '_')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn required_name(node: &XNode) -> Result<String, SchemaError> {
+    let name = node.attr("name").ok_or_else(|| {
+        invalid(format!(
+            "xs:{} needs a name{}",
+            node.local,
+            if node.attr("ref").is_some() {
+                " (references with ref= are not supported; declare it in place)"
+            } else {
+                ""
+            }
+        ))
+    })?;
+    if !is_ncname(name) {
+        return Err(invalid(format!(
+            "'{name}' is not a valid name (letters, digits, '_', '-', '.'; at most \
+             {MAX_NAME_CHARS} characters)"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+fn parse_occurrence_value(v: &str, what: &str) -> Result<u32, SchemaError> {
+    let n: u32 = v
+        .parse()
+        .map_err(|_| invalid(format!("{what} '{v}' is not a non-negative integer")))?;
+    if n > MAX_OCCURS {
+        return Err(invalid(format!(
+            "{what} {n} exceeds the limit of {MAX_OCCURS}"
+        )));
+    }
+    Ok(n)
+}
+
+fn parse_occurs(node: &XNode) -> Result<(u32, Max), SchemaError> {
+    let min = match node.attr("minOccurs") {
+        None => 1,
+        Some(v) => parse_occurrence_value(v, "minOccurs")?,
+    };
+    let max = match node.attr("maxOccurs") {
+        None => Max::Bounded(1),
+        Some("unbounded") => Max::Unbounded,
+        Some(v) => Max::Bounded(parse_occurrence_value(v, "maxOccurs")?),
+    };
+    if let Max::Bounded(m) = max {
+        if m < min {
+            return Err(invalid(format!(
+                "xs:{}: minOccurs {min} is greater than maxOccurs {m}",
+                node.local
+            )));
+        }
+    }
+    Ok((min, max))
+}
+
+/// The schema's children without `annotation`s, each checked to be an XSD
+/// element, and the node's own text checked to be blank.
+fn content_children(node: &XNode) -> Result<Vec<&XNode>, SchemaError> {
+    if !node.text.chars().all(is_xml_ws) {
+        return Err(invalid(format!("xs:{} must not contain text", node.local)));
+    }
+    let mut out = Vec::new();
+    for child in &node.children {
+        if !child.xsd {
+            return Err(invalid(format!(
+                "element '{}' is not in the XML Schema namespace",
+                child.local
+            )));
+        }
+        if child.local != "annotation" {
+            out.push(child);
+        }
+    }
+    Ok(out)
+}
+
+/// First non-empty `annotation/documentation` text directly under `node`.
+fn documentation(node: &XNode) -> Option<String> {
+    node.children
+        .iter()
+        .filter(|c| c.xsd && c.local == "annotation")
+        .flat_map(|a| a.children.iter())
+        .filter(|d| d.xsd && d.local == "documentation")
+        .map(|d| d.text.trim())
+        .find(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+struct Interpreter<'n> {
+    ns: &'n Namespaces,
+    target_ns: Option<&'n str>,
+}
+
+impl Interpreter<'_> {
+    fn resolve_type(&self, qname: &str) -> Result<TypeUse, SchemaError> {
+        let (prefix, local) = match qname.split_once(':') {
+            Some((p, l)) => (Some(p), l),
+            None => (None, qname),
+        };
+        if prefix.is_some() && self.ns.resolve(prefix).is_none() {
+            return Err(invalid(format!(
+                "type '{qname}' uses a namespace prefix that is not declared on xs:schema"
+            )));
+        }
+        match self.ns.resolve(prefix) {
+            Some(XSD_NS) => Builtin::from_local(local)
+                .map(TypeUse::Builtin)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "built-in type xs:{local} is not supported (supported: {SUPPORTED_BUILTINS})"
+                    ))
+                }),
+            ns if ns.is_none() || ns == self.target_ns => Ok(TypeUse::Named(local.to_string())),
+            Some(other) => Err(invalid(format!(
+                "type '{qname}' belongs to namespace '{other}'; types from other namespaces \
+                 are not supported"
+            ))),
+            None => unreachable!("covered by the guard above"),
+        }
+    }
+
+    fn simple_base(&self, qname: &str) -> Result<SimpleBase, SchemaError> {
+        match self.resolve_type(qname)? {
+            TypeUse::Builtin(b) => Ok(SimpleBase::Builtin(b)),
+            TypeUse::Named(n) => Ok(SimpleBase::Named(n)),
+            _ => unreachable!("resolve_type returns only builtin or named"),
+        }
+    }
+
+    fn schema(&self, root: &XNode) -> Result<Doc, SchemaError> {
+        let mut doc = Doc {
+            description: documentation(root),
+            elements: Vec::new(),
+            simple_types: Vec::new(),
+            complex_types: Vec::new(),
+        };
+        for child in content_children(root)? {
+            match child.local.as_str() {
+                "element" => doc.elements.push(self.element(child, true)?),
+                "complexType" => {
+                    let name = required_name(child)?;
+                    doc.complex_types
+                        .push((name, self.complex_type(child, true)?));
+                }
+                "simpleType" => {
+                    let name = required_name(child)?;
+                    doc.simple_types
+                        .push((name, self.simple_type(child, true)?));
+                }
+                other => return Err(unsupported_construct(other)),
+            }
+        }
+        Ok(doc)
+    }
+
+    fn element(&self, node: &XNode, global: bool) -> Result<ElementDef, SchemaError> {
+        node.check_attrs(&["name", "type", "minOccurs", "maxOccurs"])?;
+        let name = required_name(node)?;
+        let (min, max) = if global {
+            if node.attr("minOccurs").is_some() || node.attr("maxOccurs").is_some() {
+                return Err(invalid(format!(
+                    "global element '{name}' must not carry minOccurs/maxOccurs"
+                )));
+            }
+            (1, Max::Bounded(1))
+        } else {
+            parse_occurs(node)?
+        };
+        let mut inline: Option<TypeUse> = None;
+        for child in content_children(node)? {
+            match child.local.as_str() {
+                "complexType" if inline.is_none() => {
+                    inline = Some(TypeUse::Complex(Box::new(self.complex_type(child, false)?)));
+                }
+                "simpleType" if inline.is_none() => {
+                    inline = Some(TypeUse::Simple(Box::new(self.simple_type(child, false)?)));
+                }
+                "complexType" | "simpleType" => {
+                    return Err(invalid(format!(
+                        "element '{name}' declares more than one inline type"
+                    )));
+                }
+                other => return Err(unsupported_construct(other)),
+            }
+        }
+        let ty = match (node.attr("type"), inline) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "element '{name}' has both a type attribute and an inline type"
+                )));
+            }
+            (Some(t), None) => self.resolve_type(t)?,
+            (None, Some(t)) => t,
+            (None, None) => {
+                return Err(invalid(format!(
+                    "element '{name}' has no type; an untyped element is xs:anyType, which is \
+                     not supported - declare its type"
+                )));
+            }
+        };
+        Ok(ElementDef { name, ty, min, max })
+    }
+
+    fn complex_type(&self, node: &XNode, named: bool) -> Result<ComplexDef, SchemaError> {
+        node.check_attrs(if named {
+            &["name", "mixed"]
+        } else {
+            &["mixed"]
+        })?;
+        if node.attr("mixed").is_some_and(|m| m != "false") {
+            return Err(invalid("mixed content (mixed=\"true\") is not supported"));
+        }
+        let mut content = ComplexContent::Empty;
+        let mut have_content = false;
+        let mut attributes: Vec<AttrDef> = Vec::new();
+        for child in content_children(node)? {
+            match child.local.as_str() {
+                "sequence" | "choice" | "all" if !have_content && attributes.is_empty() => {
+                    content = ComplexContent::Group(self.group(child, true)?);
+                    have_content = true;
+                }
+                "simpleContent" if !have_content && attributes.is_empty() => {
+                    let (base, attrs) = self.simple_content(child)?;
+                    content = ComplexContent::Text(base);
+                    attributes.extend(attrs);
+                    have_content = true;
+                }
+                "sequence" | "choice" | "all" | "simpleContent" => {
+                    return Err(invalid(
+                        "a complexType takes exactly one content model, declared before its \
+                         attributes",
+                    ));
+                }
+                "attribute" => attributes.push(self.attribute(child)?),
+                other => return Err(unsupported_construct(other)),
+            }
+        }
+        let mut seen = HashSet::new();
+        for a in &attributes {
+            if !seen.insert(a.name.as_str()) {
+                return Err(invalid(format!("attribute '{}' is declared twice", a.name)));
+            }
+        }
+        Ok(ComplexDef {
+            content,
+            attributes,
+        })
+    }
+
+    fn simple_content(&self, node: &XNode) -> Result<(SimpleBase, Vec<AttrDef>), SchemaError> {
+        node.check_attrs(&[])?;
+        let children = content_children(node)?;
+        let [ext] = children.as_slice() else {
+            return Err(invalid("xs:simpleContent takes exactly one xs:extension"));
+        };
+        if ext.local != "extension" {
+            return Err(invalid(format!(
+                "xs:simpleContent/xs:{} is not supported; use xs:extension",
+                ext.local
+            )));
+        }
+        ext.check_attrs(&["base"])?;
+        let base = self.simple_base(
+            ext.attr("base")
+                .ok_or_else(|| invalid("xs:extension needs a base"))?,
+        )?;
+        let mut attrs = Vec::new();
+        for child in content_children(ext)? {
+            if child.local != "attribute" {
+                return Err(unsupported_construct(&child.local));
+            }
+            attrs.push(self.attribute(child)?);
+        }
+        Ok((base, attrs))
+    }
+
+    fn group(&self, node: &XNode, top: bool) -> Result<GroupDef, SchemaError> {
+        node.check_attrs(&["minOccurs", "maxOccurs"])?;
+        let kind = match node.local.as_str() {
+            "sequence" => GroupKind::Sequence,
+            "choice" => GroupKind::Choice,
+            _ => GroupKind::All,
+        };
+        let (min, max) = parse_occurs(node)?;
+        if kind == GroupKind::All && (!top || min > 1 || max != Max::Bounded(1)) {
+            return Err(invalid(
+                "xs:all must be the top-level group of a complexType and may occur at most once",
+            ));
+        }
+        let mut items = Vec::new();
+        for child in content_children(node)? {
+            match child.local.as_str() {
+                "element" => {
+                    let el = self.element(child, false)?;
+                    if kind == GroupKind::All
+                        && el.max != Max::Bounded(1)
+                        && el.max != Max::Bounded(0)
+                    {
+                        return Err(invalid(format!(
+                            "element '{}' inside xs:all may occur at most once",
+                            el.name
+                        )));
+                    }
+                    items.push(Item::Element(el));
+                }
+                "sequence" | "choice" if kind != GroupKind::All => {
+                    items.push(Item::Group(self.group(child, false)?));
+                }
+                "sequence" | "choice" | "all" => {
+                    return Err(invalid(format!(
+                        "xs:{} cannot be nested here (xs:all holds elements only and cannot be \
+                         nested)",
+                        child.local
+                    )));
+                }
+                other => return Err(unsupported_construct(other)),
+            }
+        }
+        if kind == GroupKind::Choice && items.is_empty() {
+            return Err(invalid("xs:choice must contain at least one particle"));
+        }
+        Ok(GroupDef {
+            kind,
+            min,
+            max,
+            items,
+        })
+    }
+
+    fn attribute(&self, node: &XNode) -> Result<AttrDef, SchemaError> {
+        node.check_attrs(&["name", "type", "use"])?;
+        let name = required_name(node)?;
+        let required = match node.attr("use") {
+            None | Some("optional") => false,
+            Some("required") => true,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "attribute '{name}': use=\"{other}\" is not supported (required or optional)"
+                )));
+            }
+        };
+        let mut inline = None;
+        for child in content_children(node)? {
+            if child.local != "simpleType" || inline.is_some() {
+                return Err(unsupported_construct(&child.local));
+            }
+            inline = Some(TypeUse::Simple(Box::new(self.simple_type(child, false)?)));
+        }
+        let ty = match (node.attr("type"), inline) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(format!(
+                    "attribute '{name}' has both a type attribute and an inline type"
+                )));
+            }
+            (Some(t), None) => self.resolve_type(t)?,
+            (None, Some(t)) => t,
+            // An attribute without a type is xs:anySimpleType: any text.
+            (None, None) => TypeUse::Builtin(Builtin::String),
+        };
+        Ok(AttrDef { name, ty, required })
+    }
+
+    fn simple_type(&self, node: &XNode, named: bool) -> Result<SimpleDef, SchemaError> {
+        node.check_attrs(if named { &["name"] } else { &[] })?;
+        let children = content_children(node)?;
+        let [restriction] = children.as_slice() else {
+            return Err(invalid("xs:simpleType takes exactly one xs:restriction"));
+        };
+        if restriction.local != "restriction" {
+            return Err(unsupported_construct(&restriction.local));
+        }
+        restriction.check_attrs(&["base"])?;
+        let base = self.simple_base(
+            restriction
+                .attr("base")
+                .ok_or_else(|| invalid("xs:restriction needs a base"))?,
+        )?;
+        let mut facets = FacetDef::default();
+        for facet in content_children(restriction)? {
+            facet.check_attrs(&["value"])?;
+            if !facet.children.iter().all(|c| c.local == "annotation") {
+                return Err(invalid(format!("xs:{} must be empty", facet.local)));
+            }
+            let value = facet
+                .attr("value")
+                .ok_or_else(|| invalid(format!("xs:{} needs a value", facet.local)))?;
+            match facet.local.as_str() {
+                "minLength" | "maxLength" => {
+                    let slot = if facet.local == "minLength" {
+                        &mut facets.min_length
+                    } else {
+                        &mut facets.max_length
+                    };
+                    if slot.is_some() {
+                        return Err(invalid(format!("xs:{} is given twice", facet.local)));
+                    }
+                    *slot = Some(value.parse().map_err(|_| {
+                        invalid(format!(
+                            "xs:{} value '{value}' is not a non-negative integer",
+                            facet.local
+                        ))
+                    })?);
+                }
+                "pattern" => facets.patterns.push(value.to_string()),
+                "enumeration" => facets.enumeration.push(value.to_string()),
+                other => {
+                    return Err(invalid(format!(
+                        "facet xs:{other} is not supported (supported: minLength, maxLength, \
+                         pattern, enumeration)"
+                    )));
+                }
+            }
+        }
+        Ok(SimpleDef { base, facets })
+    }
+}
+
+fn parse_doc(schema_text: &str) -> Result<Doc, SchemaError> {
+    if schema_text.len() > MAX_SCHEMA_TEXT_BYTES {
+        return Err(invalid(format!(
+            "schema text is {} bytes, exceeding the {MAX_SCHEMA_TEXT_BYTES}-byte limit",
+            schema_text.len()
+        )));
+    }
+    let (root, ns) = build_tree(schema_text)?;
+    if !(root.xsd && root.local == "schema") {
+        return Err(invalid("the root element must be xs:schema"));
+    }
+    root.check_attrs(&[
+        "targetNamespace",
+        "elementFormDefault",
+        "attributeFormDefault",
+        "version",
+        "xml:lang",
+    ])?;
+    let interpreter = Interpreter {
+        ns: &ns,
+        target_ns: root.attr("targetNamespace"),
+    };
+    let doc = interpreter.schema(&root)?;
+    if doc.elements.is_empty() {
+        return Err(invalid(
+            "the schema declares no global element; at least one document root is required",
+        ));
+    }
+    Ok(doc)
+}
+
+// =============================================================================
+// Compiled schema
+// =============================================================================
+
+#[derive(Clone, Debug)]
+struct Pattern {
+    source: String,
+    regex: Regex,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Facets {
+    min_length: Option<u32>,
+    max_length: Option<u32>,
+    patterns: Vec<Pattern>,
+    /// Canonical members; empty means "no enumeration".
+    enumeration: Vec<String>,
+}
+
+impl Facets {
+    fn is_unconstrained(&self) -> bool {
+        self.min_length.is_none()
+            && self.max_length.is_none()
+            && self.patterns.is_empty()
+            && self.enumeration.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SimpleType {
+    builtin: Builtin,
+    /// One entry per restriction step, base-most first; all must hold.
+    steps: Vec<Facets>,
+}
+
+impl SimpleType {
+    /// `Err` names the violated constraint, never the value.
+    fn check(&self, raw: &str) -> Result<(), String> {
+        let value = if self.builtin.is_string() {
+            raw
+        } else {
+            raw.trim_matches(is_xml_ws)
+        };
+        if !valid_lexical(self.builtin, value) {
+            return Err(format!("is not a valid xs:{}", self.builtin.name()));
+        }
+        let mut canonical_value: Option<String> = None;
+        for step in &self.steps {
+            if step.min_length.is_some() || step.max_length.is_some() {
+                let len = value.chars().count();
+                if step.min_length.is_some_and(|m| len < m as usize) {
+                    return Err("is shorter than minLength".to_string());
+                }
+                if step.max_length.is_some_and(|m| len > m as usize) {
+                    return Err("is longer than maxLength".to_string());
+                }
+            }
+            if !step.patterns.is_empty() && !step.patterns.iter().any(|p| p.regex.is_match(value)) {
+                return Err("does not match the pattern".to_string());
+            }
+            if !step.enumeration.is_empty() {
+                let c = canonical_value.get_or_insert_with(|| canonical(self.builtin, value));
+                if !step.enumeration.iter().any(|m| m == c) {
+                    return Err("is not one of the enumerated values".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enumeration every value must come from: the intersection of every
+    /// step's enumeration, or `None` when no step has one.
+    fn effective_enumeration(&self) -> Option<Vec<&String>> {
+        let mut result: Option<Vec<&String>> = None;
+        for step in self.steps.iter().filter(|s| !s.enumeration.is_empty()) {
+            result = Some(match result {
+                None => step.enumeration.iter().collect(),
+                Some(prev) => prev
+                    .into_iter()
+                    .filter(|m| step.enumeration.contains(m))
+                    .collect(),
+            });
+        }
+        result
+    }
+
+    fn effective_length(&self) -> (u32, Option<u32>) {
+        let min = self
+            .steps
+            .iter()
+            .filter_map(|s| s.min_length)
+            .max()
+            .unwrap_or(0);
+        let max = self.steps.iter().filter_map(|s| s.max_length).min();
+        (min, max)
+    }
+}
+
+#[derive(Debug)]
+struct ElementDecl {
+    ty: usize,
+}
+
+#[derive(Debug)]
+struct AttrDecl {
+    name: String,
+    /// Index of a `TypeDef::Simple`.
+    ty: usize,
+    required: bool,
+}
+
+#[derive(Debug)]
+struct ChildDecl {
+    name: String,
+    element: usize,
+}
+
+#[derive(Debug, Default)]
+struct NfaState {
+    eps: Vec<u32>,
+    edge: Option<(u32, u32)>,
+}
+
+#[derive(Debug)]
+struct Nfa {
+    states: Vec<NfaState>,
+    accept: u32,
+    start_set: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct NfaModel {
+    children: Vec<ChildDecl>,
+    by_name: HashMap<String, u32>,
+    nfa: Nfa,
+}
+
+#[derive(Debug)]
+struct AllModel {
+    children: Vec<ChildDecl>,
+    required: Vec<bool>,
+    by_name: HashMap<String, u32>,
+    /// `minOccurs="0"` on the group: the whole group may be absent.
+    optional: bool,
+}
+
+impl AllModel {
+    fn accepts_empty(&self) -> bool {
+        self.optional || !self.required.iter().any(|r| *r)
+    }
+}
+
+#[derive(Debug)]
+enum Model {
+    Nfa(NfaModel),
+    All(AllModel),
+}
+
+#[derive(Debug)]
+enum Content {
+    Empty,
+    /// Index of a `TypeDef::Simple`.
+    Text(usize),
+    Model(Model),
+}
+
+#[derive(Debug)]
+struct ComplexType {
+    attributes: Vec<AttrDecl>,
+    content: Content,
+}
+
+#[derive(Debug)]
+enum TypeDef {
+    Simple(SimpleType),
+    Complex(ComplexType),
+}
+
+#[derive(Debug)]
+pub struct Compiled {
+    elements: Vec<ElementDecl>,
+    types: Vec<TypeDef>,
+    roots: HashMap<String, usize>,
+    max_nfa_states: usize,
+}
+
+impl Compiled {
+    fn simple(&self, idx: usize) -> &SimpleType {
+        match &self.types[idx] {
+            TypeDef::Simple(s) => s,
+            TypeDef::Complex(_) => unreachable!("compile only stores simple types here"),
+        }
+    }
+}
+
+// ---- NFA ----------------------------------------------------------------
+
+enum Term {
+    Element(u32),
+    Sequence(Vec<Particle>),
+    Choice(Vec<Particle>),
+}
+
+struct Particle {
+    term: Term,
+    min: u32,
+    max: Max,
+}
+
+#[derive(Clone, Copy)]
+struct Frag {
+    start: u32,
+    end: u32,
+}
+
+struct NfaBuilder<'b> {
+    states: Vec<NfaState>,
+    limit: usize,
+    total: &'b mut usize,
+}
+
+impl NfaBuilder<'_> {
+    fn state(&mut self) -> Result<u32, SchemaError> {
+        if self.states.len() >= self.limit || *self.total >= MAX_TOTAL_NFA_STATES {
+            return Err(invalid(format!(
+                "a content model is too large: occurrence counts expand to more than \
+                 {MAX_NFA_STATES} states ({MAX_TOTAL_NFA_STATES} per schema); lower \
+                 minOccurs/maxOccurs or use unbounded"
+            )));
+        }
+        *self.total += 1;
+        self.states.push(NfaState::default());
+        Ok(self.states.len() as u32 - 1)
+    }
+
+    fn link(&mut self, from: u32, to: u32) {
+        self.states[from as usize].eps.push(to);
+    }
+
+    fn empty(&mut self) -> Result<Frag, SchemaError> {
+        let s = self.state()?;
+        Ok(Frag { start: s, end: s })
+    }
+
+    fn once(&mut self, p: &Particle) -> Result<Frag, SchemaError> {
+        match &p.term {
+            Term::Element(label) => {
+                let start = self.state()?;
+                let end = self.state()?;
+                self.states[start as usize].edge = Some((*label, end));
+                Ok(Frag { start, end })
+            }
+            Term::Sequence(items) => {
+                let mut frag = self.empty()?;
+                for item in items {
+                    let next = self.particle(item)?;
+                    self.link(frag.end, next.start);
+                    frag.end = next.end;
+                }
+                Ok(frag)
+            }
+            Term::Choice(items) => {
+                let start = self.state()?;
+                let end = self.state()?;
+                for item in items {
+                    let alt = self.particle(item)?;
+                    self.link(start, alt.start);
+                    self.link(alt.end, end);
+                }
+                Ok(Frag { start, end })
+            }
+        }
+    }
+
+    /// `p` repeated according to its occurrence bounds.
+    fn particle(&mut self, p: &Particle) -> Result<Frag, SchemaError> {
+        if p.max == Max::Bounded(0) {
+            return self.empty();
+        }
+        let mut parts = Vec::new();
+        for _ in 0..p.min {
+            parts.push(self.once(p)?);
+        }
+        match p.max {
+            Max::Unbounded => {
+                let inner = self.once(p)?;
+                let start = self.state()?;
+                let end = self.state()?;
+                self.link(start, inner.start);
+                self.link(inner.end, start);
+                self.link(start, end);
+                parts.push(Frag { start, end });
+            }
+            Max::Bounded(max) => {
+                for _ in p.min..max {
+                    let inner = self.once(p)?;
+                    let start = self.state()?;
+                    let end = self.state()?;
+                    self.link(start, inner.start);
+                    self.link(inner.end, end);
+                    self.link(start, end);
+                    parts.push(Frag { start, end });
+                }
+            }
+        }
+        let mut iter = parts.into_iter();
+        let Some(mut frag) = iter.next() else {
+            return self.empty();
+        };
+        for next in iter {
+            self.link(frag.end, next.start);
+            frag.end = next.end;
+        }
+        Ok(frag)
+    }
+}
+
+/// Scratch space for epsilon-closure walks; one per validation or
+/// comparison so a hot loop allocates no visited set per step.
+struct Marks {
+    stamp: u32,
+    seen: Vec<u32>,
+    work: Vec<u32>,
+}
+
+impl Marks {
+    fn new(states: usize) -> Marks {
+        Marks {
+            stamp: 0,
+            seen: vec![0; states],
+            work: Vec::new(),
+        }
+    }
+
+    fn next_stamp(&mut self) -> u32 {
+        if self.stamp == u32::MAX {
+            self.seen.fill(0);
+            self.stamp = 0;
+        }
+        self.stamp += 1;
+        self.stamp
+    }
+}
+
+impl Nfa {
+    /// Adds to `out` every state reachable from `seeds` through epsilon
+    /// edges that matters for matching (it has an edge or is the accept
+    /// state). `steps` counts visited states against the validation budget.
+    fn closure(&self, seeds: &[u32], out: &mut Vec<u32>, marks: &mut Marks, steps: &mut u64) {
+        let stamp = marks.next_stamp();
+        marks.work.clear();
+        for &s in seeds {
+            if marks.seen[s as usize] != stamp {
+                marks.seen[s as usize] = stamp;
+                marks.work.push(s);
+            }
+        }
+        while let Some(s) = marks.work.pop() {
+            *steps += 1;
+            let state = &self.states[s as usize];
+            if state.edge.is_some() || s == self.accept {
+                out.push(s);
+            }
+            for &t in &state.eps {
+                if marks.seen[t as usize] != stamp {
+                    marks.seen[t as usize] = stamp;
+                    marks.work.push(t);
+                }
+            }
+        }
+    }
+
+    fn step(&self, active: &[u32], label: u32, marks: &mut Marks, steps: &mut u64) -> Vec<u32> {
+        *steps += active.len() as u64;
+        let seeds: Vec<u32> = active
+            .iter()
+            .filter_map(|&s| match self.states[s as usize].edge {
+                Some((l, to)) if l == label => Some(to),
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        self.closure(&seeds, &mut out, marks, steps);
+        out
+    }
+
+    fn accepts(&self, active: &[u32]) -> bool {
+        active.contains(&self.accept)
+    }
+
+    fn labels_from(&self, active: &[u32]) -> BTreeSet<u32> {
+        active
+            .iter()
+            .filter_map(|&s| self.states[s as usize].edge.map(|(l, _)| l))
+            .collect()
+    }
+}
+
+// ---- AST -> compiled -----------------------------------------------------
+
+struct Labels {
+    children: Vec<ChildDecl>,
+    by_name: HashMap<String, u32>,
+}
+
+struct Compiler<'d> {
+    doc: &'d Doc,
+    types: Vec<TypeDef>,
+    elements: Vec<ElementDecl>,
+    builtin_idx: HashMap<Builtin, usize>,
+    simple_idx: HashMap<String, usize>,
+    complex_idx: HashMap<String, usize>,
+    simple_pending: HashSet<String>,
+    patterns: usize,
+    enum_values: usize,
+    nfa_states: usize,
+    max_nfa_states: usize,
+}
+
+impl<'d> Compiler<'d> {
+    fn new(doc: &'d Doc) -> Compiler<'d> {
+        Compiler {
+            doc,
+            types: Vec::new(),
+            elements: Vec::new(),
+            builtin_idx: HashMap::new(),
+            simple_idx: HashMap::new(),
+            complex_idx: HashMap::new(),
+            simple_pending: HashSet::new(),
+            patterns: 0,
+            enum_values: 0,
+            nfa_states: 0,
+            max_nfa_states: 1,
+        }
+    }
+
+    fn run(mut self) -> Result<Compiled, SchemaError> {
+        let doc = self.doc;
+        let mut names = HashSet::new();
+        for name in doc
+            .simple_types
+            .iter()
+            .map(|(n, _)| n)
+            .chain(doc.complex_types.iter().map(|(n, _)| n))
+        {
+            if !names.insert(name.as_str()) {
+                return Err(invalid(format!("type '{name}' is declared twice")));
+            }
+        }
+        let mut roots_seen = HashSet::new();
+        for e in &doc.elements {
+            if !roots_seen.insert(e.name.as_str()) {
+                return Err(invalid(format!(
+                    "global element '{}' is declared twice",
+                    e.name
+                )));
+            }
+        }
+
+        // Every named simple type is compiled even if unreferenced: nothing
+        // in a registered schema may hide unchecked.
+        for (name, _) in &doc.simple_types {
+            self.named_simple(name)?;
+        }
+        for (name, _) in &doc.complex_types {
+            self.types.push(TypeDef::Complex(ComplexType {
+                attributes: Vec::new(),
+                content: Content::Empty,
+            }));
+            self.complex_idx.insert(name.clone(), self.types.len() - 1);
+        }
+        for (name, def) in &doc.complex_types {
+            let compiled = self.complex_def(def)?;
+            let idx = self.complex_idx[name];
+            self.types[idx] = TypeDef::Complex(compiled);
+        }
+        let mut roots = HashMap::new();
+        for e in &doc.elements {
+            let idx = self.element(e)?;
+            roots.insert(e.name.clone(), idx);
+        }
+        Ok(Compiled {
+            elements: self.elements,
+            types: self.types,
+            roots,
+            max_nfa_states: self.max_nfa_states,
+        })
+    }
+
+    fn push_type(&mut self, t: TypeDef) -> usize {
+        self.types.push(t);
+        self.types.len() - 1
+    }
+
+    fn builtin(&mut self, b: Builtin) -> usize {
+        if let Some(&i) = self.builtin_idx.get(&b) {
+            return i;
+        }
+        let i = self.push_type(TypeDef::Simple(SimpleType {
+            builtin: b,
+            steps: Vec::new(),
+        }));
+        self.builtin_idx.insert(b, i);
+        i
+    }
+
+    fn named_simple(&mut self, name: &str) -> Result<usize, SchemaError> {
+        if let Some(&i) = self.simple_idx.get(name) {
+            return Ok(i);
+        }
+        if !self.simple_pending.insert(name.to_string()) {
+            return Err(invalid(format!(
+                "simple type '{name}' is defined in terms of itself"
+            )));
+        }
+        let doc = self.doc;
+        let def = &doc
+            .simple_types
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("caller checked the name")
+            .1;
+        let compiled = self.simple_def(def, name)?;
+        self.simple_pending.remove(name);
+        let idx = self.push_type(TypeDef::Simple(compiled));
+        self.simple_idx.insert(name.to_string(), idx);
+        Ok(idx)
+    }
+
+    fn simple_base(&mut self, base: &SimpleBase) -> Result<SimpleType, SchemaError> {
+        match base {
+            SimpleBase::Builtin(b) => Ok(SimpleType {
+                builtin: *b,
+                steps: Vec::new(),
+            }),
+            SimpleBase::Named(n) => {
+                let idx = self.simple_type_idx(n)?;
+                Ok(self.simple_of(idx))
+            }
+        }
+    }
+
+    fn simple_of(&self, idx: usize) -> SimpleType {
+        match &self.types[idx] {
+            TypeDef::Simple(s) => s.clone(),
+            TypeDef::Complex(_) => unreachable!("indexes handed out here are simple"),
+        }
+    }
+
+    /// Index of the named SIMPLE type `n`; a complex or unknown name is an
+    /// error naming the problem.
+    fn simple_type_idx(&mut self, n: &str) -> Result<usize, SchemaError> {
+        if self.doc.simple_types.iter().any(|(name, _)| name == n) {
+            self.named_simple(n)
+        } else if self.doc.complex_types.iter().any(|(name, _)| name == n) {
+            Err(invalid(format!(
+                "'{n}' is a complex type; a simple type is required here"
+            )))
+        } else {
+            Err(invalid(format!("unknown type '{n}'")))
+        }
+    }
+
+    fn simple_def(&mut self, def: &SimpleDef, what: &str) -> Result<SimpleType, SchemaError> {
+        let mut st = self.simple_base(&def.base)?;
+        let f = &def.facets;
+        if (f.min_length.is_some() || f.max_length.is_some()) && !st.builtin.is_string() {
+            return Err(invalid(format!(
+                "type '{what}': minLength/maxLength apply to xs:string only, not xs:{}",
+                st.builtin.name()
+            )));
+        }
+        if let (Some(min), Some(max)) = (f.min_length, f.max_length) {
+            if min > max {
+                return Err(invalid(format!(
+                    "type '{what}': minLength {min} is greater than maxLength {max}"
+                )));
+            }
+        }
+        self.patterns += f.patterns.len();
+        if self.patterns > MAX_PATTERNS {
+            return Err(invalid(format!(
+                "the schema uses more than {MAX_PATTERNS} patterns"
+            )));
+        }
+        let mut patterns = Vec::new();
+        for source in &f.patterns {
+            let regex =
+                build_pattern(source).map_err(|e| invalid(format!("type '{what}': {e}")))?;
+            patterns.push(Pattern {
+                source: source.clone(),
+                regex,
+            });
+        }
+        self.enum_values += f.enumeration.len();
+        if self.enum_values > MAX_ENUMERATION_VALUES {
+            return Err(invalid(format!(
+                "the schema lists more than {MAX_ENUMERATION_VALUES} enumeration values"
+            )));
+        }
+        let mut enumeration = Vec::new();
+        for member in &f.enumeration {
+            let value = if st.builtin.is_string() {
+                member.as_str()
+            } else {
+                member.trim_matches(is_xml_ws)
+            };
+            if !valid_lexical(st.builtin, value) {
+                return Err(invalid(format!(
+                    "type '{what}': enumeration value '{member}' is not a valid xs:{}",
+                    st.builtin.name()
+                )));
+            }
+            enumeration.push(canonical(st.builtin, value));
+        }
+        let step = Facets {
+            min_length: f.min_length,
+            max_length: f.max_length,
+            patterns,
+            enumeration,
+        };
+        if !step.is_unconstrained() {
+            st.steps.push(step);
+        }
+        Ok(st)
+    }
+
+    fn type_use(&mut self, t: &TypeUse, what: &str) -> Result<usize, SchemaError> {
+        match t {
+            TypeUse::Builtin(b) => Ok(self.builtin(*b)),
+            TypeUse::Named(n) => {
+                if self.doc.simple_types.iter().any(|(name, _)| name == n) {
+                    self.named_simple(n)
+                } else if let Some(&i) = self.complex_idx.get(n) {
+                    Ok(i)
+                } else {
+                    Err(invalid(format!("unknown type '{n}'")))
+                }
+            }
+            TypeUse::Simple(def) => {
+                let st = self.simple_def(def, what)?;
+                Ok(self.push_type(TypeDef::Simple(st)))
+            }
+            TypeUse::Complex(def) => {
+                let ct = self.complex_def(def)?;
+                Ok(self.push_type(TypeDef::Complex(ct)))
+            }
+        }
+    }
+
+    fn simple_use(&mut self, t: &TypeUse, what: &str) -> Result<usize, SchemaError> {
+        match t {
+            TypeUse::Named(n) => self.simple_type_idx(n),
+            TypeUse::Complex(_) => Err(invalid(format!("{what} needs a simple type"))),
+            other => self.type_use(other, what),
+        }
+    }
+
+    fn simple_base_idx(&mut self, base: &SimpleBase) -> Result<usize, SchemaError> {
+        match base {
+            SimpleBase::Builtin(b) => Ok(self.builtin(*b)),
+            SimpleBase::Named(n) => self.simple_type_idx(n),
+        }
+    }
+
+    fn element(&mut self, e: &ElementDef) -> Result<usize, SchemaError> {
+        let ty = self.type_use(&e.ty, &format!("element '{}'", e.name))?;
+        self.elements.push(ElementDecl { ty });
+        Ok(self.elements.len() - 1)
+    }
+
+    fn complex_def(&mut self, def: &ComplexDef) -> Result<ComplexType, SchemaError> {
+        let mut attributes = Vec::new();
+        for a in &def.attributes {
+            let ty = self.simple_use(&a.ty, &format!("attribute '{}'", a.name))?;
+            attributes.push(AttrDecl {
+                name: a.name.clone(),
+                ty,
+                required: a.required,
+            });
+        }
+        let content = match &def.content {
+            ComplexContent::Empty => Content::Empty,
+            ComplexContent::Text(base) => Content::Text(self.simple_base_idx(base)?),
+            ComplexContent::Group(g) => Content::Model(self.model(g)?),
+        };
+        Ok(ComplexType {
+            attributes,
+            content,
+        })
+    }
+
+    fn model(&mut self, g: &GroupDef) -> Result<Model, SchemaError> {
+        let mut labels = Labels {
+            children: Vec::new(),
+            by_name: HashMap::new(),
+        };
+        if g.kind == GroupKind::All {
+            let mut required = Vec::new();
+            for item in &g.items {
+                let Item::Element(e) = item else {
+                    unreachable!("the parser only admits elements inside xs:all")
+                };
+                self.label(e, &mut labels)?;
+                required.push(e.min >= 1);
+            }
+            return Ok(Model::All(AllModel {
+                children: labels.children,
+                required,
+                by_name: labels.by_name,
+                optional: g.min == 0,
+            }));
+        }
+        let particle = self.particle(g, &mut labels)?;
+        let mut builder = NfaBuilder {
+            states: Vec::new(),
+            limit: MAX_NFA_STATES,
+            total: &mut self.nfa_states,
+        };
+        let frag = builder.particle(&particle)?;
+        let states = builder.states;
+        self.max_nfa_states = self.max_nfa_states.max(states.len());
+        let mut nfa = Nfa {
+            states,
+            accept: frag.end,
+            start_set: Vec::new(),
+        };
+        let mut marks = Marks::new(nfa.states.len());
+        let mut start_set = Vec::new();
+        nfa.closure(&[frag.start], &mut start_set, &mut marks, &mut 0);
+        start_set.sort_unstable();
+        nfa.start_set = start_set;
+        Ok(Model::Nfa(NfaModel {
+            children: labels.children,
+            by_name: labels.by_name,
+            nfa,
+        }))
+    }
+
+    fn label(&mut self, e: &ElementDef, labels: &mut Labels) -> Result<u32, SchemaError> {
+        if labels.by_name.contains_key(&e.name) {
+            return Err(invalid(format!(
+                "element '{}' appears more than once in one content model; give each child \
+                 element of a type one position",
+                e.name
+            )));
+        }
+        let element = self.element(e)?;
+        let label = labels.children.len() as u32;
+        labels.children.push(ChildDecl {
+            name: e.name.clone(),
+            element,
+        });
+        labels.by_name.insert(e.name.clone(), label);
+        Ok(label)
+    }
+
+    fn particle(&mut self, g: &GroupDef, labels: &mut Labels) -> Result<Particle, SchemaError> {
+        let mut parts = Vec::new();
+        for item in &g.items {
+            parts.push(match item {
+                Item::Element(e) => {
+                    let label = self.label(e, labels)?;
+                    Particle {
+                        term: Term::Element(label),
+                        min: e.min,
+                        max: e.max,
+                    }
+                }
+                Item::Group(sub) => self.particle(sub, labels)?,
+            });
+        }
+        Ok(Particle {
+            term: match g.kind {
+                GroupKind::Choice => Term::Choice(parts),
+                _ => Term::Sequence(parts),
+            },
+            min: g.min,
+            max: g.max,
+        })
+    }
+}
+
+fn compile_doc(doc: &Doc) -> Result<Compiled, SchemaError> {
+    Compiler::new(doc).run()
+}
+
+// =============================================================================
+// Validation
+// =============================================================================
+
+fn violation(path: &str, msg: &str) -> SchemaError {
+    SchemaError::Violation(format!("{path}: {msg}"))
+}
+
+enum State {
+    None,
+    Nfa(Vec<u32>),
+    /// Which children were seen, and whether any was.
+    All(Vec<bool>, bool),
+    /// Simple type index and the collected character data.
+    Text(usize, String),
+}
+
+struct Frame {
+    name: String,
+    ty: usize,
+    state: State,
+}
+
+fn path_of(stack: &[Frame], extra: Option<&str>) -> String {
+    let mut p = String::new();
+    for f in stack {
+        p.push('/');
+        p.push_str(&f.name);
+    }
+    if let Some(e) = extra {
+        p.push('/');
+        p.push_str(e);
+    }
+    if p.is_empty() {
+        p.push_str("<root>");
+    }
+    p
+}
+
+fn initial_state(c: &Compiled, ty: usize) -> State {
+    match &c.types[ty] {
+        TypeDef::Simple(_) => State::Text(ty, String::new()),
+        TypeDef::Complex(ct) => match &ct.content {
+            Content::Empty => State::None,
+            Content::Text(simple) => State::Text(*simple, String::new()),
+            Content::Model(Model::Nfa(m)) => State::Nfa(m.nfa.start_set.clone()),
+            Content::Model(Model::All(m)) => State::All(vec![false; m.children.len()], false),
+        },
+    }
+}
+
+fn check_attributes(
+    c: &Compiled,
+    ty: usize,
+    e: &BytesStart,
+    decoder: Decoder,
+    path: &dyn Fn() -> String,
+) -> Result<(), SchemaError> {
+    let declared: &[AttrDecl] = match &c.types[ty] {
+        TypeDef::Simple(_) => &[],
+        TypeDef::Complex(ct) => &ct.attributes,
+    };
+    let required_total = declared.iter().filter(|a| a.required).count();
+    let mut required_seen = 0;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|e| violation(&path(), &format!("malformed attribute: {e}")))?;
+        let key = std::str::from_utf8(attr.key.as_ref())
+            .map_err(|_| violation(&path(), "attribute name is not valid UTF-8"))?;
+        if key == "xmlns" || key.starts_with("xmlns:") {
+            continue;
+        }
+        if let Some(local) = key.strip_prefix(XSI_PREFIX) {
+            if matches!(local, "schemaLocation" | "noNamespaceSchemaLocation") {
+                continue;
+            }
+            return Err(violation(
+                &path(),
+                &format!(
+                    "attribute '{key}' is not supported (xsi:type and xsi:nil are not honoured)"
+                ),
+            ));
+        }
+        let Some(decl) = declared.iter().find(|a| a.name == key) else {
+            return Err(violation(
+                &path(),
+                &format!("attribute '{key}' is not declared"),
+            ));
+        };
+        let value = attr
+            .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+            .map_err(|e| violation(&path(), &format!("malformed attribute value: {e}")))?;
+        if let Err(why) = c.simple(decl.ty).check(&value) {
+            return Err(violation(&path(), &format!("attribute '{key}' {why}")));
+        }
+        if decl.required {
+            required_seen += 1;
+        }
+    }
+    if required_seen < required_total {
+        let present: HashSet<String> = e
+            .attributes()
+            .filter_map(|a| a.ok())
+            .map(|a| String::from_utf8_lossy(a.key.as_ref()).into_owned())
+            .collect();
+        let missing = declared
+            .iter()
+            .find(|a| a.required && !present.contains(&a.name))
+            .map_or("?", |a| a.name.as_str());
+        return Err(violation(
+            &path(),
+            &format!("required attribute '{missing}' is missing"),
+        ));
+    }
+    Ok(())
+}
+
+enum Refusal {
+    NotAllowed,
+    Repeated,
+}
+
+/// Resolves the element `name` entered under the current top frame (or as
+/// the document root) to its declaration, advancing the parent's content
+/// matcher.
+fn enter_child(
+    c: &Compiled,
+    stack: &mut [Frame],
+    name: &str,
+    marks: &mut Marks,
+    steps: &mut u64,
+) -> Result<usize, SchemaError> {
+    let Some(parent_idx) = stack.len().checked_sub(1) else {
+        return c
+            .roots
+            .get(name)
+            .copied()
+            .ok_or_else(|| violation("<root>", &format!("root element '{name}' is not declared")));
+    };
+    let parent = &mut stack[parent_idx];
+    let outcome = match &c.types[parent.ty] {
+        TypeDef::Complex(ComplexType {
+            content: Content::Model(model),
+            ..
+        }) => match (model, &mut parent.state) {
+            (Model::Nfa(m), State::Nfa(active)) => match m.by_name.get(name) {
+                None => Err(Refusal::NotAllowed),
+                Some(&label) => {
+                    let next = m.nfa.step(active, label, marks, steps);
+                    if next.is_empty() {
+                        Err(Refusal::NotAllowed)
+                    } else {
+                        *active = next;
+                        Ok(m.children[label as usize].element)
+                    }
+                }
+            },
+            (Model::All(m), State::All(seen, any)) => match m.by_name.get(name) {
+                None => Err(Refusal::NotAllowed),
+                Some(&label) if seen[label as usize] => Err(Refusal::Repeated),
+                Some(&label) => {
+                    seen[label as usize] = true;
+                    *any = true;
+                    Ok(m.children[label as usize].element)
+                }
+            },
+            _ => Err(Refusal::NotAllowed),
+        },
+        _ => Err(Refusal::NotAllowed),
+    };
+    outcome.map_err(|refusal| {
+        let path = path_of(stack, Some(name));
+        match refusal {
+            Refusal::NotAllowed => violation(&path, "element is not allowed here"),
+            Refusal::Repeated => violation(&path, "element occurs more than once"),
+        }
+    })
+}
+
+fn close_frame(c: &Compiled, stack: &mut Vec<Frame>) -> Result<(), SchemaError> {
+    let frame = stack.last().expect("caller checked the stack is non-empty");
+    let fail = |msg: &str| violation(&path_of(stack, None), msg);
+    match (&frame.state, &c.types[frame.ty]) {
+        (State::Text(simple, text), _) => {
+            if let Err(why) = c.simple(*simple).check(text) {
+                return Err(fail(&format!("value {why}")));
+            }
+        }
+        (
+            State::Nfa(active),
+            TypeDef::Complex(ComplexType {
+                content: Content::Model(Model::Nfa(m)),
+                ..
+            }),
+        ) => {
+            if !m.nfa.accepts(active) {
+                return Err(fail("required child elements are missing"));
+            }
+        }
+        (
+            State::All(seen, any),
+            TypeDef::Complex(ComplexType {
+                content: Content::Model(Model::All(m)),
+                ..
+            }),
+        ) => {
+            if *any {
+                if let Some(i) = (0..seen.len()).find(|&i| m.required[i] && !seen[i]) {
+                    return Err(fail(&format!(
+                        "required child element '{}' is missing",
+                        m.children[i].name
+                    )));
+                }
+            } else if !m.accepts_empty() {
+                return Err(fail("required child elements are missing"));
+            }
+        }
+        _ => {}
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn on_text(stack: &mut [Frame], text: &str) -> Result<(), SchemaError> {
+    if let Some(Frame {
+        state: State::Text(_, buf),
+        ..
+    }) = stack.last_mut()
+    {
+        buf.push_str(text);
+        return Ok(());
+    }
+    if text.chars().all(is_xml_ws) {
+        return Ok(());
+    }
+    let what = if stack.is_empty() {
+        "character data outside the root element"
+    } else {
+        "character data is not allowed in element-only content"
+    };
+    Err(violation(&path_of(stack, None), what))
+}
+
+fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
+    let mut reader = Reader::from_reader(payload);
+    let decoder = reader.decoder();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut root_closed = false;
+    let mut marks = Marks::new(c.max_nfa_states);
+    let mut steps: u64 = 0;
+
+    loop {
+        if steps > MAX_VALIDATION_STEPS {
+            return Err(violation(
+                &path_of(&stack, None),
+                "document exceeds the validation work budget",
+            ));
+        }
+        let event = reader
+            .read_event()
+            .map_err(|e| violation(&path_of(&stack, None), &format!("not well-formed XML: {e}")))?;
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                if root_closed {
+                    return Err(violation("<root>", "more than one root element"));
+                }
+                if stack.len() >= MAX_DOC_DEPTH {
+                    return Err(violation(
+                        &path_of(&stack, None),
+                        "document is nested too deeply",
+                    ));
+                }
+                let name = std::str::from_utf8(e.local_name().as_ref())
+                    .map_err(|_| {
+                        violation(&path_of(&stack, None), "element name is not valid UTF-8")
+                    })?
+                    .to_string();
+                let element = enter_child(c, &mut stack, &name, &mut marks, &mut steps)?;
+                let ty = c.elements[element].ty;
+                check_attributes(c, ty, e, decoder, &|| path_of(&stack, Some(&name)))?;
+                stack.push(Frame {
+                    name,
+                    ty,
+                    state: initial_state(c, ty),
+                });
+                if matches!(event, Event::Empty(_)) {
+                    close_frame(c, &mut stack)?;
+                    root_closed = stack.is_empty();
+                }
+            }
+            Event::End(_) => {
+                if stack.is_empty() {
+                    return Err(violation("<root>", "unmatched end tag"));
+                }
+                close_frame(c, &mut stack)?;
+                root_closed = stack.is_empty();
+            }
+            Event::Text(ref t) => {
+                let s = t.decode().map_err(|e| {
+                    violation(&path_of(&stack, None), &format!("invalid text: {e}"))
+                })?;
+                on_text(&mut stack, &s)?;
+            }
+            Event::CData(ref t) => {
+                let s = t.decode().map_err(|e| {
+                    violation(&path_of(&stack, None), &format!("invalid CDATA: {e}"))
+                })?;
+                on_text(&mut stack, &s)?;
+            }
+            Event::GeneralRef(ref r) => {
+                let mut s = String::new();
+                append_ref(r, &mut s).map_err(|m| violation(&path_of(&stack, None), &m))?;
+                on_text(&mut stack, &s)?;
+            }
+            Event::DocType(_) => {
+                return Err(violation("<root>", "DOCTYPE declarations are not allowed"));
+            }
+            Event::Eof => break,
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err(violation(
+            &path_of(&stack, None),
+            "document ends inside an open element",
+        ));
+    }
+    if !root_closed {
+        return Err(violation("<root>", "document has no root element"));
+    }
+    Ok(())
+}
+
+// =============================================================================
+// derive_subschema
+// =============================================================================
+
+/// A policy field is the child's literal name as `payload_format::xml`
+/// addresses it; a prefixed entry (`ns:name`) also names the declared
+/// local `name`, since declarations are namespace-free.
+fn keeps(allowed: &BTreeSet<String>, name: &str) -> bool {
+    allowed.contains(name)
+        || allowed
+            .iter()
+            .any(|a| a.rsplit_once(':').is_some_and(|(_, local)| local == name))
+}
+
+/// The group restricted to allowed child elements, or `None` when nothing
+/// is left. A `choice` that lost a whole alternative becomes optional: a
+/// document that picked the dropped alternative projects to no element.
+fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>) -> Option<GroupDef> {
+    let mut items = Vec::new();
+    let mut lost = false;
+    for item in &g.items {
+        match item {
+            Item::Element(e) if keeps(allowed, &e.name) => items.push(item.clone()),
+            Item::Element(_) => lost = true,
+            Item::Group(sub) => match filter_group(sub, allowed) {
+                Some(f) => items.push(Item::Group(f)),
+                None => lost = true,
+            },
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let min = if g.kind == GroupKind::Choice && lost {
+        0
+    } else {
+        g.min
+    };
+    Some(GroupDef {
+        kind: g.kind,
+        min,
+        max: g.max,
+        items,
+    })
+}
+
+fn project_complex(def: ComplexDef, allowed: &BTreeSet<String>) -> ComplexDef {
+    let content = match def.content {
+        ComplexContent::Group(g) => {
+            filter_group(&g, allowed).map_or(ComplexContent::Empty, ComplexContent::Group)
+        }
+        other => other,
+    };
+    ComplexDef {
+        content,
+        attributes: def.attributes,
+    }
+}
+
+fn named_in_use(t: &TypeUse, out: &mut Vec<String>) {
+    match t {
+        TypeUse::Named(n) => out.push(n.clone()),
+        TypeUse::Builtin(_) => {}
+        TypeUse::Simple(def) => named_in_base(&def.base, out),
+        TypeUse::Complex(def) => named_in_complex(def, out),
+    }
+}
+
+fn named_in_base(b: &SimpleBase, out: &mut Vec<String>) {
+    if let SimpleBase::Named(n) = b {
+        out.push(n.clone());
+    }
+}
+
+fn named_in_group(g: &GroupDef, out: &mut Vec<String>) {
+    for item in &g.items {
+        match item {
+            Item::Element(e) => named_in_use(&e.ty, out),
+            Item::Group(sub) => named_in_group(sub, out),
+        }
+    }
+}
+
+fn named_in_complex(def: &ComplexDef, out: &mut Vec<String>) {
+    for a in &def.attributes {
+        named_in_use(&a.ty, out);
+    }
+    match &def.content {
+        ComplexContent::Empty => {}
+        ComplexContent::Text(b) => named_in_base(b, out),
+        ComplexContent::Group(g) => named_in_group(g, out),
+    }
+}
+
+/// Removes named types no longer reachable from a global element, so a
+/// pattern or enumeration that only described a hidden field cannot leak.
+fn prune_unreachable(doc: &mut Doc) {
+    let mut pending = Vec::new();
+    for e in &doc.elements {
+        named_in_use(&e.ty, &mut pending);
+    }
+    let mut reachable = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some((_, def)) = doc.simple_types.iter().find(|(n, _)| *n == name) {
+            named_in_base(&def.base, &mut pending);
+        }
+        if let Some((_, def)) = doc.complex_types.iter().find(|(n, _)| *n == name) {
+            named_in_complex(def, &mut pending);
+        }
+    }
+    doc.simple_types.retain(|(n, _)| reachable.contains(n));
+    doc.complex_types.retain(|(n, _)| reachable.contains(n));
+}
+
+fn derive_doc(doc: &Doc, allowed: &BTreeSet<String>) -> Doc {
+    let mut out = doc.clone();
+    for element in &mut out.elements {
+        let def = match &element.ty {
+            TypeUse::Named(n) => doc
+                .complex_types
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, d)| d.clone()),
+            TypeUse::Complex(d) => Some((**d).clone()),
+            _ => None,
+        };
+        if let Some(def) = def {
+            // A named type is inlined for the root only: other uses of it
+            // (deeper in the tree) keep their full shape.
+            element.ty = TypeUse::Complex(Box::new(project_complex(def, allowed)));
+        }
+    }
+    prune_unreachable(&mut out);
+    out
+}
+
+// ---- rendering ----------------------------------------------------------
+
+fn escape(s: &str, attribute: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if attribute => out.push_str("&quot;"),
+            '\t' | '\n' | '\r' if attribute => {
+                let _ = write!(out, "&#{};", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn pad(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn type_attr(t: &TypeUse) -> Option<String> {
+    match t {
+        TypeUse::Builtin(b) => Some(format!("xs:{}", b.name())),
+        TypeUse::Named(n) => Some(n.clone()),
+        TypeUse::Simple(_) | TypeUse::Complex(_) => None,
+    }
+}
+
+fn base_attr(b: &SimpleBase) -> String {
+    match b {
+        SimpleBase::Builtin(b) => format!("xs:{}", b.name()),
+        SimpleBase::Named(n) => n.clone(),
+    }
+}
+
+fn occurs_attrs(min: u32, max: Max) -> String {
+    let mut s = String::new();
+    if min != 1 {
+        let _ = write!(s, " minOccurs=\"{min}\"");
+    }
+    match max {
+        Max::Bounded(1) => {}
+        Max::Bounded(m) => {
+            let _ = write!(s, " maxOccurs=\"{m}\"");
+        }
+        Max::Unbounded => s.push_str(" maxOccurs=\"unbounded\""),
+    }
+    s
+}
+
+fn render_inline(out: &mut String, t: &TypeUse, depth: usize) {
+    match t {
+        TypeUse::Simple(def) => render_simple(out, def, None, depth),
+        TypeUse::Complex(def) => render_complex(out, def, None, depth),
+        TypeUse::Builtin(_) | TypeUse::Named(_) => {}
+    }
+}
+
+fn render_element(out: &mut String, e: &ElementDef, depth: usize, global: bool) {
+    pad(out, depth);
+    let _ = write!(out, "<xs:element name=\"{}\"", escape(&e.name, true));
+    if let Some(t) = type_attr(&e.ty) {
+        let _ = write!(out, " type=\"{}\"", escape(&t, true));
+    }
+    if !global {
+        out.push_str(&occurs_attrs(e.min, e.max));
+    }
+    if type_attr(&e.ty).is_some() {
+        out.push_str("/>\n");
+    } else {
+        out.push_str(">\n");
+        render_inline(out, &e.ty, depth + 1);
+        pad(out, depth);
+        out.push_str("</xs:element>\n");
+    }
+}
+
+fn render_group(out: &mut String, g: &GroupDef, depth: usize) {
+    let tag = match g.kind {
+        GroupKind::Sequence => "sequence",
+        GroupKind::Choice => "choice",
+        GroupKind::All => "all",
+    };
+    pad(out, depth);
+    let _ = writeln!(out, "<xs:{tag}{}>", occurs_attrs(g.min, g.max));
+    for item in &g.items {
+        match item {
+            Item::Element(e) => render_element(out, e, depth + 1, false),
+            Item::Group(sub) => render_group(out, sub, depth + 1),
+        }
+    }
+    pad(out, depth);
+    let _ = writeln!(out, "</xs:{tag}>");
+}
+
+fn render_attribute(out: &mut String, a: &AttrDef, depth: usize) {
+    pad(out, depth);
+    let _ = write!(out, "<xs:attribute name=\"{}\"", escape(&a.name, true));
+    if let Some(t) = type_attr(&a.ty) {
+        let _ = write!(out, " type=\"{}\"", escape(&t, true));
+    }
+    if a.required {
+        out.push_str(" use=\"required\"");
+    }
+    if type_attr(&a.ty).is_some() {
+        out.push_str("/>\n");
+    } else {
+        out.push_str(">\n");
+        render_inline(out, &a.ty, depth + 1);
+        pad(out, depth);
+        out.push_str("</xs:attribute>\n");
+    }
+}
+
+fn render_simple(out: &mut String, def: &SimpleDef, name: Option<&str>, depth: usize) {
+    pad(out, depth);
+    match name {
+        Some(n) => {
+            let _ = writeln!(out, "<xs:simpleType name=\"{}\">", escape(n, true));
+        }
+        None => out.push_str("<xs:simpleType>\n"),
+    }
+    pad(out, depth + 1);
+    let _ = writeln!(
+        out,
+        "<xs:restriction base=\"{}\">",
+        escape(&base_attr(&def.base), true)
+    );
+    let f = &def.facets;
+    let mut facet = |tag: &str, value: &str| {
+        pad(out, depth + 2);
+        let _ = writeln!(out, "<xs:{tag} value=\"{}\"/>", escape(value, true));
+    };
+    if let Some(m) = f.min_length {
+        facet("minLength", &m.to_string());
+    }
+    if let Some(m) = f.max_length {
+        facet("maxLength", &m.to_string());
+    }
+    for p in &f.patterns {
+        facet("pattern", p);
+    }
+    for e in &f.enumeration {
+        facet("enumeration", e);
+    }
+    pad(out, depth + 1);
+    out.push_str("</xs:restriction>\n");
+    pad(out, depth);
+    out.push_str("</xs:simpleType>\n");
+}
+
+fn render_complex(out: &mut String, def: &ComplexDef, name: Option<&str>, depth: usize) {
+    pad(out, depth);
+    match name {
+        Some(n) => {
+            let _ = writeln!(out, "<xs:complexType name=\"{}\">", escape(n, true));
+        }
+        None => out.push_str("<xs:complexType>\n"),
+    }
+    match &def.content {
+        ComplexContent::Empty => {
+            for a in &def.attributes {
+                render_attribute(out, a, depth + 1);
+            }
+        }
+        ComplexContent::Text(base) => {
+            pad(out, depth + 1);
+            out.push_str("<xs:simpleContent>\n");
+            pad(out, depth + 2);
+            let _ = writeln!(
+                out,
+                "<xs:extension base=\"{}\">",
+                escape(&base_attr(base), true)
+            );
+            for a in &def.attributes {
+                render_attribute(out, a, depth + 3);
+            }
+            pad(out, depth + 2);
+            out.push_str("</xs:extension>\n");
+            pad(out, depth + 1);
+            out.push_str("</xs:simpleContent>\n");
+        }
+        ComplexContent::Group(g) => {
+            render_group(out, g, depth + 1);
+            for a in &def.attributes {
+                render_attribute(out, a, depth + 1);
+            }
+        }
+    }
+    pad(out, depth);
+    out.push_str("</xs:complexType>\n");
+}
+
+fn render(doc: &Doc) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    let _ = writeln!(out, "<xs:schema xmlns:xs=\"{XSD_NS}\">");
+    if let Some(d) = &doc.description {
+        out.push_str("  <xs:annotation>\n");
+        let _ = writeln!(
+            out,
+            "    <xs:documentation>{}</xs:documentation>",
+            escape(d, false)
+        );
+        out.push_str("  </xs:annotation>\n");
+    }
+    for e in &doc.elements {
+        render_element(&mut out, e, 1, true);
+    }
+    for (n, d) in &doc.simple_types {
+        render_simple(&mut out, d, Some(n), 1);
+    }
+    for (n, d) in &doc.complex_types {
+        render_complex(&mut out, d, Some(n), 1);
+    }
+    out.push_str("</xs:schema>\n");
+    out
+}
+
+// =============================================================================
+// check_compatibility
+// =============================================================================
+
+enum ContentView<'a> {
+    Empty,
+    Text(&'a SimpleType),
+    Model(&'a Model),
+}
+
+fn view(c: &Compiled, ty: usize) -> (&[AttrDecl], ContentView<'_>) {
+    match &c.types[ty] {
+        TypeDef::Simple(s) => (&[], ContentView::Text(s)),
+        TypeDef::Complex(ct) => (
+            &ct.attributes,
+            match &ct.content {
+                Content::Empty => ContentView::Empty,
+                Content::Text(i) => ContentView::Text(c.simple(*i)),
+                Content::Model(m) => ContentView::Model(m),
+            },
+        ),
+    }
+}
+
+/// Decides L(sub) ⊆ L(sup) conservatively: `Ok` only when inclusion is
+/// proven. `sup` is the schema that must accept, `sub` the one producing
+/// the documents.
+struct Inclusion<'a> {
+    sup: &'a Compiled,
+    sub: &'a Compiled,
+    sup_label: &'static str,
+    sub_label: &'static str,
+    visited: HashSet<(usize, usize)>,
+    pairs: usize,
+    max_pairs: usize,
+}
+
+impl<'a> Inclusion<'a> {
+    fn fail(&self, path: &[String], msg: &str) -> String {
+        format!("/{}: {msg}", path.join("/"))
+    }
+
+    fn budget(&mut self) -> Result<(), String> {
+        self.pairs += 1;
+        if self.pairs > self.max_pairs {
+            return Err(
+                "the schemas are too complex to compare; compatibility cannot be proven"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn roots(&mut self) -> Result<(), String> {
+        let mut names: Vec<&String> = self.sub.roots.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(&sup_el) = self.sup.roots.get(name) else {
+                return Err(format!(
+                    "document root '{name}' exists in the {} schema but not in the {} schema",
+                    self.sub_label, self.sup_label
+                ));
+            };
+            let sub_el = self.sub.roots[name];
+            let mut path = vec![name.clone()];
+            self.types(
+                self.sup.elements[sup_el].ty,
+                self.sub.elements[sub_el].ty,
+                &mut path,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn types(
+        &mut self,
+        sup_ty: usize,
+        sub_ty: usize,
+        path: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if !self.visited.insert((sup_ty, sub_ty)) {
+            return Ok(());
+        }
+        self.budget()?;
+        let (sup_attrs, sup_content) = view(self.sup, sup_ty);
+        let (sub_attrs, sub_content) = view(self.sub, sub_ty);
+        for b in sub_attrs {
+            let Some(a) = sup_attrs.iter().find(|a| a.name == b.name) else {
+                return Err(self.fail(
+                    path,
+                    &format!(
+                        "attribute '{}' exists in the {} schema but not in the {} schema",
+                        b.name, self.sub_label, self.sup_label
+                    ),
+                ));
+            };
+            self.simple(self.sup.simple(a.ty), self.sub.simple(b.ty))
+                .map_err(|m| self.fail(path, &format!("attribute '{}': {m}", b.name)))?;
+            if a.required && !b.required {
+                return Err(self.fail(
+                    path,
+                    &format!(
+                        "attribute '{}' is required in the {} schema but optional in the {} schema",
+                        b.name, self.sup_label, self.sub_label
+                    ),
+                ));
+            }
+        }
+        for a in sup_attrs.iter().filter(|a| a.required) {
+            if !sub_attrs.iter().any(|b| b.name == a.name) {
+                return Err(self.fail(
+                    path,
+                    &format!(
+                        "attribute '{}' is required in the {} schema but absent from the {} schema",
+                        a.name, self.sup_label, self.sub_label
+                    ),
+                ));
+            }
+        }
+        match (sup_content, sub_content) {
+            (ContentView::Empty, ContentView::Empty) => Ok(()),
+            (ContentView::Text(a), ContentView::Text(b)) => {
+                self.simple(a, b).map_err(|m| self.fail(path, &m))
+            }
+            (ContentView::Empty, ContentView::Model(m)) => {
+                let no_children = match m {
+                    Model::Nfa(n) => n.children.is_empty(),
+                    Model::All(a) => a.children.is_empty(),
+                };
+                if no_children {
+                    Ok(())
+                } else {
+                    Err(self.fail(
+                        path,
+                        &format!(
+                            "the {} schema allows child elements where the {} schema allows none",
+                            self.sub_label, self.sup_label
+                        ),
+                    ))
+                }
+            }
+            (ContentView::Model(m), ContentView::Empty) => {
+                let nullable = match m {
+                    Model::Nfa(n) => n.nfa.accepts(&n.nfa.start_set),
+                    Model::All(a) => a.accepts_empty(),
+                };
+                if nullable {
+                    Ok(())
+                } else {
+                    Err(self.fail(
+                        path,
+                        &format!(
+                            "the {} schema requires child elements that the {} schema may omit",
+                            self.sup_label, self.sub_label
+                        ),
+                    ))
+                }
+            }
+            (ContentView::Model(a), ContentView::Model(b)) => self.models(a, b, path),
+            _ => Err(self.fail(
+                path,
+                "the content changed between text and child elements, or between empty and text",
+            )),
+        }
+    }
+
+    fn simple(&self, sup: &SimpleType, sub: &SimpleType) -> Result<(), String> {
+        if !sub.builtin.widens_to(sup.builtin) {
+            return Err(format!(
+                "type xs:{} ({}) is not contained in xs:{} ({})",
+                sub.builtin.name(),
+                self.sub_label,
+                sup.builtin.name(),
+                self.sup_label
+            ));
+        }
+        if sup.steps.is_empty() {
+            return Ok(());
+        }
+        if let Some(members) = sub.effective_enumeration() {
+            for member in members {
+                if sup.check(member).is_err() {
+                    return Err(format!(
+                        "enumerated value '{member}' of the {} schema is not accepted by the {} \
+                         schema",
+                        self.sub_label, self.sup_label
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if sub.builtin != sup.builtin {
+            return Err(
+                "restrictions cannot be compared across a type change; compatibility cannot be \
+                 proven"
+                    .to_string(),
+            );
+        }
+        if sup.steps.iter().any(|s| !s.enumeration.is_empty()) {
+            return Err(format!(
+                "the {} schema restricts the value to an enumeration that the {} schema does not",
+                self.sup_label, self.sub_label
+            ));
+        }
+        let (sup_min, sup_max) = sup.effective_length();
+        let (sub_min, sub_max) = sub.effective_length();
+        if sub_min < sup_min || sup_max.is_some_and(|m| sub_max.is_none_or(|b| b > m)) {
+            return Err(format!(
+                "the length bounds of the {} schema are wider than those of the {} schema",
+                self.sub_label, self.sup_label
+            ));
+        }
+        for step in sup.steps.iter().filter(|s| !s.patterns.is_empty()) {
+            let mut want: Vec<&str> = step.patterns.iter().map(|p| p.source.as_str()).collect();
+            want.sort_unstable();
+            let found = sub.steps.iter().any(|b| {
+                let mut have: Vec<&str> = b.patterns.iter().map(|p| p.source.as_str()).collect();
+                have.sort_unstable();
+                have == want
+            });
+            if !found {
+                return Err(format!(
+                    "the {} schema applies a pattern that the {} schema does not guarantee",
+                    self.sup_label, self.sub_label
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn models(&mut self, sup: &Model, sub: &Model, path: &mut Vec<String>) -> Result<(), String> {
+        match (sup, sub) {
+            (Model::All(a), Model::All(b)) => {
+                for (i, child) in b.children.iter().enumerate() {
+                    let Some(&j) = a.by_name.get(&child.name) else {
+                        return Err(self.fail(
+                            path,
+                            &format!(
+                                "child element '{}' exists in the {} schema but not in the {} \
+                                 schema",
+                                child.name, self.sub_label, self.sup_label
+                            ),
+                        ));
+                    };
+                    if a.required[j as usize] && !b.required[i] {
+                        return Err(self.fail(
+                            path,
+                            &format!(
+                                "child element '{}' is required in the {} schema but optional \
+                                 in the {} schema",
+                                child.name, self.sup_label, self.sub_label
+                            ),
+                        ));
+                    }
+                    path.push(child.name.clone());
+                    self.types(
+                        self.sup.elements[a.children[j as usize].element].ty,
+                        self.sub.elements[child.element].ty,
+                        path,
+                    )?;
+                    path.pop();
+                }
+                for (j, child) in a.children.iter().enumerate() {
+                    if a.required[j] && !b.by_name.contains_key(&child.name) {
+                        return Err(self.fail(
+                            path,
+                            &format!(
+                                "child element '{}' is required in the {} schema but absent \
+                                 from the {} schema",
+                                child.name, self.sup_label, self.sub_label
+                            ),
+                        ));
+                    }
+                }
+                if b.accepts_empty() && !a.accepts_empty() {
+                    return Err(self.fail(
+                        path,
+                        &format!(
+                            "the {} schema allows the group to be empty, the {} schema does not",
+                            self.sub_label, self.sup_label
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            (Model::Nfa(a), Model::Nfa(b)) => self.nfas(a, b, path),
+            _ => Err(self.fail(
+                path,
+                "the model group changed between xs:all and xs:sequence/xs:choice; compatibility \
+                 cannot be proven",
+            )),
+        }
+    }
+
+    fn nfas(
+        &mut self,
+        sup: &NfaModel,
+        sub: &NfaModel,
+        path: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let mut sup_marks = Marks::new(sup.nfa.states.len());
+        let mut sub_marks = Marks::new(sub.nfa.states.len());
+        let mut steps = 0u64;
+        let start = (sub.nfa.start_set.clone(), sup.nfa.start_set.clone());
+        let mut seen: HashSet<(Vec<u32>, Vec<u32>)> = HashSet::new();
+        seen.insert(start.clone());
+        let mut queue = VecDeque::from([start]);
+        let mut typed: HashSet<u32> = HashSet::new();
+        while let Some((s1, s2)) = queue.pop_front() {
+            self.budget()?;
+            if sub.nfa.accepts(&s1) && !sup.nfa.accepts(&s2) {
+                return Err(self.fail(
+                    path,
+                    &format!(
+                        "the {} schema accepts a sequence of child elements that ends where the \
+                         {} schema still requires more",
+                        self.sub_label, self.sup_label
+                    ),
+                ));
+            }
+            for label in sub.nfa.labels_from(&s1) {
+                let child = &sub.children[label as usize];
+                let Some(&sup_label) = sup.by_name.get(&child.name) else {
+                    return Err(self.fail(
+                        path,
+                        &format!(
+                            "child element '{}' exists in the {} schema but not in the {} schema",
+                            child.name, self.sub_label, self.sup_label
+                        ),
+                    ));
+                };
+                let mut next_sub = sub.nfa.step(&s1, label, &mut sub_marks, &mut steps);
+                let mut next_sup = sup.nfa.step(&s2, sup_label, &mut sup_marks, &mut steps);
+                next_sub.sort_unstable();
+                next_sup.sort_unstable();
+                if next_sup.is_empty() {
+                    return Err(self.fail(
+                        path,
+                        &format!(
+                            "child element '{}' may appear in the {} schema at a position where \
+                             the {} schema does not allow it",
+                            child.name, self.sub_label, self.sup_label
+                        ),
+                    ));
+                }
+                if typed.insert(label) {
+                    path.push(child.name.clone());
+                    self.types(
+                        self.sup.elements[sup.children[sup_label as usize].element].ty,
+                        self.sub.elements[child.element].ty,
+                        path,
+                    )?;
+                    path.pop();
+                }
+                let pair = (next_sub, next_sup);
+                if seen.insert(pair.clone()) {
+                    queue.push_back(pair);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Ok` iff every document valid under `sub` is proven valid under `sup`.
+fn included(
+    sup: &Compiled,
+    sub: &Compiled,
+    sup_label: &'static str,
+    sub_label: &'static str,
+) -> Result<(), String> {
+    Inclusion {
+        sup,
+        sub,
+        sup_label,
+        sub_label,
+        visited: HashSet::new(),
+        pairs: 0,
+        max_pairs: MAX_COMPAT_PAIRS,
+    }
+    .roots()
+}
+
+// =============================================================================
+// SchemaKindOps
+// =============================================================================
+
+pub struct XsdOps;
+
+fn compile_text(schema_text: &str) -> Result<Compiled, SchemaError> {
+    compile_doc(&parse_doc(schema_text)?)
+}
+
+impl SchemaKindOps for XsdOps {
+    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+        compile_text(schema_text).map(CompiledSchema::Xsd)
+    }
+
+    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+        let CompiledSchema::Xsd(c) = compiled else {
+            return Err(invalid("validate called with a non-xsd compiled schema"));
+        };
+        validate_document(c, payload)
+    }
+
+    fn derive_subschema(
+        &self,
+        schema_text: &str,
+        allowed: &BTreeSet<String>,
+    ) -> Result<String, SchemaError> {
+        let derived = derive_doc(&parse_doc(schema_text)?, allowed);
+        // The projection must itself be a registrable schema.
+        compile_doc(&derived)?;
+        Ok(render(&derived))
+    }
+
+    fn check_compatibility(
+        &self,
+        old_schema_text: &str,
+        new_schema_text: &str,
+        mode: Compatibility,
+    ) -> Result<(), SchemaError> {
+        if mode == Compatibility::None {
+            return Ok(());
+        }
+        let old = compile_text(old_schema_text)?;
+        let new = compile_text(new_schema_text)?;
+        let backward = || {
+            included(&new, &old, "new", "old").map_err(|d| {
+                SchemaError::Incompatible(format!(
+                    "backward: a document valid under the old schema may be invalid under the \
+                     new one - {d}"
+                ))
+            })
+        };
+        let forward = || {
+            included(&old, &new, "old", "new").map_err(|d| {
+                SchemaError::Incompatible(format!(
+                    "forward: a document valid under the new schema may be invalid under the \
+                     old one - {d}"
+                ))
+            })
+        };
+        match mode {
+            Compatibility::Backward => backward(),
+            Compatibility::Forward => forward(),
+            Compatibility::Full => backward().and_then(|()| forward()),
+            Compatibility::None => Ok(()),
+        }
+    }
+}
+
+pub(super) static XSD_OPS: XsdOps = XsdOps;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::payload_format::PayloadFormat;
+    use crate::bus::schema_registry::fixtures;
+
+    fn schema(body: &str) -> String {
+        format!(r#"<xs:schema xmlns:xs="{XSD_NS}">{body}</xs:schema>"#)
+    }
+
+    fn ops_compile(text: &str) -> Result<CompiledSchema, SchemaError> {
+        XSD_OPS.compile(text)
+    }
+
+    fn compiled(text: &str) -> CompiledSchema {
+        ops_compile(text).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn violation_of(schema_text: &str, doc: &str) -> String {
+        match XSD_OPS.validate(&compiled(schema_text), doc.as_bytes()) {
+            Err(SchemaError::Violation(m)) => m,
+            other => panic!("expected a violation for {doc}, got {other:?}"),
+        }
+    }
+
+    fn accepts(schema_text: &str, doc: &str) -> bool {
+        XSD_OPS
+            .validate(&compiled(schema_text), doc.as_bytes())
+            .is_ok()
+    }
+
+    fn rejected(body: &str) -> String {
+        match ops_compile(&schema(body)) {
+            Err(SchemaError::Invalid(m)) => m,
+            other => panic!("expected the schema to be rejected, got {other:?}"),
+        }
+    }
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- golden fixtures --------------------------------------------------
+
+    #[test]
+    fn golden_fixtures_validate_as_declared() {
+        let compiled = compiled(&fixtures::read("xsd", "patient.xsd"));
+        for case in fixtures::cases("xsd", "xml") {
+            let got = XSD_OPS.validate(&compiled, &case.payload);
+            match &case.expect {
+                None => assert!(got.is_ok(), "{}: {got:?}", case.name),
+                Some(expect) => assert!(
+                    matches!(&got, Err(SchemaError::Violation(m)) if m.contains(expect.as_str())),
+                    "{}: expected a violation containing {expect:?}, got {got:?}",
+                    case.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn violations_never_echo_text_or_attribute_values() {
+        let schema_text = fixtures::read("xsd", "patient.xsd");
+        let doc = "<patient><mrn>SECRET-MRN</mrn></patient>";
+        let msg = violation_of(&schema_text, doc);
+        assert!(!msg.contains("SECRET"), "{msg}");
+        let doc = r#"<patient><mrn>AB123456</mrn><name><family>A</family><given>B</given></name><birthDate>1980-01-01</birthDate><visit ward="LEAKED">x</visit></patient>"#;
+        let msg = violation_of(&schema_text, doc);
+        assert!(!msg.contains("LEAKED"), "{msg}");
+        let msg = violation_of(
+            &schema(
+                r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="never-shown-[0-9]"/></xs:restriction></xs:simpleType></xs:element>"#,
+            ),
+            "<a>x</a>",
+        );
+        assert!(!msg.contains("never-shown"), "{msg}");
+    }
+
+    // ---- compile: rejected constructs --------------------------------------
+
+    #[test]
+    fn compile_rejects_unsupported_constructs_with_a_clear_message() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"<xs:import namespace="urn:x"/><xs:element name="a" type="xs:string"/>"#,
+                "schema composition",
+            ),
+            (
+                r#"<xs:include schemaLocation="x.xsd"/><xs:element name="a" type="xs:string"/>"#,
+                "schema composition",
+            ),
+            (
+                r#"<xs:group name="g"><xs:sequence/></xs:group><xs:element name="a" type="xs:string"/>"#,
+                "named groups",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:any/></xs:sequence></xs:complexType></xs:element>"#,
+                "wildcards",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:anyAttribute/></xs:complexType></xs:element>"#,
+                "wildcards",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element name="b" type="xs:string"/></xs:sequence></xs:complexType><xs:key name="k"><xs:selector xpath="b"/><xs:field xpath="."/></xs:key></xs:element>"#,
+                "identity constraints",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:complexContent><xs:extension base="x"/></xs:complexContent></xs:complexType></xs:element>"#,
+                "type derivation",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType mixed="true"><xs:sequence/></xs:complexType></xs:element>"#,
+                "mixed content",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:long"/>"#,
+                "xs:long is not supported",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:anyType"/>"#,
+                "xs:anyType is not supported",
+            ),
+            (r#"<xs:element name="a"/>"#, "has no type"),
+            (r#"<xs:element ref="a"/>"#, "ref="),
+            (
+                r#"<xs:element name="a" type="xs:string" nillable="true"/>"#,
+                "attribute 'nillable'",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:string" default="x"/>"#,
+                "attribute 'default'",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:string" substitutionGroup="b"/>"#,
+                "attribute 'substitutionGroup'",
+            ),
+            (
+                r#"<xs:attribute name="x" type="xs:string"/><xs:element name="a" type="xs:string"/>"#,
+                "global attributes",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:attribute name="x" use="prohibited"/></xs:complexType></xs:element>"#,
+                "use=\"prohibited\"",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:attribute name="x" fixed="1"/></xs:complexType></xs:element>"#,
+                "attribute 'fixed'",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:totalDigits value="3"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "facet xs:totalDigits",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:length value="3"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "facet xs:length",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:union memberTypes="xs:int xs:string"/></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "list and union",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:int"><xs:minLength value="3"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "apply to xs:string only",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:minLength value="5"/><xs:maxLength value="2"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "greater than maxLength",
+            ),
+            (
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:int"><xs:enumeration value="x"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "not a valid xs:int",
+            ),
+            (
+                r#"<xs:simpleType name="a"><xs:restriction base="b"/></xs:simpleType><xs:simpleType name="b"><xs:restriction base="a"/></xs:simpleType><xs:element name="e" type="a"/>"#,
+                "defined in terms of itself",
+            ),
+            (
+                r#"<xs:element name="a" type="missing"/>"#,
+                "unknown type 'missing'",
+            ),
+            (
+                r#"<xs:complexType name="c"/><xs:simpleType name="t"><xs:restriction base="c"/></xs:simpleType><xs:element name="a" type="t"/>"#,
+                "is a complex type",
+            ),
+            (
+                r#"<xs:complexType name="c"/><xs:complexType name="c"/><xs:element name="a" type="c"/>"#,
+                "declared twice",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:string"/><xs:element name="a" type="xs:string"/>"#,
+                "declared twice",
+            ),
+            (r#"<xs:complexType name="c"/>"#, "no global element"),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element name="b" type="xs:string"/><xs:element name="b" type="xs:int"/></xs:sequence></xs:complexType></xs:element>"#,
+                "more than once",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element name="b" type="xs:string" minOccurs="3" maxOccurs="2"/></xs:sequence></xs:complexType></xs:element>"#,
+                "greater than maxOccurs",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element name="b" type="xs:string" maxOccurs="-1"/></xs:sequence></xs:complexType></xs:element>"#,
+                "not a non-negative integer",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element name="b" type="xs:string" maxOccurs="100001"/></xs:sequence></xs:complexType></xs:element>"#,
+                "exceeds the limit",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:choice/></xs:complexType></xs:element>"#,
+                "at least one particle",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:all><xs:element name="b" type="xs:string" maxOccurs="2"/></xs:all></xs:complexType></xs:element>"#,
+                "at most once",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:all/></xs:sequence></xs:complexType></xs:element>"#,
+                "cannot be nested",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:attribute name="x"/><xs:sequence/></xs:complexType></xs:element>"#,
+                "before its attributes",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:attribute name="x"/><xs:attribute name="x"/></xs:complexType></xs:element>"#,
+                "declared twice",
+            ),
+            (
+                r#"<xs:element name="bad name" type="xs:string"/>"#,
+                "not a valid name",
+            ),
+            (
+                r#"<xs:element name="a" type="xs:string" form="qualified"/>"#,
+                "attribute 'form'",
+            ),
+            (
+                r#"<xs:element name="a" minOccurs="0" type="xs:string"/>"#,
+                "must not carry",
+            ),
+            (
+                r#"<xs:element name="a" type="other:t"/>"#,
+                "namespace prefix that is not declared",
+            ),
+            (r#"<foo:bar/>"#, "not declared on xs:schema"),
+            (
+                r#"<xs:element name="a" type="xs:string"><xs:unique name="u"/></xs:element>"#,
+                "identity constraints",
+            ),
+        ];
+        for (body, needle) in cases {
+            let msg = rejected(body);
+            assert!(msg.contains(needle), "{body}: {msg}");
+        }
+    }
+
+    #[test]
+    fn compile_rejects_malformed_documents() {
+        for (text, needle) in [
+            ("not xml at all", "root element"),
+            ("", "no root element"),
+            ("<a/>", "must be xs:schema"),
+            (
+                &format!(
+                    r#"<xs:schema xmlns:xs="{XSD_NS}" version="1" bogus="x"><xs:element name="a" type="xs:string"/></xs:schema>"#
+                ),
+                "attribute 'bogus'",
+            ),
+            (
+                &format!(r#"<!DOCTYPE s><xs:schema xmlns:xs="{XSD_NS}"/>"#),
+                "DOCTYPE",
+            ),
+            (
+                &format!(
+                    r#"<xs:schema xmlns:xs="{XSD_NS}"><xs:element xmlns:y="urn:y" name="a" type="xs:string"/></xs:schema>"#
+                ),
+                "only supported on xs:schema",
+            ),
+            (
+                &format!(
+                    r#"<xs:schema xmlns:xs="{XSD_NS}"><xs:element name="a" type="xs:string">text</xs:element></xs:schema>"#
+                ),
+                "must not contain text",
+            ),
+            (
+                &format!(r#"<xs:schema xmlns:xs="{XSD_NS}"><other/></xs:schema>"#),
+                "not in the XML Schema namespace",
+            ),
+            (
+                &format!(
+                    r#"<xs:schema xmlns="urn:other" xmlns:xs="{XSD_NS}"><element name="a"/></xs:schema>"#
+                ),
+                "not in the XML Schema namespace",
+            ),
+            (
+                &format!(
+                    r#"<xs:schema xmlns:xs="{XSD_NS}"><xs:element name="a" type="xs:string"></xs:schema>"#
+                ),
+                "not well-formed",
+            ),
+        ] {
+            let err = XSD_OPS.compile(text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.contains(needle)),
+                "{text}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_accepts_prefix_free_xsd_namespace_and_other_prefixes() {
+        for text in [
+            format!(r#"<schema xmlns="{XSD_NS}"><element name="a" type="string"/></schema>"#),
+            format!(
+                r#"<xsd:schema xmlns:xsd="{XSD_NS}"><xsd:element name="a" type="xsd:int"/></xsd:schema>"#
+            ),
+        ] {
+            assert!(XSD_OPS.compile(&text).is_ok(), "{text}");
+        }
+    }
+
+    // ---- compile: limits ----------------------------------------------------
+
+    #[test]
+    fn compile_enforces_size_depth_and_expansion_limits() {
+        let huge = format!(
+            "{}<!-- {} -->{}",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">"#,
+            "x".repeat(MAX_SCHEMA_TEXT_BYTES),
+            "</xs:schema>"
+        );
+        assert!(
+            matches!(XSD_OPS.compile(&huge), Err(SchemaError::Invalid(m)) if m.contains("byte limit"))
+        );
+
+        let mut nested = String::new();
+        for _ in 0..MAX_SCHEMA_DEPTH + 2 {
+            nested.push_str("<xs:complexType><xs:sequence><xs:element name=\"e\">");
+        }
+        assert!(rejected(&nested).contains("nested deeper"));
+
+        let many = "<xs:key/>".repeat(MAX_SCHEMA_NODES + 1);
+        assert!(rejected(&many).contains("more than"));
+
+        // 200 children x 100000 occurrences expand far past the state budget.
+        let blowup: String = (0..200)
+            .map(|i| {
+                format!(
+                    r#"<xs:element name="c{i}" type="xs:string" minOccurs="0" maxOccurs="100000"/>"#
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"<xs:element name="a"><xs:complexType><xs:sequence>{blowup}</xs:sequence></xs:complexType></xs:element>"#
+        );
+        assert!(rejected(&body).contains("too large"));
+
+        // Nested counted groups multiply.
+        let body = r#"<xs:element name="a"><xs:complexType><xs:sequence minOccurs="1000" maxOccurs="1000"><xs:sequence minOccurs="1000" maxOccurs="1000"><xs:element name="b" type="xs:string"/></xs:sequence></xs:sequence></xs:complexType></xs:element>"#;
+        assert!(rejected(body).contains("too large"));
+    }
+
+    #[test]
+    fn compile_bounds_pattern_cost() {
+        let pattern_type = |p: &str| {
+            format!(
+                r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:pattern value="{p}"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#
+            )
+        };
+        // Compiled-program size blow-up is refused by the regex size limit.
+        let msg = rejected(&pattern_type("((a{1000}){1000}){1000}"));
+        assert!(msg.contains("not a valid or supported"), "{msg}");
+        let msg = rejected(&pattern_type(&"a".repeat(MAX_PATTERN_CHARS + 1)));
+        assert!(msg.contains("exceeds"), "{msg}");
+        let many: String = (0..=MAX_PATTERNS)
+            .map(|i| format!(r#"<xs:simpleType name="t{i}"><xs:restriction base="xs:string"><xs:pattern value="a"/></xs:restriction></xs:simpleType>"#))
+            .collect();
+        assert!(
+            rejected(&format!(r#"{many}<xs:element name="a" type="t0"/>"#)).contains("more than")
+        );
+    }
+
+    // ---- pattern dialect ----------------------------------------------------
+
+    fn matches_pattern(pattern: &str, value: &str) -> bool {
+        build_pattern(pattern).expect(pattern).is_match(value)
+    }
+
+    #[test]
+    fn patterns_are_anchored_and_use_xsd_semantics() {
+        assert!(matches_pattern("[a-c]+", "abc"));
+        assert!(
+            !matches_pattern("[a-c]+", "abcd"),
+            "implicitly anchored at the end"
+        );
+        assert!(
+            !matches_pattern("[a-c]+", "xabc"),
+            "implicitly anchored at the start"
+        );
+        // ^ and $ are ordinary characters in XSD.
+        assert!(matches_pattern("^a$", "^a$"));
+        assert!(!matches_pattern("^a$", "a"));
+        assert!(matches_pattern("a|b", "b"));
+        assert!(
+            !matches_pattern("a|b", "ab"),
+            "alternation stays inside the anchors"
+        );
+        // '.' excludes line breaks.
+        assert!(matches_pattern("a.c", "abc"));
+        assert!(!matches_pattern("a.c", "a\nc"));
+        assert!(!matches_pattern("a.c", "a\rc"));
+        assert!(matches_pattern(r"\d{3}", "123"));
+        assert!(matches_pattern(r"a\sb", "a b"));
+        assert!(matches_pattern(r"\p{Lu}\p{L}*", "Ábc"));
+        assert!(matches_pattern("[^a-c]", "d"));
+        assert!(matches_pattern(r"[a\-z]", "-"));
+        assert!(matches_pattern("[&~]", "&"));
+        assert!(matches_pattern(r"(ab){2,3}", "ababab"));
+    }
+
+    #[test]
+    fn patterns_reject_constructs_that_differ_from_xsd() {
+        for (pattern, needle) in [
+            (r"\w+", "not supported"),
+            (r"\i", "not supported"),
+            (r"\c", "not supported"),
+            (r"\b", "not supported"),
+            (r"(?i)a", "'(?'"),
+            (r"a*?", "another quantifier"),
+            (r"a+*", "another quantifier"),
+            (r"[a-z-[aeiou]]", "subtraction"),
+            (r"[[]", "must be escaped"),
+            (r"\p{IsBasicLatin}", "Unicode blocks"),
+            (r"\p{L", "unterminated"),
+            (r"[abc", "unterminated"),
+            (r"a\", "lone backslash"),
+            (r"[a--b]", "'--'"),
+            (r"(a", "valid or supported"),
+        ] {
+            let err = build_pattern(pattern).unwrap_err();
+            assert!(err.contains(needle), "{pattern}: {err}");
+        }
+    }
+
+    // ---- lexical types ------------------------------------------------------
+
+    #[test]
+    fn builtin_lexical_forms() {
+        let ok = |b: Builtin, v: &str| valid_lexical(b, v);
+        for v in ["0", "-1", "+7", "007", "2147483647", "-2147483648"] {
+            assert!(ok(Builtin::Int, v), "{v}");
+        }
+        for v in [
+            "2147483648",
+            "-2147483649",
+            "",
+            "1.0",
+            "1e3",
+            "abc",
+            "--1",
+            "99999999999999",
+        ] {
+            assert!(!ok(Builtin::Int, v), "{v}");
+        }
+        assert!(ok(Builtin::Integer, "123456789012345678901234567890"));
+        assert!(!ok(Builtin::Integer, "1.5"));
+        for v in ["1", "-1.5", ".5", "5.", "+0.0", "000.100"] {
+            assert!(ok(Builtin::Decimal, v), "{v}");
+        }
+        for v in [".", "", "1e5", "1,5", "NaN", "- 1"] {
+            assert!(!ok(Builtin::Decimal, v), "{v}");
+        }
+        for v in ["true", "false", "1", "0"] {
+            assert!(ok(Builtin::Boolean, v));
+        }
+        for v in ["TRUE", "yes", "", "2"] {
+            assert!(!ok(Builtin::Boolean, v));
+        }
+        for v in [
+            "2026-09-02",
+            "2024-02-29",
+            "2026-09-02Z",
+            "2026-09-02+01:00",
+            "2026-09-02-05:30",
+            "10000-01-01",
+        ] {
+            assert!(ok(Builtin::Date, v), "{v}");
+        }
+        for v in [
+            "0000-01-01",
+            "2026-13-01",
+            "2026-02-30",
+            "2025-02-29",
+            "26-09-02",
+            "2026-9-2",
+            "2026-09-02+25:00",
+            "2026-09-02+14:30",
+            "2026-09-02T00:00:00",
+            "",
+        ] {
+            assert!(!ok(Builtin::Date, v), "{v}");
+        }
+        for v in [
+            "2026-09-02T08:30:00",
+            "2026-09-02T08:30:00Z",
+            "2026-09-02T08:30:00.123+02:00",
+            "2026-09-02T23:59:59",
+        ] {
+            assert!(ok(Builtin::DateTime, v), "{v}");
+        }
+        for v in [
+            "2026-09-02",
+            "2026-09-02T24:00:00",
+            "2026-09-02T08:60:00",
+            "2026-09-02T08:30:60",
+            "2026-09-02T08:30",
+            "2026-09-02 08:30:00",
+            "2026-09-02T08:30:00.",
+            "2026-09-02T8:30:00",
+        ] {
+            assert!(!ok(Builtin::DateTime, v), "{v}");
+        }
+    }
+
+    #[test]
+    fn whitespace_is_collapsed_for_non_strings_and_preserved_for_strings() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="n" type="xs:int"/>
+                 <xs:element name="t"><xs:simpleType><xs:restriction base="xs:string"><xs:maxLength value="3"/></xs:restriction></xs:simpleType></xs:element>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><n>\n  42 \t</n><t>abc</t></r>"));
+        assert!(violation_of(&s, "<r><n>42</n><t>ab  </t></r>").contains("longer than maxLength"));
+        assert!(accepts(&s, "<r><n>42</n><t>ab</t></r>"));
+        // Length counts characters, not bytes.
+        assert!(!accepts(&s, "<r><n>1</n><t>żółć</t></r>"));
+        assert!(accepts(&s, "<r><n>1</n><t>żół</t></r>"));
+    }
+
+    #[test]
+    fn enumerations_compare_canonical_values() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="n"><xs:simpleType><xs:restriction base="xs:integer"><xs:enumeration value="1"/><xs:enumeration value="-2"/></xs:restriction></xs:simpleType></xs:element>
+                 <xs:element name="d"><xs:simpleType><xs:restriction base="xs:decimal"><xs:enumeration value="1.5"/></xs:restriction></xs:simpleType></xs:element>
+                 <xs:element name="b"><xs:simpleType><xs:restriction base="xs:boolean"><xs:enumeration value="true"/></xs:restriction></xs:simpleType></xs:element>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><n>+001</n><d>01.500</d><b>1</b></r>"));
+        assert!(accepts(&s, "<r><n>-0002</n><d>1.5</d><b>true</b></r>"));
+        assert!(!accepts(&s, "<r><n>2</n><d>1.5</d><b>true</b></r>"));
+        assert!(!accepts(&s, "<r><n>1</n><d>1.6</d><b>true</b></r>"));
+        assert!(!accepts(&s, "<r><n>1</n><d>1.5</d><b>false</b></r>"));
+    }
+
+    #[test]
+    fn stacked_restrictions_all_apply() {
+        let s = schema(
+            r#"<xs:simpleType name="base"><xs:restriction base="xs:string"><xs:maxLength value="5"/></xs:restriction></xs:simpleType>
+               <xs:simpleType name="derived"><xs:restriction base="base"><xs:pattern value="[a-z]+"/></xs:restriction></xs:simpleType>
+               <xs:element name="r" type="derived"/>"#,
+        );
+        assert!(accepts(&s, "<r>abc</r>"));
+        assert!(violation_of(&s, "<r>abcdef</r>").contains("longer than maxLength"));
+        assert!(violation_of(&s, "<r>AB</r>").contains("does not match the pattern"));
+        // Alternatives inside one restriction.
+        let s = schema(
+            r#"<xs:element name="r"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="a+"/><xs:pattern value="b+"/></xs:restriction></xs:simpleType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r>aaa</r>") && accepts(&s, "<r>bb</r>") && !accepts(&s, "<r>ab</r>"));
+    }
+
+    // ---- content models -----------------------------------------------------
+
+    #[test]
+    fn occurrence_bounds_choice_and_nesting() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:string" minOccurs="2" maxOccurs="3"/>
+                 <xs:choice minOccurs="0" maxOccurs="2">
+                   <xs:element name="b" type="xs:string"/>
+                   <xs:sequence><xs:element name="c" type="xs:string"/><xs:element name="d" type="xs:string"/></xs:sequence>
+                 </xs:choice>
+                 <xs:element name="e" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><a/><a/></r>"));
+        assert!(accepts(&s, "<r><a/><a/><a/><b/><c/><d/><e/><e/><e/></r>"));
+        assert!(!accepts(&s, "<r><a/></r>"), "minOccurs 2");
+        assert!(!accepts(&s, "<r><a/><a/><a/><a/></r>"), "maxOccurs 3");
+        assert!(
+            !accepts(&s, "<r><a/><a/><b/><b/><b/></r>"),
+            "choice repeats at most twice"
+        );
+        assert!(!accepts(&s, "<r><a/><a/><c/></r>"), "c needs d");
+        assert!(accepts(&s, "<r><a/><a/><c/><d/><b/></r>"));
+        assert!(
+            !accepts(&s, "<r><a/><a/><e/><b/></r>"),
+            "e closes the choice"
+        );
+        assert!(accepts(&s, "<r><a/><a/><e/><e/></r>"));
+    }
+
+    #[test]
+    fn maxoccurs_zero_prohibits_and_empty_content_rejects_children() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="gone" type="xs:string" minOccurs="0" maxOccurs="0"/>
+                 <xs:element name="kept" type="xs:string"/>
+               </xs:sequence></xs:complexType></xs:element>
+               <xs:element name="empty"><xs:complexType/></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><kept/></r>"));
+        assert!(!accepts(&s, "<r><gone/><kept/></r>"));
+        assert!(accepts(&s, "<empty/>") && accepts(&s, "<empty>  </empty>"));
+        assert!(!accepts(&s, "<empty><x/></empty>"));
+        assert!(!accepts(&s, "<empty>text</empty>"));
+    }
+
+    #[test]
+    fn all_group_allows_any_order_once_each() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:all>
+                 <xs:element name="a" type="xs:string"/>
+                 <xs:element name="b" type="xs:string"/>
+                 <xs:element name="c" type="xs:string" minOccurs="0"/>
+               </xs:all></xs:complexType></xs:element>
+               <xs:element name="opt"><xs:complexType><xs:all minOccurs="0">
+                 <xs:element name="a" type="xs:string"/>
+               </xs:all></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><b/><a/></r>"));
+        assert!(accepts(&s, "<r><c/><b/><a/></r>"));
+        assert!(violation_of(&s, "<r><a/></r>").contains("required child element 'b' is missing"));
+        assert!(violation_of(&s, "<r><a/><a/><b/></r>").contains("more than once"));
+        assert!(violation_of(&s, "<r><a/><z/><b/></r>").contains("not allowed here"));
+        assert!(violation_of(&s, "<r/>").contains("required child elements are missing"));
+        assert!(accepts(&s, "<opt/>"));
+        assert!(violation_of(&s, "<opt><a/><a/></opt>").contains("more than once"));
+    }
+
+    #[test]
+    fn recursive_types_validate_to_the_document_depth() {
+        let s = schema(
+            r#"<xs:complexType name="node"><xs:sequence>
+                 <xs:element name="label" type="xs:string"/>
+                 <xs:element name="child" type="node" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType>
+               <xs:element name="tree" type="node"/>"#,
+        );
+        assert!(accepts(&s, "<tree><label>a</label><child><label>b</label><child><label>c</label></child></child></tree>"));
+        assert!(!accepts(
+            &s,
+            "<tree><label>a</label><child><child/></child></tree>"
+        ));
+        // Depth is bounded rather than recursing without limit.
+        let deep = format!(
+            "<tree>{}</tree>",
+            "<label>x</label><child>".repeat(MAX_DOC_DEPTH) + &"</child>".repeat(MAX_DOC_DEPTH)
+        );
+        assert!(violation_of(&s, &deep).contains("nested too deeply"));
+    }
+
+    #[test]
+    fn hostile_documents_fail_closed_within_the_work_budget() {
+        // 100k alternatives of a wide choice would be quadratic without a budget.
+        let alternatives: String = (0..2000)
+            .map(|i| format!(r#"<xs:element name="c{i}" type="xs:string"/>"#))
+            .collect();
+        let s = schema(&format!(
+            r#"<xs:element name="r"><xs:complexType><xs:choice minOccurs="0" maxOccurs="unbounded">{alternatives}</xs:choice></xs:complexType></xs:element>"#
+        ));
+        let body: String = (0..2000).map(|i| format!("<c{i}/>")).collect();
+        assert!(accepts(&s, &format!("<r>{body}</r>")));
+        let big = format!("<r>{}</r>", "<c1999/>".repeat(30_000));
+        let got = XSD_OPS.validate(&compiled(&s), big.as_bytes());
+        assert!(
+            matches!(&got, Err(SchemaError::Violation(m)) if m.contains("work budget")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn character_data_entities_and_cdata() {
+        let s = schema(r#"<xs:element name="r" type="xs:string"/>"#);
+        assert!(accepts(&s, "<r>a &amp; b &lt; &#65; &#x42;</r>"));
+        assert!(accepts(&s, "<r><![CDATA[<raw>]]></r>"));
+        assert!(violation_of(&s, "<r>&nope;</r>").contains("not supported"));
+        assert!(violation_of(&s, "<r>x</r>junk").contains("outside the root"));
+        assert!(accepts(
+            &s,
+            "<?xml version=\"1.0\"?>\n<!-- c -->\n<r/>\n<!-- end -->\n"
+        ));
+        assert!(violation_of(&s, "").contains("no root element"));
+        assert!(
+            violation_of(&s, "<r>").contains("open element")
+                || violation_of(&s, "<r>").contains("not well-formed")
+        );
+        let invalid_utf8 = b"<r>\xff</r>";
+        assert!(matches!(
+            XSD_OPS.validate(&compiled(&s), invalid_utf8),
+            Err(SchemaError::Violation(_))
+        ));
+    }
+
+    #[test]
+    fn simple_content_requires_attributes_and_checks_text() {
+        let s = schema(
+            r#"<xs:element name="price"><xs:complexType><xs:simpleContent><xs:extension base="xs:decimal">
+                 <xs:attribute name="currency" use="required"><xs:simpleType><xs:restriction base="xs:string"><xs:enumeration value="EUR"/><xs:enumeration value="PLN"/></xs:restriction></xs:simpleType></xs:attribute>
+                 <xs:attribute name="note"/>
+               </xs:extension></xs:simpleContent></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(
+            &s,
+            r#"<price currency="EUR" note="anything">12.50</price>"#
+        ));
+        assert!(violation_of(&s, r#"<price currency="USD">1</price>"#).contains("enumerated"));
+        assert!(violation_of(&s, "<price>1</price>").contains("required attribute 'currency'"));
+        assert!(violation_of(&s, r#"<price currency="EUR">abc</price>"#).contains("xs:decimal"));
+        assert!(violation_of(&s, r#"<price currency="EUR"><x/></price>"#).contains("not allowed"));
+    }
+
+    #[test]
+    fn a_simple_typed_element_takes_no_attributes() {
+        let s = schema(r#"<xs:element name="r" type="xs:int"/>"#);
+        assert!(accepts(&s, "<r xmlns=\"urn:x\" xmlns:p=\"urn:p\">1</r>"));
+        assert!(violation_of(&s, r#"<r a="1">1</r>"#).contains("attribute 'a' is not declared"));
+    }
+
+    #[test]
+    fn multiple_global_elements_are_all_valid_roots() {
+        let s = schema(
+            r#"<xs:element name="a" type="xs:int"/><xs:element name="b" type="xs:boolean"/>"#,
+        );
+        assert!(accepts(&s, "<a>1</a>") && accepts(&s, "<b>true</b>"));
+        assert!(!accepts(&s, "<a>true</a>") && !accepts(&s, "<c/>"));
+    }
+
+    // ---- derive_subschema ---------------------------------------------------
+
+    #[test]
+    fn derive_matches_golden_and_is_stable() {
+        let source = fixtures::read("xsd", "patient.xsd");
+        let allowed = set(&["mrn", "birthDate", "phone", "visit"]);
+        let derived = XSD_OPS.derive_subschema(&source, &allowed).unwrap();
+        assert_eq!(derived, fixtures::read("xsd", "patient.derived.xsd"));
+        // Same inputs, same bytes; the derived schema is registrable and a
+        // fixed point of the same projection.
+        assert_eq!(
+            derived,
+            XSD_OPS.derive_subschema(&source, &allowed).unwrap()
+        );
+        assert!(XSD_OPS.compile(&derived).is_ok());
+        assert_eq!(
+            derived,
+            XSD_OPS.derive_subschema(&derived, &allowed).unwrap()
+        );
+    }
+
+    #[test]
+    fn documents_projected_by_the_xml_field_policy_validate_against_the_derived_schema() {
+        let source = fixtures::read("xsd", "patient.xsd");
+        let original = compiled(&source);
+        let doc = fixtures::cases("xsd", "xml")
+            .into_iter()
+            .find(|c| c.name == "valid-full")
+            .unwrap()
+            .payload;
+        for allowed in [
+            set(&["mrn", "birthDate", "phone", "visit"]),
+            set(&["mrn", "name", "birthDate"]),
+            set(&["email"]),
+            set(&[]),
+            set(&["mrn", "name", "birthDate", "sex", "phone", "email", "visit"]),
+        ] {
+            let derived = XSD_OPS.derive_subschema(&source, &allowed).unwrap();
+            let projected = PayloadFormat::Xml.codec().project(&doc, &allowed).unwrap();
+            let got = XSD_OPS.validate(&compiled(&derived), &projected);
+            assert!(
+                got.is_ok(),
+                "{allowed:?}: {got:?}\n{}",
+                String::from_utf8_lossy(&projected)
+            );
+            if !["mrn", "name", "birthDate"]
+                .iter()
+                .all(|f| allowed.contains(*f))
+            {
+                // The unprojected schema does reject what the policy removed.
+                assert!(
+                    XSD_OPS.validate(&original, &projected).is_err(),
+                    "{allowed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn derive_makes_a_choice_optional_when_an_alternative_disappears() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:choice>
+                 <xs:element name="a" type="xs:string"/>
+                 <xs:element name="b" type="xs:string"/>
+               </xs:choice></xs:complexType></xs:element>"#,
+        );
+        let derived = XSD_OPS.derive_subschema(&s, &set(&["a"])).unwrap();
+        let c = compiled(&derived);
+        assert!(XSD_OPS.validate(&c, b"<r><a/></r>").is_ok());
+        // A document that picked `b` projects to an empty root.
+        assert!(XSD_OPS.validate(&c, b"<r/>").is_ok());
+        assert!(XSD_OPS.validate(&c, b"<r><b/></r>").is_err());
+        // With both alternatives allowed the choice stays required.
+        let full = XSD_OPS.derive_subschema(&s, &set(&["a", "b"])).unwrap();
+        assert!(XSD_OPS.validate(&compiled(&full), b"<r/>").is_err());
+    }
+
+    #[test]
+    fn derive_keeps_other_uses_of_a_named_type_and_prunes_hidden_declarations() {
+        let s = schema(
+            r#"<xs:simpleType name="Secret"><xs:restriction base="xs:string"><xs:pattern value="[0-9]{11}"/></xs:restriction></xs:simpleType>
+               <xs:complexType name="Box"><xs:sequence>
+                 <xs:element name="ssn" type="Secret"/>
+                 <xs:element name="ok" type="xs:string"/>
+                 <xs:element name="inner" type="Box" minOccurs="0"/>
+               </xs:sequence></xs:complexType>
+               <xs:element name="root" type="Box"/>"#,
+        );
+        let derived = XSD_OPS
+            .derive_subschema(&s, &set(&["ok", "inner"]))
+            .unwrap();
+        // The root lost `ssn`, nested boxes (the named type) still need it ...
+        let c = compiled(&derived);
+        assert!(XSD_OPS.validate(&c, b"<root><ok/></root>").is_ok());
+        assert!(XSD_OPS
+            .validate(
+                &c,
+                b"<root><ok/><inner><ssn>12345678901</ssn><ok/></inner></root>"
+            )
+            .is_ok());
+        assert!(XSD_OPS
+            .validate(&c, b"<root><ssn>12345678901</ssn><ok/></root>")
+            .is_err());
+        // ... but when nothing reaches the type any more, it is dropped, and
+        // with it the pattern that only described the hidden field.
+        let derived = XSD_OPS.derive_subschema(&s, &set(&["ok"])).unwrap();
+        assert!(
+            !derived.contains("Secret") && !derived.contains("[0-9]{11}"),
+            "{derived}"
+        );
+        assert!(!derived.contains("Box"), "{derived}");
+    }
+
+    #[test]
+    fn derive_accepts_a_prefixed_policy_entry_for_a_declared_local_name() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:string"/><xs:element name="b" type="xs:string"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        );
+        let derived = XSD_OPS.derive_subschema(&s, &set(&["p:a"])).unwrap();
+        assert!(XSD_OPS
+            .validate(&compiled(&derived), b"<r><a/></r>")
+            .is_ok());
+        assert!(XSD_OPS
+            .validate(&compiled(&derived), b"<r><b/></r>")
+            .is_err());
+    }
+
+    #[test]
+    fn derive_preserves_root_attributes_and_description_and_round_trips_text() {
+        let source = fixtures::read("xsd", "patient.xsd");
+        let derived = XSD_OPS.derive_subschema(&source, &set(&["mrn"])).unwrap();
+        assert!(derived.contains("Patient registration message used by the admissions desk."));
+        assert!(derived.contains(r#"<xs:attribute name="active" type="xs:boolean"/>"#));
+        // parse(render(doc)) is the identity, including escaping.
+        let doc = parse_doc(&source).unwrap();
+        assert_eq!(parse_doc(&render(&doc)).unwrap(), doc);
+        let tricky = schema(
+            r#"<xs:annotation><xs:documentation>a &lt; b &amp; "c"</xs:documentation></xs:annotation>
+               <xs:element name="r"><xs:simpleType><xs:restriction base="xs:string">
+                 <xs:enumeration value="a&amp;b"/><xs:enumeration value="x&#9;y"/><xs:enumeration value="&lt;&gt;&quot;"/>
+               </xs:restriction></xs:simpleType></xs:element>"#,
+        );
+        let doc = parse_doc(&tricky).unwrap();
+        assert_eq!(parse_doc(&render(&doc)).unwrap(), doc);
+    }
+
+    // ---- check_compatibility --------------------------------------------------
+
+    fn element_with(content: &str) -> String {
+        schema(&format!(
+            r#"<xs:element name="r"><xs:complexType>{content}</xs:complexType></xs:element>"#
+        ))
+    }
+
+    fn seq(items: &str) -> String {
+        element_with(&format!("<xs:sequence>{items}</xs:sequence>"))
+    }
+
+    fn el(name: &str, ty: &str, occurs: &str) -> String {
+        format!(r#"<xs:element name="{name}" type="{ty}" {occurs}/>"#)
+    }
+
+    fn restricted(base: &str, facets: &str) -> String {
+        schema(&format!(
+            r#"<xs:element name="r"><xs:simpleType><xs:restriction base="{base}">{facets}</xs:restriction></xs:simpleType></xs:element>"#
+        ))
+    }
+
+    #[test]
+    fn compatibility_matrix() {
+        let a = el("a", "xs:string", "");
+        let b = el("b", "xs:string", "");
+        let b_opt = el("b", "xs:string", r#"minOccurs="0""#);
+        // (label, old, new, backward ok, forward ok)
+        let cases: Vec<(&str, String, String, bool, bool)> = vec![
+            ("identical", seq(&a), seq(&a), true, true),
+            (
+                "optional element added",
+                seq(&a),
+                seq(&format!("{a}{b_opt}")),
+                true,
+                false,
+            ),
+            (
+                "required element added",
+                seq(&a),
+                seq(&format!("{a}{b}")),
+                false,
+                false,
+            ),
+            (
+                "optional element removed",
+                seq(&format!("{a}{b_opt}")),
+                seq(&a),
+                false,
+                true,
+            ),
+            (
+                "required element removed",
+                seq(&format!("{a}{b}")),
+                seq(&a),
+                false,
+                false,
+            ),
+            (
+                "sequence reordered",
+                seq(&format!("{a}{b}")),
+                seq(&format!("{b}{a}")),
+                false,
+                false,
+            ),
+            (
+                "maxOccurs widened",
+                seq(&el("a", "xs:string", "")),
+                seq(&el("a", "xs:string", r#"maxOccurs="unbounded""#)),
+                true,
+                false,
+            ),
+            (
+                "minOccurs raised",
+                seq(&el("a", "xs:string", r#"minOccurs="0""#)),
+                seq(&el("a", "xs:string", "")),
+                false,
+                true,
+            ),
+            (
+                "count range shifted",
+                seq(&el("a", "xs:string", r#"minOccurs="1" maxOccurs="3""#)),
+                seq(&el("a", "xs:string", r#"minOccurs="2" maxOccurs="4""#)),
+                false,
+                false,
+            ),
+            (
+                "int widened to decimal",
+                seq(&el("a", "xs:int", "")),
+                seq(&el("a", "xs:decimal", "")),
+                true,
+                false,
+            ),
+            (
+                "integer widened to string",
+                seq(&el("a", "xs:integer", "")),
+                seq(&el("a", "xs:string", "")),
+                true,
+                false,
+            ),
+            (
+                "string narrowed to date",
+                seq(&el("a", "xs:string", "")),
+                seq(&el("a", "xs:date", "")),
+                false,
+                true,
+            ),
+            (
+                "unrelated types",
+                seq(&el("a", "xs:date", "")),
+                seq(&el("a", "xs:dateTime", "")),
+                false,
+                false,
+            ),
+            (
+                "choice alternative added",
+                element_with(&format!("<xs:choice>{a}</xs:choice>")),
+                element_with(&format!("<xs:choice>{a}{b}</xs:choice>")),
+                true,
+                false,
+            ),
+            (
+                "sequence to choice",
+                seq(&format!("{a}{b_opt}")),
+                element_with(&format!("<xs:choice minOccurs=\"0\">{a}{b}</xs:choice>")),
+                false,
+                false,
+            ),
+            (
+                "root added",
+                schema(&el("r", "xs:string", "")),
+                schema(&format!(
+                    "{}{}",
+                    el("r", "xs:string", ""),
+                    el("s", "xs:string", "")
+                )),
+                true,
+                false,
+            ),
+            (
+                "root renamed",
+                schema(&el("r", "xs:string", "")),
+                schema(&el("q", "xs:string", "")),
+                false,
+                false,
+            ),
+            (
+                "simple to complex",
+                schema(&el("r", "xs:string", "")),
+                seq(&a),
+                false,
+                false,
+            ),
+            (
+                "empty to optional children",
+                element_with(""),
+                seq(&b_opt),
+                true,
+                false,
+            ),
+            (
+                "empty to required children",
+                element_with(""),
+                seq(&b),
+                false,
+                false,
+            ),
+            (
+                "all required relaxed",
+                element_with(&format!("<xs:all>{a}{b}</xs:all>")),
+                element_with(&format!("<xs:all>{a}{b_opt}</xs:all>")),
+                true,
+                false,
+            ),
+            (
+                "all to sequence",
+                element_with(&format!("<xs:all>{a}{b}</xs:all>")),
+                seq(&format!("{a}{b}")),
+                false,
+                false,
+            ),
+        ];
+        for (label, old, new, backward, forward) in &cases {
+            for (mode, expected) in [
+                (Compatibility::Backward, *backward),
+                (Compatibility::Forward, *forward),
+                (Compatibility::Full, *backward && *forward),
+            ] {
+                let got = XSD_OPS.check_compatibility(old, new, mode);
+                assert_eq!(got.is_ok(), expected, "{label} under {mode:?}: {got:?}");
+                if let Err(e) = got {
+                    assert!(matches!(e, SchemaError::Incompatible(_)), "{label}: {e:?}");
+                }
+            }
+            assert!(XSD_OPS
+                .check_compatibility(old, new, Compatibility::None)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn compatibility_of_simple_type_restrictions() {
+        let string = "xs:string";
+        let enum_of = |vals: &[&str]| {
+            vals.iter()
+                .map(|v| format!(r#"<xs:enumeration value="{v}"/>"#))
+                .collect::<String>()
+        };
+        let max_len = |n: u32| format!(r#"<xs:maxLength value="{n}"/>"#);
+        let min_len = |n: u32| format!(r#"<xs:minLength value="{n}"/>"#);
+        let pattern = |p: &str| format!(r#"<xs:pattern value="{p}"/>"#);
+        // (label, old, new, backward ok, forward ok)
+        let cases: Vec<(&str, String, String, bool, bool)> = vec![
+            (
+                "maxLength widened",
+                restricted(string, &max_len(10)),
+                restricted(string, &max_len(20)),
+                true,
+                false,
+            ),
+            (
+                "maxLength removed",
+                restricted(string, &max_len(10)),
+                restricted(string, ""),
+                true,
+                false,
+            ),
+            (
+                "maxLength added",
+                restricted(string, ""),
+                restricted(string, &max_len(10)),
+                false,
+                true,
+            ),
+            (
+                "minLength raised",
+                restricted(string, &min_len(1)),
+                restricted(string, &min_len(2)),
+                false,
+                true,
+            ),
+            (
+                "enumeration value added",
+                restricted(string, &enum_of(&["a", "b"])),
+                restricted(string, &enum_of(&["a", "b", "c"])),
+                true,
+                false,
+            ),
+            (
+                "enumeration value removed",
+                restricted(string, &enum_of(&["a", "b", "c"])),
+                restricted(string, &enum_of(&["a", "b"])),
+                false,
+                true,
+            ),
+            (
+                "enumeration dropped",
+                restricted(string, &enum_of(&["a"])),
+                restricted(string, ""),
+                true,
+                false,
+            ),
+            (
+                "enumeration reordered",
+                restricted(string, &enum_of(&["a", "b"])),
+                restricted(string, &enum_of(&["b", "a"])),
+                true,
+                true,
+            ),
+            (
+                "pattern identical",
+                restricted(string, &pattern("[a-z]+")),
+                restricted(string, &pattern("[a-z]+")),
+                true,
+                true,
+            ),
+            (
+                "pattern changed (unprovable)",
+                restricted(string, &pattern("[a-z]+")),
+                restricted(string, &pattern("[a-z]*")),
+                false,
+                false,
+            ),
+            (
+                "pattern dropped",
+                restricted(string, &pattern("[a-z]+")),
+                restricted(string, ""),
+                true,
+                false,
+            ),
+            (
+                "enumeration satisfies the pattern",
+                restricted(string, &pattern("[a-z]+")),
+                restricted(string, &enum_of(&["abc", "de"])),
+                false,
+                true,
+            ),
+            (
+                "int enumeration inside decimal range",
+                restricted("xs:decimal", &enum_of(&["1", "2"])),
+                restricted("xs:int", &enum_of(&["1"])),
+                false,
+                true,
+            ),
+        ];
+        for (label, old, new, backward, forward) in &cases {
+            for (mode, expected) in [
+                (Compatibility::Backward, *backward),
+                (Compatibility::Forward, *forward),
+            ] {
+                let got = XSD_OPS.check_compatibility(old, new, mode);
+                assert_eq!(got.is_ok(), expected, "{label} under {mode:?}: {got:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_of_attributes() {
+        let with_attrs = |attrs: &str| {
+            element_with(&format!(
+                r#"<xs:sequence>{}</xs:sequence>{attrs}"#,
+                el("a", "xs:string", "")
+            ))
+        };
+        let opt = r#"<xs:attribute name="x" type="xs:string"/>"#;
+        let req = r#"<xs:attribute name="x" type="xs:string" use="required"/>"#;
+        let req_int = r#"<xs:attribute name="x" type="xs:int" use="required"/>"#;
+        let req_dec = r#"<xs:attribute name="x" type="xs:decimal" use="required"/>"#;
+        let cases = [
+            ("optional attribute added", "", opt, true, false),
+            ("required attribute added", "", req, false, false),
+            ("optional attribute removed", opt, "", false, true),
+            ("required attribute removed", req, "", false, false),
+            ("attribute became required", opt, req, false, true),
+            ("attribute became optional", req, opt, true, false),
+            ("attribute type widened", req_int, req_dec, true, false),
+        ];
+        for (label, old, new, backward, forward) in cases {
+            let (old, new) = (with_attrs(old), with_attrs(new));
+            assert_eq!(
+                XSD_OPS
+                    .check_compatibility(&old, &new, Compatibility::Backward)
+                    .is_ok(),
+                backward,
+                "{label} backward"
+            );
+            assert_eq!(
+                XSD_OPS
+                    .check_compatibility(&old, &new, Compatibility::Forward)
+                    .is_ok(),
+                forward,
+                "{label} forward"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_handles_recursive_types_and_ignores_documentation() {
+        let recursive = |doc: &str| {
+            schema(&format!(
+                r#"{doc}<xs:complexType name="node"><xs:sequence>
+                     <xs:element name="child" type="node" minOccurs="0"/>
+                   </xs:sequence></xs:complexType><xs:element name="tree" type="node"/>"#
+            ))
+        };
+        let plain = recursive("");
+        let documented = recursive(
+            "<xs:annotation><xs:documentation>changed text</xs:documentation></xs:annotation>",
+        );
+        assert!(XSD_OPS
+            .check_compatibility(&plain, &documented, Compatibility::Full)
+            .is_ok());
+        let wider = plain.replace("minOccurs=\"0\"", "minOccurs=\"0\" maxOccurs=\"2\"");
+        assert!(XSD_OPS
+            .check_compatibility(&plain, &wider, Compatibility::Backward)
+            .is_ok());
+        assert!(XSD_OPS
+            .check_compatibility(&plain, &wider, Compatibility::Forward)
+            .is_err());
+    }
+
+    #[test]
+    fn compatibility_messages_name_the_direction_and_the_path() {
+        let old = seq(&el("a", "xs:string", ""));
+        let new = seq(&format!(
+            "{}{}",
+            el("a", "xs:string", ""),
+            el("b", "xs:string", "")
+        ));
+        let Err(SchemaError::Incompatible(msg)) =
+            XSD_OPS.check_compatibility(&old, &new, Compatibility::Backward)
+        else {
+            panic!("expected Incompatible");
+        };
+        assert!(msg.starts_with("backward:") && msg.contains("/r"), "{msg}");
+        let Err(SchemaError::Incompatible(msg)) =
+            XSD_OPS.check_compatibility(&new, &old, Compatibility::Forward)
+        else {
+            panic!("expected Incompatible");
+        };
+        assert!(msg.starts_with("forward:"), "{msg}");
+    }
+
+    #[test]
+    fn compatibility_refuses_to_guess_when_the_comparison_exceeds_its_budget() {
+        let text = seq(&format!(
+            "{}{}",
+            el("a", "xs:string", ""),
+            el("b", "xs:string", r#"minOccurs="0""#)
+        ));
+        let (old, new) = (compile_text(&text).unwrap(), compile_text(&text).unwrap());
+        let mut tight = Inclusion {
+            sup: &new,
+            sub: &old,
+            sup_label: "new",
+            sub_label: "old",
+            visited: HashSet::new(),
+            pairs: 0,
+            max_pairs: 1,
+        };
+        let err = tight.roots().unwrap_err();
+        assert!(err.contains("too complex to compare"), "{err}");
+        // The same schemas are proven compatible within the real budget.
+        assert_eq!(included(&new, &old, "new", "old"), Ok(()));
+    }
+
+    // ---- misc ---------------------------------------------------------------
+
+    #[test]
+    fn validate_refuses_a_foreign_compiled_schema() {
+        let other = CompiledSchema::StoredOnly(super::super::SchemaType::Avro);
+        assert!(matches!(
+            XSD_OPS.validate(&other, b"<a/>"),
+            Err(SchemaError::Invalid(_))
+        ));
+    }
+}

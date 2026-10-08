@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
+if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.DOMParser = window.DOMParser;
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
@@ -249,15 +250,25 @@ const PROFILE = JSON.stringify({
 });
 const wynik = { ...wizyta, subject: 'wynik-badania', schemaType: 'hl7v2_profile', usedByTopics: ['wyniki-badan'] };
 
-test('an HL7 profile\'s description is its description key', () => {
+test('an XSD\'s description is its schema-level documentation, an HL7 profile\'s its description', () => {
+  const xsd = (inner) => `<?xml version="1.0"?><xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">${inner}<xs:element name="a" type="xs:string"/></xs:schema>`;
+  assert.equal(schemaDescription('xsd', xsd('<xs:annotation><xs:documentation>  Zgłoszenie pacjenta.  </xs:documentation></xs:annotation>')), 'Zgłoszenie pacjenta.');
+  assert.equal(schemaDescription('xsd', xsd('')), '');
+  assert.equal(schemaDescription('xsd', '<xs:schema'), '', 'text that is not XML has no description');
+  const nested = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a"><xs:annotation><xs:documentation>Tylko pole.</xs:documentation></xs:annotation><xs:complexType/></xs:element></xs:schema>';
+  assert.equal(schemaDescription('xsd', nested), '', 'documentation of an element is not the schema\'s');
   assert.equal(schemaDescription('hl7v2_profile', PROFILE), 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
   assert.equal(schemaDescription('hl7v2_profile', '{"required_segments":[]}'), '');
 });
 
-test('file names and editor languages of an HL7 profile', () => {
+test('file names and editor languages of an XSD and an HL7 profile', () => {
+  assert.equal(downloadName('zgloszenie', 2, 'xsd'), 'zgloszenie-v2.xsd');
   assert.equal(downloadName('wynik', 4, 'hl7v2_profile'), 'wynik-v4.json');
   assert.equal(editorLanguage('hl7v2_profile'), 'json');
+  assert.equal(editorLanguage('xsd'), 'html');
   assert.equal(displayText('hl7v2_profile', '{"required_segments":["PID"]}'), '{\n  "required_segments": [\n    "PID"\n  ]\n}');
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>';
+  assert.equal(displayText('xsd', xsd), xsd, 'an XSD is shown as stored');
 });
 
 test('a profile spelled out: its segments (listed, then those only a field names) and fields with their names', () => {

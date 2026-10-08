@@ -1344,7 +1344,7 @@ fn apply_schema_binding_guard(
         }
     }
     if !schema_type.has_validator() {
-        // avro/protobuf/thrift/xsd/hl7v2_profile: binding is allowed,
+        // avro/protobuf/thrift: binding is allowed,
         // validation is not — but whether that is a silent downgrade or a hard rejection depends on
         // WHAT this call actually asked for (review finding #5):
         //   - the call explicitly turned validation ON (or to any non-`Off`

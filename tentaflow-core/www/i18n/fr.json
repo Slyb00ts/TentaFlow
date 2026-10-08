@@ -10118,7 +10118,8 @@
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
-      "added_existing_same": "Quelqu’un l’a ajouté entre-temps avec le même texte (version {version}) — rien n’a changé."
+      "added_existing_same": "Quelqu’un l’a ajouté entre-temps avec le même texte (version {version}) — rien n’a changé.",
+      "text_not_xml": "Ce n’est pas un document XML valide, et ce format s’écrit en XML."
     },
     "topics": {
       "title": "Topics",

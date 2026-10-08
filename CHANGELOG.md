@@ -62,28 +62,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 - Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
   `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
-  i znaczniki usunięcia bez zmian). Profil `hl7v2_profile` ma walidator (opis niżej): `GET capabilities`
-  wymienia `json_schema` i `hl7v2_profile`, temat może mieć `validation =
-  warn|dlq` z takim wzorcem, a domyślna zgodność `backward` działa. `xsd` jest
-  na razie tylko przechowywany, jak `avro`/`protobuf`/`thrift`: nie ma
-  walidatora, włączenie walidacji na takim wzorcu jest odrzucane, a druga
-  wersja przy zgodności innej niż `none` także (brak porównania, którego
-  można by udawać). Rejestracja wersji `xsd` wymaga `compatibility: none`:
-  przy domyślnym `backward` odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
-  z tematem `application/xml` albo `text/xml`, `hl7v2_profile` tylko
-  z `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema`
-  nadal tylko z JSON-em; formaty binarne wiążą się niezależnie od
-  `content_type`. Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego
-  typu (konflikt w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca
-  dociera do takiego węzła przy następnym zapisie po uaktualnieniu, ale
-  wersje zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
+  i znaczniki usunięcia bez zmian; pakiety walidatorów nie mają własnej
+  migracji). Oba typy mają walidator: `GET capabilities` wymienia
+  `json_schema`, `xsd` i `hl7v2_profile`, temat może mieć `validation =
+  warn|dlq` z takim wzorcem, podschemat dla polityki odczytu jest wyliczany,
+  a domyślna zgodność `backward` działa. `avro`/`protobuf`/`thrift` nadal są
+  tylko przechowywane. Wzorzec `xsd` wiąże się tylko z tematem
+  `application/xml` albo `text/xml`, `hl7v2_profile` tylko z
+  `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema` nadal
+  tylko z JSON-em; formaty binarne wiążą się niezależnie od `content_type`.
+  Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego typu (konflikt
+  w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca dociera do
+  takiego węzła przy następnym zapisie po uaktualnieniu, ale wersje
+  zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
   (`reseed_core_state_from_current_rows`). Rzadki przypadek: stary węzeł
   z podmiotem o tej samej nazwie z generacji 0 może podpiąć wersje nowego
   typu pod swój stary wiersz i zmienić `content_type` tematu powiązanego
-  z tym podmiotem. Uaktualnij wszystkie węzły sieci razem, zanim ktoś
-  zarejestruje wzorzec XSD lub profil HL7; B4 i B5 zakładają to jako warunek
-  wstępny.
-
+  z tym podmiotem. **Uaktualnij wszystkie węzły sieci razem, zanim ktoś
+  zarejestruje wzorzec XSD lub profil HL7** (migracja 179 na każdym węźle).
 - Profil HL7 v2 (`hl7v2_profile`) to JSON `{"description"?, "required_segments",
   "required_fields"}`: wiadomość ER7 musi się dać odczytać tym samym parserem,
   co polityki pól, zawierać każdy wymagany segment, a wymagane pole
@@ -92,10 +88,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   powtórzenia i listy powyżej 512 wpisów są odrzucane przy rejestracji.
   Zgodność: `backward` — nowa wersja nie wymaga niczego ponad starą,
   `forward` — odwrotnie, `full` — równe zbiory.
-- Dashboard: „Dodaj wzór” oferuje profil HL7 v2 (kafelek z listy formatów
-  serwera), a strona wzorca opisuje go w zwykłych słowach (wymagane segmenty
-  i pola z nazwami ze słownika). Odmowa nowej wersji profilu, która wymaga
-  czegoś ponad starą wersję, ma przycisk „Usuń OBX-8 i dodaj wersję”.
+- Wzorzec XSD to własny podzbiór (na `quick-xml` i `regex`, bez nowych
+  zależności): `element` z `minOccurs`/`maxOccurs`, `complexType` z
+  `sequence`, `choice` i `all`, `simpleContent/extension`, `attribute`
+  (`required`/`optional`), typy `string`, `int`, `integer`, `decimal`,
+  `boolean`, `date`, `dateTime` oraz `restriction` z `minLength`, `maxLength`,
+  `pattern` i `enumeration`. `import`/`include`, `group`/`attributeGroup`,
+  `any`, `key`/`keyref`/`unique`, `complexContent`, `mixed`, `ref=` i inne
+  konstrukcje spoza podzbioru są odrzucane przy rejestracji z nazwą
+  konstrukcji. Dokument jest sprawdzany po lokalnych nazwach elementów
+  (przestrzenie nazw nie są rozstrzygane, tak jak w politykach pól XML);
+  `pattern` jest tłumaczony z dialektu XSD na `regex` z domyślnym
+  zakotwiczeniem (`^`/`$` są zwykłymi znakami, konstrukcje o innym
+  znaczeniu są odrzucane), a komunikaty naruszeń zawierają ścieżkę i
+  ograniczenie, nigdy wartość. Zgodność jest dowodzona zachowawczo
+  (inkluzja języków modeli zawartości, typów prostych i atrybutów):
+  `backward` — każdy dokument ważny w starym wzorcu jest ważny w nowym,
+  `forward` — odwrotnie; zmiana, której nie da się udowodnić, jest
+  odrzucana.
+- Dashboard: „Dodaj wzór” oferuje XSD i profil HL7 v2 (kafelki z listy
+  formatów serwera), strona wzorca opisuje profil HL7 w zwykłych słowach
+  (wymagane segmenty i pola z nazwami ze słownika), a opis XSD to jego
+  `xs:annotation/xs:documentation`. Odmowa nowej wersji profilu, która
+  wymaga czegoś ponad starą wersję, ma przycisk „Usuń OBX-8 i dodaj wersję”.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

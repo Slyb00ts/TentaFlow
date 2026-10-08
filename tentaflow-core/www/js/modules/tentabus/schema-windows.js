@@ -61,14 +61,26 @@ export function subjectNameProblem(name, existingNames = []) {
   return null;
 }
 
+/** Whether `text` is a well-formed XML document; assumed so where there is no XML parser to ask. */
+function wellFormedXml(text) {
+  if (typeof DOMParser === 'undefined') return true;
+  try {
+    return new DOMParser().parseFromString(String(text), 'application/xml').getElementsByTagName('parsererror').length === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Why a pattern text cannot be sent, or `null` when it can: `empty`,
- * `too_big` (over 256 KB) or `not_json` for a format written in JSON.
+ * `too_big` (over 256 KB), `not_json` for a format written in JSON or
+ * `not_xml` for an XSD.
  */
 export function schemaTextProblem(text, schemaType) {
   const value = String(text || '');
   if (!value.trim()) return 'empty';
   if (byteLength(value) > TEXT_MAX_BYTES) return 'too_big';
+  if (schemaType === 'xsd' && !wellFormedXml(value)) return 'not_xml';
   if (JSON_TEXT_TYPES.has(schemaType)) {
     try {
       JSON.parse(value);
@@ -422,7 +434,7 @@ export function addedNotice({ subject, schemaType, version, deduplicated }) {
 // The windows
 // ---------------------------------------------------------------------------
 
-const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json' };
+const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json', not_xml: 'schemas.text_not_xml' };
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
 
 function textField(label, hint, value = '') {

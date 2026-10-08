@@ -6090,7 +6090,7 @@ mod tests {
                 );
                 assert_eq!(
                     capabilities.schema_types,
-                    vec!["json_schema", "hl7v2_profile"]
+                    vec!["json_schema", "xsd", "hl7v2_profile"]
                 );
                 assert_eq!(capabilities.field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`

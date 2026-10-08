@@ -16,6 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
+if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.DOMParser = window.DOMParser;
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
@@ -445,7 +446,7 @@ test('"Dodaj wzór" hands on what the server did when the name was taken meanwhi
 });
 
 // ---------------------------------------------------------------------------
-// HL7 v2 profiles (F4 B5)
+// HL7 v2 profiles and XSD (F4 B4/B5)
 // ---------------------------------------------------------------------------
 
 const PROFILE_V3 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
@@ -453,9 +454,13 @@ const PROFILE_V4 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OB
 const wynik = { subject: 'wynik-badania', schemaType: 'hl7v2_profile', compatibility: 'backward', latestVersion: 3, deprecatedAtMs: null, usedByTopics: ['wyniki-badan'] };
 const BACKWARD_OBX8 = 'backward (the new profile requires more than the old one guarantees): fields [OBX-8] are not guaranteed';
 
-test('a profile text must be JSON', () => {
+test('a profile text must be JSON and an XSD text well-formed XML', () => {
   assert.equal(schemaTextProblem('{"required_segments": ', 'hl7v2_profile'), 'not_json');
   assert.equal(schemaTextProblem(PROFILE_V3, 'hl7v2_profile'), null);
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a" type="xs:string"/></xs:schema>';
+  assert.equal(schemaTextProblem(xsd, 'xsd'), null);
+  assert.equal(schemaTextProblem(xsd.replace('</xs:schema>', ''), 'xsd'), 'not_xml');
+  assert.equal(schemaTextProblem('{"json": true}', 'xsd'), 'not_xml');
 });
 
 test('the difference of a new profile from the newest one, in words', () => {
@@ -543,34 +548,39 @@ test('"Nowa wersja" of an HL7 profile: "Usuń OBX-8 i dodaj wersję" removes the
   closeAll();
 });
 
-test('"Dodaj wzór" offers an HL7 profile when the server validates it, and checks its text as JSON', async () => {
+test('"Dodaj wzór" offers an XSD and an HL7 profile when the server validates them, and checks each text for its own syntax', async () => {
   closeAll();
   const sent = [];
   const win = openSchemaAdd({
     instanceId: 'i',
-    schemaTypes: ['json_schema', 'hl7v2_profile'],
+    schemaTypes: ['json_schema', 'xsd', 'hl7v2_profile'],
     existingNames: () => [],
     register: async (request) => { sent.push(request); return { version: 1, deduplicated: false }; },
     describeError: String,
     onAdded: () => {},
   });
   const cards = [...win.querySelectorAll('tf-choice-card')];
-  assert.deepEqual(cards.map((c) => c.getAttribute('heading')), ['JSON Schema', 'profil HL7 v2']);
-  assert.deepEqual(cards.map((c) => c.getAttribute('description')), ['dane JSON', 'wiadomości HL7 v2']);
+  assert.deepEqual(cards.map((c) => c.getAttribute('heading')), ['JSON Schema', 'XSD', 'profil HL7 v2']);
+  assert.deepEqual(cards.map((c) => c.getAttribute('description')), ['dane JSON', 'dokumenty XML', 'wiadomości HL7 v2']);
   type(win.querySelector('[data-role="name"]'), 'wynik-badania');
   const format = win.querySelector('[data-role="format"]');
   const text = win.querySelector('[data-role="text"]');
   pick(format, 'hl7v2_profile');
-  type(text, '{"required_segments": ');
+  type(text, '<xs:schema/>');
   assert.match(text.getAttribute('error'), /To nie jest poprawny JSON/);
   type(text, PROFILE_V3);
   assert.equal(text.hasAttribute('error'), false);
+  pick(format, 'xsd');
+  assert.match(text.getAttribute('error'), /To nie jest poprawny dokument XML/, 'switching the format re-checks the text');
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a" type="xs:string"/></xs:schema>';
+  type(text, xsd);
+  assert.equal(text.hasAttribute('error'), false);
   const save = win.querySelector('[data-act="save"]');
   assert.equal(save.hasAttribute('disabled'), false);
-  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /powstanie wzór wynik-badania \(profil HL7 v2\), wersja 1/);
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /powstanie wzór wynik-badania \(XSD\), wersja 1/);
   save.click();
   await tick();
-  assert.equal(sent[0].schemaType, 'hl7v2_profile');
-  assert.equal(sent[0].schemaText, PROFILE_V3);
+  assert.equal(sent[0].schemaType, 'xsd');
+  assert.equal(sent[0].schemaText, xsd);
   closeAll();
 });
