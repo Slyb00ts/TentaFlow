@@ -10888,7 +10888,7 @@
         "addon": "Addon"
       },
       "group_sub": "{kind} · {count} {n|personne|personnes}",
-      "unknown_subject": "Sujet inconnu",
+      "unknown_subject": "Personne, groupe ou addon inconnu",
       "unknown_sub": "{kind} · identifiant {id}",
       "empty_title": "Personne n’a encore d’entrée ici",
       "empty_text": "L’accès à ce topic est décidé par le rôle dans l’organisation. Accordez un accès pour autoriser ou interdire des personnes, groupes ou addons choisis.",
@@ -11124,9 +11124,9 @@
         "write_unlisted_only": "De {whoFrom}, un message n’est accepté qu’avec les champs de la liste. Un message avec un autre champ est rejeté.",
         "write_accepted": "Les messages de {whoFrom} avec les champs {fields} sont acceptés.",
         "write_not_required": "Ces champs ne sont plus exigés de {whoFrom} : {fields}.",
-        "write_unlisted_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous ajoutez son adresse.",
-        "write_unlisted_hl7_saved": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment est rejeté.",
-        "write_unlisted_only_hl7": "Les messages de {whoFrom} sont acceptés avec les segments de la liste, y compris leurs autres positions (p. ex. PID-4, MSH-11). Un message avec un autre segment, p. ex. un segment Z, est rejeté.",
+        "write_unlisted_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous ajoutez son adresse.",
+        "write_unlisted_hl7_saved": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment est rejeté.",
+        "write_unlisted_only_hl7": "Les messages de {whoFrom} sont acceptés avec les segments de la liste, y compris leurs autres positions (p. ex. PID-4, PV1-1). Un message avec un autre segment, p. ex. un segment Z, est rejeté.",
         "read_unlisted_saved": "Les champs absents de la liste disparaissent aussi.",
         "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté."
       },
@@ -11151,7 +11151,7 @@
       "unlisted": {
         "read": "Les champs absents de la liste sont dissimulés aussi (y compris ceux qui apparaîtront plus tard), sauf si vous les saisissez ci-dessous.",
         "write": "Un message avec un champ hors de la liste est rejeté, sauf si vous saisissez ce champ ci-dessous.",
-        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous."
+        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous."
       },
       "add": {
         "button": "Ajouter une règle",
@@ -11230,7 +11230,7 @@
         "summary_hidden": "Les règles ont dissimulé {count} {n|champ|champs} : {fields}.",
         "summary_none": "Les règles n'ont dissimulé aucun champ de ce message.",
         "limited_title": "Cet aperçu est plus étroit que la vue de la personne, du groupe ou de l’addon choisi",
-        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
+        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra la personne, le groupe ou l'addon choisi : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
         "limited_missing": "Ces champs du modèle ne figurent pas dans cet aperçu : {fields}. Une règle qui s’applique aussi à vous les a masqués, ou le message ne les contient pas.",
         "who_user": "utilisateur {name}",
         "who_group": "groupe {name}",
@@ -11306,6 +11306,7 @@
       "blocked_settings": "Ouvrir les paramètres du topic",
       "blocked_preview": "L’aperçu n’est pas disponible : le contenu de ce topic ne peut pas être lu comme des champs.",
       "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
+      "reads_rest": "Champs hors de la liste : masqués",
       "fields_search": "Rechercher un champ",
       "fields_none": "Aucun champ ne correspond à la recherche.",
       "who": {

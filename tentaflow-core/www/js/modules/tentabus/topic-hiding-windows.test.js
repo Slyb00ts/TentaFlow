@@ -163,7 +163,7 @@ test('"Wszyscy": no directory question, and a rule for everyone that exists is s
   pick(again.querySelector('[data-role="direction"]'), 'write');
   pick(again.querySelector('[data-role="kind"]'), 'any');
   assert.equal(again.querySelector('[data-role="pick-note"]').textContent, 'Zasada zapisu dla wszystkich już istnieje — zmienisz ją w jej wierszu.');
-  assert.match(again.querySelector('[data-role="impact"]').textContent, /Ta osoba, grupa lub ten addon ma już zasadę zapisu/);
+  assert.match(again.querySelector('[data-role="impact"]').textContent, /Zasada zapisu dla wszystkich już istnieje — zmienisz ją w jej wierszu\./, 'the same sentence as under the switch, not the one about a person');
   assert.ok(again.querySelector('[data-act="save"]').hasAttribute('disabled'));
 });
 
@@ -229,7 +229,7 @@ test('an HL7 WRITING rule allows the unnamed positions of the listed segments an
   await tick();
   pick(win.querySelector('[data-role="direction"]'), 'write');
   chooseSubject(win, 'group:g-ksieg');
-  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /^Pozostałe pozycje segmentów z listy \(np\. PID-1, PID-4, MSH-11\) są przyjmowane\./);
+  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /^Pozostałe pozycje segmentów z listy \(np\. PID-1, PID-4, PV1-1\) są przyjmowane\./);
   pick(rowFor(win, 'PID-19'), 'forbid');
   assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Pozostałe pozycje segmentów z listy .* są przyjmowane\. Wiadomość z innym segmentem, np\. segmentem Z, zostanie odrzucona/);
   win.querySelector('[data-act="save"]').click();
@@ -572,8 +572,22 @@ test('"Usuń": what the rule does now, what follows, then one FieldPolicyDelete'
   assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /^Co się stanie po usunięciu: Osoby z grupy „Rejestracja” w topiku wizyty/);
   win.querySelector('[data-act="go"]').click();
   await tick();
-  assert.deepEqual(sent, [{ instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'read' }]);
+  assert.deepEqual(sent, [{ instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'read', expectedUpdatedAtMs: NOW }]);
   assert.deepEqual(saved, [{ title: 'Usunięto zasadę', text: 'Usunięto zasadę odczytu dla: Rejestracja.' }]);
+});
+
+test('a removal of a rule that changed since the window opened is refused by the server: the window closes with a note, nothing is removed', async () => {
+  closeAll();
+  const { ctx, saved } = addContext({ deleteRule: async () => { throw changedError(); } });
+  const win = openHidingRemove({ ...policyRows(POLICIES)[1], updatedAtMs: 1234 }, ctx);
+  win.querySelector('[data-act="go"]').click();
+  await tick(350);
+  assert.equal(win.isConnected, false, 'a window left open on a rule that has moved on would only refuse again');
+  assert.deepEqual(saved, [{
+    tone: 'warning',
+    title: 'Nic nie zapisano — zasada zmieniła się w międzyczasie',
+    text: 'Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz.',
+  }]);
 });
 
 test('a refused removal stays in the window with the reason', async () => {

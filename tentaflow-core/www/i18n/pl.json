@@ -12359,9 +12359,9 @@
         "write_unlisted_only": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.",
         "write_accepted": "Od {whoFrom} będą przyjmowane wiadomości z polami: {fields}.",
         "write_not_required": "Od {whoFrom} przestanie być wymagane: {fields}.",
-        "write_unlisted_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.",
-        "write_unlisted_hl7_saved": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.",
-        "write_unlisted_only_hl7": "Od {whoFrom} będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach (np. PID-4, MSH-11). Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona.",
+        "write_unlisted_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.",
+        "write_unlisted_hl7_saved": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.",
+        "write_unlisted_only_hl7": "Od {whoFrom} będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach (np. PID-4, PV1-1). Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona.",
         "read_unlisted_saved": "Pola spoza listy też znikną.",
         "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona."
       },
@@ -12386,7 +12386,7 @@
       "unlisted": {
         "read": "Pola, których nie ma na liście, też zostaną ukryte (także te, które pojawią się później), chyba że wpiszesz je niżej.",
         "write": "Wiadomość z polem spoza listy zostanie odrzucona, chyba że wpiszesz je niżej.",
-        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej."
+        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej."
       },
       "add": {
         "button": "Dodaj zasadę",
@@ -12541,6 +12541,7 @@
       "blocked_settings": "Otwórz ustawienia topiku",
       "blocked_preview": "Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.",
       "writes_rest": "Inne pola albo brak wymaganych: odrzuć wiadomość",
+      "reads_rest": "Pola spoza listy: ukryj",
       "fields_search": "Szukaj pola",
       "fields_none": "Żadne pole nie pasuje do wyszukiwania.",
       "who": {

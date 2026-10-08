@@ -11,7 +11,7 @@
 // The server lists EVERY position a message carries, empty or not
 // (`Hl7V2Format::list_fields`), and a writing rule refuses any position that is
 // not allowed. So a writing rule built from the named fields alone would refuse
-// the positions nobody named — MSH-11, PID-1, PID-4, EVN-1 and so on — and with
+// the positions nobody named — PID-1, PID-4, PV1-1, EVN-1 and so on — and with
 // them every real message. The positions the standard defines for the segments
 // below are therefore "implicit" for WRITING rules only: a new rule allows them
 // without listing them as rows, a stored rule that leaves one out keeps leaving
@@ -35,14 +35,16 @@ export const HL7_FIELDS = [
 ];
 
 /**
- * The highest position HL7 v2.8 defines for each segment; earlier versions
- * define fewer. Where the exact v2.8 count was not certain the larger known
- * count is used: the bound only widens the allow-list of a writing rule, so a
- * position a message does not have costs nothing.
+ * The highest position HL7 v2.8/v2.9 define for each segment; earlier versions
+ * define fewer. Where the exact count was not certain the larger known count
+ * is used (OBX, whose later positions differ between v2.8 and v2.9, is given
+ * a safe upper bound): the bound only widens the allow-list of a writing rule,
+ * so a position a message does not have costs nothing, while one too few
+ * refuses an ordinary message.
  */
 const SEGMENT_WIDTH = {
-  MSH: 25, EVN: 7, PID: 39, PD1: 22, NK1: 41, PV1: 52, PV2: 49, ROL: 13, GT1: 57, IN1: 53, IN2: 85,
-  ORC: 31, OBR: 50, OBX: 25, DG1: 21, AL1: 6, NTE: 9, SFT: 6, TQ1: 14, SPM: 30, MSA: 6, ERR: 12, MRG: 7,
+  MSH: 25, EVN: 7, PID: 39, PD1: 22, NK1: 41, PV1: 54, PV2: 50, ROL: 13, GT1: 57, IN1: 55, IN2: 85,
+  ORC: 35, OBR: 53, OBX: 33, DG1: 26, AL1: 6, NTE: 9, SFT: 6, TQ1: 14, SPM: 30, MSA: 6, ERR: 12, MRG: 7,
 };
 
 const KNOWN = new Set(HL7_FIELDS);

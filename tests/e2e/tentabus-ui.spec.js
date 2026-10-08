@@ -2929,6 +2929,18 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await assertNoOverflow(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-wizyty.png'), fullPage: true });
 
+    // Usuń on a rule somebody saved meanwhile: the server refuses the stale removal, the window
+    // closes with the same plain note, and the rule stays.
+    await ruleRow(page, 'Wszyscy').locator('tf-button[data-act="remove"]').click();
+    const stale = page.locator('tf-window.tb-access-window');
+    await expect(stale).toHaveCount(1);
+    const everyoneRead = (await serverRules(page, instanceId, 'wizyty'))['any:*:read'];
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: everyoneRead.fields, requiredFields: [] });
+    await stale.locator('[data-act="go"]').click();
+    await expect(stale).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Nic nie zapisano — zasada zmieniła się w międzyczasie');
+    expect((await serverRules(page, instanceId, 'wizyty'))['any:*:read']).toEqual(everyoneRead);
+
     // Usuń: what the rule does now, then it is gone; the last one brings the empty state back.
     await ruleRow(page, 'Wszyscy').locator('tf-button[data-act="remove"]').click();
     await expect(win).toHaveCount(0);

@@ -12123,7 +12123,7 @@
         "addon": "Addon"
       },
       "group_sub": "{kind} · {count} {n|person|people}",
-      "unknown_subject": "Unknown subject",
+      "unknown_subject": "Unknown person, group or addon",
       "unknown_sub": "{kind} · id {id}",
       "empty_title": "Nobody has an entry here yet",
       "empty_text": "Access to this topic is decided by the role in the organisation. Grant access to allow or deny chosen people, groups or addons.",
@@ -12359,9 +12359,9 @@
         "write_unlisted_only": "A message from {whoFrom} is accepted only with the fields on the list. A message with any other field is rejected.",
         "write_accepted": "Messages from {whoFrom} with the fields {fields} are accepted.",
         "write_not_required": "These fields are no longer required from {whoFrom}: {fields}.",
-        "write_unlisted_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you add its address.",
-        "write_unlisted_hl7_saved": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment is rejected.",
-        "write_unlisted_only_hl7": "Messages from {whoFrom} are accepted with the segments on the list, including their remaining positions (e.g. PID-4, MSH-11). A message with another segment, e.g. a Z segment, is rejected.",
+        "write_unlisted_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you add its address.",
+        "write_unlisted_hl7_saved": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment is rejected.",
+        "write_unlisted_only_hl7": "Messages from {whoFrom} are accepted with the segments on the list, including their remaining positions (e.g. PID-4, PV1-1). A message with another segment, e.g. a Z segment, is rejected.",
         "read_unlisted_saved": "Fields outside the list disappear too.",
         "write_unlisted_saved": "A message with a field outside the list is rejected too."
       },
@@ -12386,7 +12386,7 @@
       "unlisted": {
         "read": "Fields that are not on the list are hidden too (also those that appear later), unless you type them below.",
         "write": "A message with a field outside the list is rejected, unless you type that field below.",
-        "write_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you type its address below."
+        "write_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you type its address below."
       },
       "add": {
         "button": "Add a rule",
@@ -12465,7 +12465,7 @@
         "summary_hidden": "The rules hid {count} {n|field|fields}: {fields}.",
         "summary_none": "The rules hid no field of this message.",
         "limited_title": "This preview is narrower than what the chosen person, group or addon sees",
-        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that this subject will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you.",
+        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that the chosen person, group or addon will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you.",
         "limited_missing": "These fields of the pattern are not in this preview: {fields}. A rule that applies to you too hid them, or the message does not have them.",
         "who_user": "user {name}",
         "who_group": "group {name}",
@@ -12541,6 +12541,7 @@
       "blocked_settings": "Open the topic settings",
       "blocked_preview": "The preview is not available: the content of this topic cannot be read as fields.",
       "writes_rest": "Other fields or a missing required one: reject the message",
+      "reads_rest": "Fields outside the list: hide",
       "fields_search": "Search fields",
       "fields_none": "No field matches the search.",
       "who": {

@@ -10888,7 +10888,7 @@
         "addon": "Addon"
       },
       "group_sub": "{kind} · {count} {n|persona|personas}",
-      "unknown_subject": "Sujeto desconocido",
+      "unknown_subject": "Persona, grupo o addon desconocido",
       "unknown_sub": "{kind} · identificador {id}",
       "empty_title": "Aquí nadie tiene todavía una entrada",
       "empty_text": "El acceso a este topic lo decide el rol en la organización. Concede acceso para permitir o prohibir a personas, grupos o addons concretos.",
@@ -11124,9 +11124,9 @@
         "write_unlisted_only": "De {whoFrom} solo se acepta un mensaje con los campos de la lista. Un mensaje con cualquier otro campo se rechaza.",
         "write_accepted": "Se aceptan los mensajes de {whoFrom} con los campos {fields}.",
         "write_not_required": "Ya no se exigen estos campos a {whoFrom}: {fields}.",
-        "write_unlisted_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, MSH-11) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que añadas su dirección.",
-        "write_unlisted_hl7_saved": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, MSH-11) se aceptan. Un mensaje con otro segmento se rechaza.",
-        "write_unlisted_only_hl7": "Se aceptan los mensajes de {whoFrom} con los segmentos de la lista, también en sus demás posiciones (p. ej. PID-4, MSH-11). Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza.",
+        "write_unlisted_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que añadas su dirección.",
+        "write_unlisted_hl7_saved": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento se rechaza.",
+        "write_unlisted_only_hl7": "Se aceptan los mensajes de {whoFrom} con los segmentos de la lista, también en sus demás posiciones (p. ej. PID-4, PV1-1). Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza.",
         "read_unlisted_saved": "Los campos que no están en la lista también desaparecen.",
         "write_unlisted_saved": "Un mensaje con un campo fuera de la lista también se rechaza."
       },
@@ -11151,7 +11151,7 @@
       "unlisted": {
         "read": "Los campos que no están en la lista también se ocultan (incluso los que aparezcan más tarde), salvo que los escribas abajo.",
         "write": "Un mensaje con un campo fuera de la lista se rechaza, salvo que escribas ese campo abajo.",
-        "write_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, MSH-11) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que escribas su dirección abajo."
+        "write_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que escribas su dirección abajo."
       },
       "add": {
         "button": "Añadir una regla",
@@ -11230,7 +11230,7 @@
         "summary_hidden": "Las reglas ocultaron {count} {n|campo|campos}: {fields}.",
         "summary_none": "Las reglas no ocultaron ningún campo de este mensaje.",
         "limited_title": "Esta vista previa es más estrecha que la vista de la persona, el grupo o el addon elegido",
-        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
+        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá la persona, el grupo o el addon elegido: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
         "limited_missing": "Estos campos del patrón no aparecen en esta vista previa: {fields}. Los ocultó una regla que también se aplica a ti, o el mensaje no los tiene.",
         "who_user": "usuario {name}",
         "who_group": "grupo {name}",
@@ -11306,6 +11306,7 @@
       "blocked_settings": "Abrir los ajustes del topic",
       "blocked_preview": "La vista previa no está disponible: el contenido de este topic no se puede leer como campos.",
       "writes_rest": "Otros campos o falta un campo obligatorio: rechazar el mensaje",
+      "reads_rest": "Campos fuera de la lista: ocultar",
       "fields_search": "Buscar campos",
       "fields_none": "Ningún campo coincide con la búsqueda.",
       "who": {

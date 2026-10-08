@@ -3,7 +3,7 @@
 // Description: The HL7 v2 dictionary of the data-hiding window: every entry is
 // an address the server accepts, none is a separator field, and each has a
 // plain name in all five languages; the unnamed positions of the same segments
-// are allowed by default, so a message's own MSH-11 or PID-4 is never refused.
+// are allowed by default, so a message's own PV1-1 or PID-4 is never refused.
 // =============================================================================
 
 import { WWW_ROOT } from './_test-setup.js';
@@ -56,12 +56,12 @@ test('the unnamed positions of the dictionary\'s segments are allowed by default
   assert.ok(['MSH-8', 'MSH-11', 'MSH-12'].every((a) => HL7_FIELDS.includes(a)), 'the structural fields every message carries have rows');
 });
 
-test('the common segments beyond the first dozen are covered up to the width HL7 v2.8 defines, so an ordinary message is not refused', () => {
+test('the common segments beyond the first dozen are covered up to the width HL7 v2.8/v2.9 define, so an ordinary message is not refused', () => {
   const widest = {
-    PV2: 49, PD1: 22, ROL: 13, GT1: 57, IN2: 85, SFT: 6, TQ1: 14, SPM: 30, MSA: 6, ERR: 12, MRG: 7, NTE: 9,
+    PV1: 54, PV2: 50, IN1: 55, ORC: 35, OBR: 53, OBX: 33, DG1: 26, PD1: 22, ROL: 13, GT1: 57, IN2: 85, SFT: 6, TQ1: 14, SPM: 30, MSA: 6, ERR: 12, MRG: 7, NTE: 9,
   };
   for (const [segment, width] of Object.entries(widest)) {
-    for (const n of [1, 2, width]) assert.ok(HL7_IMPLICIT_FIELDS.includes(`${segment}-${n}`), `${segment}-${n}`);
+    for (const n of [1, width]) assert.ok(HL7_IMPLICIT_FIELDS.includes(`${segment}-${n}`), `${segment}-${n}`);
     assert.ok(!HL7_IMPLICIT_FIELDS.includes(`${segment}-${width + 1}`), `${segment} stops at ${width}`);
   }
   assert.ok(HL7_IMPLICIT_FIELDS.includes('NTE-9'), 'NTE has nine fields since v2.7, not four');

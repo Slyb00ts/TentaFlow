@@ -9,7 +9,7 @@
 //
 // A window opened before somebody else saved the same rule must not overwrite
 // it. The request therefore says what the window started from — "no such rule
-// yet" for an add, the rule's `updatedAtMs` for a change — and the server
+// yet" for an add, the rule's `updatedAtMs` for a change or a removal — and the server
 // refuses it (`bus.field_policy_changed`) when the stored rule is another one,
 // in the same transaction as the write. The window then closes with a note
 // saying nothing was saved, and the table shows the rules as they are now: a
@@ -291,7 +291,7 @@ export function openHidingAdd(ctx) {
     problem: (d) => {
       const subject = subjectOf(d.subject);
       if (!subject) return T('hiding.add.pick_first');
-      if (!free(subject)) return T('hiding.add.taken', { direction: T(`hiding.direction_of.${d.direction}`) });
+      if (!free(subject)) return T(subject.subjectType === 'any' ? 'hiding.add.any_taken' : 'hiding.add.taken', { direction: T(`hiding.direction_of.${d.direction}`) });
       return formProblem({ direction: d.direction, form: formOf(d), source, format });
     },
     impact: (d) => {
@@ -428,8 +428,22 @@ export function openHidingRemove(row, ctx) {
     button: T('hiding.remove.confirm'),
     buttonIcon: 'trash',
     danger: true,
-    run: () => ctx.deleteRule({ instanceId: ctx.instanceId, topic, subjectType: row.subjectType, subjectId: row.subjectId, direction: row.direction }),
+    run: async () => {
+      try {
+        await ctx.deleteRule({
+          instanceId: ctx.instanceId, topic, subjectType: row.subjectType, subjectId: row.subjectId, direction: row.direction, expectedUpdatedAtMs: row.updatedAtMs,
+        });
+        return { changed: false };
+      } catch (err) {
+        if (isPolicyChanged(err)) return { changed: true };
+        throw err;
+      }
+    },
     describeError: ctx.describeError,
-    onDone: () => ctx.onSaved({ title: T('hiding.remove.saved_title'), text: T('hiding.remove.saved_text', { who, direction: T(`hiding.direction_of.${row.direction}`) }) }),
+    onDone: (result) => ctx.onSaved(savedNotice(
+      result,
+      T('hiding.remove.saved_title'),
+      T('hiding.remove.saved_text', { who, direction: T(`hiding.direction_of.${row.direction}`) }),
+    )),
   });
 }

@@ -330,11 +330,13 @@ export function ruleWhatHtml(row, source) {
     const hiddenHtml = facts.hidden.length
       ? limitedHtml(source, facts.hidden.map((n) => [n, chipHtml('neutral', T('hiding.action.hide'))]))
       : plain(T('hiding.hides_none'));
-    if (!facts.visibleOutside.length) return hiddenHtml;
+    // Over an incomplete list a reading rule hides every position it does not allow too.
+    const hiddenRest = source.complete ? '' : `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.reads_rest'))}</div>`;
+    if (!facts.visibleOutside.length) return `${hiddenHtml}${hiddenRest}`;
     const shown = facts.visibleOutside.slice(0, CELL_FIELDS).join(', ');
     const rest = facts.visibleOutside.length - CELL_FIELDS;
     const outside = T('hiding.visible_outside', { fields: rest > 0 ? `${shown} ${T('hiding.and_more', { count: fmtCount(rest), n: rest })}` : shown });
-    return `${hiddenHtml}<div class="tf-table__cell-sub">${escapeHtml(outside)}</div>`;
+    return `${hiddenHtml}<div class="tf-table__cell-sub">${escapeHtml(outside)}</div>${hiddenRest}`;
   }
   const requiredItems = facts.required.map((n) => [n, chipHtml('ok', T('hiding.write.require'))]);
   const refused = `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.writes_rest'))}</div>`;

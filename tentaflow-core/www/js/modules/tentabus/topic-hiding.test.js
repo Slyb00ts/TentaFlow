@@ -84,11 +84,11 @@ test('a rule\'s row: who, what it hides with the plain name of each field, when 
   const [everyone, group, , assistant] = policyRows(POLICIES);
   const row = ruleTableRow(assistant, json, NOW);
   assert.equal(words(row.who), 'Asystent lekarza Addon');
-  assert.equal(words(row.what), 'termin Ukryj');
+  assert.equal(words(row.what), 'termin Ukryj Pola spoza listy: ukryj', 'a reading rule over an open list says it hides what it does not list too');
   assert.equal(words(row.when), 'Odczyt');
   assert.equal(row.changed, 'dziś 11:00');
   assert.equal(row._key, 'addon:asystent:read');
-  assert.equal(words(ruleTableRow(group, json, NOW).what), 'powod Ukryj powód wizyty');
+  assert.equal(words(ruleTableRow(group, json, NOW).what), 'powod Ukryj powód wizyty Pola spoza listy: ukryj');
   assert.equal(ruleTableRow(group, json, NOW).changed, 'wczoraj 12:00');
   assert.equal(words(ruleTableRow(everyone, json, NOW).what), 'pacjent Wymagane dane pacjenta termin Wymagane powod Niedozwolone powód wizyty Inne pola albo brak wymaganych: odrzuć wiadomość', 'a write rule names what it requires and what it refuses, and that the rest is refused');
   assert.equal(words(ruleTableRow(everyone, json, NOW).when), 'Zapis');
@@ -97,9 +97,9 @@ test('a rule\'s row: who, what it hides with the plain name of each field, when 
 test('a cell names three fields and counts the rest; a rule that hides nothing says so; without a list it names what stays', () => {
   const many = { ...policyRows(POLICIES)[3], fields: [] };
   const what = ruleTableRow(many, json, NOW).what;
-  assert.equal(words(what), 'pacjent Ukryj dane pacjenta lekarz Ukryj Lekarz prowadzący wizytę termin Ukryj i jeszcze 1 pole');
+  assert.equal(words(what), 'pacjent Ukryj dane pacjenta lekarz Ukryj Lekarz prowadzący wizytę termin Ukryj i jeszcze 1 pole Pola spoza listy: ukryj');
   const none = { ...many, fields: ['pacjent', 'lekarz', 'termin', 'powod'] };
-  assert.equal(words(ruleTableRow(none, json, NOW).what), 'Nie ukrywa żadnego ze znanych pól');
+  assert.equal(words(ruleTableRow(none, json, NOW).what), 'Nie ukrywa żadnego ze znanych pól Pola spoza listy: ukryj');
   assert.equal(words(ruleTableRow(many, typed, NOW).what), 'Nie widzi żadnego pola');
   assert.equal(words(ruleTableRow(policyRows(POLICIES)[2], typed, NOW).what), 'Widzi tylko: lekarz');
   const writeBlind = { ...policyRows(POLICIES)[0], fields: ['id', 'nazwisko'], requiredFields: ['id'] };
@@ -391,6 +391,7 @@ test('HL7: a stored READING rule that lets unnamed positions through shows them 
   const what = words(ruleTableRow(row, hl7, NOW).what);
   assert.match(what, /Nie ukrywa żadnego ze znanych pól/);
   assert.match(what, /Zostawia też widoczne: PID-1, PID-4/);
+  assert.match(what, /Pola spoza listy: ukryj$/, 'the row says the rule hides every position it does not allow, not only the ones it names');
   assert.deepEqual(ruleFacts(row, hl7).visibleOutside, ['PID-1', 'PID-4']);
 });
 
@@ -464,12 +465,12 @@ test('the note after the window closed does not tell anyone to "add them below";
 test('HL7 writing sentences say the other positions of the listed segments are accepted and only other segments are refused', () => {
   const form = { ...blankForm('write', hl7), actions: { ...blankForm('write', hl7).actions, 'PID-19': 'forbid' } };
   const lines = ruleImpact({ who: 'Lab', direction: 'write', form, current: null, source: hl7 });
-  assert.equal(lines.at(-1), 'Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.');
+  assert.equal(lines.at(-1), 'Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.');
   assert.ok(!lines.join(' ').includes('Wiadomość z polem spoza listy'), 'the JSON sentence would be false here');
   const untouched = ruleImpact({ who: 'Lab', direction: 'write', form: blankForm('write', hl7), current: null, source: hl7 });
   assert.match(untouched[0], /^Od „Lab” będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach/);
   const saved = ruleImpact({ who: 'Lab', saved: true, direction: 'write', form, current: null, source: hl7 });
-  assert.equal(saved.at(-1), 'Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.');
+  assert.equal(saved.at(-1), 'Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.');
   // A reading rule says what its window says: what is not listed is hidden, positions nobody named included.
   const read = ruleImpact({ who: 'Lab', direction: 'read', form: { ...blankForm('read', hl7), actions: { ...blankForm('read', hl7).actions, 'PID-5': 'hide' } }, current: null, source: hl7 });
   assert.equal(read.at(-1), 'Pola spoza listy też znikną, chyba że je dopiszesz.');
