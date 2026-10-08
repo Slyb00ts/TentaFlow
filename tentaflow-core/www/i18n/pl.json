@@ -12284,9 +12284,7 @@
       "and_more": "i jeszcze {count} {n|pole|pola|pól}",
       "action": {
         "show": "Pokaż",
-        "hide": "Ukryj",
-        "mask": "Zamaskuj",
-        "hash": "Zahaszuj"
+        "hide": "Ukryj"
       },
       "write": {
         "allow": "Dozwolone",
@@ -12313,9 +12311,9 @@
       "col_changed": "Zmieniono",
       "empty_title": "Ten topik nie ma zasad ukrywania danych",
       "empty_text": "Każdy, kto może czytać ten topik, widzi całe wiadomości. Dodaj zasadę, aby ukryć wybrane pola.",
-      "blocked_title": "Nie można dodać zasady w tym topiku",
-      "blocked_text": "Ten topik przenosi treść binarną, więc nie wiadomo, jakie ma pola. Zasady ukrywania danych działają na wiadomościach JSON, XML i HL7 v2.",
-      "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych podmiotów, a nie ma zasady dla wszystkich.",
+      "blocked_title": "Zasady tego topiku nie są tu edytowane",
+      "blocked_text": "Zasad tego topiku nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól. Ten ekran obsługuje wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
+      "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich.",
       "sees_only": "Widzi tylko: {fields}",
       "sees_nothing": "Nie widzi żadnego pola",
       "hides_none": "Nie ukrywa żadnego ze znanych pól",
@@ -12324,8 +12322,6 @@
       "writes_all": "Przyjmuje wszystkie znane pola",
       "legend": {
         "hide": "Pole znika z wiadomości.",
-        "mask": "Widać 3 ostatnie znaki, reszta to gwiazdki.",
-        "hash": "Zamiast wartości jest ciąg znaków, zawsze ten sam dla tej samej wartości.",
         "reject_name": "Odrzuć wiadomość",
         "reject": "Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku.",
         "precedence": "Zasada osoby wygrywa z zasadą jej grupy, a ta z zasadą dla wszystkich — zasady się nie sumują."
@@ -12334,12 +12330,14 @@
         "empty": "Wpisz nazwę pola.",
         "hl7_msh": "{name} to separatory samej wiadomości — nie można ich ukryć. Wybierz inne pole.",
         "hl7_shape": "„{name}” nie jest adresem pola HL7. Adres ma postać SEGMENT-numer, np. PID-5.",
-        "xml_name": "„{name}” nie jest nazwą elementu XML. Nazwa zaczyna się od litery albo znaku _ i nie ma spacji."
+        "xml_name": "„{name}” nie jest nazwą elementu XML. Nazwa zaczyna się od litery albo znaku _ i nie ma spacji.",
+        "hl7_case": "„{name}” wygląda na literówkę. Czy chodziło o {suggestion}? Adres pisze się wielkimi literami, z myślnikiem.",
+        "typed_known": "„{name}” jest na liście pól i ma tam inne ustawienie niż wpisane niżej. Zostaw je tylko w jednym miejscu."
       },
       "need": {
-        "read": "Ustaw co najmniej jedno pole na „Ukryj”. Zasada, która niczego nie ukrywa, nic nie robi — żeby przestała działać, usuń ją.",
+        "read": "Ustaw co najmniej jedno pole na „Ukryj”. Lista zawiera wszystkie pola tego topiku, więc zasada, która pokazuje je wszystkie, niczego nie zmienia — żeby przestała działać, usuń ją.",
         "read_typed": "Wpisz co najmniej jedno pole, które ma zostać widoczne. Bez żadnego widocznego pola zasada ukryłaby całą wiadomość.",
-        "write": "Ustaw co najmniej jedno pole na „Wymagane” albo „Niedozwolone”. Zasada, która niczego nie sprawdza, nic nie robi — żeby przestała działać, usuń ją.",
+        "write": "Ustaw co najmniej jedno pole na „Wymagane” albo „Niedozwolone”. Lista zawiera wszystkie pola tego topiku, więc zasada, która wszystko dopuszcza, niczego nie sprawdza — żeby przestała działać, usuń ją.",
         "write_typed": "Wpisz co najmniej jedno pole, które wolno zapisać. Bez żadnego dozwolonego pola zasada odrzucałaby każdą wiadomość."
       },
       "impact": {
@@ -12347,19 +12345,25 @@
         "read_hidden": "Dla „{who}” znikną z wiadomości pola: {fields}.",
         "read_shown": "Dla „{who}” pojawią się w wiadomościach pola: {fields}.",
         "rest": "Pozostałe pola z listy bez zmian.",
-        "read_unlisted": "Pola spoza listy też znikną, chyba że wpiszesz je niżej.",
+        "read_unlisted": "Pola spoza listy też znikną, chyba że je dopiszesz.",
         "write_only": "Od „{who}” zostanie przyjęta wiadomość tylko z polami: {fields}. Wiadomość z innym polem zostanie odrzucona.",
         "write_forbidden": "Wiadomość od „{who}”, w której jest którekolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
         "write_required": "Wiadomość od „{who}”, w której brakuje któregokolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
         "write_rest": "Odrzucona zostaje cała wiadomość, a nie samo pole.",
-        "write_unlisted": "Wiadomość z polem spoza listy też zostanie odrzucona, chyba że wpiszesz je niżej."
+        "write_unlisted": "Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.",
+        "keys_closed": "Systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku, dopóki nie dodasz zasady dla wszystkich.",
+        "read_unlisted_only": "Dla „{who}” znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.",
+        "write_unlisted_only": "Od „{who}” zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.",
+        "write_accepted": "Od „{who}” będą przyjmowane wiadomości z polami: {fields}.",
+        "write_not_required": "Od „{who}” przestanie być wymagane: {fields}."
       },
       "fields_label": "Pola",
       "source": {
         "schema": "Pola pochodzą ze wzoru wiadomości {name}, wersja {version}.",
         "dictionary": "Lista to najczęstsze pola HL7 v2. Inne pole dopiszesz niżej, podając jego adres.",
         "failed": "Nie udało się wczytać wzoru wiadomości tego topiku, więc nie znamy jego pól. Wpisz niżej pola, które mają zostać widoczne.",
-        "manual": "Nie znamy pól tego topiku — nie ma wzoru wiadomości, który by je wymieniał. Wpisz niżej pola, które mają zostać widoczne."
+        "manual": "Nie znamy pól tego topiku — nie ma wzoru wiadomości, który by je wymieniał. Wpisz niżej pola, które mają zostać widoczne.",
+        "complex": "Wzór wiadomości tego topiku zawiera pola, których nie da się z niego wypisać (odwołanie do innego pliku albo dowolne nazwy pól), więc nie znamy pełnej listy. Wpisz niżej pola, które mają zostać widoczne."
       },
       "extra": {
         "shown": "Inne pola, które mają zostać widoczne",
@@ -12381,18 +12385,25 @@
         "save": "Zapisz zasadę",
         "who": "Dla kogo",
         "when": "Kiedy działa",
-        "any_hint": "Zasada dla wszystkich obowiązuje każdego, kto nie ma własnej zasady ani zasady swojej grupy. Tylko ją widzą systemy z kluczem API.",
+        "any_hint": "Zasada dla wszystkich obowiązuje każdego, kto nie ma własnej zasady ani zasady swojej grupy. Systemy z kluczem API podlegają tylko tej zasadzie.",
         "any_taken": "Zasada {direction} dla wszystkich już istnieje — zmienisz ją w jej wierszu.",
-        "none_free": "Każdy z tej listy ma już taką zasadę w tym topiku (albo lista jest pusta).",
+        "none_free": "Każdy z tej listy ma już taką zasadę w tym topiku.",
         "pick_hint": "Na liście są osoby, grupy lub addony, które nie mają jeszcze takiej zasady.",
         "pick_first": "Wybierz, dla kogo jest zasada.",
         "taken": "Ta osoba, grupa lub ten addon ma już zasadę {direction} — zmienisz ją w jej wierszu.",
-        "saved_title": "Zapisano zasadę"
+        "saved_title": "Zapisano zasadę",
+        "search": "Szukaj na liście",
+        "choose": "Wybierz…",
+        "none_exist": {
+          "group": "W tej organizacji nie ma jeszcze żadnej grupy.",
+          "user": "W tej organizacji nie ma żadnych użytkowników.",
+          "addon": "Żaden addon nie ma dostępu do tej instancji."
+        }
       },
       "change": {
         "button": "Zmień",
         "window_title": "Zasada ukrywania danych — {name}",
-        "fixed": "Zasada należy do tej osoby, grupy lub addonu i dotyczy tylko tego jednego — tego się nie zmienia.",
+        "fixed": "Zasada należy do tej osoby, grupy lub addonu — tego się nie zmienia.",
         "saved_title": "Zapisano zmianę zasady"
       },
       "remove": {
@@ -12409,14 +12420,18 @@
         "part_nothing": "żadne pole nie jest dozwolone",
         "part_none": "wszystkie znane pola są dozwolone",
         "impact_title": "Co się stanie po usunięciu:",
-        "impact_read": "Dla „{who}” w topiku {topic} zacznie obowiązywać zasada grupy albo zasada dla wszystkich; gdy żadnej nie ma, zobaczy całe wiadomości.",
-        "impact_write": "Wiadomości od „{who}” do topiku {topic} będą sprawdzane według zasady grupy albo zasady dla wszystkich; gdy żadnej nie ma, nie będą sprawdzane wcale.",
         "impact_any_read": "Każdy, kto nie ma własnej zasady odczytu, zobaczy w topiku {topic} całe wiadomości.",
         "impact_any_write": "Zapis do topiku {topic} przestanie być sprawdzany u każdego, kto nie ma własnej zasady zapisu.",
-        "impact_keys": "Zostaną tylko zasady dla wybranych podmiotów, więc systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku.",
+        "impact_keys": "Zostaną tylko zasady dla wybranych osób, grup lub addonów, więc systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku.",
         "confirm": "Usuń zasadę",
         "saved_title": "Usunięto zasadę",
-        "saved_text": "Usunięto zasadę {direction} dla: {who}."
+        "saved_text": "Usunięto zasadę {direction} dla: {who}.",
+        "impact_read_user": "Dla użytkownika „{who}” w topiku {topic} zacznie obowiązywać zasada odczytu jednej z jego grup, a gdy żadna z nich jej nie ma — zasada dla wszystkich; gdy nie ma żadnej, zobaczy całe wiadomości.",
+        "impact_read_group": "Osoby z grupy „{who}” w topiku {topic} będą czytać według zasady odczytu swojej innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, zobaczą całe wiadomości.",
+        "impact_read_addon": "Addon „{who}” w topiku {topic} będzie czytał według zasady dla wszystkich; gdy jej nie ma, zobaczy całe wiadomości.",
+        "impact_write_user": "Wiadomości użytkownika „{who}” do topiku {topic} będą sprawdzane według zasady zapisu jednej z jego grup, a gdy żadna z nich jej nie ma — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
+        "impact_write_group": "Wiadomości osób z grupy „{who}” do topiku {topic} będą sprawdzane według zasady zapisu ich innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
+        "impact_write_addon": "Wiadomości addonu „{who}” do topiku {topic} będą sprawdzane według zasady dla wszystkich; gdy jej nie ma, nie będą sprawdzane wcale."
       },
       "preview": {
         "button": "Podgląd, jak widzi…",
@@ -12440,8 +12455,12 @@
         "rules_title": "Co zrobiły zasady",
         "summary_hidden": "Zasady ukryły {count} {n|pole|pola|pól}: {fields}.",
         "summary_none": "Zasady nie ukryły żadnego pola tej wiadomości.",
-        "limited_title": "Ten podgląd jest węższy niż widok wybranego podmiotu",
-        "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu."
+        "limited_title": "Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu",
+        "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.",
+        "limited_missing": "Mogą tu brakować pól: {fields}. Jeśli wiadomość je zawiera, ukrywa je zasada, która obowiązuje także Ciebie.",
+        "who_user": "użytkownik {name}",
+        "who_group": "grupa {name}",
+        "who_addon": "addon {name}"
       },
       "hl7": {
         "msh_3": "Aplikacja wysyłająca",
@@ -12504,8 +12523,17 @@
         "obx_14": "Data i godzina wyniku",
         "dg1_3": "Kod rozpoznania",
         "dg1_4": "Opis rozpoznania",
-        "al1_3": "Alergen"
-      }
+        "al1_3": "Alergen",
+        "msh_8": "Zabezpieczenia",
+        "msh_11": "Tryb przetwarzania",
+        "msh_12": "Wersja HL7"
+      },
+      "blocked_settings": "Otwórz ustawienia topiku",
+      "blocked_preview": "Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.",
+      "writes_rest": "Inne pola albo brak wymaganych: odrzuć wiadomość",
+      "fields_search": "Szukaj pola",
+      "fields_none": "Żadne pole nie pasuje do wyszukiwania.",
+      "stale": "Zasada zmieniła się w międzyczasie. Odświeżyliśmy listę — sprawdź ją i spróbuj jeszcze raz."
     }
   },
   "composer": {

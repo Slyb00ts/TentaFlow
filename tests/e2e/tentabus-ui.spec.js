@@ -53,6 +53,14 @@ const path = require('path');
 const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 
+// "Anuluj" asks once before it drops a changed draft, like the close button
+// and Escape: a second click is the answer.
+async function cancelOut(win) {
+  await win.locator('[data-act="cancel"]').click();
+  const discard = win.locator('[data-role="discard"]');
+  if (await discard.count() && await discard.isVisible()) await win.locator('[data-act="cancel"]').click();
+}
+
 const PORT = 18323;
 const REPO_ROOT = path.join(__dirname, '../..');
 const WORK_DIR = path.join(REPO_ROOT, '.runtime', `e2e-tentabus-ui-${PORT}`);
@@ -845,7 +853,7 @@ test('T02/T04 at 390x844: cards, no horizontal scroll, the creator and the previ
   await nextButton(page).click();
   await fits('tf-window.tb-creator');
   await page.screenshot({ path: path.join(SHOTS, 't04-krok2-telefon.png') });
-  await creator(page).locator('[data-act="cancel"]').click();
+  await cancelOut(creator(page));
   await expect(creator(page)).toHaveCount(0);
   await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3);
 
@@ -992,7 +1000,7 @@ test('U2 Ustawienia: values to read with locks; Przechowywanie saved through its
   await expect(win.locator('.tb-vr-lock')).toContainText('Innego sposobu sprzątania na razie nie ma.');
   await win.locator('#tb-set-retention select').selectOption({ label: '3 dni' });
   await expect(win.locator('[data-role="impact"]')).toContainText('Co się stanie po zapisaniu: Wiadomości');
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   await expect(retentionValue).toHaveText('7 dni');
 
@@ -1128,7 +1136,7 @@ test('U2 Ponowne próby and Wzór wiadomości saved; a refusal stays in the wind
   await expect(win.locator('[data-role="error"]')).toBeVisible({ timeout: 15000 });
   await expect(win.locator('[data-role="error"]')).toContainText(/e2e-ustawienia|topik/i);
   await expect(win).toHaveCount(1);
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect(errors.filter((e) => !/topic_not_found|NotFound/.test(e)), errors.join('\n')).toEqual([]);
 });
@@ -1223,7 +1231,7 @@ test('U2 at 390x844: the section list replaces the menu, cards fit, a window fil
   await expect(changeWindow(page)).toBeVisible();
   await windowFits(page, 'tf-window.tb-change-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 'tp-ustawienia-zmien-przechowywanie-telefon.png') });
-  await changeWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(changeWindow(page));
   await pick.locator('select').selectOption('partitions');
   await expect(section(page, 'partitions').locator('tf-table tbody tr')).toHaveCount(3, { timeout: 15000 });
   await assertNoOverflow(page);
@@ -1540,7 +1548,7 @@ test('U3 Przesuń: to a number, to the start, to the end and to a time — the w
   await win.locator('#tb-move-offset input').fill(String(after[1].hw));
   await expect(win.locator('#tb-move-offset')).toHaveAttribute('error', /^Podaj numer od /);
   await expect(win.locator('[data-act="move"]')).toHaveAttribute('disabled', '');
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect((await readingPlaces(page, instanceId, group, topic))[1].committed).toBe(after[1].committed);
 
@@ -1622,7 +1630,7 @@ test('U3 at 390x844: the list as cards, the section list, the move window fills 
   await expect(moveWindow(page).locator('.tf-window-title-text')).toBeVisible();
   await windowFits(page, 'tf-window.tb-move-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 'od-przesun-p0-telefon.png') });
-  await moveWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(moveWindow(page));
   await pick.locator('select').selectOption('settings');
   await expect(consumerSection(page, 'settings').locator('.section-card')).toHaveCount(2);
   await assertNoOverflow(page);
@@ -1969,7 +1977,7 @@ test('U4 Ponów one message: the window says where it goes and who gets it; it l
   expect(impact).toContain('Dostaną ją wszyscy odbiorcy tego topiku (aplikacja-lekarza i raporty-laboratorium) — także ci, którzy już ją przetworzyli.');
   expect(impact).toContain('po 5 próbach');
   await page.screenshot({ path: path.join(SHOTS, 'tp-nieprzetworzone-ponow.png') });
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect(await topicEnd(page, instanceId, 'wyniki-badan')).toBe(endBefore);
 
@@ -2244,7 +2252,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   await expect(win).toHaveCount(1);
   await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
   await page.screenshot({ path: path.join(SHOTS, 't08-wzor-nowa-wersja-odmowa.png') });
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: REFERRAL })).versions).toHaveLength(1);
 
@@ -2362,7 +2370,7 @@ test('U5 at 390x844: the list as cards, the pattern\'s page in one column, a win
   await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
   await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 't08-dodaj-telefon.png') });
-  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(schemaWindow(page));
   await expect(schemaWindow(page)).toHaveCount(0);
   await schemaRow(page, 'wizyta').locator('td').first().click();
   const p = schemaSlot(page);
@@ -2375,7 +2383,7 @@ test('U5 at 390x844: the list as cards, the pattern\'s page in one column, a win
   await p.locator('[data-role="compat"]').click();
   await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
   await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
-  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(schemaWindow(page));
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
@@ -2702,7 +2710,7 @@ test('U6 at 390x844: Dostęp from the section list, the rows as cards, a window 
     await windowFits(page, 'tf-window.tb-access-window', PHONE.width);
     await settled(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj-390.png') });
-    await accessWindow(page).locator('[data-act="cancel"]').click();
+    await cancelOut(accessWindow(page));
     await expect(accessWindow(page)).toHaveCount(0);
   } finally {
     await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: 'e2e-telefon', accessLevel: 'clear', action: 'read' });
@@ -2798,8 +2806,9 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
     await expect(win.locator('tf-segmented[data-field]')).toHaveCount(4);
     await expect(win.locator('[data-role="source-note"]')).toContainText('Pola pochodzą ze wzoru wiadomości wizyta, wersja 3.');
-    await expect(win.locator('[data-role="impact"]')).toContainText('Ustaw co najmniej jedno pole na „Ukryj”');
-    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    // The pattern does not close itself, so a rule that hides no listed field still hides the rest — and it is the first rule, which closes the topic to keys.
+    await expect(win.locator('[data-role="impact"]')).toContainText('znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Systemy zewnętrzne z kluczem API nie będą mogły czytać tego topiku, dopóki nie dodasz zasady dla wszystkich.');
     await pickSegment(win, 'tf-segmented[data-field="lekarz"]', 'Ukryj');
     await expect(win.locator('[data-role="impact"]')).toContainText(`Dla „${groupName}” znikną z wiadomości pola: lekarz. Pozostałe pola z listy bez zmian.`);
     await windowFits(page, 'tf-window.tb-hiding-window', DESKTOP.width);
@@ -2859,7 +2868,7 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await expect(preview).toHaveCount(0);
     await s.locator('tf-button[data-go="hiding-add"]').click();
     await pickSegment(win, '[data-role="kind"]', 'Wszyscy');
-    await expect(win.locator('[data-role="pick-note"]')).toContainText('Tylko ją widzą systemy z kluczem API.');
+    await expect(win.locator('[data-role="pick-note"]')).toContainText('Systemy z kluczem API podlegają tylko tej zasadzie.');
     await pickSegment(win, 'tf-segmented[data-field="gabinet"]', 'Ukryj');
     await win.locator('[data-act="save"]').click();
     await expect(win).toHaveCount(0);
@@ -2870,7 +2879,7 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await expect(preview.locator('[data-role="subject"] select option', { hasText: groupName })).toHaveCount(1, { timeout: 15000 });
     await preview.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
     await preview.locator('[data-act="show"]').click();
-    await expect(preview.locator('tf-alert[data-role="limited"]')).toHaveAttribute('title', 'Ten podgląd jest węższy niż widok wybranego podmiotu', { timeout: 15000 });
+    await expect(preview.locator('tf-alert[data-role="limited"]')).toHaveAttribute('title', 'Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu', { timeout: 15000 });
     await expect(preview.locator('tf-alert[data-role="limited"]')).toHaveAttribute('message', /Podgląd nigdy nie pokazuje więcej, niż widzisz sam/);
     await settled(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-zawezony.png') });
@@ -2953,7 +2962,7 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
     await tags.fill('PID-31');
     await tags.press('Enter');
     await expect(win.locator('[data-role="impact"]')).toContainText('znikną z wiadomości pola: Imię i nazwisko pacjenta (PID-5), Płeć (PID-8).');
-    await expect(win.locator('[data-role="impact"]')).toContainText('Pola spoza listy też znikną, chyba że wpiszesz je niżej.');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Pola spoza listy też znikną, chyba że je dopiszesz.');
     await settled(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-hl7.png') });
     await win.locator('[data-act="save"]').click();
@@ -2972,10 +2981,8 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
     await pickSegment(preview, '[data-role="kind"]', 'Wszyscy');
     await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
     await preview.locator('[data-act="show"]').click();
-    // The server keeps what is allowed, so the fields of the message the
-    // dictionary does not list (MSH-11, OBR-1, …) are hidden together with the two chosen.
-    await expect(preview.locator('[data-role="summary"]')).toContainText(/Zasady ukryły \d+ pól: .*PID-5.*PID-8/, { timeout: 15000 });
-    await expect(preview.locator('[data-role="summary"]')).toContainText('MSH-11');
+    // The unnamed positions of the dictionary's segments (MSH-11, PID-1, …) stay allowed, so the rule hides the two chosen fields and nothing else of the message.
+    await expect(preview.locator('[data-role="summary"]')).toHaveText('Zasady ukryły 2 pola: PID-5, PID-8.', { timeout: 15000 });
     await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]', { hasText: 'PID-5' })).toContainText('Imię i nazwisko pacjenta');
     const message = await preview.locator('[data-role="payload"]').innerText();
     expect(message).toContain('MSH|');
@@ -2998,8 +3005,8 @@ test('U7 a topic with binary content cannot get a rule, and the section says why
   try {
     await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${name}&section=hiding`);
     const s = hidingSection(page);
-    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Nie można dodać zasady w tym topiku', { timeout: 20000 });
-    await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /przenosi treść binarną/);
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Zasady tego topiku nie są tu edytowane', { timeout: 20000 });
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /nie edytuje się na tym ekranie/);
     await expect(s.locator('[data-role="add"]')).toHaveAttribute('disabled', '');
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-powiadomienia.png'), fullPage: true });
   } finally {
@@ -3032,7 +3039,7 @@ test('U7 at 390x844: Ukrywanie danych from the section list, the rules as cards,
     await windowFits(page, 'tf-window.tb-hiding-window', PHONE.width);
     await settled(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-390.png') });
-    await win.locator('[data-act="cancel"]').click();
+    await cancelOut(win);
     await expect(win).toHaveCount(0);
     await s.locator('tf-button[data-go="hiding-preview"]').click();
     const preview = previewWindow(page);

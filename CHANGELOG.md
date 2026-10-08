@@ -216,26 +216,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zmieniono. Serwer zapisuje pola **dozwolone**, więc ekran pokazuje odwrotność
   (znane pola bez dozwolonych); pole, którego nie ma na liście okna, też jest
   ukryte (a przy zapisie odrzucane), chyba że wpisze się je osobno. Listę pól
-  daje wzór wiadomości topiku JSON (właściwości najwyższego poziomu),
-  podręczny słownik około sześćdziesięciu pól HL7 v2 z nazwami w pięciu językach
-  (adres spoza słownika wpisuje się ręcznie i jest sprawdzany przed wysłaniem tak
-  jak na serwerze) albo, gdy listy nie ma (XML, JSON bez wzoru), pola do
-  pozostawienia wpisuje się w całości. Topik z treścią binarną nie przyjmuje
-  zasad, a sekcja mówi dlaczego.
+  daje wzór wiadomości topiku JSON (właściwości, także z `allOf`, `oneOf`,
+  `anyOf`, `if`/`then`/`else` i lokalnych `$ref`; wzór z odwołaniem do innego
+  pliku, `patternProperties` albo `additionalProperties` jako schematem
+  traktujemy jak brak listy), podręczny słownik około sześćdziesięciu pól HL7 v2
+  z nazwami w pięciu językach (pozostałe pozycje tych segmentów, np. MSH-11,
+  PID-1, PID-4, EVN-1, są domyślnie dozwolone, więc zwykła wiadomość nie jest
+  odrzucana; adres spoza słownika wpisuje się ręcznie i jest sprawdzany przed
+  wysłaniem tak jak na serwerze, każdy błędny osobno) albo, gdy listy nie ma
+  (XML, JSON bez wzoru), pola do pozostawienia wpisuje się w całości. Długą
+  listę pól można przeszukać. Topik z treścią binarną nie jest tu edytowany,
+  a sekcja mówi dlaczego i odsyła do ustawień topiku.
+- Zapis zasady sprawdza najpierw, czy nikt jej w międzyczasie nie dodał ani nie
+  zmienił; jeśli tak, okno mówi „Zasada zmieniła się w międzyczasie” i nic nie
+  nadpisuje. Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
+  dla wybranych osób zamknie topik dla systemów z kluczem API; nikogo nie
+  wybiera za administratora.
+- Lista zasad topiku (`FieldPolicyListRequest`) jest tylko dla administratora
+  tego topiku; czytelnik widzi wyłącznie podgląd wiadomości z własnym ukrywaniem.
 - „Dodaj zasadę” wybiera osobę, grupę, addon z katalogu (tylko tych, którzy nie
   mają jeszcze zasady w tym kierunku) albo Wszystkich, kierunek i dla każdego
   pola Pokaż / Ukryj (przy zapisie: Dozwolone / Wymagane / Niedozwolone);
   „Zmień” zachowuje podmiot i kierunek, „Usuń” mówi, co zasada robi teraz i kto
-  zobaczy całe wiadomości po jej usunięciu. „Zamaskuj” i „Zahaszuj” pojawią się
-  w oknie i w legendzie same, gdy serwer poda je w `BusCapabilitiesWire.field_actions`;
-  pole z takim działaniem nigdy nie trafia na listę dozwolonych.
+  zobaczy całe wiadomości po jej usunięciu (osobno dla osoby, grupy i addonu,
+  w kolejności, w jakiej serwer wybiera zasadę). „Zamaskuj” i „Zahaszuj” dojdą
+  razem z działaniem na pole w protokole.
 - „Podgląd, jak widzi…” pokazuje prawdziwą wiadomość (domyślnie najnowszą
   z najbardziej obciążonej partycji) tak, jak czyta ją wybrany podmiot, z listą
   ukrytych pól. Okno mówi, że każdy podgląd zapisuje się w dzienniku audytu,
   a gdy zasada obowiązująca samego administratora ukrywa pola, które zobaczy
-  podmiot (`limited_by_caller`), wyjaśnia, że podgląd jest węższy niż jego widok.
+  wybrany odbiorca (`limited_by_caller`), wyjaśnia, że podgląd jest węższy niż
+  jego widok, i wymienia pola, których może brakować. Wynik znika, gdy zmieni
+  się osoba, grupa albo wiadomość.
   Pod tabelą widać, w którym kierunku topik jest zamknięty dla kluczy API (są
-  zasady dla wybranych podmiotów, a nie ma zasady dla wszystkich).
+  zasady dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich).
 - Błędy: `bus.record_not_found` ma tłumaczenie, a `bus.subject_not_found`
   mówi o osobie, kluczu albo addonie (nie tylko o kluczu).
 

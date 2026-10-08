@@ -1498,7 +1498,7 @@ function openHidingWindow(name, action) {
   const still = () => state.instanceId === instanceId && state.view?.name === name;
   const directory = ({ kind, query }) => ApiBinary.one('busSubjectDirectoryRequest', { instanceId, kind, query });
   if (action.kind === 'hiding-preview') {
-    if (!detail.access.canRead) return;
+    if (!detail.access.canRead || source.mode === 'blocked') return;
     openHidingPreview({
       instanceId,
       topic: name,
@@ -1528,7 +1528,8 @@ function openHidingWindow(name, action) {
     format,
     source,
     rules,
-    fieldActions: state.capabilities?.fieldActions || [],
+    listPolicies: async () => (await ApiBinary.one('busFieldPolicyListRequest', { instanceId, topic: name }))?.policies || [],
+    reload: () => { if (still()) loadTopicHiding(name); },
     directory,
     setPolicy: reloadAfter((request) => ApiBinary.action('busFieldPolicySetRequest', request)),
     deleteRule: reloadAfter((request) => ApiBinary.action('busFieldPolicyDeleteRequest', request)),

@@ -11049,9 +11049,7 @@
       "and_more": "y {count} {n|campo más|campos más}",
       "action": {
         "show": "Mostrar",
-        "hide": "Ocultar",
-        "mask": "Enmascarar",
-        "hash": "Aplicar hash"
+        "hide": "Ocultar"
       },
       "write": {
         "allow": "Permitido",
@@ -11078,9 +11076,9 @@
       "col_changed": "Modificado",
       "empty_title": "Este topic no tiene reglas para ocultar datos",
       "empty_text": "Cualquiera que pueda leer este topic ve los mensajes completos. Añade una regla para ocultar campos concretos.",
-      "blocked_title": "No se puede añadir una regla en este topic",
-      "blocked_text": "Este topic transporta contenido binario, así que no se conocen sus campos. Las reglas para ocultar datos funcionan con mensajes JSON, XML y HL7 v2.",
-      "keys_closed": "Los sistemas externos con clave de API no pueden usar este topic para {directions}: solo tiene reglas para sujetos concretos y ninguna para todos.",
+      "blocked_title": "Las reglas de este topic no se editan aquí",
+      "blocked_text": "Las reglas de este topic no se editan en esta pantalla porque su contenido es binario y no se puede leer como campos. Esta pantalla funciona con mensajes JSON, XML y HL7 v2. El tipo de contenido se fija al crear el topic.",
+      "keys_closed": "Los sistemas externos con clave de API tienen cerrado este topic para {directions}: solo hay reglas para personas, grupos o addons elegidos y ninguna para todos.",
       "sees_only": "Ve solo: {fields}",
       "sees_nothing": "No ve ningún campo",
       "hides_none": "No oculta ninguno de los campos conocidos",
@@ -11089,8 +11087,6 @@
       "writes_all": "Acepta todos los campos conocidos",
       "legend": {
         "hide": "El campo desaparece del mensaje.",
-        "mask": "Se ven los 3 últimos caracteres; el resto son asteriscos.",
-        "hash": "Una cadena de caracteres sustituye al valor, siempre la misma para el mismo valor.",
         "reject_name": "Rechazar el mensaje",
         "reject": "Al escribir: un mensaje con un campo no permitido, o sin uno obligatorio, no llega al topic.",
         "precedence": "La regla de una persona gana a la de su grupo, y esta a la de todos — las reglas no se suman."
@@ -11099,12 +11095,14 @@
         "empty": "Escribe el nombre de un campo.",
         "hl7_msh": "{name} contiene los separadores del propio mensaje — no se puede ocultar. Elige otro campo.",
         "hl7_shape": "«{name}» no es una dirección de campo HL7. Una dirección tiene la forma SEGMENTO-número, p. ej. PID-5.",
-        "xml_name": "«{name}» no es un nombre de elemento XML. Un nombre empieza por una letra o _ y no tiene espacios."
+        "xml_name": "«{name}» no es un nombre de elemento XML. Un nombre empieza por una letra o _ y no tiene espacios.",
+        "hl7_case": "«{name}» parece una errata. ¿Querías decir {suggestion}? La dirección se escribe en mayúsculas y con guion.",
+        "typed_known": "«{name}» está en la lista de campos con un ajuste distinto al escrito abajo. Déjalo en un solo sitio."
       },
       "need": {
-        "read": "Pon al menos un campo en «Ocultar». Una regla que no oculta nada no hace nada — para detenerla, elimínala.",
+        "read": "Pon al menos un campo en «Ocultar». La lista contiene todos los campos de este topic, así que una regla que los muestra todos no cambia nada: para detenerla, elimínala.",
         "read_typed": "Escribe al menos un campo que siga visible. Sin ningún campo visible, la regla ocultaría todo el mensaje.",
-        "write": "Pon al menos un campo en «Obligatorio» o «No permitido». Una regla que no comprueba nada no hace nada — para detenerla, elimínala.",
+        "write": "Pon al menos un campo en «Obligatorio» o «No permitido». La lista contiene todos los campos de este topic, así que una regla que lo permite todo no comprueba nada: para detenerla, elimínala.",
         "write_typed": "Escribe al menos un campo que se pueda escribir. Sin ningún campo permitido, la regla rechazaría todos los mensajes."
       },
       "impact": {
@@ -11112,19 +11110,25 @@
         "read_hidden": "Para «{who}» desaparecerán de los mensajes estos campos: {fields}.",
         "read_shown": "Para «{who}» aparecerán en los mensajes estos campos: {fields}.",
         "rest": "Los demás campos de la lista no cambian.",
-        "read_unlisted": "Los campos fuera de la lista también desaparecen, salvo que los escribas abajo.",
+        "read_unlisted": "Los campos que no están en la lista también desaparecen, salvo que los añadas.",
         "write_only": "Un mensaje de «{who}» solo se acepta con los campos: {fields}. Un mensaje con cualquier otro campo se rechaza.",
         "write_forbidden": "Un mensaje de «{who}» que contenga alguno de los campos {fields} se rechaza y no llega al topic.",
         "write_required": "Un mensaje de «{who}» al que le falte alguno de los campos {fields} se rechaza y no llega al topic.",
         "write_rest": "Se rechaza el mensaje entero, no solo el campo.",
-        "write_unlisted": "Un mensaje con un campo fuera de la lista también se rechaza, salvo que escribas ese campo abajo."
+        "write_unlisted": "Un mensaje con un campo que no está en la lista también se rechaza, salvo que añadas ese campo.",
+        "keys_closed": "Los sistemas externos con clave de API no podrán {action} este topic hasta que añadas una regla para todos.",
+        "read_unlisted_only": "Para «{who}», los campos que no están en la lista desaparecen. Todos los campos de la lista siguen visibles.",
+        "write_unlisted_only": "De «{who}» solo se acepta un mensaje con los campos de la lista. Un mensaje con cualquier otro campo se rechaza.",
+        "write_accepted": "Se aceptan los mensajes de «{who}» con los campos {fields}.",
+        "write_not_required": "A «{who}» ya no se le exigen estos campos: {fields}."
       },
       "fields_label": "Campos",
       "source": {
         "schema": "Los campos proceden del patrón de mensaje {name}, versión {version}.",
         "dictionary": "La lista contiene los campos HL7 v2 más habituales. Añade otro campo más abajo escribiendo su dirección.",
         "failed": "No se pudo leer el patrón de mensaje de este topic, así que no se conocen sus campos. Escribe abajo los campos que siguen visibles.",
-        "manual": "No se conocen los campos de este topic: ningún patrón de mensaje los enumera. Escribe abajo los campos que siguen visibles."
+        "manual": "No se conocen los campos de este topic: ningún patrón de mensaje los enumera. Escribe abajo los campos que siguen visibles.",
+        "complex": "El patrón de mensaje de este topic contiene campos que no se pueden enumerar a partir de él (una referencia a otro archivo o nombres de campo libres), así que no se conoce la lista completa. Escribe abajo los campos que siguen visibles."
       },
       "extra": {
         "shown": "Otros campos que siguen visibles",
@@ -11146,18 +11150,25 @@
         "save": "Guardar la regla",
         "who": "Para quién",
         "when": "Cuándo se aplica",
-        "any_hint": "La regla para todos se aplica a cualquiera sin una regla propia ni de su grupo. Es la única que encuentran los sistemas con clave de API.",
+        "any_hint": "La regla para todos se aplica a quien no tiene regla propia ni regla de su grupo. Los sistemas con clave de API solo están sujetos a esta regla.",
         "any_taken": "Ya existe una regla para todos de {direction}: cámbiala en su fila.",
-        "none_free": "Todos los de esta lista ya tienen una regla así en este topic (o la lista está vacía).",
+        "none_free": "Todos los de esta lista ya tienen una regla así en este topic.",
         "pick_hint": "La lista muestra personas, grupos o addons que aún no tienen una regla así.",
         "pick_first": "Elige para quién es la regla.",
         "taken": "Esta persona, grupo o addon ya tiene una regla de {direction}: cámbiala en su fila.",
-        "saved_title": "Regla guardada"
+        "saved_title": "Regla guardada",
+        "search": "Buscar en la lista",
+        "choose": "Elegir…",
+        "none_exist": {
+          "group": "Esta organización aún no tiene ningún grupo.",
+          "user": "Esta organización no tiene usuarios.",
+          "addon": "Ningún addon tiene acceso a esta instancia."
+        }
       },
       "change": {
         "button": "Cambiar",
         "window_title": "Regla para ocultar datos — {name}",
-        "fixed": "La regla pertenece a esta persona, grupo o addon y solo a este sentido: eso no cambia.",
+        "fixed": "La regla pertenece a esta persona, grupo o addon: eso no cambia.",
         "saved_title": "Cambio de la regla guardado"
       },
       "remove": {
@@ -11174,14 +11185,18 @@
         "part_nothing": "ningún campo está permitido",
         "part_none": "todos los campos conocidos están permitidos",
         "impact_title": "Qué pasa tras eliminarla:",
-        "impact_read": "Para «{who}» en el topic {topic} se aplicará la regla de un grupo o la regla para todos; si no hay ninguna, se verán los mensajes completos.",
-        "impact_write": "Los mensajes de «{who}» al topic {topic} se comprobarán con la regla de un grupo o la regla para todos; si no hay ninguna, no se comprobarán.",
         "impact_any_read": "Cualquiera sin una regla de lectura propia verá los mensajes completos en el topic {topic}.",
         "impact_any_write": "La escritura en el topic {topic} dejará de comprobarse para cualquiera sin una regla de escritura propia.",
-        "impact_keys": "Solo quedarán reglas para sujetos concretos, así que los sistemas externos con clave de API no podrán {action} este topic.",
+        "impact_keys": "Solo quedan reglas para personas, grupos o addons elegidos, así que los sistemas externos con clave de API no podrán {action} este topic.",
         "confirm": "Eliminar la regla",
         "saved_title": "Regla eliminada",
-        "saved_text": "Se eliminó la regla de {direction} para: {who}."
+        "saved_text": "Se eliminó la regla de {direction} para: {who}.",
+        "impact_read_user": "Para el usuario «{who}» en el topic {topic} pasa a aplicarse la regla de lectura de uno de sus grupos y, si ninguno la tiene, la regla para todos; si no hay ninguna, ve los mensajes completos.",
+        "impact_read_group": "Las personas del grupo «{who}» leen el topic {topic} según la regla de lectura de otro de sus grupos y, si no la tienen, según la regla para todos; si no hay ninguna, ven los mensajes completos.",
+        "impact_read_addon": "El addon «{who}» lee el topic {topic} según la regla para todos; si no la hay, ve los mensajes completos.",
+        "impact_write_user": "Los mensajes del usuario «{who}» al topic {topic} se comprueban con la regla de escritura de uno de sus grupos y, si ninguno la tiene, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
+        "impact_write_group": "Los mensajes de las personas del grupo «{who}» al topic {topic} se comprueban con la regla de escritura de otro de sus grupos y, si no la tienen, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
+        "impact_write_addon": "Los mensajes del addon «{who}» al topic {topic} se comprueban con la regla para todos; si no la hay, no se comprueban en absoluto."
       },
       "preview": {
         "button": "Vista previa de lo que ve…",
@@ -11205,8 +11220,12 @@
         "rules_title": "Qué hicieron las reglas",
         "summary_hidden": "Las reglas ocultaron {count} {n|campo|campos}: {fields}.",
         "summary_none": "Las reglas no ocultaron ningún campo de este mensaje.",
-        "limited_title": "Esta vista previa es más estrecha que lo que ve el sujeto elegido",
-        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura."
+        "limited_title": "Esta vista previa es más estrecha que la vista de la persona, el grupo o el addon elegido",
+        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
+        "limited_missing": "Aquí pueden faltar campos: {fields}. Si el mensaje los tiene, los oculta una regla que también se aplica a ti.",
+        "who_user": "usuario {name}",
+        "who_group": "grupo {name}",
+        "who_addon": "addon {name}"
       },
       "hl7": {
         "msh_3": "Aplicación emisora",
@@ -11269,8 +11288,17 @@
         "obx_14": "Fecha y hora del resultado",
         "dg1_3": "Código de diagnóstico",
         "dg1_4": "Descripción del diagnóstico",
-        "al1_3": "Alérgeno"
-      }
+        "al1_3": "Alérgeno",
+        "msh_8": "Seguridad",
+        "msh_11": "ID de procesamiento",
+        "msh_12": "Versión HL7"
+      },
+      "blocked_settings": "Abrir los ajustes del topic",
+      "blocked_preview": "La vista previa no está disponible: el contenido de este topic no se puede leer como campos.",
+      "writes_rest": "Otros campos o falta un campo obligatorio: rechazar el mensaje",
+      "fields_search": "Buscar campos",
+      "fields_none": "Ningún campo coincide con la búsqueda.",
+      "stale": "La regla ha cambiado mientras tanto. Hemos actualizado la lista: revísala e inténtalo de nuevo."
     }
   },
   "composer": {

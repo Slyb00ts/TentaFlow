@@ -383,7 +383,7 @@ test('the note after "Dodaj wzór" says what the server did: a new pattern, a ve
   assert.match(addedNotice({ subject: 'wizyta', schemaType: 'json_schema', version: 3, deduplicated: true }).text, /\(wersja 3\) — nic się nie zmieniło/);
 });
 
-test('Escape on a changed draft asks once; "Anuluj" leaves without asking', async () => {
+test('Escape on a changed draft asks once; "Anuluj" asks too', async () => {
   closeAll();
   const open = () => openSchemaAdd({ instanceId: 'i', schemaTypes: ['json_schema'], existingNames: () => [], register: async () => ({}), describeError: String, onAdded: () => {} });
   const win = open();
@@ -403,6 +403,9 @@ test('Escape on a changed draft asks once; "Anuluj" leaves without asking', asyn
 
   const cancelled = open();
   type(cancelled.querySelector('[data-role="name"]'), 'skierowanie');
+  cancelled.querySelector('[data-act="cancel"]').click();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(cancelled.isConnected, true, '"Anuluj" asks like the close button');
   cancelled.querySelector('[data-act="cancel"]').click();
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(cancelled.isConnected, false);

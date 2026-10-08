@@ -11049,9 +11049,7 @@
       "and_more": "und {count} weitere {n|Feld|Felder}",
       "action": {
         "show": "Anzeigen",
-        "hide": "Ausblenden",
-        "mask": "Maskieren",
-        "hash": "Hashen"
+        "hide": "Ausblenden"
       },
       "write": {
         "allow": "Erlaubt",
@@ -11078,9 +11076,9 @@
       "col_changed": "Geändert",
       "empty_title": "Dieses Topic hat keine Regeln zum Ausblenden von Daten",
       "empty_text": "Wer dieses Topic lesen darf, sieht die vollständigen Nachrichten. Fügen Sie eine Regel hinzu, um bestimmte Felder auszublenden.",
-      "blocked_title": "In diesem Topic kann keine Regel hinzugefügt werden",
-      "blocked_text": "Dieses Topic überträgt binäre Inhalte, daher sind seine Felder nicht bekannt. Regeln zum Ausblenden von Daten gelten für JSON-, XML- und HL7-v2-Nachrichten.",
-      "keys_closed": "Externe Systeme mit API-Schlüssel sind für dieses Topic beim {directions} gesperrt: Es gibt nur Regeln für ausgewählte Einträge und keine für alle.",
+      "blocked_title": "Regeln für dieses Topic werden hier nicht bearbeitet",
+      "blocked_text": "Regeln für dieses Topic werden auf diesem Bildschirm nicht bearbeitet, weil sein Inhalt binär ist und sich nicht als Felder lesen lässt. Dieser Bildschirm unterstützt JSON-, XML- und HL7-v2-Nachrichten. Die Art des Inhalts wird beim Erstellen des Topics festgelegt.",
+      "keys_closed": "Externe Systeme mit API-Schlüssel sind für dieses Topic im Bereich {directions} gesperrt: Es gibt nur Regeln für ausgewählte Personen, Gruppen oder Addons und keine Regel für alle.",
       "sees_only": "Sieht nur: {fields}",
       "sees_nothing": "Sieht kein Feld",
       "hides_none": "Blendet keines der bekannten Felder aus",
@@ -11089,8 +11087,6 @@
       "writes_all": "Akzeptiert alle bekannten Felder",
       "legend": {
         "hide": "Das Feld verschwindet aus der Nachricht.",
-        "mask": "Die letzten 3 Zeichen sind sichtbar, der Rest sind Sternchen.",
-        "hash": "Anstelle des Werts steht eine Zeichenfolge, für denselben Wert immer dieselbe.",
         "reject_name": "Nachricht ablehnen",
         "reject": "Beim Schreiben: Eine Nachricht mit einem nicht erlaubten Feld oder ohne ein erforderliches Feld gelangt nicht in das Topic.",
         "precedence": "Die Regel einer Person geht vor der Regel ihrer Gruppe, diese vor der Regel für alle — Regeln werden nicht addiert."
@@ -11099,12 +11095,14 @@
         "empty": "Geben Sie den Namen eines Felds ein.",
         "hl7_msh": "{name} enthält die Trennzeichen der Nachricht selbst — es kann nicht ausgeblendet werden. Wählen Sie ein anderes Feld.",
         "hl7_shape": "„{name}“ ist keine HL7-Feldadresse. Eine Adresse hat die Form SEGMENT-Nummer, z. B. PID-5.",
-        "xml_name": "„{name}“ ist kein XML-Elementname. Ein Name beginnt mit einem Buchstaben oder _ und enthält keine Leerzeichen."
+        "xml_name": "„{name}“ ist kein XML-Elementname. Ein Name beginnt mit einem Buchstaben oder _ und enthält keine Leerzeichen.",
+        "hl7_case": "„{name}“ sieht nach einem Tippfehler aus. Meinten Sie {suggestion}? Eine Adresse wird in Großbuchstaben und mit Bindestrich geschrieben.",
+        "typed_known": "„{name}“ steht in der Feldliste mit einer anderen Einstellung als der unten eingegebenen. Behalten Sie es nur an einer Stelle."
       },
       "need": {
-        "read": "Setzen Sie mindestens ein Feld auf „Ausblenden“. Eine Regel, die nichts ausblendet, bewirkt nichts — löschen Sie sie, um sie zu beenden.",
+        "read": "Setzen Sie mindestens ein Feld auf „Ausblenden“. Die Liste enthält alle Felder dieses Topics, daher ändert eine Regel, die alle anzeigt, nichts – löschen Sie sie, um sie zu beenden.",
         "read_typed": "Geben Sie mindestens ein Feld ein, das sichtbar bleibt. Ohne sichtbares Feld würde die Regel die ganze Nachricht ausblenden.",
-        "write": "Setzen Sie mindestens ein Feld auf „Erforderlich“ oder „Nicht erlaubt“. Eine Regel, die nichts prüft, bewirkt nichts — löschen Sie sie, um sie zu beenden.",
+        "write": "Setzen Sie mindestens ein Feld auf „Erforderlich“ oder „Nicht erlaubt“. Die Liste enthält alle Felder dieses Topics, daher prüft eine Regel, die alles erlaubt, nichts – löschen Sie sie, um sie zu beenden.",
         "write_typed": "Geben Sie mindestens ein Feld ein, das geschrieben werden darf. Ohne erlaubtes Feld würde die Regel jede Nachricht ablehnen."
       },
       "impact": {
@@ -11112,19 +11110,25 @@
         "read_hidden": "Für „{who}“ verschwinden diese Felder aus den Nachrichten: {fields}.",
         "read_shown": "Für „{who}“ erscheinen diese Felder in den Nachrichten: {fields}.",
         "rest": "Die übrigen Felder der Liste bleiben unverändert.",
-        "read_unlisted": "Felder außerhalb der Liste verschwinden ebenfalls, außer Sie geben sie unten ein.",
+        "read_unlisted": "Felder außerhalb der Liste verschwinden ebenfalls, es sei denn, Sie fügen sie hinzu.",
         "write_only": "Eine Nachricht von „{who}“ wird nur mit den Feldern {fields} angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
         "write_forbidden": "Eine Nachricht von „{who}“, die eines der Felder {fields} enthält, wird abgelehnt und gelangt nicht in das Topic.",
         "write_required": "Eine Nachricht von „{who}“, der eines der Felder {fields} fehlt, wird abgelehnt und gelangt nicht in das Topic.",
         "write_rest": "Abgelehnt wird die ganze Nachricht, nicht nur das Feld.",
-        "write_unlisted": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt, außer Sie geben dieses Feld unten ein."
+        "write_unlisted": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt, es sei denn, Sie fügen dieses Feld hinzu.",
+        "keys_closed": "Externe Systeme mit API-Schlüssel können dieses Topic nicht {action}, bis Sie eine Regel für alle hinzufügen.",
+        "read_unlisted_only": "Für „{who}“ verschwinden Felder außerhalb der Liste. Alle Felder der Liste bleiben sichtbar.",
+        "write_unlisted_only": "Von „{who}“ wird eine Nachricht nur mit den Feldern der Liste angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
+        "write_accepted": "Nachrichten von „{who}“ mit den Feldern {fields} werden angenommen.",
+        "write_not_required": "Von „{who}“ sind diese Felder nicht mehr erforderlich: {fields}."
       },
       "fields_label": "Felder",
       "source": {
         "schema": "Die Felder stammen aus dem Nachrichtenmuster {name}, Version {version}.",
         "dictionary": "Die Liste enthält die häufigsten HL7-v2-Felder. Weitere Felder fügen Sie unten über ihre Adresse hinzu.",
         "failed": "Das Nachrichtenmuster dieses Topics konnte nicht gelesen werden, daher sind seine Felder nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben.",
-        "manual": "Die Felder dieses Topics sind nicht bekannt — kein Nachrichtenmuster nennt sie. Geben Sie unten die Felder ein, die sichtbar bleiben."
+        "manual": "Die Felder dieses Topics sind nicht bekannt — kein Nachrichtenmuster nennt sie. Geben Sie unten die Felder ein, die sichtbar bleiben.",
+        "complex": "Das Nachrichtenmuster dieses Topics enthält Felder, die sich daraus nicht auflisten lassen (Verweis auf eine andere Datei oder frei gewählte Feldnamen), daher ist die vollständige Liste nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben."
       },
       "extra": {
         "shown": "Weitere Felder, die sichtbar bleiben",
@@ -11146,18 +11150,25 @@
         "save": "Regel speichern",
         "who": "Für wen",
         "when": "Wann sie gilt",
-        "any_hint": "Die Regel für alle gilt für jeden ohne eigene Regel und ohne Regel der eigenen Gruppe. Nur sie betrifft Systeme mit API-Schlüssel.",
+        "any_hint": "Die Regel für alle gilt für jeden ohne eigene Regel und ohne Regel seiner Gruppe. Systeme mit API-Schlüssel unterliegen nur dieser Regel.",
         "any_taken": "Eine Regel für alle zum {direction} gibt es schon — ändern Sie sie in ihrer Zeile.",
-        "none_free": "Jeder in dieser Liste hat in diesem Topic bereits eine solche Regel (oder die Liste ist leer).",
+        "none_free": "Jeder aus dieser Liste hat in diesem Topic bereits eine solche Regel.",
         "pick_hint": "Die Liste zeigt Personen, Gruppen oder Addons, die noch keine solche Regel haben.",
         "pick_first": "Wählen Sie, für wen die Regel gilt.",
         "taken": "Diese Person, Gruppe oder dieses Addon hat bereits eine Regel zum {direction} — ändern Sie sie in ihrer Zeile.",
-        "saved_title": "Regel gespeichert"
+        "saved_title": "Regel gespeichert",
+        "search": "In der Liste suchen",
+        "choose": "Auswählen…",
+        "none_exist": {
+          "group": "In dieser Organisation gibt es noch keine Gruppen.",
+          "user": "In dieser Organisation gibt es keine Benutzer.",
+          "addon": "Kein Addon hat Zugriff auf diese Instanz."
+        }
       },
       "change": {
         "button": "Ändern",
         "window_title": "Regel zum Ausblenden von Daten — {name}",
-        "fixed": "Die Regel gehört zu dieser Person, Gruppe oder diesem Addon und gilt nur für diese Richtung — das ändert sich nicht.",
+        "fixed": "Die Regel gehört zu dieser Person, Gruppe oder diesem Addon – das ändert sich nicht.",
         "saved_title": "Regeländerung gespeichert"
       },
       "remove": {
@@ -11174,14 +11185,18 @@
         "part_nothing": "kein Feld ist erlaubt",
         "part_none": "alle bekannten Felder sind erlaubt",
         "impact_title": "Was nach dem Löschen geschieht:",
-        "impact_read": "Für „{who}“ gilt im Topic {topic} stattdessen die Regel einer Gruppe oder die Regel für alle; gibt es keine, sind die Nachrichten vollständig zu sehen.",
-        "impact_write": "Nachrichten von „{who}“ an das Topic {topic} werden nach der Regel einer Gruppe oder der Regel für alle geprüft; gibt es keine, werden sie gar nicht geprüft.",
         "impact_any_read": "Jeder ohne eigene Leseregel sieht im Topic {topic} vollständige Nachrichten.",
         "impact_any_write": "Das Schreiben in das Topic {topic} wird bei jedem ohne eigene Schreibregel nicht mehr geprüft.",
-        "impact_keys": "Es bleiben nur Regeln für ausgewählte Einträge, daher können externe Systeme mit API-Schlüssel dieses Topic nicht mehr {action}.",
+        "impact_keys": "Es bleiben nur Regeln für ausgewählte Personen, Gruppen oder Addons, daher können externe Systeme mit API-Schlüssel dieses Topic nicht {action}.",
         "confirm": "Regel löschen",
         "saved_title": "Regel gelöscht",
-        "saved_text": "Die Regel zum {direction} für: {who} wurde gelöscht."
+        "saved_text": "Die Regel zum {direction} für: {who} wurde gelöscht.",
+        "impact_read_user": "Für den Benutzer „{who}“ im Topic {topic} gilt stattdessen die Leseregel einer seiner Gruppen, hat keine eine, die Regel für alle; gibt es keine, sieht er ganze Nachrichten.",
+        "impact_read_group": "Personen der Gruppe „{who}“ lesen das Topic {topic} nach der Leseregel einer ihrer anderen Gruppen, haben sie keine, nach der Regel für alle; gibt es keine, sehen sie ganze Nachrichten.",
+        "impact_read_addon": "Das Addon „{who}“ liest das Topic {topic} nach der Regel für alle; gibt es keine, sieht es ganze Nachrichten.",
+        "impact_write_user": "Nachrichten des Benutzers „{who}“ an das Topic {topic} werden nach der Schreibregel einer seiner Gruppen geprüft, hat keine eine, nach der Regel für alle; gibt es keine, werden sie gar nicht geprüft.",
+        "impact_write_group": "Nachrichten von Personen der Gruppe „{who}“ an das Topic {topic} werden nach der Schreibregel einer ihrer anderen Gruppen geprüft, haben sie keine, nach der Regel für alle; gibt es keine, werden sie gar nicht geprüft.",
+        "impact_write_addon": "Nachrichten des Addons „{who}“ an das Topic {topic} werden nach der Regel für alle geprüft; gibt es keine, werden sie gar nicht geprüft."
       },
       "preview": {
         "button": "Vorschau: So sieht es …",
@@ -11205,8 +11220,12 @@
         "rules_title": "Was die Regeln bewirkt haben",
         "summary_hidden": "Die Regeln haben {count} {n|Feld|Felder} ausgeblendet: {fields}.",
         "summary_none": "Die Regeln haben kein Feld dieser Nachricht ausgeblendet.",
-        "limited_title": "Cet aperçu est plus étroit que ce que voit le sujet choisi",
-        "limited_text": "Eine Leseregel, die auch für Sie gilt (Ihre eigene, die Ihrer Gruppe oder die für alle), blendet Felder aus, die dieser Eintrag sieht: {who}. Eine Vorschau zeigt nie mehr, als Sie selbst sehen können, daher fehlen diese Felder hier. Die vollständige Sicht erscheint, wenn für Sie keine Leseregel gilt."
+        "limited_title": "Diese Vorschau ist enger als die Ansicht der gewählten Person, Gruppe oder des gewählten Addons",
+        "limited_text": "Eine Leseregel, die auch für Sie gilt (Ihre eigene, die Ihrer Gruppe oder die für alle), blendet Felder aus, die dieser Eintrag sieht: {who}. Eine Vorschau zeigt nie mehr, als Sie selbst sehen können, daher fehlen diese Felder hier. Die vollständige Sicht erscheint, wenn für Sie keine Leseregel gilt.",
+        "limited_missing": "Hier können Felder fehlen: {fields}. Enthält die Nachricht sie, blendet sie eine Regel aus, die auch für Sie gilt.",
+        "who_user": "Benutzer {name}",
+        "who_group": "Gruppe {name}",
+        "who_addon": "Addon {name}"
       },
       "hl7": {
         "msh_3": "Sendende Anwendung",
@@ -11269,8 +11288,17 @@
         "obx_14": "Datum und Uhrzeit des Ergebnisses",
         "dg1_3": "Diagnosecode",
         "dg1_4": "Diagnosebeschreibung",
-        "al1_3": "Allergen"
-      }
+        "al1_3": "Allergen",
+        "msh_8": "Sicherheit",
+        "msh_11": "Verarbeitungs-ID",
+        "msh_12": "HL7-Version"
+      },
+      "blocked_settings": "Topic-Einstellungen öffnen",
+      "blocked_preview": "Die Vorschau ist nicht verfügbar: Der Inhalt dieses Topics lässt sich nicht als Felder lesen.",
+      "writes_rest": "Andere Felder oder ein fehlendes Pflichtfeld: Nachricht ablehnen",
+      "fields_search": "Felder suchen",
+      "fields_none": "Kein Feld passt zur Suche.",
+      "stale": "Die Regel hat sich in der Zwischenzeit geändert. Die Liste wurde aktualisiert – prüfen Sie sie und versuchen Sie es erneut."
     }
   },
   "composer": {

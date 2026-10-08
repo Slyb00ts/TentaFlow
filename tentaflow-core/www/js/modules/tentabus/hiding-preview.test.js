@@ -4,8 +4,9 @@
 // message of the busiest partition, asks for the record as the chosen subject
 // reads it (the exact FieldPolicyPreviewRequest), shows the record with the
 // hidden fields named and marked, says that every preview is audited, and
-// explains a preview narrowed by the administrator's own rule instead of
-// presenting it as the subject's view.
+// explains a preview narrowed by the administrator's own rule (naming the
+// fields that may be missing because of it) instead of presenting it as the
+// subject's view; the answer goes when the subject or the message changes.
 // =============================================================================
 
 import { window } from './_test-setup.js';
@@ -14,7 +15,7 @@ import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
-const { openHidingPreview, previewResultHtml, whoPhrase, displayPayload } = await import('./hiding-preview.js');
+const { openHidingPreview, previewResultHtml, whoPhrase, displayPayload, missingFields } = await import('./hiding-preview.js');
 const { fieldSource } = await import('./topic-hiding.js');
 const { newestOffset } = await import('./message-preview.js');
 
@@ -87,11 +88,31 @@ test('a preview narrowed by the administrator\'s own rule says so, in plain word
   host.innerHTML = html;
   const limited = host.querySelector('[data-role="limited"]');
   assert.equal(limited.getAttribute('tone'), 'warning');
-  assert.equal(limited.getAttribute('title'), 'Ten podgląd jest węższy niż widok wybranego podmiotu');
+  assert.equal(limited.getAttribute('title'), 'Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu');
   assert.equal(limited.getAttribute('message'),
     'Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: addon Asystent lekarza. '
     + 'Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.');
   assert.ok(html.indexOf('data-role="limited"') < html.indexOf('tb-preview-record'), 'the explanation comes before the record it qualifies');
+});
+
+test('a narrowed preview names the known fields that are neither in the record nor in the answer — the administrator\'s own rule may hide them', () => {
+  const narrowed = { record: { ...record, payloadPreview: bytes('{"pacjent":"x"}') }, applied: [{ field: 'pacjent', action: 'show' }], limitedByCaller: true };
+  assert.deepEqual(missingFields({ resp: narrowed, source: json }), ['lekarz', 'powod']);
+  const host = document.createElement('div');
+  host.innerHTML = previewResultHtml({ resp: narrowed, subject: { subjectType: 'group', label: 'Rejestracja' }, source: json, nowMs: NOW });
+  assert.match(host.querySelector('[data-role="limited"]').getAttribute('message'),
+    / Mogą tu brakować pól: lekarz, powod\. Jeśli wiadomość je zawiera, ukrywa je zasada, która obowiązuje także Ciebie\.$/);
+  const full = previewResultHtml({ resp: { ...narrowed, limitedByCaller: false }, subject: { subjectType: 'group', label: 'Rejestracja' }, source: json, nowMs: NOW });
+  assert.doesNotMatch(full, /Mogą tu brakować/, 'only a narrowed preview has anything to explain');
+  assert.deepEqual(missingFields({ resp: narrowed, source: fieldSource({ format: 'hl7v2', schema: null }) }), [], 'a dictionary lists what most messages carry, not what this one should');
+  const empty = { ...narrowed, record: { ...record, payloadPreview: bytes('{}') }, applied: [] };
+  assert.deepEqual(missingFields({ resp: empty, source: json }), ['pacjent', 'lekarz', 'powod'], 'an empty record does not look like a full one');
+});
+
+test('each kind of subject is named by its own template', () => {
+  for (const [kind, label, expected] of [['group', 'Księgowość', 'grupa Księgowość'], ['user', 'Ewa', 'użytkownik Ewa'], ['addon', 'Bot', 'addon Bot']]) {
+    assert.equal(whoPhrase({ subjectType: kind, label }), expected);
+  }
 });
 
 function open(overrides = {}) {
@@ -130,8 +151,11 @@ test('"Pokaż" sends the exact request for the chosen subject and message and sh
   const { win, previews } = open();
   await tick();
   const show = win.querySelector('[data-act="show"]');
-  assert.equal(show.hasAttribute('disabled'), false, 'a group is chosen by default');
+  assert.equal(win.querySelector('[data-role="subject"]').value, '', 'nobody is chosen for the administrator');
+  assert.ok(show.hasAttribute('disabled'), 'until someone is chosen there is nothing to ask');
+  assert.equal(norm(win.querySelector('.tb-pick-box label').textContent), 'Szukaj na liście');
   pick(win.querySelector('[data-role="subject"]'), 'group:g-rej');
+  assert.equal(show.hasAttribute('disabled'), false);
   win.querySelector('[data-role="offset"]').value = '41';
   win.querySelector('[data-role="offset"]').dispatchEvent(new CustomEvent('input', { bubbles: true }));
   pick(win.querySelector('[data-role="partition"]'), '1');
@@ -169,6 +193,7 @@ test('a message that is not there, or a refusal, is said in the window; a previe
   closeAll();
   const failing = open({ preview: async () => { throw new Error('bus.record_not_found'); } });
   await tick();
+  pick(failing.win.querySelector('[data-role="subject"]'), 'group:g-rej');
   failing.win.querySelector('[data-act="show"]').click();
   await tick();
   assert.equal(norm(failing.win.querySelector('[data-role="error"]').textContent), 'błąd: bus.record_not_found');
@@ -176,6 +201,7 @@ test('a message that is not there, or a refusal, is said in the window; a previe
   closeAll();
   const narrowed = open({ preview: async () => ({ ...RESPONSE, limitedByCaller: true }) });
   await tick();
+  pick(narrowed.win.querySelector('[data-role="subject"]'), 'group:g-rej');
   narrowed.win.querySelector('[data-act="show"]').click();
   await tick();
   assert.ok(narrowed.win.querySelector('[data-role="result"] tf-alert[data-role="limited"]'));
@@ -186,10 +212,67 @@ test('a topic\'s partition list that cannot be read leaves the window usable on 
   const { win, previews } = open({ loadPartitions: async () => { throw new Error('nope'); } });
   await tick();
   assert.equal(win.querySelector('[data-role="offset"]').value, '');
+  pick(win.querySelector('[data-role="subject"]'), 'group:g-rej');
   assert.ok(win.querySelector('[data-act="show"]').hasAttribute('disabled'), 'no number, nothing to ask');
   win.querySelector('[data-role="offset"]').value = '7';
   win.querySelector('[data-role="offset"]').dispatchEvent(new CustomEvent('input', { bubbles: true }));
   win.querySelector('[data-act="show"]').click();
   await tick();
   assert.deepEqual([previews[0].partition, previews[0].offset], [0, 7]);
+});
+
+test('the answer goes when the subject or the message changes, and an answer still on its way is dropped', async () => {
+  closeAll();
+  const { win, previews } = open();
+  await tick();
+  const result = () => win.querySelector('[data-role="result"]');
+  const ask = async () => {
+    win.querySelector('[data-act="show"]').click();
+    await tick();
+  };
+  pick(win.querySelector('[data-role="subject"]'), 'group:g-rej');
+  await ask();
+  assert.ok(result().querySelector('.tb-preview-record'));
+  pick(win.querySelector('[data-role="subject"]'), 'group:g-ksieg');
+  assert.equal(result().textContent.trim(), '', 'another subject: the old answer is not left under the new name');
+  await ask();
+  assert.ok(result().querySelector('.tb-preview-record'));
+  win.querySelector('[data-role="offset"]').value = '12';
+  win.querySelector('[data-role="offset"]').dispatchEvent(new CustomEvent('input', { bubbles: true }));
+  assert.equal(result().textContent.trim(), '', 'another message');
+  await ask();
+  pick(win.querySelector('[data-role="partition"]'), '0');
+  assert.equal(result().textContent.trim(), '', 'another partition');
+  assert.equal(previews.length, 3);
+});
+
+test('an answer that arrives after the subject changed, or after the window closed, paints nothing', async () => {
+  closeAll();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { win } = open({ preview: async () => { await gate; return RESPONSE; } });
+  await tick();
+  pick(win.querySelector('[data-role="subject"]'), 'group:g-rej');
+  win.querySelector('[data-act="show"]').click();
+  await tick();
+  assert.ok(win.querySelector('[data-role="result"] tf-spinner'));
+  pick(win.querySelector('[data-role="subject"]'), 'group:g-ksieg');
+  release();
+  await tick();
+  assert.equal(win.querySelector('[data-role="result"]').textContent.trim(), '', 'the answer was for the other subject');
+  assert.equal(win.querySelector('[data-act="show"]').hasAttribute('disabled'), false, 'the button is free again');
+
+  closeAll();
+  let late;
+  const second = new Promise((r) => { late = r; });
+  const closed = open({ preview: async () => { await second; return RESPONSE; } });
+  await tick();
+  pick(closed.win.querySelector('[data-role="subject"]'), 'group:g-rej');
+  closed.win.querySelector('[data-act="show"]').click();
+  await tick();
+  closed.win.remove();
+  late();
+  await tick();
+  assert.equal(closed.win.isConnected, false);
+  assert.equal(closed.win.querySelector('[data-role="result"]').textContent.includes('Tak widzi ją'), false, 'a window that is gone gets no answer');
 });

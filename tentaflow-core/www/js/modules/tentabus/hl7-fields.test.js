@@ -2,7 +2,8 @@
 // File: modules/tentabus/hl7-fields.test.js
 // Description: The HL7 v2 dictionary of the data-hiding window: every entry is
 // an address the server accepts, none is a separator field, and each has a
-// plain name in all five languages.
+// plain name in all five languages; the unnamed positions of the same segments
+// are allowed by default, so a message's own MSH-11 or PID-4 is never refused.
 // =============================================================================
 
 import { WWW_ROOT } from './_test-setup.js';
@@ -11,7 +12,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const { HL7_FIELDS, hl7FieldLabel, hl7LabelKey } = await import('./hl7-fields.js');
+const { HL7_FIELDS, HL7_IMPLICIT_FIELDS, hl7FieldLabel, hl7LabelKey } = await import('./hl7-fields.js');
 const { fieldNameProblem } = await import('./topic-hiding.js');
 
 const LOCALES = ['pl', 'en', 'de', 'es', 'fr'];
@@ -44,4 +45,13 @@ test('a name comes from the dictionary only; another address has none', () => {
   assert.equal(hl7FieldLabel('OBX-8'), 'Znaczniki nieprawidłowego wyniku');
   assert.equal(hl7FieldLabel('PID-31'), '');
   assert.equal(hl7FieldLabel('pacjent'), '');
+});
+
+test('the unnamed positions of the dictionary\'s segments are allowed by default: set-ids, EVN, the rest of MSH — never the separators', () => {
+  assert.equal(new Set(HL7_IMPLICIT_FIELDS).size, HL7_IMPLICIT_FIELDS.length);
+  for (const address of HL7_IMPLICIT_FIELDS) assert.equal(fieldNameProblem('hl7v2', address), null, address);
+  for (const must of ['MSH-13', 'PID-1', 'PID-4', 'PID-9', 'PV1-1', 'OBX-1', 'EVN-1', 'EVN-2', 'NTE-3']) assert.ok(HL7_IMPLICIT_FIELDS.includes(must), must);
+  assert.ok(HL7_IMPLICIT_FIELDS.every((a) => !HL7_FIELDS.includes(a)), 'a named field is a row, not an implicit position');
+  assert.ok(['MSH-1', 'MSH-2'].every((a) => !HL7_IMPLICIT_FIELDS.includes(a)));
+  assert.ok(['MSH-8', 'MSH-11', 'MSH-12'].every((a) => HL7_FIELDS.includes(a)), 'the structural fields every message carries have rows');
 });

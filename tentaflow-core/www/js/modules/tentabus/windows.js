@@ -48,9 +48,8 @@ export function windowEl({ title, icon, width, cls }) {
  * the save unlocks only once the draft differs from it. `problem(draft)`, when
  * given, names what the draft still lacks (nobody picked, no right set): the
  * sentence stands in for the impact and the save stays locked. "Popraw zaznaczone
- * pole" is said only once a field is actually marked. The close button and
- * Escape ask once before dropping a changed draft ("Anuluj" is the explicit
- * way out and never asks).
+ * pole" is said only once a field is actually marked. The close button, Escape
+ * and "Anuluj" all ask once before dropping a changed draft.
  */
 export function openChangeWindow({
   title, icon, width = 620, cls = 'tb-change-window', fields, wire, draft, current, impact,
@@ -120,7 +119,7 @@ export function openChangeWindow({
   win.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn || btn.hasAttribute('disabled')) return;
-    if (btn.dataset.act === 'cancel') { win.close(true); return; }
+    if (btn.dataset.act === 'cancel') { win.close(); return; }
     if (btn.dataset.act !== 'save') return;
     const d = draft(win);
     if (!changed(d) || (problem && problem(d))) return;

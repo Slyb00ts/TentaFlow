@@ -6,8 +6,10 @@
 // come from (a JSON Schema's properties, the HL7 v2 dictionary, typed in);
 // the form of a rule and the exact FieldPolicySet request built from it; the
 // "Co się stanie" sentences in the mockups' words; the section in its states
-// (loading, error with retry, empty, blocked, filled) and the legend, whose
-// "zamaskuj" and "zahaszuj" appear only when the server offers them.
+// (loading, error with retry, empty, blocked, filled) and the legend. A real
+// HL7 message is run through the default form the way the server reads its
+// fields, so a rule built from the dictionary cannot refuse an ordinary
+// message.
 // =============================================================================
 
 import { window } from './_test-setup.js';
@@ -17,9 +19,9 @@ import assert from 'node:assert/strict';
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
 const {
-  policyRows, policyKey, whoTitle, whoSub, hidingCount, topicFormat, jsonSchemaFields, fieldSource, fieldLabel, fieldPhrase, fieldNameProblem,
-  ruleFacts, ruleTableRow, readActionList, actionOptions, blankForm, formFromRule, serializeForm, parseForm, buildPolicyRequest, formProblem,
-  ruleImpact, legendHtml, directionsClosedToKeys, paintHidingSection,
+  policyRows, policyKey, whoTitle, whoSub, hidingCount, topicFormat, readJsonSchema, fieldSource, fieldLabel, fieldPhrase, fieldNameProblem, hl7Suggestion,
+  ruleFacts, ruleTableRow, actionOptions, blankForm, formFromRule, serializeForm, parseForm, buildPolicyRequest, formProblem,
+  ruleImpact, legendHtml, directionsClosedToKeys, closesTopicToKeys, paintHidingSection,
 } = await import('./topic-hiding.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -86,7 +88,7 @@ test('a rule\'s row: who, what it hides with the plain name of each field, when 
   assert.equal(row._key, 'addon:asystent:read');
   assert.equal(words(ruleTableRow(group, json, NOW).what), 'powod Ukryj powód wizyty');
   assert.equal(ruleTableRow(group, json, NOW).changed, 'wczoraj 12:00');
-  assert.equal(words(ruleTableRow(everyone, json, NOW).what), 'pacjent Wymagane dane pacjenta termin Wymagane powod Niedozwolone powód wizyty', 'a write rule names what it requires and what it refuses');
+  assert.equal(words(ruleTableRow(everyone, json, NOW).what), 'pacjent Wymagane dane pacjenta termin Wymagane powod Niedozwolone powód wizyty Inne pola albo brak wymaganych: odrzuć wiadomość', 'a write rule names what it requires and what it refuses, and that the rest is refused');
   assert.equal(words(ruleTableRow(everyone, json, NOW).when), 'Zapis');
 });
 
@@ -99,24 +101,51 @@ test('a cell names three fields and counts the rest; a rule that hides nothing s
   assert.equal(words(ruleTableRow(many, typed, NOW).what), 'Nie widzi żadnego pola');
   assert.equal(words(ruleTableRow(policyRows(POLICIES)[2], typed, NOW).what), 'Widzi tylko: lekarz');
   const writeBlind = { ...policyRows(POLICIES)[0], fields: ['id', 'nazwisko'], requiredFields: ['id'] };
-  assert.equal(words(ruleTableRow(writeBlind, typed, NOW).what), 'Może zapisać tylko: id, nazwisko id Wymagane');
+  assert.equal(words(ruleTableRow(writeBlind, typed, NOW).what), 'Może zapisać tylko: id, nazwisko id Wymagane Inne pola albo brak wymaganych: odrzuć wiadomość');
 });
 
 // ---------------------------------------------------------------------------
 // The fields a rule can name
 // ---------------------------------------------------------------------------
 
-test('a JSON Schema gives its top-level properties in the order it writes them, named by title or description; a branch of allOf counts', () => {
-  assert.deepEqual(jsonSchemaFields(VISIT_SCHEMA), [
+test('a JSON Schema gives its properties in the order it writes them, named by title or description; a branch of allOf counts', () => {
+  assert.deepEqual(readJsonSchema(VISIT_SCHEMA).fields, [
     { name: 'pacjent', label: 'dane pacjenta' },
     { name: 'lekarz', label: 'Lekarz prowadzący wizytę' },
     { name: 'termin', label: '' },
     { name: 'powod', label: 'powód wizyty' },
   ]);
-  assert.deepEqual(jsonSchemaFields(JSON.stringify({ allOf: [{ properties: { a: {} } }, { properties: { b: { title: 'B' }, a: { title: 'ignored' } } }] })).map((f) => [f.name, f.label]), [['a', ''], ['b', 'B']]);
-  assert.deepEqual(jsonSchemaFields('{"type":"object"}'), []);
-  assert.deepEqual(jsonSchemaFields('not json'), []);
-  assert.equal(jsonSchemaFields(JSON.stringify({ properties: { x: { description: 'a'.repeat(200) } } }))[0].label.length, 70, 'a long description is cut');
+  assert.deepEqual(readJsonSchema(JSON.stringify({ allOf: [{ properties: { a: {} } }, { properties: { b: { title: 'B' }, a: { title: 'ignored' } } }] })).fields.map((f) => [f.name, f.label]), [['a', ''], ['b', 'B']]);
+  assert.deepEqual(readJsonSchema('{"type":"object"}').fields, []);
+  assert.deepEqual(readJsonSchema('not json'), { fields: [], complex: false, closed: false });
+  assert.equal(readJsonSchema(JSON.stringify({ properties: { x: { description: 'a'.repeat(200) } } })).fields[0].label.length, 70, 'a long description is cut');
+});
+
+test('properties are found through oneOf, anyOf, if / then / else and local $ref (#/$defs, #/definitions), each once', () => {
+  const names = (schema) => readJsonSchema(JSON.stringify(schema)).fields.map((f) => f.name);
+  assert.deepEqual(names({ properties: { id: {} }, oneOf: [{ properties: { a: {} } }, { properties: { b: {} } }] }), ['id', 'a', 'b']);
+  assert.deepEqual(names({ anyOf: [{ properties: { c: {} } }], properties: { id: {} } }), ['id', 'c']);
+  assert.deepEqual(names({ if: { properties: { kind: {} } }, then: { properties: { t: {} } }, else: { properties: { e: {} } } }), ['kind', 't', 'e']);
+  assert.deepEqual(names({ $ref: '#/$defs/visit', $defs: { visit: { properties: { pacjent: {}, lekarz: {} } } } }), ['pacjent', 'lekarz']);
+  assert.deepEqual(names({ allOf: [{ $ref: '#/definitions/base' }], definitions: { base: { properties: { id: {} } } } }), ['id']);
+  assert.deepEqual(names({ $ref: '#/$defs/a%20b', $defs: { 'a b': { properties: { x: {} } } } }), ['x'], 'a pointer is decoded');
+  const loop = { $ref: '#/$defs/n', $defs: { n: { properties: { v: {} }, allOf: [{ $ref: '#/$defs/n' }] } } };
+  assert.deepEqual(readJsonSchema(JSON.stringify(loop)), { fields: [{ name: 'v', label: '' }], complex: false, closed: false }, 'a reference to itself does not loop');
+});
+
+test('a pattern with fields the walk cannot list is "complex": the list would be incomplete, so the fields are typed in', () => {
+  const complexOf = (schema) => readJsonSchema(JSON.stringify(schema)).complex;
+  assert.equal(complexOf({ properties: { a: {} }, $ref: 'https://example.com/other.json' }), true, 'a remote $ref');
+  assert.equal(complexOf({ properties: { a: {} }, $ref: '#/$defs/missing' }), true, 'a $ref to nothing');
+  assert.equal(complexOf({ properties: { a: {} }, patternProperties: { '^x_': {} } }), true);
+  assert.equal(complexOf({ properties: { a: {} }, additionalProperties: { type: 'string' } }), true);
+  assert.equal(complexOf({ properties: { a: {} }, additionalProperties: false }), false);
+  assert.equal(complexOf({ properties: { a: {} }, additionalProperties: true }), false);
+  const source = fieldSource({ format: 'json', schema: { subject: 's', version: 2, text: JSON.stringify({ properties: { a: {} }, patternProperties: { '^x_': {} } }) } });
+  assert.deepEqual([source.mode, source.fields, source.complex], ['manual', [], true]);
+  const closed = fieldSource({ format: 'json', schema: { subject: 's', version: 2, text: JSON.stringify({ properties: { a: {} }, additionalProperties: false }) } });
+  assert.deepEqual([closed.mode, closed.complete], ['schema', true]);
+  assert.equal(json.complete, false, 'a pattern that does not close itself may be followed by other fields');
 });
 
 test('where the known fields come from: the pattern, the HL7 dictionary, or nowhere (typed in); binary content has none', () => {
@@ -125,7 +154,7 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(hl7.mode, 'dictionary');
   assert.ok(hl7.fields.length >= 55);
   assert.deepEqual(hl7.fields.find((f) => f.name === 'PID-5'), { name: 'PID-5', label: 'Imię i nazwisko pacjenta' });
-  assert.deepEqual(typed, { mode: 'manual', fields: [], failed: false });
+  assert.deepEqual(typed, { mode: 'manual', fields: [], implicit: [], complete: false, failed: false, complex: false });
   assert.equal(fieldSource({ format: 'json', schema: null }).mode, 'manual');
   assert.equal(fieldSource({ format: 'json', schema: { failed: true } }).failed, true, 'a pattern that could not be read is said so');
   assert.equal(fieldSource({ format: 'json', schema: { subject: 's', version: 1, text: '{"type":"object"}' } }).mode, 'manual', 'a pattern without properties lists nothing');
@@ -144,7 +173,11 @@ test('an address the server would refuse is refused before the request: HL7 SEGM
   assert.equal(fieldNameProblem('hl7v2', 'ZX1-12'), null);
   assert.equal(fieldNameProblem('hl7v2', 'MSH-1'), 'hl7_msh');
   assert.equal(fieldNameProblem('hl7v2', 'MSH-2'), 'hl7_msh');
-  for (const bad of ['PID', 'PID-0', 'PID-05', 'pid-5', 'PIDX-5', 'PI-5', 'PID-5.1', 'PID-a']) assert.equal(fieldNameProblem('hl7v2', bad), 'hl7_shape', bad);
+  for (const bad of ['PID', 'PID-0', 'PID-05', 'PIDX-5', 'PI-5', 'PID-5.1', 'PID-a']) assert.equal(fieldNameProblem('hl7v2', bad), 'hl7_shape', bad);
+  for (const typo of ['pid-5', 'pid5', 'PID5']) assert.equal(fieldNameProblem('hl7v2', typo), 'hl7_case', typo);
+  assert.equal(hl7Suggestion('pid5'), 'PID-5');
+  assert.equal(hl7Suggestion('msh1'), null, 'the separator field is no suggestion');
+  assert.equal(hl7Suggestion('PID-0'), null);
   assert.equal(fieldNameProblem('xml', 'pacjent'), null);
   assert.equal(fieldNameProblem('xml', 'ns:tag'), null);
   assert.equal(fieldNameProblem('xml', '_x-1.y'), null);
@@ -161,19 +194,20 @@ test('a new reading rule shows every known field; a stored one is read back as h
   assert.deepEqual(blankForm('read', json).actions, { pacjent: 'show', lekarz: 'show', termin: 'show', powod: 'show' });
   assert.deepEqual(blankForm('write', json).actions, { pacjent: 'allow', lekarz: 'allow', termin: 'allow', powod: 'allow' });
   const rule = { ...policyRows(POLICIES)[3], fields: ['lekarz', 'pacjent', 'powod', 'telefon'] };
-  assert.deepEqual(formFromRule(rule, json), { actions: { pacjent: 'show', lekarz: 'show', termin: 'hide', powod: 'show' }, extraShown: ['telefon'], extraRequired: [] });
+  assert.deepEqual(formFromRule(rule, json), { actions: { pacjent: 'show', lekarz: 'show', termin: 'hide', powod: 'show' }, extraShown: ['telefon'], extraRequired: [], hiddenImplicit: [] });
   const writeRule = { ...policyRows(POLICIES)[0], fields: ['lekarz', 'pacjent', 'termin', 'x', 'y'], requiredFields: ['pacjent', 'y'] };
   assert.deepEqual(formFromRule(writeRule, json), {
     actions: { pacjent: 'require', lekarz: 'allow', termin: 'allow', powod: 'forbid' },
     extraShown: ['x'],
     extraRequired: ['y'],
+    hiddenImplicit: [],
   });
 });
 
 test('a form travels as one string and comes back; text that is not a form is refused', () => {
-  const form = { actions: { pacjent: 'show', lekarz: 'hide', termin: 'show', powod: 'show' }, extraShown: ['b', 'a', 'a'], extraRequired: [] };
+  const form = { actions: { pacjent: 'show', lekarz: 'hide', termin: 'show', powod: 'show' }, extraShown: ['b', 'a', 'a'], extraRequired: [], hiddenImplicit: ['PID-4'] };
   const text = serializeForm(form, json);
-  assert.deepEqual(parseForm(text, json), { actions: form.actions, extraShown: ['a', 'b'], extraRequired: [] });
+  assert.deepEqual(parseForm(text, json), { actions: form.actions, extraShown: ['a', 'b'], extraRequired: [], hiddenImplicit: ['PID-4'] });
   assert.equal(serializeForm(blankForm('read', json), json), serializeForm(blankForm('read', json), json));
   assert.notEqual(serializeForm(blankForm('read', json), json), serializeForm(blankForm('write', json), json));
   assert.equal(parseForm('nope', json), null);
@@ -196,29 +230,111 @@ test('FieldPolicySet carries the ALLOWED fields: hidden ones left out, required 
   assert.deepEqual(buildPolicyRequest({ ...where, direction: 'read', form: { actions: {}, extraShown: ['id'], extraRequired: [] }, source: typed }).fields, ['id']);
 });
 
-test('"Zamaskuj" and "Zahaszuj" never leave a field allowed: a server that does not store them yet still hides it', () => {
-  const where = { instanceId: INSTANCE, topic: TOPIC, subject: { subjectType: 'user', subjectId: 'u-1' }, direction: 'read', source: json };
-  const form = { actions: { pacjent: 'hash', lekarz: 'mask', termin: 'show', powod: 'hide' }, extraShown: [], extraRequired: [] };
-  assert.deepEqual(buildPolicyRequest({ ...where, form }).fields, ['termin']);
-});
+/** The positions the server lists for a message (`Hl7V2Format::list_fields`): MSH-3 on, and every position of every other segment, empty or not. */
+function serverFieldList(message) {
+  const segments = message.split(/\r\n?|\n/).filter(Boolean);
+  const fsep = segments[0][3];
+  const out = new Set();
+  segments[0].slice(4).split(fsep).forEach((_, idx) => { if (idx >= 1) out.add(`MSH-${idx + 2}`); });
+  for (const segment of segments.slice(1)) {
+    segment.slice(4).split(fsep).forEach((_, idx) => out.add(`${segment.slice(0, 3)}-${idx + 1}`));
+  }
+  return [...out];
+}
+
+const closedJson = fieldSource({ format: 'json', schema: { ...SCHEMA, text: JSON.stringify({ ...JSON.parse(VISIT_SCHEMA), additionalProperties: false }) } });
 
 test('a rule needs something to do: one hidden field (or a required or refused one), or typed fields when none are listed', () => {
   const ok = (direction, form, source, format) => formProblem({ direction, form, source, format });
-  const blank = blankForm('read', json);
-  assert.match(ok('read', blank, json, 'json'), /Ustaw co najmniej jedno pole na „Ukryj”/);
-  assert.equal(ok('read', { ...blank, actions: { ...blank.actions, powod: 'hide' } }, json, 'json'), null);
-  assert.equal(ok('read', { ...blank, actions: { ...blank.actions, powod: 'hash' } }, json, 'json'), null, 'any action that takes the field away counts');
+  const blank = blankForm('read', closedJson);
+  assert.match(ok('read', blank, closedJson, 'json'), /Ustaw co najmniej jedno pole na „Ukryj”\. Lista zawiera wszystkie pola tego topiku/);
+  assert.equal(ok('read', { ...blank, actions: { ...blank.actions, powod: 'hide' } }, closedJson, 'json'), null);
   assert.match(ok('read', { actions: {}, extraShown: [], extraRequired: [] }, typed, 'xml'), /Wpisz co najmniej jedno pole, które ma zostać widoczne/);
   assert.equal(ok('read', { actions: {}, extraShown: ['id'], extraRequired: [] }, typed, 'xml'), null);
-  const write = blankForm('write', json);
-  assert.match(ok('write', write, json, 'json'), /„Wymagane” albo „Niedozwolone”/);
-  assert.equal(ok('write', { ...write, actions: { ...write.actions, termin: 'require' } }, json, 'json'), null);
-  assert.equal(ok('write', { ...write, extraRequired: ['id'] }, json, 'json'), null);
+  const write = blankForm('write', closedJson);
+  assert.match(ok('write', write, closedJson, 'json'), /„Wymagane” albo „Niedozwolone”\. Lista zawiera wszystkie pola tego topiku/);
+  assert.equal(ok('write', { ...write, actions: { ...write.actions, termin: 'require' } }, closedJson, 'json'), null);
+  assert.equal(ok('write', { ...write, extraRequired: ['id'] }, closedJson, 'json'), null);
   assert.match(ok('write', { actions: {}, extraShown: [], extraRequired: [] }, typed, 'xml'), /Wpisz co najmniej jedno pole, które wolno zapisać/);
-  // A typed address the format refuses is named first.
+  // A typed address the format refuses is named.
   assert.match(ok('read', { ...blankForm('read', hl7), extraShown: ['PID-0'] }, hl7, 'hl7v2'), /„PID-0” nie jest adresem pola HL7\. Adres ma postać SEGMENT-numer, np\. PID-5\./);
   assert.match(ok('read', { ...blankForm('read', hl7), extraShown: ['MSH-2'] }, hl7, 'hl7v2'), /MSH-2 to separatory samej wiadomości/);
   assert.match(ok('read', { actions: {}, extraShown: ['1a'], extraRequired: [] }, typed, 'xml'), /nie jest nazwą elementu XML/);
+});
+
+test('over a list that is not complete, a rule that touches no listed field still hides (or refuses) the rest, so it is allowed and says so', () => {
+  const ok = (direction, source, format) => formProblem({ direction, form: blankForm(direction, source), source, format });
+  assert.equal(ok('read', json, 'json'), null, 'the pattern may be followed by other fields');
+  assert.equal(ok('write', json, 'json'), null);
+  assert.equal(ok('read', hl7, 'hl7v2'), null);
+  assert.equal(ok('write', hl7, 'hl7v2'), null);
+  assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'read', form: blankForm('read', json), current: null, source: json }),
+    ['Dla „Księgowość” znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.']);
+  assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'write', form: blankForm('write', json), current: null, source: json }),
+    ['Od „Księgowość” zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.']);
+});
+
+test('every typed address that is wrong is named, a near miss gets its probable form', () => {
+  const problem = formProblem({ direction: 'read', form: { ...blankForm('read', hl7), extraShown: ['PID-0', 'pid5', 'ZZZ-3'] }, source: hl7, format: 'hl7v2' });
+  assert.match(problem, /„PID-0” nie jest adresem pola HL7/);
+  assert.match(problem, /„pid5” wygląda na literówkę\. Czy chodziło o PID-5\?/);
+  assert.doesNotMatch(problem, /ZZZ-3/, 'a well-formed address is not a problem');
+});
+
+test('a typed "required" name that is also a listed field makes that row required; the sentences say what the request carries', () => {
+  const where = { instanceId: INSTANCE, topic: TOPIC, subject: { subjectType: 'user', subjectId: 'u-1' }, direction: 'write', source: json };
+  const form = { ...blankForm('write', json), extraRequired: [' termin ', 'nowe'] };
+  const request = buildPolicyRequest({ ...where, form });
+  assert.deepEqual(request.requiredFields, ['nowe', 'termin']);
+  assert.ok(request.fields.includes('termin') && request.fields.includes('nowe'));
+  const lines = ruleImpact({ who: 'Jan', direction: 'write', form, current: null, source: json });
+  assert.match(lines.join(' '), /brakuje któregokolwiek z pól: nowe, termin, zostanie odrzucona/);
+  // A listed field refused in its row cannot also be typed in as required.
+  const clash = { ...blankForm('write', json), actions: { ...blankForm('write', json).actions, termin: 'forbid' }, extraRequired: ['termin'] };
+  assert.match(formProblem({ direction: 'write', form: clash, source: json, format: 'json' }), /„termin” jest na liście pól i ma tam inne ustawienie niż wpisane niżej\./);
+  const hiddenClash = { ...blankForm('read', json), actions: { ...blankForm('read', json).actions, termin: 'hide' }, extraShown: ['termin'] };
+  assert.match(formProblem({ direction: 'read', form: hiddenClash, source: json, format: 'json' }), /„termin” jest na liście pól/);
+  // A typed name of a field that is shown anyway changes nothing and is not a problem.
+  assert.equal(formProblem({ direction: 'read', form: { ...hiddenClash, actions: { ...hiddenClash.actions, termin: 'show', powod: 'hide' } }, source: json, format: 'json' }), null);
+});
+
+test('HL7: the dictionary\'s default form allows an ordinary message — every position the server lists, MSH-11 and PID-4 included', () => {
+  const where = { instanceId: INSTANCE, topic: 'adt', subject: { subjectType: 'any', subjectId: '*' } };
+  const message = [
+    'MSH|^~\\&|REJ|PRZYCHODNIA|LAB|SZPITAL|20260930120000||ADT^A01|MSG0001|P|2.5.1',
+    'EVN|A01|20260930120000',
+    'PID|1||123456^^^PESEL||Kowalska^Anna||19800101|F|||ul. Kwiatowa 1^^Lublin||600100200|||||||||||||||||',
+    'PV1|1|I|OIOM^101^1||||1234^Nowak^Jan||||||||||||V0001',
+    'OBX|1|NM|8867-4^HR||72|bpm|60-100|N|||F',
+  ].join('\r');
+  const present = serverFieldList(message);
+  assert.ok(present.includes('MSH-11') && present.includes('MSH-12') && present.includes('PID-4') && present.includes('EVN-1') && present.includes('PID-1'));
+  const refused = (request) => present.filter((f) => !request.fields.includes(f));
+  const writeAll = buildPolicyRequest({ ...where, direction: 'write', form: blankForm('write', hl7), source: hl7 });
+  assert.deepEqual(refused(writeAll), [], 'a rule that forbids nothing refuses no field of the message');
+  const form = { ...blankForm('write', hl7), actions: { ...blankForm('write', hl7).actions, 'PID-19': 'forbid' } };
+  assert.deepEqual(refused(buildPolicyRequest({ ...where, direction: 'write', form, source: hl7 })), ['PID-19'], 'forbidding PID-19 refuses a message that carries it, and nothing else');
+  // Reading: hiding one field hides that field only, not the message's own MSH-11 / MSH-12.
+  const readForm = { ...blankForm('read', hl7), actions: { ...blankForm('read', hl7).actions, 'PID-5': 'hide' } };
+  const readRequest = buildPolicyRequest({ ...where, direction: 'read', form: readForm, source: hl7 });
+  assert.deepEqual(refused(readRequest), ['PID-5']);
+});
+
+test('HL7: a stored rule that leaves an unnamed position out keeps leaving it out when it is edited, and the table names it', () => {
+  const row = { ...policyRows(POLICIES)[3], subjectType: 'group', subjectId: 'g', subjectLabel: 'Lab', direction: 'read', fields: hl7.fields.map((f) => f.name).concat(hl7.implicit.filter((n) => n !== 'PID-4')), requiredFields: [] };
+  const form = formFromRule(row, hl7);
+  assert.deepEqual(form.hiddenImplicit, ['PID-4']);
+  assert.deepEqual(form.extraShown, [], 'an unnamed position is not a typed-in field');
+  assert.ok(!buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: row, direction: 'read', form, source: hl7 }).fields.includes('PID-4'));
+  assert.equal(words(ruleTableRow(row, hl7, NOW).what), 'PID-4 Ukryj');
+});
+
+test('a rule is the first for chosen subjects in its direction only when no rule of that direction exists yet', () => {
+  const rows = policyRows(POLICIES);
+  assert.equal(closesTopicToKeys({ rules: [], subjectType: 'group', direction: 'read' }), true);
+  assert.equal(closesTopicToKeys({ rules: rows, subjectType: 'group', direction: 'write' }), false, 'writing has the rule for everyone');
+  assert.equal(closesTopicToKeys({ rules: rows, subjectType: 'user', direction: 'read' }), false, 'already closed: nothing new to say');
+  assert.equal(closesTopicToKeys({ rules: [], subjectType: 'any', direction: 'read' }), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -231,7 +347,7 @@ test('"Co się stanie" for a new reading rule, a change, and a topic without a l
   assert.deepEqual(ruleImpact({ who: 'Rejestracja', direction: 'read', form: hide, current: null, source: json }), [
     'Dla „Rejestracja” znikną z wiadomości pola: termin, powód wizyty (powod).',
     'Pozostałe pola z listy bez zmian.',
-    'Pola spoza listy też znikną, chyba że wpiszesz je niżej.',
+    'Pola spoza listy też znikną, chyba że je dopiszesz.',
   ]);
   const before = formFromRule(policyRows(POLICIES)[1], json);
   const after = { ...before, actions: { ...before.actions, powod: 'show', termin: 'hide' } };
@@ -239,7 +355,7 @@ test('"Co się stanie" for a new reading rule, a change, and a topic without a l
     'Dla „Rejestracja” znikną z wiadomości pola: termin.',
     'Dla „Rejestracja” pojawią się w wiadomościach pola: powód wizyty (powod).',
     'Pozostałe pola z listy bez zmian.',
-    'Pola spoza listy też znikną, chyba że wpiszesz je niżej.',
+    'Pola spoza listy też znikną, chyba że je dopiszesz.',
   ]);
   assert.deepEqual(ruleImpact({ who: 'Rejestracja', direction: 'read', form: before, current: before, source: json }), [], 'no change, nothing to say');
   assert.deepEqual(ruleImpact({ who: 'Wszyscy', direction: 'read', form: { actions: {}, extraShown: ['id', 'nazwa'], extraRequired: [] }, current: null, source: typed }),
@@ -252,7 +368,7 @@ test('"Co się stanie" for a writing rule: whole messages are refused, and the s
     'Wiadomość od „Księgowość”, w której jest którekolwiek z pól: termin, zostanie odrzucona i nie trafi do topiku.',
     'Wiadomość od „Księgowość”, w której brakuje któregokolwiek z pól: dane pacjenta (pacjent), zostanie odrzucona i nie trafi do topiku.',
     'Odrzucona zostaje cała wiadomość, a nie samo pole.',
-    'Wiadomość z polem spoza listy też zostanie odrzucona, chyba że wpiszesz je niżej.',
+    'Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.',
   ]);
   assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'write', form: { actions: {}, extraShown: ['id'], extraRequired: ['nr'] }, current: null, source: typed }), [
     'Od „Księgowość” zostanie przyjęta wiadomość tylko z polami: id, nr. Wiadomość z innym polem zostanie odrzucona.',
@@ -261,30 +377,35 @@ test('"Co się stanie" for a writing rule: whole messages are refused, and the s
   ]);
 });
 
+test('changing a writing rule says what changes: what is newly refused, newly accepted and no longer required', () => {
+  const stored = { ...policyRows(POLICIES)[0], fields: ['lekarz', 'pacjent', 'termin', 'stary'], requiredFields: ['pacjent', 'termin'] };
+  const before = formFromRule(stored, json);
+  const after = { ...before, actions: { ...before.actions, powod: 'allow', lekarz: 'forbid', termin: 'allow' }, extraShown: ['x'] };
+  assert.deepEqual(ruleImpact({ who: 'Wszyscy', direction: 'write', form: after, current: before, source: json }), [
+    'Wiadomość od „Wszyscy”, w której jest którekolwiek z pól: Lekarz prowadzący wizytę (lekarz), stary, zostanie odrzucona i nie trafi do topiku.',
+    'Od „Wszyscy” będą przyjmowane wiadomości z polami: powód wizyty (powod), x.',
+    'Od „Wszyscy” przestanie być wymagane: termin.',
+    'Odrzucona zostaje cała wiadomość, a nie samo pole.',
+    'Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.',
+  ], 'the typed-in "stary" that was allowed and is no longer typed is now refused');
+  assert.deepEqual(ruleImpact({ who: 'Wszyscy', direction: 'write', form: before, current: before, source: json }), [], 'nothing changed, nothing to say');
+});
+
 // ---------------------------------------------------------------------------
 // What the server offers
 // ---------------------------------------------------------------------------
 
-test('reading offers "Pokaż" and "Ukryj"; "Zamaskuj" and "Zahaszuj" appear on their own when the server lists them', () => {
-  assert.deepEqual(readActionList(['hide']), ['show', 'hide']);
-  assert.deepEqual(readActionList([]), ['show', 'hide'], 'hiding has always been there, an older answer without a list included');
-  assert.deepEqual(readActionList(undefined), ['show', 'hide']);
-  assert.deepEqual(readActionList(['hide', 'mask', 'hash']), ['show', 'hide', 'mask', 'hash']);
-  assert.deepEqual(readActionList(['mask']), ['show', 'hide', 'mask'], 'an action is offered because the server lists it, not because another is');
-  assert.deepEqual(actionOptions('read', ['hide']).map((o) => o.label), ['Pokaż', 'Ukryj']);
-  assert.deepEqual(actionOptions('read', ['hide', 'mask', 'hash']).map((o) => [o.value, o.label]), [['show', 'Pokaż'], ['hide', 'Ukryj'], ['mask', 'Zamaskuj'], ['hash', 'Zahaszuj']]);
-  assert.deepEqual(actionOptions('write', ['hide', 'mask']).map((o) => o.label), ['Dozwolone', 'Wymagane', 'Niedozwolone'], 'writing has no hiding action');
+test('reading offers "Pokaż" and "Ukryj" only: the wire has no per-field action to carry "Zamaskuj" or "Zahaszuj"', () => {
+  assert.deepEqual(actionOptions('read').map((o) => [o.value, o.label]), [['show', 'Pokaż'], ['hide', 'Ukryj']]);
+  assert.deepEqual(actionOptions('write').map((o) => o.label), ['Dozwolone', 'Wymagane', 'Niedozwolone'], 'writing has no hiding action');
 });
 
-test('the legend explains "ukryj" and "odrzuć wiadomość"; "zamaskuj" and "zahaszuj" only where the server offers them', () => {
-  const plain = words(legendHtml(['hide']));
+test('the legend explains "ukryj", "odrzuć wiadomość" and which rule wins — and nothing the screen cannot do', () => {
+  const plain = words(legendHtml());
   assert.match(plain, /Ukryj — Pole znika z wiadomości\./);
   assert.match(plain, /Odrzuć wiadomość — Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku\./);
   assert.match(plain, /Zasada osoby wygrywa z zasadą jej grupy/);
   assert.doesNotMatch(plain, /Zamaskuj|Zahaszuj/);
-  const full = words(legendHtml(['hide', 'mask', 'hash']));
-  assert.match(full, /Zamaskuj — Widać 3 ostatnie znaki, reszta to gwiazdki\./);
-  assert.match(full, /Zahaszuj — Zamiast wartości jest ciąg znaków/);
 });
 
 test('a direction with rules for chosen subjects and none for everyone is closed to API keys', () => {
@@ -298,10 +419,10 @@ test('a direction with rules for chosen subjects and none for everyone is closed
 // The section
 // ---------------------------------------------------------------------------
 
-function paint({ hidingData, contentType = 'application/json', access = { canRead: true, canAdmin: true }, capabilities = { fieldActions: ['hide'] }, notice = null, host = document.createElement('div') }) {
+function paint({ hidingData, contentType = 'application/json', access = { canRead: true, canAdmin: true }, notice = null, host = document.createElement('div') }) {
   document.body.appendChild(host);
   const moves = [];
-  paintHidingSection(host, { topic: { name: TOPIC, contentType }, access, capabilities, notice, nowMs: NOW, hidingData }, { go: (a) => moves.push(a) });
+  paintHidingSection(host, { topic: { name: TOPIC, contentType }, access, notice, nowMs: NOW, hidingData }, { go: (a) => moves.push(a) });
   return { host, moves };
 }
 
@@ -316,12 +437,13 @@ test('while the rules load the section says so and offers no rule; "Dodaj zasad�
   assert.ok(waiting.host.querySelector('tf-empty-state [data-go="hiding-add"]').hasAttribute('disabled'));
 });
 
-test('a failed load keeps the retry in the section (T12) and the retry asks again', () => {
-  const { host, moves } = paint({ hidingData: { policies: null, policiesError: 'Brak uprawnień do tej operacji.', schema: null, schemaSettled: true } });
+test('a failed load keeps the retry in the section (T12), marked for the shell to load the rules again', () => {
+  const { host } = paint({ hidingData: { policies: null, policiesError: 'Brak uprawnień do tej operacji.', schema: null, schemaSettled: true } });
   assert.match(norm(host.querySelector('[data-role="state"]').textContent), /Brak uprawnień do tej operacji\./);
-  host.querySelector('[data-role="state"] [data-go="hiding-reload"]').click?.();
-  assert.equal(host.querySelector('[data-role="state"] [data-go="hiding-reload"]').textContent, 'Spróbuj ponownie');
-  assert.equal(moves.length, 0, 'the page wires data-go to the shell; the section only marks the button');
+  const retry = host.querySelector('[data-role="state"] [data-go="hiding-reload"]');
+  assert.equal(retry.textContent, 'Spróbuj ponownie');
+  assert.equal(retry.hasAttribute('disabled'), false);
+  assert.equal(host.querySelector('[data-role="rules"]').hidden, true);
 });
 
 test('a topic without rules shows the empty state (T11) whose action opens the add window', () => {
@@ -340,11 +462,17 @@ test('a topic without rules shows the empty state (T11) whose action opens the a
 test('a binary topic has no fields to name: the section says so and "Dodaj zasadę" is closed', () => {
   const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
   const empty = host.querySelector('[data-role="state"] tf-empty-state');
-  assert.equal(empty.getAttribute('title'), 'Nie można dodać zasady w tym topiku');
-  assert.match(empty.getAttribute('message'), /przenosi treść binarną/);
-  assert.equal(empty.querySelector('[data-go]'), null);
+  assert.equal(empty.getAttribute('title'), 'Zasady tego topiku nie są tu edytowane');
+  assert.match(empty.getAttribute('message'), /nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól/);
+  assert.doesNotMatch(empty.getAttribute('message'), /nie działają/, 'the server does apply rules to such a topic; the screen just does not edit them');
+  const open = empty.querySelector('[data-go="section"]');
+  assert.equal(open.getAttribute('data-section'), 'settings');
+  assert.equal(open.textContent, 'Otwórz ustawienia topiku', 'the button opens the settings, it does not promise a change of content type');
   assert.ok(host.querySelector('[data-role="add"]').hasAttribute('disabled'));
   assert.equal(host.querySelector('[data-role="add"]').getAttribute('title'), empty.getAttribute('message'));
+  const preview = host.querySelector('[data-role="preview"]');
+  assert.ok(preview.hasAttribute('disabled'), 'a binary message has no fields to preview');
+  assert.equal(preview.getAttribute('title'), 'Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.');
 });
 
 test('the filled section: count, columns, one row per rule with Zmień and Usuń, the legend, who the keys cannot reach', () => {
@@ -364,19 +492,16 @@ test('the filled section: count, columns, one row per rule with Zmień and Usuń
   assert.deepEqual(moves.at(-1), { kind: 'hiding-remove', rule: 'group:g-rej:read' });
   assert.equal(host.querySelector('[data-role="legend"]').hidden, false);
   assert.match(norm(host.querySelector('[data-role="legend"]').textContent), /^Ukryj — Pole znika z wiadomości\.Odrzuć wiadomość/);
-  assert.match(norm(host.querySelector('[data-role="keys-note"]').textContent), /Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie odczytu: są w nim zasady tylko dla wybranych podmiotów, a nie ma zasady dla wszystkich\./);
+  assert.match(norm(host.querySelector('[data-role="keys-note"]').textContent), /Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie odczytu: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich\./);
   assert.equal(host.querySelector('[data-role="state"]').textContent.trim(), '');
 });
 
-test('the legend gains "zamaskuj" and "zahaszuj" with the server\'s list, and a repaint keeps the table\'s buttons', () => {
+test('a repaint with unchanged rules keeps the table\'s buttons', () => {
   const host = document.createElement('div');
   paint({ host, hidingData: { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true } });
   const table = host.querySelector('[data-role="rules"]');
   const rowsBefore = table.rows;
-  assert.doesNotMatch(host.querySelector('[data-role="legend"]').textContent, /Zahaszuj/);
-  paint({ host, capabilities: { fieldActions: ['hide', 'mask', 'hash'] }, hidingData: { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true } });
-  assert.match(host.querySelector('[data-role="legend"]').textContent, /Zamaskuj/);
-  assert.match(host.querySelector('[data-role="legend"]').textContent, /Zahaszuj/);
+  paint({ host, hidingData: { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true } });
   assert.equal(table.rows, rowsBefore, 'an unchanged poll does not hand the table its rows again');
 });
 

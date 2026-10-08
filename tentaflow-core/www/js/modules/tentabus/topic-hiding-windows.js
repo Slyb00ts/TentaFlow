@@ -7,23 +7,32 @@
 // before it saves (`Co się stanie po zapisaniu`), and the fields are drawn
 // like the access rights: the field and its name, one segmented control.
 //
+// Before a rule is sent the window asks the server for the rules once more:
+// the server stores whatever it is sent, so a window opened before somebody
+// else saved a rule would silently overwrite it. A rule that appeared (add) or
+// changed or vanished (change) in the meantime is refused and the table
+// reloads.
+//
 // Fields come from the topic (`source`, see `fieldSource`): a row per known
 // field, and below them the typed-in ones — the server keeps only what is
 // allowed, so a field the window does not list is hidden too, and the fields
 // of a topic nobody listed are typed in as "the ones that stay visible".
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { T } from '/js/modules/tentabus/format.js';
+import { T, fmtCount } from '/js/modules/tentabus/format.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import {
   SUBJECT_KINDS, DIRECTIONS, ANY_ID, whoTitle, whoSub, fieldPhrase, ruleFacts, actionOptions, blankForm, formFromRule, serializeForm,
-  parseForm, formProblem, buildPolicyRequest, ruleImpact, policyKey,
+  parseForm, formProblem, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
 } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-tag-input.js';
+
+/** A list longer than this gets a search box over its rows. */
+const SEARCH_FROM = 12;
 
 const typedHint = { hl7v2: 'hiding.extra.hint_hl7', xml: 'hiding.extra.hint_xml', json: 'hiding.extra.hint_json', binary: 'hiding.extra.hint_json' };
 
@@ -32,6 +41,7 @@ const typedHint = { hl7v2: 'hiding.extra.hint_hl7', xml: 'hiding.extra.hint_xml'
 // ---------------------------------------------------------------------------
 
 function sourceNote(source) {
+  if (source.complex) return T('hiding.source.complex');
   if (source.mode === 'schema') return T('hiding.source.schema', { name: source.subject, version: source.version });
   if (source.mode === 'dictionary') return T('hiding.source.dictionary');
   return T(source.failed ? 'hiding.source.failed' : 'hiding.source.manual');
@@ -39,7 +49,7 @@ function sourceNote(source) {
 
 function rowHtml(field) {
   return `
-    <div class="tb-right-row">
+    <div class="tb-right-row" data-search="${escapeAttr(`${field.name} ${field.label || ''}`.toLocaleLowerCase())}">
       <div class="tb-right-name"><b class="mono">${escapeHtml(field.name)}</b>${field.label ? `<span>${escapeHtml(field.label)}</span>` : ''}</div>
       <tf-segmented size="md" data-field="${escapeAttr(field.name)}" aria-label="${escapeAttr(field.name)}"></tf-segmented>
     </div>`;
@@ -50,7 +60,9 @@ function fieldsHtml(source) {
   return `
     <div class="field" data-role="fields-box"${listed ? '' : ' hidden'}>
       <label>${escapeHtml(T('hiding.fields_label'))}</label>
+      ${source.fields.length > SEARCH_FROM ? `<tf-searchbox data-role="field-search" debounce="150" placeholder="${escapeAttr(T('hiding.fields_search'))}" aria-label="${escapeAttr(T('hiding.fields_search'))}"></tf-searchbox>` : ''}
       <div class="tb-rights" data-role="rows"></div>
+      <div class="muted" data-role="rows-none" hidden>${escapeHtml(T('hiding.fields_none'))}</div>
     </div>
     <div class="muted" data-role="source-note">${escapeHtml(sourceNote(source))}</div>
     <div data-role="extras"></div>
@@ -70,13 +82,14 @@ function extraHtml(role, label, hint) {
  * Draws the rows and the typed-in lists of `direction` with the values of
  * `form`; `sync` is called on every change.
  */
-function paintFields(win, { direction, form, source, format, fieldActions, sync }) {
+function paintFields(win, { direction, form, source, format, sync }) {
   const rows = win.querySelector('[data-role="rows"]');
   rows.innerHTML = source.fields.map(rowHtml).join('');
   for (const seg of rows.querySelectorAll('tf-segmented[data-field]')) {
-    seg.setOptions(actionOptions(direction, fieldActions), form.actions[seg.getAttribute('data-field')]);
+    seg.setOptions(actionOptions(direction), form.actions[seg.getAttribute('data-field')]);
     seg.addEventListener('change', sync);
   }
+  filterRows(win);
   const listed = source.fields.length > 0;
   const read = direction === 'read';
   const hint = T(typedHint[format]);
@@ -91,13 +104,50 @@ function paintFields(win, { direction, form, source, format, fieldActions, sync 
   win.querySelector('[data-role="unlisted-note"]').textContent = listed ? T(`hiding.unlisted.${direction}`) : '';
 }
 
-/** The form the window holds now, as the string `serializeForm` makes of it. */
-function readSerialized(win, source) {
+/** Shows the rows whose name or plain name holds what the field search holds. */
+function filterRows(win) {
+  const query = String(win.querySelector('[data-role="field-search"]')?.value ?? '').trim().toLocaleLowerCase();
+  let shown = 0;
+  for (const row of win.querySelectorAll('[data-role="rows"] > .tb-right-row')) {
+    const match = !query || row.getAttribute('data-search').includes(query);
+    row.hidden = !match;
+    if (match) shown += 1;
+  }
+  const none = win.querySelector('[data-role="rows-none"]');
+  if (none) none.hidden = shown > 0;
+}
+
+/**
+ * The form the window holds now, as the string `serializeForm` makes of it;
+ * `hiddenImplicit` = the unnamed positions of a stored rule, which the
+ * window has no control for and keeps as they are.
+ */
+function readSerialized(win, source, hiddenImplicit = []) {
   const actions = {};
   for (const seg of win.querySelectorAll('tf-segmented[data-field]')) actions[seg.getAttribute('data-field')] = seg.value || '';
   const tags = (role) => win.querySelector(`[data-role="${role}"]`)?.tags || [];
-  return serializeForm({ actions, extraShown: tags('extra-shown'), extraRequired: tags('extra-required') }, source);
+  return serializeForm({ actions, extraShown: tags('extra-shown'), extraRequired: tags('extra-required'), hiddenImplicit }, source);
 }
+
+/** The refusal of a rule that changed under an open window; `stale` tells it from the server's own refusals. */
+function staleError() {
+  return Object.assign(new Error('rule changed'), { stale: true });
+}
+
+/**
+ * Asks the server for the rules again and refuses the send when the one being
+ * written is no longer what the window started from. `expected` = `null` for
+ * a new rule (nobody may have stored it since) or the row being changed.
+ */
+async function ensureFresh(ctx, key, expected) {
+  const fresh = (await ctx.listPolicies()).find((p) => policyKey(p) === key) ?? null;
+  const unchanged = expected ? fresh != null && (fresh.updatedAtMs ?? null) === expected.updatedAtMs : fresh == null;
+  if (unchanged) return;
+  ctx.reload();
+  throw staleError();
+}
+
+const describeWith = (ctx) => (err) => (err?.stale ? T('hiding.stale') : ctx.describeError(err));
 
 // ---------------------------------------------------------------------------
 // Dodaj zasadę
@@ -105,7 +155,8 @@ function readSerialized(win, source) {
 
 /**
  * "Dodaj zasadę". `ctx` = `{ instanceId, topic, format, source, rules (the
- * stored rows), fieldActions, directory({ kind, query }), setPolicy(request),
+ * stored rows), directory({ kind, query }), listPolicies() (the rules now),
+ * reload() (the section again), setPolicy(request),
  * describeError, onSaved(notice) }`.
  */
 export function openHidingAdd(ctx) {
@@ -136,8 +187,11 @@ export function openHidingAdd(ctx) {
         <label>${escapeHtml(T('hiding.add.who'))}</label>
         <tf-segmented size="md" data-role="kind" aria-label="${escapeAttr(T('hiding.add.who'))}"></tf-segmented>
       </div>
-      <div data-role="pick-box">
-        <tf-searchbox data-role="query" debounce="250" placeholder="${escapeAttr(T('access.grant.search'))}"></tf-searchbox>
+      <div class="tb-pick-box" data-role="pick-box">
+        <div class="field">
+          <label>${escapeHtml(T('hiding.add.search'))}</label>
+          <tf-searchbox data-role="query" debounce="250" placeholder="${escapeAttr(T('access.grant.search'))}" aria-label="${escapeAttr(T('hiding.add.search'))}"></tf-searchbox>
+        </div>
         <tf-select data-role="subject" label="${escapeAttr(T('access.grant.pick.group'))}"></tf-select>
       </div>
       <div class="muted" data-role="pick-note" aria-live="polite"></div>
@@ -165,12 +219,13 @@ export function openHidingAdd(ctx) {
         }
         const options = found.entries ? found.entries.filter((e) => free(e)) : [];
         select.setAttribute('label', T(`access.grant.pick.${kind}`));
-        select.setOptions(options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) })), options[0] ? `${options[0].subjectType}:${options[0].subjectId}` : '');
+        // Nobody is chosen for the administrator: the first name of a list is not a decision.
+        select.setOptions([{ value: '', label: T('hiding.add.choose') }, ...options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) }))], '');
         select.toggleAttribute('disabled', options.length === 0);
         let text;
         if (found.error) text = ctx.describeError(found.error);
         else if (!found.entries) text = T('shell.loading');
-        else if (!options.length) text = T(query ? 'access.grant.none_found' : 'hiding.add.none_free');
+        else if (!options.length) text = T(query ? 'access.grant.none_found' : found.entries.length ? 'hiding.add.none_free' : `hiding.add.none_exist.${kind}`);
         else text = T('hiding.add.pick_hint') + (found.truncated ? ` ${T('access.grant.truncated')}` : '');
         note.textContent = text;
         sync();
@@ -191,12 +246,13 @@ export function openHidingAdd(ctx) {
       kindSeg.addEventListener('change', () => { kind = kindSeg.value; ask(); });
       search.addEventListener('search', (e) => { query = String(e.detail?.value ?? '').trim(); ask(); });
       select.addEventListener('change', sync);
+      w.querySelector('[data-role="field-search"]')?.addEventListener('search', () => filterRows(w));
       dirSeg.addEventListener('change', () => {
         direction = dirSeg.value;
-        paintFields(w, { direction, form: blankForm(direction, source), source, format, fieldActions: ctx.fieldActions, sync });
+        paintFields(w, { direction, form: blankForm(direction, source), source, format, sync });
         paintPick();
       });
-      paintFields(w, { direction, form: blankForm(direction, source), source, format, fieldActions: ctx.fieldActions, sync });
+      paintFields(w, { direction, form: blankForm(direction, source), source, format, sync });
       ask();
     },
     draft: (w) => ({
@@ -210,9 +266,20 @@ export function openHidingAdd(ctx) {
       if (!free(subject)) return T('hiding.add.taken', { direction: T(`hiding.direction_of.${d.direction}`) });
       return formProblem({ direction: d.direction, form: formOf(d), source, format });
     },
-    impact: (d) => ruleImpact({ who: subjectOf(d.subject).label, direction: d.direction, form: formOf(d), current: null, source }),
-    save: (d) => ctx.setPolicy(buildPolicyRequest({ instanceId: ctx.instanceId, topic, subject: subjectOf(d.subject), direction: d.direction, form: formOf(d), source })),
-    describeError: ctx.describeError,
+    impact: (d) => {
+      const subject = subjectOf(d.subject);
+      const lines = ruleImpact({ who: subject.label, direction: d.direction, form: formOf(d), current: null, source });
+      if (closesTopicToKeys({ rules: ctx.rules, subjectType: subject.subjectType, direction: d.direction })) {
+        lines.push(T('hiding.impact.keys_closed', { action: T(`hiding.direction_do.${d.direction}`) }));
+      }
+      return lines;
+    },
+    save: async (d) => {
+      const subject = subjectOf(d.subject);
+      await ensureFresh(ctx, `${subject.subjectType}:${subject.subjectId}:${d.direction}`, null);
+      return ctx.setPolicy(buildPolicyRequest({ instanceId: ctx.instanceId, topic, subject, direction: d.direction, form: formOf(d), source }));
+    },
+    describeError: describeWith(ctx),
     onSaved: (d) => {
       const subject = subjectOf(d.subject);
       ctx.onSaved({
@@ -243,21 +310,27 @@ export function openHidingChange(row, ctx) {
     fields: () => `
       <div class="field">
         <label>${escapeHtml(T('hiding.add.who'))}</label>
-        <div class="tb-explain-box"><b>${escapeHtml(who)}</b><div class="muted">${escapeHtml(whoSub(row))}</div></div>
+        <div class="tb-explain-box"><b>${escapeHtml(who)}</b><div class="muted">${escapeHtml(whoSub(row))}</div><div class="muted">${escapeHtml(T('hiding.change.fixed'))}</div></div>
       </div>
       <div class="field">
         <label>${escapeHtml(T('hiding.add.when'))}</label>
-        <div class="tb-explain-box"><b>${escapeHtml(T(`hiding.direction.${row.direction}`))}</b><div class="muted">${escapeHtml(T('hiding.change.fixed'))}</div></div>
+        <div class="tb-explain-box"><b>${escapeHtml(T(`hiding.direction.${row.direction}`))}</b></div>
       </div>
       ${fieldsHtml(source)}`,
-    wire: (w, sync) => paintFields(w, { direction: row.direction, form: stored, source, format, fieldActions: ctx.fieldActions, sync }),
-    draft: (w) => ({ form: readSerialized(w, source) }),
+    wire: (w, sync) => {
+      paintFields(w, { direction: row.direction, form: stored, source, format, sync });
+      w.querySelector('[data-role="field-search"]')?.addEventListener('search', () => filterRows(w));
+    },
+    draft: (w) => ({ form: readSerialized(w, source, stored.hiddenImplicit) }),
     problem: (d) => formProblem({ direction: row.direction, form: formOf(d), source, format }),
     impact: (d) => ruleImpact({ who, direction: row.direction, form: formOf(d), current: stored, source }),
-    save: (d) => ctx.setPolicy(buildPolicyRequest({
-      instanceId: ctx.instanceId, topic, subject: { subjectType: row.subjectType, subjectId: row.subjectId }, direction: row.direction, form: formOf(d), source,
-    })),
-    describeError: ctx.describeError,
+    save: async (d) => {
+      await ensureFresh(ctx, row.key, row);
+      return ctx.setPolicy(buildPolicyRequest({
+        instanceId: ctx.instanceId, topic, subject: { subjectType: row.subjectType, subjectId: row.subjectId }, direction: row.direction, form: formOf(d), source,
+      }));
+    },
+    describeError: describeWith(ctx),
     onSaved: (d) => ctx.onSaved({
       title: T('hiding.change.saved_title'),
       text: ruleImpact({ who, direction: row.direction, form: formOf(d), current: stored, source }).join(' '),
@@ -269,11 +342,15 @@ export function openHidingChange(row, ctx) {
 // Usuń
 // ---------------------------------------------------------------------------
 
+/** The lead of the delete window names this many fields before it counts the rest. */
+const LEAD_FIELDS = 8;
+
 /** The sentence that says what the rule does now. */
 export function removeLead(row, source) {
   const who = whoTitle(row);
   const facts = ruleFacts(row, source);
-  const names = (list) => list.map((n) => fieldPhrase(source, n)).join(', ');
+  // A rule written elsewhere can leave out every unnamed position of a segment: name the first few, count the rest.
+  const names = (list) => `${list.slice(0, LEAD_FIELDS).map((n) => fieldPhrase(source, n)).join(', ')}${list.length > LEAD_FIELDS ? ` ${T('hiding.and_more', { count: fmtCount(list.length - LEAD_FIELDS), n: list.length - LEAD_FIELDS })}` : ''}`;
   if (row.direction === 'read') {
     if (!facts.known) return facts.visible.length ? T('hiding.remove.lead_read_only', { who, fields: facts.visible.join(', ') }) : T('hiding.remove.lead_read_nothing', { who });
     return facts.hidden.length ? T('hiding.remove.lead_read', { who, fields: names(facts.hidden) }) : T('hiding.remove.lead_read_none', { who });
@@ -285,7 +362,12 @@ export function removeLead(row, source) {
   return T('hiding.remove.lead_write', { who, parts: parts.length ? parts.join('; ') : T('hiding.remove.part_none') });
 }
 
-/** What changes for the subject, and for keys, once the rule is gone. */
+/**
+ * What changes for the subject, and for keys, once the rule is gone. Who
+ * falls back to what follows the server's order: a person's own rule, then
+ * the rules of their groups, then the rule for everyone; a group or an addon
+ * has no groups of its own to fall back to.
+ */
 export function removeImpact(row, source, topic, rules) {
   const who = whoTitle(row);
   const lines = [];
@@ -294,7 +376,7 @@ export function removeImpact(row, source, topic, rules) {
     const othersRemain = rules.some((r) => r.direction === row.direction && r.key !== row.key);
     if (othersRemain) lines.push(T('hiding.remove.impact_keys', { action: T(`hiding.direction_do.${row.direction}`) }));
   } else {
-    lines.push(T(`hiding.remove.impact_${row.direction}`, { who, topic }));
+    lines.push(T(`hiding.remove.impact_${row.direction}_${row.subjectType}`, { who, topic }));
   }
   return lines;
 }

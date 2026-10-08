@@ -32,10 +32,32 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 
 const PAYLOAD_BYTES = 4096;
 
-/** "grupa Księgowość", "addon Asystent lekarza", "wszyscy" — the subject as the sentences name it. */
+/** "grupa Księgowość", "addon Asystent lekarza", "wszyscy" — the subject as the sentences name it (one template per kind, so every language declines it its own way). */
 export function whoPhrase(subject) {
   if (subject.subjectType === 'any') return T('hiding.preview.who_any');
-  return `${T(`access.kind.${subject.subjectType}`).toLocaleLowerCase()} ${subject.label}`;
+  return T(`hiding.preview.who_${subject.subjectType}`, { name: subject.label });
+}
+
+/** The top-level names of a JSON record, none for anything else. */
+function recordFields(bytes) {
+  try {
+    const value = JSON.parse(bytesToPreviewText(bytes, PAYLOAD_BYTES));
+    return value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The known fields of a pattern-checked topic that are neither in the record
+ * nor named by the answer. When the administrator's own rule narrows the
+ * preview they are gone from the record without a trace; a field the message
+ * never had looks the same, so the sentence says "may".
+ */
+export function missingFields({ resp, source }) {
+  if (source?.mode !== 'schema') return [];
+  const seen = new Set([...recordFields(resp.record.payloadPreview), ...(resp.applied || []).map((a) => a.field)]);
+  return source.fields.map((f) => f.name).filter((n) => !seen.has(n));
 }
 
 /**
@@ -68,11 +90,16 @@ export function previewResultHtml({ resp, subject, source, nowMs = Date.now() })
       <span class="tf-chip tf-chip--outline ${a.action === 'hide' ? 'warn' : 'ok'}">${escapeHtml(T(a.action === 'hide' ? 'hiding.preview.hidden' : 'hiding.preview.shown'))}</span>
     </div>`;
   }).join('');
+  const missing = resp.limitedByCaller ? missingFields({ resp, source }) : [];
+  const limitedText = [
+    T('hiding.preview.limited_text', { who: whoPhrase(subject) }),
+    missing.length ? T('hiding.preview.limited_missing', { fields: missing.join(', ') }) : '',
+  ].filter(Boolean).join(' ');
   const summary = hidden.length
     ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.join(', ') })
     : T('hiding.preview.summary_none');
   return `
-    ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(T('hiding.preview.limited_text', { who: whoPhrase(subject) }))}"></tf-alert>` : ''}
+    ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(limitedText)}"></tf-alert>` : ''}
     <div class="tb-preview-record">
       <div class="tb-preview-record-head"><span>${escapeHtml(T('hiding.preview.sees', { who: whoPhrase(subject) }))}</span> <span class="muted">${escapeHtml(title)}</span></div>
       <pre class="tb-payload" data-role="payload">${escapeHtml(displayPayload(record.payloadPreview)) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
@@ -101,8 +128,11 @@ export function openHidingPreview(ctx) {
         <label>${escapeHtml(T('hiding.preview.who'))}</label>
         <tf-segmented size="md" data-role="kind" aria-label="${escapeAttr(T('hiding.preview.who'))}"></tf-segmented>
       </div>
-      <div data-role="pick-box">
-        <tf-searchbox data-role="query" debounce="250" placeholder="${escapeAttr(T('access.grant.search'))}"></tf-searchbox>
+      <div class="tb-pick-box" data-role="pick-box">
+        <div class="field">
+          <label>${escapeHtml(T('hiding.add.search'))}</label>
+          <tf-searchbox data-role="query" debounce="250" placeholder="${escapeAttr(T('access.grant.search'))}" aria-label="${escapeAttr(T('hiding.add.search'))}"></tf-searchbox>
+        </div>
         <tf-select data-role="subject" label="${escapeAttr(T('access.grant.pick.group'))}"></tf-select>
       </div>
       <div class="muted" data-role="pick-note" aria-live="polite"></div>
@@ -137,6 +167,13 @@ export function openHidingPreview(ctx) {
     const raw = String(offsetInput.value ?? '').trim();
     return /^\d+$/.test(raw) ? Number(raw) : null;
   };
+  // An answer belongs to the subject and message it was asked for: when either
+  // changes it goes, and an answer still on its way is dropped.
+  const dropResult = () => {
+    state.turn += 1;
+    $('result').innerHTML = '';
+    $('error').hidden = true;
+  };
   const syncButton = () => showBtn.toggleAttribute('disabled', busy || !subjectOf() || offsetValue() == null);
 
   const paintPick = () => {
@@ -148,7 +185,7 @@ export function openHidingPreview(ctx) {
     }
     const options = state.found.entries || [];
     select.setAttribute('label', T(`access.grant.pick.${state.kind}`));
-    select.setOptions(options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) })), options[0] ? `${options[0].subjectType}:${options[0].subjectId}` : '');
+    select.setOptions([{ value: '', label: T('hiding.add.choose') }, ...options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) }))], '');
     select.toggleAttribute('disabled', options.length === 0);
     if (state.found.error) note.textContent = ctx.describeError(state.found.error);
     else if (!state.found.entries) note.textContent = T('shell.loading');
@@ -171,9 +208,9 @@ export function openHidingPreview(ctx) {
   };
 
   kindSeg.setOptions(SUBJECT_KINDS.map((k) => ({ value: k, label: T(k === 'any' ? 'hiding.everyone' : `access.kind.${k}`) })), state.kind);
-  kindSeg.addEventListener('change', () => { state.kind = kindSeg.value; ask(); });
-  $('query').addEventListener('search', (e) => { state.query = String(e.detail?.value ?? '').trim(); ask(); });
-  select.addEventListener('change', syncButton);
+  kindSeg.addEventListener('change', () => { state.kind = kindSeg.value; dropResult(); ask(); });
+  $('query').addEventListener('search', (e) => { state.query = String(e.detail?.value ?? '').trim(); dropResult(); ask(); });
+  select.addEventListener('change', () => { dropResult(); syncButton(); });
 
   const count = Math.max(1, Number(ctx.partitionCount) || 1);
   const partitionSelect = $('partition');
@@ -181,14 +218,15 @@ export function openHidingPreview(ctx) {
   const paintRange = () => { $('range').textContent = rangeText(state.partitions.get(state.partition)); };
   partitionSelect.addEventListener('change', (e) => {
     state.chosen = true;
+    dropResult();
     state.partition = Number(e.detail.value) || 0;
     const newest = newestOffset(state.partitions.get(state.partition));
     offsetInput.value = newest == null ? '' : String(newest);
     paintRange();
     syncButton();
   });
-  offsetInput.addEventListener('input', () => { state.chosen = true; syncButton(); });
-  offsetInput.addEventListener('change', syncButton);
+  offsetInput.addEventListener('input', () => { state.chosen = true; dropResult(); syncButton(); });
+  offsetInput.addEventListener('change', () => { dropResult(); syncButton(); });
 
   const show = async () => {
     const subject = subjectOf();

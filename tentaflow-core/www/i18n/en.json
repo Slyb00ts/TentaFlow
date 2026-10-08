@@ -12284,9 +12284,7 @@
       "and_more": "and {count} more {n|field|fields}",
       "action": {
         "show": "Show",
-        "hide": "Hide",
-        "mask": "Mask",
-        "hash": "Hash"
+        "hide": "Hide"
       },
       "write": {
         "allow": "Allowed",
@@ -12313,9 +12311,9 @@
       "col_changed": "Changed",
       "empty_title": "This topic has no data hiding rules",
       "empty_text": "Anyone who can read this topic sees whole messages. Add a rule to hide chosen fields.",
-      "blocked_title": "A rule cannot be added in this topic",
-      "blocked_text": "This topic carries binary content, so its fields are not known. Data hiding rules work on JSON, XML and HL7 v2 messages.",
-      "keys_closed": "Outside systems with an API key are shut out of this topic for {directions}: it has rules for chosen subjects only and none for everyone.",
+      "blocked_title": "Rules for this topic are not edited here",
+      "blocked_text": "Rules for this topic are not edited on this screen because its content is binary and cannot be read as fields. This screen works with JSON, XML and HL7 v2 messages. The kind of content is set when the topic is created.",
+      "keys_closed": "Outside systems with an API key are shut out of this topic for {directions}: it has rules for chosen people, groups or addons only and none for everyone.",
       "sees_only": "Sees only: {fields}",
       "sees_nothing": "Sees no field",
       "hides_none": "Hides none of the known fields",
@@ -12324,8 +12322,6 @@
       "writes_all": "Accepts all known fields",
       "legend": {
         "hide": "The field disappears from the message.",
-        "mask": "The last 3 characters show, the rest are asterisks.",
-        "hash": "A string of characters stands in for the value, always the same for the same value.",
         "reject_name": "Reject the message",
         "reject": "When writing: a message with a field that is not allowed, or without a required one, does not reach the topic.",
         "precedence": "A person's own rule beats the rule of their group, which beats the rule for everyone — rules are never added together."
@@ -12334,12 +12330,14 @@
         "empty": "Type the name of a field.",
         "hl7_msh": "{name} holds the separators of the message itself — it cannot be hidden. Choose another field.",
         "hl7_shape": "“{name}” is not an HL7 field address. An address looks like SEGMENT-number, e.g. PID-5.",
-        "xml_name": "“{name}” is not an XML element name. A name starts with a letter or _ and has no spaces."
+        "xml_name": "“{name}” is not an XML element name. A name starts with a letter or _ and has no spaces.",
+        "hl7_case": "“{name}” looks like a typo. Did you mean {suggestion}? An address is written in capital letters, with a dash.",
+        "typed_known": "“{name}” is on the field list with a different setting than the one typed below. Keep it in one place only."
       },
       "need": {
-        "read": "Set at least one field to “Hide”. A rule that hides nothing does nothing — to stop it, delete it.",
+        "read": "Set at least one field to “Hide”. The list holds every field of this topic, so a rule that shows them all changes nothing — to stop it, delete it.",
         "read_typed": "Type at least one field that stays visible. With no visible field the rule would hide the whole message.",
-        "write": "Set at least one field to “Required” or “Not allowed”. A rule that checks nothing does nothing — to stop it, delete it.",
+        "write": "Set at least one field to “Required” or “Not allowed”. The list holds every field of this topic, so a rule that allows everything checks nothing — to stop it, delete it.",
         "write_typed": "Type at least one field that may be written. With no allowed field the rule would reject every message."
       },
       "impact": {
@@ -12347,19 +12345,25 @@
         "read_hidden": "For “{who}” these fields disappear from messages: {fields}.",
         "read_shown": "For “{who}” these fields appear in messages: {fields}.",
         "rest": "The other fields of the list stay as they are.",
-        "read_unlisted": "Fields outside the list disappear too, unless you type them below.",
+        "read_unlisted": "Fields outside the list disappear too, unless you add them.",
         "write_only": "A message from “{who}” is accepted only with the fields: {fields}. A message with any other field is rejected.",
         "write_forbidden": "A message from “{who}” that contains any of the fields {fields} is rejected and does not reach the topic.",
         "write_required": "A message from “{who}” that lacks any of the fields {fields} is rejected and does not reach the topic.",
         "write_rest": "The whole message is rejected, not just the field.",
-        "write_unlisted": "A message with a field outside the list is rejected too, unless you type that field below."
+        "write_unlisted": "A message with a field outside the list is rejected too, unless you add that field.",
+        "keys_closed": "Outside systems with an API key will not be able to {action} this topic until you add a rule for everyone.",
+        "read_unlisted_only": "For “{who}”, fields outside the list disappear. Every field on the list stays visible.",
+        "write_unlisted_only": "A message from “{who}” is accepted only with the fields on the list. A message with any other field is rejected.",
+        "write_accepted": "Messages from “{who}” with the fields {fields} are accepted.",
+        "write_not_required": "These fields are no longer required from “{who}”: {fields}."
       },
       "fields_label": "Fields",
       "source": {
         "schema": "The fields come from the message pattern {name}, version {version}.",
         "dictionary": "The list holds the most common HL7 v2 fields. Add another field below by typing its address.",
         "failed": "The message pattern of this topic could not be read, so its fields are not known. Type below the fields that stay visible.",
-        "manual": "The fields of this topic are not known — no message pattern lists them. Type below the fields that stay visible."
+        "manual": "The fields of this topic are not known — no message pattern lists them. Type below the fields that stay visible.",
+        "complex": "The message pattern of this topic holds fields that cannot be listed from it (a reference to another file or free-form field names), so the full list is not known. Type below the fields that stay visible."
       },
       "extra": {
         "shown": "Other fields that stay visible",
@@ -12381,18 +12385,25 @@
         "save": "Save the rule",
         "who": "For whom",
         "when": "When it applies",
-        "any_hint": "The rule for everyone applies to anyone without a rule of their own or of their group. It is the only rule systems with an API key meet.",
+        "any_hint": "The rule for everyone applies to anyone without a rule of their own or of their group. Systems with an API key are subject to this rule only.",
         "any_taken": "A rule for everyone for {direction} already exists — change it in its row.",
-        "none_free": "Everyone on this list already has such a rule in this topic (or the list is empty).",
+        "none_free": "Everyone on this list already has such a rule in this topic.",
         "pick_hint": "The list shows people, groups or addons that do not have such a rule yet.",
         "pick_first": "Choose whom the rule is for.",
         "taken": "This person, group or addon already has a rule for {direction} — change it in its row.",
-        "saved_title": "Rule saved"
+        "saved_title": "Rule saved",
+        "search": "Search the list",
+        "choose": "Choose…",
+        "none_exist": {
+          "group": "This organization has no groups yet.",
+          "user": "This organization has no users.",
+          "addon": "No addon has access to this instance."
+        }
       },
       "change": {
         "button": "Change",
         "window_title": "Data hiding rule — {name}",
-        "fixed": "The rule belongs to this person, group or addon, for this direction only — that does not change.",
+        "fixed": "The rule belongs to this person, group or addon — that does not change.",
         "saved_title": "Rule change saved"
       },
       "remove": {
@@ -12409,14 +12420,18 @@
         "part_nothing": "no field is allowed",
         "part_none": "all known fields are allowed",
         "impact_title": "What happens after deleting:",
-        "impact_read": "For “{who}” in the topic {topic}, the rule of a group or the rule for everyone applies instead; if there is none, whole messages are seen.",
-        "impact_write": "Messages from “{who}” to the topic {topic} are checked against the rule of a group or the rule for everyone; if there is none, they are not checked at all.",
         "impact_any_read": "Anyone without a reading rule of their own sees whole messages in the topic {topic}.",
         "impact_any_write": "Writing to the topic {topic} is no longer checked for anyone without a writing rule of their own.",
-        "impact_keys": "Only rules for chosen subjects remain, so outside systems with an API key will not be able to {action} this topic.",
+        "impact_keys": "Only rules for chosen people, groups or addons remain, so outside systems with an API key will not be able to {action} this topic.",
         "confirm": "Delete the rule",
         "saved_title": "Rule deleted",
-        "saved_text": "The rule for {direction} for: {who} was deleted."
+        "saved_text": "The rule for {direction} for: {who} was deleted.",
+        "impact_read_user": "For the user “{who}” in the topic {topic}, the reading rule of one of their groups applies instead, and if none of them has one, the rule for everyone; if there is none, whole messages are seen.",
+        "impact_read_group": "People in the group “{who}” read the topic {topic} by the reading rule of another group of theirs, and if they have none, by the rule for everyone; if there is none, they see whole messages.",
+        "impact_read_addon": "The addon “{who}” reads the topic {topic} by the rule for everyone; if there is none, it sees whole messages.",
+        "impact_write_user": "Messages from the user “{who}” to the topic {topic} are checked against the writing rule of one of their groups, and if none of them has one, the rule for everyone; if there is none, they are not checked at all.",
+        "impact_write_group": "Messages from people in the group “{who}” to the topic {topic} are checked against the writing rule of another group of theirs, and if they have none, the rule for everyone; if there is none, they are not checked at all.",
+        "impact_write_addon": "Messages from the addon “{who}” to the topic {topic} are checked against the rule for everyone; if there is none, they are not checked at all."
       },
       "preview": {
         "button": "Preview what they see…",
@@ -12440,8 +12455,12 @@
         "rules_title": "What the rules did",
         "summary_hidden": "The rules hid {count} {n|field|fields}: {fields}.",
         "summary_none": "The rules hid no field of this message.",
-        "limited_title": "This preview is narrower than what the chosen subject sees",
-        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that this subject will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you."
+        "limited_title": "This preview is narrower than what the chosen person, group or addon sees",
+        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that this subject will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you.",
+        "limited_missing": "Fields that may be missing here: {fields}. If the message has them, a rule that applies to you too hides them.",
+        "who_user": "user {name}",
+        "who_group": "group {name}",
+        "who_addon": "addon {name}"
       },
       "hl7": {
         "msh_3": "Sending application",
@@ -12504,8 +12523,17 @@
         "obx_14": "Result date and time",
         "dg1_3": "Diagnosis code",
         "dg1_4": "Diagnosis description",
-        "al1_3": "Allergen"
-      }
+        "al1_3": "Allergen",
+        "msh_8": "Security",
+        "msh_11": "Processing ID",
+        "msh_12": "HL7 version"
+      },
+      "blocked_settings": "Open the topic settings",
+      "blocked_preview": "The preview is not available: the content of this topic cannot be read as fields.",
+      "writes_rest": "Other fields or a missing required one: reject the message",
+      "fields_search": "Search fields",
+      "fields_none": "No field matches the search.",
+      "stale": "The rule changed in the meantime. The list was refreshed — check it and try again."
     }
   },
   "composer": {

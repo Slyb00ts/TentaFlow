@@ -465,3 +465,83 @@ test('no control in tentabus.js is gated on isSiteAdmin', () => {
     'every admin control must gate on canAdmin() — the site-admin dispatch tier is gone',
   );
 });
+
+// ---------------------------------------------------------------------------
+// loadTopicHiding — the shell's loader of a topic's rules. Only the newest
+// answer for the open topic of the open instance may land: a slow answer for
+// an earlier call, or for a topic left in the meantime, must not paint over it.
+// ---------------------------------------------------------------------------
+
+function makeHidingLoader(world) {
+  // eslint-disable-next-line no-new-func
+  return new Function('world', `
+    const { state, ApiBinary, requireInstanceId, describeBusError, renderPanel, topicFormat } = world;
+    let hidingTurn = 0;
+    ${cut(source, 'freshHiding')}
+    async ${cut(source, 'fetchFieldSchema')}
+    async ${cut(source, 'loadTopicHiding')}
+    return { load: loadTopicHiding, leave: () => { hidingTurn += 1; } };`)(world);
+}
+
+function hidingWorld(answers) {
+  const painted = [];
+  const world = {
+    state: { instanceId: 'tentabus-a1b2c3d4', view: { name: 'wizyty' }, detail: { topic: { schemaId: '', contentType: 'application/json' } }, hiding: { topic: 'wizyty', policies: null, schemaSettled: false } },
+    ApiBinary: { one: (name, req) => answers[name](req) },
+    requireInstanceId: (id) => id,
+    describeBusError: (e) => `błąd: ${e.message}`,
+    renderPanel: () => painted.push(world.state.hiding),
+    topicFormat: () => 'json',
+  };
+  return { world, painted };
+}
+
+test('loadTopicHiding: only the newest answer for the open topic lands', async () => {
+  const waiting = [];
+  const { world, painted } = hidingWorld({
+    busFieldPolicyListRequest: () => new Promise((resolve) => waiting.push(resolve)),
+  });
+  const { load } = makeHidingLoader(world);
+  const first = load('wizyty');
+  const second = load('wizyty');
+  waiting[1]({ policies: [{ subjectId: 'new' }] });
+  await second;
+  waiting[0]({ policies: [{ subjectId: 'old' }] });
+  await first;
+  assert.deepEqual(world.state.hiding.policies, [{ subjectId: 'new' }], 'the slow, earlier answer did not overwrite the newer one');
+  assert.equal(painted.length, 1);
+});
+
+test('loadTopicHiding: an answer for a topic that was left, or after the topic was closed, lands nowhere', async () => {
+  const waiting = [];
+  const { world, painted } = hidingWorld({ busFieldPolicyListRequest: () => new Promise((resolve) => waiting.push(resolve)) });
+  const { load, leave } = makeHidingLoader(world);
+  const pending = load('wizyty');
+  world.state.view = { name: 'inny' };
+  waiting[0]({ policies: [{ subjectId: 'x' }] });
+  await pending;
+  assert.equal(world.state.hiding.policies, null);
+  assert.equal(painted.length, 0);
+  world.state.view = { name: 'wizyty' };
+  const closed = load('wizyty');
+  leave();
+  waiting[1]({ policies: [{ subjectId: 'y' }] });
+  await closed;
+  assert.equal(world.state.hiding.policies, null, 'the page was closed (turn bumped) before the answer');
+  assert.equal(painted.length, 0);
+});
+
+test('loadTopicHiding: a failed reload keeps the rules the section showed; a first failure shows the reason', async () => {
+  let fail = false;
+  const { world } = hidingWorld({ busFieldPolicyListRequest: async () => { if (fail) throw new Error('Unavailable'); return { policies: [{ subjectId: 'a' }] }; } });
+  const { load } = makeHidingLoader(world);
+  await load('wizyty');
+  fail = true;
+  await load('wizyty');
+  assert.deepEqual(world.state.hiding.policies, [{ subjectId: 'a' }]);
+  assert.equal(world.state.hiding.policiesError, null);
+  world.state.hiding = { topic: 'wizyty', policies: null };
+  await load('wizyty');
+  assert.equal(world.state.hiding.policies, null);
+  assert.equal(world.state.hiding.policiesError, 'błąd: Unavailable');
+});

@@ -11049,9 +11049,7 @@
       "and_more": "et {count} {n|autre champ|autres champs}",
       "action": {
         "show": "Afficher",
-        "hide": "Dissimuler",
-        "mask": "Masquer",
-        "hash": "Hacher"
+        "hide": "Dissimuler"
       },
       "write": {
         "allow": "Autorisé",
@@ -11078,9 +11076,9 @@
       "col_changed": "Modifié",
       "empty_title": "Ce topic n'a aucune règle de dissimulation des données",
       "empty_text": "Toute personne qui peut lire ce topic voit les messages entiers. Ajoutez une règle pour dissimuler certains champs.",
-      "blocked_title": "Impossible d'ajouter une règle dans ce topic",
-      "blocked_text": "Ce topic transporte du contenu binaire, ses champs ne sont donc pas connus. Les règles de dissimulation s'appliquent aux messages JSON, XML et HL7 v2.",
-      "keys_closed": "Les systèmes externes avec une clé d'API n'ont pas accès à ce topic en {directions} : il n'a que des règles pour des sujets choisis et aucune pour tout le monde.",
+      "blocked_title": "Les règles de ce topic ne sont pas modifiées ici",
+      "blocked_text": "Les règles de ce topic ne se modifient pas sur cet écran, car son contenu est binaire et ne peut pas être lu comme des champs. Cet écran prend en charge les messages JSON, XML et HL7 v2. Le type de contenu est fixé à la création du topic.",
+      "keys_closed": "Les systèmes externes avec une clé d’API n’ont pas accès à ce topic en {directions} : il n’a de règles que pour des personnes, groupes ou addons choisis et aucune pour tout le monde.",
       "sees_only": "Voit seulement : {fields}",
       "sees_nothing": "Ne voit aucun champ",
       "hides_none": "Ne dissimule aucun des champs connus",
@@ -11089,8 +11087,6 @@
       "writes_all": "Accepte tous les champs connus",
       "legend": {
         "hide": "Le champ disparaît du message.",
-        "mask": "Les 3 derniers caractères sont visibles, le reste devient des astérisques.",
-        "hash": "Une chaîne de caractères remplace la valeur, toujours la même pour la même valeur.",
         "reject_name": "Rejeter le message",
         "reject": "À l'écriture : un message avec un champ interdit, ou sans champ obligatoire, n'arrive pas dans le topic.",
         "precedence": "La règle d'une personne l'emporte sur celle de son groupe, qui l'emporte sur celle pour tout le monde — les règles ne s'additionnent pas."
@@ -11099,12 +11095,14 @@
         "empty": "Saisissez le nom d'un champ.",
         "hl7_msh": "{name} contient les séparateurs du message lui-même — il ne peut pas être dissimulé. Choisissez un autre champ.",
         "hl7_shape": "« {name} » n'est pas une adresse de champ HL7. Une adresse a la forme SEGMENT-numéro, p. ex. PID-5.",
-        "xml_name": "« {name} » n'est pas un nom d'élément XML. Un nom commence par une lettre ou _ et ne contient pas d'espace."
+        "xml_name": "« {name} » n'est pas un nom d'élément XML. Un nom commence par une lettre ou _ et ne contient pas d'espace.",
+        "hl7_case": "« {name} » ressemble à une faute de frappe. Vouliez-vous dire {suggestion} ? Une adresse s’écrit en majuscules, avec un tiret.",
+        "typed_known": "« {name} » figure dans la liste des champs avec un réglage différent de celui saisi ci-dessous. Ne le gardez qu’à un seul endroit."
       },
       "need": {
-        "read": "Réglez au moins un champ sur « Dissimuler ». Une règle qui ne dissimule rien ne fait rien — supprimez-la pour l'arrêter.",
+        "read": "Réglez au moins un champ sur « Masquer ». La liste contient tous les champs de ce topic : une règle qui les montre tous ne change rien. Pour l’arrêter, supprimez-la.",
         "read_typed": "Saisissez au moins un champ qui reste visible. Sans champ visible, la règle dissimulerait tout le message.",
-        "write": "Réglez au moins un champ sur « Obligatoire » ou « Interdit ». Une règle qui ne vérifie rien ne fait rien — supprimez-la pour l'arrêter.",
+        "write": "Réglez au moins un champ sur « Obligatoire » ou « Interdit ». La liste contient tous les champs de ce topic : une règle qui autorise tout ne vérifie rien. Pour l’arrêter, supprimez-la.",
         "write_typed": "Saisissez au moins un champ qu'il est permis d'écrire. Sans champ autorisé, la règle rejetterait chaque message."
       },
       "impact": {
@@ -11112,19 +11110,25 @@
         "read_hidden": "Pour « {who} », ces champs disparaissent des messages : {fields}.",
         "read_shown": "Pour « {who} », ces champs apparaissent dans les messages : {fields}.",
         "rest": "Les autres champs de la liste restent inchangés.",
-        "read_unlisted": "Les champs hors de la liste disparaissent aussi, sauf si vous les saisissez ci-dessous.",
+        "read_unlisted": "Les champs absents de la liste disparaissent aussi, sauf si vous les ajoutez.",
         "write_only": "Un message de « {who} » n'est accepté qu'avec les champs : {fields}. Un message avec un autre champ est rejeté.",
         "write_forbidden": "Un message de « {who} » qui contient l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
         "write_required": "Un message de « {who} » auquel manque l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
         "write_rest": "Le message entier est rejeté, pas seulement le champ.",
-        "write_unlisted": "Un message avec un champ hors de la liste est rejeté aussi, sauf si vous saisissez ce champ ci-dessous."
+        "write_unlisted": "Un message avec un champ absent de la liste est aussi rejeté, sauf si vous ajoutez ce champ.",
+        "keys_closed": "Les systèmes externes avec une clé d’API ne pourront pas {action} ce topic tant que vous n’aurez pas ajouté une règle pour tout le monde.",
+        "read_unlisted_only": "Pour « {who} », les champs absents de la liste disparaissent. Tous les champs de la liste restent visibles.",
+        "write_unlisted_only": "De « {who} », un message n’est accepté qu’avec les champs de la liste. Un message avec un autre champ est rejeté.",
+        "write_accepted": "Les messages de « {who} » avec les champs {fields} sont acceptés.",
+        "write_not_required": "Ces champs ne sont plus exigés de « {who} » : {fields}."
       },
       "fields_label": "Champs",
       "source": {
         "schema": "Les champs proviennent du modèle de message {name}, version {version}.",
         "dictionary": "La liste contient les champs HL7 v2 les plus courants. Ajoutez un autre champ ci-dessous en saisissant son adresse.",
         "failed": "Le modèle de message de ce topic n'a pas pu être lu, ses champs ne sont donc pas connus. Saisissez ci-dessous les champs qui restent visibles.",
-        "manual": "Les champs de ce topic ne sont pas connus — aucun modèle de message ne les énumère. Saisissez ci-dessous les champs qui restent visibles."
+        "manual": "Les champs de ce topic ne sont pas connus — aucun modèle de message ne les énumère. Saisissez ci-dessous les champs qui restent visibles.",
+        "complex": "Le modèle de message de ce topic contient des champs qu’on ne peut pas en extraire (renvoi vers un autre fichier ou noms de champs libres), la liste complète n’est donc pas connue. Saisissez ci-dessous les champs qui restent visibles."
       },
       "extra": {
         "shown": "Autres champs qui restent visibles",
@@ -11146,18 +11150,25 @@
         "save": "Enregistrer la règle",
         "who": "Pour qui",
         "when": "Quand elle s'applique",
-        "any_hint": "La règle pour tout le monde s'applique à toute personne sans règle propre ni règle de son groupe. C'est la seule que rencontrent les systèmes avec une clé d'API.",
+        "any_hint": "La règle pour tout le monde s’applique à quiconque n’a ni règle propre ni règle de son groupe. Les systèmes avec une clé d’API ne sont soumis qu’à cette règle.",
         "any_taken": "Une règle pour tout le monde en {direction} existe déjà — modifiez-la dans sa ligne.",
-        "none_free": "Chacun de cette liste a déjà une telle règle dans ce topic (ou la liste est vide).",
+        "none_free": "Chaque entrée de cette liste a déjà une telle règle dans ce topic.",
         "pick_hint": "La liste montre les personnes, groupes ou addons qui n'ont pas encore une telle règle.",
         "pick_first": "Choisissez à qui la règle s'applique.",
         "taken": "Cette personne, ce groupe ou cet addon a déjà une règle en {direction} — modifiez-la dans sa ligne.",
-        "saved_title": "Règle enregistrée"
+        "saved_title": "Règle enregistrée",
+        "search": "Rechercher dans la liste",
+        "choose": "Choisir…",
+        "none_exist": {
+          "group": "Cette organisation n’a pas encore de groupe.",
+          "user": "Cette organisation n’a aucun utilisateur.",
+          "addon": "Aucun addon n’a accès à cette instance."
+        }
       },
       "change": {
         "button": "Modifier",
         "window_title": "Règle de dissimulation des données — {name}",
-        "fixed": "La règle appartient à cette personne, ce groupe ou cet addon, pour ce sens uniquement — cela ne change pas.",
+        "fixed": "La règle appartient à cette personne, ce groupe ou cet addon : cela ne change pas.",
         "saved_title": "Modification de la règle enregistrée"
       },
       "remove": {
@@ -11174,14 +11185,18 @@
         "part_nothing": "aucun champ n'est autorisé",
         "part_none": "tous les champs connus sont autorisés",
         "impact_title": "Ce qui se passe après la suppression :",
-        "impact_read": "Pour « {who} » dans le topic {topic}, la règle d'un groupe ou la règle pour tout le monde s'applique à la place ; s'il n'y en a pas, les messages sont vus en entier.",
-        "impact_write": "Les messages de « {who} » vers le topic {topic} seront vérifiés selon la règle d'un groupe ou la règle pour tout le monde ; s'il n'y en a pas, ils ne seront pas vérifiés du tout.",
         "impact_any_read": "Toute personne sans règle de lecture propre verra les messages entiers dans le topic {topic}.",
         "impact_any_write": "L'écriture dans le topic {topic} ne sera plus vérifiée pour toute personne sans règle d'écriture propre.",
-        "impact_keys": "Il ne restera que des règles pour des sujets choisis ; les systèmes externes avec une clé d'API ne pourront plus {action} ce topic.",
+        "impact_keys": "Il ne reste que des règles pour des personnes, groupes ou addons choisis : les systèmes externes avec une clé d’API ne pourront pas {action} ce topic.",
         "confirm": "Supprimer la règle",
         "saved_title": "Règle supprimée",
-        "saved_text": "La règle en {direction} pour : {who} a été supprimée."
+        "saved_text": "La règle en {direction} pour : {who} a été supprimée.",
+        "impact_read_user": "Pour l’utilisateur « {who} » dans le topic {topic}, c’est la règle de lecture de l’un de ses groupes qui s’applique, à défaut la règle pour tout le monde ; s’il n’y en a aucune, il voit les messages entiers.",
+        "impact_read_group": "Les membres du groupe « {who} » lisent le topic {topic} selon la règle de lecture d’un autre de leurs groupes, à défaut selon la règle pour tout le monde ; s’il n’y en a aucune, ils voient les messages entiers.",
+        "impact_read_addon": "L’addon « {who} » lit le topic {topic} selon la règle pour tout le monde ; s’il n’y en a pas, il voit les messages entiers.",
+        "impact_write_user": "Les messages de l’utilisateur « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture de l’un de ses groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
+        "impact_write_group": "Les messages des membres du groupe « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture d’un autre de leurs groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
+        "impact_write_addon": "Les messages de l’addon « {who} » vers le topic {topic} sont vérifiés selon la règle pour tout le monde ; s’il n’y en a pas, ils ne sont pas vérifiés du tout."
       },
       "preview": {
         "button": "Aperçu de ce que voit…",
@@ -11205,8 +11220,12 @@
         "rules_title": "Ce que les règles ont fait",
         "summary_hidden": "Les règles ont dissimulé {count} {n|champ|champs} : {fields}.",
         "summary_none": "Les règles n'ont dissimulé aucun champ de ce message.",
-        "limited_title": "Diese Vorschau ist enger als die Sicht des gewählten Eintrags",
-        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne."
+        "limited_title": "Cet aperçu est plus étroit que la vue de la personne, du groupe ou de l’addon choisi",
+        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
+        "limited_missing": "Des champs peuvent manquer ici : {fields}. Si le message les contient, une règle qui s’applique aussi à vous les masque.",
+        "who_user": "utilisateur {name}",
+        "who_group": "groupe {name}",
+        "who_addon": "addon {name}"
       },
       "hl7": {
         "msh_3": "Application émettrice",
@@ -11269,8 +11288,17 @@
         "obx_14": "Date et heure du résultat",
         "dg1_3": "Code du diagnostic",
         "dg1_4": "Description du diagnostic",
-        "al1_3": "Allergène"
-      }
+        "al1_3": "Allergène",
+        "msh_8": "Sécurité",
+        "msh_11": "ID de traitement",
+        "msh_12": "Version HL7"
+      },
+      "blocked_settings": "Ouvrir les paramètres du topic",
+      "blocked_preview": "L’aperçu n’est pas disponible : le contenu de ce topic ne peut pas être lu comme des champs.",
+      "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
+      "fields_search": "Rechercher un champ",
+      "fields_none": "Aucun champ ne correspond à la recherche.",
+      "stale": "La règle a changé entre-temps. La liste a été actualisée : vérifiez-la et réessayez."
     }
   },
   "composer": {

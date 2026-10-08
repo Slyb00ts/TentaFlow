@@ -486,7 +486,9 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
    change, delete; "Podgląd, jak widzi…"). The field rows reuse the rights
    rows of Dostęp.
    ============================================================================= */
-.tb-hiding-window [data-role="rows"] { max-height: 320px; overflow-y: auto; }
+.tb-hiding-window .tb-right-row[hidden] { display: none; }
+.tb-hiding-window [data-role="field-search"] { display: block; margin-bottom: 8px; }
+.tb-hiding-window .tb-pick-box, .tb-hiding-preview .tb-pick-box { display: flex; flex-direction: column; gap: 12px; }
 .tb-hiding-window tf-tag-input { display: block; }
 .tb-hiding-preview [data-role="result"] { display: flex; flex-direction: column; gap: 14px; }
 .tb-hiding-preview .tb-preview-record-head { justify-content: space-between; }

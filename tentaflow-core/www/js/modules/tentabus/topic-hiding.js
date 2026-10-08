@@ -20,8 +20,10 @@
 //     rules for chosen subjects but none for everyone is closed to keys.
 //
 // The known fields come from the topic's message pattern (a JSON Schema's
-// top-level properties) or, for HL7 v2, from a dictionary (hl7-fields.js); a
-// topic with neither (XML, JSON without a pattern) is listed by hand. The
+// properties, followed through allOf / oneOf / anyOf / if-then-else and local
+// $ref) or, for HL7 v2, from a dictionary (hl7-fields.js) whose unnamed
+// positions are allowed by default; a topic with neither (XML, JSON without a
+// pattern, a pattern the screen cannot read to the end) is listed by hand. The
 // shell (tentabus.js) loads the rules and the pattern; this module paints the
 // section and builds the requests, the windows are in topic-hiding-windows.js.
 
@@ -30,7 +32,7 @@ import { I18n } from '/js/i18n.js';
 import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime, contentKind } from '/js/modules/tentabus/format.js';
 import { subjectTitle, subjectSub } from '/js/modules/tentabus/topic-access.js';
-import { HL7_FIELDS, hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
+import { HL7_FIELDS, HL7_IMPLICIT_FIELDS, hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
@@ -45,8 +47,6 @@ export const DIRECTIONS = ['read', 'write'];
 export const SUBJECT_KINDS = ['group', 'user', 'addon', 'any'];
 /** The id the server stores for the rule that covers everyone. */
 export const ANY_ID = '*';
-/** Actions that take a field away from a reader, widest first; the server offers more over time (`fieldActions`). */
-const READ_HIDING_ACTIONS = ['hide', 'mask', 'hash'];
 /** A table cell names this many fields before it counts the rest. */
 const CELL_FIELDS = 3;
 
@@ -112,55 +112,100 @@ export function topicFormat(contentType) {
 const clip = (text, max = 70) => (text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text);
 
 /**
- * The top-level properties of a JSON Schema as `[{ name, label }]`, in the
- * order the pattern writes them; the label is the property's title, else the
- * start of its description. Properties of an `allOf` branch count too. An
- * empty list for text that is not a schema with properties.
+ * Reads the fields of a JSON Schema: `{ fields: [{ name, label }], complex,
+ * closed }`. The fields are the properties of the schema, its allOf / oneOf /
+ * anyOf branches, if / then / else and every local `$ref` (`#/$defs/..`,
+ * `#/definitions/..`), in the order the pattern writes them; the label is the
+ * property's title, else the start of its description. `complex` is true when
+ * the pattern names fields this walk cannot list — a remote or dangling
+ * `$ref`, `patternProperties`, an `additionalProperties` schema — so the list
+ * would be incomplete; `closed` when the schema forbids any other property.
+ * No fields for text that is not a schema.
  */
-export function jsonSchemaFields(text) {
+export function readJsonSchema(text) {
   let root;
   try {
     root = JSON.parse(text);
   } catch {
-    return [];
+    return { fields: [], complex: false, closed: false };
   }
   const found = new Map();
+  const seen = new Set();
+  let complex = false;
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const resolve = (ref) => {
+    if (ref === '#') return root;
+    if (typeof ref !== 'string' || !ref.startsWith('#/')) return undefined;
+    let node = root;
+    for (const part of ref.slice(2).split('/')) {
+      let key;
+      try {
+        key = decodeURIComponent(part).replace(/~1/g, '/').replace(/~0/g, '~');
+      } catch {
+        return undefined;
+      }
+      if (!isObject(node) && !Array.isArray(node)) return undefined;
+      if (!Object.hasOwn(node, key)) return undefined;
+      node = node[key];
+    }
+    return node;
+  };
   const collect = (node) => {
-    if (!node || typeof node !== 'object') return;
-    const props = node.properties;
-    if (props && typeof props === 'object' && !Array.isArray(props)) {
-      for (const [name, def] of Object.entries(props)) {
+    if (!isObject(node) || seen.has(node)) return;
+    seen.add(node);
+    if ('$ref' in node) {
+      const target = resolve(node.$ref);
+      if (target === undefined) complex = true;
+      else collect(target);
+    }
+    if (isObject(node.properties)) {
+      for (const [name, def] of Object.entries(node.properties)) {
         if (found.has(name)) continue;
-        const label = def && typeof def === 'object' ? String(def.title || def.description || '').trim() : '';
+        const label = isObject(def) ? String(def.title || def.description || '').trim() : '';
         found.set(name, { name, label: clip(label) });
       }
     }
-    if (Array.isArray(node.allOf)) node.allOf.forEach(collect);
+    if (isObject(node.patternProperties) && Object.keys(node.patternProperties).length) complex = true;
+    if (isObject(node.additionalProperties)) complex = true;
+    for (const key of ['allOf', 'oneOf', 'anyOf']) {
+      if (Array.isArray(node[key])) node[key].forEach(collect);
+    }
+    for (const key of ['if', 'then', 'else']) collect(node[key]);
   };
   collect(root);
-  return [...found.values()];
+  return { fields: [...found.values()], complex, closed: isObject(root) && root.additionalProperties === false };
 }
 
 /**
  * Where a topic's known fields come from. `schema` = `{ subject, version,
  * text }` of the pattern the topic checks with, `{ failed: true }` when it
- * could not be read, or `null`. Returns `{ mode, fields, subject, version,
- * failed }` with `mode`:
+ * could not be read, or `null`. Returns `{ mode, fields, complete, implicit,
+ * subject, version, failed, complex }` with `mode`:
  *   - `schema`: the pattern's properties;
- *   - `dictionary`: HL7 v2's common fields (any other address can be typed);
- *   - `manual`: no list — the fields to keep are typed in;
+ *   - `dictionary`: HL7 v2's common fields (any other address can be typed),
+ *     with `implicit` = the unnamed positions of the same segments, which a
+ *     new rule allows without a row of their own;
+ *   - `manual`: no list — the fields to keep are typed in (`complex` = the
+ *     pattern is there but names fields the screen cannot list);
  *   - `blocked`: binary content, which has no fields to name.
+ * `complete` says the list is every field a message can carry (a closed
+ * pattern): only then can a rule that leaves every listed field alone be a
+ * rule that does nothing.
  */
 export function fieldSource({ format, schema }) {
-  if (format === 'binary') return { mode: 'blocked', fields: [] };
+  if (format === 'binary') return { mode: 'blocked', fields: [], implicit: [], complete: false };
   if (format === 'hl7v2') {
-    return { mode: 'dictionary', fields: HL7_FIELDS.map((name) => ({ name, label: hl7FieldLabel(name) })) };
+    return { mode: 'dictionary', fields: HL7_FIELDS.map((name) => ({ name, label: hl7FieldLabel(name) })), implicit: HL7_IMPLICIT_FIELDS, complete: false };
   }
+  let complex = false;
   if (format === 'json' && schema && !schema.failed) {
-    const fields = jsonSchemaFields(schema.text);
-    if (fields.length) return { mode: 'schema', fields, subject: schema.subject, version: schema.version };
+    const read = readJsonSchema(schema.text);
+    if (read.fields.length && !read.complex) {
+      return { mode: 'schema', fields: read.fields, implicit: [], complete: read.closed, subject: schema.subject, version: schema.version };
+    }
+    complex = read.complex;
   }
-  return { mode: 'manual', fields: [], failed: Boolean(schema?.failed) };
+  return { mode: 'manual', fields: [], implicit: [], complete: false, failed: Boolean(schema?.failed), complex };
 }
 
 /** The plain name of a field in `source`, '' when the source has none. */
@@ -175,7 +220,15 @@ export function fieldPhrase(source, name) {
 }
 
 const HL7_ADDRESS = /^[A-Z0-9]{3}-[1-9][0-9]*$/;
+const HL7_LOOSE_ADDRESS = /^([A-Za-z0-9]{3})-?([1-9][0-9]*)$/;
 const XML_NAME = /^[\p{Alphabetic}_][\p{Alphabetic}\p{N}_.:-]*$/u;
+
+/** The address a near miss ("pid5", "pid-5") was probably meant to be ("PID-5"), or `null`. */
+export function hl7Suggestion(name) {
+  const m = HL7_LOOSE_ADDRESS.exec(String(name ?? '').trim());
+  const suggestion = m ? `${m[1].toUpperCase()}-${m[2]}` : null;
+  return suggestion && suggestion !== 'MSH-1' && suggestion !== 'MSH-2' ? suggestion : null;
+}
 
 /**
  * Why `name` cannot be a field address of this format, as the key of the
@@ -188,7 +241,8 @@ export function fieldNameProblem(format, name) {
   if (!value.trim()) return 'empty';
   if (format === 'hl7v2') {
     if (value === 'MSH-1' || value === 'MSH-2') return 'hl7_msh';
-    return HL7_ADDRESS.test(value) ? null : 'hl7_shape';
+    if (HL7_ADDRESS.test(value)) return null;
+    return hl7Suggestion(value) ? 'hl7_case' : 'hl7_shape';
   }
   if (format === 'xml') return XML_NAME.test(value) ? null : 'xml_name';
   return null;
@@ -204,11 +258,11 @@ export function fieldNameProblem(format, name) {
  * without a list only the allowed fields are known (`visible`).
  */
 export function ruleFacts(row, source) {
-  const names = source.fields.map((f) => f.name);
+  const names = [...source.fields.map((f) => f.name), ...source.implicit];
   const allowed = new Set(row.fields);
   const outside = names.filter((n) => !allowed.has(n));
   return {
-    known: names.length > 0,
+    known: source.fields.length > 0,
     hidden: row.direction === 'read' ? outside : [],
     forbidden: row.direction === 'write' ? outside : [],
     required: row.direction === 'write' ? [...row.requiredFields].sort() : [],
@@ -243,12 +297,13 @@ export function ruleWhatHtml(row, source) {
     return limitedHtml(source, facts.hidden.map((n) => [n, chipHtml('neutral', T('hiding.action.hide'))]));
   }
   const requiredItems = facts.required.map((n) => [n, chipHtml('ok', T('hiding.write.require'))]);
+  const refused = `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.writes_rest'))}</div>`;
   if (!facts.known) {
     const only = plain(facts.visible.length ? T('hiding.writes_only', { fields: facts.visible.join(', ') }) : T('hiding.writes_nothing'));
-    return requiredItems.length ? `${only}${limitedHtml(source, requiredItems)}` : only;
+    return `${only}${requiredItems.length ? limitedHtml(source, requiredItems) : ''}${refused}`;
   }
   const items = [...requiredItems, ...facts.forbidden.map((n) => [n, chipHtml('err', T('hiding.write.forbid'))])];
-  return items.length ? limitedHtml(source, items) : plain(T('hiding.writes_all'));
+  return `${items.length ? limitedHtml(source, items) : plain(T('hiding.writes_all'))}${refused}`;
 }
 
 /** A table row of the rules' card. */
@@ -262,25 +317,13 @@ export function ruleTableRow(row, source, nowMs = Date.now()) {
   };
 }
 
-/** Actions a reader's field can be set to: "Pokaż" and what `fieldActions` says the server can do besides. */
-export function readActionList(fieldActions) {
-  const offered = new Set(fieldActions || []);
-  return ['show', ...READ_HIDING_ACTIONS.filter((a) => a === 'hide' || offered.has(a))];
+/** The segmented options of one field in a window: reading offers "Pokaż" and "Ukryj", writing allowed / required / not allowed. */
+export function actionOptions(direction) {
+  const options = direction === 'read'
+    ? [['show', 'hiding.action.show', 'ok'], ['hide', 'hiding.action.hide', 'warn']]
+    : [['allow', 'hiding.write.allow', 'ok'], ['require', 'hiding.write.require', 'accent'], ['forbid', 'hiding.write.forbid', 'err']];
+  return options.map(([value, key, variant]) => ({ value, label: T(key), variant }));
 }
-
-/** The segmented options of one field in a window: reading offers "Pokaż" and the hiding actions, writing allowed / required / not allowed. */
-export function actionOptions(direction, fieldActions) {
-  const variants = { show: 'ok', hide: 'warn', mask: 'warn', hash: 'warn', allow: 'ok', require: 'accent', forbid: 'err' };
-  const values = direction === 'read' ? readActionList(fieldActions) : ['allow', 'require', 'forbid'];
-  return values.map((value) => ({
-    value,
-    label: T(direction === 'read' ? `hiding.action.${value}` : `hiding.write.${value}`),
-    variant: variants[value],
-  }));
-}
-
-/** Whether a reading action takes the field away from the reader (everything but "Pokaż"). */
-const takesFieldAway = (action) => action !== 'show';
 
 // ---------------------------------------------------------------------------
 // A rule as the window edits it, and the request that stores it
@@ -289,19 +332,26 @@ const takesFieldAway = (action) => action !== 'show';
 const defaultAction = (direction) => (direction === 'read' ? 'show' : 'allow');
 const sortedUnique = (list) => [...new Set(list)].sort();
 
-/** The form of a new rule: every known field shown (reading) or allowed (writing), nothing typed in. */
+/**
+ * The form of a new rule: every known field shown (reading) or allowed
+ * (writing), nothing typed in, no unnamed position kept out. `hiddenImplicit`
+ * holds the unnamed positions a stored rule leaves out: the window has no row
+ * for them, but saving the rule again must not allow them.
+ */
 export function blankForm(direction, source) {
-  return { actions: Object.fromEntries(source.fields.map((f) => [f.name, defaultAction(direction)])), extraShown: [], extraRequired: [] };
+  return { actions: Object.fromEntries(source.fields.map((f) => [f.name, defaultAction(direction)])), extraShown: [], extraRequired: [], hiddenImplicit: [] };
 }
 
 /**
  * The form of a stored rule. A known field not among the allowed ones is
  * "Ukryj" (or "Niedozwolone"); the allowed ones outside the known list are
- * the typed-in fields.
+ * the typed-in fields (an unnamed position of the dictionary's segments is
+ * not typed in: it is allowed by default).
  */
 export function formFromRule(row, source) {
   const names = source.fields.map((f) => f.name);
   const known = new Set(names);
+  const implicit = new Set(source.implicit);
   const allowed = new Set(row.fields);
   const required = new Set(row.requiredFields);
   const actions = {};
@@ -311,14 +361,20 @@ export function formFromRule(row, source) {
   }
   return {
     actions,
-    extraShown: sortedUnique(row.fields.filter((n) => !known.has(n) && !(row.direction === 'write' && required.has(n)))),
+    extraShown: sortedUnique(row.fields.filter((n) => !known.has(n) && !implicit.has(n) && !(row.direction === 'write' && required.has(n)))),
     extraRequired: row.direction === 'write' ? sortedUnique(row.requiredFields.filter((n) => !known.has(n))) : [],
+    hiddenImplicit: source.implicit.filter((n) => !allowed.has(n)),
   };
 }
 
 /** A form as one string, so a window can tell whether anything changed. */
 export function serializeForm(form, source) {
-  return JSON.stringify([source.fields.map((f) => form.actions[f.name] ?? ''), sortedUnique(form.extraShown), sortedUnique(form.extraRequired)]);
+  return JSON.stringify([
+    source.fields.map((f) => form.actions[f.name] ?? ''),
+    sortedUnique(form.extraShown),
+    sortedUnique(form.extraRequired),
+    sortedUnique(form.hiddenImplicit || []),
+  ]);
 }
 
 /** The form a `serializeForm` string holds (`null` for text that is not one). */
@@ -329,102 +385,164 @@ export function parseForm(text, source) {
   } catch {
     return null;
   }
-  if (!Array.isArray(parsed) || parsed.length !== 3) return null;
-  const [actions, extraShown, extraRequired] = parsed;
+  if (!Array.isArray(parsed) || parsed.length !== 4) return null;
+  const [actions, extraShown, extraRequired, hiddenImplicit] = parsed;
   return {
     actions: Object.fromEntries(source.fields.map((f, i) => [f.name, actions[i] ?? ''])),
     extraShown: [...extraShown],
     extraRequired: [...extraRequired],
+    hiddenImplicit: [...hiddenImplicit],
+  };
+}
+
+/**
+ * The form as the request will carry it: the typed-in names trimmed, a typed
+ * "required" name that is also a listed field makes that row "Wymagane", and
+ * what stays typed is only what the list does not have. One place decides
+ * this, so the request and the sentences about it cannot disagree.
+ */
+function effectiveForm(form, source, direction) {
+  const known = new Set(source.fields.map((f) => f.name));
+  const typed = (list) => sortedUnique(list.map((n) => n.trim()).filter(Boolean));
+  const required = direction === 'read' ? [] : typed(form.extraRequired);
+  const actions = { ...form.actions };
+  for (const n of required) if (known.has(n) && actions[n] !== 'forbid') actions[n] = 'require';
+  return {
+    actions,
+    extraShown: typed(form.extraShown).filter((n) => !known.has(n)),
+    extraRequired: required.filter((n) => !known.has(n)),
+    hiddenImplicit: form.hiddenImplicit || [],
   };
 }
 
 /**
  * The `FieldPolicySetRequest` of a form. The allowed fields are the known
- * ones left shown (or allowed or required) plus the typed-in ones; a field
- * set to any action that takes it away — "Ukryj", and "Zamaskuj" or "Zahaszuj"
- * where the server offers them — is never listed as allowed, so a server that
- * does not store those actions yet still hides the field.
+ * ones left shown (or allowed or required), the typed-in ones and the unnamed
+ * positions of the dictionary's segments that the rule does not keep out; a
+ * field set to "Ukryj" is never listed as allowed.
  */
 export function buildPolicyRequest({ instanceId, topic, subject, direction, form, source }) {
   const names = source.fields.map((f) => f.name);
-  const known = new Set(names);
-  const typed = (list) => sortedUnique(list.map((n) => n.trim()).filter((n) => n && !known.has(n)));
+  const eff = effectiveForm(form, source, direction);
   const read = direction === 'read';
-  const allowedKnown = names.filter((n) => (read ? !takesFieldAway(form.actions[n]) : form.actions[n] !== 'forbid'));
-  const extraRequired = read ? [] : typed(form.extraRequired);
-  const requiredKnown = read ? [] : names.filter((n) => form.actions[n] === 'require');
+  const allowedKnown = names.filter((n) => (read ? eff.actions[n] !== 'hide' : eff.actions[n] !== 'forbid'));
+  const requiredKnown = read ? [] : names.filter((n) => eff.actions[n] === 'require');
+  const kept = new Set(eff.hiddenImplicit);
+  const implicit = source.implicit.filter((n) => !kept.has(n));
   return {
     instanceId,
     topic,
     subjectType: subject.subjectType,
     subjectId: subject.subjectId,
     direction,
-    fields: sortedUnique([...allowedKnown, ...typed(form.extraShown), ...extraRequired]),
-    requiredFields: sortedUnique([...requiredKnown, ...extraRequired]),
+    fields: sortedUnique([...allowedKnown, ...eff.extraShown, ...eff.extraRequired, ...implicit]),
+    requiredFields: sortedUnique([...requiredKnown, ...eff.extraRequired]),
   };
 }
 
 /**
  * What a form still lacks to be a rule worth storing, in words, or `null`:
- * a typed-in address the format refuses, or no field set to anything. A rule
- * that hides nothing does nothing — the way to switch one off is to delete it.
+ * every typed-in address the format refuses (each one named, so none is
+ * found only after the one before it was fixed), a typed name that
+ * contradicts the row of the same field, or no field set to anything. A rule
+ * that hides nothing in a COMPLETE list does nothing — the way to switch one
+ * off is to delete it; over an incomplete list it still hides (or refuses)
+ * what the list does not name, which the sentence about it says.
  */
 export function formProblem({ direction, form, source, format }) {
   const typed = [...form.extraShown, ...form.extraRequired];
+  const problems = [];
   for (const name of typed) {
     const reason = fieldNameProblem(format, name);
-    if (reason) return T(`hiding.field_problem.${reason}`, { name });
+    if (reason) problems.push(T(`hiding.field_problem.${reason}`, { name, suggestion: hl7Suggestion(name) ?? '' }));
+  }
+  if (problems.length) return problems.join(' ');
+  const known = new Set(source.fields.map((f) => f.name));
+  const against = direction === 'read' ? 'hide' : 'forbid';
+  for (const name of typed.map((n) => n.trim())) {
+    if (known.has(name) && form.actions[name] === against) return T('hiding.field_problem.typed_known', { name });
   }
   const listed = source.fields.length > 0;
+  const eff = effectiveForm(form, source, direction);
   if (direction === 'read') {
-    if (listed) return source.fields.some((f) => takesFieldAway(form.actions[f.name])) ? null : T('hiding.need.read');
-    return form.extraShown.length ? null : T('hiding.need.read_typed');
+    if (listed) return source.complete && !source.fields.some((f) => eff.actions[f.name] === 'hide') ? T('hiding.need.read') : null;
+    return eff.extraShown.length ? null : T('hiding.need.read_typed');
   }
   if (listed) {
-    const set = source.fields.some((f) => form.actions[f.name] === 'forbid' || form.actions[f.name] === 'require');
-    return set || form.extraRequired.length ? null : T('hiding.need.write');
+    const set = source.fields.some((f) => eff.actions[f.name] === 'forbid' || eff.actions[f.name] === 'require');
+    return set || eff.extraRequired.length || !source.complete ? null : T('hiding.need.write');
   }
-  return typed.length ? null : T('hiding.need.write_typed');
+  return eff.extraShown.length || eff.extraRequired.length ? null : T('hiding.need.write_typed');
 }
 
 const phrases = (source, names) => names.map((n) => fieldPhrase(source, n)).join(', ');
+const minus = (list, other) => list.filter((n) => !other.includes(n));
+
+/**
+ * Whether saving a rule for chosen people, groups or addons closes the topic
+ * to systems with an API key: the first rule of a direction that is not the
+ * rule for everyone (`bus.key_needs_topic_wide_rule`). `rules` = the stored
+ * rows.
+ */
+export function closesTopicToKeys({ rules, subjectType, direction }) {
+  return subjectType !== 'any' && !rules.some((r) => r.direction === direction);
+}
 
 /**
  * The sentences of "Co się stanie po zapisaniu". `who` = the name the rule
  * goes by; `current` = the form of the rule as it is stored (`null` for a
- * new rule). Fields are named, never counted, so the sentences hold in every
- * case; what stays unchanged is said only when something else changes.
+ * new rule). Fields are named, never counted, so the sentences hold for every
+ * list; what stays unchanged is said only when something else changes. They
+ * describe what `buildPolicyRequest` sends, and say none of them where the
+ * window is: they are also the text of the note after the window closed.
  */
 export function ruleImpact({ who, direction, form, current, source }) {
   const names = source.fields.map((f) => f.name);
+  const eff = effectiveForm(form, source, direction);
+  const was = current ? effectiveForm(current, source, direction) : null;
   const lines = [];
   if (direction === 'read') {
-    const away = (f) => names.filter((n) => takesFieldAway(f?.actions[n] ?? 'show'));
-    const nowAway = away(form);
-    const wasAway = new Set(away(current));
-    const hiddenMore = nowAway.filter((n) => !wasAway.has(n));
-    const shownMore = [...wasAway].filter((n) => !nowAway.includes(n));
-    const typed = sortedUnique(form.extraShown);
-    const wasTyped = new Set(current?.extraShown || []);
-    const typedMore = typed.filter((n) => !wasTyped.has(n));
-    const typedLess = [...wasTyped].filter((n) => !typed.includes(n));
-    if (!names.length) return [T('hiding.impact.read_only', { who, fields: typed.join(', ') })];
+    const away = (f) => names.filter((n) => f?.actions[n] === 'hide');
+    const nowAway = away(eff);
+    const wasAway = away(was);
+    const hiddenMore = minus(nowAway, wasAway);
+    const shownMore = minus(wasAway, nowAway);
+    const typedMore = minus(eff.extraShown, was?.extraShown || []);
+    const typedLess = minus(was?.extraShown || [], eff.extraShown);
+    if (!names.length) return [T('hiding.impact.read_only', { who, fields: eff.extraShown.join(', ') })];
     if (hiddenMore.length || typedLess.length) lines.push(T('hiding.impact.read_hidden', { who, fields: phrases(source, [...hiddenMore, ...typedLess]) }));
     // A new rule hides; the fields it leaves shown were shown before it.
     if (current && (shownMore.length || typedMore.length)) lines.push(T('hiding.impact.read_shown', { who, fields: phrases(source, [...shownMore, ...typedMore]) }));
     if (lines.length) lines.push(T('hiding.impact.rest'), T('hiding.impact.read_unlisted'));
+    else if (!current && !source.complete) lines.push(T('hiding.impact.read_unlisted_only', { who }));
     return lines;
   }
-  const forbidden = names.filter((n) => form.actions[n] === 'forbid');
-  const required = [...names.filter((n) => form.actions[n] === 'require'), ...sortedUnique(form.extraRequired)];
+  const forbidden = (f) => names.filter((n) => f?.actions[n] === 'forbid');
+  const required = (f) => sortedUnique([...names.filter((n) => f?.actions[n] === 'require'), ...(f?.extraRequired || [])]);
+  const typedAllowed = (f) => sortedUnique([...(f?.extraShown || []), ...(f?.extraRequired || [])]);
   if (!names.length) {
-    lines.push(T('hiding.impact.write_only', { who, fields: sortedUnique([...form.extraShown, ...form.extraRequired]).join(', ') }));
-  } else if (forbidden.length) {
-    lines.push(T('hiding.impact.write_forbidden', { who, fields: phrases(source, forbidden) }));
+    lines.push(T('hiding.impact.write_only', { who, fields: typedAllowed(eff).join(', ') }));
+    if (required(eff).length) lines.push(T('hiding.impact.write_required', { who, fields: phrases(source, required(eff)) }));
+    if (lines.length) lines.push(T('hiding.impact.write_rest'));
+    return lines;
   }
-  if (required.length) lines.push(T('hiding.impact.write_required', { who, fields: phrases(source, required) }));
-  if (lines.length) lines.push(T('hiding.impact.write_rest'));
-  if (names.length && lines.length) lines.push(T('hiding.impact.write_unlisted'));
+  if (!was) {
+    if (forbidden(eff).length) lines.push(T('hiding.impact.write_forbidden', { who, fields: phrases(source, forbidden(eff)) }));
+    if (required(eff).length) lines.push(T('hiding.impact.write_required', { who, fields: phrases(source, required(eff)) }));
+    if (lines.length) lines.push(T('hiding.impact.write_rest'), T('hiding.impact.write_unlisted'));
+    else if (!source.complete) lines.push(T('hiding.impact.write_unlisted_only', { who }));
+    return lines;
+  }
+  const refusedMore = [...minus(forbidden(eff), forbidden(was)), ...minus(typedAllowed(was), typedAllowed(eff))];
+  const acceptedMore = [...minus(forbidden(was), forbidden(eff)), ...minus(typedAllowed(eff), typedAllowed(was))];
+  const requiredMore = minus(required(eff), required(was));
+  const requiredLess = minus(required(was), required(eff));
+  if (refusedMore.length) lines.push(T('hiding.impact.write_forbidden', { who, fields: phrases(source, refusedMore) }));
+  if (acceptedMore.length) lines.push(T('hiding.impact.write_accepted', { who, fields: phrases(source, acceptedMore) }));
+  if (requiredMore.length) lines.push(T('hiding.impact.write_required', { who, fields: phrases(source, requiredMore) }));
+  if (requiredLess.length) lines.push(T('hiding.impact.write_not_required', { who, fields: phrases(source, requiredLess) }));
+  if (refusedMore.length || requiredMore.length) lines.push(T('hiding.impact.write_rest'));
+  if (lines.length) lines.push(T('hiding.impact.write_unlisted'));
   return lines;
 }
 
@@ -477,11 +595,10 @@ function stateHtml({ loading, error }) {
   return '';
 }
 
-/** The legend under the table: what a field can become; "zamaskuj" and "zahaszuj" only where the server offers them. */
-export function legendHtml(fieldActions) {
-  const offered = readActionList(fieldActions).filter((a) => a !== 'show');
+/** The legend under the table: what "Ukryj" and a refused message mean, and which rule wins. */
+export function legendHtml() {
   const items = [
-    ...offered.map((a) => `<span><b>${escapeHtml(T(`hiding.action.${a}`))}</b> — ${escapeHtml(T(`hiding.legend.${a}`))}</span>`),
+    `<span><b>${escapeHtml(T('hiding.action.hide'))}</b> — ${escapeHtml(T('hiding.legend.hide'))}</span>`,
     `<span><b>${escapeHtml(T('hiding.legend.reject_name'))}</b> — ${escapeHtml(T('hiding.legend.reject'))}</span>`,
     `<span>${escapeHtml(T('hiding.legend.precedence'))}</span>`,
   ];
@@ -502,7 +619,7 @@ export function directionsClosedToKeys(rows) {
 
 /**
  * Paints the Ukrywanie danych section. `view` carries the page's `topic`
- * (`name`, `contentType`), `access`, `capabilities` (`fieldActions`),
+ * (`name`, `contentType`), `access`,
  * `notice`, `nowMs` and `hidingData` = `{ policies, policiesError, schema,
  * schemaSettled }` (`policies` null while loading; `schema` as in
  * `fieldSource`; `schemaSettled` false while the pattern is being read).
@@ -535,7 +652,7 @@ export function paintHidingSection(host, view, ctx) {
   let state = stateHtml({ loading: !loaded && !data.policiesError, error: loaded ? null : data.policiesError });
   if (loaded && !rows.length) {
     state = blocked
-      ? `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.blocked_title'))}" message="${escapeAttr(T('hiding.blocked_text'))}"></tf-empty-state>`
+      ? `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.blocked_title'))}" message="${escapeAttr(T('hiding.blocked_text'))}"><tf-button variant="secondary" icon="settings" data-go="section" data-section="settings">${escapeHtml(T('hiding.blocked_settings'))}</tf-button></tf-empty-state>`
       : `<tf-empty-state badge icon="shield" title="${escapeAttr(T('hiding.empty_title'))}" message="${escapeAttr(T('hiding.empty_text'))}"><tf-button variant="primary" icon="plus" data-go="hiding-add"${ready ? '' : ' disabled'}>${escapeHtml(T('hiding.add.button'))}</tf-button></tf-empty-state>`;
   }
   patchHtml(host.querySelector('[data-role="state"]'), state);
@@ -549,8 +666,8 @@ export function paintHidingSection(host, view, ctx) {
   setAttr(add, 'disabled', !ready || blocked);
   setAttr(add, 'title', blocked ? T('hiding.blocked_text') : null);
   const preview = host.querySelector('[data-role="preview"]');
-  setAttr(preview, 'disabled', !view.access?.canRead || !loaded);
-  setAttr(preview, 'title', view.access?.canRead ? null : T('detail.preview_no_read', { name: view.topic.name }));
+  setAttr(preview, 'disabled', !view.access?.canRead || !loaded || blocked);
+  setAttr(preview, 'title', !view.access?.canRead ? T('detail.preview_no_read', { name: view.topic.name }) : blocked ? T('hiding.blocked_preview') : null);
 
   const table = host.querySelector('[data-role="rules"]');
   table.hidden = rows.length === 0;
@@ -566,6 +683,6 @@ export function paintHidingSection(host, view, ctx) {
       ]);
     };
   }
-  patchHtml(host.querySelector('[data-role="legend"]'), legendHtml(view.capabilities?.fieldActions));
+  patchHtml(host.querySelector('[data-role="legend"]'), legendHtml());
   setRowsIfChanged(table, rows.map((r) => ruleTableRow(r, source, view.nowMs ?? Date.now())));
 }
