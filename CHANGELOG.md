@@ -210,6 +210,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Okno z jednorazowo pokazanym kluczem pyta raz przed zamknięciem klawiszem
   Escape lub krzyżykiem, jeśli klucza nie skopiowano; wskazówka techniczna jest
   zwinięta w „Dla programisty” z przyciskiem „Kopiuj nazwę odbiorcy”.
+- Strona topiku ma sekcję „Ukrywanie danych” (tylko dla administratora topiku).
+  Tabela pokazuje zasady: kto (osoba, grupa, addon albo Wszyscy), jakie pola
+  ukrywa albo odrzuca przy zapisie, czy dotyczy odczytu czy zapisu i kiedy ją
+  zmieniono. Serwer zapisuje pola **dozwolone**, więc ekran pokazuje odwrotność
+  (znane pola bez dozwolonych); pole, którego nie ma na liście okna, też jest
+  ukryte (a przy zapisie odrzucane), chyba że wpisze się je osobno. Listę pól
+  daje wzór wiadomości topiku JSON (właściwości najwyższego poziomu),
+  podręczny słownik około sześćdziesięciu pól HL7 v2 z nazwami w pięciu językach
+  (adres spoza słownika wpisuje się ręcznie i jest sprawdzany przed wysłaniem tak
+  jak na serwerze) albo, gdy listy nie ma (XML, JSON bez wzoru), pola do
+  pozostawienia wpisuje się w całości. Topik z treścią binarną nie przyjmuje
+  zasad, a sekcja mówi dlaczego.
+- „Dodaj zasadę” wybiera osobę, grupę, addon z katalogu (tylko tych, którzy nie
+  mają jeszcze zasady w tym kierunku) albo Wszystkich, kierunek i dla każdego
+  pola Pokaż / Ukryj (przy zapisie: Dozwolone / Wymagane / Niedozwolone);
+  „Zmień” zachowuje podmiot i kierunek, „Usuń” mówi, co zasada robi teraz i kto
+  zobaczy całe wiadomości po jej usunięciu. „Zamaskuj” i „Zahaszuj” pojawią się
+  w oknie i w legendzie same, gdy serwer poda je w `BusCapabilitiesWire.field_actions`;
+  pole z takim działaniem nigdy nie trafia na listę dozwolonych.
+- „Podgląd, jak widzi…” pokazuje prawdziwą wiadomość (domyślnie najnowszą
+  z najbardziej obciążonej partycji) tak, jak czyta ją wybrany podmiot, z listą
+  ukrytych pól. Okno mówi, że każdy podgląd zapisuje się w dzienniku audytu,
+  a gdy zasada obowiązująca samego administratora ukrywa pola, które zobaczy
+  podmiot (`limited_by_caller`), wyjaśnia, że podgląd jest węższy niż jego widok.
+  Pod tabelą widać, w którym kierunku topik jest zamknięty dla kluczy API (są
+  zasady dla wybranych podmiotów, a nie ma zasady dla wszystkich).
+- Błędy: `bus.record_not_found` ma tłumaczenie, a `bus.subject_not_found`
+  mówi o osobie, kluczu albo addonie (nie tylko o kluczu).
 
 ## [0.4.0-beta.1] — 2026-09-29
 

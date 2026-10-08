@@ -5,14 +5,15 @@
 // carries and checks), "Podgląd
 // wiadomości" on the right, then a vertical section menu (tf-tabs
 // orientation="vertical"; a "Sekcja: …" list on a phone) beside exactly one
-// section: Stan, Ustawienia, Dostęp, Nieprzetworzone, Partycje i kopie.
+// section: Stan, Ustawienia, Dostęp, Ukrywanie danych, Nieprzetworzone,
+// Partycje i kopie.
 // Sections are read views; every change goes through a window
 // (topic-settings.js, topic-access.js, unprocessed-windows.js, partitions.js)
 // and comes back as a note over the section it changed.
 //
 // Rights come from `TopicDetailResponse.access`: without administration the
 // page shows no change buttons and says who can change the topic
-// (`adminLabels`), and Dostęp is not in the menu at all; without read access
+// (`adminLabels`), and Dostęp and Ukrywanie danych are not in the menu at all; without read access
 // the sections that show messages and their numbers are unavailable with the
 // reason, and so is the preview.
 //
@@ -30,6 +31,7 @@ import { settingsHtml, whoCanChange } from '/js/modules/tentabus/topic-settings.
 import { partitionRows, transferBlocker, copyChipHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
 import { paintUnprocessedSection } from '/js/modules/tentabus/unprocessed.js';
 import { paintAccessSection, accessCount } from '/js/modules/tentabus/topic-access.js';
+import { paintHidingSection, hidingCount } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-button.js';
@@ -40,11 +42,11 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const SECTION_ICONS = { state: 'gauge', settings: 'settings', access: 'lock', dlq: 'inbox', partitions: 'layers' };
+const SECTION_ICONS = { state: 'gauge', settings: 'settings', access: 'lock', hiding: 'shield', dlq: 'inbox', partitions: 'layers' };
 /** Sections that show messages or their numbers: closed to a reader without read access. */
 const READ_SECTIONS = new Set(['state', 'dlq', 'partitions']);
 /** Sections only the topic's administrators see: absent from the menu for everyone else. */
-const ADMIN_SECTIONS = new Set(['access']);
+const ADMIN_SECTIONS = new Set(['access', 'hiding']);
 
 /**
  * Loads a topic's page data so that only the newest answer lands: a poll
@@ -144,13 +146,14 @@ function missingHtml(name) {
  * Draws or repaints the page from `ctx.view()` = `{ name, detail, error,
  * errorKind, section, stats, subjects, capabilities, nodes, replicaTopics,
  * replicaLags, lagSeries, notice, justMoved, unprocessed, unprocessedShown,
- * accessData, instanceId, instanceLabel, nowMs }`.
+ * accessData, hidingData, instanceId, instanceLabel, nowMs }`.
  * `ctx.go(action)`: `{ kind: 'back' | 'preview' | 'delete' | 'retry' }`,
  * `{ kind: 'section', section }`, `{ kind: 'change', card }`,
  * `{ kind: 'group', group }`, `{ kind: 'dlq' }`, `{ kind: 'transfer', partition }`,
  * the unprocessed section's `{ kind: 'unp-view' | 'unp-retry' |
  * 'unp-discard', key }`, `{ kind: 'unp-retry-all' | 'unp-more' | 'unp-reload' }`
- * and the access section's (see `paintAccessSection`).
+ * and the access and hiding sections' (see `paintAccessSection`,
+ * `paintHidingSection`).
  */
 export function drawTopicDetail(body, ctx) {
   const view = ctx.view();
@@ -218,6 +221,7 @@ function paintPage(body, view, ctx) {
     partitions: fmtCount(topic.partitions),
     dlq: access.canRead && unprocessed > 0 ? fmtCount(unprocessed) : null,
     access: entries != null && entries > 0 ? fmtCount(entries) : null,
+    hiding: access.canAdmin && hidingCount(view.hidingData) > 0 ? fmtCount(hidingCount(view.hidingData)) : null,
   };
   for (const s of TOPIC_SECTIONS) {
     const tab = menu.querySelector(`tf-tab#${s}`);
@@ -253,6 +257,7 @@ function paintPage(body, view, ctx) {
   if (section === 'state') paintStateSection(host, sectionView);
   else if (section === 'settings') patchHtml(host, settingsHtml(sectionView));
   else if (section === 'access') paintAccessSection(host, sectionView, ctx);
+  else if (section === 'hiding') paintHidingSection(host, sectionView, ctx);
   else if (section === 'dlq') paintUnprocessedSection(host, sectionView, ctx);
   else paintPartitionsSection(host, sectionView, ctx);
 }

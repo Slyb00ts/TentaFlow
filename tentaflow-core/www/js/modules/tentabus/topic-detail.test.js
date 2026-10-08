@@ -53,7 +53,7 @@ const replicaTopics = [{
   ],
 }];
 
-function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null } = {}) {
+function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null, hidingData = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -73,6 +73,7 @@ function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, sec
     notice: null,
     justMoved: new Set(),
     accessData,
+    hidingData,
     instanceId: 'tentabus-a1b2c3d4',
     instanceLabel: 'Produkcja',
     nowMs: NOW,
@@ -123,17 +124,51 @@ test('Dostęp\'s counter is its entries plus the keys, once they are loaded', ()
   assert.equal(loaded.body.querySelector('tf-tab#access').getAttribute('count'), '3');
 });
 
+test('Ukrywanie danych opens for the topic\'s administrator only; its counter is the number of rules once they are loaded', () => {
+  assert.equal(sectionOpen('hiding', { canRead: true, canAdmin: false }), false);
+  assert.equal(sectionOpen('hiding', { canRead: false, canAdmin: true }), true, 'administration without read access still manages the rules');
+  assert.equal(sectionListed('hiding', { canAdmin: false }), false);
+  assert.equal(effectiveSection('hiding', { canRead: true, canAdmin: false }), 'state', 'an address naming it opens Stan for a reader');
+  assert.equal(effectiveSection('hiding', { canRead: true, canAdmin: true }), 'hiding');
+
+  const reader = mount({ access: { canRead: true, canWrite: false, canAdmin: false }, section: 'hiding' });
+  assert.equal(reader.body.querySelector('[data-role="menu"] tf-tab#hiding').hidden, true);
+  assert.equal(reader.body.querySelector('[data-section="state"]').hidden, false);
+  assert.equal(reader.body.querySelector('[data-section="hiding"]').hidden, true);
+  assert.equal(reader.body.querySelector('[data-section="hiding"]').children.length, 0, 'nothing of it is drawn for a reader');
+
+  const loading = mount({ section: 'hiding', hidingData: { policies: null, policiesError: null, schema: null, schemaSettled: false } });
+  assert.equal(loading.body.querySelector('tf-tab#hiding').getAttribute('count'), null, 'nothing is guessed before the rules answer');
+  assert.ok(loading.body.querySelector('[data-section="hiding"] tf-spinner'));
+  const policies = [
+    { subjectType: 'group', subjectId: 'g-1', direction: 'read', fields: ['a'], requiredFields: [], updatedAtMs: NOW, subjectLabel: 'Lekarze', memberCount: 12 },
+    { subjectType: 'any', subjectId: '*', direction: 'write', fields: ['a'], requiredFields: [], updatedAtMs: NOW, subjectLabel: null, memberCount: null },
+  ];
+  const loaded = mount({ section: 'hiding', hidingData: { policies, policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(loaded.body.querySelector('tf-tab#hiding').getAttribute('count'), '2');
+  const host = loaded.body.querySelector('[data-section="hiding"]');
+  assert.equal(host.hidden, false);
+  assert.equal(host.querySelector('[data-role="rules"]').rows.length, 2);
+  host.querySelector('[data-go="hiding-add"]').click();
+  assert.deepEqual(loaded.moves.at(-1), { kind: 'hiding-add' });
+  host.querySelector('[data-go="hiding-preview"]').click();
+  assert.deepEqual(loaded.moves.at(-1), { kind: 'hiding-preview' });
+  const empty = mount({ section: 'hiding', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(empty.body.querySelector('tf-tab#hiding').getAttribute('count'), null, 'a topic without rules has no counter');
+});
+
 test('the page: back link, title with what the topic carries, the vertical menu and one section', () => {
   const { body, moves } = mount();
   assert.equal(body.querySelector('.tb-title').textContent, 'wyniki-badan');
   assert.equal(body.querySelector('[data-role="desc"]').textContent, 'HL7 v2 · bez wzoru');
   const menu = body.querySelector('[data-role="menu"]');
   assert.equal(menu.getAttribute('orientation'), 'vertical');
-  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'access', 'dlq', 'partitions']);
+  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'access', 'hiding', 'dlq', 'partitions']);
   assert.equal(menu.querySelector('tf-tab#access').hidden, false, 'the administrator sees Dostęp');
+  assert.equal(menu.querySelector('tf-tab#hiding').hidden, false, 'and Ukrywanie danych');
   assert.equal(menu.querySelector('tf-tab#partitions').getAttribute('count'), '2');
   assert.equal(menu.querySelector('tf-tab#dlq').getAttribute('count'), '14', 'the unprocessed count of the stats snapshot');
-  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['access', true], ['dlq', true], ['partitions', true]]);
+  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['access', true], ['hiding', true], ['dlq', true], ['partitions', true]]);
   body.querySelector('[data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
 });
@@ -166,7 +201,7 @@ test('moving between sections goes through the shell; the phone list offers the 
   body.querySelector('[data-role="menu"] tf-tab#settings > button').click();
   assert.deepEqual(moves.at(-1), { kind: 'section', section: 'settings' });
   const pick = body.querySelector('[data-role="pick"]');
-  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Dostęp', 'Nieprzetworzone', 'Partycje i kopie']);
+  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Dostęp', 'Ukrywanie danych', 'Nieprzetworzone', 'Partycje i kopie']);
 });
 
 test('Nieprzetworzone is a section of the page; Stan\'s "Zobacz i ponów" leads to it', () => {

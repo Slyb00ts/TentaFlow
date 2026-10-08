@@ -480,3 +480,14 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 @media (max-width: 767px) {
   .tb-window .tb-right-row tf-segmented { width: 100%; }
 }
+
+/* =============================================================================
+   U7 Ukrywanie danych (T07): a topic's rules and the windows over them (add,
+   change, delete; "Podgląd, jak widzi…"). The field rows reuse the rights
+   rows of Dostęp.
+   ============================================================================= */
+.tb-hiding-window [data-role="rows"] { max-height: 320px; overflow-y: auto; }
+.tb-hiding-window tf-tag-input { display: block; }
+.tb-hiding-preview [data-role="result"] { display: flex; flex-direction: column; gap: 14px; }
+.tb-hiding-preview .tb-preview-record-head { justify-content: space-between; }
+.tb-hiding-preview [data-role="applied"] { max-height: 220px; overflow-y: auto; }
