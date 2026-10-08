@@ -6065,7 +6065,17 @@ fn remap_text_int_column(
 
 /// Returns one human-readable line per `foreign_key_check` violation.
 fn foreign_key_check(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    foreign_key_violations(conn, "PRAGMA foreign_key_check")
+}
+
+/// Child-side check of one table only. `table` is always a literal from this
+/// file, so interpolating it into the pragma is safe.
+fn foreign_key_check_table(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    foreign_key_violations(conn, &format!("PRAGMA foreign_key_check({table})"))
+}
+
+fn foreign_key_violations(conn: &Connection, pragma: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(pragma)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -10076,9 +10086,18 @@ CREATE INDEX idx_resperm_resource ON resource_permissions(resource_type, resourc
 /// the new types at the CHECK. The inbox records that op as a conflict and
 /// the subject's version ops, which defer until it exists, escalate to
 /// conflicts after their retry budget; nothing crashes or blocks the inbox.
-/// The subject reaches such a node when it is next written after the node
-/// upgraded (rows replicate whole), so upgrade the nodes of a mesh together
-/// before registering an XSD or HL7 profile subject.
+/// The subject row reaches such a node when it is next written after the
+/// node upgraded (rows replicate whole), but the versions registered
+/// meanwhile do not arrive without a baseline reset
+/// (`reseed_core_state_from_current_rows`). So every node of a mesh must be
+/// upgraded before an XSD or HL7 profile subject is registered; B4/B5 treat
+/// that as a prerequisite.
+///
+/// Rare case: an old node that holds a pre-incarnation subject of the same
+/// name (generation 0) can attach the new type's versions under its old-type
+/// row, and can change the `content_type` of a topic bound to that subject,
+/// because its content-type guard needs the subject locally. Same remedy:
+/// upgrade the nodes together.
 fn bus_schema_registry_widen_types(conn: &Connection, version: i64, name: &str) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
@@ -10114,7 +10133,9 @@ fn bus_schema_registry_widen_types(conn: &Connection, version: i64, name: &str) 
             ",
         )?;
 
-        let fk_violations = foreign_key_check(&tx)?;
+        // `bus_schema_subjects` declares no foreign key of its own; the only
+        // FK touching the rebuilt parent is `bus_schema_versions`' child side.
+        let fk_violations = foreign_key_check_table(&tx, "bus_schema_versions")?;
         if !fk_violations.is_empty() {
             anyhow::bail!(
                 "bus_schema_registry_widen_types: foreign_key_check found {} violation(s): {}",

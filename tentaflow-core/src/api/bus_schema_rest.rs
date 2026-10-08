@@ -571,10 +571,10 @@ async fn run_route(
         SchemaRoute::Register { subject } => {
             let parsed: RegisterBody = parse_json(body)?;
             let kind = SchemaType::parse(&parsed.schema_type).ok_or_else(|| {
-                RouteError::BadRequest(
-                    "schema_type must be one of json_schema|avro|protobuf|thrift|xsd|hl7v2_profile"
-                        .to_string(),
-                )
+                RouteError::BadRequest(format!(
+                    "schema_type must be one of {}",
+                    SchemaType::accepted_list()
+                ))
             })?;
             let compatibility = parsed
                 .compatibility

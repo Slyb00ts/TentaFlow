@@ -66,13 +66,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `avro`/`protobuf`/`thrift`: nie mają walidatora, więc `GET capabilities`
   nadal wymienia wyłącznie `json_schema`, włączenie walidacji na takim wzorcu
   jest odrzucane, a druga wersja przy zgodności innej niż `none` także
-  (brak porównania, którego można by udawać). Wzorzec `xsd` wiąże się tylko
-  z tematem `application/xml`/`text/xml`, `hl7v2_profile` tylko
-  z `application/hl7-v2`, `json_schema` nadal tylko z JSON-em; formaty
-  binarne wiążą się niezależnie od `content_type`. Węzeł bez migracji 179
-  odrzuca replikowany wzorzec nowego typu (konflikt w skrzynce, bez
-  zatrzymania synchronizacji) — uaktualnij węzły sieci razem, zanim ktoś
-  zarejestruje wzorzec XSD lub profil HL7.
+  (brak porównania, którego można by udawać). Rejestracja wersji `xsd` lub
+  `hl7v2_profile` wymaga `compatibility: none`: przy domyślnym `backward`
+  odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
+  z tematem `application/xml` albo `text/xml`, `hl7v2_profile` tylko
+  z `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema`
+  nadal tylko z JSON-em; formaty binarne wiążą się niezależnie od
+  `content_type`. Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego
+  typu (konflikt w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca
+  dociera do takiego węzła przy następnym zapisie po uaktualnieniu, ale
+  wersje zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
+  (`reseed_core_state_from_current_rows`). Rzadki przypadek: stary węzeł
+  z podmiotem o tej samej nazwie z generacji 0 może podpiąć wersje nowego
+  typu pod swój stary wiersz i zmienić `content_type` tematu powiązanego
+  z tym podmiotem. Uaktualnij wszystkie węzły sieci razem, zanim ktoś
+  zarejestruje wzorzec XSD lub profil HL7; B4 i B5 zakładają to jako warunek
+  wstępny.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

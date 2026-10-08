@@ -76,6 +76,16 @@ impl SchemaType {
         }
     }
 
+    /// `json_schema|avro|…` as listed in "must be one of" request errors,
+    /// built from `ALL` so a new kind cannot be missing from the message.
+    pub fn accepted_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     pub fn parse(s: &str) -> Option<SchemaType> {
         match s {
             "json_schema" => Some(SchemaType::JsonSchema),
@@ -337,8 +347,9 @@ mod tests {
         for t in SchemaType::ALL {
             assert_eq!(SchemaType::parse(t.as_str()), Some(t));
         }
-        // `ALL` must list every variant: a kind missing from it would never
-        // be offered to the UI (`BusCapabilitiesWire.schema_types`).
+        // `ALL` must list every variant: `BusCapabilitiesWire.schema_types` is
+        // filtered from it by `has_validator`, so a kind missing here could
+        // never reach that list.
         for t in SchemaType::ALL {
             match t {
                 SchemaType::JsonSchema

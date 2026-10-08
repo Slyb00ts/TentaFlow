@@ -19447,6 +19447,109 @@ mod tests {
     }
 
     #[test]
+    fn update_topic_refuses_binding_an_xsd_or_profile_subject_to_a_foreign_format() {
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        for (subject, kind, text) in [
+            ("patients-xsd", Xsd, "<xs:schema/>"),
+            (
+                "adt-profile",
+                Hl7v2Profile,
+                r#"{"required_segments":["PID"]}"#,
+            ),
+        ] {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                subject,
+                kind,
+                text,
+                Some(schema_registry::Compatibility::None),
+                None,
+            )
+            .unwrap();
+        }
+        // The default topic is JSON, so neither XML nor HL7 subject may bind.
+        svc.create_topic(&ctx, "patients.events", topics::TopicOptions::default())
+            .unwrap();
+        for (subject, expected) in [
+            ("patients-xsd", "is xsd but"),
+            ("adt-profile", "is hl7v2_profile but"),
+        ] {
+            let err = svc
+                .update_topic(
+                    &ctx,
+                    "patients.events",
+                    topics::TopicOptions {
+                        schema_id: Some(subject.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                    if reason.contains(expected)),
+                "{subject}: {err:?}"
+            );
+        }
+        let stored = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "patients.events")
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.schema_id.is_none(),
+            "a refused bind must not persist"
+        );
+    }
+
+    #[test]
+    fn update_topic_refuses_changing_content_type_of_a_topic_bound_to_an_xsd_subject() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "patients-xsd",
+            schema_registry::SchemaType::Xsd,
+            "<xs:schema/>",
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "patients.xml",
+            topics::TopicOptions {
+                content_type: Some("application/xml".to_string()),
+                schema_id: Some("patients-xsd".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = svc
+            .update_topic(
+                &ctx,
+                "patients.xml",
+                topics::TopicOptions {
+                    content_type: Some("application/json".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                if reason.contains("while schema subject 'patients-xsd' is bound")),
+            "{err:?}"
+        );
+        let stored = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "patients.xml")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content_type, "application/xml");
+    }
+
+    #[test]
     fn schema_derived_get_projects_through_the_stored_read_policy() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
