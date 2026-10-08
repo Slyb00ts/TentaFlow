@@ -954,6 +954,56 @@
   display: block;
 }
 .fb-field-hint { font-size: 11px; color: var(--tf-text-3, #6a7196); }
+/* Activity data I/O editor — declarations, associations, and repeat coordinator. */
+.fb-activity-io {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: var(--tf-radius, 10px);
+  background: var(--tf-bg-2, #0a0e22);
+}
+.fb-activity-io > .fb-field-section {
+  margin: 0;
+  padding: 0 0 8px;
+  border-top: 0;
+  border-bottom: 1px solid var(--tf-border, #1f2548);
+}
+.fb-activity-io > .fb-field-hint { margin: 0; }
+.fb-activity-io-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--tf-border, #1f2548) 70%, transparent);
+}
+.fb-activity-io-group:first-of-type { border-top: 0; padding-top: 0; }
+.fb-activity-io-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 8px;
+  align-items: end;
+  padding: 10px;
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: 8px;
+  background: var(--tf-bg-input, #0b0e22);
+}
+.fb-activity-io-row > * { min-width: 0; }
+.fb-activity-io-row > tf-button { align-self: end; }
+.fb-activity-io [data-activity-coordinator] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.fb-activity-io [data-activity-coordinator] .fb-activity-io-row {
+  background: var(--tf-bg-card, #141836);
+}
+@media (max-width: 640px) {
+  .fb-activity-io-row { grid-template-columns: 1fr 1fr; }
+  .fb-activity-io-row > tf-button { justify-self: start; }
+}
 .fb-input, .fb-select, .fb-textarea {
   width: 100%;
   padding: 9px 12px;
@@ -1310,21 +1360,76 @@
   opacity: 0.6;
 }
 
-/* Process notation shares the editor shell and retains the model's DI bounds. */
-.fb-process-shell { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
-.fb-process-shell .fb-topbar { flex-wrap: wrap; align-content: flex-start; padding-block: 8px; overflow-x: hidden; overflow-y: auto; gap: 8px; }
+/* Process chrome follows its controls; the flexible body receives unused height. */
+.fb-process-shell {
+  grid-template-rows:
+    auto
+    auto
+    auto
+    minmax(clamp(160px, 30vh, 320px), 1fr)
+    minmax(52px, clamp(56px, 10vh, 88px));
+  align-content: start;
+}
+.fb-process-shell .fb-topbar {
+  flex-wrap: wrap;
+  align-content: flex-start;
+  min-height: 0;
+  padding-block: 8px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  gap: 8px;
+}
 .fb-process-shell .fb-topbar > tf-button { flex-shrink: 0; }
 .fb-process-shell .fb-topbar-separator { display: none; }
 .fb-process-shell .fb-topbar-spacer { flex-basis: 20px; }
+.fb-process-shell .fb-flow-name {
+  flex: 1 1 560px;
+  min-width: min(360px, 100%);
+  max-width: min(560px, 100%);
+  align-self: flex-start;
+}
+.fb-process-shell .fb-flow-name textarea,
+.fb-process-shell [data-process="name"] textarea {
+  min-height: 38px;
+  max-height: none;
+  resize: vertical;
+  overflow-y: hidden;
+  overflow-wrap: anywhere;
+}
 .fb-process-shell .fb-config-header,
 .fb-process-shell .fb-config-footer { flex: none; }
 .fb-process-shell .fb-config-body { min-height: 0; }
 .fb-process-shell .fb-config-title,
 .fb-process-shell .fb-config-subtitle { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
-.fb-process-shell .fb-flow-name textarea { max-height: none; resize: none; overflow-wrap: anywhere; }
-.fb-process-shell [data-process="name"] textarea { max-height: none; resize: none; overflow-wrap: anywhere; }
-.fb-process-shell .fb-bottombar { flex-wrap: wrap; align-content: flex-start; min-height: 44px; padding-block: 8px; overflow: visible; }
+.fb-process-shell .fb-process-notice {
+  min-height: 0;
+  max-height: none;
+  align-content: flex-start;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.fb-process-shell .fb-process-notice > span {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+.fb-process-shell .fb-process-notice > tf-select,
+.fb-process-shell .fb-process-notice > tf-input {
+  flex: 1 1 220px;
+  width: auto;
+  min-width: min(220px, 100%);
+  max-width: 360px;
+}
+.fb-process-shell .fb-bottombar {
+  flex-wrap: wrap;
+  align-content: flex-start;
+  min-height: 0;
+  padding-block: 8px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
 .fb-process-shell .fb-breadcrumb { flex: 1 1 360px; min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.fb-process-shell .fb-breadcrumb { max-height: 56px; overflow-y: auto; scrollbar-gutter: stable; }
 .fb-process-shell .fb-breadcrumb .fb-crumb { min-width: 0; }
 .fb-process-shell .fb-breadcrumb .fb-crumb:first-child,
 .fb-process-shell .fb-breadcrumb .fb-sep { flex: none; }
@@ -1342,19 +1447,28 @@
 .fb-process-symbol > span { min-width: 0; line-height: 1.4; font-weight: 600; max-height: 100%; overflow-y: auto; }
 .fb-process-node.fb-external-label .fb-process-symbol > span { display: none; }
 .fb-process-symbol svg { width: 24px; height: 24px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; }
-.fb-process-node.bpmn_start, .fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_terminate_end, .fb-process-node.bpmn_timer_start, .fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_boundary_timer, .fb-process-node.bpmn_message_start, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw, .fb-process-node.bpmn_boundary_message, .fb-process-node.bpmn_boundary_error, .fb-process-node.bpmn_boundary_escalation { border-radius: 50%; }
-.fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw { border-style: double; border-width: 5px; }
-.fb-process-node.bpmn_boundary_timer.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_message.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_escalation.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_error { border-style: solid; border-width: 4px; }
+.fb-process-node.bpmn_start, .fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_terminate_end, .fb-process-node.bpmn_timer_start, .fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_boundary_timer, .fb-process-node.bpmn_message_start, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw, .fb-process-node.bpmn_signal_throw, .fb-process-node.bpmn_signal_catch, .fb-process-node.bpmn_link_throw, .fb-process-node.bpmn_link_catch, .fb-process-node.bpmn_boundary_message, .fb-process-node.bpmn_boundary_error, .fb-process-node.bpmn_boundary_escalation { border-radius: 50%; }
+.fb-process-node.bpmn_timer_catch, .fb-process-node.bpmn_message_catch, .fb-process-node.bpmn_message_throw, .fb-process-node.bpmn_signal_throw, .fb-process-node.bpmn_signal_catch, .fb-process-node.bpmn_link_throw, .fb-process-node.bpmn_link_catch { border-style: double; border-width: 5px; }
+.fb-process-node .fb-port { opacity: 0; pointer-events: auto; }
+.fb-process-node:hover .fb-port,
+.fb-process-node:focus-within .fb-port,
+.fb-process-shell .fb-canvas.connecting .fb-process-node .fb-port,
+.fb-process-node .fb-port.drop-target,
+.fb-process-node .fb-port.drop-incompatible { opacity: 1; }
+.fb-process-node.bpmn_boundary_timer.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_message.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_escalation.fb-boundary-interrupting, .fb-process-node.bpmn_boundary_error.fb-boundary-interrupting { border-style: solid; border-width: 4px; }
 .fb-process-node.bpmn_boundary_timer.fb-boundary-noninterrupting, .fb-process-node.bpmn_boundary_message.fb-boundary-noninterrupting, .fb-process-node.bpmn_boundary_escalation.fb-boundary-noninterrupting { border-style: dashed; border-width: 3px; }
+.fb-process-node.bpmn_boundary_timer.fb-boundary-interrupting::before, .fb-process-node.bpmn_boundary_message.fb-boundary-interrupting::before, .fb-process-node.bpmn_boundary_escalation.fb-boundary-interrupting::before, .fb-process-node.bpmn_boundary_error.fb-boundary-interrupting::before, .fb-process-node.bpmn_boundary_timer.fb-boundary-noninterrupting::before, .fb-process-node.bpmn_boundary_message.fb-boundary-noninterrupting::before, .fb-process-node.bpmn_boundary_escalation.fb-boundary-noninterrupting::before { content: ''; position: absolute; inset: 5px; border: 1px solid currentColor; border-radius: 50%; pointer-events: none; }
+.fb-process-node.bpmn_boundary_timer.fb-boundary-noninterrupting::before, .fb-process-node.bpmn_boundary_message.fb-boundary-noninterrupting::before, .fb-process-node.bpmn_boundary_escalation.fb-boundary-noninterrupting::before { border-style: dashed; }
 .fb-process-node.bpmn_end, .fb-process-node.bpmn_error_end, .fb-process-node.bpmn_terminate_end { border-width: 4px; }
 .fb-process-node.bpmn_error_end { border-color: var(--tf-danger, #ef4444); }
 .fb-process-node.bpmn_terminate_end { border-color: var(--tf-danger, #ef4444); }
 .fb-process-node.bpmn_call_activity { border-width: 4px; }
-.fb-process-node.bpmn_call_activity::after { content: '+'; position: absolute; left: 50%; bottom: 3px; transform: translateX(-50%); font-size: 16px; font-weight: 700; line-height: 1; pointer-events: none; }
+.fb-process-node.bpmn_user_task .fb-process-symbol > svg, .fb-process-node.bpmn_service_task .fb-process-symbol > svg, .fb-process-node.bpmn_script_task .fb-process-symbol > svg, .fb-process-node.bpmn_manual_task .fb-process-symbol > svg, .fb-process-node.bpmn_send_task .fb-process-symbol > svg, .fb-process-node.bpmn_receive_task .fb-process-symbol > svg { position: absolute; top: 8px; left: 10px; width: 22px; height: 22px; }
+.fb-process-node.bpmn_sub_process .fb-process-symbol > svg, .fb-process-node.bpmn_call_activity .fb-process-symbol > svg { position: absolute; left: 50%; bottom: 4px; width: 18px; height: 18px; transform: translateX(-50%); }
+.fb-process-node.bpmn_sub_process .fb-repeat-marker, .fb-process-node.bpmn_call_activity .fb-repeat-marker { left: calc(50% + 15px); }
 .fb-process-node.bpmn_exclusive_gateway, .fb-process-node.bpmn_parallel_gateway, .fb-process-node.bpmn_inclusive_gateway, .fb-process-node.bpmn_event_based_gateway { background: transparent; border: none; box-shadow: none; }
 .fb-process-node.bpmn_exclusive_gateway::before, .fb-process-node.bpmn_parallel_gateway::before, .fb-process-node.bpmn_inclusive_gateway::before, .fb-process-node.bpmn_event_based_gateway::before { content: ''; position: absolute; inset: 15%; transform: rotate(45deg); background: var(--tf-bg-card); border: 2px solid var(--tf-warning); box-sizing: border-box; }
-.fb-process-node.bpmn_inclusive_gateway .fb-process-symbol svg { display: none; }
-.fb-process-node.bpmn_inclusive_gateway .fb-process-symbol::after { content: 'O'; font-size: 24px; font-weight: 700; line-height: 1; }
+.fb-process-node.bpmn_exclusive_gateway .fb-process-symbol > svg, .fb-process-node.bpmn_parallel_gateway .fb-process-symbol > svg, .fb-process-node.bpmn_inclusive_gateway .fb-process-symbol > svg, .fb-process-node.bpmn_event_based_gateway .fb-process-symbol > svg { position: relative; z-index: 1; width: 28px; height: 28px; }
 .fb-process-node .fb-process-symbol { position: relative; }
 .fb-repeat-marker { position: absolute; bottom: 2px; left: 50%; transform: translateX(-50%); width: 18px; height: 14px; pointer-events: none; font-style: normal; font-size: 21px; font-weight: 700; line-height: 14px; text-align: center; color: var(--tf-text); }
 .fb-repeat-marker-sequential { background: repeating-linear-gradient(to bottom, var(--tf-text) 0 2px, transparent 2px 5px); height: 12px; }
@@ -1379,6 +1493,12 @@
 .fb-process-work p { color: var(--tf-text-2); margin-bottom: 0; line-height: 1.5; }
 .fb-process-json { min-width: 0; }
 .fb-process-json tf-code-editor { display: block; height: 200px; max-width: 100%; border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
+.fb-process-activity-inputs { min-width: 0; width: 100%; }
+.fb-process-activity-inputs h3 { margin-block: 0 4px; }
+.fb-process-activity-inputs-hint { color: var(--tf-text-2); margin: 0 0 10px; line-height: 1.5; }
+.fb-process-activity-input { min-width: 0; border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 10px; margin-block: 8px; }
+.fb-process-activity-input h4 { overflow-wrap: anywhere; margin: 0 0 8px; }
+.fb-process-activity-input tf-code-editor { display: block; width: 100%; max-width: 100%; height: clamp(140px, 24vh, 320px); border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
 .fb-process-import tf-code-editor { display: block; height: 320px; }
 .fb-process-history ol { list-style: none; padding: 0; }
 .fb-process-history li { border-left: 2px solid var(--tf-border); padding: 4px 0 16px 16px; line-height: 1.5; overflow-wrap: anywhere; }

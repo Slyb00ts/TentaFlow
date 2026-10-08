@@ -23,7 +23,7 @@ const { codecReady, encode } = await import('../../protocol/codec.js');
 const wasm = await codecReady;
 const { Router } = await import('../../router.js');
 const { TfWindow } = await import('../../components/tf-window.js');
-const { emptyProcessModel, processToCanvas, canvasToProcess, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
+const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
@@ -84,7 +84,7 @@ function fixtures(values) {
 }
 async function mount(current, additions = {}) {
   await builder.unmount();
-  fixtures({ processDefinitionGetRequest: { definition: current }, processOptionsRequest: options, ...additions });
+  fixtures({ processDefinitionGetRequest: { definition: current, startCatalog: [] }, processOptionsRequest: options, ...additions });
   document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
   await builder.mount({ flowId: current.definitionId, mode: 'bpmn' });
   return builder._state;
@@ -392,10 +392,75 @@ test('boundary siblings retain stable attachment, modes, DI and reject incoming 
   assert.equal(graph.nodesLayer.querySelectorAll('.bpmn_boundary_timer').length, 2);
   assert.equal(graph.nodesLayer.querySelector('.bpmn_boundary_timer.fb-boundary-interrupting').dataset.nodeId, 'Timer_A');
   assert.equal(graph.nodesLayer.querySelector('.bpmn_boundary_timer.fb-boundary-noninterrupting').dataset.nodeId, 'Timer_B');
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="Timer_A"] use').getAttribute('href'), '#i-clock');
+  assert.equal(graph.nodesLayer.querySelector('[data-node-id="Timer_B"] use').getAttribute('href'), '#i-clock');
   assert.equal(graph.nodesLayer.querySelector('[data-node-id="Timer_A"] .fb-port-in'), null);
   assert.equal(graph.connectNodes('Start', 'Timer_A'), false);
   assert.deepEqual(graph.getData(), model);
   graph.destroy();
+});
+
+test('BPMN canvas renders the official marker mapping for every supported template', () => {
+  const expected = new Map([
+    ['bpmn_start', null], ['bpmn_end', null],
+    ['bpmn_error_end', 'bpmn-error-filled'], ['bpmn_terminate_end', 'bpmn-terminate'],
+    ['bpmn_timer_start', 'clock'], ['bpmn_timer_catch', 'clock'], ['bpmn_boundary_timer', 'clock'],
+    ['bpmn_message_start', 'bpmn-message-catch'], ['bpmn_message_catch', 'bpmn-message-catch'],
+    ['bpmn_message_throw', 'bpmn-message-throw'], ['bpmn_signal_throw', 'bpmn-signal-throw'],
+    ['bpmn_signal_catch', 'bpmn-signal-catch'], ['bpmn_link_throw', 'link-throw'],
+    ['bpmn_link_catch', 'link-catch'], ['bpmn_boundary_message', 'bpmn-message-catch'],
+    ['bpmn_boundary_error', 'bpmn-error'], ['bpmn_boundary_escalation', 'bpmn-escalation-catch'],
+    ['bpmn_user_task', 'user'], ['bpmn_service_task', 'bpmn-service-task'],
+    ['bpmn_script_task', 'bpmn-script-task'], ['bpmn_manual_task', 'bpmn-manual-task'],
+    ['bpmn_send_task', 'bpmn-message-throw'], ['bpmn_receive_task', 'bpmn-message-catch'],
+    ['bpmn_sub_process', 'bpmn-subprocess'], ['bpmn_call_activity', 'bpmn-subprocess'],
+    ['bpmn_exclusive_gateway', 'bpmn-gateway-exclusive'], ['bpmn_parallel_gateway', 'bpmn-gateway-parallel'],
+    ['bpmn_inclusive_gateway', 'bpmn-gateway-inclusive'], ['bpmn_event_based_gateway', 'bpmn-gateway-event-based'],
+  ]);
+  assert.equal(expected.size, 29);
+  assert.equal(processTemplates().length, expected.size);
+  for (const [nodeType, marker] of expected) {
+    const graph = canvas();
+    graph.addNodeFromTemplate(processTemplates().find((template) => template.node_type === nodeType), 250, 300);
+    const node = graph.nodes.at(-1);
+    const element = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`);
+    const use = element.querySelector('use');
+    assert.equal(use?.getAttribute('href') ?? null, marker == null ? null : `#i-${marker}`, nodeType);
+    if (nodeType === 'bpmn_start' || nodeType === 'bpmn_end') assert.equal(element.querySelector('.fb-process-symbol svg'), null, nodeType);
+    graph.destroy();
+  }
+});
+
+test('BPMN marker definitions preserve filled and hollow semantics and boundary rings', () => {
+  const sprite = readFileSync(new URL('../../../index.html', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../../../css/flows-builder.css', import.meta.url), 'utf8');
+  const symbolFragment = (id) => {
+    const match = sprite.match(new RegExp(`<symbol id="i-${id}"[^>]*>([\\s\\S]*?)</symbol>`));
+    assert.ok(match, `missing symbol fragment ${id}`);
+    return match[1];
+  };
+  for (const marker of ['bpmn-none-start', 'bpmn-none-end', 'bpmn-message-catch', 'bpmn-message-throw',
+    'bpmn-signal-catch', 'bpmn-signal-throw', 'bpmn-error', 'bpmn-error-filled', 'bpmn-terminate', 'bpmn-escalation-catch',
+    'bpmn-service-task', 'bpmn-script-task', 'bpmn-manual-task', 'bpmn-subprocess', 'bpmn-gateway-exclusive',
+    'bpmn-gateway-parallel', 'bpmn-gateway-inclusive', 'bpmn-gateway-event-based']) {
+    assert.match(sprite, new RegExp(`<symbol id="i-${marker}"`), marker);
+  }
+  const spriteIds = new Set([...sprite.matchAll(/<symbol id="i-([^"]+)"/g)].map((match) => match[1]));
+  for (const marker of processTemplates().map((template) => template.icon).filter((icon) => icon.startsWith('bpmn-'))) {
+    assert.ok(spriteIds.has(marker), `missing sprite symbol ${marker}`);
+  }
+  const messageThrow = symbolFragment('bpmn-message-throw');
+  assert.match(messageThrow, /<rect[^>]*fill="currentColor"/);
+  assert.match(messageThrow, /<path d="M3 6l9 7 9-7"[^>]*stroke="var\(--tf-bg-card/);
+  assert.match(symbolFragment('bpmn-signal-throw'), /fill="currentColor"/);
+  assert.match(symbolFragment('bpmn-message-catch'), /fill="none"/);
+  assert.match(symbolFragment('bpmn-signal-catch'), /fill="none"/);
+  assert.match(symbolFragment('bpmn-error'), /fill="none"/);
+  assert.match(symbolFragment('bpmn-error-filled'), /fill="currentColor"/);
+  assert.match(symbolFragment('bpmn-terminate'), /fill="currentColor"/);
+  assert.match(symbolFragment('bpmn-escalation-catch'), /fill="none"/);
+  assert.match(css, /bpmn_boundary_timer\.fb-boundary-interrupting::before/);
+  assert.match(css, /bpmn_boundary_timer\.fb-boundary-noninterrupting::before/);
 });
 
 test('mounted Send boundaries clear both host ports and remain selectable after the host is raised', async () => {
@@ -546,6 +611,70 @@ test('boundary moves with its activity once, cascades on delete and remaps clone
   graph.destroy();
 });
 
+test('grid snapping canonicalizes negative-origin creation and drag without changing ordinary coordinates', () => {
+  const graph = canvas();
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 900, height: 600 });
+  graph.view = { x: 0, y: 0, zoom: 1 };
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const added = graph.addNodeFromTemplate(template, template.width / 2 - 0.4, template.height / 2 + 30.4);
+  assert.equal(added.x, 0);
+  assert.equal(Object.is(added.x, -0), false);
+  assert.equal(added.y, 30);
+
+  const nodeElement = graph.nodesLayer.querySelector(`[data-node-id="${CSS.escape(added.id)}"]`);
+  nodeElement.dispatchEvent(new window.PointerEvent('pointerdown', {
+    bubbles: true, pointerId: 71, button: 0, clientX: 100, clientY: 100,
+  }));
+  graph._flushPointerMove(95.9, 100);
+  assert.equal(added.x, 0);
+  assert.equal(Object.is(added.x, -0), false);
+  window.dispatchEvent(new window.PointerEvent('pointerup', {
+    pointerId: 71, button: 0, clientX: 95.9, clientY: 100,
+  }));
+
+  const ordinary = graph.nodes.find((node) => node.id === 'Start');
+  const before = { x: ordinary.x, y: ordinary.y };
+  const ordinaryElement = graph.nodesLayer.querySelector('[data-node-id="Start"]');
+  ordinaryElement.dispatchEvent(new window.PointerEvent('pointerdown', {
+    bubbles: true, pointerId: 72, button: 0, clientX: 100, clientY: 100,
+  }));
+  graph._flushPointerMove(104.1, 104.1);
+  assert.deepEqual({ x: ordinary.x, y: ordinary.y }, before);
+  window.dispatchEvent(new window.PointerEvent('pointerup', {
+    pointerId: 72, button: 0, clientX: 104.1, clientY: 104.1,
+  }));
+  graph.destroy();
+});
+
+test('duplicating an activity preserves its data-object binding with fresh IO element IDs', () => {
+  const graph = canvas();
+  const original = userNode(graph);
+  original.activityIo = {
+    dataInputs: [{ id: 'Customer_Input', name: '' }],
+    dataOutputs: [{ id: 'Reviewed_Output', name: null, valueExpression: 'inputs.Customer_Input' }],
+    inputSetId: 'Input_Set', inputSet: ['Customer_Input'],
+    outputSetId: 'Output_Set', outputSet: ['Reviewed_Output'],
+    inputAssociations: [{ DirectRef: { id: 'Input_Association', sourceObjectRefId: 'Customer_Ref', targetInputId: 'Customer_Input' } }],
+    outputAssociations: [{ id: 'Output_Association', sourceOutputId: 'Reviewed_Output', targetObjectRefId: 'Review_Ref' }],
+  };
+  const before = structuredClone(original.activityIo);
+  graph.duplicateNodes([original.id]);
+  const clone = graph.nodes.find((node) => graph.selectedIds.has(node.id));
+  assert.ok(clone && clone.id !== original.id);
+  assert.deepEqual(original.activityIo, before);
+  const saved = graph.getData();
+  const copied = saved.nodes.find((node) => node.id === clone.id).activityIo;
+  assert.notEqual(copied.dataInputs[0].id, before.dataInputs[0].id);
+  assert.notEqual(copied.dataOutputs[0].id, before.dataOutputs[0].id);
+  assert.equal(copied.inputSet[0], copied.dataInputs[0].id);
+  assert.equal(copied.outputSet[0], copied.dataOutputs[0].id);
+  assert.equal(copied.inputAssociations[0].DirectRef.targetInputId, copied.dataInputs[0].id);
+  assert.equal(copied.inputAssociations[0].DirectRef.sourceObjectRefId, 'Customer_Ref');
+  assert.equal(copied.outputAssociations[0].sourceOutputId, copied.dataOutputs[0].id);
+  assert.equal(copied.outputAssociations[0].targetObjectRefId, 'Review_Ref');
+  graph.destroy();
+});
+
 test('message and error elements retain declarations, target expressions, attachment and DI through real canvas edits', async () => {
   const model = emptyProcessModel();
   model.targetNamespace = 'urn:example:orders';
@@ -591,8 +720,8 @@ test('message and error elements retain declarations, target expressions, attach
   config.show(throwNode, graph.templates.get(throwNode.type));
   fixtures({
     processDefinitionListRequest: { definitions: [{ definitionId: 'target-definition', name: 'Target' }], hasMore: false },
-    processDefinitionGetRequest: { definition: definition('target-definition', { publishedVersion: 1 }) },
-    processVersionGetRequest: { version: { model } },
+    processDefinitionGetRequest: { definition: definition('target-definition', { publishedVersion: 1 }), startCatalog: [] },
+    processVersionGetRequest: { version: { model }, startCatalog: [] },
   });
   click(config.root.querySelector('[data-load-targets]'));
   await flush(2);
@@ -625,9 +754,19 @@ test('message and error elements retain declarations, target expressions, attach
 
 test('call picker binds an exact published version and previews it without replacing the unsaved caller', async () => {
   const model = emptyProcessModel();
+  model.targetNamespace = 'urn:example:caller';
+  model.additionalProcesses = [{ processId: 'Local_Process', processName: 'Local review',
+    nodes: [{ id: 'Local_Start', name: '', kind: 'Start' }, { id: 'Local_End', name: '', kind: 'End' }],
+    sequenceFlows: [{ id: 'Local_Flow', sourceId: 'Local_Start', targetId: 'Local_End', condition: null }],
+    variables: {}, diagram: { shapes: [], edges: [] } }];
   const called = emptyProcessModel();
   called.processId = 'Called_Process';
   called.targetNamespace = 'urn:example:called';
+  const extraCalled = { processId: 'Extra_Process', processName: 'Second callable body',
+    nodes: [{ id: 'Extra_Start', name: '', kind: 'Start' }, { id: 'Extra_End', name: '', kind: 'End' }],
+    sequenceFlows: [{ id: 'Extra_Flow', sourceId: 'Extra_Start', targetId: 'Extra_End', condition: null }],
+    variables: {}, diagram: { shapes: [], edges: [] } };
+  called.additionalProcesses = [extraCalled];
   const second = emptyProcessModel();
   second.processId = 'Second_Process';
   second.targetNamespace = 'urn:example:second';
@@ -652,7 +791,7 @@ test('call picker binds an exact published version and previews it without repla
     processVersionListRequest: ({ definitionId: selected }) => ({ versions: [{ definitionId: selected,
       version: selected === definitionId ? 7 : 3 }], hasMore: false }),
     processVersionGetRequest: ({ definitionId: selected, version }) => ({ version: { definitionId: selected,
-      version, model: selected === definitionId ? called : second } }),
+      version, model: selected === definitionId ? called : second }, startCatalog: [] }),
   });
   click(config.root.querySelector('[data-load-calls]'));
   await flush(2);
@@ -663,6 +802,7 @@ test('call picker binds an exact published version and previews it without repla
   await flush(2);
   change(config.root.querySelector('[data-process="calledVersionChoice"]'), '7');
   await flush(2);
+  change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Called_Process');
   assert.deepEqual(call.config.calledElement, { namespaceUri: 'urn:example:called', processId: 'Called_Process' });
   assert.equal(call.config.calledVersion, 7);
   assert.equal(call.config.calledDefinitionId, definitionId);
@@ -673,6 +813,12 @@ test('call picker binds an exact published version and previews it without repla
   const preview = [...document.querySelectorAll('tf-window')].at(-1);
   assert.equal(preview.querySelector('tf-code-editor').hasAttribute('readonly'), true);
   assert.deepEqual(JSON.parse(preview.querySelector('tf-code-editor').value), called);
+  change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Extra_Process');
+  click(config.root.querySelector('[data-preview-called]'));
+  await flush(2);
+  const selectedPreview = [...document.querySelectorAll('tf-window')].at(-1);
+  assert.deepEqual(JSON.parse(selectedPreview.querySelector('tf-code-editor').value), extraCalled);
+  change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Called_Process');
   assert.deepEqual(graph.getData().nodes[0], before.nodes[0]);
   assert.equal(graph.getData().nodes.find((node) => node.id === 'Call_1').kind.CallActivity.calledVersion, 7);
   change(config.root.querySelector('[data-process="calledVersionChoice"]'), '');
@@ -687,10 +833,22 @@ test('call picker binds an exact published version and previews it without repla
   await flush(2);
   change(config.root.querySelector('[data-process="calledVersionChoice"]'), '3');
   await flush(2);
+  change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Second_Process');
   assert.equal(call.config.calledDefinitionId, secondDefinitionId);
   assert.equal(call.config.calledVersion, 3);
   assert.deepEqual(call.config.calledElement, { namespaceUri: 'urn:example:second', processId: 'Second_Process' });
   assert.deepEqual(graph.getData().nodes[0], before.nodes[0], 'switching exact targets retains the unsaved caller');
+  change(config.root.querySelector('[data-process="callTargetMode"]'), 'local');
+  assert.ok([...config.root.querySelector('[data-process="localBodyChoice"] .tf-select').options]
+    .some((option) => option.value === 'Local_Process'));
+  change(config.root.querySelector('[data-process="localBodyChoice"]'), 'Local_Process');
+  assert.deepEqual(graph.getData().nodes.find((node) => node.id === 'Call_1').kind.CallActivity,
+    { localBody: { namespaceUri: 'urn:example:caller', processId: 'Local_Process' },
+      inputMapping: before.nodes[1].kind.CallActivity.inputMapping,
+      outputMapping: before.nodes[1].kind.CallActivity.outputMapping });
+  change(config.root.querySelector('[data-process="callTargetMode"]'), 'published');
+  assert.equal(Object.hasOwn(call.config, 'localBody'), false);
+  assert.equal(call.config.calledVersion, 0);
   config.destroy(); graph.destroy();
 });
 
@@ -856,7 +1014,7 @@ test('distinct send and receive task inspectors save exact message fields and di
   }) });
   state.canvas.selectNode('Send_1');
   await flush(2);
-  assert.equal(state.config.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.ok(state.config.root.querySelector('[data-process="repeatMode"]'));
   assert.ok(state.config.root.querySelector('[data-process="targetType"]'));
   assert.ok(state.config.root.textContent.includes(I18n.t('bpmn.node_send_task_hint')));
   change(state.config.root.querySelector('[data-process="targetDefinitionId"]'), 'target-definition');
@@ -866,7 +1024,7 @@ test('distinct send and receive task inspectors save exact message fields and di
   assert.ok(state.config.root.querySelector('[data-process="messageRef"]'));
   assert.ok(state.config.root.querySelector('[data-process="outputMapping"]'));
   assert.equal(state.config.root.querySelector('[data-process="targetType"]'), null);
-  assert.equal(state.config.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.ok(state.config.root.querySelector('[data-process="repeatMode"]'));
   assert.equal(await builder._save(), true);
   const saved = calls.find((call) => call.kind === 'processDefinitionSaveRequest').payload;
   assert.deepEqual(saved.model.nodes.find((node) => node.id === 'Send_1').kind.SendTask, {
@@ -918,7 +1076,7 @@ test('root Send timer and message boundaries save, publish and retain their pinn
       return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
     },
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) }, startCatalog: [] }),
   });
   for (const [nodeId, kind] of [['Send_Timer', 'BoundaryTimer'], ['Send_Message', 'BoundaryMessage']]) {
     state.canvas.selectNode(nodeId); await flush(2);
@@ -1040,7 +1198,7 @@ test('embedded Send timer and message attachments survive authoring and pinned r
       return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
     },
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) }, startCatalog: [] }),
   });
   state.canvas.selectNode('Scope_Review'); await flush(2);
   click(state.config.root.querySelector('[data-process-enter]'));
@@ -1130,7 +1288,7 @@ test('embedded manual and receive boundaries save, publish and retain their pinn
         return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
       },
       processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-      processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+      processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) }, startCatalog: [] }),
     });
     state.canvas.selectNode('Scope_Review'); await flush(2);
     click(state.config.root.querySelector('[data-process-enter]'));
@@ -1224,7 +1382,7 @@ test('event gateway receive and signal alternatives save, publish and retain pin
       return { definition: { ...current, publishedVersion: published, draftRevision: 5 }, version };
     },
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) } }),
+    processVersionGetRequest: () => ({ version: { version: 1, model: structuredClone(pinned) }, startCatalog: [] }),
   });
   assert.deepEqual(state.canvas.validate(), []);
   state.canvas.selectNode('Receive_1'); await flush(2);
@@ -1334,6 +1492,65 @@ test('signal throw and catch inspectors preserve exact declarations, expressions
   assert.match(subscription, /Order changed <&>/);
   assert.equal(subscription.includes(I18n.t('bpmn.message_correlation_key')), false);
   win.remove();
+});
+
+test('Link throw and catch use reciprocal typed definitions without a drawn jump edge', async () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0,
+    { id: 'Throw_1', name: 'Again', kind: { LinkThrow: { definition: {
+      id: 'Link_Throw', name: 'repeat', sourceRefs: [], targetRef: 'Link_Catch',
+    } } } },
+    { id: 'Catch_1', name: 'Resume', kind: { LinkCatch: { definition: {
+      id: 'Link_Catch', name: 'repeat', sourceRefs: ['Link_Throw'], targetRef: null,
+    } } } });
+  model.sequenceFlows = [
+    { id: 'Flow_Throw', sourceId: 'Start', targetId: 'Throw_1', condition: null },
+    { id: 'Flow_End', sourceId: 'Catch_1', targetId: 'End', condition: null },
+  ];
+  const current = definition('link-draft', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({
+    definition: { ...current, model: payload.model, draftRevision: 5 },
+  }) });
+  assert.equal(state.canvas.root.querySelector('[data-node-id="Throw_1"] use').getAttribute('href'), '#i-link-throw');
+  assert.equal(state.canvas.root.querySelector('[data-node-id="Catch_1"] use').getAttribute('href'), '#i-link-catch');
+  assert.match(state.canvas.root.querySelector('[data-node-id="Throw_1"] .fb-process-label').textContent, /Again · repeat/);
+  assert.match(state.canvas.root.querySelector('[data-node-id="Catch_1"] .fb-process-label').textContent, /Resume · repeat/);
+  const markerIds = [...state.canvas.svg.querySelectorAll('marker')].map((marker) => marker.id);
+  assert.equal(markerIds.length, 1);
+  const edgePaths = [...state.canvas.svg.querySelectorAll('.fb-edge-path')];
+  assert.equal(edgePaths.length, 2);
+  assert.equal(edgePaths.every((path) => path.getAttribute('marker-end') === `url(#${state.canvas._edgeMarkerId})`), true);
+  assert.equal(new Set(edgePaths.map((path) => path.getAttribute('d'))).size, 2);
+  state.canvas.selectEdge('Flow_Throw');
+  const selectedPath = state.canvas.svg.querySelector('.fb-edge-path.selected');
+  assert.equal(selectedPath.getAttribute('marker-end'), `url(#${state.canvas._edgeMarkerId})`);
+  assert.equal(state.canvas.connectNodes('Throw_1', 'Catch_1'), false);
+  assert.equal(state.canvas.connectNodes('Start', 'Catch_1'), false);
+  assert.equal(state.canvas.getData().sequenceFlows.length, 2);
+  state.canvas.selectNode('Throw_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="linkDefinitionId"]').value, 'Link_Throw');
+  assert.equal(state.config.root.querySelector('[data-process="linkTargetRef"]').value, 'Link_Catch');
+  change(state.config.root.querySelector('[data-process="linkName"]'), 'repeat');
+  state.canvas.selectNode('Catch_1'); await flush(2);
+  assert.equal(state.config.root.querySelector('[data-process="linkSourceRefs"]').value, 'Link_Throw');
+  assert.equal(await builder._save(), true);
+  const saved = calls.filter((call) => call.kind === 'processDefinitionSaveRequest').at(-1).payload.model;
+  assert.deepEqual(saved.nodes.find((node) => node.id === 'Throw_1').kind.LinkThrow.definition,
+    { id: 'Link_Throw', name: 'repeat', sourceRefs: [], targetRef: 'Link_Catch' });
+  assert.deepEqual(saved.nodes.find((node) => node.id === 'Catch_1').kind.LinkCatch.definition,
+    { id: 'Link_Catch', name: 'repeat', sourceRefs: ['Link_Throw'], targetRef: null });
+  assert.equal(saved.sequenceFlows.length, 2);
+  const cloned = cloneProcessBody(saved);
+  const clonedThrow = cloned.nodes.find((node) => node.kind?.LinkThrow).kind.LinkThrow.definition;
+  const clonedCatch = cloned.nodes.find((node) => node.kind?.LinkCatch).kind.LinkCatch.definition;
+  assert.notEqual(clonedThrow.id, 'Link_Throw');
+  assert.notEqual(clonedCatch.id, 'Link_Catch');
+  assert.equal(clonedThrow.targetRef, clonedCatch.id);
+  assert.deepEqual(clonedCatch.sourceRefs, [clonedThrow.id]);
+  assert.match(processEventText({ kind: 'link_thrown', nodeName: 'Again',
+    data: { catch_node_id: 'Catch_1' } }), /Again.*Catch_1/);
+  assert.match(processEventText({ kind: 'link_caught', nodeName: 'Resume',
+    data: { source_token_id: 'token_1' } }), /Resume.*token_1/);
 });
 
 test('signal history distinguishes admitted source from received delivery after zero-recipient completion', async () => {
@@ -1590,7 +1807,7 @@ test('manual inspector saves pinned instructions and discloses assigned executio
   const instructions = state.root.querySelector('[data-process="instructions"]');
   assert.equal(instructions.tagName, 'TF-TEXTAREA');
   assert.equal(state.root.querySelector('[data-process="outputMapping"]'), null);
-  assert.equal(state.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.ok(state.root.querySelector('[data-process="repeatMode"]'));
   click(picker.querySelector('[data-id="lee"]'));
   change(instructions, 'Inspect <register> & report.\nAcknowledge outside work.');
   assert.match(state.root.textContent, new RegExp(I18n.t('bpmn.manual_access_disclosure')));
@@ -1697,6 +1914,65 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
+test('activity IO inspector authors ordered inputs, outputs, associations and repetition coordinator', () => {
+  const model = emptyProcessModel();
+  model.variables = { mapped: null };
+  model.modeling = {
+    laneSets: [], dataObjects: [{ id: 'Object_1', name: 'Result' }],
+    dataObjectReferences: [{ id: 'Ref_1', name: 'Result reference', dataObjectRef: 'Object_1', variableBindingKey: 'mapped' }],
+    textAnnotations: [], associations: [], dataStoreReferences: [],
+  };
+  model.nodes.splice(1, 0, { id: 'Service_1', name: 'Check', kind: { ServiceTask: {
+    flowId: 'flow-one', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60,
+  } }, repeat: { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'mapped' } } });
+  model.sequenceFlows[0].targetId = 'Service_1';
+  model.sequenceFlows.push({ id: 'Service_exit', sourceId: 'Service_1', targetId: 'End', condition: null });
+  model.diagram.shapes = [
+    { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
+    { elementId: 'Service_1', x: 220, y: 140, width: 240, height: 96 },
+    { elementId: 'End', x: 560, y: 160, width: 56, height: 56 },
+  ];
+  model.diagram.edges = model.sequenceFlows.map((edge) => ({ sequenceFlowId: edge.id,
+    waypoints: [{ x: 100, y: 180 }, { x: 600, y: 180 }] }));
+  const graph = canvas(model);
+  const node = graph.nodes.find((candidate) => candidate.id === 'Service_1');
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  click(config.root.querySelector('[data-activity-action="enable"]'));
+  click(config.root.querySelector('[data-activity-action="add-input"]'));
+  click(config.root.querySelector('[data-activity-action="add-output"]'));
+  assert.equal(node.activityIo.dataInputs.length, 1);
+  assert.equal(node.activityIo.dataOutputs.length, 1);
+  const inputId = node.activityIo.dataInputs[0].id;
+  const outputId = node.activityIo.dataOutputs[0].id;
+  change(config.root.querySelector('[data-activity-row="input"] [data-activity-field="name"]'), 'Payload');
+  change(config.root.querySelector('[data-activity-row="output"] [data-activity-field="expression"]'), 'outputs.answer');
+  click(config.root.querySelector('[data-activity-action="add-input-association"]'));
+  click(config.root.querySelector('[data-activity-action="add-output-association"]'));
+  change(config.root.querySelector('[data-activity-row="input-association"] [data-activity-field="target-input"]'), inputId);
+  change(config.root.querySelector('[data-activity-row="input-association"] [data-activity-field="from-expression"]'), 'vars.source');
+  change(config.root.querySelector('[data-activity-row="output-association"] [data-activity-field="source-output"]'), outputId);
+  change(config.root.querySelector('[data-activity-row="output-association"] [data-activity-field="target-object"]'), 'Ref_1');
+  const coordinator = config.root.querySelector('[data-activity-field="coordinator-enabled"]');
+  coordinator.checked = true;
+  coordinator.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+  click(config.root.querySelector('[data-activity-action="add-coordinator-output"]'));
+  assert.equal(node.activityIo.dataInputs[0].name, 'Payload');
+  assert.equal(node.activityIo.dataOutputs[0].valueExpression, 'outputs.answer');
+  assert.deepEqual(node.activityIo.inputAssociations[0].CelAssignment, {
+    id: node.activityIo.inputAssociations[0].CelAssignment.id,
+    fromExpression: 'vars.source', targetInputId: inputId,
+  });
+  assert.deepEqual(node.activityIo.outputAssociations[0], {
+    id: node.activityIo.outputAssociations[0].id, sourceOutputId: outputId, targetObjectRefId: 'Ref_1',
+  });
+  assert.equal(node.activityIo.inputSet[0], inputId);
+  assert.equal(node.activityIo.outputSet[0], outputId);
+  assert.equal(node.activityIo.coordinatorOutput.dataOutputs.length, 1);
+  const saved = graph.getData().nodes.find((candidate) => candidate.id === 'Service_1');
+  assert.equal(saved.activityIo.coordinatorOutput.outputSet.length, 1);
+  config.destroy(); graph.destroy();
+});
+
 test('script inspector keeps a direct CEL body and explicit mapping through mounted Save', async () => {
   const model = emptyProcessModel();
   model.variables.answer = null;
@@ -1715,7 +1991,7 @@ test('script inspector keeps a direct CEL body and explicit mapping through moun
   assert.equal(script.tagName, 'TF-TEXTAREA');
   assert.ok(script.hasAttribute('autogrow'));
   assert.equal(mapping.tagName, 'TF-KEYVALUE-EDITOR');
-  assert.equal(state.root.querySelector('[data-process="repeatMode"]'), null);
+  assert.ok(state.root.querySelector('[data-process="repeatMode"]'));
   change(script, 'vars.amount + 1');
   change(mapping, { answer: 'outputs' });
   const expected = { ScriptTask: { script: 'vars.amount + 1', outputMapping: { answer: 'outputs' } } };
@@ -1733,6 +2009,79 @@ test('script inspector keeps a direct CEL body and explicit mapping through moun
   assert.equal(readOnly.root.querySelector('[data-process="script"]').hasAttribute('disabled'), true);
   assert.equal(readOnly.root.querySelector('[data-process="outputMapping"]').hasAttribute('disabled'), true);
   readOnly.destroy();
+});
+
+test('repeated Script inspector saves an editable MI draft and pins empty mapping before loop V2', async () => {
+  calls.length = 0;
+  const model = emptyProcessModel();
+  model.variables = { results: [], items: [null, 7, { case_key: 'Łódź <&>' }], step: 0 };
+  model.nodes.splice(1, 0, { id: 'Script_1', name: 'Calculate <&> Łódź',
+    kind: { ScriptTask: { script: 'repeat.item', outputMapping: {} } } });
+  model.sequenceFlows[0].targetId = 'Script_1';
+  model.sequenceFlows.push({ id: 'ScriptExit', sourceId: 'Script_1', targetId: 'End', condition: null });
+  const current = definition('script-repeat-draft', { model });
+  let draftRevision = 4, publishedVersion = 0, pinnedV1;
+  const state = await mount(current, {
+    processDefinitionSaveRequest: (payload) => ({ definition: { ...current,
+      draftRevision: ++draftRevision, publishedVersion: publishedVersion || null, model: payload.model } }),
+    processDefinitionPublishRequest: () => {
+      const published = structuredClone(state.canvas.getData());
+      publishedVersion += 1;
+      if (publishedVersion === 1) pinnedV1 = structuredClone(published);
+      return { definition: { ...current, draftRevision, publishedVersion, model: published },
+        version: { version: publishedVersion, model: published } };
+    },
+    processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: { version: { version: 1, model: null }, startCatalog: [] },
+  });
+  state.canvas.selectNode('Script_1'); await flush(2);
+  const body = state.root.querySelector('[data-process="script"]');
+  assert.equal(body.tagName, 'TF-TEXTAREA');
+  change(state.root.querySelector('[data-process="repeatMode"]'), 'mi_parallel'); await flush(2);
+  change(state.root.querySelector('[data-process="repeatInputMode"]'), 'collection'); await flush(2);
+  change(state.root.querySelector('[data-process="repeatCollection"]'), 'vars.items');
+  change(state.root.querySelector('[data-process="repeatOutput"]'), 'results');
+  change(state.root.querySelector('[data-process="outputMapping"]'), { step: 'outputs' });
+  assert.ok(state.root.textContent.includes(I18n.t('bpmn.repeat_script_mi_meaning')));
+  assert.equal(await builder._save(), true);
+  assert.deepEqual(calls.filter((row) => row.kind === 'processDefinitionSaveRequest').at(-1)
+    .payload.model.nodes.find((node) => node.id === 'Script_1').kind.ScriptTask.outputMapping,
+    { step: 'outputs' });
+  change(state.root.querySelector('[data-process="outputMapping"]'), {});
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(publishedVersion, 1);
+  assert.deepEqual(pinnedV1.nodes.find((node) => node.id === 'Script_1').kind.ScriptTask,
+    { script: 'repeat.item', outputMapping: {} });
+  assert.deepEqual(pinnedV1.nodes.find((node) => node.id === 'Script_1').repeat,
+    { MultiInstance: { mode: 'Parallel', input: { CollectionExpression: { expression: 'vars.items' } },
+      outputCollectionVariable: 'results' } });
+  state.canvas.selectNode('Script_1'); await flush(2);
+  change(state.root.querySelector('[data-process="repeatMode"]'), 'loop'); await flush(2);
+  change(state.root.querySelector('[data-process="repeatCondition"]'), 'vars.step < 3');
+  change(state.root.querySelector('[data-process="repeatMaximum"]'), '32');
+  change(state.root.querySelector('[data-process="repeatOutput"]'), 'results');
+  change(state.root.querySelector('[data-process="outputMapping"]'), { step: 'outputs' });
+  assert.ok(state.root.textContent.includes(I18n.t('bpmn.repeat_script_loop_meaning')));
+  assert.equal(await builder._save(), true);
+  await builder._publish();
+  assert.equal(publishedVersion, 2);
+  assert.deepEqual(pinnedV1.nodes.find((node) => node.id === 'Script_1').kind.ScriptTask.outputMapping, {});
+  assert.equal(state.canvas.getData().nodes.find((node) => node.id === 'Script_1').repeat.StructuredLoop.maxIterations, 32);
+  fixtures({ processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+    processVersionGetRequest: { version: { version: 1, model: pinnedV1 }, startCatalog: [] } });
+  await builder._openProcessVersions();
+  click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+  await flush();
+  assert.equal(state.canvas.readOnly, true);
+  state.canvas.selectNode('Script_1'); await flush(2);
+  assert.equal(state.root.querySelector('[data-process="script"]').value, 'repeat.item');
+  assert.equal(state.root.querySelector('[data-process="repeatMode"]').value, 'mi_parallel');
+  for (const field of ['script', 'outputMapping', 'repeatMode', 'repeatCollection', 'repeatOutput']) {
+    assert.equal(state.root.querySelector(`[data-process="${field}"]`).hasAttribute('disabled'), true);
+  }
+  assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Script_1'),
+    pinnedV1.nodes.find((node) => node.id === 'Script_1'));
 });
 
 test('repeat inspector persists MI and loop metadata outside task config and renders the standard marker', async () => {
@@ -1810,10 +2159,221 @@ test('repeat inspector changes survive the mounted draft save and undo/redo snap
   assert.deepEqual(request.payload.model.nodes.find((node) => node.id === 'RepeatWork').repeat, expected);
 });
 
+test('eight repeated activities retain outer boundaries and exact pinned version metadata', async () => {
+  const user = { UserTask: { assigneeUserId: null, outputMapping: {} } };
+  const service = { ServiceTask: { flowId: 'flow-one', inputMapping: {}, outputMapping: {},
+    verification: 'Human', timeoutSeconds: 60, resultExpression: 'outputs.result' } };
+  const script = { ScriptTask: { script: 'repeat.item', outputMapping: {} } };
+  const manual = { ManualTask: { assigneeUserId: null, instructions: 'Check the external register <&>' } };
+  const send = { SendTask: { messageRef: 'Message_1',
+    target: { Start: { definitionId: '91764f75-dadb-41aa-a252-a8a911fe7a94' } },
+    correlationExpression: 'vars.case_key', payloadExpression: 'vars.payload', ttlSeconds: 60 } };
+  const receive = { ReceiveTask: { messageRef: 'Message_1',
+    correlationExpression: 'vars.case_key', outputMapping: {} } };
+  const embedded = structuredClone(embeddedModel().nodes.find((node) => node.id === 'Scope_Review').kind);
+  embedded.SubProcess.inputMapping = {};
+  embedded.SubProcess.outputMapping = {};
+  const call = { CallActivity: { calledDefinitionId: '91764f75-dadb-41aa-a252-a8a911fe7a94',
+    calledVersion: 2, calledElement: { namespaceUri: 'urn:review', processId: 'Review_Process' },
+    inputMapping: {}, outputMapping: {} } };
+  for (const [tag, kind] of Object.entries({ UserTask: user, ServiceTask: service, ScriptTask: script,
+    ManualTask: manual, SendTask: send,
+    ReceiveTask: receive, SubProcess: embedded, CallActivity: call })) {
+    calls.length = 0;
+    const model = emptyProcessModel();
+    model.timerTimezone = 'Europe/Warsaw';
+    model.variables = { results: [], items: [null, { case_key: 'Łódź <&>' }],
+      case_key: 'case-1', payload: { case_key: 'case-1' }, more: false };
+    model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+    model.nodes.splice(1, 0, { id: 'Repeat_1', name: 'Repeat <&> Łódź', kind });
+    model.nodes.push({ id: 'GroupDeadline', name: 'Group deadline', kind: { BoundaryTimer: {
+      attachedToId: 'Repeat_1', cancelActivity: true, timer: { Duration: { seconds: 90 } },
+    } } }, { id: 'GroupReply', name: 'Group reply', kind: { BoundaryMessage: {
+      attachedToId: 'Repeat_1', cancelActivity: false, messageRef: 'Message_1',
+      correlationExpression: 'vars.case_key', outputMapping: {},
+    } } });
+    model.sequenceFlows[0].targetId = 'Repeat_1';
+    model.sequenceFlows.push({ id: 'RepeatExit', sourceId: 'Repeat_1', targetId: 'End', condition: null });
+    model.sequenceFlows.push({ id: 'DeadlineExit', sourceId: 'GroupDeadline', targetId: 'End', condition: null },
+      { id: 'ReplyExit', sourceId: 'GroupReply', targetId: 'End', condition: null });
+    const current = definition(`repeat-${tag}`, { model });
+    let draftRevision = 4, publishedVersion = 0, pinnedV1;
+    const state = await mount(current, {
+      processDefinitionSaveRequest: (payload) => {
+        draftRevision += 1;
+        return { definition: { ...current, draftRevision, publishedVersion: publishedVersion || null,
+          model: payload.model } };
+      },
+      processDefinitionPublishRequest: () => {
+        publishedVersion += 1;
+        const published = state.canvas.getData();
+        if (publishedVersion === 1) pinnedV1 = structuredClone(published);
+        return { definition: { ...current, draftRevision, publishedVersion, model: published },
+          version: { version: publishedVersion, model: published } };
+      },
+      processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+      processVersionGetRequest: { version: { version: 1, model: null }, startCatalog: [] },
+    });
+    state.canvas.selectNode('Repeat_1');
+    await flush(2);
+    const mode = state.root.querySelector('[data-process="repeatMode"]');
+    assert.ok(mode, `${tag} exposes the existing repeat inspector`);
+    change(mode, 'mi_sequential');
+    await flush(2);
+    change(state.root.querySelector('[data-process="repeatInputMode"]'), 'collection');
+    await flush(2);
+    change(state.root.querySelector('[data-process="repeatCollection"]'), 'vars.items');
+    change(state.root.querySelector('[data-process="repeatOutput"]'), 'results');
+    const expected = { MultiInstance: { mode: 'Sequential',
+      input: { CollectionExpression: { expression: 'vars.items' } },
+      outputCollectionVariable: 'results' } };
+    assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Repeat_1').repeat, expected);
+    const parent = state.canvas.nodes.find((node) => node.id === 'Repeat_1');
+    const ports = [state.canvas._getPortWorldPos(parent.id, 'in', 'in'),
+      state.canvas._getPortWorldPos(parent.id, 'full', 'out')];
+    for (const id of ['GroupDeadline', 'GroupReply']) {
+      state.canvas.updateNodeConfig(id, { attachedToId: null });
+      state.canvas.updateNodeConfig(id, { attachedToId: 'Repeat_1' });
+      const boundary = state.canvas.nodes.find((node) => node.id === id);
+      const center = { x: boundary.x + boundary.width / 2, y: boundary.y + boundary.height / 2 };
+      assert.ok(center.x === parent.x || center.x === parent.x + parent.width
+        || center.y === parent.y || center.y === parent.y + parent.height);
+      assert.ok(ports.every((port) => Math.hypot(center.x - port.x, center.y - port.y) >= boundary.width / 2 + 16));
+      state.canvas.selectNode(id);
+      await flush(2);
+      const attachment = state.root.querySelector('[data-process="attachedToId"]');
+      assert.equal(attachment.value, 'Repeat_1');
+      assert.equal(attachment.querySelector('option[value="Repeat_1"]').disabled, false);
+      assert.equal(state.root.querySelector('[data-boundary-scope]').textContent, I18n.t('bpmn.boundary_repeat_group_hint'));
+    }
+    const [deadline, reply] = ['GroupDeadline', 'GroupReply'].map((id) => state.canvas.nodes.find((node) => node.id === id));
+    assert.ok(Math.hypot(deadline.x - reply.x, deadline.y - reply.y) >= deadline.width);
+    assert.equal(await builder._save(), true);
+    const saved = calls.filter((row) => row.kind === 'processDefinitionSaveRequest').at(-1);
+    assert.deepEqual(saved.payload.model.nodes.find((node) => node.id === 'Repeat_1').repeat, expected);
+    await builder._publish();
+    assert.equal(publishedVersion, 1);
+    assert.deepEqual(pinnedV1.nodes.find((node) => node.id === 'Repeat_1').repeat, expected);
+    for (const id of ['GroupDeadline', 'GroupReply']) {
+      assert.deepEqual(pinnedV1.nodes.find((node) => node.id === id), model.nodes.find((node) => node.id === id));
+    }
+    state.canvas.updateNodeConfig('Repeat_1', { repeat: { StructuredLoop: {
+      condition: 'vars.more', testBefore: false, maxIterations: 3,
+      outputCollectionVariable: 'results' } } });
+    assert.equal(await builder._save(), true);
+    await builder._publish();
+    assert.equal(publishedVersion, 2);
+    assert.deepEqual(pinnedV1.nodes.find((node) => node.id === 'Repeat_1').repeat, expected);
+    fixtures({ processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
+      processVersionGetRequest: { version: { version: 1, model: pinnedV1 }, startCatalog: [] } });
+    await builder._openProcessVersions();
+    click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
+    await flush();
+    assert.equal(state.previewVersion, 1);
+    assert.equal(state.canvas.readOnly, true);
+    assert.deepEqual(state.canvas.getData().nodes.find((node) => node.id === 'Repeat_1').repeat, expected);
+    state.canvas.selectNode('Repeat_1');
+    const readonlyMode = state.root.querySelector('[data-process="repeatMode"]');
+    assert.equal(readonlyMode.getAttribute('value'), 'mi_sequential');
+    await flush(2);
+    assert.equal(readonlyMode.value, 'mi_sequential');
+    assert.equal(readonlyMode.hasAttribute('disabled'), true);
+    assert.equal(state.root.querySelector('[data-process="repeatCollection"]').hasAttribute('disabled'), true);
+    assert.equal(state.root.querySelector('[data-process="repeatOutput"]').hasAttribute('disabled'), true);
+    assert.equal(state.root.querySelector('[data-role="save"]').hasAttribute('disabled'), true);
+    state.canvas.selectNode('GroupDeadline');
+    await flush(2);
+    assert.equal(state.root.querySelector('[data-process="attachedToId"]').hasAttribute('disabled'), true);
+    assert.equal(state.root.querySelector('[data-boundary-scope]').textContent, I18n.t('bpmn.boundary_repeat_group_hint'));
+    assert.equal(calls.filter((row) => row.kind === 'processDefinitionSaveRequest').length, 2);
+  }
+});
+
+test('repeated manual and receive waits reject an unattached boundary draft before save', async () => {
+  for (const kind of [
+    { ManualTask: { assigneeUserId: null, instructions: 'Check the external register' } },
+    { ReceiveTask: { messageRef: 'Message_1', correlationExpression: 'vars.case_key', outputMapping: {} } },
+  ]) {
+    calls.length = 0;
+    const model = boundaryModel();
+    model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+    model.variables.results = [];
+    model.variables.case_key = 'case-1';
+    model.nodes.find((node) => node.id === 'Review').kind = kind;
+    model.nodes.find((node) => node.id === 'Review').repeat = { MultiInstance: {
+      mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'results' } };
+    model.nodes.find((node) => node.id === 'Timer_A').kind.BoundaryTimer.attachedToId = 'MissingActivity';
+    const state = await mount(definition('repeat-boundary-draft', { model }));
+    assert.ok(state.canvas.validate().includes(I18n.t('bpmn.boundary_required')));
+    assert.equal(await builder._save(), false);
+    assert.equal(calls.some((row) => row.kind === 'processDefinitionSaveRequest'), false);
+  }
+});
+
+test('five locales explain the selected repeated activity without losing its full name', async () => {
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const [template, meaning] of [
+        ['bpmn_script_task', 'script_mi'], ['bpmn_manual_task', 'manual'], ['bpmn_send_task', 'send'],
+        ['bpmn_receive_task', 'receive'], ['bpmn_sub_process', 'subprocess'],
+        ['bpmn_call_activity', 'call'],
+      ]) {
+        const graph = canvas();
+        graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === template), 250, 300);
+        const node = graph.nodes.at(-1);
+        const fullName = `R&D <Łódź> ${'Long activity '.repeat(12)}`;
+        graph.updateNodeLabel(node.id, fullName);
+        const config = inspector(graph);
+        config.show(node, graph.templates.get(node.type));
+        assert.ok(config.root.querySelector('[data-process="repeatMode"]'));
+        assert.equal(config.root.querySelector('.fb-config-title').textContent, fullName);
+        assert.ok(config.root.textContent.includes(I18n.t(`bpmn.repeat_${meaning}_meaning`)));
+        if (meaning === 'script_mi') {
+          change(config.root.querySelector('[data-process="repeatMode"]'), 'loop');
+          await flush(2);
+          assert.ok(graph.nodes.find((candidate) => candidate.id === node.id).repeat?.StructuredLoop);
+          assert.ok(config.root.textContent.includes(I18n.t('bpmn.repeat_script_loop_meaning')));
+        }
+        assert.equal(config.root.querySelector('.fb-config-title').querySelector('Łódź'), null);
+        graph.updateNodeConfig(node.id, { repeat: { MultiInstance: { mode: 'Sequential',
+          input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'results' } } });
+        graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 500, 300);
+        const boundary = graph.nodes.at(-1);
+        graph.updateNodeConfig(boundary.id, { attachedToId: node.id });
+        config.show(boundary, graph.templates.get(boundary.type));
+        const attachment = config.root.querySelector('[data-process="attachedToId"]');
+        assert.equal(attachment.getAttribute('value'), node.id);
+        await flush(2);
+        assert.equal(attachment.value, node.id);
+        if (meaning === 'script_mi') {
+          const target = config.root.querySelector(`[data-process="attachedToId"] option[value="${node.id}"]`);
+          assert.ok(target && !target.disabled, 'A repeated Script has one selectable outer Timer host');
+          for (const [type, supported] of [['bpmn_boundary_message', true],
+            ['bpmn_boundary_error', false], ['bpmn_boundary_escalation', false]]) {
+            graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === type), 500, 380);
+            const candidate = graph.nodes.at(-1);
+            config.show(candidate, graph.templates.get(candidate.type));
+            const option = config.root.querySelector(`[data-process="attachedToId"] option[value="${node.id}"]`);
+            assert.equal(!!option && !option.disabled, supported,
+              `${type} exposes only a supported repeated Script boundary target`);
+          }
+          config.show(boundary, graph.templates.get(boundary.type));
+        }
+        assert.equal(config.root.querySelector('[data-boundary-scope]').textContent, I18n.t('bpmn.boundary_repeat_group_hint'));
+        assert.ok(config.root.querySelector('[data-boundary-target]').textContent.includes(fullName));
+        config.destroy(); graph.destroy();
+      }
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
 test('palette offers the supported elements and cancels drag/filter work when disposed', async () => {
   const root = document.createElement('aside'); document.body.append(root); let added = 0;
   const palette = new FlowPalette(root, { mode: 'bpmn', onAdd: () => { added += 1; } }); await palette.init();
-  assert.equal(root.querySelectorAll('[data-node-type]').length, 27);
+  assert.equal(root.querySelectorAll('[data-node-type]').length, 29);
+  assert.ok(root.querySelector('[data-node-type="bpmn_link_throw"]'));
+  assert.ok(root.querySelector('[data-node-type="bpmn_link_catch"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_boundary_escalation"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_manual_task"]'));
   assert.ok(root.querySelector('[data-node-type="bpmn_send_task"]'));
@@ -2144,6 +2704,150 @@ test('declaration editor keeps exact namespace and long names in the real draft 
   assert.equal(state.definition.publishedVersion, 1, 'draft edits do not mutate the published version');
 });
 
+test('mounted modeling editor saves pools, lanes, data, annotations, associations and DI', async () => {
+  const model = emptyProcessModel();
+  model.variables.review = null;
+  const current = definition('modeling-draft', { model });
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: saved }) => ({ definition: { ...current, model: saved, draftRevision: 5 } }),
+    processDefinitionPublishRequest: () => ({ definition: { ...current, publishedVersion: 1 },
+      version: { version: 1, model: state.canvas.getData() } }),
+  });
+  click(state.root.querySelector('[data-role="modeling"]'));
+  const form = document.querySelector('.tf-act-window');
+  click(form.querySelector('[data-add-modeling="lane"]'));
+  const lane = form.querySelector('[data-modeling-kind="lane"]');
+  const laneId = lane.dataset.modelingId;
+  change(lane.querySelector('[data-modeling-field="name"]'), 'Review Łódź <&>');
+  change(lane.querySelector('[data-modeling-node]'), 'Start');
+  click(lane.querySelector('[data-assign-node]'));
+  change(form.querySelector(`[data-modeling-id="${CSS.escape(laneId)}"] [data-geometry-field="x"]`), '42');
+  click(form.querySelector(`[data-modeling-id="${CSS.escape(laneId)}"] [data-add-child-lane]`));
+  const childLane = [...form.querySelectorAll('[data-modeling-kind="lane"]')]
+    .find((row) => row.dataset.modelingId !== laneId);
+  let deepestLaneId = childLane.dataset.modelingId;
+  change(childLane.querySelector('[data-modeling-node]'), 'End');
+  click(childLane.querySelector('[data-assign-node]'));
+  for (let depth = 2; depth <= 3; depth += 1) {
+    click(form.querySelector(`[data-modeling-id="${CSS.escape(deepestLaneId)}"] [data-add-child-lane]`));
+    deepestLaneId = [...form.querySelectorAll('[data-modeling-kind="lane"]')].at(-1).dataset.modelingId;
+  }
+  assert.equal(form.querySelector(`[data-modeling-id="${CSS.escape(deepestLaneId)}"] [data-add-child-lane]`), null,
+    'the inspector stops at the model validator lane depth');
+  click(form.querySelector('[data-add-modeling="reference"]'));
+  const reference = form.querySelector('[data-modeling-kind="reference"]');
+  const referenceId = reference.dataset.modelingId;
+  change(reference.querySelector('[data-modeling-field="objectName"]'), 'Case data');
+  change(reference.querySelector('[data-modeling-field="name"]'), 'Case reference');
+  change(reference.querySelector('[data-modeling-field="variableBindingKey"]'), 'review');
+  click(form.querySelector('[data-add-modeling="annotation"]'));
+  const annotation = form.querySelector('[data-modeling-kind="annotation"]');
+  const annotationId = annotation.dataset.modelingId;
+  const annotationText = `Explain <&> the decision\n${'Long review detail '.repeat(24)}`;
+  change(annotation.querySelector('[data-modeling-field="text"]'), annotationText);
+  click(form.querySelector('[data-add-modeling="association"]'));
+  const association = form.querySelector('[data-modeling-kind="association"]');
+  change(association.querySelector('[data-modeling-field="sourceRef"]'), referenceId);
+  change(association.querySelector('[data-modeling-field="targetRef"]'), annotationId);
+  change(association.querySelector('[data-point-index="1"] [data-point-field="x"]'), '514');
+  click(form.querySelector('[data-add-modeling="participant"]'));
+  const pool = form.querySelector('[data-modeling-kind="participant"]');
+  change(pool.querySelector('[data-modeling-field="name"]'), 'Approval pool');
+  change(pool.querySelector('[data-modeling-field="processRef"]'), model.processId);
+  change(pool.querySelector('[data-geometry-field="width"]'), '960');
+  click(form.querySelector('[data-add-modeling="participant"]'));
+  const blackBox = form.querySelectorAll('[data-modeling-kind="participant"]')[1];
+  change(blackBox.querySelector('[data-modeling-field="name"]'), 'External pool');
+  click(form.querySelector('[data-add-modeling="messageFlow"]'));
+  const messageFlow = form.querySelector('[data-modeling-kind="messageFlow"]');
+  change(messageFlow.querySelector('[data-modeling-field="sourceRef"]'), pool.dataset.modelingId);
+  change(messageFlow.querySelector('[data-modeling-field="targetRef"]'), blackBox.dataset.modelingId);
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  const authored = state.canvas.getData();
+  assert.deepEqual(authored.modeling.laneSets[0].lanes[0].flowNodeRefs, ['Start']);
+  assert.deepEqual(authored.modeling.laneSets[0].lanes[0].childLaneSets[0].lanes[0].flowNodeRefs, ['End']);
+  assert.equal(authored.modeling.laneSets[0].lanes[0].name, 'Review Łódź <&>');
+  assert.equal(authored.diagram.modelingShapes.find((shape) => shape.elementId === laneId).x, 42);
+  assert.equal(authored.modeling.dataObjectReferences[0].variableBindingKey, 'review');
+  assert.equal(authored.modeling.textAnnotations[0].text, annotationText);
+  assert.equal(authored.modeling.associations[0].sourceRef, referenceId);
+  assert.equal(authored.modeling.associations[0].targetRef, annotationId);
+  assert.equal(authored.diagram.modelingEdges[0].waypoints[1].x, 514);
+  assert.equal(authored.collaboration.participants[0].processRef.processId, model.processId);
+  assert.equal(authored.collaboration.participants[1].processRef, undefined);
+  assert.equal(authored.collaboration.diagram.modelingShapes[0].width, 960);
+  assert.equal(authored.collaboration.messageFlows[0].targetRef, blackBox.dataset.modelingId);
+  for (const elementId of [laneId, referenceId, annotationId, pool.dataset.modelingId, blackBox.dataset.modelingId])
+    assert.ok(state.canvas.root.querySelector(`[data-modeling-id="${CSS.escape(elementId)}"]`));
+  const renderedAnnotation = state.canvas.root.querySelector(`[data-modeling-id="${CSS.escape(annotationId)}"]`);
+  assert.equal(renderedAnnotation.style.overflow, 'visible');
+  assert.equal(renderedAnnotation.style.whiteSpace, 'pre-wrap');
+  assert.equal(renderedAnnotation.textContent, annotationText);
+  const regionOrder = [...state.canvas.regionsLayer.querySelectorAll('[data-modeling-id]')]
+    .map((element) => element.dataset.modelingId);
+  assert.ok(regionOrder.indexOf(pool.dataset.modelingId) < regionOrder.indexOf(laneId),
+    'the pool is painted behind its readable lane');
+  assert.equal(await builder._save(), true);
+  const saved = calls.filter((call) => call.kind === 'processDefinitionSaveRequest').at(-1).payload.model;
+  assert.deepEqual(saved.modeling, authored.modeling);
+  assert.deepEqual(saved.diagram.modelingShapes, authored.diagram.modelingShapes);
+  assert.deepEqual(saved.collaboration, authored.collaboration);
+  await builder._publish();
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionPublishRequest').length, 1);
+});
+
+test('mounted modeling editor authors document data stores and selected-body references', async () => {
+  const model = emptyProcessModel();
+  const current = definition('data-store-draft', { model });
+  const state = await mount(current, {
+    processDefinitionSaveRequest: ({ model: saved }) => ({ definition: { ...current, model: saved, draftRevision: 5 } }),
+  });
+  click(state.root.querySelector('[data-role="modeling"]'));
+  const form = document.querySelector('.tf-act-window');
+  assert.ok(!form.querySelector('[data-add-modeling="storeReference"]'),
+    'a store reference cannot be added without a document store');
+  click(form.querySelector('[data-add-modeling="store"]'));
+  const store = form.querySelector('[data-modeling-kind="store"]');
+  const storeId = store.dataset.modelingId;
+  change(store.querySelector('[data-modeling-field="name"]'), 'Retained metadata Łódź <&>');
+  change(store.querySelector('[data-modeling-field="capacity"]'), '12');
+  change(store.querySelector('[data-modeling-field="isUnlimited"]'), 'false');
+  click(form.querySelector('[data-add-modeling="storeReference"]'));
+  const reference = form.querySelector('[data-modeling-kind="storeReference"]');
+  const referenceId = reference.dataset.modelingId;
+  change(reference.querySelector('[data-modeling-field="name"]'), 'Case store reference');
+  change(reference.querySelector('[data-modeling-field="dataStoreRef"]'), storeId);
+  assert.ok(!form.querySelector(`[data-modeling-id="${CSS.escape(storeId)}"] [data-remove-modeling]`),
+    'a referenced document store cannot be deleted in the mounted editor');
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  const authored = state.canvas.getData();
+  assert.deepEqual(authored.dataStores, [{ id: storeId, name: 'Retained metadata Łódź <&>', capacity: 12, isUnlimited: false }]);
+  assert.deepEqual(authored.modeling.dataStoreReferences,
+    [{ id: referenceId, name: 'Case store reference', dataStoreRef: storeId }]);
+  assert.equal(authored.diagram.modelingShapes.filter((shape) => shape.elementId === referenceId).length, 1);
+  assert.equal(state.canvas.root.querySelector(`[data-modeling-id="${CSS.escape(referenceId)}"]`).textContent,
+    'Case store reference');
+  assert.equal(await builder._save(), true);
+  const saved = calls.filter((call) => call.kind === 'processDefinitionSaveRequest').at(-1).payload.model;
+  assert.deepEqual(saved.dataStores, authored.dataStores);
+  assert.deepEqual(saved.modeling.dataStoreReferences, authored.modeling.dataStoreReferences);
+});
+
+test('modeling editor preserves a message flow aimed at a nested subprocess node', async () => {
+  const model = embeddedModel();
+  model.collaboration = { id: 'Collaboration_External', participants: [{ id: 'Participant_External', name: 'External' }],
+    messageFlows: [{ id: 'MessageFlow_Nested', sourceRef: 'Participant_External', targetRef: 'Local_Review' }],
+    diagram: { shapes: [], edges: [], modelingShapes: [], modelingEdges: [] } };
+  const state = await mount(definition('nested-message-flow', { model }));
+  click(state.root.querySelector('[data-role="modeling"]'));
+  const form = document.querySelector('.tf-act-window');
+  const target = form.querySelector('[data-modeling-kind="messageFlow"] [data-modeling-field="targetRef"]');
+  assert.ok(target.querySelector('option[value="Local_Review"]'));
+  assert.equal(target.value, 'Local_Review');
+  assert.equal(form.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
+  assert.deepEqual(state.canvas.getData().collaboration, model.collaboration);
+});
+
 test('pinned published signal declarations remain inspectable without enabling edits', async () => {
   const pinned = { ...emptyProcessModel(), targetNamespace: 'urn:orders:Łódź',
     signals: [{ signalId: 'Signal_Order', namespaceUri: 'urn:orders:Łódź', name: 'Order changed <&>' }] };
@@ -2152,7 +2856,7 @@ test('pinned published signal declarations remain inspectable without enabling e
   const current = definition('signal-preview', { model: draft, publishedVersion: 2 });
   const state = await mount(current, {
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: { version: { version: 1, model: pinned } },
+    processVersionGetRequest: { version: { version: 1, model: pinned }, startCatalog: [] },
   });
   await builder._openProcessVersions();
   click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
@@ -2236,6 +2940,7 @@ test('definition lists use real offset pagination and ignore a stale list after 
 test('save and publish persist the draft revision, preserve keys and use the published full model', async () => {
   const saved = definition();
   const state = await mount(saved, {
+    processDefinitionGetRequest: { definition: saved, startCatalog: manualStartCatalog(saved.model, 3) },
     processDefinitionSaveRequest: (payload) => ({ definition: { ...saved, name: payload.name, draftRevision: 5, model: payload.model } }),
     processDefinitionPublishRequest: () => ({ definition: { definitionId: saved.definitionId, name: 'Approved name', description: '', ownerUserId: 'owner', draftRevision: 5, publishedVersion: 3, archived: false }, version: { version: 3, model: state.canvas.getData() } }),
   });
@@ -2247,6 +2952,7 @@ test('save and publish persist the draft revision, preserve keys and use the pub
   assert.equal(savedRequest.payload.expectedRevision, 4); assert.equal(savedRequest.payload.model.variables.Customer_ID, 4);
   const publication = calls.find((call) => call.kind === 'processDefinitionPublishRequest'); assert.equal(publication.payload.expectedRevision, 5);
   assert.equal(state.definition.model.variables.Customer_ID, 4);
+  change(state.root.querySelector('[data-role="start-entry"]'), '0');
   assert.equal(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'), false);
 });
 
@@ -2261,13 +2967,13 @@ test('failed save retains edits and an uncertain retry sends the same command', 
 
 test('late definition/options or save completion cannot replace another editor', async () => {
   const load = deferred(), optionRead = deferred();
-  fixtures({ processDefinitionGetRequest: ({ definitionId }) => definitionId === 'A' ? load.promise : { definition: definition('B') }, processOptionsRequest: () => optionRead.promise });
+  fixtures({ processDefinitionGetRequest: ({ definitionId }) => definitionId === 'A' ? load.promise : { definition: definition('B'), startCatalog: [] }, processOptionsRequest: () => optionRead.promise });
   document.body.innerHTML = builder.render({ mode: 'bpmn' }); const first = builder.mount({ flowId: 'A', mode: 'bpmn' });
   await builder.unmount(); document.body.innerHTML = builder.render({ mode: 'bpmn' });
   optionRead.resolve(options); const second = builder.mount({ flowId: 'B', mode: 'bpmn' }); await second;
-  load.resolve({ definition: definition('A') }); await first;
+  load.resolve({ definition: definition('A'), startCatalog: [] }); await first;
   assert.equal(builder._state.flowId, 'B'); assert.equal(document.querySelector('[data-role="name"]').value, 'Process B');
-  const delayedSave = deferred(); responder = (kind) => kind === 'processDefinitionSaveRequest' ? delayedSave.promise : kind === 'processDefinitionGetRequest' ? { definition: definition('C') } : options;
+  const delayedSave = deferred(); responder = (kind) => kind === 'processDefinitionSaveRequest' ? delayedSave.promise : kind === 'processDefinitionGetRequest' ? { definition: definition('C'), startCatalog: [] } : options;
   builder._state.canvas.updateNodeLabel('Start', 'B edit'); const saving = builder._save();
   await builder.unmount(); document.body.innerHTML = builder.render({ mode: 'bpmn' }); await builder.mount({ flowId: 'C', mode: 'bpmn' });
   delayedSave.resolve({ definition: definition('B', { name: 'Late B' }) }); await saving;
@@ -2312,8 +3018,8 @@ test('published version paging and competing previews use the selected current r
   const state = await mount(definition(), { processVersionListRequest: { versions: [{ version: 2, publishedAtMs: 1000 }, { version: 1, publishedAtMs: 100 }], total: 2, hasMore: false }, processVersionGetRequest: ({ version }) => version === 1 ? old.promise : recent.promise });
   await builder._openProcessVersions(); const table = document.querySelector('tf-window tf-table');
   click(table.shadowRoot.querySelectorAll('tbody tf-button')[1]); click(table.shadowRoot.querySelectorAll('tbody tf-button')[0]);
-  recent.resolve({ version: { version: 2, model: emptyProcessModel() } }); await flush();
-  old.resolve({ version: { version: 1, model: { ...emptyProcessModel(), variables: { wrong: true } } } }); await flush();
+  recent.resolve({ version: { version: 2, model: emptyProcessModel() }, startCatalog: [] }); await flush();
+  old.resolve({ version: { version: 1, model: { ...emptyProcessModel(), variables: { wrong: true } } }, startCatalog: [] }); await flush();
   assert.equal(state.previewVersion, 2); assert.deepEqual(state.canvas.getData().variables, {}); assert.equal(state.canvas.readOnly, true);
 });
 
@@ -2325,9 +3031,9 @@ test('preview shows its pinned calendar state and returning to the draft restore
   const draft = { ...published, workCalendar: { ...original, name: 'Revised' } };
   const current = definition('calendar-preview', { model: draft, publishedVersion: 1, calendarPinState: 'Stale' });
   const state = await mount(current, {
-    processDefinitionGetRequest: { definition: current },
+    processDefinitionGetRequest: { definition: current, startCatalog: [] },
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: { version: { version: 1, model: published } },
+    processVersionGetRequest: { version: { version: 1, model: published }, startCatalog: [] },
   });
   assert.equal(state.root.querySelector('[data-role="calendar-state"]').textContent, I18n.t('bpmn.calendar_state_stale'));
   await builder._openProcessVersions();
@@ -2352,6 +3058,34 @@ test('human completion fetches full authorized work and sends instance revision 
   const submitted = calls.find((row) => row.kind === 'processUserTaskCompleteRequest').payload;
   assert.equal(submitted.expectedRevision, 11); assert.notEqual(submitted.expectedRevision, task.revision); assert.deepEqual(submitted.outputs, { Output_ID: { Customer_ID: 8 } }); assert.equal(submitted.approved, null);
   assert.equal(win.querySelector('[data-complete]'), null);
+});
+
+test('human task form shows authenticated missing, null and present activity inputs read-only', async () => {
+  const task = { userTaskId: 'work-inputs', nodeId: 'Review', name: 'Review contract',
+    assigneeUserId: 'anna', kind: 'Work', status: 'Open', revision: 2, canComplete: true };
+  const detail = { ...task, outputs: {}, activityInputs: [
+    { position: 0, declarationId: 'Customer_ID', name: 'Customer ID', value: { Present: 'C-42' } },
+    { position: 1, declarationId: 'Optional_Note', name: 'Optional note', value: 'Missing' },
+    { position: 2, declarationId: 'Nullable_Flag', name: 'Nullable flag', value: { Present: null } },
+  ] };
+  const current = instance('work-inputs-run', { userTasks: [task] });
+  const win = await monitor(current, { processUserTaskGetRequest: { task: detail } });
+  click(win.querySelector('[data-complete]')); await flush();
+  const form = document.querySelector('.tf-act-window');
+  const section = form.querySelector('.fb-process-activity-inputs');
+  assert.ok(section);
+  assert.equal(section.querySelectorAll('.fb-process-activity-input').length, 3);
+  assert.match(section.textContent, /Customer ID/);
+  assert.match(section.textContent, /Optional note/);
+  assert.match(section.textContent, /Missing/);
+  const editors = section.querySelectorAll('tf-code-editor');
+  assert.equal(editors.length, 2);
+  assert.equal(editors[0].value, JSON.stringify('C-42', null, 2));
+  assert.equal(editors[1].value, 'null');
+  assert.ok([...editors].every((editor) => editor.hasAttribute('readonly')));
+  assert.equal(section.querySelectorAll('input').length, 0);
+  assert.equal(section.querySelectorAll('button').length, 0);
+  win.remove(); form.remove();
 });
 
 test('instance pages advance independently and keep the exact incident selection while polling', async () => {
@@ -2483,6 +3217,58 @@ test('repeat history kind labels are localized without rewriting factual payload
       assert.match(win.querySelector('[data-process-seq="1"] tf-code-editor').value, /business_key/);
       assert.match(win.querySelector('[data-process-seq="6"] tf-code-editor').value, /incident_id/);
       assert.match(win.querySelector(`[data-process-seq="${events.length}"] tf-code-editor`).value, /parent_token_id/);
+      win.remove();
+    }
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('repeated Script body result stays distinct from an accepted blocked ordinal in five locales', async () => {
+  const group = { groupId: 'script-group', nodeId: 'Script_1', nodeName: 'Calculate <&>',
+    scopeId: 'script-scope', parentTokenId: 'wait-1', mode: 'structured_loop', status: 'incident',
+    total: null, createdCount: 1, completed: 0, maxIterations: 32, revision: 2,
+    createdAtMs: 1, updatedAtMs: 2 };
+  const occurrence = { occurrenceId: 'script-occurrence', groupId: group.groupId, ordinal: 0,
+    status: 'accepted_blocked', tokenId: 'script-token', userTaskId: null, jobId: null,
+    verificationUserTaskId: null, acceptedSourceEventId: 'script-source', approvalEventId: null,
+    createdAtMs: 1, updatedAtMs: 2 };
+  const events = [
+    { seq: 1, atMs: 1000, eventId: 'script-source', kind: 'script_completed',
+      nodeName: 'Calculate <&>', data: { outputs: null } },
+    { seq: 2, atMs: 1001, eventId: 'script-incident', kind: 'incident',
+      nodeName: 'Calculate <&>', data: { code: 'REPETITION_MAPPING_FAILED', message: 'invalid local step' } },
+    { seq: 3, atMs: 1002, eventId: 'script-blocked', kind: 'repetition_group_blocked',
+      nodeName: 'Calculate <&>', data: { group_id: group.groupId, last_completed_ordinal: null,
+        last_source_event_id: 'script-source', incident_id: 'script-incident', phase: 'aggregate',
+        code: 'REPETITION_MAPPING_FAILED', reason: null } },
+  ];
+  try {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const current = instance(`script-blocked-${language}`, { repetitionGroups: [group] });
+      const win = await monitor(current, {
+        processHistoryRequest: { events, nextSeq: 3, hasMore: false },
+        processInstanceGetRequest: ({ pages }) => ({ instance: instance(current.instanceId, {
+          repetitionGroups: [group],
+          repetitionOccurrences: pages.selectedRepetitionGroupId ? [occurrence] : [],
+          selectedRepetitionOccurrence: pages.selectedRepetitionOccurrenceId ? {
+            summary: occurrence, valueKind: pages.selectedRepetitionValue,
+            valueAvailable: false, value: null, acceptedOrigin: null,
+          } : null,
+        }) }),
+      });
+      assert.equal(win.querySelectorAll('[data-process-seq]').length, 3);
+      assert.deepEqual(JSON.parse(win.querySelector('[data-process-seq="1"] tf-code-editor').value), null);
+      assert.ok(win.querySelector('[data-process-seq="1"]').textContent.includes(I18n.t('bpmn.event_script_completed', { node: 'Calculate <&>' })));
+      assert.ok(win.querySelector('[data-process-seq="3"]').textContent.includes(I18n.t('bpmn.incident_repetition_mapping_failed')));
+      click(win.querySelector('[data-repeat-inspect]')); await flush();
+      assert.ok(win.querySelector('[data-repetition-occurrence-rows]').textContent
+        .includes(I18n.t('bpmn.repeat_occurrence_status_accepted_blocked')));
+      click(win.querySelector('[data-repeat-item]')); await flush();
+      assert.ok(win.querySelector('[data-repetition-detail]').textContent
+        .includes(`${I18n.t('bpmn.repeat_accepted_source_event')}: script-source`));
+      assert.equal(win.querySelector('[data-repetition-detail] tf-code-editor'), null);
+      assert.equal(win.querySelector('[data-events] img'), null);
+      assert.equal(win.querySelector('[data-events] script'), null);
       win.remove();
     }
   } finally { await I18n.setLanguage('en'); }
@@ -2641,7 +3427,9 @@ test('instance summaries paginate without fetching full opaque business values',
 
 test('run uses immutable selected version variables and blocks oversized input before any request', async () => {
   fixtures({ processInstanceStartRequest: () => { throw new Error('Start should remain blocked'); } });
-  const form = openProcessRun(definition('published', { publishedVersion: 3, model: { ...emptyProcessModel(), variables: { Version_ID: 'pinned' } } }), [{ version: 3 }]);
+  const published = definition('published', { publishedVersion: 3, model: { ...emptyProcessModel(), variables: { Version_ID: 'pinned' } } });
+  const catalog = manualStartCatalog(published.model, 3);
+  const form = openProcessRun(published, [{ version: 3 }], catalog, catalog[0]);
   assert.match(form.querySelector('tf-code-editor').value, /Version_ID/); const editor = form.querySelector('tf-code-editor'); editor.value = JSON.stringify({ Long_Value: 'a'.repeat(256 * 1024) });
   click(form.querySelector('[data-act="submit"]')); await flush();
   assert.match(form.querySelector('[data-json-error]').getAttribute('message'), /256/); assert.equal(calls.some((row) => row.kind === 'processInstanceStartRequest'), false);
@@ -2651,7 +3439,13 @@ test('all five locales translate supported elements, current statuses and every 
   const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
-    assert.equal(processTemplates().length, 27);
+    assert.equal(processTemplates().length, 29);
+    for (const kind of ['link_throw', 'link_catch']) {
+      const template = processTemplates().find((item) => item.node_type === `bpmn_${kind}`);
+      assert.equal(template?.label, I18n.t(`bpmn.node_${kind}`));
+      assert.equal(template?.description, I18n.t(`bpmn.node_${kind}_hint`));
+      assert.doesNotMatch(`${template.label} ${template.description}`, /bpmn\.|LinkDefinition_/);
+    }
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_manual_task')?.label,
       I18n.t('bpmn.node_manual_task'));
     assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_send_task')?.label,
@@ -2668,6 +3462,18 @@ test('all five locales translate supported elements, current statuses and every 
       assert.doesNotMatch(message, /bpmn\.|\{node\}/);
     }
     for (const template of processTemplates()) assert.doesNotMatch(template.label, /^bpmn\./);
+    const linkThrown = processEventText({ kind: 'link_thrown', nodeName: 'Handoff <&>',
+      data: { catch_node_id: 'Catch_1' } });
+    const linkCaught = processEventText({ kind: 'link_caught', nodeName: 'Resume <&>',
+      data: { source_token_id: 'source-token-1' } });
+    assert.equal(linkThrown, I18n.t('bpmn.event_link_thrown', { node: 'Handoff <&>', target: 'Catch_1' }));
+    assert.equal(linkCaught, I18n.t('bpmn.event_link_caught', { node: 'Resume <&>', source: 'source-token-1' }));
+    assert.doesNotMatch(`${linkThrown} ${linkCaught}`, /bpmn\.|catch_node_id|source_token_id/);
+    const linkLimit = processEventText({ kind: 'incident', nodeName: 'Handoff <&>',
+      data: { code: 'IMMEDIATE_TRANSITION_LIMIT', message: 'raw internal reason' } });
+    assert.equal(linkLimit, I18n.t('bpmn.event_incident', { node: 'Handoff <&>',
+      message: I18n.t('bpmn.incident_immediate_transition_limit') }));
+    assert.doesNotMatch(linkLimit, /raw internal reason|IMMEDIATE_TRANSITION_LIMIT|bpmn\./);
     for (const kind of ['manual_task_opened', 'manual_task_acknowledged']) {
       assert.equal(processEventText({ kind, nodeName: 'External work', data: {} }),
         I18n.t(`bpmn.event_${kind}`, { node: 'External work' }));
@@ -2726,7 +3532,8 @@ test('DAG mode preserves its graph serialization and a system flow remains read-
 test('run obtains the selected immutable version rather than unsaved draft variables', async () => {
   const draft = definition('versioned', { publishedVersion: 4 }); draft.model.variables = { Source_ID: 'draft' };
   const published = { ...emptyProcessModel(), variables: { Source_ID: 'published' } };
-  await mount(draft, { processVersionGetRequest: (payload) => { assert.equal(payload.version, 4); return { version: { version: 4, model: published } }; } });
+  const state = await mount(draft, { processDefinitionGetRequest: { definition: draft, startCatalog: manualStartCatalog(published, 4) }, processVersionGetRequest: (payload) => { assert.equal(payload.version, 4); return { version: { version: 4, model: published }, startCatalog: manualStartCatalog(published, 4) }; } });
+  change(state.root.querySelector('[data-role="start-entry"]'), '0');
   await builder._runProcess(); const form = document.querySelector('.tf-act-window');
   assert.deepEqual(JSON.parse(form.querySelector('tf-code-editor').value), { Source_ID: 'published' });
   assert.equal(form.querySelector('[data-version]').value, '4');
@@ -2782,6 +3589,26 @@ function timedModel(kind = 'TimerStart', type = 'Duration', spec = { seconds: 60
 }
 function savedTimer(overrides = {}) {
   return { timerId: 'private-timer-id', nodeId: 'Start', nodeName: 'Daily approval', kind: 'Start', status: 'Pending', dueAtMs: Date.UTC(2026, 9, 3, 7), timezone: 'Europe/Warsaw', occurrence: 3, totalFirings: 7, lastReason: null, ...overrides };
+}
+function manualStartCatalog(model, version) {
+  const start = model.nodes.find((node) => node.kind === 'Start');
+  return [{ processId: model.processId, processName: model.processName ?? null,
+    startNodeId: start.id, startNodeName: start.name ?? null, version, trigger: { Start: { canStart: true } } }];
+}
+function timerStartCatalog(definition, persistedTimer) {
+  if (!persistedTimer) return [];
+  const start = definition.model.nodes.find((node) => node.id === persistedTimer.nodeId);
+  return [{ processId: definition.model.processId, processName: definition.model.processName ?? null,
+    startNodeId: persistedTimer.nodeId, startNodeName: persistedTimer.nodeName,
+    version: definition.publishedVersion ?? 1, trigger: { TimerStart: {
+      timer: start?.kind?.TimerStart?.timer ?? { Duration: { seconds: 60 } },
+      timezone: persistedTimer.timezone, workingTime: null, persistedTimer,
+    } } }];
+}
+function messageStartCatalog(definition, canSend = true) {
+  return [{ processId: definition.model.processId, processName: definition.model.processName ?? null,
+    startNodeId: 'Start', startNodeName: 'Start', version: definition.publishedVersion,
+    trigger: { MessageStart: { messageRef: 'Message_1', messageName: 'order.received', canSend } } }];
 }
 
 test('all supported timer literals preserve IANA, variables, stable IDs and DI through the actual canvas', () => {
@@ -3068,7 +3895,7 @@ test('timer publication requires a real arming confirmation and refreshes the au
   const previousConfirm = TfWindow.confirm;
   try {
     const state = await mount(current, {
-      processDefinitionGetRequest: () => ({ definition: { ...current, publishedVersion: published ? 1 : null }, timerStart: published ? savedTimer() : null }),
+      processDefinitionGetRequest: () => ({ definition: { ...current, publishedVersion: published ? 1 : null }, startCatalog: published ? timerStartCatalog(current, savedTimer()) : [] }),
       processDefinitionPublishRequest: () => { published = true; return { definition: { ...current, publishedVersion: 1 }, version: { version: 1, model: current.model } }; },
     });
     TfWindow.confirm = async (options) => { confirmations += 1; assert.match(options.message, /Europe\/Warsaw/); assert.match(options.message, /arms|automatic/); return false; };
@@ -3104,7 +3931,7 @@ test('BPMN names retain their full text when saved and in immutable inspection',
   assert.equal(saved.payload.model.nodes[0].name, nodeName);
   state = await mount({ ...current, publishedVersion: 1 }, {
     processVersionListRequest: { versions: [{ version: 1, publishedAtMs: 1000 }], total: 1, hasMore: false },
-    processVersionGetRequest: { version: { version: 1, model: current.model } },
+    processVersionGetRequest: { version: { version: 1, model: current.model }, startCatalog: [] },
   });
   await builder._openProcessVersions();
   click(document.querySelector('tf-window tf-table').shadowRoot.querySelector('tbody tf-button'));
@@ -3135,6 +3962,53 @@ test('BPMN fit includes the rendered event label without altering stored DI', ()
   assert.ok(graph.view.y + bounds.minY * graph.view.zoom >= 0);
   assert.deepEqual(graph.getData(), original);
   graph.destroy();
+});
+
+test('BPMN fit waits for measurable canvas bounds before assigning a zoom', () => {
+  const originalObserver = globalThis.ResizeObserver;
+  let onResize;
+  globalThis.ResizeObserver = class {
+    constructor(callback) { onResize = callback; }
+    observe() {}
+    disconnect() {}
+  };
+  let graph;
+  try {
+    let rect = { left: 0, top: 0, width: 0, height: 0 };
+    const root = document.createElement('div');
+    root.getBoundingClientRect = () => rect;
+    document.body.append(root);
+    graph = new FlowCanvas(root, { mode: 'bpmn' });
+    graph.setTemplates(processTemplates());
+    graph.setData(timedModel());
+    const model = graph.getData();
+    graph.fitToContent();
+    assert.equal(graph.view.zoom, 1);
+    assert.equal(graph._pendingFitMinZoom, 0);
+    rect = { left: 0, top: 0, width: 500, height: 400 };
+    onResize();
+    const bounds = graph._contentBounds();
+    const expected = Math.min(1, Math.min(
+      rect.width / (bounds.maxX - bounds.minX + 80),
+      rect.height / (bounds.maxY - bounds.minY + 80),
+    ));
+    assert.equal(graph.view.zoom, expected);
+    assert.ok(Number.isFinite(graph.view.zoom) && graph.view.zoom > 0);
+    assert.equal(graph._pendingFitMinZoom, null);
+    assert.deepEqual(graph.getData(), model);
+    const rendered = graph.world.style.transform;
+    graph.view.zoom = 0;
+    assert.throws(() => graph._clientToWorld(200, 200), /Canvas zoom must be positive and finite/);
+    assert.equal(graph.world.style.transform, rendered);
+    graph.fitToContent();
+    assert.equal(graph.view.zoom, expected);
+    assert.equal(graph.world.style.transform, rendered);
+    const point = graph._clientToWorld(200, 200);
+    assert.ok(Number.isFinite(point.x) && Number.isFinite(point.y));
+  } finally {
+    graph?.destroy();
+    globalThis.ResizeObserver = originalObserver;
+  }
 });
 
 test('BPMN full task and sibling boundary names occupy separate measured regions before and after Fit', () => {
@@ -3270,12 +4144,14 @@ test('BPMN minimap confines its real viewport to the measured map area', async (
 
 test('published timer start cannot submit a manual run even with a direct helper call', async () => {
   const current = definition('timed', { model: timedModel(), publishedVersion: 2 });
-  const state = await mount(current, { processDefinitionGetRequest: { definition: current, timerStart: savedTimer() }, processVersionGetRequest: { version: { version: 2, model: current.model } } });
+  const state = await mount(current, { processDefinitionGetRequest: { definition: current, startCatalog: timerStartCatalog(current, savedTimer()) }, processVersionGetRequest: { version: { version: 2, model: current.model }, startCatalog: timerStartCatalog(current, savedTimer()) } });
+  assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
+  change(state.root.querySelector('[data-role="start-entry"]'), '0');
   assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
   await builder._runProcess();
   assert.equal(document.querySelector('.tf-act-window'), null);
   assert.match(document.querySelector('[data-timers]').textContent, /Daily approval/);
-  const form = openProcessRun(current, [{ version: 2, model: current.model }]);
+  const form = openProcessRun(current, [{ version: 2, model: current.model }], timerStartCatalog(current, savedTimer()));
   assert.ok(form.querySelector('[data-act="submit"]').hasAttribute('disabled'));
   click(form.querySelector('[data-act="submit"]')); await flush();
   assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
@@ -3286,10 +4162,11 @@ test('published message start offers the current authorized send and never invok
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
   model.nodes[0].kind = { MessageStart: { messageRef: 'Message_1', outputMapping: {} } };
   const current = definition('message-start', { model, publishedVersion: 2 });
-  const messageStart = { nodeId: 'Start', nodeName: 'Start', messageName: 'order.received', version: 2, canSend: true };
-  const state = await mount(current, { processDefinitionGetRequest: { definition: current, messageStart },
-    processVersionGetRequest: { version: { version: 2, model } } });
+  const startCatalog = messageStartCatalog(current);
+  const state = await mount(current, { processDefinitionGetRequest: { definition: current, startCatalog },
+    processVersionGetRequest: { version: { version: 2, model }, startCatalog } });
   assert.equal(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'), true);
+  change(state.root.querySelector('[data-role="start-entry"]'), '0');
   assert.equal(state.root.querySelector('[data-role="send-start"]').hidden, false);
   click(state.root.querySelector('[data-role="send-start"]'));
   assert.ok(document.querySelector('.tf-act-window [data-message-name]'));
@@ -3300,7 +4177,8 @@ test('published message start offers the current authorized send and never invok
 
 test('schedule reads persisted Pending, Blocked and Missed states and scopes delayed reads to its window', async () => {
   let actual = savedTimer();
-  fixtures({ processDefinitionGetRequest: () => ({ definition: definition('schedule', { publishedVersion: 2 }), timerStart: actual }) });
+  const schedule = definition('schedule', { model: timedModel(), publishedVersion: 2 });
+  fixtures({ processDefinitionGetRequest: () => ({ definition: schedule, startCatalog: timerStartCatalog(schedule, actual) }) });
   const win = await openProcessSchedule('schedule');
   assert.match(win.querySelector('[data-timers]').textContent, /Scheduled.*Europe\/Warsaw/);
   assert.doesNotMatch(win.textContent, /private-timer-id/);
@@ -3311,9 +4189,11 @@ test('schedule reads persisted Pending, Blocked and Missed states and scopes del
   assert.match(win.querySelector('[data-timers]').textContent, /Missed.*publish.*No next deadline/);
   const pending = deferred(); responder = () => pending.promise; const loading = poll();
   win.remove(); await flush();
-  fixtures({ processDefinitionGetRequest: { definition: definition('other'), timerStart: savedTimer({ nodeName: 'Current other' }) } });
+  const otherDefinition = definition('other', { model: timedModel(), publishedVersion: 1 });
+  fixtures({ processDefinitionGetRequest: { definition: otherDefinition, startCatalog: timerStartCatalog(otherDefinition, savedTimer({ nodeName: 'Current other' })) } });
   const other = await openProcessSchedule('other');
-  pending.resolve({ definition: definition('late'), timerStart: savedTimer({ nodeName: 'Late private data' }) }); await loading;
+  const late = definition('late', { model: timedModel(), publishedVersion: 1 });
+  pending.resolve({ definition: late, startCatalog: timerStartCatalog(late, savedTimer({ nodeName: 'Late private data' })) }); await loading;
   assert.match(other.querySelector('[data-timers]').textContent, /Current other/);
   assert.doesNotMatch(other.textContent, /Late private data/);
 });
@@ -3321,7 +4201,8 @@ test('schedule reads persisted Pending, Blocked and Missed states and scopes del
 test('schedule renders a long unbroken definition name and untrusted markup as text', async () => {
   const name = `${'Approval'.repeat(24)}X<img src=x onerror=alert(1)>`;
   assert.equal(name.length, 221);
-  fixtures({ processDefinitionGetRequest: { definition: definition('long-schedule', { name, publishedVersion: 1 }), timerStart: savedTimer() } });
+  const current = definition('long-schedule', { name, model: timedModel(), publishedVersion: 1 });
+  fixtures({ processDefinitionGetRequest: { definition: current, startCatalog: timerStartCatalog(current, savedTimer()) } });
   const win = await openProcessSchedule('long-schedule');
   const summary = win.querySelector('[data-schedule-summary]');
   assert.ok(summary.textContent.startsWith(name));
@@ -3405,11 +4286,11 @@ test('schedule and current start localize known timer reasons in five languages 
       await I18n.setLanguage(language);
       const current = definition(`reason-${language}`, { model: timedModel(), publishedVersion: 1 });
       const timer = savedTimer({ lastReason: reasons[0][0] });
-      const state = await mount(current, { processDefinitionGetRequest: () => ({ definition: current, timerStart: timer }) });
+      const state = await mount(current, { processDefinitionGetRequest: () => ({ definition: current, startCatalog: timerStartCatalog(current, timer) }) });
       const win = await openProcessSchedule(current.definitionId);
       for (const [reason, key] of reasons) {
         timer.lastReason = reason;
-        state.timerStart = timer;
+        state.startCatalog = timerStartCatalog(current, timer);
         builder._syncProcessControls();
         await poll();
         const translated = I18n.t(`bpmn.${key}`);
@@ -3420,7 +4301,7 @@ test('schedule and current start localize known timer reasons in five languages 
         assert.doesNotMatch(win.querySelector('[data-timers]').textContent, new RegExp(reason));
       }
       timer.lastReason = arbitrary;
-      state.timerStart = timer;
+      state.startCatalog = timerStartCatalog(current, timer);
       builder._syncProcessControls();
       await poll();
       assert.equal(win.querySelector('[data-timers] dd:last-child').textContent, arbitrary);
@@ -3561,7 +4442,7 @@ test('terminal timer Error displays its full reason and real incident without of
   assert.ok(win.querySelector('[data-incidents]').textContent.includes(reason));
   assert.equal(win.querySelector('[data-retry]'), null);
   const actual = definition('start-error', { model: timedModel(), publishedVersion: 4 });
-  const state = await mount(actual, { processDefinitionGetRequest: { definition: actual, timerStart: { ...timer, kind: 'Start' } } });
+  const state = await mount(actual, { processDefinitionGetRequest: { definition: actual, startCatalog: timerStartCatalog(actual, { ...timer, kind: 'Start' }) } });
   assert.ok(state.root.querySelector('[data-role="timer-summary"]').textContent.includes(reason));
   assert.match(state.root.querySelector('[data-role="timer-summary"]').textContent, /Current start.*4.*Timer error/);
   assert.ok(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'));
@@ -3569,7 +4450,7 @@ test('terminal timer Error displays its full reason and real incident without of
 
 test('current schedule access denial clears persisted private details and disables its run-list action', async () => {
   let revoked = false;
-  fixtures({ processDefinitionGetRequest: () => { if (revoked) throw new Error('Current access was revoked'); return { definition: definition('private-schedule'), timerStart: savedTimer() }; } });
+  fixtures({ processDefinitionGetRequest: () => { if (revoked) throw new Error('Current access was revoked'); const current = definition('private-schedule', { model: timedModel(), publishedVersion: 1 }); return { definition: current, startCatalog: timerStartCatalog(current, savedTimer()) }; } });
   const win = await openProcessSchedule('private-schedule');
   assert.equal(win.querySelectorAll('[data-timer-id]').length, 1);
   revoked = true; await poll();
@@ -3624,5 +4505,85 @@ test('blank required timer numbers block draft save and publication instead of s
     }
     assert.equal(await builder._save(), true);
     assert.equal(calls.find((call) => call.kind === 'processDefinitionSaveRequest' && call.payload.definitionId === id).payload.model.nodes[0].kind.TimerStart.timer[type][field], Number(valid));
+  }
+});
+
+test('mounted body selector authors and publishes two exact executable process bodies', async () => {
+  const current = definition('body-selection');
+  const state = await mount(current, {
+    processDefinitionGetRequest: { definition: current, startCatalog: [] },
+    processDefinitionSaveRequest: ({ model }) => ({ definition: { ...current, model, draftRevision: 5 } }),
+    processDefinitionPublishRequest: () => ({ definition: { ...current, publishedVersion: 1 },
+      version: { version: 1, model: state.canvas.getData() } }),
+  });
+  click(state.root.querySelector('[data-role="add-body"]'));
+  const added = state.canvas.selectedProcessId;
+  assert.notEqual(added, current.model.processId);
+  change(state.root.querySelector('[data-role="body-name"]'), 'Review & sign-off');
+  const authored = state.canvas.getData();
+  assert.equal(authored.additionalProcesses.length, 1);
+  assert.equal(authored.additionalProcesses[0].processId, added);
+  assert.equal(authored.additionalProcesses[0].processName, 'Review & sign-off');
+  assert.deepEqual(authored.nodes, current.model.nodes);
+  change(state.root.querySelector('[data-role="body-select"]'), current.model.processId);
+  assert.equal(state.canvas.selectedProcessId, current.model.processId);
+  change(state.root.querySelector('[data-role="body-select"]'), added);
+  assert.equal(state.canvas.selectedProcessId, added);
+  assert.equal(await builder._save(), true);
+  const saved = calls.filter((row) => row.kind === 'processDefinitionSaveRequest').at(-1).payload.model;
+  assert.equal(saved.additionalProcesses[0].processName, 'Review & sign-off');
+  await builder._publish();
+  assert.equal(calls.filter((row) => row.kind === 'processDefinitionPublishRequest').length, 1);
+  assert.equal(state.canvas.getData().additionalProcesses[0].processId, added);
+});
+
+test('activity result inspector edits the localized CEL result and exposes no output port', async () => {
+  const expression = "{'outcome':'Completed','code':null,'summary':'Completed','outputs':payload,'evidence':[]}";
+  const template = {
+    node_type: 'activity_result', category: 'output', label: 'Activity result',
+    default_config: JSON.stringify({ result_expression: expression }),
+    params_schema: JSON.stringify({ properties: { result_expression: {
+      type: 'string', title: 'Activity result (CEL)', title_key: 'flows_config.activity_result_expression',
+      description: 'Return the complete result object.', description_key: 'flows_config.activity_result_expression_hint',
+      format: 'textarea',
+    } }, required: ['result_expression'], order: ['result_expression'] }),
+    input_ports: ['in'], output_ports: [],
+  };
+  const graphRoot = document.createElement('div'); document.body.append(graphRoot);
+  const graph = new FlowCanvas(graphRoot, { mode: 'flow' });
+  graph.setTemplates([template]);
+  graph.setData([{ id: 'Result', type: 'activity_result', label: '',
+    position: { x: 240, y: 180 }, config: { result_expression: expression } }], []);
+  const configRoot = document.createElement('aside'); document.body.append(configRoot);
+  const config = new FlowConfig(configRoot, { mode: 'flow', getCanvas: () => graph,
+    onConfigChange: (id, patch) => graph.updateNodeConfig(id, patch) });
+  try {
+    assert.equal(graph.nodesLayer.querySelector('[data-node-id="Result"] .fb-port-out'), null);
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      config.show(graph.nodes[0], template);
+      const field = config.root.querySelector('tf-textarea[data-bind="result_expression"]');
+      assert.ok(field, 'the schema uses the project textarea component');
+      assert.equal(field.value, expression);
+      assert.equal(field.getAttribute('label'), `${I18n.t('flows_config.activity_result_expression')} *`);
+      assert.equal(field.getAttribute('hint'), I18n.t('flows_config.activity_result_expression_hint'));
+      const tabs = config.root.querySelector('tf-tabs');
+      tabs.value = 'ports';
+      tabs.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value: 'ports' } }));
+      assert.ok(config.root.querySelector('[data-role="body"]').textContent
+        .includes(I18n.t('flows_config.no_outputs')));
+      assert.equal(config.root.querySelectorAll('.fb-port-list li').length, 1, 'only the factual input port remains');
+    }
+    await I18n.setLanguage('en');
+    config.show(graph.nodes[0], template);
+    const field = config.root.querySelector('tf-textarea[data-bind="result_expression"]');
+    const edited = "{'outcome':'NeedsHuman','code':'REVIEW','summary':'Review','outputs':{},'evidence':[]}";
+    change(field, edited);
+    assert.equal(graph.nodes[0].config.result_expression, edited);
+    assert.equal(graph.nodesLayer.querySelector('[data-node-id="Result"] .fb-port-out'), null);
+  } finally {
+    await I18n.setLanguage('en');
+    config.destroy();
+    graph.destroy();
   }
 });

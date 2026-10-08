@@ -5,7 +5,8 @@ use runtime::test_support::{edge, flow, graph, publish_model, service_model, Fix
 use serde_json::json;
 use std::collections::BTreeMap;
 use tentaflow_protocol::processes::{
-    ActivityVerification, ProcessErrorDeclaration, ProcessInstanceStatus, ProcessMessageStatus,
+    ActivityVerification, ProcessActivityIo, ProcessCallActivity, ProcessErrorDeclaration,
+    ProcessInputAssociation, ProcessInstanceStatus, ProcessIoDataInput, ProcessMessageStatus,
     ProcessNode, ProcessNodeKind, ProcessTimerSpec, ProcessUserTaskKind, ProcessUserTaskStatus,
 };
 
@@ -16,6 +17,38 @@ fn return_count(fixture: &Fixture, instance_id: &str) -> usize {
         .iter()
         .filter(|event| event.kind == "call_returned")
         .count()
+}
+
+#[test]
+fn configured_activity_io_publishes_with_its_mapping_writer() {
+    let fixture = Fixture::new();
+    let mut model = runtime::test_support::user_model(None);
+    model.nodes[1].activity_io = Some(ProcessActivityIo {
+        data_inputs: vec![ProcessIoDataInput { id: "Input_1".into(), name: None }],
+        data_outputs: vec![],
+        input_set_id: "InputSet_1".into(),
+        input_set: vec!["Input_1".into()],
+        output_set_id: "OutputSet_1".into(),
+        output_set: vec![],
+        input_associations: vec![ProcessInputAssociation::CelAssignment {
+            id: "InputAssociation_1".into(),
+            from_expression: "1".into(),
+            target_input_id: "Input_1".into(),
+        }],
+        output_associations: vec![],
+        coordinator_output: None,
+    });
+    let definition = repository::save_definition(
+        &fixture.db, &fixture.owner, &runtime::test_support::stamp("save configured IO"),
+        None, 0, "Configured IO", "", &model,
+    ).unwrap();
+    let (_, version) = repository::publish_definition(
+        &fixture.db, &fixture.owner, &runtime::test_support::stamp("publish configured IO"),
+        &definition.definition_id, definition.draft_revision, &[], None,
+    ).unwrap();
+    assert!(version.model.nodes[1].activity_io.is_some());
+    assert_eq!(repository::list_versions(&fixture.db, &fixture.owner,
+        &definition.definition_id, 0, 20).unwrap().0.len(), 1);
 }
 
 #[test]
@@ -32,6 +65,7 @@ fn child_timer_catch_fires_and_returns_parent_once() {
                 timer: ProcessTimerSpec::Duration { seconds: 1 },
             },
             repeat: None,
+            activity_io: None,
         },
     );
     child_model.sequence_flows = vec![
@@ -240,6 +274,7 @@ fn human_error_end_crosses_pinned_call_boundary_before_root_termination_once() {
             ]),
         },
         repeat: None,
+        activity_io: None,
     });
     parent_model.sequence_flows.push(edge("CaughtToTerminate", "CatchCalledError", "End_1"));
     let caller = publish_model(&fixture, &parent_model);
@@ -338,7 +373,8 @@ fn terminate_caller(
             output_mapping: BTreeMap::new(),
         }),
     ] {
-        model.nodes.push(ProcessNode { id: id.into(), name: id.into(), kind, repeat: None, });
+        model.nodes.push(ProcessNode { id: id.into(), name: id.into(), kind,
+            repeat: None, activity_io: None });
     }
     model.sequence_flows = vec![
         edge("StartSplit", "Start_1", "Split"),
@@ -384,7 +420,7 @@ fn immediate_pinned_terminate_child_has_no_manual_command_and_reopens_exactly() 
     let target = publish_model(&fixture, &terminate_child(false));
     let mut caller = call_tests::caller(&target, BTreeMap::from([("received".into(),"outputs.answer".into())]));
     caller.variables.insert("parent_seed".into(),json!(9));
-    let ProcessNodeKind::CallActivity { input_mapping, .. } = &mut caller.nodes.iter_mut()
+    let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &mut caller.nodes.iter_mut()
         .find(|node| node.id == "Call_1").unwrap().kind else { panic!("actual pinned call"); };
     input_mapping.insert("seed".into(),"vars.parent_seed".into());
     let version = publish_model(&fixture, &caller);
@@ -392,10 +428,10 @@ fn immediate_pinned_terminate_child_has_no_manual_command_and_reopens_exactly() 
     let at = chrono::Utc::now().timestamp_millis();
     let command = runtime::test_support::stamp("immediate called termination");
     let variables = serde_json::to_value(&version.model.variables).unwrap();
-    let plan = runtime::plan_start(&version.model,&instance_id,&fixture.owner,&version.definition_id,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),&instance_id,&fixture.owner,&version.definition_id,
         version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command), None).unwrap();
     let parent = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
+        &version.definition_id,version.version,&variables, None, None,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(parent.status,ProcessInstanceStatus::Completed);
     assert_eq!(parent.variables["received"],json!(42));
     let child_id = call_tests::child_id(&fixture,&instance_id);
@@ -433,7 +469,7 @@ fn immediate_pinned_terminate_child_has_no_manual_command_and_reopens_exactly() 
         }
     }
     let replay = repository::start_instance(&reopened,&owner,&command,&uuid::Uuid::new_v4().to_string(),
-        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
+        &version.definition_id,version.version,&variables, None, None,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(replay,parent);
     assert_eq!(repository::list_events(&reopened,&owner,&child_id,0,200).unwrap().0,events);
     assert_eq!(repository::list_events(&reopened,&owner,&instance_id,0,200).unwrap().0,parent_events);
@@ -611,7 +647,7 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
     let target = publish_model(&fixture,&terminate_child(false));
     let mut caller = call_tests::caller(&target,BTreeMap::new());
     caller.variables.insert("parent_seed".into(),json!(9));
-    let ProcessNodeKind::CallActivity { input_mapping, .. } = &mut caller.nodes.iter_mut()
+    let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &mut caller.nodes.iter_mut()
         .find(|node| node.id == "Call_1").unwrap().kind else { panic!("real call"); };
     input_mapping.insert("seed".into(),"vars.parent_seed".into());
     let version = publish_model(&fixture,&caller);
@@ -622,7 +658,7 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
     let command = runtime::test_support::stamp("canonical child start proof");
     let at = chrono::Utc::now().timestamp_millis();
     let variables = serde_json::to_value(&version.model.variables).unwrap();
-    let plan = runtime::plan_start(&version.model,&instance_id,&fixture.owner,&version.definition_id,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),&instance_id,&fixture.owner,&version.definition_id,
         version.version,variables.clone(),runtime::StartCause::Manual,at,runtime::test_support::manual_input(&command), None).unwrap();
     let controls = ["call-id","called-definition","called-version","model-pin","parent-revision","step-index",
         "mapped-child-input","foreign-source-instance","foreign-source-uuid","extra-ready-token","omitted-closure","extra-variable-effect"];
@@ -688,14 +724,14 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
             }
         })));
         let attempted = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-            &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at);
+            &version.definition_id,version.version,&variables, None, None,repository::ProcessPlanInput::Supplied(&plan),at);
         repository::CALL_PLAN_TEST_MUTATOR.with(|slot| *slot.borrow_mut() = None);
         assert!(inspected.load(std::sync::atomic::Ordering::SeqCst),"{label} inspected real canonical child plan");
         assert!(attempted.is_err(),"{label} must reject atomically");
         assert_eq!(call_tests::transition_rows(&fixture),before,"{label}: every column of all fourteen tables");
     }
     let accepted = repository::start_instance(&fixture.db,&fixture.owner,&command,&instance_id,
-        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
+        &version.definition_id,version.version,&variables, None, None,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(accepted.status,ProcessInstanceStatus::Completed);
     let child_id = call_tests::child_id(&fixture,&instance_id);
     assert_eq!(repository::get_instance(&fixture.db,&fixture.owner,&child_id,None).unwrap().variables["seed"],json!(9));
@@ -704,7 +740,7 @@ fn canonical_call_start_forgeries_roll_back_all_fourteen_tables_then_valid_plan_
     let committed = call_tests::transition_rows(&fixture);
     assert_ne!(committed,before);
     let replay = repository::start_instance(&fixture.db,&fixture.owner,&command,&uuid::Uuid::new_v4().to_string(),
-        &version.definition_id,version.version,&variables,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
+        &version.definition_id,version.version,&variables, None, None,repository::ProcessPlanInput::Supplied(&plan),at).unwrap();
     assert_eq!(replay,accepted);
     assert_eq!(call_tests::transition_rows(&fixture),committed);
 }

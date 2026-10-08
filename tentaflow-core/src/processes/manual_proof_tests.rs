@@ -17,7 +17,7 @@ fn manual_wait_requires_one_pinned_open_fact_before_any_acknowledgment() {
     let instance_id = Uuid::new_v4().to_string();
     let command = stamp("manual-open-proof");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
         at_ms, manual_input(&command), None).unwrap();
     let opened = plan.events.iter().position(|event| event.kind == "manual_task_opened").unwrap();
@@ -33,13 +33,13 @@ fn manual_wait_requires_one_pinned_open_fact_before_any_acknowledgment() {
         }
         let before = transition_rows(&fixture);
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
             repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
         assert_eq!(transition_rows(&fixture), before,
             "manual open forgery {variant} changed durable rows");
     }
     repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables,
+        &instance_id, &version.definition_id, version.version, &variables, None, None,
         repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     let reopened = repository::get_instance(&fixture.db, &fixture.owner, &instance_id, None).unwrap();
     assert_eq!(reopened.user_tasks.iter().filter(|task|
@@ -182,7 +182,7 @@ fn interrupting_manual_timer_requires_exact_wait_cancellation_and_source() {
     let candidate = repository::due_timers(&fixture.db, at_ms, 32).unwrap().into_iter()
         .find(|row| row.timer_id == timer.timer_id).unwrap();
     let selected = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-    let plan = super::timers::plan_timer_fire(&selected, at_ms, None).unwrap();
+    let plan = super::timers::plan_timer_fire(&selected, at_ms, None, None).unwrap();
     assert!(plan.cancel_user_task_ids.contains(&task.user_task_id));
     let fired = plan.events.iter().position(|event| event.kind == "timer_fired").unwrap();
     let before = super::signal_proof_tests::all_transition_rows(&fixture);

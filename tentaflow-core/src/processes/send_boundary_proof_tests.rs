@@ -24,7 +24,7 @@ fn noninterrupting_timer_script_fact_requires_its_fenced_timer_and_occurrence() 
     let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
         .find(|candidate| candidate.timer_id == timer.timer_id).unwrap();
     let timer_snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-    let plan = super::timers::plan_timer_fire(&timer_snapshot, due, None).unwrap();
+    let plan = super::timers::plan_timer_fire(&timer_snapshot, due, None, None).unwrap();
     assert!(plan.termination_attempts.is_empty());
     assert!(plan.events.iter().any(|event| event.kind == "script_completed"));
     let fired = plan.events.iter().position(|event| event.kind == "timer_fired").unwrap();
@@ -220,7 +220,7 @@ fn pending_send_entry_requires_one_source_event_one_wait_and_its_exact_boundary_
     let command = runtime::test_support::stamp("start pending Send proof");
     let variables = serde_json::to_value(&source.model.variables).unwrap();
     let plan = runtime::plan_start(
-        &source.model,
+        &source.model, &source.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&source.model),
         &instance_id,
         &fixture.owner,
         &source.definition_id,
@@ -267,7 +267,7 @@ fn pending_send_entry_requires_one_source_event_one_wait_and_its_exact_boundary_
             &instance_id,
             &source.definition_id,
             source.version,
-            &variables,
+            &variables, None, None,
             ProcessPlanInput::Supplied(&forged),
             at_ms,
         )
@@ -290,7 +290,7 @@ fn pending_send_entry_requires_one_source_event_one_wait_and_its_exact_boundary_
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         ProcessPlanInput::Supplied(&plan),
         at_ms,
     )
@@ -306,7 +306,7 @@ fn pending_send_entry_requires_one_source_event_one_wait_and_its_exact_boundary_
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         ProcessPlanInput::Supplied(&plan),
         at_ms,
     )
@@ -360,7 +360,7 @@ fn finite_send_failure_requires_the_exact_incident_code_pending_source_and_immut
         .iter()
         .find(|node| node.id == "Send_1")
         .unwrap();
-    let error = super::messages::prepare_throw(&source.model, pinned, &snapshot.instance.variables)
+    let error = super::messages::prepare_throw(&source.model, pinned, &snapshot.instance.variables, &[])
         .unwrap_err();
     let reason = repository::bounded_failure_message(&error.to_string());
     let input = AcceptedInputRef::SendAdmission {

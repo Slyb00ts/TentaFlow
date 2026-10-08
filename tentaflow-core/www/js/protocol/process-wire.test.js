@@ -28,7 +28,13 @@ function cbor(value) {
     if (value >= 0 && value < 256) return [0x18, value];
     throw new RangeError('test CBOR integer is out of fixture bounds');
   }
-  const head = (major, length) => length < 24 ? [(major << 5) | length] : [(major << 5) | 24, length];
+  const head = (major, length) => {
+    if (length < 24) return [(major << 5) | length];
+    if (length < 0x100) return [(major << 5) | 24, length];
+    if (length < 0x10000) return [(major << 5) | 25, length >> 8, length & 0xff];
+    return [(major << 5) | 26, length >>> 24, (length >>> 16) & 0xff,
+      (length >>> 8) & 0xff, length & 0xff];
+  };
   if (typeof value === 'string') {
     const bytes = [...new TextEncoder().encode(value)];
     return [...head(3, bytes.length), ...bytes];
@@ -37,6 +43,26 @@ function cbor(value) {
   const entries = Object.entries(value);
   return [...head(5, entries.length), ...entries.flatMap(([key, item]) => [...cbor(key), ...cbor(item)])];
 }
+
+test('link definitions preserve exact typed source and target references', { skip }, () => {
+  const base = { schemaVersion: 1, processId: 'P_1', variables: {},
+    sequenceFlows: [], diagram: { shapes: [], edges: [] } };
+  const nodes = [{ id: 'Throw_1', name: 'Go', kind: { LinkThrow: { definition: {
+    id: 'Link_Throw', name: 'repeat', sourceRefs: [], targetRef: 'Link_Catch',
+  } } } }, { id: 'Catch_1', name: 'Resume', kind: { LinkCatch: { definition: {
+    id: 'Link_Catch', name: 'repeat', sourceRefs: ['Link_Throw'], targetRef: null,
+  } } } }];
+  const saved = request('processDefinitionSaveRequest', { commandId: 'link', definitionId: null,
+    expectedRevision: 0, name: 'Link', description: '', model: { ...base, nodes } });
+  assert.equal(saved.model.nodes[0].kind.LinkThrow.definition.targetRef, 'Link_Catch');
+  assert.deepEqual(saved.model.nodes[1].kind.LinkCatch.definition.sourceRefs, ['Link_Throw']);
+  assert.equal(saved.model.nodes[0].kind.LinkThrow.definition.name, 'repeat');
+  assert.equal(saved.model.nodes[1].kind.LinkCatch.definition.name, 'repeat');
+  assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'bad-link', definitionId: null,
+    expectedRevision: 0, name: 'Link', description: '', model: { ...base, nodes: [{ ...nodes[0],
+      kind: { LinkThrow: { definition: { ...nodes[0].kind.LinkThrow.definition, sourceRefs: 'Link_Throw' } } },
+    }] } }), /link definition requires/);
+});
 
 test('escalation wire preserves typed declarations, boundary mapping and diagnostic context', { skip }, () => {
   const model = { schemaVersion: 1, processId: 'P_1', targetNamespace: 'urn:example:review',
@@ -290,13 +316,14 @@ test('call activity wire preserves exact QName binding, direct pins and terminal
       published_at_ms: 1, published_by: 'owner', model_sha256: 'sha', service_flows: [],
       call_activities: [{ node_id: 'Call_1', called_definition_id: 'definition-2', called_version: 7,
         called_element: { namespace_uri: 'urn:example:approval', process_id: 'Approval_1' },
-        model_sha256: 'target-sha' }] } },
+        model_sha256: 'target-sha' }] }, start_catalog: [] },
   } })));
   assert.equal(version.version.callActivities[0].calledElement.namespaceUri, 'urn:example:approval');
   assert.equal(version.version.callActivities[0].calledVersion, 7);
   const terminal = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance: { instance_id: 'child-1', definition_id: 'definition-2',
-      definition_name: 'Child', initiator_user_id: 'owner', version: 7, revision: 2,
+      definition_name: 'Child', process_id: 'Approval_1', start_node_id: 'Start_1',
+      initiator_user_id: 'owner', version: 7, revision: 2,
       status: 'Error', variables: {}, active_node_ids: [], user_tasks: [], incidents: [],
       created_at_ms: 1, updated_at_ms: 2, can_cancel: false, can_retry: false,
       calls: [{ Incoming: { parent: null } }],
@@ -305,9 +332,127 @@ test('call activity wire preserves exact QName binding, direct pins and terminal
         source_event_id: 'event-1', source_node_id: 'ErrorEnd_1', source_scope_id: 'child-1' } } },
   } })));
   assert.equal(terminal.instance.status, 'Error');
+  assert.equal(terminal.instance.processId, 'Approval_1');
+  assert.equal(terminal.instance.startNodeId, 'Start_1');
   assert.deepEqual(terminal.instance.calls, [{ Incoming: { parent: null } }]);
   assert.equal(terminal.instance.terminalError.errorCode, 'BUSINESS.REJECTED');
   assert.equal(Object.hasOwn(terminal.instance.calls[0].Incoming, 'callNodeId'), false);
+});
+
+test('selected bodies, modeling, data stores and activity IO survive the typed binary boundary', { skip }, () => {
+  const diagram = { shapes: [], edges: [], modelingShapes: [{ diId: 'Shape_StoreRef',
+    elementId: 'StoreRef_1', x: 40, y: 60, width: 140, height: 60 }],
+  modelingEdges: [{ diId: 'Edge_Association', elementId: 'Association_1',
+    waypoints: [{ x: 50, y: 60 }, { x: 90, y: 80 }] }] };
+  const modeling = { laneSets: [{ id: 'LaneSet_1', lanes: [{ id: 'Lane_1', name: '',
+    flowNodeRefs: ['Script_1'], childLaneSets: [] }] }],
+  dataObjects: [{ id: 'Object_1', name: null }],
+  dataObjectReferences: [{ id: 'ObjectRef_1', name: '', dataObjectRef: 'Object_1',
+    variableBindingKey: 'customer_ID' }],
+  textAnnotations: [{ id: 'Note_1', text: 'First line\nŁódź <&>' }],
+  associations: [{ id: 'Association_1', sourceRef: 'ObjectRef_1', targetRef: 'Note_1' }],
+  dataStoreReferences: [{ id: 'StoreRef_1', name: '', dataStoreRef: 'Store_1' }] };
+  const io = { dataInputs: [{ id: 'Input_1', name: '' }],
+    dataOutputs: [{ id: 'Output_1', name: null, valueExpression: 'inputs.Input_1' }],
+    inputSetId: 'InputSet_1', inputSet: ['Input_1'],
+    outputSetId: 'OutputSet_1', outputSet: ['Output_1'],
+    inputAssociations: [{ DirectRef: { id: 'InputAssociation_1',
+      sourceObjectRefId: 'ObjectRef_1', targetInputId: 'Input_1' } }],
+    outputAssociations: [{ id: 'OutputAssociation_1', sourceOutputId: 'Output_1',
+      targetObjectRefId: 'ObjectRef_1' }],
+    coordinatorOutput: {
+      dataOutputs: [{ id: 'CoordinatorOutput_1', name: '', valueExpression: 'outputs.payload' }],
+      outputSetId: 'CoordinatorOutputSet_1', outputSet: ['CoordinatorOutput_1'],
+      outputAssociations: [{ id: 'CoordinatorAssociation_1',
+        sourceOutputId: 'CoordinatorOutput_1', targetObjectRefId: 'ObjectRef_1' }],
+    } };
+  const model = { schemaVersion: 1, processId: 'Primary_1', processName: '',
+    targetNamespace: 'urn:example:document', dataStores: [{ id: 'Store_1', name: null,
+      capacity: 12, isUnlimited: false }],
+    nodes: [{ id: 'Script_1', name: 'Evaluate', kind: { ScriptTask: {
+      script: 'vars.customer_ID', outputMapping: {} } },
+      repeat: { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } },
+        outputCollectionVariable: 'results' } }, activityIo: io }],
+    sequenceFlows: [{ id: 'Flow_1', sourceId: 'Script_1', targetId: 'Call_1',
+      condition: null, callStartNodeId: 'ChildStart_1' }],
+    variables: { customer_ID: { inner_key: null }, results: [] }, diagram, modeling,
+    additionalProcesses: [{ processId: 'Child_1', processName: null,
+      nodes: [{ id: 'Call_1', name: '', kind: { CallActivity: {
+        localBody: { namespaceUri: 'urn:example:document', processId: 'Primary_1' },
+        inputMapping: { customer_ID: 'vars.customer_ID' }, outputMapping: {} } } }],
+      sequenceFlows: [], variables: {}, diagram: { shapes: [], edges: [] }, modeling: {
+        laneSets: [], dataObjects: [], dataObjectReferences: [], textAnnotations: [],
+        associations: [], dataStoreReferences: [{ id: 'StoreRef_Child', name: null,
+          dataStoreRef: 'Store_1' }] } }],
+    collaboration: { id: 'Collaboration_1', name: '',
+      participants: [{ id: 'Pool_1', name: '', processRef: {
+        namespaceUri: 'urn:example:document', processId: 'Primary_1' } },
+      { id: 'Pool_2', name: null, processRef: null }],
+      messageFlows: [{ id: 'MessageFlow_1', sourceRef: 'Pool_2', targetRef: 'Script_1',
+        messageRef: null }], diagram: { shapes: [], edges: [], modelingShapes: [], modelingEdges: [] } } };
+  const saved = request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Document', description: '', model });
+  assert.equal(saved.model.processName, '');
+  assert.equal(Object.hasOwn(saved.model.dataStores[0], 'name'), false);
+  assert.equal(saved.model.dataStores[0].capacity, 12);
+  assert.equal(saved.model.dataStores[0].isUnlimited, false);
+  assert.equal(saved.model.modeling.laneSets[0].lanes[0].name, '');
+  assert.equal(saved.model.modeling.dataObjectReferences[0].name, '');
+  assert.equal(saved.model.modeling.dataStoreReferences[0].name, '');
+  assert.equal(saved.model.modeling.textAnnotations[0].text, 'First line\nŁódź <&>');
+  assert.deepEqual(saved.model.diagram.modelingShapes, diagram.modelingShapes);
+  assert.deepEqual(saved.model.diagram.modelingEdges, diagram.modelingEdges);
+  const savedIo = saved.model.nodes[0].activityIo;
+  assert.equal(savedIo.dataInputs[0].name, '');
+  assert.equal(Object.hasOwn(savedIo.dataOutputs[0], 'name'), false);
+  assert.equal(savedIo.dataOutputs[0].valueExpression, 'inputs.Input_1');
+  assert.deepEqual(savedIo.inputAssociations, io.inputAssociations);
+  assert.deepEqual(savedIo.outputAssociations, io.outputAssociations);
+  assert.deepEqual(savedIo.coordinatorOutput, io.coordinatorOutput);
+  assert.equal(saved.model.sequenceFlows[0].callStartNodeId, 'ChildStart_1');
+  assert.equal(saved.model.additionalProcesses[0].processId, 'Child_1');
+  assert.equal(Object.hasOwn(saved.model.additionalProcesses[0], 'processName'), false);
+  assert.equal(saved.model.additionalProcesses[0].modeling.dataStoreReferences[0].dataStoreRef, 'Store_1');
+  assert.deepEqual(saved.model.additionalProcesses[0].nodes[0].kind.CallActivity,
+    model.additionalProcesses[0].nodes[0].kind.CallActivity);
+  assert.equal(saved.model.collaboration.participants[1].processRef ?? null, null);
+  assert.equal(saved.model.collaboration.messageFlows[0].targetRef, 'Script_1');
+  const maximumModel = { ...model, dataStores: [{ ...model.dataStores[0], capacity: Number.MAX_SAFE_INTEGER }] };
+  const maximum = request('processDefinitionSaveRequest', { commandId: 'maximum', definitionId: null,
+    expectedRevision: 0, name: 'Maximum', description: '', model: maximumModel });
+  assert.equal(maximum.model.dataStores[0].capacity, Number.MAX_SAFE_INTEGER);
+  for (const invalid of [
+    { ...model, dataStores: [{ ...model.dataStores[0], itemSubjectRef: 'Unsupported_1' }] },
+    { ...model, dataStores: [{ ...model.dataStores[0], capacity: Number.MAX_SAFE_INTEGER + 1 }] },
+    { ...model, modeling: { ...modeling, silentlyDropped: true } },
+    { ...model, modeling: { ...modeling, laneSets: [{ ...modeling.laneSets[0],
+      lanes: [{ ...modeling.laneSets[0].lanes[0], childLaneSets: { length: 0 } }] }] } },
+    { ...model, nodes: [{ ...model.nodes[0], kind: { ...model.nodes[0].kind, End: {} } }] },
+  ]) assert.throws(() => request('processDefinitionSaveRequest', { commandId: 'bad',
+    definitionId: null, expectedRevision: 0, name: 'Invalid', description: '', model: invalid }),
+  /unsupported|requires one variant|requires node references|safe integer/);
+});
+
+test('optional selected start identity is absent on old requests and explicit when authored', { skip }, () => {
+  const old = request('processInstanceStartRequest', { commandId: 'cmd',
+    definitionId: 'definition-1', version: 1, variables: {} });
+  assert.equal(Object.hasOwn(old, 'processId'), false);
+  assert.equal(Object.hasOwn(old, 'startNodeId'), false);
+  const selected = request('processInstanceStartRequest', { commandId: 'cmd',
+    definitionId: 'definition-1', version: 1, variables: {},
+    processId: 'Process_2', startNodeId: 'Start_2' });
+  assert.equal(selected.processId, 'Process_2');
+  assert.equal(selected.startNodeId, 'Start_2');
+  const oldMessage = request('processMessageSendRequest', { commandId: 'cmd', messageId: 'message-1',
+    target: { Start: { definitionId: 'definition-1' } }, messageName: 'order.received',
+    correlationKey: 'case-1', payload: {}, ttlSeconds: 60 });
+  assert.equal(Object.hasOwn(oldMessage.target.Start, 'processId'), false);
+  assert.equal(Object.hasOwn(oldMessage.target.Start, 'startNodeId'), false);
+  const selectedMessage = request('processMessageSendRequest', { commandId: 'cmd', messageId: 'message-2',
+    target: { Start: { definitionId: 'definition-1', processId: 'Process_2', startNodeId: 'MessageStart_2' } },
+    messageName: 'order.received', correlationKey: 'case-1', payload: {}, ttlSeconds: 60 });
+  assert.equal(selectedMessage.target.Start.processId, 'Process_2');
+  assert.equal(selectedMessage.target.Start.startNodeId, 'MessageStart_2');
 });
 
 test('instance pages encode exact selectors and message detail preserves null availability', { skip }, () => {
@@ -358,6 +503,7 @@ test('instance pages encode exact selectors and message detail preserves null av
 test('instance response decodes required empty and populated message collections', { skip }, () => {
   const base = {
     instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval',
+    process_id: 'Process_Approval', start_node_id: 'Start_1',
     initiator_user_id: 'u1', version: 1, revision: 1, status: 'Running',
     variables: { business_key: 'kept' }, active_node_ids: [], user_tasks: [], incidents: [],
     created_at_ms: 1, updated_at_ms: 1, can_cancel: true, can_retry: false,
@@ -390,6 +536,8 @@ test('instance response decodes required empty and populated message collections
       subprocess_node_name: 'Review', parent_token_id: 'wait-1', revision: 1, status: 'Running',
       depth: 1, created_at_ms: 1, updated_at_ms: 1 }],
   });
+  assert.equal(populated.instance.processId, 'Process_Approval');
+  assert.equal(populated.instance.startNodeId, 'Start_1');
   assert.equal(populated.instance.subscriptions[0].subscriptionId, 's1');
   assert.deepEqual(populated.instance.eventRaces[0].branchSubscriptionIds, ['s1']);
   assert.equal(populated.instance.outgoingMessages[0].messageId, 'm1');
@@ -552,6 +700,7 @@ test('boundary timer and full task scope identity decode with nullable timer fie
   const timer = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance: {
       instance_id: 'i1', definition_id: 'd1', definition_name: 'Boundary',
+      process_id: 'Process_Boundary', start_node_id: 'Start_1',
       initiator_user_id: 'person', version: 1, revision: 1, status: 'Running',
       variables: { attached_to_id: 'business' }, active_node_ids: ['Review_1'],
       user_tasks: [], incidents: [], created_at_ms: 1, updated_at_ms: 1,
@@ -559,12 +708,14 @@ test('boundary timer and full task scope identity decode with nullable timer fie
       calls: [], repetition_groups: [], repetition_occurrences: [], selected_repetition_occurrence: null,
     } },
   } })));
+  assert.equal(timer.instance.processId, 'Process_Boundary');
+  assert.equal(timer.instance.startNodeId, 'Start_1');
   assert.equal(timer.instance.timers[0].attachedToId, 'Review_1');
   assert.equal(timer.instance.timers[0].kind, 'Boundary');
   assert.deepEqual(timer.instance.variables, { attached_to_id: 'business' });
 });
 
-test('timer status Error and schedule fields decode to canonical camel keys', { skip }, () => {
+test('pinned timer catalog decodes authored rule and matching persisted status', { skip }, () => {
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     DefinitionGetResponse: { definition: {
       definition_id: 'd1', name: 'Morning', description: '', owner_user_id: 'u1',
@@ -577,17 +728,24 @@ test('timer status Error and schedule fields decode to canonical camel keys', { 
         sequence_flows: [{ id: 'Flow_1', source_id: 'Start_1', target_id: 'End_1', condition: null }],
         variables: {}, diagram: { shapes: [], edges: [] },
       },
-    }, timer_start: {
-      timer_id: 't1', node_id: 'Start_1', node_name: 'Morning', kind: 'Start',
-      status: 'Error', due_at_ms: 1, timezone: 'Europe/Warsaw', occurrence: 3,
-      total_firings: 3, last_reason: 'calendar horizon exceeded',
-    } },
+    }, start_catalog: [{ process_id: 'P_1', process_name: null,
+      start_node_id: 'Start_1', start_node_name: 'Morning', version: 1,
+      trigger: { TimerStart: { timer: { Duration: { seconds: 1 } }, timezone: 'Europe/Warsaw',
+        working_time: null, persisted_timer: {
+          timer_id: 't1', node_id: 'Start_1', node_name: 'Morning', kind: 'Start',
+          status: 'Error', due_at_ms: 1, timezone: 'Europe/Warsaw', occurrence: 3,
+          total_firings: 3, last_reason: 'calendar horizon exceeded',
+        } } } }] },
   } })));
   assert.equal(decoded.variant, 'ProcessDefinitionGetResponse');
-  assert.equal(decoded.timerStart.status, 'Error');
-  assert.equal(decoded.timerStart.totalFirings, 3);
-  assert.equal(decoded.timerStart.lastReason, 'calendar horizon exceeded');
-  assert.equal(Object.hasOwn(decoded.timerStart, 'total_firings'), false);
+  assert.equal(decoded.startCatalog[0].processId, 'P_1');
+  assert.equal(decoded.startCatalog[0].processName, null);
+  assert.equal(decoded.startCatalog[0].trigger.TimerStart.timer.Duration.seconds, 1);
+  const persisted = decoded.startCatalog[0].trigger.TimerStart.persistedTimer;
+  assert.equal(persisted.status, 'Error');
+  assert.equal(persisted.totalFirings, 3);
+  assert.equal(persisted.lastReason, 'calendar horizon exceeded');
+  assert.equal(Object.hasOwn(persisted, 'total_firings'), false);
 });
 
 test('paged list request and response use canonical camel keys only', { skip }, () => {
@@ -611,6 +769,43 @@ test('user task detail request keeps explicit instance and task identity', { ski
   assert.equal(body.instanceId, 'i1');
   assert.equal(body.userTaskId, 't1');
   assert.equal(Object.hasOwn(body, 'user_task_id'), false);
+});
+
+test('user task detail transports sixteen near-limit authenticated activity inputs', { skip }, () => {
+  const value = 'x'.repeat(256 * 1024 - 64);
+  const task = {
+    user_task_id: 'large-task', node_id: 'Review_1', name: 'Review', assignee_user_id: 'u1',
+    kind: 'Work', status: 'Open', outputs: null, revision: 1, can_complete: true,
+    token_id: 'waiting-1', scope_id: 'i1',
+    activity_inputs: Array.from({ length: 16 }, (_, position) => ({
+      position, declaration_id: `input_${position}`, name: `Input ${position}`,
+      value: { Present: value },
+    })),
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    UserTaskGetResponse: { task },
+  } })));
+  assert.equal(decoded.task.activityInputs.length, 16);
+  assert.equal(decoded.task.activityInputs[0].value.Present.length, value.length);
+  assert.equal(decoded.task.activityInputs[15].declarationId, 'input_15');
+  assert.equal(Object.hasOwn(decoded.task, 'activity_inputs'), false);
+});
+
+test('user task detail decodes missing and present null activity inputs distinctly', { skip }, () => {
+  const task = {
+    user_task_id: 'activity-inputs', node_id: 'Review_1', name: 'Review', assignee_user_id: 'u1',
+    kind: 'Work', status: 'Open', outputs: null, revision: 1, can_complete: true,
+    token_id: 'waiting-1', scope_id: 'i1',
+    activity_inputs: [
+      { position: 0, declaration_id: 'Required_Value', name: 'Required value', value: 'Missing' },
+      { position: 1, declaration_id: 'Nullable_Value', name: 'Nullable value', value: { Present: null } },
+    ],
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    UserTaskGetResponse: { task },
+  } })));
+  assert.equal(decoded.task.activityInputs[0].value, 'Missing');
+  assert.deepEqual(decoded.task.activityInputs[1].value, { Present: null });
 });
 
 test('manual task uses a distinct acknowledgment request without work outputs', { skip }, () => {

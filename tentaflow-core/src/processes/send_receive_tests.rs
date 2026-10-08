@@ -35,7 +35,7 @@ pub(super) fn send_model(target_definition: &str, target_instance: &str) -> tent
             },
             correlation_expression: "'case-1'".into(),
             payload_expression: "{'value': 42}".into(), ttl_seconds: 120,
-        }, repeat: None });
+        }, repeat: None, activity_io: None,});
     model.sequence_flows = vec![edge("ToSend", "Start_1", "Send_1"),
         edge("ToEnd", "Send_1", "End_1")];
     model
@@ -441,9 +441,9 @@ pub(super) fn receive_boundary_model(message: bool, interrupt: bool)
         })
     };
     model.nodes.push(ProcessNode { id: id.into(), name: "Receive boundary".into(),
-        kind, repeat: None });
+        kind, repeat: None, activity_io: None,});
     model.nodes.push(ProcessNode { id: "BoundaryEnd".into(), name: "Boundary end".into(),
-        kind: ProcessNodeKind::End, repeat: None });
+        kind: ProcessNodeKind::End, repeat: None, activity_io: None,});
     model.sequence_flows.push(edge("BoundaryFlow", id, "BoundaryEnd"));
     model
 }

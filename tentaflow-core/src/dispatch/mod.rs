@@ -2867,7 +2867,26 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::MessageCancelResponse { .. } => "ProcessMessageCancelResponse",
                 P::ScopeGetRequest { .. } => "ProcessScopeGetRequest",
                 P::ScopeGetResponse { .. } => "ProcessScopeGetResponse",
-
+                P::SimulationStartRequest { .. } => "ProcessSimulationStartRequest",
+                P::SimulationStartResponse { .. } => "ProcessSimulationStartResponse",
+                P::SimulationViewRequest { .. } => "ProcessSimulationViewRequest",
+                P::SimulationViewResponse { .. } => "ProcessSimulationViewResponse",
+                P::SimulationAdvanceRequest { .. } => "ProcessSimulationAdvanceRequest",
+                P::SimulationAdvanceResponse { .. } => "ProcessSimulationAdvanceResponse",
+                P::SimulationUserTaskCompleteRequest { .. } => {
+                    "ProcessSimulationUserTaskCompleteRequest"
+                }
+                P::SimulationUserTaskCompleteResponse { .. } => {
+                    "ProcessSimulationUserTaskCompleteResponse"
+                }
+                P::SimulationManualTaskAcknowledgeRequest { .. } => {
+                    "ProcessSimulationManualTaskAcknowledgeRequest"
+                }
+                P::SimulationManualTaskAcknowledgeResponse { .. } => {
+                    "ProcessSimulationManualTaskAcknowledgeResponse"
+                }
+                P::SimulationReleaseRequest { .. } => "ProcessSimulationReleaseRequest",
+                P::SimulationReleaseResponse { .. } => "ProcessSimulationReleaseResponse",
             }
         }
         MessageBody::MapBody(p) => {

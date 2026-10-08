@@ -1,0 +1,1 @@
+{"CallActivity":{"called_definition_id":"da53c1fd-c235-40ec-bde1-44cf57bb620d","called_version":7,"called_element":{"namespace_uri":"urn:example:approval:v1","process_id":"Approval_1"},"input_mapping":{"customer_ID":"vars.customer_ID","request_note":"vars.request_note"},"output_mapping":{"approved_value":"outputs.business_key"}}}

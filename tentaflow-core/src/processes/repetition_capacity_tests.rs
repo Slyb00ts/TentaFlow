@@ -1,6 +1,6 @@
 // ============ File: repetition_capacity_tests.rs — file-backed repetition byte admission regressions ============
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
@@ -20,7 +20,7 @@ use super::runtime::{self, test_support::{edge, flow, graph, human_input, manual
 
 const RETAINED_LIMIT: u64 = 64 * 1024 * 1024;
 
-fn physical_retained_bytes(fixture: &Fixture, group_id: &str) -> u64 {
+pub(super) fn physical_retained_bytes(fixture: &Fixture, group_id: &str) -> u64 {
     let conn = fixture.db.read().unwrap();
     let bytes: i64 = conn.query_row(
         "SELECT length(CAST(g.entry_variables_json AS BLOB))
@@ -36,10 +36,32 @@ fn physical_retained_bytes(fixture: &Fixture, group_id: &str) -> u64 {
                 +COALESCE(length(CAST(j.result_json AS BLOB)),0)) FROM bpmn_jobs j
                 WHERE j.instance_id=g.instance_id AND j.job_id IN
                 (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
+            +COALESCE((SELECT SUM(length(CAST(v.observed_result_json AS BLOB)))
+                FROM bpmn_service_invocations v
+                WHERE v.instance_id=g.instance_id AND v.job_id IN
+                (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
             +COALESCE((SELECT SUM(length(CAST(t.outputs_json AS BLOB))) FROM bpmn_user_tasks t
                 WHERE t.instance_id=g.instance_id AND t.user_task_id IN
                 (SELECT o.user_task_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id
                  UNION SELECT o.verification_user_task_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
+            +COALESCE((SELECT SUM(COALESCE(length(CAST(m.payload_json AS BLOB)),0))
+                FROM bpmn_messages m WHERE m.source_instance_id=g.instance_id
+                AND m.source_activation_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                    WHERE o.group_id=g.group_id)),0)
+            +COALESCE((SELECT SUM(COALESCE(length(CAST(s.message_name AS BLOB)),0)
+                +COALESCE(length(CAST(s.correlation_key AS BLOB)),0))
+                FROM bpmn_event_subscriptions s WHERE s.instance_id=g.instance_id
+                AND s.token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                    WHERE o.group_id=g.group_id)),0)
+            +COALESCE((SELECT SUM(length(CAST(s.local_variables_json AS BLOB)))
+                FROM bpmn_scopes s WHERE s.instance_id=g.instance_id
+                AND s.parent_token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                    WHERE o.group_id=g.group_id)),0)
+            +COALESCE((SELECT SUM(length(CAST(i.variables_json AS BLOB)))
+                FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id
+                WHERE c.parent_instance_id=g.instance_id
+                AND c.parent_token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                    WHERE o.group_id=g.group_id)),0)
             +COALESCE((SELECT SUM(length(CAST(e.data_json AS BLOB))) FROM bpmn_events e
                 WHERE e.instance_id=g.instance_id AND (
                     json_extract(e.data_json,'$.group_id')=g.group_id
@@ -81,9 +103,9 @@ fn large_loop_model(owner: &str, padding_bytes: usize) -> tentaflow_protocol::pr
     model.variables.insert("padding".into(), json!("é".repeat(padding_bytes / 2)));
     model.variables.insert("step".into(), json!(0));
     model.nodes.push(ProcessNode { id: "Split".into(), name: "Split".into(),
-        kind: ProcessNodeKind::ParallelGateway, repeat: None });
+        kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,});
     model.nodes.push(ProcessNode { id: "Join".into(), name: "Join".into(),
-        kind: ProcessNodeKind::ParallelGateway, repeat: None });
+        kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,});
     let prototype = model.nodes.iter().find(|node| node.id == "RepeatedWork").unwrap().clone();
     model.nodes.retain(|node| node.id != "RepeatedWork");
     model.sequence_flows = vec![edge("EnterSplit", "Start_1", "Split")];
@@ -109,6 +131,108 @@ fn large_loop_model(owner: &str, padding_bytes: usize) -> tentaflow_protocol::pr
     model
 }
 
+fn large_loop_with_repeated_service(
+    owner: &str, flow_id: &str,
+) -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = large_loop_model(owner, 80_000);
+    model.variables.insert("service_items".into(), json!(["observed"]));
+    model.variables.insert("service_results".into(), json!([]));
+    let mut service = service_model(flow_id, ActivityVerification::Condition {
+        expression: "true".into(),
+    }).nodes.into_iter().find(|node| node.id == "Service").unwrap();
+    service.id = "RepeatedService".into();
+    let ProcessNodeKind::ServiceTask { output_mapping, result_expression, .. } =
+        &mut service.kind else { panic!("fixture Service changed kind") };
+    output_mapping.clear();
+    *result_expression = Some("outputs.variables.actual_result".into());
+    service.repeat = Some(ProcessRepeatSpec::MultiInstance {
+        mode: ProcessMultiInstanceMode::Sequential,
+        input: ProcessMultiInstanceInput::CollectionExpression {
+            expression: "vars.service_items".into(),
+        },
+        output_collection_variable: "service_results".into(),
+    });
+    model.nodes.push(service);
+    model.sequence_flows.push(edge("ServiceBranch", "Split", "RepeatedService"));
+    model.sequence_flows.push(edge("ServiceJoin", "RepeatedService", "Join"));
+    model
+}
+
+fn parallel_manual_parent_aggregate_model(owner: &str, flow_id: &str)
+    -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = sequential_human_model(owner, 0);
+    model.nodes.retain(|node| node.id != "RepeatedWork");
+    model.variables.remove("results");
+    model.variables.insert("padding".into(), json!("é".repeat(123_844)));
+    model.variables.insert("service_marker".into(), json!(""));
+    model.variables.insert("fine".into(), json!(""));
+    let mut service = service_model(flow_id, ActivityVerification::Condition {
+        expression: "true".into(),
+    }).nodes.into_iter().find(|node| node.id == "Service").unwrap();
+    let ProcessNodeKind::ServiceTask { output_mapping, .. } = &mut service.kind else {
+        panic!("actual Service fixture changed kind")
+    };
+    *output_mapping = BTreeMap::from([(
+        "service_marker".into(), "outputs.variables.marker".into(),
+    )]);
+    model.nodes.push(service);
+    model.nodes.push(ProcessNode {
+        id: "FineTune".into(), name: "Tune actual accepted input".into(),
+        kind: ProcessNodeKind::UserTask {
+            assignee_user_id: Some(owner.into()),
+            output_mapping: BTreeMap::from([("fine".into(), "outputs.fine".into())]),
+        }, repeat: None,
+        activity_io: None,
+    });
+    for index in 0..4 {
+        let output = format!("manual_results_{index}");
+        model.variables.insert(output.clone(), json!([]));
+        model.nodes.push(ProcessNode {
+            id: format!("RepeatedManual_{index}"),
+            name: format!("Acknowledge actual ordinal {index}"),
+            kind: ProcessNodeKind::ManualTask {
+                assignee_user_id: Some(owner.into()),
+                instructions: "Acknowledge the physical work item.".into(),
+            },
+            repeat: Some(ProcessRepeatSpec::StructuredLoop {
+                condition: "true".into(), test_before: false,
+                max_iterations: 32, output_collection_variable: output,
+            }),
+            activity_io: None,
+        });
+    }
+    for index in 0..2 {
+        let output = format!("parallel_results_{index}");
+        model.variables.insert(output.clone(), json!([]));
+        model.nodes.push(ProcessNode {
+            id: format!("ParallelManual_{index}"),
+            name: format!("Acknowledge parallel ordinals {index}"),
+            kind: ProcessNodeKind::ManualTask {
+                assignee_user_id: Some(owner.into()),
+                instructions: "Acknowledge the selected physical work item.".into(),
+            },
+            repeat: Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: output,
+            }),
+            activity_io: None,
+        });
+    }
+    model.sequence_flows = vec![
+        edge("EnterManual_0", "Start_1", "RepeatedManual_0"),
+        edge("Manual_0ToManual_1", "RepeatedManual_0", "RepeatedManual_1"),
+        edge("Manual_1ToManual_2", "RepeatedManual_1", "RepeatedManual_2"),
+        edge("Manual_2ToManual_3", "RepeatedManual_2", "RepeatedManual_3"),
+        edge("Manual_3ToParallel_0", "RepeatedManual_3", "ParallelManual_0"),
+        edge("Parallel_0ToService", "ParallelManual_0", "Service"),
+        edge("ServiceToFineTune", "Service", "FineTune"),
+        edge("FineTuneToParallel_1", "FineTune", "ParallelManual_1"),
+        edge("Parallel_1ToEnd", "ParallelManual_1", "End_1"),
+    ];
+    model
+}
+
 fn verification_capacity_model(owner: &str, flow_id: &str, needs_human: bool)
     -> tentaflow_protocol::processes::ProcessModel {
     let mut model = service_model(flow_id, ActivityVerification::Human);
@@ -127,17 +251,17 @@ fn verification_capacity_model(owner: &str, flow_id: &str, needs_human: bool)
     }
     model.nodes.extend([
         ProcessNode { id: "OuterSplit".into(), name: "Parallel source and gate".into(),
-            kind: ProcessNodeKind::ParallelGateway, repeat: None },
+            kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,},
         ProcessNode { id: "OuterJoin".into(), name: "Join after verification".into(),
-            kind: ProcessNodeKind::ParallelGateway, repeat: None },
+            kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,},
         ProcessNode { id: "GateHuman".into(), name: "Release the work fanout".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: Some(owner.into()), output_mapping: BTreeMap::new(),
-            }, repeat: None },
+            }, repeat: None, activity_io: None,},
         ProcessNode { id: "InnerSplit".into(), name: "Start four real repetitions".into(),
-            kind: ProcessNodeKind::ParallelGateway, repeat: None },
+            kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,},
         ProcessNode { id: "InnerJoin".into(), name: "Join four repetitions".into(),
-            kind: ProcessNodeKind::ParallelGateway, repeat: None },
+            kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,},
     ]);
     let prototype = sequential_human_model(owner, 16).nodes.into_iter()
         .find(|node| node.id == "RepeatedWork").unwrap();
@@ -171,7 +295,11 @@ fn verification_capacity_model(owner: &str, flow_id: &str, needs_human: bool)
 
 fn open_work(snapshot: &repository::RuntimeSnapshot) -> (String, u32, String) {
     let occurrence = snapshot.repetition_occurrences.iter()
-        .filter(|row| row.status == ProcessRepetitionOccurrenceStatus::Active)
+        .filter(|row| row.status == ProcessRepetitionOccurrenceStatus::Active
+            && row.user_task_id.as_ref().is_some_and(|task_id|
+                snapshot.user_tasks.iter().any(|task|
+                    task.user_task_id == *task_id
+                        && task.status == ProcessUserTaskStatus::Open)))
         .min_by_key(|row| (row.ordinal, row.group_id.as_str()))
         .expect("actual open repetition occurrence");
     let task_id = occurrence.user_task_id.as_ref().expect("actual repeated Work task");
@@ -206,7 +334,7 @@ fn assert_capacity_forgeries(fixture: &Fixture, instance_id: &str,
     snapshot: &repository::RuntimeSnapshot, task_id: &str,
     command: &repository::CommandStamp, outputs: &Value, canonical: &RuntimePlan, at_ms: i64) {
     let before = super::call_tests::transition_rows(fixture);
-    assert_eq!(before.len(), 16);
+    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     let capacity = canonical.repetition_capacity.as_ref().expect("canonical capacity latch");
     assert_eq!(capacity.reason, "repetition_bytes");
     assert!(canonical.events.iter().any(|event| event.kind == "user_task_completed"));
@@ -469,6 +597,286 @@ fn physical_utf8_capacity_latches_before_denied_next_ordinal_and_owner_cancel_ke
     complete_capacity_control(false);
 }
 
+#[tokio::test]
+async fn final_parallel_manual_parent_aggregate_keeps_highest_ordinal_source() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph(&"s".repeat(128), None));
+    let model = parallel_manual_parent_aggregate_model(&fixture.owner.user_id, &flow_id);
+    let started = start_model(&fixture, &model);
+    assert_eq!(started.status, ProcessInstanceStatus::Waiting);
+
+    for group_index in 0..4 {
+        for ordinal in 0..32 {
+            let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+                &started.instance_id).unwrap();
+            let node_id = format!("RepeatedManual_{group_index}");
+            let task = snapshot.user_tasks.iter().find(|task|
+                task.node_id == node_id && task.kind == ProcessUserTaskKind::Manual
+                    && task.status == ProcessUserTaskStatus::Open).unwrap();
+            let occurrence = snapshot.repetition_occurrences.iter().find(|row|
+                row.user_task_id.as_deref() == Some(task.user_task_id.as_str())).unwrap();
+            assert_eq!(occurrence.ordinal, ordinal);
+            let command = stamp("accept real Manual byte-prefix ordinal");
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            let plan = runtime::plan_manual_acknowledgment(&snapshot, &task.user_task_id,
+                &fixture.owner.user_id, at_ms,
+                super::manual_tests::manual_entry(&snapshot, &task.user_task_id, &command),
+                None).unwrap();
+            assert!(plan.repetition_capacity.is_none(),
+                "the factual prefix must remain below the capacity limit");
+            repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+                &command, &started.instance_id, &task.user_task_id,
+                snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&plan),
+                at_ms).unwrap();
+        }
+        let after_group = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let node_id = format!("RepeatedManual_{group_index}");
+        assert!(after_group.repetition_groups.iter().any(|group|
+            group.node_id == node_id && group.status == ProcessRepetitionGroupStatus::Completed
+                && group.completed_count == 32));
+        assert!(measured_retained_bytes(&fixture, &started.instance_id) <= RETAINED_LIMIT,
+            "each real completed UTF-8 prefix must stay under the physical limit");
+    }
+    let before_calibration = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let root_variables_before_calibration =
+        serde_json::to_vec(&before_calibration.instance.variables).unwrap().len();
+    let calibration_group = before_calibration.repetition_groups.iter().find(|group|
+        group.node_id == "ParallelManual_0").unwrap();
+    assert_eq!(calibration_group.mode,
+        tentaflow_protocol::processes::ProcessRepetitionGroupMode::MultiInstanceParallel);
+    assert_eq!(calibration_group.created_count, 2);
+    for ordinal in [1, 0] {
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let occurrence = snapshot.repetition_occurrences.iter().find(|row|
+            row.group_id == calibration_group.group_id && row.ordinal == ordinal).unwrap();
+        let task_id = occurrence.user_task_id.as_ref().unwrap();
+        let command = stamp("accept real calibration parallel Manual ordinal");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let plan = runtime::plan_manual_acknowledgment(&snapshot, task_id,
+            &fixture.owner.user_id, at_ms,
+            super::manual_tests::manual_entry(&snapshot, task_id, &command), None).unwrap();
+        assert!(plan.repetition_capacity.is_none());
+        repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+            &command, &started.instance_id, task_id, snapshot.instance.revision,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    }
+    let after_calibration = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let calibration_group = after_calibration.repetition_groups.iter().find(|group|
+        group.node_id == "ParallelManual_0").unwrap();
+    assert_eq!(calibration_group.status, ProcessRepetitionGroupStatus::Completed);
+    assert_eq!(calibration_group.completed_count, 2);
+    let calibration_bytes = physical_retained_bytes(&fixture, &calibration_group.group_id);
+    let retained_before_service = measured_retained_bytes(&fixture, &started.instance_id);
+    assert!(retained_before_service <= RETAINED_LIMIT);
+    let completed_event_bytes: i64 = fixture.db.read().unwrap().query_row(
+        "SELECT length(CAST(data_json AS BLOB)) FROM bpmn_events \
+         WHERE instance_id=?1 AND kind='repetition_completed' \
+         AND json_extract(data_json,'$.group_id')=?2",
+        rusqlite::params![started.instance_id, calibration_group.group_id],
+        |row| row.get(0),
+    ).unwrap();
+    let completed_event_bytes = u64::try_from(completed_event_bytes).unwrap();
+
+    let worker = "parallel-parent-aggregate-source-worker";
+    let claim = repository::claim_job(&fixture.db, worker,
+        chrono::Utc::now().timestamp_millis()).unwrap().expect("real Service claim");
+    assert_eq!(claim.job.node_id, "Service");
+    jobs::execute_claimed(&fixture.db, fixture.dispatcher(), worker, claim.clone(),
+        CancellationToken::new()).await.unwrap();
+    let after_service = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(after_service.instance.variables["service_marker"], json!("s".repeat(128)));
+    assert_eq!(measured_retained_bytes(&fixture, &started.instance_id),
+        retained_before_service, "ordinary Service cannot synthesize repetition retention");
+    let service_event_id: String = fixture.db.read().unwrap().query_row(
+        "SELECT event_id FROM bpmn_events WHERE instance_id=?1 \
+         AND kind='service_result' AND node_id='Service'",
+        [&started.instance_id], |row| row.get(0),
+    ).unwrap();
+    let root_variables_after_service =
+        serde_json::to_vec(&after_service.instance.variables).unwrap().len();
+    let delta_without_fine = i128::try_from(root_variables_after_service).unwrap()
+        - i128::try_from(root_variables_before_calibration).unwrap();
+    assert!(delta_without_fine > 128,
+        "the actual prior parallel aggregate and Service mapping must enlarge root variables");
+    let root_copies = 3_i128;
+    let baseline_before_completion = i128::from(retained_before_service)
+        + i128::from(calibration_bytes) + root_copies * delta_without_fine
+        - i128::from(completed_event_bytes);
+    let smallest_fine = (i128::from(RETAINED_LIMIT) - baseline_before_completion
+        - i128::from(completed_event_bytes)).div_euclid(root_copies) + 1;
+    let largest_fine = (i128::from(RETAINED_LIMIT) - baseline_before_completion)
+        .div_euclid(root_copies);
+    assert!(smallest_fine >= 0 && smallest_fine <= largest_fine,
+        "real parallel group must have a reachable UTF-8 completion window: \
+         baseline={baseline_before_completion}, event={completed_event_bytes}, \
+         range={smallest_fine}..={largest_fine}");
+    let fine_bytes = usize::try_from(smallest_fine).unwrap();
+    let fine_outputs = json!({"fine":"f".repeat(fine_bytes)});
+    let mut projected_root = after_service.instance.variables.clone();
+    projected_root.as_object_mut().unwrap().insert("fine".into(),
+        fine_outputs["fine"].clone());
+    assert!(serde_json::to_vec(&projected_root).unwrap().len()
+        <= super::model::MAX_VARIABLE_BYTES,
+        "the physical calibration must keep actual parent variables inside 256 KiB");
+    assert!(serde_json::to_vec(&fine_outputs).unwrap().len()
+        <= super::model::MAX_VARIABLE_BYTES,
+        "the real Work output must remain within its published limit");
+    let task = after_service.user_tasks.iter().find(|task|
+        task.node_id == "FineTune" && task.status == ProcessUserTaskStatus::Open).unwrap();
+    let fine_command = stamp("accept real fine-tuning Work source");
+    let fine_ms = chrono::Utc::now().timestamp_millis();
+    let fine_plan = planned_completion(&after_service, &task.user_task_id,
+        &fine_command, &fine_outputs, fine_ms);
+    assert!(fine_plan.repetition_capacity.is_none());
+    repository::complete_user_task(&fixture.db, &fixture.owner, &fine_command,
+        &started.instance_id, &task.user_task_id, after_service.instance.revision,
+        &fine_outputs, None, repository::ProcessPlanInput::Supplied(&fine_plan),
+        fine_ms).unwrap();
+    let after_fine = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(after_fine.instance.variables["fine"], fine_outputs["fine"]);
+    let after_fine_retained = measured_retained_bytes(&fixture, &started.instance_id);
+    assert!(after_fine_retained <= RETAINED_LIMIT,
+        "the actual target group must open below the physical limit");
+    let target_group = after_fine.repetition_groups.iter().find(|group|
+        group.node_id == "ParallelManual_1").unwrap();
+    let target_open_bytes = physical_retained_bytes(&fixture, &target_group.group_id);
+    assert!(target_open_bytes > 0);
+    for prior in &after_service.repetition_groups {
+        let persisted = after_fine.repetition_groups.iter().find(|group|
+            group.group_id == prior.group_id).unwrap();
+        assert_eq!(persisted.retained_bytes, prior.retained_bytes,
+            "FineTune cannot change an already retained repetition group");
+        assert_eq!(physical_retained_bytes(&fixture, &prior.group_id), prior.retained_bytes);
+    }
+    assert_eq!(after_fine_retained, retained_before_service + target_open_bytes,
+        "the new parallel group alone must account for the physical retention increase");
+    assert_eq!(target_group.created_count, 2);
+    assert_eq!(target_group.mode,
+        tentaflow_protocol::processes::ProcessRepetitionGroupMode::MultiInstanceParallel);
+    let target_group_id = target_group.group_id.clone();
+    let first = after_fine.repetition_occurrences.iter().find(|row|
+        row.group_id == target_group_id && row.ordinal == 1).unwrap();
+    let first_task_id = first.user_task_id.as_ref().unwrap();
+    let first_command = stamp("accept higher parallel Manual ordinal first");
+    let first_ms = chrono::Utc::now().timestamp_millis();
+    let first_entry = super::manual_tests::manual_entry(&after_fine,
+        first_task_id, &first_command);
+    let first_plan = runtime::plan_manual_acknowledgment(&after_fine, first_task_id,
+        &fixture.owner.user_id, first_ms, first_entry.clone(), None).unwrap();
+    assert!(first_plan.repetition_capacity.is_none());
+    repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+        &first_command, &started.instance_id, first_task_id,
+        after_fine.instance.revision, repository::ProcessPlanInput::Supplied(&first_plan),
+        first_ms).unwrap();
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let after_higher_retained = measured_retained_bytes(&fixture, &started.instance_id);
+    assert!(after_higher_retained <= RETAINED_LIMIT,
+        "the actual first accepted target ordinal must remain below the physical limit");
+    assert!(physical_retained_bytes(&fixture, &target_group_id) > target_open_bytes,
+        "the first accepted target ordinal must add factual retained evidence");
+    let higher = snapshot.repetition_occurrences.iter().find(|row|
+        row.group_id == target_group_id && row.ordinal == 1).unwrap();
+    assert_eq!(higher.status, ProcessRepetitionOccurrenceStatus::Completed);
+    let higher_source = higher.accepted_source_event_id.as_ref().unwrap().clone();
+    let lower = snapshot.repetition_occurrences.iter().find(|row|
+        row.group_id == target_group_id && row.ordinal == 0).unwrap();
+    assert_eq!(lower.status, ProcessRepetitionOccurrenceStatus::Active);
+    let lower_task_id = lower.user_task_id.as_ref().unwrap();
+    let command = stamp("accept lower Manual last and deny parallel parent aggregate");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let canonical = runtime::plan_manual_acknowledgment(&snapshot, lower_task_id,
+        &fixture.owner.user_id, at_ms,
+        super::manual_tests::manual_entry(&snapshot, lower_task_id, &command),
+        None).unwrap();
+    let capacity = canonical.repetition_capacity.as_ref().expect("real parent aggregate denial");
+    assert_eq!(capacity.reason, "repetition_bytes");
+    assert_eq!(capacity.group_id, target_group_id);
+    assert!(matches!(&capacity.accepted_input,
+        repository::AcceptedInputRef::ManualAcknowledgment { task_id, .. }
+            if task_id == lower_task_id));
+    let lower_index = canonical.events.iter().position(|event|
+        event.kind == "manual_task_acknowledged").unwrap();
+    let lower_source = canonical.event_ids.get(&lower_index).unwrap();
+    assert_ne!(lower_source, &higher_source);
+    assert!(matches!(&capacity.denied_candidate,
+        Some(RepetitionDeniedBytes::ParentAggregate {
+            final_ordinal: Some(1), source_event_id: Some(source),
+        }) if source == &higher_source));
+    assert!(capacity.retained_before_closure_bytes <= RETAINED_LIMIT);
+    assert!(capacity.denied_candidate_bytes.unwrap() > RETAINED_LIMIT);
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len() + 2);
+    let mut wrong_ordinal = canonical.clone();
+    wrong_ordinal.repetition_capacity.as_mut().unwrap().denied_candidate =
+        Some(RepetitionDeniedBytes::ParentAggregate {
+            final_ordinal: Some(0), source_event_id: Some(higher_source.clone()),
+        });
+    let mut wrong_highest_source = canonical.clone();
+    wrong_highest_source.repetition_capacity.as_mut().unwrap().denied_candidate =
+        Some(RepetitionDeniedBytes::ParentAggregate {
+            final_ordinal: Some(1), source_event_id: Some(lower_source.clone()),
+        });
+    let mut wrong_accepted_input = canonical.clone();
+    wrong_accepted_input.repetition_capacity.as_mut().unwrap().accepted_input = first_entry;
+    let mut wrong_service_source = canonical.clone();
+    wrong_service_source.repetition_capacity.as_mut().unwrap().accepted_input =
+        repository::AcceptedInputRef::Service {
+            job_id: claim.job.job_id.clone(), attempt: claim.job.attempt,
+            fence: claim.job.fence, result_event_id: service_event_id.clone(),
+        };
+    for forged in [wrong_ordinal, wrong_highest_source, wrong_accepted_input,
+        wrong_service_source] {
+        assert!(repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+            &command, &started.instance_id, lower_task_id,
+            snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&forged),
+            at_ms).is_err());
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before);
+    }
+    repository::acknowledge_manual_task(&fixture.db, &fixture.owner,
+        &command, &started.instance_id, lower_task_id,
+        snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&canonical),
+        at_ms).unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    let final_group = persisted.repetition_groups.iter().find(|group|
+        group.group_id == target_group_id).unwrap();
+    assert_eq!(persisted.instance.status, ProcessInstanceStatus::Cancelled);
+    assert_eq!(final_group.status, ProcessRepetitionGroupStatus::Incident);
+    assert!(final_group.terminal_capacity);
+    assert_eq!(final_group.completed_count, 2);
+    assert!(persisted.repetition_occurrences.iter().any(|row|
+        row.group_id == target_group_id && row.ordinal == 0
+            && row.status == ProcessRepetitionOccurrenceStatus::Completed
+            && row.accepted_source_event_id.as_deref() == Some(lower_source.as_str())));
+    assert!(persisted.repetition_occurrences.iter().any(|row|
+        row.group_id == target_group_id && row.ordinal == 1
+            && row.status == ProcessRepetitionOccurrenceStatus::Completed
+            && row.accepted_source_event_id.as_deref() == Some(higher_source.as_str())));
+    assert!(persisted.user_tasks.iter().any(|row|
+        row.user_task_id == *lower_task_id && row.status == ProcessUserTaskStatus::Completed));
+    assert_eq!(event_data(&fixture, &started.instance_id, lower_source).0,
+        "manual_task_acknowledged");
+    assert_eq!(event_data(&fixture, &started.instance_id, &higher_source).0,
+        "manual_task_acknowledged");
+    assert_eq!(event_data(&fixture, &started.instance_id, &service_event_id).0,
+        "service_result");
+    assert!(!persisted.tokens.iter().any(|token| token.node_id == "End_1"));
+    let after = super::signal_proof_tests::all_transition_rows(&fixture);
+    repository::acknowledge_manual_task(&reopened, &fixture.owner,
+        &command, &started.instance_id, lower_task_id,
+        snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&canonical),
+        at_ms).unwrap();
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), after);
+}
+
 #[test]
 fn aggregate_limit_retains_two_accepted_sources_and_rejects_forged_finite_codes() {
     let fixture = Fixture::new();
@@ -487,7 +895,7 @@ fn aggregate_limit_retains_two_accepted_sources_and_rejects_forged_finite_codes(
             &command, &outputs, at_ms);
         if ordinal == 1 {
             let before = super::call_tests::transition_rows(&fixture);
-            assert_eq!(before.len(), 16);
+            assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
             for both_codes in [false, true] {
                 let mut forged = canonical.clone();
                 let blocked = forged.events.iter_mut().find(|event|
@@ -569,6 +977,14 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
             row.job_id.as_deref() == Some(claim.job.job_id.as_str())).unwrap();
         let service_job = waiting.jobs.iter().find(|job|
             job.job_id == claim.job.job_id).unwrap();
+        let observed_bytes: i64 = fixture.db.read().unwrap().query_row(
+            "SELECT length(CAST(observed_result_json AS BLOB)) FROM bpmn_service_invocations WHERE job_id=?1 AND phase='accepted'",
+            [&claim.job.job_id], |row| row.get(0)).unwrap();
+        assert!(observed_bytes > 0);
+        let service_group = waiting.repetition_groups.iter().find(|group|
+            group.group_id == service_occurrence.group_id).unwrap();
+        assert_eq!(service_group.retained_bytes,
+            physical_retained_bytes(&fixture, &service_group.group_id));
         assert_eq!(service_job.status, "completed");
         assert_eq!(service_occurrence.status,
             ProcessRepetitionOccurrenceStatus::AwaitingVerification);
@@ -602,7 +1018,7 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
         assert!(matches!(&capacity.accepted_input,
             repository::AcceptedInputRef::Human { .. }));
         let before = super::call_tests::transition_rows(&fixture);
-        assert_eq!(before.len(), 16);
+        assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
         let mut unrelated_verification = canonical.clone();
         unrelated_verification.complete_user_task_ids.push(verification_id.clone());
         assert_rejected_unchanged(&fixture, &started.instance_id, &waiting,
@@ -621,6 +1037,14 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
+        let retained_observation: String = reopened.read().unwrap().query_row(
+            "SELECT observed_result_json FROM bpmn_service_invocations WHERE job_id=?1 AND phase='accepted'",
+            [&claim.job.job_id], |row| row.get(0)).unwrap();
+        assert_eq!(i64::try_from(retained_observation.as_bytes().len()).unwrap(),
+            observed_bytes);
+        assert_eq!(persisted.repetition_groups.iter().find(|group|
+            group.group_id == service_group.group_id).unwrap().retained_bytes,
+            physical_retained_bytes(&fixture, &service_group.group_id));
         assert_eq!(persisted.instance.status, ProcessInstanceStatus::Cancelled);
         assert!(persisted.repetition_groups.iter().any(|group|
             group.group_id == capacity.group_id
@@ -658,6 +1082,504 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
     }
 }
 
+fn repeated_service_observation_graph(large_answer: bool) -> String {
+    let actual_result = if large_answer {
+        r#"{"outcome":"Completed","code":null,"summary":"accepted","outputs":{"answer":payload.padding},"evidence":[]}"#
+    } else {
+        r#"{"outcome":"Completed","code":null,"summary":"late original","outputs":{"answer":17},"evidence":[]}"#
+    };
+    let noise = if large_answer {
+        "[]"
+    } else {
+        "[payload.padding,payload.padding]"
+    };
+    assert!(actual_result.len() <= crate::flow_engine::expr::MAX_EXPR_CHARS);
+    assert!(noise.len() <= crate::flow_engine::expr::MAX_EXPR_CHARS);
+    json!({
+        "nodes":[{"id":"trigger","type":"trigger","config":{"output_mapping":{
+            "actual_result":actual_result,
+            "noise":noise
+        }}},{"id":"output","type":"output","config":{}}],
+        "edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}],
+        "variables":[{"name":"actual_result","type":"json"},
+            {"name":"noise","type":"json"}]
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn repeated_service_large_observation_uses_real_pinned_flow_input() {
+    for large_answer in [true, false] {
+        let fixture = Fixture::new();
+        let graph_json = repeated_service_observation_graph(large_answer);
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph_json);
+        let model = large_loop_with_repeated_service(&fixture.owner.user_id, &flow_id);
+        let started = start_model(&fixture, &model);
+        let worker = "large-observation-fixture-worker";
+        let claim =
+            repository::claim_job(&fixture.db, worker, chrono::Utc::now().timestamp_millis())
+                .unwrap()
+                .expect("real Service claim");
+        assert_eq!(claim.job.node_id, "RepeatedService");
+        assert_eq!(
+            claim.job.input["payload"]["padding"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .len(),
+            80_000
+        );
+        let observed =
+            super::repetition_service_tests::observed_flow_result(&fixture, &claim).await;
+        let bytes = serde_json::to_vec(&observed).unwrap().len();
+        assert!(
+            bytes > 300_000
+                && u64::try_from(bytes).unwrap() <= runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES,
+            "real pinned Flow observation has {bytes} bytes"
+        );
+        let executions: i64 = fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions WHERE request_id=?1",
+                [&claim.request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(executions, 1);
+        let persisted =
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+                .unwrap();
+        assert!(persisted
+            .service_dispatches
+            .iter()
+            .any(|dispatch| dispatch.job_id == claim.job.job_id && dispatch.phase == "observed"));
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let plan = runtime::test_support::plan_recorded_result(
+            &fixture, &claim, &observed, at_ms,
+        )
+        .unwrap();
+        assert!(plan.repetition_capacity.is_none());
+        repository::accept_job_result(
+            &fixture.db,
+            &fixture.owner,
+            &claim.job.job_id,
+            claim.job.attempt,
+            claim.job.fence,
+            worker,
+            &observed,
+            persisted.instance.revision,
+            repository::ProcessPlanInput::Supplied(&plan),
+            at_ms,
+        )
+        .unwrap();
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let accepted = repository::runtime_snapshot(
+            &reopened,
+            &fixture.owner,
+            &started.instance_id,
+        )
+        .unwrap();
+        let group = accepted
+            .repetition_groups
+            .iter()
+            .find(|group| group.node_id == "RepeatedService")
+            .unwrap();
+        assert_eq!(group.completed_count, 1);
+        assert_eq!(group.status, ProcessRepetitionGroupStatus::Completed);
+        assert_eq!(group.retained_bytes, physical_retained_bytes(&fixture, &group.group_id));
+        assert!(accepted.repetition_occurrences.iter().any(|occurrence|
+            occurrence.group_id == group.group_id
+                && occurrence.ordinal == 0
+                && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed
+                && occurrence.accepted_source_event_id.is_some()));
+        let executions: i64 = reopened.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM flow_executions WHERE request_id=?1",
+            [&claim.request_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(executions, 1);
+    }
+}
+
+#[tokio::test]
+async fn near_limit_repeated_service_retains_observation_through_accepted_capacity_latch() {
+    let fixture = Fixture::new();
+    let graph_json = repeated_service_observation_graph(true);
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph_json);
+    let mut model = large_loop_with_repeated_service(&fixture.owner.user_id, &flow_id);
+    model.variables.insert("service_items".into(), json!(["observed", "next"]));
+    let started = start_model(&fixture, &model);
+    let mut work_completions = 0;
+    loop {
+        let retained = measured_retained_bytes(&fixture, &started.instance_id);
+        let slack = RETAINED_LIMIT.checked_sub(retained).unwrap();
+        if slack <= 550_000 { break; }
+        assert!(work_completions < 160, "real Work history did not approach the byte boundary");
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let (_, ordinal, task_id) = open_work(&snapshot);
+        let command = stamp("retain real Work history before Service dispatch");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let wanted = usize::try_from(slack.saturating_sub(500_000)).unwrap()
+            .saturating_sub(150_000).min(240_000);
+        let large = json!({"next_step":ordinal + 1,"evidence":"x".repeat(wanted)});
+        let large_plan = planned_completion(&snapshot, &task_id, &command, &large, at_ms);
+        let small = json!({"next_step":ordinal + 1});
+        let small_plan = planned_completion(&snapshot, &task_id, &command, &small, at_ms);
+        let (outputs, plan) = if large_plan.repetition_capacity.is_none() {
+            (&large, &large_plan)
+        } else {
+            assert!(small_plan.repetition_capacity.is_none(),
+                "Service reservation must not strand a factual small Work completion");
+            (&small, &small_plan)
+        };
+        repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+            &started.instance_id, &task_id, snapshot.instance.revision,
+            outputs, None, repository::ProcessPlanInput::Supplied(plan), at_ms).unwrap();
+        work_completions += 1;
+    }
+    let retained_before = measured_retained_bytes(&fixture, &started.instance_id);
+    assert!(RETAINED_LIMIT - retained_before <= 550_000);
+    let worker = "near-limit-repeated-service-worker";
+    let claim = repository::claim_job(&fixture.db, worker,
+        chrono::Utc::now().timestamp_millis()).unwrap().expect("factual Service claim");
+    assert_eq!(claim.job.node_id, "RepeatedService");
+    let observed = super::repetition_service_tests::observed_flow_result(&fixture, &claim).await;
+    let observed_bytes = u64::try_from(serde_json::to_vec(&observed).unwrap().len()).unwrap();
+    assert!(observed_bytes > 300_000
+        && observed_bytes <= runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES);
+    let after_observation = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let service_group = after_observation.repetition_groups.iter().find(|group|
+        group.node_id == "RepeatedService").unwrap();
+    assert_eq!(service_group.total_count, Some(2));
+    assert_eq!(service_group.retained_bytes,
+        physical_retained_bytes(&fixture, &service_group.group_id));
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let canonical = runtime::test_support::plan_recorded_result(&fixture, &claim,
+        &observed, at_ms).unwrap();
+    let capacity = canonical.repetition_capacity.as_ref()
+        .expect("accepted result must close the measured near-limit repetition");
+    assert_eq!(capacity.reason, "repetition_bytes");
+    assert_eq!(capacity.group_id, service_group.group_id);
+    let source_index = canonical.events.iter().position(|event|
+        event.kind == "service_result" && event.node_id.as_deref() == Some("RepeatedService"))
+        .expect("accepted Service result event");
+    let source_id = canonical.event_ids.get(&source_index).unwrap();
+    let occurrence = after_observation.repetition_occurrences.iter().find(|row|
+        row.group_id == service_group.group_id && row.ordinal == 0).unwrap();
+    if capacity.retained_before_closure_bytes > RETAINED_LIMIT {
+        assert!(capacity.denied_candidate.is_none());
+        assert!(capacity.denied_candidate_bytes.is_none());
+    } else {
+        assert!(matches!(&capacity.denied_candidate,
+            Some(RepetitionDeniedBytes::AcceptedMapping {
+                occurrence_id, accepted_source_event_id,
+            }) if occurrence_id == &occurrence.occurrence_id
+                && accepted_source_event_id == source_id));
+        assert!(capacity.denied_candidate_bytes.unwrap() > RETAINED_LIMIT);
+    }
+    let before = super::call_tests::transition_rows(&fixture);
+    let mut forged = canonical.clone();
+    forged.repetition_capacity.as_mut().unwrap().retained_before_closure_bytes += 1;
+    assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before);
+    repository::accept_job_result(&fixture.db, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    let group = persisted.repetition_groups.iter().find(|group|
+        group.group_id == service_group.group_id).unwrap();
+    assert_eq!(group.status, ProcessRepetitionGroupStatus::Incident);
+    assert!(group.terminal_capacity);
+    assert_eq!(group.completed_count, 0);
+    assert_eq!(group.retained_bytes, physical_retained_bytes(&fixture, &group.group_id));
+    let closure_bytes = u64::try_from(serde_json::to_vec(
+        &canonical.events[capacity.event_index].data).unwrap().len()).unwrap()
+        + u64::try_from(canonical.add_incidents.iter().find(|incident|
+            incident.incident_id == capacity.incident_id).unwrap().message.len()).unwrap();
+    assert_eq!(measured_retained_bytes(&fixture, &started.instance_id)
+        .checked_sub(closure_bytes), Some(capacity.retained_before_closure_bytes));
+    let accepted = persisted.repetition_occurrences.iter().find(|row|
+        row.group_id == group.group_id && row.ordinal == 0).unwrap();
+    assert_eq!(accepted.status, ProcessRepetitionOccurrenceStatus::AcceptedBlocked);
+    assert_eq!(accepted.accepted_source_event_id.as_deref(), Some(source_id.as_str()));
+    assert!(accepted.accepted_origin.is_some());
+    assert!(accepted.aggregate_item.is_none());
+    let (service_results, occurrence_completions): (i64, i64) = reopened.read().unwrap()
+        .query_row("SELECT
+            (SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND kind='service_result'
+                AND node_id='RepeatedService' AND event_id=?2),
+            (SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1
+                AND kind='repetition_occurrence_completed' AND node_id='RepeatedService')",
+            rusqlite::params![started.instance_id, source_id],
+            |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(service_results, 1);
+    assert_eq!(occurrence_completions, 0);
+    let raw: String = reopened.read().unwrap().query_row(
+        "SELECT observed_result_json FROM bpmn_service_invocations WHERE job_id=?1 AND phase='accepted'",
+        [&claim.job.job_id], |row| row.get(0)).unwrap();
+    assert_eq!(u64::try_from(raw.as_bytes().len()).unwrap(), observed_bytes);
+    assert!(!persisted.repetition_occurrences.iter().any(|row|
+        row.group_id == group.group_id && row.ordinal > 0));
+    assert_eq!(persisted.repetition_occurrences.iter().filter(|row|
+        row.group_id == group.group_id).count(), 1);
+    let service_jobs: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1 AND node_id='RepeatedService'",
+        [&started.instance_id], |row| row.get(0)).unwrap();
+    assert_eq!(service_jobs, 1);
+    assert!(repository::claim_job(&reopened, "after-service-capacity-latch",
+        chrono::Utc::now().timestamp_millis()).unwrap().is_none());
+    let committed = super::call_tests::transition_rows(&fixture);
+    repository::accept_job_result(&reopened, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&canonical), at_ms).unwrap();
+    assert_eq!(super::call_tests::transition_rows(&fixture), committed);
+    let executions: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM flow_executions WHERE flow_id=?1",
+        [&flow_id], |row| row.get(0)).unwrap();
+    assert_eq!(executions, 1);
+}
+
+#[tokio::test]
+async fn near_limit_completed_service_denies_only_the_next_factual_ordinal() {
+    let fixture = Fixture::new();
+    let graph_json = repeated_service_observation_graph(true);
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph_json);
+    let mut model = large_loop_with_repeated_service(&fixture.owner.user_id, &flow_id);
+    model.variables.insert("service_items".into(), json!(["observed", "next"]));
+    let started = start_model(&fixture, &model);
+    let mut work_completions = 0;
+    loop {
+        let slack = RETAINED_LIMIT - measured_retained_bytes(&fixture, &started.instance_id);
+        if slack <= 1_100_000 { break; }
+        assert!(work_completions < 140, "real Work history did not approach Service capacity");
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let (_, ordinal, task_id) = open_work(&snapshot);
+        let command = stamp("retain Work before completed Service capacity probe");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let wanted = usize::try_from(slack.saturating_sub(1_050_000)).unwrap()
+            .saturating_sub(150_000).min(240_000);
+        let large = json!({"next_step":ordinal + 1,"evidence":"x".repeat(wanted)});
+        let large_plan = planned_completion(&snapshot, &task_id, &command, &large, at_ms);
+        let small = json!({"next_step":ordinal + 1});
+        let small_plan = planned_completion(&snapshot, &task_id, &command, &small, at_ms);
+        let (outputs, plan) = if large_plan.repetition_capacity.is_none() {
+            (&large, &large_plan)
+        } else {
+            assert!(small_plan.repetition_capacity.is_none());
+            (&small, &small_plan)
+        };
+        repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+            &started.instance_id, &task_id, snapshot.instance.revision,
+            outputs, None, repository::ProcessPlanInput::Supplied(plan), at_ms).unwrap();
+        work_completions += 1;
+    }
+    let worker = "completed-service-capacity-worker";
+    let claim = repository::claim_job(&fixture.db, worker,
+        chrono::Utc::now().timestamp_millis()).unwrap().expect("factual Service claim");
+    assert_eq!(claim.job.node_id, "RepeatedService");
+    let observed = super::repetition_service_tests::observed_flow_result(&fixture, &claim).await;
+    let observed_bytes = u64::try_from(serde_json::to_vec(&observed).unwrap().len()).unwrap();
+    assert!(observed_bytes > 300_000
+        && observed_bytes <= runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES);
+
+    let mut canonical;
+    let mut canonical_at_ms;
+    loop {
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        assert!(repository::renew_job_lease(&fixture.db, &claim.job.job_id,
+            claim.job.attempt, claim.job.fence, worker, at_ms).unwrap(),
+            "the original observed Service lease must remain fenced during calibration");
+        canonical = runtime::test_support::plan_recorded_result(&fixture, &claim,
+            &observed, at_ms).unwrap();
+        canonical_at_ms = at_ms;
+        if let Some(capacity) = &canonical.repetition_capacity {
+            assert!(matches!(&capacity.denied_candidate,
+                Some(RepetitionDeniedBytes::Occurrence { ordinal: 1 })),
+                "real calibration passed the completed first ordinal's next-work window: {:?}",
+                capacity.denied_candidate);
+            break;
+        }
+        assert!(work_completions < 160,
+            "factual Work completions did not reach the next-Service admission boundary");
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let (_, ordinal, task_id) = open_work(&snapshot);
+        let command = stamp("measure completed Service next-ordinal admission");
+        let outputs = json!({"next_step":ordinal + 1,"evidence":"x".repeat(4_096)});
+        let work_plan = planned_completion(&snapshot, &task_id, &command, &outputs, at_ms);
+        assert!(work_plan.repetition_capacity.is_none(),
+            "Work completion must not own the Service capacity latch");
+        repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+            &started.instance_id, &task_id, snapshot.instance.revision,
+            &outputs, None, repository::ProcessPlanInput::Supplied(&work_plan), at_ms).unwrap();
+        work_completions += 1;
+    }
+    let after_observation = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let service_group = after_observation.repetition_groups.iter().find(|group|
+        group.node_id == "RepeatedService").unwrap();
+    let capacity = canonical.repetition_capacity.as_ref().unwrap();
+    assert_eq!(capacity.reason, "repetition_bytes");
+    assert_eq!(capacity.group_id, service_group.group_id);
+    assert!(capacity.retained_before_closure_bytes <= RETAINED_LIMIT);
+    assert!(capacity.denied_candidate_bytes.unwrap() > RETAINED_LIMIT);
+    assert_eq!(service_group.retained_bytes,
+        physical_retained_bytes(&fixture, &service_group.group_id));
+    let source_index = canonical.events.iter().position(|event|
+        event.kind == "service_result" && event.node_id.as_deref() == Some("RepeatedService"))
+        .unwrap();
+    let source_id = canonical.event_ids.get(&source_index).unwrap();
+    let before = super::call_tests::transition_rows(&fixture);
+    let mut forged = canonical.clone();
+    forged.repetition_capacity.as_mut().unwrap().denied_candidate =
+        Some(RepetitionDeniedBytes::Occurrence { ordinal: 0 });
+    assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&forged), canonical_at_ms).is_err());
+    assert_eq!(super::call_tests::transition_rows(&fixture), before);
+    repository::accept_job_result(&fixture.db, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&canonical), canonical_at_ms).unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    let group = persisted.repetition_groups.iter().find(|group|
+        group.group_id == service_group.group_id).unwrap();
+    assert_eq!(group.status, ProcessRepetitionGroupStatus::Incident);
+    assert!(group.terminal_capacity);
+    assert_eq!(group.completed_count, 1);
+    assert_eq!(group.retained_bytes, physical_retained_bytes(&fixture, &group.group_id));
+    let closure_bytes = u64::try_from(serde_json::to_vec(
+        &canonical.events[capacity.event_index].data).unwrap().len()).unwrap()
+        + u64::try_from(canonical.add_incidents.iter().find(|incident|
+            incident.incident_id == capacity.incident_id).unwrap().message.len()).unwrap();
+    assert_eq!(measured_retained_bytes(&fixture, &started.instance_id)
+        .checked_sub(closure_bytes), Some(capacity.retained_before_closure_bytes));
+    let first = persisted.repetition_occurrences.iter().find(|row|
+        row.group_id == group.group_id && row.ordinal == 0).unwrap();
+    assert_eq!(first.status, ProcessRepetitionOccurrenceStatus::Completed);
+    assert_eq!(first.accepted_source_event_id.as_deref(), Some(source_id.as_str()));
+    assert!(!persisted.repetition_occurrences.iter().any(|row|
+        row.group_id == group.group_id && row.ordinal > 0));
+    let raw: String = reopened.read().unwrap().query_row(
+        "SELECT observed_result_json FROM bpmn_service_invocations WHERE job_id=?1 AND phase='accepted'",
+        [&claim.job.job_id], |row| row.get(0)).unwrap();
+    assert_eq!(u64::try_from(raw.as_bytes().len()).unwrap(), observed_bytes);
+    let jobs: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1 AND node_id='RepeatedService'",
+        [&started.instance_id], |row| row.get(0)).unwrap();
+    assert_eq!(jobs, 1);
+    assert!(repository::claim_job(&reopened, "after-next-Service-denial",
+        chrono::Utc::now().timestamp_millis()).unwrap().is_none());
+    let executions: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM flow_executions WHERE request_id=?1",
+        [&claim.request_id], |row| row.get(0)).unwrap();
+    assert_eq!(executions, 1);
+    let committed = super::call_tests::transition_rows(&fixture);
+    repository::accept_job_result(&reopened, &fixture.owner,
+        &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+        &observed, after_observation.instance.revision,
+        repository::ProcessPlanInput::Supplied(&canonical), canonical_at_ms).unwrap();
+    assert_eq!(super::call_tests::transition_rows(&fixture), committed);
+}
+
+#[tokio::test]
+async fn near_limit_cancelled_repeated_service_retains_late_original_observation() {
+    let fixture = Fixture::new();
+    let graph_json = repeated_service_observation_graph(false);
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph_json);
+    let model = large_loop_with_repeated_service(&fixture.owner.user_id, &flow_id);
+    let started = start_model(&fixture, &model);
+    let mut work_completions = 0;
+    loop {
+        let retained = measured_retained_bytes(&fixture, &started.instance_id);
+        let slack = RETAINED_LIMIT.checked_sub(retained).unwrap();
+        if slack <= 550_000 { break; }
+        assert!(work_completions < 160, "real Work history did not approach the byte boundary");
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let (_, ordinal, task_id) = open_work(&snapshot);
+        let command = stamp("retain Work before late original Service observation");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let wanted = usize::try_from(slack.saturating_sub(500_000)).unwrap()
+            .saturating_sub(150_000).min(240_000);
+        let large = json!({"next_step":ordinal + 1,"evidence":"x".repeat(wanted)});
+        let large_plan = planned_completion(&snapshot, &task_id, &command, &large, at_ms);
+        let small = json!({"next_step":ordinal + 1});
+        let small_plan = planned_completion(&snapshot, &task_id, &command, &small, at_ms);
+        let (outputs, plan) = if large_plan.repetition_capacity.is_none() {
+            (&large, &large_plan)
+        } else {
+            assert!(small_plan.repetition_capacity.is_none(),
+                "the original observation reservation must preserve a small Work continuation");
+            (&small, &small_plan)
+        };
+        repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+            &started.instance_id, &task_id, snapshot.instance.revision,
+            outputs, None, repository::ProcessPlanInput::Supplied(plan), at_ms).unwrap();
+        work_completions += 1;
+    }
+    let retained_before = measured_retained_bytes(&fixture, &started.instance_id);
+    assert!(RETAINED_LIMIT - retained_before <= 550_000);
+    let worker = "late-original-near-limit-worker";
+    let claim = repository::claim_job(&fixture.db, worker,
+        chrono::Utc::now().timestamp_millis()).unwrap().expect("factual Service claim");
+    assert_eq!(claim.job.node_id, "RepeatedService");
+    let original = super::repetition_service_tests::original_flow_result(&fixture, &claim).await;
+    let original_bytes = u64::try_from(serde_json::to_vec(&original).unwrap().len()).unwrap();
+    assert!(original_bytes > 300_000
+        && original_bytes <= runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES);
+    let before_cancel = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    repository::cancel_instance(&fixture.db, &fixture.owner,
+        &stamp("close committed near-limit Service activation"),
+        &started.instance_id, before_cancel.instance.revision).unwrap();
+    let cancelled = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(cancelled.instance.status, ProcessInstanceStatus::Cancelled);
+    assert_eq!(repository::record_job_observation(&fixture.db, &claim, worker,
+        &original, chrono::Utc::now().timestamp_millis()).unwrap(),
+        repository::JobObservationState::Blocked);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(persisted.instance.status, ProcessInstanceStatus::Cancelled);
+    let group = persisted.repetition_groups.iter().find(|group|
+        group.node_id == "RepeatedService").unwrap();
+    assert_eq!(group.retained_bytes, physical_retained_bytes(&fixture, &group.group_id));
+    assert!(measured_retained_bytes(&fixture, &started.instance_id) <= RETAINED_LIMIT);
+    let raw: String = reopened.read().unwrap().query_row(
+        "SELECT observed_result_json FROM bpmn_service_invocations WHERE job_id=?1 AND phase='observed_blocked'",
+        [&claim.job.job_id], |row| row.get(0)).unwrap();
+    assert_eq!(raw.as_bytes(), serde_json::to_string(&original).unwrap().as_bytes());
+    assert_eq!(repository::record_job_observation(&reopened, &claim, worker,
+        &original, chrono::Utc::now().timestamp_millis()).unwrap(),
+        repository::JobObservationState::Blocked);
+    assert_eq!(group.retained_bytes, physical_retained_bytes(&fixture, &group.group_id));
+    let service_results: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND kind='service_result' AND node_id='RepeatedService'",
+        [&started.instance_id], |row| row.get(0)).unwrap();
+    assert_eq!(service_results, 0);
+    let executions: i64 = reopened.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM flow_executions WHERE flow_id=?1",
+        [&flow_id], |row| row.get(0)).unwrap();
+    assert_eq!(executions, 1);
+}
+
 #[test]
 fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     let fixture = Fixture::new();
@@ -667,7 +1589,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     model.nodes.push(ProcessNode { id: "Manual".into(), name: "Inspect external work".into(),
         kind: ProcessNodeKind::ManualTask { assignee_user_id: None,
             instructions: "Inspect the physical item before acknowledging it.".into() },
-        repeat: None });
+        repeat: None, activity_io: None,});
     model.sequence_flows.push(edge("OuterToManual", "OuterSplit", "Manual"));
     model.sequence_flows.push(edge("ManualToOuterJoin", "Manual", "OuterJoin"));
     let version = publish_model(&fixture, &model);
@@ -675,20 +1597,20 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let start_command = stamp("start manual sibling capacity");
     let start_ms = chrono::Utc::now().timestamp_millis();
-    let start_plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let start_plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), runtime::StartCause::Manual,
         start_ms, manual_input(&start_command), None).unwrap();
     let occurrence_event = start_plan.events.iter().find(|event|
         event.kind == "repetition_occurrence_started").unwrap();
     let occurrence_token_id = occurrence_event.data["token_id"].as_str().unwrap().to_owned();
     let before_start = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before_start.len(), 16);
+    assert_eq!(before_start.len(), super::call_tests::TRANSITION_TABLES.len());
     let mut wrong_start_source = start_plan.clone();
     wrong_start_source.events.iter_mut().find(|event|
         event.kind == "repetition_occurrence_started").unwrap().data["token_id"] =
             json!(Uuid::new_v4().to_string());
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables,
+        &instance_id, &version.definition_id, version.version, &variables, None, None,
         repository::ProcessPlanInput::Supplied(&wrong_start_source), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let manual_wait_id = start_plan.create_user_tasks.iter().find(|task|
@@ -696,18 +1618,18 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     let mut wrong_parent = start_plan.clone();
     wrong_parent.token_sources.insert(occurrence_token_id.clone(), manual_wait_id);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables,
+        &instance_id, &version.definition_id, version.version, &variables, None, None,
         repository::ProcessPlanInput::Supplied(&wrong_parent), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let mut wrong_ready = start_plan.clone();
     wrong_ready.create_tokens.iter_mut().find(|token|
         token.token_id == occurrence_token_id).unwrap().status = "waiting".into();
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables,
+        &instance_id, &version.definition_id, version.version, &variables, None, None,
         repository::ProcessPlanInput::Supplied(&wrong_ready), start_ms).is_err());
     assert_eq!(super::call_tests::transition_rows(&fixture), before_start);
     let started = repository::start_instance(&fixture.db, &fixture.owner, &start_command,
-        &instance_id, &version.definition_id, version.version, &variables,
+        &instance_id, &version.definition_id, version.version, &variables, None, None,
         repository::ProcessPlanInput::Supplied(&start_plan), start_ms).unwrap();
     let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();
@@ -753,7 +1675,7 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     assert_eq!((opened, acknowledged), (1,0));
     drop(conn);
     let before = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before.len(), 16);
+    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     assert!(repository::acknowledge_manual_task(&reopened, &fixture.owner,
         &manual_command, &started.instance_id, &manual_id, snapshot.instance.revision,
         repository::ProcessPlanInput::Supplied(&manual_plan), at_ms).is_err());
@@ -762,4 +1684,70 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
         &gate_command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
         &gate_outputs, None, repository::ProcessPlanInput::Supplied(&gate_plan), at_ms).unwrap();
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
+}
+
+#[test]
+fn active_occurrence_capacity_closes_repeated_manual_tasks_without_acknowledgment() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("repeated manual capacity", None));
+    let mut model = verification_capacity_model(&fixture.owner.user_id, &flow_id, false);
+    for node in model.nodes.iter_mut().filter(|node| node.id.starts_with("HumanRepeat_")) {
+        node.kind = ProcessNodeKind::ManualTask {
+            assignee_user_id: Some(fixture.owner.user_id.clone()),
+            instructions: "Inspect each physical item before acknowledging it.".into(),
+        };
+    }
+    model.sequence_flows.retain(|flow|
+        flow.id != "InnerBranch_0" && flow.id != "InnerReturn_0");
+    model.sequence_flows.push(edge("OuterToManual_0", "OuterSplit", "HumanRepeat_0"));
+    model.sequence_flows.push(edge("Manual_0ToOuter", "HumanRepeat_0", "OuterJoin"));
+    let started = start_model(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let manual_ids: BTreeSet<String> = snapshot.user_tasks.iter()
+        .filter(|task| task.kind == ProcessUserTaskKind::Manual
+            && task.node_id == "HumanRepeat_0"
+            && task.status == ProcessUserTaskStatus::Open)
+        .map(|task| task.user_task_id.clone()).collect();
+    assert_eq!(manual_ids.len(), 16, "the direct branch must open 16 distinct Manual waits");
+    assert_eq!(snapshot.user_tasks.iter().filter(|task|
+        task.kind == ProcessUserTaskKind::Manual).count(), 16);
+    let gate = snapshot.user_tasks.iter().find(|task|
+        task.node_id == "GateHuman" && task.status == ProcessUserTaskStatus::Open).unwrap();
+    let command = stamp("release actual repeated Manual capacity");
+    let outputs = json!({"gate":"approved"});
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let plan = planned_completion(&snapshot, &gate.user_task_id, &command, &outputs, at_ms);
+    let capacity = plan.repetition_capacity.as_ref().expect("real 65th active ordinal denial");
+    assert_eq!(capacity.reason, "active_occurrences");
+    let before = super::signal_proof_tests::all_transition_rows(&fixture);
+    let mut forged = plan.clone();
+    forged.repetition_capacity.as_mut().unwrap().group_id = Uuid::new_v4().to_string();
+    assert!(repository::complete_user_task(&fixture.db, &fixture.owner,
+        &command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
+        &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), before);
+    repository::complete_user_task(&fixture.db, &fixture.owner,
+        &command, &started.instance_id, &gate.user_task_id, snapshot.instance.revision,
+        &outputs, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(persisted.instance.status, ProcessInstanceStatus::Cancelled);
+    assert!(persisted.repetition_groups.iter().any(|group|
+        group.group_id == capacity.group_id && group.terminal_capacity));
+    let persisted_manual: Vec<_> = persisted.user_tasks.iter().filter(|task|
+        task.kind == ProcessUserTaskKind::Manual).collect();
+    assert_eq!(persisted_manual.len(), manual_ids.len());
+    assert_eq!(persisted_manual.iter().map(|task| task.user_task_id.clone())
+        .collect::<BTreeSet<_>>(), manual_ids);
+    assert!(persisted_manual.iter().all(|task|
+        task.status == ProcessUserTaskStatus::Cancelled));
+    let (opened, acknowledged): (i64, i64) = reopened.read().unwrap().query_row(
+        "SELECT SUM(kind='manual_task_opened'),SUM(kind='manual_task_acknowledged') \
+         FROM bpmn_events WHERE instance_id=?1",
+        [&started.instance_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert!(opened > 0);
+    assert_eq!(opened, 16);
+    assert_eq!(acknowledged, 0);
 }

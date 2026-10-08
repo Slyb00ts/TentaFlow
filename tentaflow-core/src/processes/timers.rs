@@ -5,14 +5,14 @@ use chrono::{DateTime, Days, Duration, LocalResult, NaiveDate, Offset, TimeZone,
 use chrono_tz::Tz;
 use serde_json::json;
 use tentaflow_protocol::processes::{
-    ProcessCalendarPin, ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus,
+    ProcessCalendarPin, ProcessNodeKind, ProcessTimerKind, ProcessTimerSpec, ProcessTimerStatus,
 };
 use uuid::Uuid;
 
 use super::repository::{
     self, CancelledJobClaim, PlannedEvent, ProcessTimer, RuntimePlan, TimerSnapshot, TimerUpdate,
 };
-use super::runtime::{self, StartCause};
+use super::runtime::{self, RuntimeIdSourceHandle, StartCause};
 use crate::db::DbPool;
 use crate::project_studio::schedules::{compute_next_run, parse_timezone};
 
@@ -372,6 +372,7 @@ pub fn next_timer_occurrence(
 
 pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
     signal_admission: Option<&runtime::SignalAdmissionResolver<'_>>,
+    id_source: Option<RuntimeIdSourceHandle>,
 ) -> Result<RuntimePlan> {
     let timer = match snapshot {
         TimerSnapshot::Start { timer, .. }
@@ -384,12 +385,27 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
             &snapshot.model
         }
     };
+    let calendar_pin = if timer.kind == ProcessTimerKind::Start {
+        let process_id = timer.start_process_id.as_deref()
+            .context("start timer lacks its pinned process ID")?;
+        if process_id == model.process_id {
+            model.calendar_pin.as_ref()
+        } else {
+            model.additional_processes.iter()
+                .find(|body| body.process_id == process_id)
+                .context("start timer selected process is outside its pinned version")?
+                .calendar_pin.as_ref()
+        }
+    } else {
+        model.calendar_pin.as_ref()
+    };
     let advance = next_timer_occurrence(
         timer,
         at_ms,
         TimerAdvanceMode::Fire,
-        model.calendar_pin.as_ref(),
+        calendar_pin,
     )?;
+    let id_source = id_source.unwrap_or_else(runtime::random_runtime_id_source);
     let mut plan = match snapshot {
         TimerSnapshot::Start {
             actor,
@@ -397,13 +413,21 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
             version,
         } => {
             let instance_id = Uuid::new_v4().to_string();
+            let process_id = timer.start_process_id.as_deref()
+                .context("start timer lacks its pinned process ID")?;
+            let body = super::model::selected_body(&version.model, process_id, &[])?;
+            let start = body.nodes.iter().find(|node| node.id == timer.node_id
+                && matches!(node.kind, ProcessNodeKind::TimerStart { .. }))
+                .context("start timer node differs from its pinned process")?;
             runtime::plan_start(
                 &version.model,
+                process_id,
+                &start.id,
                 &instance_id,
                 actor,
                 &timer.definition_id,
                 timer.version,
-                serde_json::to_value(&version.model.variables)?,
+                serde_json::to_value(body.variables)?,
                 StartCause::Timer {
                     timer_id: timer.timer_id.clone(),
                     occurrence: advance.selected_occurrence,
@@ -423,7 +447,7 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
                 timer_id: timer.timer_id.clone(),
                 expected_timer_revision: timer.revision,
                 fired_occurrence: advance.selected_occurrence,
-            }, signal_admission)?,
+            }, signal_admission, id_source.clone())?,
         TimerSnapshot::Boundary {
             timer, snapshot, ..
         } => runtime::plan_timer_boundary(snapshot, timer, at_ms,
@@ -455,9 +479,10 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
         event.data["working_time"] = serde_json::to_value(working_time)?;
         event.data["timezone"] = json!(timer.timezone);
     }
-    if let TimerSnapshot::Boundary { snapshot, .. } = snapshot {
+    let timer_event_index = if let TimerSnapshot::Boundary { snapshot, .. } = snapshot {
         let node = super::repository::scope_node(
             &snapshot.model,
+            &snapshot.instance.process_id,
             &snapshot.scopes,
             &snapshot.instance.instance_id,
             timer
@@ -511,9 +536,25 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
         for message in &mut plan.create_messages {
             message.source_event_index += 1;
         }
+        for closed in &mut plan.closed_service_dispatches {
+            closed.event_index += 1;
+        }
+        0
     } else {
         plan.events.push(event);
-    }
+        plan.events.len() - 1
+    };
+    let timer_event_id = id_source.borrow_mut().next_id("runtime");
+    ensure!(
+        id_source.borrow().error().is_none(),
+        "timer event identifier allocation failed"
+    );
+    ensure!(
+        plan.event_ids
+            .insert(timer_event_index, timer_event_id)
+            .is_none(),
+        "timer event identifier was already assigned"
+    );
     plan.timer_updates.push(TimerUpdate {
         timer_id: timer.timer_id.clone(),
         expected_revision: timer.revision,
@@ -605,6 +646,13 @@ mod tests {
         ProcessNodeKind, ProcessUserTaskStatus,
     };
 
+    fn only_persisted_timer(catalog: Vec<tentaflow_protocol::processes::ProcessStartCatalogEntry>) -> tentaflow_protocol::processes::ProcessTimerSummary {
+        let [entry] = catalog.as_slice() else { panic!("one TimerStart expected") };
+        let tentaflow_protocol::processes::ProcessStartTrigger::TimerStart { persisted_timer: Some(timer), .. } = &entry.trigger
+        else { panic!("persisted TimerStart expected") };
+        timer.clone()
+    }
+
     fn at(text: &str) -> i64 {
         DateTime::parse_from_rfc3339(text)
             .unwrap()
@@ -624,6 +672,7 @@ mod tests {
             org_id: Uuid::new_v4().to_string(),
             definition_id: Uuid::new_v4().to_string(),
             version: 1,
+            start_process_id: Some("Process_1".into()),
             node_id: "Start_1".into(),
             kind: ProcessTimerKind::Start,
             instance_id: None,
@@ -654,6 +703,7 @@ mod tests {
                 name: "Wait for the due instant".into(),
                 kind: ProcessNodeKind::TimerCatch { timer: rule },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -682,30 +732,34 @@ mod tests {
                 message_ref: "ThrowDecl".into(),
                 target: ProcessMessageTargetSpec::Start {
                     definition_id: receiver.definition_id,
+                    process_id: None,
+                    start_node_id: None,
                 },
                 correlation_expression: "'case-1'".into(),
                 payload_expression: "{'customer_ID': 23}".into(),
                 ttl_seconds: 120,
             },
             repeat: None,
+            activity_io: None,
         });
         let body = tentaflow_protocol::processes::ProcessSubProcess {
             nodes: vec![
                 ProcessNode { id: "ChildStart".into(), name: "Enter child".into(),
                     kind: ProcessNodeKind::Start,
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "ChildTerminate".into(), name: "Terminate child".into(),
                     kind: ProcessNodeKind::TerminateEnd,
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
             ],
             sequence_flows: vec![edge("ChildToTerminate", "ChildStart", "ChildTerminate")],
             variables: BTreeMap::new(),
             diagram: Default::default(),
+            modeling: None,
         };
         model.nodes.push(ProcessNode { id: "Scope".into(), name: "Timer child".into(),
             kind: ProcessNodeKind::SubProcess { body,
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new() },
-            repeat: None, });
+            repeat: None,   activity_io: None,});
         model.sequence_flows.iter_mut().find(|flow| flow.id == "From_Limit")
             .unwrap().target_id = "Throw".into();
         model.sequence_flows.push(edge("ThrowScope", "Throw", "Scope"));
@@ -719,7 +773,7 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap()
             .into_iter().find(|timer| timer.timer_id == before.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None, None).unwrap();
         assert_eq!(plan.events[0].kind, "timer_fired");
         assert_eq!(plan.create_messages.len(), 1);
         let queued_index = plan.create_messages[0].source_event_index;
@@ -766,7 +820,7 @@ mod tests {
         let variables = serde_json::to_value(&model.variables).unwrap();
         let command = stamp("timed manual start");
         let plan = runtime::plan_start(
-            &version.model,
+            &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
             &id,
             &fixture.owner,
             &version.definition_id,
@@ -784,7 +838,7 @@ mod tests {
             &id,
             &version.definition_id,
             version.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
@@ -804,7 +858,7 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None, None).unwrap();
         use tentaflow_protocol::processes::{ProcessEventRaceStatus as R, ProcessSubscriptionStatus as S};
         assert_eq!(plan.race_updates.len(), 1);
         assert_eq!(plan.race_updates[0].status, R::Won);
@@ -862,11 +916,11 @@ mod tests {
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Concurrent paths".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "SideWork".into(), name: "Independent open work".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
                     output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"),
@@ -886,7 +940,7 @@ mod tests {
         let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == started.timers[0].timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None, None).unwrap();
         assert!(repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
             Some(started.revision), repository::ProcessPlanInput::Supplied(&plan), due).unwrap().is_some());
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id).unwrap();
@@ -915,7 +969,7 @@ mod tests {
             .find(|candidate| candidate.timer_id == started.timers.iter()
                 .find(|timer| timer.node_id == "Timer_1").unwrap().timer_id).unwrap();
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None, None).unwrap();
         use tentaflow_protocol::processes::ProcessEventRaceStatus as R;
         assert_eq!(plan.race_updates.len(), 2);
         assert!(plan.race_updates.iter().any(|update| update.race_id == first.race_id && update.status == R::Won));
@@ -1187,17 +1241,16 @@ mod tests {
         };
         let version = publish_model(&fixture, &model);
         let summary =
-            repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
+            only_persisted_timer(repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
                 .unwrap()
-                .1
-                .unwrap();
+                .1);
         let first_due = summary.due_at_ms.unwrap();
         let at_ms = first_due + 650_000;
         let candidate = repository::due_timers(&fixture.db, at_ms, 32)
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms, None, None).unwrap();
         let id = plan
             .start_instance_id
             .clone()
@@ -1235,7 +1288,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let other_snapshot = repository::timer_snapshot(&reopened, &other_candidate).unwrap();
-        let other_plan = plan_timer_fire(&other_snapshot, at_ms, None).unwrap();
+        let other_plan = plan_timer_fire(&other_snapshot, at_ms, None, None).unwrap();
         let other_id = other_plan.start_instance_id.clone().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let results = std::thread::scope(|scope| {
@@ -1319,10 +1372,9 @@ mod tests {
         assert_eq!(fired.data["skipped_from_occurrence"], 1);
         assert_eq!(fired.data["skipped_through_occurrence"], 2);
         assert_eq!(
-            repository::get_definition(&reopened, &owner, &version.definition_id)
+            only_persisted_timer(repository::get_definition(&reopened, &owner, &version.definition_id)
                 .unwrap()
-                .1
-                .unwrap()
+                .1)
                 .status,
             ProcessTimerStatus::Fired
         );
@@ -1367,7 +1419,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let timer_snapshot = repository::timer_snapshot(&reopened, &candidate).unwrap();
-        let plan = plan_timer_fire(&timer_snapshot, at_ms + 60_000, None).unwrap();
+        let plan = plan_timer_fire(&timer_snapshot, at_ms + 60_000, None, None).unwrap();
         repository::cancel_instance(
             &reopened,
             &owner,
@@ -1459,6 +1511,7 @@ mod tests {
                 name: "Parallel wait".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Review".into(),
@@ -1468,12 +1521,14 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Join".into(),
                 name: "Wait for both branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -1489,7 +1544,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms + 60_000, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms + 60_000, None, None).unwrap();
         let partial = repository::fire_timer(
             &fixture.db,
             &candidate,
@@ -1601,6 +1656,7 @@ mod tests {
                     timer: ProcessTimerSpec::Duration { seconds: 60 },
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -1677,7 +1733,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due + 120_000, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due + 120_000, None, None).unwrap();
         crate::db::repository::update_user_account(
             &fixture.db,
             &fixture.owner.user_id,
@@ -1764,10 +1820,9 @@ mod tests {
         };
         let version = publish_model(&fixture, &repeated);
         let before =
-            repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
+            only_persisted_timer(repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
                 .unwrap()
-                .1
-                .unwrap();
+                .1);
         let horizon = DateTime::<Utc>::MAX_UTC.timestamp_millis();
         assert_eq!(
             {
@@ -1779,10 +1834,9 @@ mod tests {
             0
         );
         let failed =
-            repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
+            only_persisted_timer(repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
                 .unwrap()
-                .1
-                .unwrap();
+                .1);
         assert_eq!(failed.status, ProcessTimerStatus::Error);
         assert_eq!(failed.due_at_ms, before.due_at_ms);
         assert_eq!(failed.occurrence, 1);
@@ -1797,10 +1851,9 @@ mod tests {
             0
         );
         assert_eq!(
-            repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
+            only_persisted_timer(repository::get_definition(&fixture.db, &fixture.owner, &version.definition_id)
                 .unwrap()
-                .1
-                .unwrap(),
+                .1),
             failed
         );
         assert_eq!(
@@ -1823,6 +1876,7 @@ mod tests {
                 name: "Parallel".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Review".into(),
@@ -1832,12 +1886,14 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Join".into(),
                 name: "Join both".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -1957,6 +2013,7 @@ mod tests {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "After".into(),
@@ -1965,6 +2022,7 @@ mod tests {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
                 repeat: None,
+                activity_io: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -2074,6 +2132,7 @@ mod tests {
                     timer: ProcessTimerSpec::Duration { seconds: 1 },
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -2141,7 +2200,7 @@ mod tests {
             let id = Uuid::new_v4().to_string();
             let command = stamp("bounded timer start");
             let plan = runtime::plan_start(
-                &model,
+                &model, &model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&model),
                 &id,
                 &fixture.owner,
                 &version.definition_id,
@@ -2159,7 +2218,7 @@ mod tests {
                 &id,
                 &version.definition_id,
                 version.version,
-                &json!({}),
+                &json!({}), None, None,
                 repository::ProcessPlanInput::Supplied(&plan),
                 at_ms,
             )
@@ -2232,7 +2291,7 @@ mod tests {
             })
             .expect("actual due boundary");
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, at_ms, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, at_ms, None, None).unwrap();
         (candidate, snapshot, plan)
     }
 
@@ -2469,6 +2528,7 @@ mod tests {
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         });
         model
             .sequence_flows
@@ -2718,6 +2778,7 @@ mod tests {
                         default_flow_id: None,
                     },
                     repeat: None,
+                    activity_io: None,
                 });
                 model
                     .sequence_flows
@@ -2973,13 +3034,13 @@ mod tests {
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Select waits".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "Review".into(), name: "Independent review".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "Join".into(), name: "Selected waits done".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![
             edge("ToSplit", "Start_1", "Split"),
@@ -3021,6 +3082,7 @@ mod tests {
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
                 repeat: None,
+                activity_io: None,
             });
         }
         for id in ["Main_A", "Main_B", "Side_A", "Side_B"] {
@@ -3032,6 +3094,7 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             });
         }
         model
@@ -3297,6 +3360,7 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             });
             model
                 .sequence_flows
@@ -3311,7 +3375,7 @@ mod tests {
             let anchor = at("2026-11-09T13:00:00Z");
             let command = stamp("V1 waits before future activation");
             let plan = runtime::plan_start(
-                &version.model,
+                &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
                 &id,
                 &fixture.owner,
                 &version.definition_id,
@@ -3329,7 +3393,7 @@ mod tests {
                 &id,
                 &version.definition_id,
                 version.version,
-                &json!({}),
+                &json!({}), None, None,
                 repository::ProcessPlanInput::Supplied(&plan),
                 anchor,
             )
@@ -3476,7 +3540,7 @@ mod tests {
             assert_eq!(fired.data["working_time"]["due_offset_seconds"], -18000);
             assert_eq!(fired.data["timezone"], "America/Winnipeg");
             assert_eq!(
-                repository::get_version(&reopened, &owner, &version.definition_id, 1).unwrap(),
+                repository::get_version(&reopened, &owner, &version.definition_id, 1).unwrap().0,
                 version
             );
             let replay = drain_due(&reopened, due + 60000);
@@ -3501,7 +3565,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = plan_timer_fire(&snapshot, due, None).unwrap();
+        let plan = plan_timer_fire(&snapshot, due, None, None).unwrap();
         fixture
             .db
             .write()
@@ -3601,7 +3665,7 @@ mod tests {
                 .unwrap()
                 .remove(0);
             let snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-            let fire = plan_timer_fire(&snapshot, anchor + 1000, None).unwrap();
+            let fire = plan_timer_fire(&snapshot, anchor + 1000, None, None).unwrap();
             if complete_first {
                 repository::complete_user_task(
                     &fixture.db,
@@ -3707,6 +3771,7 @@ mod tests {
                 default_flow_id: None,
             },
             repeat: None,
+            activity_io: None,
         });
         model
             .sequence_flows
@@ -3798,7 +3863,7 @@ mod tests {
         let variables = serde_json::to_value(&catch_model.variables).unwrap();
         let command = stamp("start due evaluation");
         let plan = runtime::plan_start(
-            &version.model,
+            &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
             &id,
             &fixture.owner,
             &version.definition_id,
@@ -3856,7 +3921,7 @@ mod tests {
                     &id,
                     &version.definition_id,
                     version.version,
-                    &variables,
+                    &variables, None, None,
                     repository::ProcessPlanInput::Supplied(&forged),
                     anchor,
                 )
@@ -3882,7 +3947,7 @@ mod tests {
             &id,
             &version.definition_id,
             version.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Supplied(&plan),
             anchor,
         )

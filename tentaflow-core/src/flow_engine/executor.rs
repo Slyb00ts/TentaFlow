@@ -298,6 +298,15 @@ pub async fn execute_blocking(
     // równoległości) — sortujemy po starcie dla stabilnego widoku.
     trace.sort_by_key(|s| s.started_at_ms);
 
+    if error.is_none() && compiled.definition.nodes.iter().any(|node|
+        node.node_type == crate::flow_engine::node_adapters::activity_result::NODE_TYPE)
+        && !trace.iter().any(|step|
+            step.node_type == crate::flow_engine::node_adapters::activity_result::NODE_TYPE
+                && matches!(step.status, TraceStatus::Ok))
+    {
+        error = Some("ACTIVITY_RESULT_NOT_PRODUCED: the result terminal did not complete".into());
+        last_finish_reason = Some(FinishReason::Error);
+    }
     let final_envelope = pick_final_envelope(&outputs, &initial_arc);
     let aggregate_usage = aggregate_usage(&trace);
     let total_latency_ms = started.elapsed().as_millis() as i64;
@@ -3424,6 +3433,7 @@ mod concurrent_executor_tests {
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register(Arc::new(CombineNodeAdapter::new()));
         r.register(Arc::new(ConditionNodeAdapter::new()));
+        r.register(Arc::new(crate::flow_engine::node_adapters::ActivityResultNodeAdapter::new()));
         r.register(Arc::new(SleepAdapter));
         Arc::new(r)
     }
@@ -3469,6 +3479,31 @@ mod concurrent_executor_tests {
         execute_blocking(db, compiled, FlowEnvelope::empty(), stub_ctx(), reg)
             .await
             .expect("exec")
+    }
+
+    #[tokio::test]
+    async fn skipped_activity_result_is_an_execution_error() {
+        let graph = serde_json::json!({"nodes":[
+            {"id":"t","type":"trigger","config":{}},
+            {"id":"condition","type":"condition","config":{"expression":"false"}},
+            {"id":"result","type":"activity_result","config":{"result_expression":"{'outcome':'Completed','code':null,'summary':'done','outputs':{},'evidence':[]}"}}
+        ],"edges":[{"from":"t","to":"condition","from_port":"text","to_port":"in"},
+            {"from":"condition","to":"result","from_port":"true","to_port":"in"}]});
+        let outcome = run(&graph.to_string()).await;
+        assert!(outcome.error.as_deref().unwrap().contains("ACTIVITY_RESULT_NOT_PRODUCED"));
+        assert_eq!(outcome.finish_reason, FinishReason::Error);
+        assert!(!outcome.trace.iter().any(|step| step.node_id == "result" && matches!(step.status, TraceStatus::Ok)));
+    }
+
+    #[tokio::test]
+    async fn failed_activity_result_cannot_be_ignored_by_continue_on_error() {
+        let graph = serde_json::json!({"nodes":[
+            {"id":"t","type":"trigger","config":{"continue_on_error":true}},
+            {"id":"result","type":"activity_result","config":{"result_expression":"{'outcome':'Completed'}"}}
+        ],"edges":[{"from":"t","to":"result","from_port":"text","to_port":"in"}]});
+        let outcome = run(&graph.to_string()).await;
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.finish_reason, FinishReason::Error);
     }
 
     /// Wall-clock budget of everything that is NOT the sleeping: compiling the

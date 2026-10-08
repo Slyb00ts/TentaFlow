@@ -1,0 +1,1 @@
+{"CallActivity":{"called_definition_id":"definition-1","called_version":7,"called_element":{"namespace_uri":"urn:example:approval","process_id":"Approval_1"},"input_mapping":{"customer_ID":"vars.customer_ID"},"output_mapping":{"approved_value":"outputs.business_key"}}}

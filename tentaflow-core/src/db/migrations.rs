@@ -1166,6 +1166,26 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_event_gateway_wait_subscriptions",
             MigrationStep::RustSelfManaged(bpmn_event_gateway_wait_subscriptions),
         ),
+        (
+            194,
+            "bpmn_repetition_accepted_source_instance",
+            MigrationStep::Rust(bpmn_repetition_accepted_source_instance),
+        ),
+        (
+            195,
+            "bpmn_selected_body_pins",
+            MigrationStep::RustSelfManaged(bpmn_selected_body_pins),
+        ),
+        (
+            196,
+            "bpmn_service_invocations",
+            MigrationStep::Rust(bpmn_service_invocations),
+        ),
+        (
+            197,
+            "bpmn_activity_io_witnesses",
+            MigrationStep::Rust(bpmn_activity_io_witnesses),
+        ),
     ]
 }
 
@@ -2749,6 +2769,73 @@ fn bpmn_event_gateway_wait_subscriptions(conn: &Connection, version: i64, name: 
         (Err(error), Ok(_)) => Err(error.context("event gateway migration could not restore foreign key mode")),
         (Err(error), Err(restore)) => Err(error.context(format!("event gateway migration could not restore foreign key mode: {restore}"))),
     }
+}
+
+const BPMN_REPETITION_ACCEPTED_SOURCE_INSTANCE: &str = r#"
+CREATE UNIQUE INDEX uq_bpmn_events_instance_event ON bpmn_events(instance_id,event_id);
+CREATE TABLE bpmn_repetition_occurrences_194 (
+    occurrence_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal BETWEEN 0 AND 4294967295),
+    status TEXT NOT NULL CHECK(status IN ('pending','active','awaiting_verification','retryable_error','accepted_blocked','completed','cancelled')),
+    token_id TEXT NOT NULL,
+    user_task_id TEXT REFERENCES bpmn_user_tasks(user_task_id) DEFERRABLE INITIALLY DEFERRED,
+    job_id TEXT,
+    verification_user_task_id TEXT REFERENCES bpmn_user_tasks(user_task_id) DEFERRABLE INITIALLY DEFERRED,
+    item_json TEXT NOT NULL CHECK(json_valid(item_json) AND length(CAST(item_json AS BLOB))<=262144),
+    input_variables_json TEXT NOT NULL CHECK(json_valid(input_variables_json) AND json_type(input_variables_json)='object' AND length(CAST(input_variables_json AS BLOB))<=262144),
+    accepted_source_event_id TEXT,
+    approval_event_id TEXT,
+    aggregate_item_json TEXT CHECK(aggregate_item_json IS NULL OR (json_valid(aggregate_item_json) AND length(CAST(aggregate_item_json AS BLOB))<=262144)),
+    state_patch_json TEXT CHECK(state_patch_json IS NULL OR (json_valid(state_patch_json) AND json_type(state_patch_json)='object' AND length(CAST(state_patch_json AS BLOB))<=262144)),
+    state_after_json TEXT CHECK(state_after_json IS NULL OR (json_valid(state_after_json) AND json_type(state_after_json)='object' AND length(CAST(state_after_json AS BLOB))<=262144)),
+    accepted_origin TEXT CHECK(accepted_origin IS NULL OR accepted_origin IN ('envelope','contract','platform')),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer'),
+    updated_at_ms INTEGER NOT NULL CHECK(typeof(updated_at_ms)='integer'),
+    UNIQUE(group_id,ordinal),
+    UNIQUE(instance_id,scope_id,token_id),
+    FOREIGN KEY(instance_id,scope_id,group_id) REFERENCES bpmn_repetition_groups(instance_id,scope_id,group_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,job_id) REFERENCES bpmn_jobs(instance_id,scope_id,job_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,accepted_source_event_id) REFERENCES bpmn_events(instance_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,approval_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(user_task_id IS NULL OR verification_user_task_id IS NULL OR user_task_id<>verification_user_task_id),
+    CHECK((state_patch_json IS NULL AND state_after_json IS NULL) OR (state_patch_json IS NOT NULL AND state_after_json IS NOT NULL)),
+    CHECK(approval_event_id IS NULL OR accepted_source_event_id IS NOT NULL)
+);
+INSERT INTO bpmn_repetition_occurrences_194(occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,user_task_id,job_id,verification_user_task_id,item_json,input_variables_json,accepted_source_event_id,approval_event_id,aggregate_item_json,state_patch_json,state_after_json,accepted_origin,revision,created_at_ms,updated_at_ms)
+SELECT occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,user_task_id,job_id,verification_user_task_id,item_json,input_variables_json,accepted_source_event_id,approval_event_id,aggregate_item_json,state_patch_json,state_after_json,accepted_origin,revision,created_at_ms,updated_at_ms FROM bpmn_repetition_occurrences;
+"#;
+
+const BPMN_REPETITION_ACCEPTED_SOURCE_SWAP: &str = r#"
+DROP TABLE bpmn_repetition_occurrences;
+ALTER TABLE bpmn_repetition_occurrences_194 RENAME TO bpmn_repetition_occurrences;
+CREATE INDEX idx_bpmn_repetition_occurrences_page
+    ON bpmn_repetition_occurrences(instance_id,group_id,ordinal ASC);
+CREATE INDEX idx_bpmn_repetition_occurrences_status
+    ON bpmn_repetition_occurrences(instance_id,status,group_id,ordinal);
+"#;
+
+fn bpmn_repetition_accepted_source_instance(conn: &Connection) -> Result<()> {
+    let old_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_occurrences", [], |row| row.get(0))?;
+    conn.execute_batch(BPMN_REPETITION_ACCEPTED_SOURCE_INSTANCE)?;
+    let new_count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_repetition_occurrences_194", [], |row| row.get(0))?;
+    anyhow::ensure!(old_count == new_count, "repetition accepted-source migration changed occurrence count");
+    for (left, right) in [("bpmn_repetition_occurrences", "bpmn_repetition_occurrences_194"),
+        ("bpmn_repetition_occurrences_194", "bpmn_repetition_occurrences")] {
+        let sql = format!("SELECT COUNT(*) FROM (SELECT occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,user_task_id,job_id,verification_user_task_id,item_json,input_variables_json,accepted_source_event_id,approval_event_id,aggregate_item_json,state_patch_json,state_after_json,accepted_origin,revision,created_at_ms,updated_at_ms FROM {left} EXCEPT SELECT occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,user_task_id,job_id,verification_user_task_id,item_json,input_variables_json,accepted_source_event_id,approval_event_id,aggregate_item_json,state_patch_json,state_after_json,accepted_origin,revision,created_at_ms,updated_at_ms FROM {right})");
+        let changed: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+        anyhow::ensure!(changed == 0, "repetition accepted-source migration changed an occurrence row");
+    }
+    conn.execute_batch(BPMN_REPETITION_ACCEPTED_SOURCE_SWAP)?;
+    let violations = foreign_key_check(conn)?;
+    anyhow::ensure!(violations.is_empty(), "repetition accepted-source migration foreign key violations: {}", violations.join("; "));
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    anyhow::ensure!(integrity == "ok", "repetition accepted-source migration integrity: {integrity}");
+    Ok(())
 }
 
 const BPMN_MANUAL_TASK_ACKNOWLEDGMENTS: &str = r#"
@@ -12438,14 +12525,14 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
     conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('boundary-owner','Boundary owner','x',1)", []).unwrap();
     let mut model = crate::processes::model::starter_model();
     model.timer_timezone = Some("UTC".into());
-    model.nodes.push(ProcessNode { repeat: None,
+    model.nodes.push(ProcessNode { activity_io: None, repeat: None,
         id: "Review_1".into(), name: "Review".into(),
         kind: ProcessNodeKind::UserTask {
             assignee_user_id: Some("boundary-owner".into()),
             output_mapping: Default::default(),
         },
     });
-    model.nodes.push(ProcessNode { repeat: None,
+    model.nodes.push(ProcessNode { activity_io: None, repeat: None,
         id: "Service_1".into(), name: "Service".into(),
         kind: ProcessNodeKind::ServiceTask {
             flow_id: "flow-pinned".into(), input_mapping: Default::default(),
@@ -12454,7 +12541,7 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
             result_expression: None,
         },
     });
-    model.nodes.push(ProcessNode { repeat: None,
+    model.nodes.push(ProcessNode { activity_io: None, repeat: None,
         id: "Catch_1".into(), name: "Wait".into(),
         kind: ProcessNodeKind::TimerCatch {
             timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 90 },
@@ -12466,7 +12553,7 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
         ("Flow_3", "Service_1", "Catch_1"),
         ("Flow_4", "Catch_1", "End_1"),
     ] {
-        model.sequence_flows.push(ProcessSequenceFlow {
+        model.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None,
             id: id.into(), source_id: source.into(), target_id: target.into(), condition: None,
         });
     }
@@ -16589,7 +16676,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('bpmn-old',1,?1,?2,'[]',1,'bpmn-owner')", rusqlite::params![&old_model_json, &old_hash]).unwrap();
         conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('bpmn-old-instance','bpmn-old',1,'org-default','bpmn-owner',1,'completed','{}',1,1)", []).unwrap();
         conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('bpmn-old-event','bpmn-old-instance',1,1,'instance_started',NULL,'bpmn-owner','{\"source_key\":1}')", []).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let retained: String = conn.query_row(
             "SELECT name FROM flows WHERE id='flow-retained'", [], |row| row.get(0),
         ).unwrap();
@@ -16611,7 +16698,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 193);
+        assert_eq!(version, 194);
         let (model, hash, start_timer, start_occurrence, event): (String, String, Option<String>, Option<i64>, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,i.start_timer_id,i.start_occurrence,e.data_json FROM bpmn_versions v JOIN bpmn_instances i ON i.definition_id=v.definition_id AND i.version=v.version JOIN bpmn_events e ON e.instance_id=i.instance_id WHERE v.definition_id='bpmn-old'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
@@ -16634,11 +16721,11 @@ mod tests {
         conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('message-process',1,?1,?2,'[]',1,'message-owner')", rusqlite::params![&bytes, &hash]).unwrap();
         conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('message-instance','message-process',1,'org-default','message-owner',1,'completed','{}',1,1)", []).unwrap();
         conn.execute("INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('message-event','message-instance',1,1,'instance_started',NULL,'message-owner','{\"customer_ID\":\"kept\"}')", []).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 193);
+        assert_eq!(version, 194);
         let retained: (String, String, String) = conn.query_row(
             "SELECT v.model_json,v.model_sha256,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='message-instance' WHERE v.definition_id='message-process'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -16738,11 +16825,11 @@ mod tests {
                 .unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
         conn.execute("INSERT INTO bpmn_commands(org_id,actor_user_id,command_id,request_hash,result_json,created_at_ms) VALUES('org-default','boundary-owner','old-command','old-hash','{\"instance_id\":\"boundary-instance\",\"opaque_ID\":true}',1)", []).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 193);
+        assert_eq!(version, 194);
         let roots: (i64, i64) = conn.query_row("SELECT COUNT(*),COUNT(revision) FROM bpmn_scopes WHERE scope_id='boundary-instance' AND instance_id='boundary-instance' AND parent_scope_id IS NULL AND local_variables_json IS NULL", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(roots, (1, 0));
         let after: Vec<(
@@ -16794,22 +16881,22 @@ mod tests {
         run_ladder_up_to(conn, 186);
         let mut model = crate::processes::model::starter_model();
         model.nodes.extend([
-            ProcessNode { repeat: None, id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
         ]);
         model.sequence_flows[0].target_id = "Split".into();
         for branch in 0..9 {
             let node_id = format!("Branch_{branch}");
-            model.nodes.push(ProcessNode { repeat: None, id: node_id.clone(), name: node_id.clone(),
+            model.nodes.push(ProcessNode { activity_io: None, repeat: None, id: node_id.clone(), name: node_id.clone(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
-            model.sequence_flows.push(ProcessSequenceFlow {
+            model.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None,
                 id: format!("To_{branch}"), source_id: "Split".into(), target_id: node_id.clone(), condition: None,
             });
-            model.sequence_flows.push(ProcessSequenceFlow {
+            model.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None,
                 id: format!("From_{branch}"), source_id: node_id, target_id: "Join".into(), condition: None,
             });
         }
-        model.sequence_flows.push(ProcessSequenceFlow {
+        model.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None,
             id: "After_Join".into(), source_id: "Join".into(), target_id: "End_1".into(), condition: None,
         });
         crate::processes::model::validate_model(&model).unwrap();
@@ -16842,12 +16929,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let conn = Connection::open(directory.path().join("gateway-upgrade.db")).unwrap();
         let (model_json, model_hash) = gateway_migration_fixture(&conn);
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         assert_eq!(
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            193
+            194
         );
         assert!(!table_exists(&conn, "bpmn_and_receipts").unwrap());
         let receipt: (String, String, String) = conn
@@ -16911,7 +16998,7 @@ mod tests {
         let original_receipt: (String,String,String,String,String,String,i64) = conn.query_row(
             "SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms FROM bpmn_and_receipts", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let converted_receipt: (String,String,String,String,String,String,i64,String) = conn.query_row(
             "SELECT instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms,gateway_kind FROM bpmn_gateway_receipts", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))).unwrap();
@@ -17026,15 +17113,15 @@ mod tests {
         let original: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get(0)).unwrap();
         let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&original).unwrap();
         let child_nodes = vec![
-            ProcessNode { repeat: None, id: "Child_Start".into(), name: String::new(), kind: ProcessNodeKind::Start },
-            ProcessNode { repeat: None, id: "Child_Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Child_A".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Child_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { repeat: None, id: "Nested_A".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { repeat: None, id: "Nested_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
-            ProcessNode { repeat: None, id: "Nested_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Child_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Child_End".into(), name: String::new(), kind: ProcessNodeKind::End },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_Start".into(), name: String::new(), kind: ProcessNodeKind::Start },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_Split".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_A".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { activity_io: None, repeat: None, id: "Nested_A".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { activity_io: None, repeat: None, id: "Nested_B".into(), name: String::new(), kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } },
+            ProcessNode { activity_io: None, repeat: None, id: "Nested_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_Join".into(), name: String::new(), kind: ProcessNodeKind::ParallelGateway },
+            ProcessNode { activity_io: None, repeat: None, id: "Child_End".into(), name: String::new(), kind: ProcessNodeKind::End },
         ];
         let child_flows = [
             ("Child_Entry", "Child_Start", "Child_Split"),
@@ -17047,11 +17134,11 @@ mod tests {
             ("Child_From_A", "Nested_Join", "Child_Join"),
             ("Child_From_B", "Child_B", "Child_Join"),
             ("Child_Exit", "Child_Join", "Child_End"),
-        ].into_iter().map(|(id, source_id, target_id)| ProcessSequenceFlow {
+        ].into_iter().map(|(id, source_id, target_id)| ProcessSequenceFlow { call_start_node_id: None,
             id: id.into(), source_id: source_id.into(), target_id: target_id.into(), condition: None,
         }).collect();
         model.nodes.iter_mut().find(|node| node.id == "Branch_1").unwrap().kind = ProcessNodeKind::SubProcess {
-            body: ProcessSubProcess { nodes: child_nodes, sequence_flows: child_flows, variables: Default::default(), diagram: Default::default() },
+            body: ProcessSubProcess { nodes: child_nodes, sequence_flows: child_flows, variables: Default::default(), diagram: Default::default(), modeling: None },
             input_mapping: Default::default(), output_mapping: Default::default(),
         };
         crate::processes::model::validate_model(&model).unwrap();
@@ -17070,7 +17157,7 @@ mod tests {
         conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('child-token','and-instance','child-scope','Nested_Join','Nested_From_A',?1,'joining',1)", [&frame]).unwrap();
         conn.execute("INSERT INTO bpmn_and_receipts(instance_id,scope_id,join_node_id,activation_id,branch_edge_id,token_id,created_at_ms) VALUES('and-instance','child-scope','Nested_Join','nested-activation','Nested_To_A','child-token',1)", []).unwrap();
 
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let converted: String = conn.query_row("SELECT fork_stack_json FROM bpmn_tokens WHERE token_id='child-token'", [], |row| row.get(0)).unwrap();
         let converted: serde_json::Value = serde_json::from_str(&converted).unwrap();
         assert_eq!(converted[0]["gateway_kind"], "parallel");
@@ -17086,7 +17173,7 @@ mod tests {
 
     #[test]
     fn gateway_migration_preserves_active_call_parent_frame_and_child_facts() {
-        use tentaflow_protocol::processes::{ProcessCallableReference, ProcessNode, ProcessNodeKind, ProcessSequenceFlow};
+        use tentaflow_protocol::processes::{ProcessCallActivity, ProcessCallTarget, ProcessCallableReference, ProcessNode, ProcessNodeKind, ProcessSequenceFlow};
 
         let directory = tempfile::tempdir().unwrap();
         let conn = Connection::open(directory.path().join("gateway-call.db")).unwrap();
@@ -17096,19 +17183,19 @@ mod tests {
         let mut parent: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&parent_json).unwrap();
         let called_definition_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let reference = ProcessCallableReference { namespace_uri: "https://tentaflow.app/bpmn/1".into(), process_id: "Called_Process".into() };
-        parent.nodes.iter_mut().find(|node| node.id == "Branch_1").unwrap().kind = ProcessNodeKind::CallActivity {
-            called_definition_id: called_definition_id.into(), called_version: 1, called_element: reference.clone(),
+        parent.nodes.iter_mut().find(|node| node.id == "Branch_1").unwrap().kind = ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::PublishedBody { definition_id: called_definition_id.into(), version: 1, called_element: reference.clone() },
             input_mapping: Default::default(), output_mapping: Default::default(),
-        };
+        });
         crate::processes::model::validate_model(&parent).unwrap();
         let parent_json = serde_json::to_string(&parent).unwrap();
         let parent_hash = crate::processes::repository::request_hash(&parent).unwrap();
         let mut child = crate::processes::model::starter_model();
         child.process_id = "Called_Process".into();
-        child.nodes.insert(1, ProcessNode { repeat: None, id: "Child_Work".into(), name: "Child work".into(),
+        child.nodes.insert(1, ProcessNode { activity_io: None, repeat: None, id: "Child_Work".into(), name: "Child work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: Default::default() } });
         child.sequence_flows[0].target_id = "Child_Work".into();
-        child.sequence_flows.push(ProcessSequenceFlow { id: "Child_Exit".into(), source_id: "Child_Work".into(), target_id: "End_1".into(), condition: None });
+        child.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None, id: "Child_Exit".into(), source_id: "Child_Work".into(), target_id: "End_1".into(), condition: None });
         crate::processes::model::validate_model(&child).unwrap();
         let child_json = serde_json::to_string(&child).unwrap();
         let child_hash = crate::processes::repository::request_hash(&child).unwrap();
@@ -17124,6 +17211,14 @@ mod tests {
         conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('called-token','called-instance','called-instance','Child_Work','Flow_1','[]','waiting',1)", []).unwrap();
         conn.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,scope_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id) VALUES('called-task','called-instance','called-instance','Child_Work','Child work','and-owner','work','open','{}',1,1,1,'called-token')", []).unwrap();
         conn.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES('active-call','and-instance','and-instance','token-1','Branch_1','called-instance','and-nine',1,?1,1,?2,1,'waiting',1,1)", rusqlite::params![called_definition_id,&child_hash]).unwrap();
+        run_ladder_up_to(&conn, 194);
+        let old_call_schema: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_calls'", [], |row| row.get(0)).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET arrival_edge_id='To_0' WHERE token_id='token-1'", []).unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 194);
+        assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_calls'", [], |row| row.get::<_, String>(0)).unwrap(), old_call_schema);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        conn.execute("UPDATE bpmn_tokens SET arrival_edge_id='To_1' WHERE token_id='token-1'", []).unwrap();
         let before: (String,String,String,String) = conn.query_row("SELECT c.call_id,c.status,i.variables_json,t.fork_stack_json FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id JOIN bpmn_tokens t ON t.token_id=c.parent_token_id WHERE c.call_id='active-call'", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         run(&conn).unwrap();
@@ -17136,6 +17231,8 @@ mod tests {
         assert_eq!(conn.query_row("SELECT status FROM bpmn_user_tasks WHERE user_task_id='called-task'", [], |row| row.get::<_, String>(0)).unwrap(), "open");
         assert_eq!(conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id=?1", [called_definition_id], |row| row.get::<_, String>(0)).unwrap(), child_json);
         assert_eq!(conn.query_row("SELECT model_sha256 FROM bpmn_versions WHERE definition_id='and-nine'", [], |row| row.get::<_, String>(0)).unwrap(), parent_hash);
+        let durable_call_pin: (String, String, String) = conn.query_row("SELECT parent_arrival_edge_id,called_process_id,child_start_node_id FROM bpmn_calls WHERE call_id='active-call'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(durable_call_pin, ("To_1".into(), "Called_Process".into(), "Start_1".into()));
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
         drop(conn);
@@ -17169,7 +17266,7 @@ mod tests {
         });
         model.nodes.insert(
             1,
-            ProcessNode { repeat: None,
+            ProcessNode { activity_io: None, repeat: None,
                 id: "Catch_1".into(),
                 name: "Wait".into(),
                 kind: ProcessNodeKind::MessageCatch {
@@ -17180,7 +17277,7 @@ mod tests {
             },
         );
         model.sequence_flows[0].target_id = "Catch_1".into();
-        model.sequence_flows.push(ProcessSequenceFlow {
+        model.sequence_flows.push(ProcessSequenceFlow { call_start_node_id: None,
             id: "Flow_2".into(),
             source_id: "Catch_1".into(),
             target_id: "End_1".into(),
@@ -17211,7 +17308,7 @@ mod tests {
         let old_row: (String,String,String,String,String,Option<String>,i64,String) = conn.query_row(
             "SELECT subscription_id,scope_id,node_id,token_id,kind,last_reason,revision,status FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?))).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let row: (String,String,String,String,String,Option<String>,i64,String,Option<String>) = conn.query_row(
             "SELECT subscription_id,scope_id,node_id,token_id,kind,last_reason,revision,status,escalation_code FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?))).unwrap();
@@ -17236,7 +17333,7 @@ mod tests {
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            193
+            194
         );
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(
@@ -17288,7 +17385,7 @@ mod tests {
         let old_events: (String, String) = conn.query_row(
             "SELECT v.model_json,e.data_json FROM bpmn_versions v JOIN bpmn_events e ON e.instance_id='escalation-instance' WHERE v.definition_id='escalation-legacy' LIMIT 1",
             [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let new: (String, String, String, String) = conn.query_row(
             "SELECT subscription_id,token_id,kind,COALESCE(escalation_code,'') FROM bpmn_event_subscriptions WHERE subscription_id='legacy-subscription'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
@@ -17298,7 +17395,7 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
         assert_eq!(new_events, old_events);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 193);
+            |row| row.get::<_,i64>(0)).unwrap(), 194);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(), "ok");
@@ -17338,7 +17435,7 @@ mod tests {
              JOIN bpmn_events e ON e.instance_id=s.instance_id \
              WHERE s.subscription_id='legacy-subscription' LIMIT 1",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let current: (String, String, String, String) = conn.query_row(
             "SELECT s.subscription_id,s.kind,v.model_json,e.data_json \
              FROM bpmn_event_subscriptions s JOIN bpmn_versions v \
@@ -17348,7 +17445,7 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(current, old);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 193);
+            |row| row.get::<_,i64>(0)).unwrap(), 194);
         for table in ["bpmn_signal_emissions", "bpmn_signal_receipts"] {
             assert!(table_exists(&conn, table).unwrap());
             assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [],
@@ -17402,7 +17499,7 @@ mod tests {
             "SELECT s.subscription_id,s.kind,v.model_json,e.data_json FROM bpmn_event_subscriptions s JOIN bpmn_versions v ON v.definition_id=s.definition_id AND v.version=s.version JOIN bpmn_events e ON e.instance_id=s.instance_id WHERE s.subscription_id='legacy-subscription' LIMIT 1",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         let old_command: String = conn.query_row("SELECT result_json FROM bpmn_commands WHERE command_id='legacy-command'", [], |row| row.get(0)).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         let after: (String, String, String, String) = conn.query_row(
             "SELECT s.subscription_id,s.kind,v.model_json,e.data_json FROM bpmn_event_subscriptions s JOIN bpmn_versions v ON v.definition_id=s.definition_id AND v.version=s.version JOIN bpmn_events e ON e.instance_id=s.instance_id WHERE s.subscription_id='legacy-subscription' LIMIT 1",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
@@ -17459,8 +17556,8 @@ mod tests {
         assert_eq!(old_facts.1, model_hash);
         let old_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        run(&conn).unwrap();
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 193);
+        run_ladder_up_to(&conn, 194);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 194);
         let new_tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn_%' ORDER BY name")
             .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(new_tables.len(), old_tables.len() + 4);
@@ -17474,7 +17571,7 @@ mod tests {
         assert_eq!(retained, old_facts);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM _migrations WHERE version=189", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
     }
 
@@ -17511,9 +17608,9 @@ mod tests {
         let before: (String,String,String) = conn.query_row(
             "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 193);
+            |row| row.get::<_,i64>(0)).unwrap(), 194);
         let after: (String,String,String) = conn.query_row(
             "SELECT t.outputs_json,o.user_task_id,e.data_json FROM bpmn_user_tasks t JOIN bpmn_repetition_occurrences o ON o.user_task_id=t.user_task_id JOIN bpmn_events e ON e.event_id='and-event' WHERE t.user_task_id='legacy-work'",
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
@@ -17522,9 +17619,68 @@ mod tests {
         assert!(conn.execute("UPDATE bpmn_user_tasks SET outputs_json='{}' WHERE user_task_id='new-manual'", []).is_err());
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(), "ok");
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 194);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM _migrations WHERE version=190", [],
             |row| row.get::<_,i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn repetition_accepted_source_upgrade_preserves_rows_and_pins_child_event_to_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("repetition-source-upgrade.db")).unwrap();
+        populated_manual_upgrade_fixture(&conn);
+        run_ladder_up_to(&conn, 193);
+        conn.execute("UPDATE bpmn_repetition_occurrences SET accepted_source_event_id='and-event',aggregate_item_json='null',accepted_origin='contract' WHERE occurrence_id='legacy-occurrence'", []).unwrap();
+        let before: (String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT item_json,input_variables_json,accepted_source_event_id,aggregate_item_json,accepted_origin FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+        run_ladder_up_to(&conn, 194);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 194);
+        let after: (String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT item_json,input_variables_json,accepted_source_event_id,aggregate_item_json,accepted_origin FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+        assert_eq!(after, before);
+        for index in ["uq_bpmn_events_instance_event", "idx_bpmn_repetition_occurrences_page", "idx_bpmn_repetition_occurrences_status"] {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [index], |row| row.get::<_, i64>(0)).unwrap(), 1, "{index}");
+        }
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id,parent_scope_id,subprocess_node_id,parent_token_id,revision,status,local_variables_json,created_at_ms,updated_at_ms) VALUES('child-scope','and-instance','and-instance','Branch_2','token-2',1,'completed','{}',2,2)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) SELECT 'child-completion','and-instance','child-scope',MAX(seq)+1,2,'scope_completed',NULL,'{}' FROM bpmn_events WHERE instance_id='and-instance'", []).unwrap();
+        conn.execute("UPDATE bpmn_repetition_occurrences SET accepted_source_event_id='child-completion' WHERE occurrence_id='legacy-occurrence'", []).unwrap();
+        assert!(conn.execute("UPDATE bpmn_repetition_occurrences SET approval_event_id='child-completion' WHERE occurrence_id='legacy-occurrence'", []).is_err());
+        assert_eq!(conn.query_row("SELECT approval_event_id FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'", [], |row| row.get::<_, Option<String>>(0)).unwrap(), None);
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) SELECT 'foreign-instance',definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms FROM bpmn_instances WHERE instance_id='and-instance'", []).unwrap();
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES('foreign-instance','foreign-instance')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,data_json) VALUES('foreign-completion','foreign-instance','foreign-instance',1,2,'scope_completed','{}')", []).unwrap();
+        assert!(conn.execute("UPDATE bpmn_repetition_occurrences SET accepted_source_event_id='foreign-completion' WHERE occurrence_id='legacy-occurrence'", []).is_err());
+        assert_eq!(conn.query_row("SELECT accepted_source_event_id FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'", [], |row| row.get::<_, String>(0)).unwrap(), "child-completion");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        run_ladder_up_to(&conn, 194);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM _migrations WHERE version=194", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn repetition_accepted_source_upgrade_rolls_back_corrupt_reference_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let conn = Connection::open(directory.path().join("repetition-source-corrupt.db")).unwrap();
+        populated_manual_upgrade_fixture(&conn);
+        run_ladder_up_to(&conn, 193);
+        let old_schema: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_repetition_occurrences'", [], |row| row.get(0)).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute("UPDATE bpmn_repetition_occurrences SET accepted_source_event_id='missing-source' WHERE occurrence_id='legacy-occurrence'", []).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 193);
+        assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_repetition_occurrences'", [], |row| row.get::<_, String>(0)).unwrap(), old_schema);
+        assert!(!table_exists(&conn, "bpmn_repetition_occurrences_194").unwrap());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='uq_bpmn_events_instance_event'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT accepted_source_event_id FROM bpmn_repetition_occurrences WHERE occurrence_id='legacy-occurrence'", [], |row| row.get::<_, String>(0)).unwrap(), "missing-source");
+        conn.execute("UPDATE bpmn_repetition_occurrences SET accepted_source_event_id='and-event' WHERE occurrence_id='legacy-occurrence'", []).unwrap();
+        run_ladder_up_to(&conn, 194);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 194);
     }
 
     #[test]
@@ -17545,4 +17701,1852 @@ mod tests {
             |row| row.get::<_,String>(0)).unwrap(), "{\"opaque_task\":true}");
         assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)).unwrap(), 1);
     }
+
+    fn selected_body_history_fixture(conn: &Connection) -> (String, String) {
+        use tentaflow_protocol::processes::ProcessNodeKind;
+
+        run_ladder_up_to(conn, 194);
+        let model = crate::processes::model::starter_model();
+        let start = model.nodes.iter().find(|node| matches!(node.kind, ProcessNodeKind::Start)).unwrap();
+        let model_json = serde_json::to_string(&model).unwrap();
+        let model_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("INSERT INTO user_accounts(id,username,password_hash,is_active) VALUES('selected-owner','Selected owner','x',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('selected-definition','org-default','selected-owner','Selected','',1,?1,1,0,1,1)", [&model_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES('selected-definition',1,?1,?2,'[]',1,'selected-owner')", rusqlite::params![model_json, model_hash]).unwrap();
+        conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms) VALUES('selected-instance','selected-definition',1,'org-default','selected-owner',1,'waiting','{\"retained\":null}',1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES('selected-instance','selected-instance')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,actor_user_id,data_json) VALUES('selected-started','selected-instance','selected-instance',1,1,'instance_started','selected-owner','{\"initiator_user_id\":\"selected-owner\"}')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES('selected-start-completed','selected-instance','selected-instance',2,1,'node_completed',?1,'selected-owner','{}')", [&start.id]).unwrap();
+        (model.process_id, start.id.clone())
+    }
+
+    #[test]
+    fn selected_body_migration_preserves_populated_history_and_pins_exact_start() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (process_id, start_node_id) = selected_body_history_fixture(&conn);
+        let old_model: (String, String) = conn.query_row("SELECT model_json,model_sha256 FROM bpmn_versions WHERE definition_id='selected-definition'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let old_instance: (String, String, i64) = conn.query_row("SELECT status,variables_json,revision FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        run_ladder_up_to(&conn, 195);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 195);
+        assert_eq!(conn.query_row("SELECT selected_process_id,start_node_id FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?))).unwrap(), (process_id, start_node_id));
+        assert_eq!(conn.query_row("SELECT status,variables_json,revision FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, i64>(2)?))).unwrap(), old_instance);
+        assert_eq!(conn.query_row("SELECT model_json,model_sha256 FROM bpmn_versions WHERE definition_id='selected-definition'", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?))).unwrap(), old_model);
+        assert!(conn.execute("UPDATE bpmn_instances SET selected_process_id='foreign-body' WHERE instance_id='selected-instance'", []).is_err());
+        assert!(conn.execute("UPDATE bpmn_instances SET start_node_id='foreign-start' WHERE instance_id='selected-instance'", []).is_err());
+        for table in ["bpmn_instances", "bpmn_calls", "bpmn_timers", "bpmn_messages"] {
+            assert!(table_exists(&conn, table).unwrap(), "{table}");
+        }
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn selected_body_migration_uses_unique_pinned_start_when_older_events_are_absent() {
+        let conn = Connection::open_in_memory().unwrap();
+        let expected = selected_body_history_fixture(&conn);
+        conn.execute("DELETE FROM bpmn_events WHERE instance_id='selected-instance'", []).unwrap();
+        run_ladder_up_to(&conn, 195);
+        let actual: (String, String) = conn.query_row("SELECT selected_process_id,start_node_id FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 195);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_body_migration_retains_unpinned_historical_queued_message() {
+        use sha2::{Digest, Sha256};
+
+        let conn = Connection::open_in_memory().unwrap();
+        selected_body_history_fixture(&conn);
+        let payload = "{}";
+        conn.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms) VALUES('org-default','selected-owner','queued-start','request','api','start','selected-definition','created','case',?1,?2,2,60,1,61,1,'pending',1,1)", rusqlite::params![payload,hex::encode(Sha256::digest(payload.as_bytes()))]).unwrap();
+        let original: (String, String, String) = conn.query_row("SELECT request_hash,status,payload_json FROM bpmn_messages WHERE message_id='queued-start'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        run_ladder_up_to(&conn, 195);
+        let after: (String, String, String, Option<String>, Option<String>) = conn.query_row("SELECT request_hash,status,payload_json,target_process_id,target_start_node_id FROM bpmn_messages WHERE message_id='queued-start'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!((after.0,after.1,after.2), original);
+        assert_eq!((after.3,after.4), (None,None));
+        assert!(conn.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms) SELECT org_id,sender_user_id,'new-unpinned-start',request_hash,origin,target_kind,definition_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms FROM bpmn_messages WHERE message_id='queued-start'", []).is_err());
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_body_migration_pins_delivered_message_to_its_factual_instance() {
+        use sha2::{Digest, Sha256};
+        use tentaflow_protocol::processes::{ProcessMessageDeclaration, ProcessNodeKind};
+
+        let conn = Connection::open_in_memory().unwrap();
+        let expected = selected_body_history_fixture(&conn);
+        let model_json: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'", [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&model_json).unwrap();
+        model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "SelectedReady".into() });
+        model.nodes.iter_mut().find(|node| node.id == expected.1).unwrap().kind = ProcessNodeKind::MessageStart {
+            message_ref: "Message_1".into(), output_mapping: Default::default(),
+        };
+        let published_json = serde_json::to_string(&model).unwrap();
+        let published_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='selected-definition'", rusqlite::params![published_json,published_hash]).unwrap();
+        conn.execute("UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id='selected-definition'", [serde_json::to_string(&model).unwrap()]).unwrap();
+        conn.execute("UPDATE bpmn_events SET data_json='{\"initiator_user_id\":\"selected-owner\",\"start_message_id\":\"delivered-start\"}' WHERE event_id='selected-started'", []).unwrap();
+        let payload = "{}";
+        conn.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,matched_instance_id,matched_version,matched_node_id,delivered_at_ms) VALUES('org-default','selected-owner','delivered-start','request','api','start','selected-definition','SelectedReady','case',?1,?2,2,60,1,61,2,'delivered',1,2,'selected-instance',1,?3,2)", rusqlite::params![payload,hex::encode(Sha256::digest(payload.as_bytes())),expected.1]).unwrap();
+        run_ladder_up_to(&conn, 195);
+        let pins: (Option<String>, Option<String>) = conn.query_row("SELECT target_process_id,target_start_node_id FROM bpmn_messages WHERE message_id='delivered-start'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(pins, (Some(expected.0),Some(expected.1)));
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_messages WHERE message_id='delivered-start'", [], |row| row.get::<_, String>(0)).unwrap(), "delivered");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_body_migration_preserves_start_timer_identity() {
+        use tentaflow_protocol::processes::{ProcessNodeKind, ProcessTimerSpec};
+
+        let conn = Connection::open_in_memory().unwrap();
+        let expected = selected_body_history_fixture(&conn);
+        let model_json: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'", [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&model_json).unwrap();
+        let rule = ProcessTimerSpec::Duration { seconds: 60 };
+        model.nodes.iter_mut().find(|node| node.id == expected.1).unwrap().kind = ProcessNodeKind::TimerStart { timer: rule.clone() };
+        let published_json = serde_json::to_string(&model).unwrap();
+        let published_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='selected-definition'", rusqlite::params![published_json,published_hash]).unwrap();
+        conn.execute("UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id='selected-definition'", [serde_json::to_string(&model).unwrap()]).unwrap();
+        conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,rule_json,timezone,anchor_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) VALUES('selected-timer','org-default','selected-definition',1,?1,'start',?2,'UTC',1,1,1,'fired',1,1,1)", rusqlite::params![expected.1,serde_json::to_string(&rule).unwrap()]).unwrap();
+        conn.execute("UPDATE bpmn_instances SET start_timer_id='selected-timer',start_occurrence=1 WHERE instance_id='selected-instance'", []).unwrap();
+        conn.execute("UPDATE bpmn_events SET data_json='{\"initiator_user_id\":\"selected-owner\",\"start_timer_id\":\"selected-timer\",\"start_occurrence\":1}' WHERE event_id='selected-started'", []).unwrap();
+        run_ladder_up_to(&conn, 195);
+        assert_eq!(conn.query_row("SELECT start_process_id FROM bpmn_timers WHERE timer_id='selected-timer'", [], |row| row.get::<_, String>(0)).unwrap(), expected.0.clone());
+        assert_eq!(conn.query_row("SELECT selected_process_id,start_node_id,start_timer_id,start_occurrence FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, i64>(3)?))).unwrap(), (expected.0,expected.1,"selected-timer".into(),1));
+        assert!(conn.execute("UPDATE bpmn_timers SET start_process_id='foreign-body' WHERE timer_id='selected-timer'", []).is_err());
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_body_migration_refuses_ambiguous_pinned_start_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        selected_body_history_fixture(&conn);
+        let model_json: String = conn.query_row("SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'", [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&model_json).unwrap();
+        let mut second_start = model.nodes.iter().find(|node| matches!(node.kind, tentaflow_protocol::processes::ProcessNodeKind::Start)).unwrap().clone();
+        second_start.id = "Another_Start".into();
+        model.nodes.push(second_start);
+        let ambiguous_json = serde_json::to_string(&model).unwrap();
+        let ambiguous_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='selected-definition'", rusqlite::params![ambiguous_json,ambiguous_hash]).unwrap();
+        let before: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_instances'", [], |row| row.get(0)).unwrap();
+        let old_version: i64 = conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0)).unwrap();
+        assert!(run(&conn).is_err());
+        assert_eq!(old_version, 194);
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get::<_, i64>(0)).unwrap(), old_version);
+        assert_eq!(conn.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='bpmn_instances'", [], |row| row.get::<_, String>(0)).unwrap(), before);
+        assert!(!table_exists(&conn, "bpmn_instances_195").unwrap());
+        assert_eq!(conn.query_row("SELECT variables_json FROM bpmn_instances WHERE instance_id='selected-instance'", [], |row| row.get::<_, String>(0)).unwrap(), "{\"retained\":null}");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    fn service_invocation_history_fixture(conn: &Connection) {
+        use sha2::{Digest, Sha256};
+        use tentaflow_protocol::processes::{ActivityVerification, ProcessNode, ProcessNodeKind, ProcessSequenceFlow};
+
+        selected_body_history_fixture(conn);
+        let model_json: String = conn.query_row(
+            "SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'",
+            [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel = serde_json::from_str(&model_json).unwrap();
+        model.nodes.push(ProcessNode {
+            id: "Service_1".into(), name: "Historical service".into(),
+            kind: ProcessNodeKind::ServiceTask {
+                flow_id: "historical-flow".into(), input_mapping: Default::default(),
+                output_mapping: Default::default(), verification: ActivityVerification::Human,
+                timeout_seconds: 30, result_expression: None,
+            },
+            repeat: None, activity_io: None,
+        });
+        model.sequence_flows = vec![
+            ProcessSequenceFlow { id: "Start_Service".into(), source_id: "Start_1".into(),
+                target_id: "Service_1".into(), condition: None, call_start_node_id: None },
+            ProcessSequenceFlow { id: "Service_End".into(), source_id: "Service_1".into(),
+                target_id: "End_1".into(), condition: None, call_start_node_id: None },
+        ];
+        let graph_json = "{}";
+        let graph_sha = hex::encode(Sha256::digest(graph_json.as_bytes()));
+        let snapshots = serde_json::json!([{
+            "info": {"node_id":"Service_1","flow_id":"historical-flow",
+                "source_version":1,"graph_sha256":graph_sha},
+            "graph_json":graph_json
+        }]).to_string();
+        let new_json = serde_json::to_string(&model).unwrap();
+        let model_sha = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2,service_snapshots_json=?3 WHERE definition_id='selected-definition'",
+            rusqlite::params![new_json,model_sha,snapshots]).unwrap();
+        run_ladder_up_to(conn, 195);
+        for (token_id, job_id, status) in [
+            ("queued-token", "queued-job", "queued"),
+            ("failed-token", "failed-job", "error"),
+        ] {
+            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,'selected-instance','selected-instance','Service_1','Start_Service','[]','waiting',1)",
+                [token_id]).unwrap();
+            conn.execute("INSERT INTO bpmn_jobs(job_id,instance_id,scope_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms) VALUES(?1,'selected-instance','selected-instance','Service_1',?2,'{}',?3,1,1)",
+                rusqlite::params![job_id,token_id,status]).unwrap();
+        }
+    }
+
+    #[test]
+    fn service_invocation_migration_preserves_queued_and_proves_unclaimed_error_retryable() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        let before: Vec<(String,String,String)> = conn.prepare(
+            "SELECT job_id,status,input_json FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 197);
+        let rows: Vec<(String,String,String,Option<String>)> = conn.prepare(
+            "SELECT job_id,phase,dispatch_evidence,stable_request_id FROM bpmn_service_invocations ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((&rows[0].0[..],&rows[0].1[..],&rows[0].2[..]),
+            ("failed-job","proved_no_effect","no_boundary"));
+        assert_eq!((&rows[1].0[..],&rows[1].1[..],&rows[1].2[..]),
+            ("queued-job","prepared","no_boundary"));
+        assert!(rows.iter().all(|row| row.3.as_ref().is_some_and(|id|
+            uuid::Uuid::parse_str(id).is_ok())));
+        let after: Vec<(String,String,String)> = conn.prepare(
+            "SELECT job_id,status,input_json FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(after,before);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn service_invocation_migration_retains_noncanonical_accepted_result_bytes() {
+        use tentaflow_protocol::processes::{
+            ActivityVerification, ProcessMultiInstanceInput, ProcessMultiInstanceMode,
+            ProcessNodeKind, ProcessRepeatSpec,
+        };
+
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        let model_json: String = conn.query_row(
+            "SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'",
+            [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel =
+            serde_json::from_str(&model_json).unwrap();
+        model.variables.insert("items".into(), serde_json::json!([null]));
+        model.variables.insert("results".into(), serde_json::json!([]));
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service_1").unwrap();
+        let ProcessNodeKind::ServiceTask { verification, .. } = &mut service.kind else {
+            panic!("historical fixture lost its Service task");
+        };
+        *verification = ActivityVerification::Condition {
+            expression: "true".into(),
+        };
+        service.repeat = Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Sequential,
+            input: ProcessMultiInstanceInput::CollectionExpression {
+                expression: "vars.items".into(),
+            },
+            output_collection_variable: "results".into(),
+        });
+        let model_json = serde_json::to_string(&model).unwrap();
+        let model_hash = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='selected-definition'",
+            rusqlite::params![model_json,model_hash]).unwrap();
+        conn.execute("UPDATE bpmn_instances SET variables_json='{\"retained\":null,\"items\":[null],\"results\":[{\"note\":\"é\"}]' WHERE instance_id='selected-instance'", []).unwrap();
+
+        let result = " { \"outputs\" : {\"note\":\"é\"}, \"evidence\" : [], \"summary\" : \"accepted\", \"code\" : null, \"outcome\" : \"Completed\" } ";
+        let typed: tentaflow_protocol::processes::ActivityResult =
+            serde_json::from_str(result).unwrap();
+        assert_eq!(typed.outputs, serde_json::json!({"note":"é"}));
+        let mut event: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(result).unwrap();
+        event.insert("result_origin".into(), serde_json::json!("envelope"));
+        let event_json = serde_json::Value::Object(event).to_string();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('repeat-source','selected-instance','selected-instance','Service_1','Start_Service','[]','consumed',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('repeat-parent','selected-instance','selected-instance','Service_1','Start_Service','[]','waiting',1)", []).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='repeat-parent'", []).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='queued-token'", []).unwrap();
+        conn.execute("UPDATE bpmn_jobs SET status='completed',result_json=?1,result_origin='envelope' WHERE job_id='queued-job'",
+            [result]).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('accepted-result','selected-instance','selected-instance',3,2,'service_result','Service_1',?1)",
+            [&event_json]).unwrap();
+        let occurrence_completed = serde_json::json!({"group_id":"accepted-group",
+            "occurrence_id":"accepted-occurrence","ordinal":0,
+            "source_event_id":"accepted-result"}).to_string();
+        let repetition_completed = serde_json::json!({"group_id":"accepted-group",
+            "completed":1,"parent_token_id":"repeat-parent"}).to_string();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('accepted-ordinal','selected-instance','selected-instance',4,2,'repetition_occurrence_completed','Service_1',?1)",
+            [&occurrence_completed]).unwrap();
+        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('accepted-group-completed','selected-instance','selected-instance',5,2,'repetition_completed','Service_1',?1)",
+            [&repetition_completed]).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_groups(group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,output_collection_variable,entry_variables_json,total_count,created_count,completed_count,loop_state_revision,next_ordinal,retained_bytes,revision,created_at_ms,updated_at_ms) VALUES('accepted-group','selected-instance','selected-instance','selected-definition',1,'Service_1','mi_sequential','completed','repeat-source','repeat-parent','results','{}',1,1,1,0,1,0,1,1,2)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_occurrences(occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,job_id,item_json,input_variables_json,accepted_source_event_id,aggregate_item_json,accepted_origin,revision,created_at_ms,updated_at_ms) VALUES('accepted-occurrence','selected-instance','selected-instance','accepted-group',0,'completed','queued-token','queued-job','null','{}','accepted-result','{\"note\":\"é\"}','envelope',1,1,2)", []).unwrap();
+        let old_physical: i64 = conn.query_row(
+            "SELECT length(CAST(g.entry_variables_json AS BLOB))+
+                length(CAST(o.item_json AS BLOB))+
+                length(CAST(o.input_variables_json AS BLOB))+
+                length(CAST(o.aggregate_item_json AS BLOB))+
+                length(CAST(j.input_json AS BLOB))+
+                length(CAST(j.result_json AS BLOB))+
+                length(CAST(e.data_json AS BLOB))+
+                length(CAST(oe.data_json AS BLOB))+
+                length(CAST(ge.data_json AS BLOB))
+             FROM bpmn_repetition_groups g
+             JOIN bpmn_repetition_occurrences o ON o.group_id=g.group_id
+             JOIN bpmn_jobs j ON j.job_id=o.job_id
+             JOIN bpmn_events e ON e.event_id=o.accepted_source_event_id
+             JOIN bpmn_events oe ON oe.event_id='accepted-ordinal'
+             JOIN bpmn_events ge ON ge.event_id='accepted-group-completed'
+             WHERE g.group_id='accepted-group'", [], |row| row.get(0)).unwrap();
+        conn.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE group_id='accepted-group'",
+            [old_physical]).unwrap();
+        let raw_bytes = i64::try_from(result.as_bytes().len()).unwrap();
+        run(&conn).unwrap();
+        let copied: String = conn.query_row(
+            "SELECT observed_result_json FROM bpmn_service_invocations WHERE job_id='queued-job' AND phase='accepted'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(copied.as_bytes(), result.as_bytes());
+        let retained: i64 = conn.query_row(
+            "SELECT retained_bytes FROM bpmn_repetition_groups WHERE group_id='accepted-group'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(retained, old_physical + raw_bytes);
+        assert_eq!(conn.query_row("SELECT length(CAST(observed_result_json AS BLOB)) FROM bpmn_service_invocations WHERE job_id='queued-job'",
+            [], |row| row.get::<_, i64>(0)).unwrap(), raw_bytes);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_, String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn service_invocation_migration_refuses_inaccurate_repeated_service_counter_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('counter-source','selected-instance','selected-instance','Service_1','Start_Service','[]','consumed',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('counter-parent','selected-instance','selected-instance','Service_1','Start_Service','[]','waiting',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_groups(group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,output_collection_variable,entry_variables_json,total_count,created_count,completed_count,loop_state_revision,next_ordinal,retained_bytes,revision,created_at_ms,updated_at_ms) VALUES('counter-group','selected-instance','selected-instance','selected-definition',1,'Service_1','mi_sequential','open','counter-source','counter-parent','results','{}',1,1,0,0,1,0,1,1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_occurrences(occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,job_id,item_json,input_variables_json,revision,created_at_ms,updated_at_ms) VALUES('counter-occurrence','selected-instance','selected-instance','counter-group',0,'active','queued-token','queued-job','null','{}',1,1,1)", []).unwrap();
+        let before_jobs: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_jobs", [],
+            |row| row.get(0)).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains("inaccurate historical repetition counter"),
+            "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_, i64>(0)).unwrap(),195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        assert_eq!(conn.query_row("SELECT retained_bytes FROM bpmn_repetition_groups WHERE group_id='counter-group'", [],
+            |row| row.get::<_, i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_jobs", [],
+            |row| row.get::<_, i64>(0)).unwrap(),before_jobs);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_, i64>(0)).unwrap(),1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_refuses_unreserved_live_service_history_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('reserve-source','selected-instance','selected-instance','Service_1','Start_Service','[]','consumed',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('reserve-parent','selected-instance','selected-instance','Service_1','Start_Service','[]','waiting',1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_groups(group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,output_collection_variable,entry_variables_json,total_count,created_count,completed_count,loop_state_revision,next_ordinal,retained_bytes,revision,created_at_ms,updated_at_ms) VALUES('reserve-group','selected-instance','selected-instance','selected-definition',1,'Service_1','mi_sequential','open','reserve-source','reserve-parent','results','{}',1,1,0,0,1,0,1,1,1)", []).unwrap();
+        conn.execute("INSERT INTO bpmn_repetition_occurrences(occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id,job_id,item_json,input_variables_json,revision,created_at_ms,updated_at_ms) VALUES('reserve-occurrence','selected-instance','selected-instance','reserve-group',0,'active','queued-token','queued-job','null','{}',1,1,1)", []).unwrap();
+        let reserve = crate::processes::runtime::repetition_claim_reservation().unwrap()
+            + crate::processes::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES
+            + crate::processes::runtime::MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES;
+        let target = 64 * 1024 * 1024 - reserve / 2;
+        let mut retained = 10_u64;
+        let mut index = 0_u64;
+        while target - retained > 64 {
+            let padding = usize::try_from((target - retained - 64).min(240_000)).unwrap();
+            let event = serde_json::json!({"group_id":"reserve-group",
+                "padding":"x".repeat(padding)}).to_string();
+            retained += u64::try_from(event.len()).unwrap();
+            conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES(?1,'selected-instance','selected-instance',?2,1,'repetition_occurrence_started','Service_1',?3)",
+                rusqlite::params![format!("reserve-event-{index}"), i64::try_from(10 + index).unwrap(), event]).unwrap();
+            index += 1;
+        }
+        assert!(retained <= 64 * 1024 * 1024 && retained + reserve > 64 * 1024 * 1024);
+        conn.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE group_id='reserve-group'",
+            [i64::try_from(retained).unwrap()]).unwrap();
+        let before: (i64, i64) = conn.query_row(
+            "SELECT g.retained_bytes,COUNT(e.event_id) FROM bpmn_repetition_groups g JOIN bpmn_events e ON json_extract(e.data_json,'$.group_id')=g.group_id WHERE g.group_id='reserve-group'",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "historical repeated Service observation exceeds unlatched retained-byte capacity"),
+            "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        let after: (i64, i64) = conn.query_row(
+            "SELECT g.retained_bytes,COUNT(e.event_id) FROM bpmn_repetition_groups g JOIN bpmn_events e ON json_extract(e.data_json,'$.group_id')=g.group_id WHERE g.group_id='reserve-group'",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(after,before);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_, i64>(0)).unwrap(),1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_rolls_back_created_uncertainty_on_later_ambiguous_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='failed-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_jobs SET status='completed',result_json='{}',result_origin='envelope' WHERE job_id='queued-job'", []).unwrap();
+        let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
+        let old_incidents: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [], |row| row.get(0)).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains("unproved completed Service history"), "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
+            |row| row.get::<_,i64>(0)).unwrap(),old_events);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [],
+            |row| row.get::<_,i64>(0)).unwrap(),old_incidents);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)).unwrap(),1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn service_invocation_migration_keeps_old_uncertainty_readable_without_a_dispatch_tuple() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("historical-uncertain.db");
+        let conn = Connection::open(&path).unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='failed-job'", []).unwrap();
+        run(&conn).unwrap();
+        let row: (String,String,Option<String>,Option<i64>) = conn.query_row(
+            "SELECT phase,dispatch_evidence,stable_request_id,dispatch_fence FROM bpmn_service_invocations WHERE job_id='failed-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(row, ("uncertain".into(),"boundary_unknown".into(),None,None));
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let actor = crate::processes::repository::ProcessActor {
+            org_id: "org-default".into(), user_id: "selected-owner".into(),
+        };
+        let snapshot = crate::processes::repository::runtime_snapshot(
+            &pool, &actor, "selected-instance").unwrap();
+        assert!(snapshot.incidents.iter().any(|incident|
+            incident.job_id.as_deref() == Some("failed-job")
+                && incident.code == "EXTERNAL_OUTCOME_UNCERTAIN"));
+        assert!(!snapshot.service_dispatches.iter().any(|dispatch|
+            dispatch.job_id == "failed-job"));
+        assert!(foreign_key_check(&pool.read().unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_refuses_attempted_queued_history_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='queued-job'", []).unwrap();
+        let before_jobs: Vec<(String,String,i64)> = conn.prepare(
+            "SELECT job_id,status,fence FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        let before_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
+            |row| row.get(0)).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains("attempted queued history without an original dispatch tuple"),
+            "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        let after_jobs: Vec<(String,String,i64)> = conn.prepare(
+            "SELECT job_id,status,fence FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(after_jobs,before_jobs);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
+            |row| row.get::<_, i64>(0)).unwrap(),before_events);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_, i64>(0)).unwrap(),1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_refuses_closed_attempted_history_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='failed-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='failed-token'", []).unwrap();
+        let old_jobs: Vec<(String,String)> = conn.prepare(
+            "SELECT job_id,status FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
+        let old_incidents: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [], |row| row.get(0)).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains("closed historical external uncertainty without original dispatch identity"), "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        let jobs: Vec<(String,String)> = conn.prepare(
+            "SELECT job_id,status FROM bpmn_jobs ORDER BY job_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(jobs,old_jobs);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
+            |row| row.get::<_,i64>(0)).unwrap(),old_events);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [],
+            |row| row.get::<_,i64>(0)).unwrap(),old_incidents);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(),"ok");
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
+            |row| row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn service_invocation_migration_refuses_nonrepeated_completed_without_accepted_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET status='completed',result_json='{}',result_origin='envelope' WHERE job_id='queued-job'", []).unwrap();
+        let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
+        let error = run(&conn).unwrap_err();
+        assert!(format!("{error:#}").contains("unproved completed Service history"), "{error:#}");
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 195);
+        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
+            |row| row.get::<_,i64>(0)).unwrap(),old_events);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn activity_io_witness_schema_keeps_input_and_accepted_result_immutable() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        run(&conn).unwrap();
+        let (process_id, model_sha): (String, String) = conn.query_row(
+            "SELECT i.selected_process_id,v.model_sha256 FROM bpmn_instances i \
+             JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+             WHERE i.instance_id='selected-instance'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+             VALUES('io-input','selected-instance','selected-instance',3,2,'activity_io_input_captured','Service_1','{}')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+             VALUES('io-direct-result','selected-instance','selected-instance',100,2,'service_result','Service_1','{}')",
+            [],
+        ).unwrap();
+        let direct_result = conn.execute(
+            "INSERT INTO bpmn_activity_io_witnesses( \
+                witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner, \
+                definition_id,version,selected_process_id,body_path_json,model_sha256, \
+                io_spec_sha256,phase,revision,input_event_id,input_values_json,input_sha256, \
+                result_event_id,source_instance_id,source_event_id,result_sources_json, \
+                result_presence,result_json,result_sha256,retained_route_kind,created_at_ms,updated_at_ms) \
+             VALUES('io-direct','selected-instance','selected-instance','queued-token', \
+                'Service_1','service','ordinary','selected-definition',1,?1,'[]',?2,?3, \
+                'result_accepted',1,'io-input','[]',?4,'io-direct-result','selected-instance', \
+                'io-direct-result','[\"io-direct-result\"]','present','null',?5,'mapping',2,2)",
+            rusqlite::params![process_id,model_sha,"a".repeat(64),"b".repeat(64),"c".repeat(64)],
+        ).unwrap_err();
+        assert!(direct_result.to_string().contains("invalid initial activity IO phase"));
+        conn.execute(
+            "INSERT INTO bpmn_activity_io_witnesses( \
+                witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,definition_id,version, \
+                selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,revision, \
+                input_event_id,input_values_json,input_sha256,created_at_ms,updated_at_ms) \
+             VALUES('io-witness','selected-instance','selected-instance','queued-token','Service_1', \
+                'service','ordinary','selected-definition',1,?1,'[]',?2,?3,'input_captured',1, \
+                'io-input','[]',?4,2,2)",
+            rusqlite::params![process_id,model_sha,"a".repeat(64),"b".repeat(64)],
+        ).unwrap();
+        assert!(conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET input_values_json='[null]',revision=2 \
+             WHERE witness_id='io-witness'", [],
+        ).is_err());
+        assert!(conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_applied',revision=2 \
+             WHERE witness_id='io-witness'", [],
+        ).is_err());
+        conn.execute(
+            "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+             VALUES('io-result','selected-instance','selected-instance',4,3,'activity_result_accepted','Service_1','{}')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='result_accepted',revision=2, \
+                retained_route_kind='mapping', \
+                result_event_id='io-result',source_instance_id='selected-instance', \
+                source_event_id='io-result',result_sources_json='[\"io-result\"]', \
+                result_presence='present',result_json='null',result_sha256=?1,updated_at_ms=3 \
+             WHERE witness_id='io-witness' AND revision=1",
+            ["c".repeat(64)],
+        ).unwrap();
+        assert!(conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET result_json='0',revision=3 \
+             WHERE witness_id='io-witness'", [],
+        ).is_err());
+        conn.execute(
+            "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+             VALUES('io-output','selected-instance','selected-instance',5,4,'activity_io_output_applied','Service_1','{}')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_applied',revision=3, \
+                output_event_id='io-output',output_values_json='[]', \
+                local_patch_json='{\"retained\":null}',updated_at_ms=4 \
+             WHERE witness_id='io-witness' AND revision=2",
+            [],
+        ).unwrap();
+        assert_eq!(conn.query_row(
+            "SELECT phase,revision FROM bpmn_activity_io_witnesses WHERE witness_id='io-witness'",
+            [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).unwrap(), ("output_applied".into(),3));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn activity_io_ordinal_witness_belongs_to_its_factual_group_and_ordinal() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        run(&conn).unwrap();
+        let (process_id, model_sha): (String, String) = conn.query_row(
+            "SELECT i.selected_process_id,v.model_sha256 FROM bpmn_instances i \
+             JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+             WHERE i.instance_id='selected-instance'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        for (group_id, source, parent) in [
+            ("io-group-one", "queued-token", "failed-token"),
+            ("io-group-two", "failed-token", "queued-token"),
+        ] {
+            conn.execute(
+                "INSERT INTO bpmn_repetition_groups( \
+                    group_id,instance_id,scope_id,definition_id,version,node_id,mode,status, \
+                    source_token_id,parent_token_id,output_collection_variable,entry_variables_json, \
+                    total_count,created_count,completed_count,loop_state_revision,next_ordinal, \
+                    retained_bytes,revision,created_at_ms,updated_at_ms) \
+                 VALUES(?1,'selected-instance','selected-instance','selected-definition',1, \
+                    'Service_1','mi_sequential','open',?2,?3,'items','{}',1,1,0,0,1,0,1,2,2)",
+                rusqlite::params![group_id, source, parent],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO bpmn_repetition_occurrences( \
+                occurrence_id,instance_id,scope_id,group_id,ordinal,status,token_id, \
+                item_json,input_variables_json,revision,created_at_ms,updated_at_ms) \
+             VALUES('io-occurrence','selected-instance','selected-instance','io-group-two',0, \
+                'active','queued-token','null','{}',1,2,2)", [],
+        ).unwrap();
+        for (event_id, seq) in [("io-input-correct", 3), ("io-input-cross-group", 4)] {
+            conn.execute(
+                "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+                 VALUES(?1,'selected-instance','selected-instance',?2,2, \
+                    'activity_io_input_captured','Service_1','{}')",
+                rusqlite::params![event_id, seq],
+            ).unwrap();
+        }
+        let insert_witness = |witness_id: &str, group_id: &str, event_id: &str, ordinal: i64| {
+            conn.execute(
+                "INSERT INTO bpmn_activity_io_witnesses( \
+                    witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner, \
+                    group_id,occurrence_id,ordinal,definition_id,version,selected_process_id, \
+                    body_path_json,model_sha256,io_spec_sha256,phase,revision,input_event_id, \
+                    input_values_json,input_sha256,created_at_ms,updated_at_ms) \
+                 VALUES(?1,'selected-instance','selected-instance','queued-token','Service_1', \
+                    'service','ordinal',?2,'io-occurrence',?3,'selected-definition',1,?4, \
+                    '[]',?5,?6,'input_captured',1,?7,'[]',?8,2,2)",
+                rusqlite::params![witness_id, group_id, ordinal, process_id, model_sha,
+                    "a".repeat(64), event_id, "b".repeat(64)],
+            )
+        };
+        insert_witness("io-witness-valid", "io-group-two", "io-input-correct", 0).unwrap();
+        assert!(insert_witness("io-witness-cross-group", "io-group-one",
+            "io-input-cross-group", 0).is_err());
+        assert!(insert_witness("io-witness-wrong-ordinal", "io-group-two",
+            "io-input-cross-group", 1).is_err());
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM bpmn_activity_io_witnesses", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn activity_io_output_blockage_retains_accepted_result_and_incident_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        run(&conn).unwrap();
+        let (process_id, model_sha): (String, String) = conn.query_row(
+            "SELECT i.selected_process_id,v.model_sha256 FROM bpmn_instances i \
+             JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+             WHERE i.instance_id='selected-instance'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        for (event_id, seq, kind) in [
+            ("io-input", 3, "activity_io_input_captured"),
+            ("io-result", 4, "activity_result_accepted"),
+            ("io-blocked", 5, "incident"),
+            ("io-late-output", 6, "activity_io_output_applied"),
+        ] {
+            conn.execute(
+                "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+                 VALUES(?1,'selected-instance','selected-instance',?2,2,?3,'Service_1','{}')",
+                rusqlite::params![event_id, seq, kind],
+            ).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) \
+             VALUES('io-incident','selected-instance','selected-instance','Service_1','queued-job', \
+                'ACTIVITY_IO_OUTPUT_FAILED','accepted result mapping failed',2)", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_activity_io_witnesses( \
+                witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner, \
+                definition_id,version,selected_process_id,body_path_json,model_sha256, \
+                io_spec_sha256,phase,revision,input_event_id,input_values_json,input_sha256, \
+                created_at_ms,updated_at_ms) \
+             VALUES('io-witness','selected-instance','selected-instance','queued-token', \
+                'Service_1','service','ordinary','selected-definition',1,?1,'[]',?2,?3, \
+                'input_captured',1,'io-input','[]',?4,2,2)",
+            rusqlite::params![process_id, model_sha, "a".repeat(64), "b".repeat(64)],
+        ).unwrap();
+        conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='result_accepted',revision=2, \
+                retained_route_kind='mapping', \
+                result_event_id='io-result',source_instance_id='selected-instance', \
+                source_event_id='io-result',result_sources_json='[\"io-result\"]', \
+                result_presence='present',result_json='null',result_sha256=?1,updated_at_ms=3 \
+             WHERE witness_id='io-witness' AND revision=1",
+            ["c".repeat(64)],
+        ).unwrap();
+        assert!(conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_blocked',revision=3, \
+                result_json='0',result_sha256=?1,incident_event_id='io-blocked', \
+                incident_id='io-incident',failed_association_id='OutputAssociation_1', \
+                failed_position=0,updated_at_ms=4 \
+             WHERE witness_id='io-witness' AND revision=2",
+            ["d".repeat(64)],
+        ).is_err());
+        conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_blocked',revision=3, \
+                incident_event_id='io-blocked',incident_id='io-incident', \
+                failed_association_id='OutputAssociation_1',failed_position=0,updated_at_ms=4 \
+             WHERE witness_id='io-witness' AND revision=2",
+            [],
+        ).unwrap();
+        assert!(conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_applied',revision=4, \
+                output_event_id='io-late-output',output_values_json='[]',local_patch_json='{}', \
+                incident_event_id=NULL,incident_id=NULL,failed_association_id=NULL, \
+                failed_position=NULL,updated_at_ms=5 \
+             WHERE witness_id='io-witness' AND revision=3", [],
+        ).is_err());
+        assert_eq!(conn.query_row(
+            "SELECT phase,revision,result_event_id,result_json,incident_event_id,incident_id, \
+                    output_event_id FROM bpmn_activity_io_witnesses WHERE witness_id='io-witness'",
+            [], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,
+                row.get::<_,String>(2)?,row.get::<_,String>(3)?,
+                row.get::<_,String>(4)?,row.get::<_,String>(5)?,
+                row.get::<_,Option<String>>(6)?)),
+        ).unwrap(), ("output_blocked".into(),3,"io-result".into(),"null".into(),
+            "io-blocked".into(),"io-incident".into(),None));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+    }
+}
+const BPMN_SELECTED_BODY_PINS: &str = r#"
+CREATE TABLE bpmn_instances_195 (
+ instance_id TEXT PRIMARY KEY,
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+ org_id TEXT NOT NULL REFERENCES organizations(org_id),
+ initiator_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+ revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','incident','cancelled','error')),
+ variables_json TEXT NOT NULL,
+ created_at_ms INTEGER NOT NULL,
+ updated_at_ms INTEGER NOT NULL,
+ start_timer_id TEXT REFERENCES bpmn_timers(timer_id),
+ start_occurrence INTEGER CHECK(start_occurrence IS NULL OR (typeof(start_occurrence)='integer' AND start_occurrence>0)),
+ terminal_error_json TEXT CHECK(terminal_error_json IS NULL OR (json_valid(terminal_error_json) AND json_type(terminal_error_json)='object' AND length(CAST(terminal_error_json AS BLOB))<=4096)),
+ error_event_id TEXT,
+ error_scope_id TEXT,
+ selected_process_id TEXT NOT NULL CHECK(length(selected_process_id)>0),
+ start_node_id TEXT NOT NULL CHECK(length(start_node_id)>0),
+ CHECK((status='error' AND terminal_error_json IS NOT NULL AND error_event_id IS NOT NULL AND error_scope_id IS NOT NULL) OR (status<>'error' AND terminal_error_json IS NULL AND error_event_id IS NULL AND error_scope_id IS NULL)),
+ FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+ FOREIGN KEY(instance_id,error_scope_id,error_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE bpmn_calls_195 (
+ call_id TEXT PRIMARY KEY,
+ parent_instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+ parent_scope_id TEXT NOT NULL,
+ parent_token_id TEXT NOT NULL,
+ parent_arrival_edge_id TEXT NOT NULL CHECK(length(parent_arrival_edge_id)>0),
+ call_node_id TEXT NOT NULL,
+ child_instance_id TEXT NOT NULL UNIQUE REFERENCES bpmn_instances(instance_id) DEFERRABLE INITIALLY DEFERRED,
+ definition_id TEXT NOT NULL,
+ version INTEGER NOT NULL,
+ called_definition_id TEXT NOT NULL,
+ called_version INTEGER NOT NULL,
+ called_process_id TEXT NOT NULL CHECK(length(called_process_id)>0),
+ child_start_node_id TEXT NOT NULL CHECK(length(child_start_node_id)>0),
+ model_sha256 TEXT NOT NULL CHECK(length(model_sha256)=64),
+ revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+ status TEXT NOT NULL CHECK(status IN ('waiting','returned','error','cancelled','return_incident')),
+ created_at_ms INTEGER NOT NULL,
+ updated_at_ms INTEGER NOT NULL,
+ UNIQUE(parent_instance_id,parent_token_id),
+ FOREIGN KEY(parent_instance_id,parent_scope_id,parent_token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+ FOREIGN KEY(definition_id,version,call_node_id) REFERENCES bpmn_call_pins(definition_id,version,node_id),
+ FOREIGN KEY(called_definition_id,called_version) REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT
+);
+
+CREATE TABLE bpmn_timers_195 (
+    timer_id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version > 0),
+    node_id TEXT NOT NULL,
+    start_process_id TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('start','catch','boundary')),
+    instance_id TEXT REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT,
+    token_id TEXT REFERENCES bpmn_tokens(token_id),
+    rule_json TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    anchor_at_ms INTEGER NOT NULL,
+    due_at_ms INTEGER,
+    occurrence INTEGER NOT NULL CHECK(typeof(occurrence) = 'integer' AND occurrence > 0),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('pending','fired','cancelled','archived','blocked','missed','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    race_id TEXT REFERENCES bpmn_event_races(race_id),
+    CHECK((kind='start' AND start_process_id IS NOT NULL AND instance_id IS NULL AND scope_id IS NULL AND token_id IS NULL) OR
+          (kind IN ('catch','boundary') AND start_process_id IS NULL AND instance_id IS NOT NULL AND scope_id IS NOT NULL AND token_id IS NOT NULL)),
+    FOREIGN KEY(definition_id,version) REFERENCES bpmn_versions(definition_id,version),
+    FOREIGN KEY(instance_id,scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id) REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    UNIQUE(instance_id,scope_id,timer_id),
+    FOREIGN KEY(instance_id,scope_id,race_id) REFERENCES bpmn_event_races(instance_id,scope_id,race_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE bpmn_messages_195 (
+    org_id TEXT NOT NULL REFERENCES organizations(org_id),
+    sender_user_id TEXT NOT NULL REFERENCES user_accounts(id),
+    message_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK(origin IN ('api','process')),
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('start','catch')),
+    definition_id TEXT NOT NULL REFERENCES bpmn_definitions(definition_id),
+    target_process_id TEXT,
+    target_start_node_id TEXT,
+    target_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    target_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    message_name TEXT NOT NULL CHECK(length(CAST(message_name AS BLOB)) BETWEEN 1 AND 256),
+    correlation_key TEXT NOT NULL CHECK(length(CAST(correlation_key AS BLOB)) BETWEEN 1 AND 256),
+    payload_json TEXT,
+    payload_sha256 TEXT NOT NULL,
+    payload_bytes INTEGER NOT NULL CHECK(typeof(payload_bytes)='integer' AND payload_bytes BETWEEN 1 AND 262144),
+    ttl_seconds INTEGER NOT NULL CHECK(typeof(ttl_seconds)='integer' AND ttl_seconds BETWEEN 1 AND 604800),
+    received_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>received_at_ms),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    status TEXT NOT NULL CHECK(status IN ('pending','blocked','ambiguous','delivered','expired','cancelled','error')),
+    last_reason TEXT,
+    next_check_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    payload_pruned_at_ms INTEGER,
+    resolved_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    resolved_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    resolved_token_id TEXT REFERENCES bpmn_tokens(token_id),
+    matched_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    matched_version INTEGER CHECK(matched_version IS NULL OR (typeof(matched_version)='integer' AND matched_version>0)),
+    matched_node_id TEXT,
+    matched_subscription_id TEXT REFERENCES bpmn_event_subscriptions(subscription_id),
+    delivered_at_ms INTEGER,
+    source_instance_id TEXT REFERENCES bpmn_instances(instance_id),
+    source_scope_id TEXT,
+    source_definition_id TEXT,
+    source_version INTEGER,
+    source_node_id TEXT,
+    source_activation_id TEXT,
+    source_event_id TEXT REFERENCES bpmn_events(event_id),
+    PRIMARY KEY(org_id,sender_user_id,message_id),
+    UNIQUE(source_instance_id,source_activation_id,source_node_id),
+    CHECK((origin='api' AND source_scope_id IS NULL AND source_instance_id IS NULL AND source_definition_id IS NULL AND source_version IS NULL AND source_node_id IS NULL AND source_activation_id IS NULL AND source_event_id IS NULL) OR (origin='process' AND source_scope_id IS NOT NULL AND source_instance_id IS NOT NULL AND source_definition_id IS NOT NULL AND source_version IS NOT NULL AND source_node_id IS NOT NULL AND source_activation_id IS NOT NULL AND source_event_id IS NOT NULL)),
+    CHECK((target_process_id IS NULL) = (target_start_node_id IS NULL)),
+    CHECK((target_kind='start' AND target_instance_id IS NULL AND target_subscription_id IS NULL) OR (target_kind='catch' AND target_process_id IS NULL AND target_start_node_id IS NULL AND (target_subscription_id IS NULL OR target_instance_id IS NOT NULL))),
+    CHECK((resolved_instance_id IS NULL AND resolved_subscription_id IS NULL AND resolved_token_id IS NULL) OR (target_kind='catch' AND resolved_instance_id IS NOT NULL AND resolved_subscription_id IS NOT NULL AND resolved_token_id IS NOT NULL)),
+    CHECK((status='delivered' AND matched_instance_id IS NOT NULL AND matched_version IS NOT NULL AND matched_node_id IS NOT NULL AND delivered_at_ms IS NOT NULL) OR (status<>'delivered' AND matched_instance_id IS NULL AND matched_version IS NULL AND matched_node_id IS NULL AND matched_subscription_id IS NULL AND delivered_at_ms IS NULL)),
+    CHECK((payload_json IS NOT NULL AND payload_pruned_at_ms IS NULL) OR (payload_json IS NULL AND payload_pruned_at_ms IS NOT NULL AND status IN ('delivered','expired','cancelled','error'))),
+    FOREIGN KEY(source_instance_id,source_scope_id) REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(source_instance_id,source_scope_id,source_event_id) REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED
+);
+
+INSERT INTO bpmn_instances_195(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence,terminal_error_json,error_event_id,error_scope_id,selected_process_id,start_node_id)
+SELECT o.instance_id,o.definition_id,o.version,o.org_id,o.initiator_user_id,o.revision,o.status,o.variables_json,o.created_at_ms,o.updated_at_ms,o.start_timer_id,o.start_occurrence,o.terminal_error_json,o.error_event_id,o.error_scope_id,p.process_id,p.start_node_id FROM bpmn_instances o JOIN temp.bpmn_instance_pins_195 p ON p.instance_id=o.instance_id;
+
+INSERT INTO bpmn_calls_195(call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms,parent_arrival_edge_id,called_process_id,child_start_node_id)
+SELECT o.call_id,o.parent_instance_id,o.parent_scope_id,o.parent_token_id,o.call_node_id,o.child_instance_id,o.definition_id,o.version,o.called_definition_id,o.called_version,o.model_sha256,o.revision,o.status,o.created_at_ms,o.updated_at_ms,p.parent_arrival_edge_id,p.called_process_id,p.child_start_node_id FROM bpmn_calls o JOIN temp.bpmn_call_history_pins_195 p ON p.call_id=o.call_id;
+
+INSERT INTO bpmn_timers_195(timer_id,org_id,definition_id,version,node_id,kind,instance_id,scope_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id,start_process_id)
+SELECT o.timer_id,o.org_id,o.definition_id,o.version,o.node_id,o.kind,o.instance_id,o.scope_id,o.token_id,o.rule_json,o.timezone,o.anchor_at_ms,o.due_at_ms,o.occurrence,o.revision,o.status,o.last_reason,o.next_check_at_ms,o.created_at_ms,o.updated_at_ms,o.race_id,p.process_id FROM bpmn_timers o LEFT JOIN temp.bpmn_timer_pins_195 p ON p.timer_id=o.timer_id;
+
+INSERT INTO bpmn_messages_195(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,payload_pruned_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,source_scope_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id,target_process_id,target_start_node_id)
+SELECT o.org_id,o.sender_user_id,o.message_id,o.request_hash,o.origin,o.target_kind,o.definition_id,o.target_instance_id,o.target_subscription_id,o.message_name,o.correlation_key,o.payload_json,o.payload_sha256,o.payload_bytes,o.ttl_seconds,o.received_at_ms,o.expires_at_ms,o.revision,o.status,o.last_reason,o.next_check_at_ms,o.updated_at_ms,o.payload_pruned_at_ms,o.resolved_instance_id,o.resolved_subscription_id,o.resolved_token_id,o.matched_instance_id,o.matched_version,o.matched_node_id,o.matched_subscription_id,o.delivered_at_ms,o.source_instance_id,o.source_scope_id,o.source_definition_id,o.source_version,o.source_node_id,o.source_activation_id,o.source_event_id,p.process_id,p.start_node_id FROM bpmn_messages o LEFT JOIN temp.bpmn_message_pins_195 p ON p.org_id=o.org_id AND p.sender_user_id=o.sender_user_id AND p.message_id=o.message_id;
+DROP TABLE bpmn_messages;
+DROP TABLE bpmn_timers;
+DROP TABLE bpmn_calls;
+DROP TABLE bpmn_instances;
+ALTER TABLE bpmn_instances_195 RENAME TO bpmn_instances;
+ALTER TABLE bpmn_calls_195 RENAME TO bpmn_calls;
+ALTER TABLE bpmn_timers_195 RENAME TO bpmn_timers;
+ALTER TABLE bpmn_messages_195 RENAME TO bpmn_messages;
+CREATE INDEX idx_bpmn_instances_initiator ON bpmn_instances(org_id,initiator_user_id,updated_at_ms DESC);
+CREATE UNIQUE INDEX uq_bpmn_timer_start_slot ON bpmn_instances(start_timer_id,start_occurrence) WHERE start_timer_id IS NOT NULL;
+CREATE INDEX idx_bpmn_calls_parent ON bpmn_calls(parent_instance_id,status,created_at_ms,call_id);
+CREATE INDEX idx_bpmn_calls_parent_scope ON bpmn_calls(parent_instance_id,parent_scope_id,status);
+CREATE INDEX idx_bpmn_timers_race ON bpmn_timers(race_id);
+CREATE UNIQUE INDEX uq_bpmn_timer_start ON bpmn_timers(definition_id,version,start_process_id,node_id) WHERE kind='start';
+CREATE INDEX idx_bpmn_timers_due ON bpmn_timers(status,next_check_at_ms,due_at_ms,timer_id);
+CREATE INDEX idx_bpmn_timers_instance ON bpmn_timers(instance_id,status);
+CREATE UNIQUE INDEX uq_bpmn_timer_activation ON bpmn_timers(instance_id,token_id,node_id) WHERE kind IN ('catch','boundary');
+CREATE INDEX idx_bpmn_messages_due ON bpmn_messages(status,next_check_at_ms,received_at_ms,sender_user_id,message_id);
+CREATE INDEX idx_bpmn_messages_target ON bpmn_messages(org_id,definition_id,message_name,correlation_key,target_instance_id,status);
+CREATE INDEX idx_bpmn_messages_source ON bpmn_messages(source_instance_id,source_scope_id,status,received_at_ms);
+CREATE INDEX idx_bpmn_messages_sender ON bpmn_messages(org_id,sender_user_id,received_at_ms,message_id);
+CREATE INDEX idx_bpmn_messages_prune ON bpmn_messages(status,payload_pruned_at_ms,updated_at_ms);
+CREATE TRIGGER bpmn_call_identity_immutable BEFORE UPDATE ON bpmn_calls
+ WHEN NEW.call_id IS NOT OLD.call_id OR NEW.parent_instance_id IS NOT OLD.parent_instance_id OR NEW.parent_scope_id IS NOT OLD.parent_scope_id OR NEW.parent_token_id IS NOT OLD.parent_token_id OR NEW.parent_arrival_edge_id IS NOT OLD.parent_arrival_edge_id OR NEW.call_node_id IS NOT OLD.call_node_id OR NEW.child_instance_id IS NOT OLD.child_instance_id OR NEW.definition_id IS NOT OLD.definition_id OR NEW.version IS NOT OLD.version OR NEW.called_definition_id IS NOT OLD.called_definition_id OR NEW.called_version IS NOT OLD.called_version OR NEW.called_process_id IS NOT OLD.called_process_id OR NEW.child_start_node_id IS NOT OLD.child_start_node_id OR NEW.model_sha256 IS NOT OLD.model_sha256 OR NEW.created_at_ms IS NOT OLD.created_at_ms
+ BEGIN SELECT RAISE(ABORT,'process call identity is immutable'); END;
+CREATE TRIGGER bpmn_instance_start_identity_immutable BEFORE UPDATE ON bpmn_instances
+WHEN NEW.selected_process_id IS NOT OLD.selected_process_id OR NEW.start_node_id IS NOT OLD.start_node_id
+BEGIN SELECT RAISE(ABORT,'process start identity is immutable'); END;
+CREATE TRIGGER bpmn_timer_start_identity_immutable BEFORE UPDATE ON bpmn_timers
+WHEN NEW.start_process_id IS NOT OLD.start_process_id
+BEGIN SELECT RAISE(ABORT,'process timer start identity is immutable'); END;
+CREATE TRIGGER bpmn_instance_timer_pair_insert BEFORE INSERT ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+           AND t.start_process_id=NEW.selected_process_id AND t.node_id=NEW.start_node_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+CREATE TRIGGER bpmn_instance_timer_pair_update BEFORE UPDATE OF start_timer_id,start_occurrence,selected_process_id,start_node_id ON bpmn_instances
+WHEN (NEW.start_timer_id IS NULL) != (NEW.start_occurrence IS NULL) OR
+     (NEW.start_timer_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM bpmn_timers t WHERE t.timer_id=NEW.start_timer_id AND t.kind='start'
+           AND t.definition_id=NEW.definition_id AND t.version=NEW.version AND t.org_id=NEW.org_id
+           AND t.start_process_id=NEW.selected_process_id AND t.node_id=NEW.start_node_id
+     ))
+BEGIN SELECT RAISE(ABORT,'invalid process start timer identity'); END;
+CREATE TRIGGER bpmn_message_envelope_immutable BEFORE UPDATE ON bpmn_messages
+WHEN NEW.org_id IS NOT OLD.org_id OR NEW.sender_user_id IS NOT OLD.sender_user_id OR NEW.message_id IS NOT OLD.message_id OR NEW.request_hash IS NOT OLD.request_hash OR NEW.origin IS NOT OLD.origin OR NEW.target_kind IS NOT OLD.target_kind OR NEW.definition_id IS NOT OLD.definition_id OR NEW.target_process_id IS NOT OLD.target_process_id OR NEW.target_start_node_id IS NOT OLD.target_start_node_id OR NEW.target_instance_id IS NOT OLD.target_instance_id OR NEW.target_subscription_id IS NOT OLD.target_subscription_id OR NEW.message_name IS NOT OLD.message_name OR NEW.correlation_key IS NOT OLD.correlation_key OR NEW.payload_sha256 IS NOT OLD.payload_sha256 OR NEW.payload_bytes IS NOT OLD.payload_bytes OR NEW.ttl_seconds IS NOT OLD.ttl_seconds OR NEW.received_at_ms IS NOT OLD.received_at_ms OR NEW.expires_at_ms IS NOT OLD.expires_at_ms OR NEW.source_instance_id IS NOT OLD.source_instance_id OR NEW.source_scope_id IS NOT OLD.source_scope_id OR NEW.source_definition_id IS NOT OLD.source_definition_id OR NEW.source_version IS NOT OLD.source_version OR NEW.source_node_id IS NOT OLD.source_node_id OR NEW.source_activation_id IS NOT OLD.source_activation_id OR NEW.source_event_id IS NOT OLD.source_event_id OR (NEW.payload_json IS NOT OLD.payload_json AND NOT (OLD.payload_json IS NOT NULL AND NEW.payload_json IS NULL AND NEW.payload_pruned_at_ms IS NOT NULL AND NEW.status IN ('delivered','expired','cancelled','error')))
+BEGIN SELECT RAISE(ABORT,'BPMN message envelope is immutable'); END;
+CREATE TRIGGER bpmn_message_start_selection_insert BEFORE INSERT ON bpmn_messages
+WHEN NEW.target_kind='start' AND (NEW.target_process_id IS NULL OR NEW.target_start_node_id IS NULL)
+BEGIN SELECT RAISE(ABORT,'new Message Start requires exact selected body and Start'); END;
+"#;
+
+fn bpmn_selected_body_pins(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    use anyhow::{ensure, Context};
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    use tentaflow_protocol::processes::{ProcessCallTarget, ProcessModel, ProcessNodeKind};
+
+    let original_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let result = (|| -> Result<()> {
+        ensure!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? == 0,
+            "selected-body migration requires foreign keys disabled outside its transaction");
+        let tx = conn.unchecked_transaction()?;
+        ensure!(foreign_key_check(&tx)?.is_empty(),
+            "selected-body migration refuses an invalid existing foreign key");
+        tx.execute_batch("CREATE TEMP TABLE bpmn_instance_pins_195(instance_id TEXT PRIMARY KEY,process_id TEXT NOT NULL,start_node_id TEXT NOT NULL);
+            CREATE TEMP TABLE bpmn_timer_pins_195(timer_id TEXT PRIMARY KEY,process_id TEXT NOT NULL);
+            CREATE TEMP TABLE bpmn_call_history_pins_195(call_id TEXT PRIMARY KEY,parent_arrival_edge_id TEXT NOT NULL,called_process_id TEXT NOT NULL,child_start_node_id TEXT NOT NULL);
+            CREATE TEMP TABLE bpmn_message_pins_195(org_id TEXT NOT NULL,sender_user_id TEXT NOT NULL,message_id TEXT NOT NULL,process_id TEXT NOT NULL,start_node_id TEXT NOT NULL,PRIMARY KEY(org_id,sender_user_id,message_id));
+            CREATE TEMP TABLE bpmn_instances_old_195 AS SELECT * FROM bpmn_instances;
+            CREATE TEMP TABLE bpmn_calls_old_195 AS SELECT * FROM bpmn_calls;
+            CREATE TEMP TABLE bpmn_timers_old_195 AS SELECT * FROM bpmn_timers;
+            CREATE TEMP TABLE bpmn_messages_old_195 AS SELECT * FROM bpmn_messages;")?;
+
+        let mut instances = tx.prepare("SELECT i.instance_id,i.definition_id,i.version,v.model_json,v.model_sha256,i.start_timer_id FROM bpmn_instances i JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version ORDER BY i.instance_id")?;
+        let rows = instances.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(instances);
+        let old_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_instances", [], |row| row.get(0))?;
+        ensure!(i64::try_from(rows.len())? == old_count,
+            "selected-body migration refuses an instance without its immutable version");
+        for (instance_id, _, _, model_json, model_sha256, timer_id) in rows {
+            ensure!(hex::encode(Sha256::digest(model_json.as_bytes())) == model_sha256,
+                "selected-body migration refuses a changed pinned process model");
+            let model: ProcessModel = serde_json::from_str(&model_json)
+                .context("selected-body migration cannot parse an immutable process model")?;
+            ensure!(model.additional_processes.is_empty() && !model.process_id.is_empty(),
+                "historical instance has no uniquely selected single body");
+            let starts = model.nodes.iter().filter(|node| matches!(node.kind,
+                ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+                    | ProcessNodeKind::MessageStart { .. })).collect::<Vec<_>>();
+            ensure!(starts.len() == 1,
+                "historical instance has no unique pinned Start event");
+            let start = starts[0];
+            match &start.kind {
+                ProcessNodeKind::Start | ProcessNodeKind::MessageStart { .. } =>
+                    ensure!(timer_id.is_none(), "historical Start has a mismatched timer identity"),
+                ProcessNodeKind::TimerStart { .. } => ensure!(timer_id.is_some(),
+                    "historical timer Start lacks its timer identity"),
+                _ => unreachable!(),
+            }
+            tx.execute("INSERT INTO temp.bpmn_instance_pins_195(instance_id,process_id,start_node_id) VALUES(?1,?2,?3)", rusqlite::params![instance_id,model.process_id,start.id])?;
+        }
+
+        let mut timers = tx.prepare("SELECT t.timer_id,t.definition_id,t.version,t.node_id,v.model_json,v.model_sha256 FROM bpmn_timers t JOIN bpmn_versions v ON v.definition_id=t.definition_id AND v.version=t.version WHERE t.kind='start' ORDER BY t.timer_id")?;
+        let rows = timers.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, u32>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(timers);
+        let total: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_timers WHERE kind='start'", [], |row| row.get(0))?;
+        ensure!(i64::try_from(rows.len())? == total,
+            "historical start timer lacks its immutable version");
+        for (timer_id, _, _, node_id, model_json, model_sha256) in rows {
+            ensure!(hex::encode(Sha256::digest(model_json.as_bytes())) == model_sha256,
+                "historical timer model hash differs from immutable bytes");
+            let model: ProcessModel = serde_json::from_str(&model_json)?;
+            ensure!(model.additional_processes.is_empty()
+                && model.nodes.iter().filter(|node| node.id == node_id
+                    && matches!(node.kind, ProcessNodeKind::TimerStart { .. })).count() == 1,
+                "historical start timer has no unique pinned body and node");
+            tx.execute("INSERT INTO temp.bpmn_timer_pins_195(timer_id,process_id) VALUES(?1,?2)", rusqlite::params![timer_id,model.process_id])?;
+        }
+
+        let mut calls = tx.prepare("SELECT c.call_id,c.parent_instance_id,c.parent_scope_id,c.parent_token_id,c.call_node_id,c.child_instance_id,c.definition_id,c.version,c.called_definition_id,c.called_version,c.model_sha256,p.arrival_edge_id,p.node_id,v.model_json,v.model_sha256 FROM bpmn_calls c JOIN bpmn_tokens p ON p.instance_id=c.parent_instance_id AND p.scope_id=c.parent_scope_id AND p.token_id=c.parent_token_id JOIN bpmn_instances i ON i.instance_id=c.parent_instance_id AND i.definition_id=c.definition_id AND i.version=c.version JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version ORDER BY c.call_id")?;
+        let rows = calls.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,row.get::<_, String>(6)?,row.get::<_, u32>(7)?,row.get::<_, String>(8)?,row.get::<_, u32>(9)?,row.get::<_, String>(10)?,row.get::<_, Option<String>>(11)?,row.get::<_, String>(12)?,row.get::<_, String>(13)?,row.get::<_, String>(14)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(calls);
+        let total: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_calls", [], |row| row.get(0))?;
+        ensure!(i64::try_from(rows.len())? == total,
+            "historical Call lacks its factual parent token or pinned version");
+        for (call_id,parent_id,parent_scope,_parent_token,node_id,child_id,parent_definition,parent_version,called_definition,called_version,called_hash,arrival,parent_token_node,model_json,model_sha256) in rows {
+            ensure!(hex::encode(Sha256::digest(model_json.as_bytes())) == model_sha256,
+                "historical Call parent model hash differs from immutable bytes");
+            ensure!(parent_token_node == node_id,
+                "historical Call parent token differs from its pinned node");
+            let arrival = arrival.context("historical Call has no factual incoming edge")?;
+            let model: ProcessModel = serde_json::from_str(&model_json)?;
+            ensure!(model.additional_processes.is_empty(),
+                "historical Call parent has no uniquely selected body");
+            let mut path = Vec::new();
+            let mut scope = parent_scope.clone();
+            let mut seen = HashSet::new();
+            while scope != parent_id {
+                ensure!(seen.insert(scope.clone()) && path.len() < 3,
+                    "historical Call scope ancestry is cyclic or too deep");
+                let (parent,subprocess): (String,String) = tx.query_row("SELECT parent_scope_id,subprocess_node_id FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2", rusqlite::params![parent_id,scope], |row| Ok((row.get(0)?,row.get(1)?)))?;
+                path.push(subprocess);
+                scope = parent;
+            }
+            path.reverse();
+            let (nodes, flows, _) = crate::processes::model::scope_body(&model, &path)?;
+            ensure!(flows.iter().filter(|flow| flow.id == arrival
+                && flow.target_id == node_id).count() == 1,
+                "historical Call arrival differs from its pinned incoming flow");
+            let node = nodes.iter().find(|node| node.id == node_id)
+                .context("historical Call node is outside its pinned scope")?;
+            let ProcessNodeKind::CallActivity(call) = &node.kind else {
+                anyhow::bail!("historical Call node is not a CallActivity")
+            };
+            let ProcessCallTarget::PublishedBody { definition_id, version, called_element } = &call.target else {
+                anyhow::bail!("historical Call has no published target")
+            };
+            let (child_process,child_start): (String,String) = tx.query_row("SELECT process_id,start_node_id FROM temp.bpmn_instance_pins_195 WHERE instance_id=?1", [&child_id], |row| Ok((row.get(0)?,row.get(1)?)))
+                .context("historical Call child lacks its factual Start")?;
+            let (child_definition, child_version): (String, u32) = tx.query_row(
+                "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+                [&child_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).context("historical Call child instance is missing")?;
+            ensure!(definition_id == &called_definition && *version == called_version
+                && child_definition == called_definition && child_version == called_version
+                && called_element.process_id == child_process,
+                "historical Call child body differs from its immutable target");
+            let pin: (String,u32,String,String) = tx.query_row("SELECT called_definition_id,called_version,called_element_json,model_sha256 FROM bpmn_call_pins WHERE definition_id=?1 AND version=?2 AND node_id=?3", rusqlite::params![parent_definition,parent_version,node_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))
+                .context("historical Call has no immutable direct pin")?;
+            let child_hash: String = tx.query_row("SELECT model_sha256 FROM bpmn_versions WHERE definition_id=?1 AND version=?2", rusqlite::params![called_definition,called_version], |row| row.get(0))?;
+            ensure!(pin.0 == called_definition && pin.1 == called_version
+                && serde_json::from_str::<tentaflow_protocol::processes::ProcessCallableReference>(&pin.2)? == *called_element
+                && pin.3 == called_hash && called_hash == child_hash,
+                "historical Call direct pin differs from its retained target");
+            tx.execute("INSERT INTO temp.bpmn_call_history_pins_195(call_id,parent_arrival_edge_id,called_process_id,child_start_node_id) VALUES(?1,?2,?3,?4)", rusqlite::params![call_id,arrival,child_process,child_start])?;
+        }
+
+        let mut messages = tx.prepare("SELECT m.org_id,m.sender_user_id,m.message_id,m.definition_id,m.message_name,m.matched_version,m.matched_node_id,i.org_id,i.definition_id,i.version,p.process_id,p.start_node_id,v.model_json FROM bpmn_messages m JOIN bpmn_instances i ON i.instance_id=m.matched_instance_id JOIN temp.bpmn_instance_pins_195 p ON p.instance_id=i.instance_id JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version WHERE m.target_kind='start' AND m.status='delivered' ORDER BY m.org_id,m.sender_user_id,m.message_id")?;
+        let delivered = messages.query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, Option<u32>>(5)?,row.get::<_, Option<String>>(6)?,row.get::<_, String>(7)?,row.get::<_, String>(8)?,row.get::<_, u32>(9)?,row.get::<_, String>(10)?,row.get::<_, String>(11)?,row.get::<_, String>(12)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(messages);
+        let delivered_count: i64 = tx.query_row("SELECT COUNT(*) FROM bpmn_messages WHERE target_kind='start' AND status='delivered'", [], |row| row.get(0))?;
+        ensure!(i64::try_from(delivered.len())? == delivered_count,
+            "historical delivered Message Start lacks its factual instance pin");
+        for (org_id,sender_user_id,message_id,definition_id,message_name,matched_version,matched_node_id,instance_org,instance_definition,instance_version,process_id,start_node_id,model_json) in delivered {
+            ensure!(org_id == instance_org && definition_id == instance_definition
+                && matched_version == Some(instance_version)
+                && matched_node_id.as_deref() == Some(start_node_id.as_str()),
+                "historical delivered Message Start differs from its selected instance");
+            let model: ProcessModel = serde_json::from_str(&model_json)?;
+            let node = model.nodes.iter().find(|node| node.id == start_node_id)
+                .context("historical delivered Message Start is absent from its pinned body")?;
+            let ProcessNodeKind::MessageStart { message_ref, .. } = &node.kind else {
+                anyhow::bail!("historical delivered Message Start has the wrong node kind")
+            };
+            ensure!(model.messages.iter().any(|decl| decl.message_id.as_str() == message_ref.as_str()
+                && decl.name.as_str() == message_name.as_str()),
+                "historical delivered Message Start has the wrong message declaration");
+            tx.execute("INSERT INTO temp.bpmn_message_pins_195(org_id,sender_user_id,message_id,process_id,start_node_id) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![org_id,sender_user_id,message_id,process_id,start_node_id])?;
+        }
+
+        tx.execute_batch(BPMN_SELECTED_BODY_PINS)?;
+        for (table,old,columns) in [
+            ("bpmn_instances","bpmn_instances_old_195","instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence,terminal_error_json,error_event_id,error_scope_id"),
+            ("bpmn_calls","bpmn_calls_old_195","call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms"),
+            ("bpmn_timers","bpmn_timers_old_195","timer_id,org_id,definition_id,version,node_id,kind,instance_id,scope_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id"),
+            ("bpmn_messages","bpmn_messages_old_195","org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,payload_pruned_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,source_scope_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id"),
+        ] {
+            let current: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+            let prior: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM temp.{old}"), [], |row| row.get(0))?;
+            ensure!(current == prior, "selected-body migration changed historical {table} row count");
+            for (left,right) in [(table,old),(old,table)] {
+                let changed: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM (SELECT {columns} FROM {left} EXCEPT SELECT {columns} FROM {right})"), [], |row| row.get(0))?;
+                ensure!(changed == 0, "selected-body migration changed historical {table} column bytes");
+            }
+        }
+        let violations = foreign_key_check(&tx)?;
+        ensure!(violations.is_empty(),
+            "selected-body migration foreign key violations: {}", violations.join("; "));
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        ensure!(integrity == "ok", "selected-body migration integrity: {integrity}");
+        tx.execute("INSERT INTO _migrations(version,name) VALUES(?1,?2)", rusqlite::params![version,name])?;
+        tx.execute_batch("DROP TABLE temp.bpmn_instance_pins_195; DROP TABLE temp.bpmn_timer_pins_195;
+            DROP TABLE temp.bpmn_call_history_pins_195; DROP TABLE temp.bpmn_instances_old_195;
+            DROP TABLE temp.bpmn_message_pins_195;
+            DROP TABLE temp.bpmn_calls_old_195; DROP TABLE temp.bpmn_timers_old_195;
+            DROP TABLE temp.bpmn_messages_old_195;")?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = if original_fk == 0 { "PRAGMA foreign_keys=OFF;" }
+        else { "PRAGMA foreign_keys=ON;" };
+    let restored = conn.execute_batch(restore).and_then(|()|
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)));
+    match (result, restored) {
+        (Ok(()), Ok(mode)) if mode == original_fk => Ok(()),
+        (Ok(()), Ok(_)) => anyhow::bail!("selected-body migration did not restore foreign key mode"),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Ok(mode)) if mode == original_fk => Err(error),
+        (Err(error), Ok(_)) => Err(error.context("selected-body migration did not restore foreign key mode")),
+        (Err(error), Err(restore)) => Err(error.context(format!("selected-body migration could not restore foreign key mode: {restore}"))),
+    }
+}
+
+const BPMN_SERVICE_INVOCATIONS: &str = r#"
+CREATE UNIQUE INDEX uq_bpmn_incidents_invocation_link ON bpmn_incidents(instance_id,scope_id,job_id,incident_id);
+CREATE TABLE bpmn_service_invocations (
+    invocation_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE,
+    instance_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    selected_process_id TEXT NOT NULL,
+    whole_document_sha256 TEXT NOT NULL,
+    flow_id TEXT NOT NULL,
+    pinned_flow_digest TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    stable_request_id TEXT UNIQUE,
+    phase TEXT NOT NULL,
+    dispatch_evidence TEXT NOT NULL,
+    phase_revision INTEGER NOT NULL DEFAULT 1,
+    acceptance_revision INTEGER NOT NULL DEFAULT 0,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    dispatch_attempt INTEGER,
+    dispatch_fence INTEGER,
+    dispatch_worker_id TEXT,
+    dispatch_committed_at_ms INTEGER,
+    observed_result_json TEXT,
+    observed_result_origin TEXT,
+    observed_result_sha256 TEXT,
+    reserved_result_event_id TEXT UNIQUE,
+    observed_at_ms INTEGER,
+    acceptance_owner_id TEXT,
+    acceptance_lease_until_ms INTEGER,
+    uncertainty_incident_id TEXT UNIQUE,
+    blocked_incident_id TEXT UNIQUE,
+    blocked_reason TEXT,
+    CHECK (phase IN ('prepared','may_have_executed','uncertain','observed',
+                    'observed_blocked','accepted','proved_no_effect')),
+    CHECK (dispatch_evidence IN ('no_boundary','committed_boundary','boundary_unknown')),
+    CHECK (stable_request_id IS NULL OR stable_request_id=invocation_id),
+    CHECK (typeof(version)='integer' AND version>0 AND
+           typeof(phase_revision)='integer' AND phase_revision>0 AND
+           typeof(acceptance_revision)='integer' AND acceptance_revision>=0),
+    CHECK (length(whole_document_sha256)=64 AND
+           whole_document_sha256 NOT GLOB '*[^0-9a-f]*' AND
+           length(pinned_flow_digest)=64 AND
+           pinned_flow_digest NOT GLOB '*[^0-9a-f]*' AND
+           length(input_sha256)=64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((dispatch_evidence='no_boundary' AND
+            phase IN ('prepared','proved_no_effect') AND
+            stable_request_id IS NOT NULL AND
+            dispatch_attempt IS NULL AND dispatch_fence IS NULL AND
+            dispatch_worker_id IS NULL AND dispatch_committed_at_ms IS NULL) OR
+           (dispatch_evidence='committed_boundary' AND
+            phase IN ('may_have_executed','uncertain','observed',
+                      'observed_blocked','accepted') AND
+            stable_request_id IS NOT NULL AND
+            dispatch_attempt IS NOT NULL AND dispatch_attempt>0 AND
+            dispatch_fence IS NOT NULL AND dispatch_fence>=0 AND
+            dispatch_worker_id IS NOT NULL AND
+            dispatch_committed_at_ms IS NOT NULL) OR
+           (dispatch_evidence='boundary_unknown' AND
+            phase IN ('uncertain','accepted') AND
+            stable_request_id IS NULL AND
+            dispatch_attempt IS NULL AND dispatch_fence IS NULL AND
+            dispatch_worker_id IS NULL AND dispatch_committed_at_ms IS NULL)),
+    CHECK ((phase IN ('prepared','may_have_executed','uncertain','proved_no_effect') AND
+            observed_result_json IS NULL AND observed_result_origin IS NULL AND
+            observed_result_sha256 IS NULL AND reserved_result_event_id IS NULL AND
+            observed_at_ms IS NULL) OR
+           (phase IN ('observed','observed_blocked','accepted') AND
+            observed_result_json IS NOT NULL AND json_valid(observed_result_json) AND
+            observed_result_origin IS NOT NULL AND
+            observed_result_sha256 IS NOT NULL AND
+            length(observed_result_sha256)=64 AND
+            observed_result_sha256 NOT GLOB '*[^0-9a-f]*' AND
+            reserved_result_event_id IS NOT NULL AND observed_at_ms IS NOT NULL)),
+    CHECK ((acceptance_owner_id IS NULL AND acceptance_lease_until_ms IS NULL) OR
+           (phase='observed' AND dispatch_evidence='committed_boundary' AND
+            acceptance_owner_id IS NOT NULL AND acceptance_lease_until_ms IS NOT NULL)),
+    CHECK ((phase='uncertain' AND uncertainty_incident_id IS NOT NULL) OR
+           (phase IN ('prepared','may_have_executed','proved_no_effect') AND
+            uncertainty_incident_id IS NULL) OR
+           phase IN ('observed','observed_blocked','accepted')),
+    CHECK ((phase='observed_blocked' AND blocked_incident_id IS NOT NULL AND
+            blocked_reason IN ('activation_closed','execution_authority_revoked')) OR
+           (phase<>'observed_blocked' AND blocked_incident_id IS NULL AND
+            blocked_reason IS NULL)),
+    CHECK (dispatch_evidence<>'boundary_unknown' OR phase<>'accepted' OR
+           reserved_result_event_id IS NOT NULL),
+    FOREIGN KEY (instance_id,scope_id,job_id)
+        REFERENCES bpmn_jobs(instance_id,scope_id,job_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (instance_id,scope_id,token_id)
+        REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (definition_id,version)
+        REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT,
+    FOREIGN KEY (instance_id,scope_id,job_id,uncertainty_incident_id)
+        REFERENCES bpmn_incidents(instance_id,scope_id,job_id,incident_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (instance_id,scope_id,job_id,blocked_incident_id)
+        REFERENCES bpmn_incidents(instance_id,scope_id,job_id,incident_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TRIGGER bpmn_service_invocations_immutable
+BEFORE UPDATE ON bpmn_service_invocations
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT,'invocation identity changed') WHERE
+        NEW.invocation_id IS NOT OLD.invocation_id OR
+        NEW.job_id IS NOT OLD.job_id OR NEW.instance_id IS NOT OLD.instance_id OR
+        NEW.scope_id IS NOT OLD.scope_id OR NEW.node_id IS NOT OLD.node_id OR
+        NEW.token_id IS NOT OLD.token_id OR NEW.definition_id IS NOT OLD.definition_id OR
+        NEW.version IS NOT OLD.version OR
+        NEW.selected_process_id IS NOT OLD.selected_process_id OR
+        NEW.whole_document_sha256 IS NOT OLD.whole_document_sha256 OR
+        NEW.flow_id IS NOT OLD.flow_id OR
+        NEW.pinned_flow_digest IS NOT OLD.pinned_flow_digest OR
+        NEW.input_sha256 IS NOT OLD.input_sha256 OR
+        NEW.stable_request_id IS NOT OLD.stable_request_id OR
+        NEW.created_at_ms IS NOT OLD.created_at_ms;
+    SELECT RAISE(ABORT,'dispatch evidence changed') WHERE
+        NOT ((OLD.phase='prepared' AND OLD.dispatch_evidence='no_boundary' AND
+              NEW.phase='may_have_executed' AND
+              NEW.dispatch_evidence='committed_boundary') OR
+             NEW.dispatch_evidence IS OLD.dispatch_evidence);
+    SELECT RAISE(ABORT,'dispatch tuple changed') WHERE
+        OLD.dispatch_evidence='committed_boundary' AND
+        (NEW.dispatch_attempt IS NOT OLD.dispatch_attempt OR
+         NEW.dispatch_fence IS NOT OLD.dispatch_fence OR
+         NEW.dispatch_worker_id IS NOT OLD.dispatch_worker_id OR
+         NEW.dispatch_committed_at_ms IS NOT OLD.dispatch_committed_at_ms);
+    SELECT RAISE(ABORT,'observed result changed') WHERE
+        OLD.observed_result_json IS NOT NULL AND
+        (NEW.observed_result_json IS NOT OLD.observed_result_json OR
+         NEW.observed_result_origin IS NOT OLD.observed_result_origin OR
+         NEW.observed_result_sha256 IS NOT OLD.observed_result_sha256 OR
+         NEW.reserved_result_event_id IS NOT OLD.reserved_result_event_id OR
+         NEW.observed_at_ms IS NOT OLD.observed_at_ms);
+    SELECT RAISE(ABORT,'incident link changed') WHERE
+        (OLD.uncertainty_incident_id IS NOT NULL AND
+         NEW.uncertainty_incident_id IS NOT OLD.uncertainty_incident_id) OR
+        (OLD.blocked_incident_id IS NOT NULL AND
+         NEW.blocked_incident_id IS NOT OLD.blocked_incident_id);
+    SELECT RAISE(ABORT,'invalid phase transition') WHERE
+        NOT ((OLD.phase='prepared' AND NEW.phase IN ('may_have_executed','proved_no_effect')) OR
+             (OLD.phase='may_have_executed' AND NEW.phase IN ('uncertain','observed')) OR
+             (OLD.phase='uncertain' AND OLD.dispatch_evidence='committed_boundary' AND
+              NEW.phase='observed') OR
+             (OLD.phase='observed' AND NEW.phase IN ('observed','accepted','observed_blocked')));
+    SELECT RAISE(ABORT,'invalid phase revision') WHERE
+        NEW.phase_revision<>OLD.phase_revision+1 OR
+        NEW.updated_at_ms<OLD.updated_at_ms OR
+        (NEW.acceptance_owner_id IS OLD.acceptance_owner_id AND
+         NEW.acceptance_lease_until_ms IS OLD.acceptance_lease_until_ms AND
+         NEW.acceptance_revision<>OLD.acceptance_revision) OR
+        ((NEW.acceptance_owner_id IS NOT OLD.acceptance_owner_id OR
+          NEW.acceptance_lease_until_ms IS NOT OLD.acceptance_lease_until_ms) AND
+         NEW.acceptance_revision<>OLD.acceptance_revision+1);
+END;
+"#;
+
+fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
+    use anyhow::{bail, ensure, Context};
+    use rusqlite::params;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use tentaflow_protocol::processes::{ProcessModel, ProcessNodeKind};
+    use uuid::Uuid;
+
+    ensure!(foreign_key_check(conn)?.is_empty(),
+        "service invocation migration refuses invalid historical foreign keys");
+    conn.execute_batch(BPMN_SERVICE_INVOCATIONS)?;
+    let old_groups = conn.prepare(
+        "SELECT DISTINCT g.instance_id,g.group_id,g.retained_bytes
+         FROM bpmn_repetition_groups g
+         JOIN bpmn_repetition_occurrences o ON o.group_id=g.group_id
+             AND o.instance_id=g.instance_id AND o.scope_id=g.scope_id
+         JOIN bpmn_jobs j ON j.job_id=o.job_id
+             AND j.instance_id=o.instance_id AND j.scope_id=o.scope_id")?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (instance_id, group_id, retained) in old_groups {
+        let physical = crate::processes::repository::measured_repetition_retained_bytes_on(
+            conn, &instance_id, &group_id)?;
+        ensure!(u64::try_from(retained)? == physical,
+            "service invocation migration refuses an inaccurate historical repetition counter");
+    }
+    let mut statement = conn.prepare(
+        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,j.token_id,j.input_json, \
+                j.status,j.attempt,j.fence,j.worker_id,j.result_json,j.result_origin, \
+                j.created_at_ms,j.updated_at_ms,i.definition_id,i.version, \
+                i.selected_process_id,v.model_json,v.model_sha256,v.service_snapshots_json \
+         FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id \
+         JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+         ORDER BY j.job_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?, row.get::<_, u32>(7)?,
+            row.get::<_, i64>(8)?, row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
+            row.get::<_, i64>(12)?, row.get::<_, i64>(13)?,
+            row.get::<_, String>(14)?, row.get::<_, u32>(15)?,
+            row.get::<_, String>(16)?, row.get::<_, String>(17)?,
+            row.get::<_, String>(18)?, row.get::<_, String>(19)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_jobs", [], |row| row.get(0))?;
+    ensure!(i64::try_from(rows.len())? == count,
+        "service invocation migration refuses a job without its immutable version");
+    let cutover_at_ms = i64::try_from(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())?;
+
+    for (job_id, instance_id, scope_id, node_id, token_id, input_json, status,
+        attempt, fence, worker_id, result_json, result_origin, created_at_ms,
+        updated_at_ms, definition_id, version, selected_process_id, model_json,
+        model_sha256, snapshots_json) in rows {
+        let fence = u64::try_from(fence)
+            .context("service invocation migration refuses a negative historical fence")?;
+        ensure!(hex::encode(Sha256::digest(model_json.as_bytes())) == model_sha256,
+            "service invocation migration refuses a changed pinned model");
+        let model: ProcessModel = serde_json::from_str(&model_json)
+            .context("service invocation migration cannot parse pinned model")?;
+        let mut path = Vec::new();
+        let mut scope = scope_id.clone();
+        let mut seen = std::collections::HashSet::new();
+        while scope != instance_id {
+            ensure!(seen.insert(scope.clone()) && path.len() < 3,
+                "service invocation migration refuses cyclic scope ancestry");
+            let (parent, node): (String, String) = conn.query_row(
+                "SELECT parent_scope_id,subprocess_node_id FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2",
+                params![instance_id, scope], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            path.push(node);
+            scope = parent;
+        }
+        path.reverse();
+        let body = crate::processes::model::selected_body(&model, &selected_process_id, &path)?;
+        let nodes = body.nodes.iter().filter(|node| node.id == node_id).collect::<Vec<_>>();
+        ensure!(nodes.len() == 1,
+            "service invocation migration has no unique pinned scoped Service node");
+        let ProcessNodeKind::ServiceTask { flow_id, .. } = &nodes[0].kind else {
+            bail!("service invocation migration job node is not a Service task")
+        };
+        let snapshots: Vec<crate::processes::repository::PinnedServiceSnapshot> =
+            serde_json::from_str(&snapshots_json)?;
+        let pins = snapshots.iter().filter(|snapshot|
+            snapshot.info.node_id == node_id && snapshot.info.flow_id == *flow_id)
+            .collect::<Vec<_>>();
+        ensure!(pins.len() == 1
+            && hex::encode(Sha256::digest(pins[0].graph_json.as_bytes()))
+                == pins[0].info.graph_sha256,
+            "service invocation migration has no unique immutable flow pin");
+
+        let unclaimed = attempt == 0 && fence == 0 && worker_id.is_none()
+            && result_json.is_none() && result_origin.is_none();
+        let accepted = if result_json.is_some() && result_origin.is_some() {
+            let mut accepted = conn.prepare(
+                "SELECT e.event_id,e.at_ms,e.data_json FROM bpmn_repetition_occurrences o \
+                 JOIN bpmn_events e ON e.instance_id=o.instance_id \
+                   AND e.event_id=o.accepted_source_event_id \
+                 WHERE o.job_id=?1 AND o.instance_id=?2 AND o.scope_id=?3 \
+                   AND o.token_id=?4 AND o.status='completed' \
+                   AND e.scope_id=o.scope_id AND e.node_id=?5 AND e.kind='service_result'")?;
+            let matches = accepted.query_map(
+                params![job_id,instance_id,scope_id,token_id,node_id],
+                |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(matches.len() <= 1,
+                "service invocation migration refuses ambiguous accepted results");
+            if let Some((event_id, at_ms, data_json)) = matches.into_iter().next() {
+                let mut event: Value = serde_json::from_str(&data_json)?;
+                let origin = event.as_object_mut()
+                    .and_then(|data| data.remove("result_origin"))
+                    .context("historical Service result has no origin")?;
+                let stored: Value = serde_json::from_str(
+                    result_json.as_deref().context("accepted result disappeared")?)?;
+                ensure!(event == stored && origin.as_str() == result_origin.as_deref(),
+                    "historical accepted Service result differs from its factual event");
+                Some((event_id, at_ms))
+            } else { None }
+        } else { None };
+        let live: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i \
+             ON i.instance_id=t.instance_id WHERE t.instance_id=?1 AND t.scope_id=?2 \
+             AND t.token_id=?3 AND t.node_id=?4 AND t.status='waiting' \
+             AND i.status NOT IN ('completed','cancelled','error'))",
+            params![instance_id,scope_id,token_id,node_id], |row| row.get(0))?;
+        ensure!(status != "running",
+            "service invocation migration requires old workers to be quiesced");
+        let (phase, evidence) = if accepted.is_some() {
+            ("accepted", "boundary_unknown")
+        } else if unclaimed && live && status == "queued" {
+            ("prepared", "no_boundary")
+        } else if unclaimed && (status == "error" || status == "cancelled" && !live) {
+            ("proved_no_effect", "no_boundary")
+        } else if status == "completed" {
+            bail!("service invocation migration refuses unproved completed Service history")
+        } else if attempt > 0 || fence > 0 || worker_id.is_some() || result_json.is_some() {
+            ("uncertain", "boundary_unknown")
+        } else {
+            bail!("service invocation migration refuses inconsistent Service history")
+        };
+        ensure!(phase != "uncertain" || status == "error",
+            "service invocation migration refuses attempted queued history without an original dispatch tuple");
+        ensure!(phase != "uncertain" || live,
+            "service invocation migration refuses closed historical external uncertainty without original dispatch identity");
+        let invocation_id = Uuid::new_v4().to_string();
+        let stable_request_id = (evidence == "no_boundary").then(|| invocation_id.clone());
+        let incident_id = if phase == "uncertain" {
+            let id = Uuid::new_v4().to_string();
+            let code = "EXTERNAL_OUTCOME_UNCERTAIN";
+            let message = "The external effect may have occurred; direct retry is unavailable";
+            conn.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id,instance_id,scope_id,node_id,job_id,code,message,cutover_at_ms])?;
+            let seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+                [&instance_id], |row| row.get(0))?;
+            conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,'incident',?6,NULL,?7)",
+                params![Uuid::new_v4().to_string(),instance_id,scope_id,seq,cutover_at_ms,node_id,
+                    serde_json::json!({"incident_id":id,"job_id":job_id,"code":code,"message":message,"invocation_id":invocation_id}).to_string()])?;
+            Some(id)
+        } else { None };
+        let observed_hash = result_json.as_ref()
+            .filter(|_| accepted.is_some())
+            .map(|result| hex::encode(Sha256::digest(result.as_bytes())));
+        conn.execute(
+            "INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms,observed_result_json,observed_result_origin,observed_result_sha256,reserved_result_event_id,observed_at_ms,uncertainty_incident_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,1,0,?17,?18,?19,?20,?21,?22,?23,?24)",
+            params![invocation_id,job_id,instance_id,scope_id,node_id,token_id,
+                definition_id,version,selected_process_id,model_sha256,flow_id,
+                pins[0].info.graph_sha256,
+                hex::encode(Sha256::digest(input_json.as_bytes())),stable_request_id,
+                phase,evidence,created_at_ms,
+                if phase == "uncertain" { cutover_at_ms } else { updated_at_ms },
+                result_json.filter(|_| accepted.is_some()),
+                result_origin.filter(|_| accepted.is_some()),observed_hash,
+                accepted.as_ref().map(|row| row.0.as_str()),
+                accepted.as_ref().map(|row| row.1),incident_id])?;
+    }
+    conn.execute(
+        "UPDATE bpmn_repetition_groups SET retained_bytes=retained_bytes+
+            COALESCE((SELECT SUM(length(CAST(v.observed_result_json AS BLOB)))
+                FROM bpmn_repetition_occurrences o
+                JOIN bpmn_service_invocations v ON v.job_id=o.job_id
+                    AND v.instance_id=o.instance_id AND v.scope_id=o.scope_id
+                WHERE o.group_id=bpmn_repetition_groups.group_id),0)
+            WHERE EXISTS(SELECT 1 FROM bpmn_repetition_occurrences o
+                JOIN bpmn_service_invocations v ON v.job_id=o.job_id
+                    AND v.instance_id=o.instance_id AND v.scope_id=o.scope_id
+                WHERE o.group_id=bpmn_repetition_groups.group_id
+                    AND v.observed_result_json IS NOT NULL)",
+        [],
+    )?;
+    let mut reservations = std::collections::HashMap::<String, u64>::new();
+    let mut reserved_jobs = conn.prepare(
+        "SELECT o.instance_id,j.status,v.phase,v.dispatch_evidence,v.reserved_result_event_id
+         FROM bpmn_repetition_occurrences o
+         JOIN bpmn_jobs j ON j.job_id=o.job_id
+             AND j.instance_id=o.instance_id AND j.scope_id=o.scope_id
+         JOIN bpmn_service_invocations v ON v.job_id=j.job_id
+             AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id",
+    )?;
+    let rows = reserved_jobs.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (instance_id, status, phase, evidence, observed_event_id) in rows {
+        let (claim, observation, incident) =
+            crate::processes::runtime::repetition_service_reservation_flags(
+                &status, Some(&phase), &evidence, observed_event_id.is_some());
+        let entry = reservations.entry(instance_id).or_default();
+        if claim {
+            *entry = entry.checked_add(
+                crate::processes::runtime::repetition_claim_reservation()?)
+                .context("historical repeated Service claim reservation overflow")?;
+        }
+        if observation {
+            *entry = entry.checked_add(
+                crate::processes::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES)
+                .context("historical repeated Service observation reservation overflow")?;
+        }
+        if incident {
+            *entry = entry.checked_add(
+                crate::processes::runtime::MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES)
+                .context("historical repeated Service incident reservation overflow")?;
+        }
+    }
+    drop(reserved_jobs);
+    let mut groups = conn.prepare(
+        "SELECT instance_id,COALESCE(SUM(retained_bytes),0),MAX(terminal_capacity)
+         FROM bpmn_repetition_groups GROUP BY instance_id",
+    )?;
+    let rows = groups.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (instance_id, retained, terminal_capacity) in rows {
+        let retained = u64::try_from(retained)?;
+        let reserved = reservations.get(&instance_id).copied().unwrap_or_default();
+        ensure!(terminal_capacity == 1 || retained.checked_add(reserved)
+            .context("historical repeated Service capacity calculation overflow")? <= 64 * 1024 * 1024,
+            "historical repeated Service observation exceeds unlatched retained-byte capacity");
+    }
+    ensure!(foreign_key_check(conn)?.is_empty(),
+        "service invocation migration created a foreign key violation");
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    ensure!(integrity == "ok", "service invocation migration integrity: {integrity}");
+    Ok(())
+}
+
+const BPMN_ACTIVITY_IO_WITNESSES: &str = r#"
+CREATE UNIQUE INDEX uq_bpmn_io_occurrence_scope
+    ON bpmn_repetition_occurrences(instance_id,scope_id,occurrence_id);
+CREATE UNIQUE INDEX uq_bpmn_io_occurrence_group_ordinal
+    ON bpmn_repetition_occurrences(instance_id,scope_id,group_id,occurrence_id,ordinal);
+CREATE UNIQUE INDEX uq_bpmn_io_incident_scope
+    ON bpmn_incidents(instance_id,scope_id,incident_id);
+CREATE UNIQUE INDEX uq_bpmn_io_service_invocation_scope
+    ON bpmn_service_invocations(instance_id,scope_id,token_id,invocation_id);
+CREATE UNIQUE INDEX uq_bpmn_io_call_parent
+    ON bpmn_calls(parent_instance_id,call_id);
+CREATE TABLE bpmn_activity_io_witnesses (
+    witness_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES bpmn_instances(instance_id) ON DELETE CASCADE,
+    scope_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    activity_kind TEXT NOT NULL CHECK(activity_kind IN
+        ('user','script','service','manual','send','receive','subprocess','call')),
+    phase_owner TEXT NOT NULL CHECK(phase_owner IN ('ordinary','ordinal','coordinator')),
+    group_id TEXT,
+    occurrence_id TEXT,
+    ordinal INTEGER,
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    selected_process_id TEXT NOT NULL,
+    body_path_json TEXT NOT NULL CHECK(json_valid(body_path_json) AND json_type(body_path_json)='array'),
+    model_sha256 TEXT NOT NULL,
+    io_spec_sha256 TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN
+        ('input_failed','input_captured','result_accepted','output_blocked','output_applied')),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>0),
+    input_event_id TEXT,
+    input_values_json TEXT,
+    input_sha256 TEXT,
+    result_event_id TEXT,
+    source_instance_id TEXT,
+    source_event_id TEXT,
+    result_sources_json TEXT,
+    result_presence TEXT CHECK(result_presence IS NULL OR result_presence IN ('missing','present')),
+    result_json TEXT,
+    result_sha256 TEXT,
+    retained_route_kind TEXT CHECK(retained_route_kind IS NULL OR retained_route_kind IN
+        ('mapping','awaiting_verification','final_script_mapping_failure',
+         'final_scope_return_failure',
+         'final_boundary_error',
+         'final_boundary_escalation','final_unhandled_error',
+         'final_unhandled_escalation','final_verification_rejected','final_cancelled')),
+    retained_route_event_id TEXT,
+    retained_route_resource_id TEXT,
+    accepted_origin TEXT CHECK(accepted_origin IS NULL OR accepted_origin IN ('envelope','contract','platform')),
+    resource_id TEXT,
+    resource_revision INTEGER CHECK(resource_revision IS NULL OR
+        (typeof(resource_revision)='integer' AND resource_revision>=0)),
+    service_invocation_id TEXT,
+    child_scope_id TEXT,
+    call_id TEXT,
+    child_instance_id TEXT,
+    child_expected_revision INTEGER CHECK(child_expected_revision IS NULL OR
+        (typeof(child_expected_revision)='integer' AND child_expected_revision>0)),
+    child_status TEXT,
+    parent_wait_token_id TEXT,
+    output_event_id TEXT,
+    output_values_json TEXT,
+    local_patch_json TEXT,
+    incident_event_id TEXT,
+    incident_id TEXT,
+    failed_association_id TEXT,
+    failed_position INTEGER CHECK(failed_position IS NULL OR
+        (typeof(failed_position)='integer' AND failed_position>=0 AND failed_position<16)),
+    created_at_ms INTEGER NOT NULL CHECK(typeof(created_at_ms)='integer'),
+    updated_at_ms INTEGER NOT NULL CHECK(typeof(updated_at_ms)='integer'),
+    CHECK ((phase_owner='ordinary' AND group_id IS NULL AND occurrence_id IS NULL AND ordinal IS NULL)
+        OR (phase_owner='ordinal' AND group_id IS NOT NULL AND occurrence_id IS NOT NULL
+            AND typeof(ordinal)='integer' AND ordinal BETWEEN 0 AND 4294967295)
+        OR (phase_owner='coordinator' AND group_id IS NOT NULL AND occurrence_id IS NULL
+            AND ordinal IS NULL)),
+    CHECK (length(model_sha256)=64 AND model_sha256 NOT GLOB '*[^0-9a-f]*'
+        AND length(io_spec_sha256)=64 AND io_spec_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((phase='input_failed' AND input_event_id IS NULL AND input_values_json IS NULL
+        AND input_sha256 IS NULL AND failed_association_id IS NOT NULL
+        AND failed_position IS NOT NULL)
+        OR (phase<>'input_failed' AND input_event_id IS NOT NULL
+        AND input_values_json IS NOT NULL AND json_valid(input_values_json)
+        AND json_type(input_values_json)='array' AND input_sha256 IS NOT NULL)),
+    CHECK ((phase='input_failed' AND failed_association_id IS NOT NULL
+        AND failed_position IS NOT NULL)
+        OR (phase='output_blocked' AND
+            ((failed_association_id IS NULL AND failed_position IS NULL)
+             OR (failed_association_id IS NOT NULL AND failed_position IS NOT NULL)))
+        OR (phase NOT IN ('input_failed','output_blocked')
+            AND failed_association_id IS NULL AND failed_position IS NULL)),
+    CHECK (input_sha256 IS NULL OR (length(input_sha256)=64
+        AND input_sha256 NOT GLOB '*[^0-9a-f]*')),
+    CHECK ((phase IN ('input_failed','input_captured') AND result_event_id IS NULL
+        AND source_instance_id IS NULL AND source_event_id IS NULL
+        AND result_sources_json IS NULL AND result_presence IS NULL
+        AND result_json IS NULL AND result_sha256 IS NULL)
+        OR (phase IN ('result_accepted','output_blocked','output_applied')
+        AND retained_route_kind IS NOT NULL
+        AND result_event_id IS NOT NULL AND source_instance_id IS NOT NULL
+        AND source_event_id IS NOT NULL AND result_sources_json IS NOT NULL
+        AND json_valid(result_sources_json) AND json_type(result_sources_json)='array'
+        AND result_presence IS NOT NULL AND result_sha256 IS NOT NULL
+        AND ((result_presence='missing' AND result_json IS NULL)
+            OR (result_presence='present' AND result_json IS NOT NULL
+                AND json_valid(result_json) AND length(CAST(result_json AS BLOB))<=262144)))),
+    CHECK (result_sha256 IS NULL OR (length(result_sha256)=64
+        AND result_sha256 NOT GLOB '*[^0-9a-f]*')),
+    CHECK ((phase IN ('input_failed','input_captured') AND retained_route_kind IS NULL
+        AND retained_route_event_id IS NULL AND retained_route_resource_id IS NULL)
+        OR (phase IN ('result_accepted','output_blocked','output_applied')
+        AND ((retained_route_kind='mapping' AND retained_route_event_id IS NULL
+                AND retained_route_resource_id IS NULL)
+            OR (retained_route_kind<>'mapping' AND retained_route_event_id IS NOT NULL
+                AND ((retained_route_kind IN ('awaiting_verification',
+                    'final_boundary_error','final_boundary_escalation',
+                    'final_verification_rejected') AND retained_route_resource_id IS NOT NULL)
+                  OR (retained_route_kind IN ('final_script_mapping_failure',
+                    'final_scope_return_failure',
+                    'final_unhandled_error',
+                    'final_unhandled_escalation','final_cancelled')
+                    AND retained_route_resource_id IS NULL)))))),
+    CHECK ((phase='output_applied' AND output_event_id IS NOT NULL
+        AND output_values_json IS NOT NULL AND json_valid(output_values_json)
+        AND json_type(output_values_json)='array' AND local_patch_json IS NOT NULL
+        AND json_valid(local_patch_json) AND json_type(local_patch_json)='object'
+        AND length(CAST(local_patch_json AS BLOB))<=262144)
+        OR (phase<>'output_applied' AND output_event_id IS NULL
+        AND output_values_json IS NULL AND local_patch_json IS NULL)),
+    CHECK ((phase IN ('input_failed','output_blocked') AND incident_event_id IS NOT NULL
+        AND incident_id IS NOT NULL)
+        OR (phase NOT IN ('input_failed','output_blocked')
+        AND incident_event_id IS NULL AND incident_id IS NULL)),
+    CHECK ((phase IN ('input_failed','input_captured') AND
+            child_scope_id IS NULL AND call_id IS NULL AND child_instance_id IS NULL AND
+            child_expected_revision IS NULL AND child_status IS NULL AND parent_wait_token_id IS NULL)
+        OR (phase IN ('result_accepted','output_blocked','output_applied') AND
+            ((activity_kind='subprocess' AND child_scope_id IS NOT NULL AND
+                call_id IS NULL AND child_instance_id IS NULL AND
+                child_expected_revision IS NOT NULL AND child_status IS NOT NULL AND
+                parent_wait_token_id IS NOT NULL AND parent_wait_token_id=token_id AND
+                source_instance_id=instance_id)
+             OR (activity_kind='call' AND child_scope_id IS NULL AND
+                call_id IS NOT NULL AND child_instance_id IS NOT NULL AND
+                child_expected_revision IS NOT NULL AND child_status='completed' AND
+                parent_wait_token_id IS NOT NULL AND parent_wait_token_id=token_id AND
+                source_instance_id=child_instance_id)
+             OR (activity_kind NOT IN ('subprocess','call') AND
+                child_scope_id IS NULL AND call_id IS NULL AND child_instance_id IS NULL AND
+                child_expected_revision IS NULL AND child_status IS NULL AND parent_wait_token_id IS NULL)))),
+    FOREIGN KEY(instance_id,scope_id,token_id)
+        REFERENCES bpmn_tokens(instance_id,scope_id,token_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,child_scope_id)
+        REFERENCES bpmn_scopes(instance_id,scope_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,call_id)
+        REFERENCES bpmn_calls(parent_instance_id,call_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(child_instance_id)
+        REFERENCES bpmn_instances(instance_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(definition_id,version)
+        REFERENCES bpmn_versions(definition_id,version) ON DELETE RESTRICT,
+    FOREIGN KEY(instance_id,scope_id,group_id)
+        REFERENCES bpmn_repetition_groups(instance_id,scope_id,group_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,group_id,occurrence_id,ordinal)
+        REFERENCES bpmn_repetition_occurrences(instance_id,scope_id,group_id,occurrence_id,ordinal)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,input_event_id)
+        REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,result_event_id)
+        REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(source_instance_id,source_event_id)
+        REFERENCES bpmn_events(instance_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,retained_route_event_id)
+        REFERENCES bpmn_events(instance_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,output_event_id)
+        REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,incident_event_id)
+        REFERENCES bpmn_events(instance_id,scope_id,event_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,incident_id)
+        REFERENCES bpmn_incidents(instance_id,scope_id,incident_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(instance_id,scope_id,token_id,service_invocation_id)
+        REFERENCES bpmn_service_invocations(instance_id,scope_id,token_id,invocation_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE UNIQUE INDEX uq_bpmn_io_activation
+    ON bpmn_activity_io_witnesses(instance_id,scope_id,token_id,phase_owner,COALESCE(occurrence_id,''));
+CREATE UNIQUE INDEX uq_bpmn_io_input_event
+    ON bpmn_activity_io_witnesses(input_event_id) WHERE input_event_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_io_result_event
+    ON bpmn_activity_io_witnesses(result_event_id) WHERE result_event_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_io_retained_route_event
+    ON bpmn_activity_io_witnesses(retained_route_event_id)
+    WHERE retained_route_event_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_io_output_event
+    ON bpmn_activity_io_witnesses(output_event_id) WHERE output_event_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_bpmn_io_incident
+    ON bpmn_activity_io_witnesses(incident_id) WHERE incident_id IS NOT NULL;
+CREATE INDEX idx_bpmn_io_instance_page
+    ON bpmn_activity_io_witnesses(instance_id,scope_id,node_id,created_at_ms,witness_id);
+CREATE TRIGGER bpmn_activity_io_witnesses_initial_phase
+BEFORE INSERT ON bpmn_activity_io_witnesses
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT,'invalid initial activity IO phase') WHERE
+        NEW.phase NOT IN ('input_failed','input_captured') OR NEW.revision<>1;
+END;
+CREATE TRIGGER bpmn_activity_io_witnesses_cas
+BEFORE UPDATE ON bpmn_activity_io_witnesses
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT,'activity IO witness identity changed') WHERE
+        NEW.witness_id IS NOT OLD.witness_id OR
+        NEW.instance_id IS NOT OLD.instance_id OR NEW.scope_id IS NOT OLD.scope_id OR
+        NEW.token_id IS NOT OLD.token_id OR NEW.node_id IS NOT OLD.node_id OR
+        NEW.activity_kind IS NOT OLD.activity_kind OR
+        NEW.phase_owner IS NOT OLD.phase_owner OR NEW.group_id IS NOT OLD.group_id OR
+        NEW.occurrence_id IS NOT OLD.occurrence_id OR NEW.ordinal IS NOT OLD.ordinal OR
+        NEW.definition_id IS NOT OLD.definition_id OR NEW.version IS NOT OLD.version OR
+        NEW.selected_process_id IS NOT OLD.selected_process_id OR
+        NEW.body_path_json IS NOT OLD.body_path_json OR
+        NEW.model_sha256 IS NOT OLD.model_sha256 OR
+        NEW.io_spec_sha256 IS NOT OLD.io_spec_sha256 OR
+        NEW.created_at_ms IS NOT OLD.created_at_ms;
+    SELECT RAISE(ABORT,'activity IO input changed') WHERE
+        NEW.input_event_id IS NOT OLD.input_event_id OR
+        NEW.input_values_json IS NOT OLD.input_values_json OR
+        NEW.input_sha256 IS NOT OLD.input_sha256 OR
+        OLD.phase='input_failed' AND
+            (NEW.failed_association_id IS NOT OLD.failed_association_id OR
+             NEW.failed_position IS NOT OLD.failed_position);
+    SELECT RAISE(ABORT,'activity IO accepted result changed') WHERE
+        OLD.result_event_id IS NOT NULL AND
+        (NEW.result_event_id IS NOT OLD.result_event_id OR
+         NEW.source_instance_id IS NOT OLD.source_instance_id OR
+         NEW.source_event_id IS NOT OLD.source_event_id OR
+         NEW.result_sources_json IS NOT OLD.result_sources_json OR
+         NEW.result_presence IS NOT OLD.result_presence OR
+         NEW.result_json IS NOT OLD.result_json OR
+         NEW.result_sha256 IS NOT OLD.result_sha256 OR
+         NEW.retained_route_kind IS NOT OLD.retained_route_kind OR
+         NEW.retained_route_event_id IS NOT OLD.retained_route_event_id OR
+         NEW.retained_route_resource_id IS NOT OLD.retained_route_resource_id OR
+         NEW.accepted_origin IS NOT OLD.accepted_origin OR
+         NEW.resource_id IS NOT OLD.resource_id OR
+         NEW.resource_revision IS NOT OLD.resource_revision OR
+         NEW.service_invocation_id IS NOT OLD.service_invocation_id);
+    SELECT RAISE(ABORT,'activity IO accepted child changed') WHERE
+        OLD.result_event_id IS NOT NULL AND
+        (NEW.child_scope_id IS NOT OLD.child_scope_id OR
+         NEW.call_id IS NOT OLD.call_id OR
+         NEW.child_instance_id IS NOT OLD.child_instance_id OR
+         NEW.child_expected_revision IS NOT OLD.child_expected_revision OR
+         NEW.child_status IS NOT OLD.child_status OR
+         NEW.parent_wait_token_id IS NOT OLD.parent_wait_token_id);
+    SELECT RAISE(ABORT,'activity IO output or incident changed') WHERE
+        OLD.output_event_id IS NOT NULL AND
+        (NEW.output_event_id IS NOT OLD.output_event_id OR
+         NEW.output_values_json IS NOT OLD.output_values_json OR
+         NEW.local_patch_json IS NOT OLD.local_patch_json) OR
+        OLD.incident_id IS NOT NULL AND
+        (NEW.incident_event_id IS NOT OLD.incident_event_id OR
+         NEW.incident_id IS NOT OLD.incident_id);
+    SELECT RAISE(ABORT,'invalid activity IO phase transition') WHERE
+        NOT (OLD.phase='input_captured' AND NEW.phase='result_accepted' OR
+             OLD.phase='result_accepted' AND NEW.phase IN ('output_applied','output_blocked')
+                 AND OLD.retained_route_kind IN ('mapping','awaiting_verification'));
+    SELECT RAISE(ABORT,'invalid activity IO revision') WHERE
+        NEW.revision<>OLD.revision+1 OR NEW.updated_at_ms<OLD.updated_at_ms;
+END;
+"#;
+
+fn bpmn_activity_io_witnesses(conn: &Connection) -> Result<()> {
+    anyhow::ensure!(foreign_key_check(conn)?.is_empty(),
+        "activity IO migration refuses historical foreign key violations");
+    conn.execute_batch(BPMN_ACTIVITY_IO_WITNESSES)?;
+    anyhow::ensure!(foreign_key_check(conn)?.is_empty(),
+        "activity IO migration created a foreign key violation");
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    anyhow::ensure!(integrity == "ok", "activity IO migration integrity: {integrity}");
+    Ok(())
 }

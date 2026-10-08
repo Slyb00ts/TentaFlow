@@ -2,10 +2,11 @@
 
 use super::{model, repository, runtime::test_support};
 use rusqlite::{params, types::Value, Connection};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tentaflow_protocol::processes::{
-    ActivityVerification, HolidayPolicy, ProcessCallableReference, ProcessDefinition, ProcessModel,
-    ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessVersion, ProcessWorkCalendar,
+    ActivityVerification, HolidayPolicy, ProcessCallActivity, ProcessCallTarget,
+    ProcessCallableReference, PinnedFlowInfo, ProcessDefinition, ProcessModel, ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessVersion, ProcessWorkCalendar,
     WorkWindow,
 };
 
@@ -13,10 +14,11 @@ fn call_node(id: &str, target: &ProcessVersion) -> ProcessNode {
     ProcessNode {
         id: id.into(),
         name: format!("Call {id}"),
-        kind: ProcessNodeKind::CallActivity {
-            called_definition_id: target.definition_id.clone(),
-            called_version: target.version,
-            called_element: ProcessCallableReference {
+        kind: ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::PublishedBody {
+                definition_id: target.definition_id.clone(),
+                version: target.version,
+                called_element: ProcessCallableReference {
                 namespace_uri: target
                     .model
                     .target_namespace
@@ -24,10 +26,12 @@ fn call_node(id: &str, target: &ProcessVersion) -> ProcessNode {
                     .unwrap_or_else(|| "https://tentaflow.app/bpmn/1".into()),
                 process_id: target.model.process_id.clone(),
             },
+            },
             input_mapping: BTreeMap::new(),
             output_mapping: BTreeMap::new(),
-        },
+        }),
         repeat: None,
+        activity_io: None,
     }
 }
 
@@ -45,6 +49,7 @@ fn sequence_model(targets: &[ProcessVersion]) -> ProcessModel {
             source_id: previous,
             target_id: id.clone(),
             condition: None,
+            call_start_node_id: None,
         });
         previous = id;
     }
@@ -53,6 +58,7 @@ fn sequence_model(targets: &[ProcessVersion]) -> ProcessModel {
         source_id: previous,
         target_id: model.nodes.last().unwrap().id.clone(),
         condition: None,
+        call_start_node_id: None,
     });
     model
 }
@@ -136,7 +142,7 @@ fn call_publication_pins_exact_target_model_service_and_calendar() {
         &flow_id,
         &test_support::graph("edited", None),
     );
-    let retained = repository::get_version(
+    let (retained, _) = repository::get_version(
         &fixture.db,
         &fixture.owner,
         &target.definition_id,
@@ -154,7 +160,7 @@ fn call_publication_pins_exact_target_model_service_and_calendar() {
             &caller.definition_id,
             caller.version
         )
-        .unwrap(),
+        .unwrap().0,
         caller
     );
 }
@@ -252,10 +258,10 @@ fn repeated_call_target_still_checks_every_edge_qname() {
     let fixture = test_support::Fixture::new();
     let target = test_support::publish_model(&fixture, &model::starter_model());
     let mut model = sequence_model(&[target.clone(), target]);
-    let ProcessNodeKind::CallActivity { called_element, .. } = &mut model.nodes[2].kind else {
+    let ProcessNodeKind::CallActivity(ProcessCallActivity { target: ProcessCallTarget::PublishedBody { called_element, .. }, .. }) = &mut model.nodes[2].kind else {
         panic!("second call is present");
     };
-    called_element.process_id = "Wrong_Process".into();
+    called_element.namespace_uri = "urn:wrong-called-process".into();
     let caller = save_draft(&fixture, &model);
     let error = publish_draft(&fixture, &caller).unwrap_err();
     assert!(format!("{error:#}").contains("QName"));
@@ -539,6 +545,36 @@ fn legacy_database() -> (tempfile::TempDir, Connection, String, String) {
     let conn = Connection::open(directory.path().join("process-v185.db")).unwrap();
     let (model_json, model_sha256) = crate::db::migrations::bpmn_boundary_migration_fixture(&conn);
     crate::db::migrations::run_ladder_up_to(&conn, 185);
+    let graph_json = test_support::graph("legacy call-free service", None);
+    conn.execute(
+        "INSERT INTO flows(id,name,flow_json,status) VALUES('flow-pinned','Pinned service',?1,'active')",
+        [&graph_json],
+    ).unwrap();
+    let (source_version, retained_graph): (u32, String) = conn.query_row(
+        "SELECT version,flow_json FROM flows WHERE id='flow-pinned'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    let snapshot = repository::PinnedServiceSnapshot {
+        info: PinnedFlowInfo {
+            node_id: "Service_1".into(),
+            flow_id: "flow-pinned".into(),
+            source_version,
+            graph_sha256: hex::encode(Sha256::digest(retained_graph.as_bytes())),
+        },
+        graph_json: retained_graph,
+    };
+    conn.execute(
+        "UPDATE bpmn_versions SET service_snapshots_json=?1 WHERE definition_id='boundary-process' AND version=1",
+        [serde_json::to_string(&vec![snapshot]).unwrap()],
+    ).unwrap();
+    conn.execute(
+        "UPDATE bpmn_jobs SET status='queued' WHERE job_id='job-verification' AND status='completed'",
+        [],
+    ).unwrap();
+    conn.execute(
+        "DELETE FROM bpmn_user_tasks WHERE user_task_id='task-verification' AND status='open'",
+        [],
+    ).unwrap();
     let payload = r#"{"customer_ID":"é"}"#;
     let payload_sha256 = repository::request_hash(&serde_json::json!({"customer_ID":"é"})).unwrap();
     let payload_bytes = i64::try_from(payload.len()).unwrap();
@@ -593,15 +629,34 @@ fn migration_preserves_populated_legacy_call_free_rows_and_foreign_keys() {
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        193
+        196
     );
+    let migrated_messages = table_rows(&conn, "bpmn_messages", "message_id");
+    assert!(migrated_messages.iter().all(|row| {
+        row.len() == before[3][0].len() + 2
+            && row[7] == Value::Null && row[8] == Value::Null
+    }), "historical queued Start messages must retain unknown selectors");
     let after = [
         table_rows(&conn, "bpmn_versions", "definition_id,version"),
         table_rows(&conn, "bpmn_events", "instance_id,seq"),
         table_rows(&conn, "bpmn_commands", "command_id"),
-        table_rows(&conn, "bpmn_messages", "message_id"),
+        migrated_messages.into_iter().map(|row| row.into_iter().enumerate()
+            .filter_map(|(index, value)| (!matches!(index, 7 | 8)).then_some(value))
+            .collect::<Vec<_>>()).collect::<Vec<_>>(),
     ];
     assert_eq!(before, after);
+    let retained_graph: String = conn.query_row(
+        "SELECT flow_json FROM flows WHERE id='flow-pinned'",
+        [], |row| row.get(0),
+    ).unwrap();
+    let invocation: (String, String, String, String) = conn.query_row(
+        "SELECT phase,dispatch_evidence,flow_id,pinned_flow_digest FROM bpmn_service_invocations WHERE job_id='job-verification'",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(invocation, (
+        "prepared".into(), "no_boundary".into(), "flow-pinned".into(),
+        hex::encode(Sha256::digest(retained_graph.as_bytes())),
+    ));
     assert_eq!(
         after[3].len(),
         4,

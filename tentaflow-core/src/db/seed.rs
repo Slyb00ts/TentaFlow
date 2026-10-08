@@ -549,6 +549,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             r#"{"properties":{"separator":{"type":"string","title":"Separator","description":"Tekst wstawiany między branche","default":"\n\n"}},"order":["separator"]}"#,
         ),
         (
+            "activity_result",
+            "output",
+            "Wynik aktywności",
+            "Jawny wynik pracy dla procesu: ukończono, błąd, wymaga człowieka lub anulowano",
+            r#"{"result_expression":"{'outcome':'Completed','code':null,'summary':'Completed','outputs':payload,'evidence':[]}"}"#,
+            "send",
+            r#"{"properties":{"result_expression":{"type":"string","title":"Wynik aktywności (CEL)","title_key":"flows_config.activity_result_expression","description":"Pełny obiekt outcome/code/summary/outputs/evidence. W zadaniu usługi wybierz wynik outputs.payload.","description_key":"flows_config.activity_result_expression_hint","format":"textarea"}},"required":["result_expression"],"order":["result_expression"]}"#,
+        ),
+        (
             "output",
             "output",
             "Wyjście",

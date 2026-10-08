@@ -41,6 +41,9 @@ use crate::flow_engine::types::{FlowDataType, FlowDefinition};
 
 #[derive(Debug, Clone)]
 pub enum FlowValidationError {
+    InvalidActivityResult {
+        detail: String,
+    },
     UnknownNode {
         edge_endpoint: &'static str,
         node_id: String,
@@ -188,6 +191,7 @@ pub enum FlowValidationError {
 impl fmt::Display for FlowValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidActivityResult { detail } => write!(f, "invalid activity result: {detail}"),
             Self::UnknownNode {
                 edge_endpoint,
                 node_id,
@@ -423,6 +427,9 @@ pub fn validate(
             });
         }
     }
+
+    crate::flow_engine::node_adapters::activity_result::validate_graph(def)
+        .map_err(|error| FlowValidationError::InvalidActivityResult { detail: format!("{error:#}") })?;
 
     // R1, R3, R4, R6
     let mut incoming_count: HashMap<&str, usize> = HashMap::new();

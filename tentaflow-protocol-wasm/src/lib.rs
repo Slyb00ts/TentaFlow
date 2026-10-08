@@ -26061,7 +26061,8 @@ mod process_wire_tests {
 
     #[test]
     fn process_request_encoder_preserves_exact_call_binding_error_end_and_calls_page() {
-        use tentaflow_protocol::processes::{ProcessCallableReference, ProcessNodeKind, ProcessPayload};
+        use tentaflow_protocol::processes::{ProcessCallActivity, ProcessCallTarget,
+            ProcessCallableReference, ProcessNodeKind, ProcessPayload};
 
         let fields = serde_json::json!({
             "command_id":"cmd","definition_id":null,"expected_revision":0,
@@ -26084,14 +26085,16 @@ mod process_wire_tests {
             panic!("typed process save request expected");
         };
         assert_eq!(model.variables["customer_ID"]["inner_value"], 7);
-        assert_eq!(model.nodes[0].kind, ProcessNodeKind::CallActivity {
-            called_definition_id: "definition-1".into(), called_version: 7,
-            called_element: ProcessCallableReference {
-                namespace_uri: "urn:example:approval".into(), process_id: "Approval_1".into(),
+        assert_eq!(model.nodes[0].kind, ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::PublishedBody {
+                definition_id: "definition-1".into(), version: 7,
+                called_element: ProcessCallableReference {
+                    namespace_uri: "urn:example:approval".into(), process_id: "Approval_1".into(),
+                },
             },
             input_mapping: std::collections::BTreeMap::from([("customer_ID".into(), "vars.customer_ID".into())]),
             output_mapping: std::collections::BTreeMap::from([("approved_value".into(), "outputs.business_key".into())]),
-        });
+        }));
         assert_eq!(model.nodes[1].kind, ProcessNodeKind::ErrorEnd { error_ref: "Error_1".into() });
         let bytes = encode_process_request("InstanceGetRequest".into(), serde_json::json!({
             "instance_id":"instance-1", "pages":{"calls":{"offset":20,"limit":20}}

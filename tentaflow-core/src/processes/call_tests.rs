@@ -18,10 +18,11 @@ pub(super) fn caller(
         ProcessNode {
             id: "Call_1".into(),
             name: "Call the published evidence process".into(),
-            kind: ProcessNodeKind::CallActivity {
-                called_definition_id: target.definition_id.clone(),
-                called_version: target.version,
-                called_element: ProcessCallableReference {
+            kind: ProcessNodeKind::CallActivity(ProcessCallActivity {
+                target: ProcessCallTarget::PublishedBody {
+                    definition_id: target.definition_id.clone(),
+                    version: target.version,
+                    called_element: ProcessCallableReference {
                     namespace_uri: target
                         .model
                         .target_namespace
@@ -29,10 +30,12 @@ pub(super) fn caller(
                         .unwrap_or_else(|| "https://tentaflow.app/bpmn/1".into()),
                     process_id: target.model.process_id.clone(),
                 },
+                },
                 input_mapping: BTreeMap::new(),
                 output_mapping,
-            },
+            }),
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -40,6 +43,159 @@ pub(super) fn caller(
         edge("CallEnd", "Call_1", "End_1"),
     ];
     model
+}
+
+#[test]
+fn configured_call_captures_input_before_legacy_mapping_failure_and_rejects_forged_owner() {
+    let fixture = Fixture::new();
+    let target = publish_model(&fixture, &user_model(None));
+    let mut model = caller(&target, BTreeMap::new());
+    model.modeling = Some(ProcessBodyModeling::default());
+    model.nodes[1].activity_io = Some(ProcessActivityIo {
+        data_inputs: Vec::new(), data_outputs: Vec::new(),
+        input_set_id: "Call_Input_Set".into(), input_set: Vec::new(),
+        output_set_id: "Call_Output_Set".into(), output_set: Vec::new(),
+        input_associations: Vec::new(), output_associations: Vec::new(),
+        coordinator_output: None,
+    });
+    let ProcessNodeKind::CallActivity(call) = &mut model.nodes[1].kind else {
+        unreachable!()
+    };
+    call.input_mapping.insert("answer".into(), "1 / 0".into());
+    let version = publish_model(&fixture, &model);
+    let instance_id = Uuid::new_v4().to_string();
+    let variables = serde_json::to_value(&version.model.variables).unwrap();
+    let command = stamp("configured Call legacy mapping failure");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let plan = runtime::plan_start(&version.model, &version.model.process_id,
+        "Start_1", &instance_id, &fixture.owner, &version.definition_id,
+        version.version, variables.clone(), runtime::StartCause::Manual,
+        at_ms, runtime::test_support::manual_input(&command), None).unwrap();
+    let capture_index = plan.events.iter().position(|event|
+        event.kind == "activity_io_input_captured").unwrap();
+    let incident_index = plan.events.iter().position(|event|
+        event.kind == "incident" && event.data["code"] == "CALL_ADMISSION_ERROR").unwrap();
+    assert!(capture_index < incident_index);
+    assert!(plan.call_requests.is_empty());
+    let waiting = plan.activity_io_inputs.iter().find_map(|fact| match fact {
+        repository::ActivityIoInputFact::Captured { activation_token_id, .. } =>
+            Some(activation_token_id.as_str()),
+        _ => None,
+    }).unwrap();
+    assert_eq!(plan.events[incident_index].data["activation_token_id"], waiting);
+    assert_eq!(plan.events[incident_index].data["incident_id"],
+        plan.add_incidents[0].incident_id);
+
+    let before = transition_rows(&fixture);
+    let mut forged = plan.clone();
+    forged.events[incident_index].data["activation_token_id"] =
+        json!(Uuid::new_v4().to_string());
+    let rejection = repository::start_instance(&fixture.db, &fixture.owner,
+        &command, &instance_id, &version.definition_id, version.version,
+        &variables, None, None, repository::ProcessPlanInput::Supplied(&forged),
+        at_ms).unwrap_err();
+    assert!(format!("{rejection:#}").contains("activity IO input capture lacks one later resource"));
+    assert_eq!(transition_rows(&fixture), before);
+
+    let actual = repository::start_instance(&fixture.db, &fixture.owner,
+        &command, &instance_id, &version.definition_id, version.version,
+        &variables, None, None, repository::ProcessPlanInput::Supplied(&plan),
+        at_ms).unwrap();
+    assert_eq!(actual.status, ProcessInstanceStatus::Incident);
+    assert_eq!(actual.incidents.len(), 1);
+    assert_eq!(actual.incidents[0].code, "CALL_ADMISSION_ERROR");
+    let persisted = transition_rows(&fixture);
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let replay = repository::get_instance(&reopened, &fixture.owner, &instance_id, None).unwrap();
+    assert_eq!(replay, actual);
+    assert_eq!(transition_rows(&fixture), persisted);
+}
+
+#[test]
+fn local_body_call_uses_pinned_incoming_edge_and_child_start_after_reopen() {
+    let fixture = Fixture::new();
+    let mut model = super::model::starter_model();
+    model.additional_processes.push(ProcessExecutableProcess {
+        process_id: "Child_Process".into(),
+        process_name: None,
+        nodes: vec![
+            ProcessNode { id: "Child_Start".into(), name: "Child start".into(), kind: ProcessNodeKind::Start, repeat: None, activity_io: None },
+            ProcessNode { id: "Child_End".into(), name: "Child end".into(), kind: ProcessNodeKind::End, repeat: None, activity_io: None },
+            ProcessNode { id: "Other_Start".into(), name: "Unselected start".into(), kind: ProcessNodeKind::Start, repeat: None, activity_io: None },
+            ProcessNode { id: "Other_End".into(), name: "Unselected end".into(), kind: ProcessNodeKind::End, repeat: None, activity_io: None },
+        ],
+        sequence_flows: vec![
+            edge("Child_Flow", "Child_Start", "Child_End"),
+            edge("Other_Flow", "Other_Start", "Other_End"),
+        ],
+        variables: BTreeMap::new(),
+        diagram: ProcessDiagram::default(),
+        timer_timezone: None,
+        work_calendar: None,
+        calendar_pin: None,
+        modeling: None,
+    });
+    model.nodes.insert(1, ProcessNode {
+        id: "Call_Local".into(),
+        name: "Call selected local body".into(),
+        kind: ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::LocalBody {
+                called_element: ProcessCallableReference {
+                    namespace_uri: "https://tentaflow.app/bpmn/1".into(),
+                    process_id: "Child_Process".into(),
+                },
+            },
+            input_mapping: BTreeMap::new(),
+            output_mapping: BTreeMap::new(),
+        }),
+        repeat: None,
+        activity_io: None,
+    });
+    model.sequence_flows = vec![
+        ProcessSequenceFlow {
+            call_start_node_id: Some("Child_Start".into()),
+            ..edge("To_Local_Call", "Start_1", "Call_Local")
+        },
+        edge("Local_Return", "Call_Local", "End_1"),
+    ];
+    let mut ambiguous = model.clone();
+    ambiguous.sequence_flows[0].call_start_node_id = None;
+    let error = super::model::validate_model(&ambiguous).unwrap_err();
+    assert!(format!("{error:#}").contains("requires an exact Start for each incoming flow"));
+    let version = publish_model(&fixture, &model);
+    let parent_id = Uuid::new_v4().to_string();
+    let command = stamp("start selected local call");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let variables = serde_json::to_value(&version.model.variables).unwrap();
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, "Start_1",
+        &parent_id, &fixture.owner, &version.definition_id, version.version,
+        variables.clone(), runtime::StartCause::Manual, at_ms,
+        runtime::test_support::manual_input(&command), None).unwrap();
+    let parent = repository::start_instance(&fixture.db, &fixture.owner, &command,
+        &parent_id, &version.definition_id, version.version, &variables,
+        Some(&version.model.process_id), Some("Start_1"),
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    assert_eq!(parent.status, ProcessInstanceStatus::Completed);
+    let child_id = child_id(&fixture, &parent.instance_id);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    assert_eq!(snapshot.instance.process_id, "Child_Process");
+    assert_eq!(snapshot.instance.start_node_id, "Child_Start");
+    assert_eq!(snapshot.instance.version, version.version);
+    assert_eq!(snapshot.calls[0].parent_arrival_edge_id, "To_Local_Call");
+    assert_eq!(snapshot.calls[0].called_process_id, "Child_Process");
+    assert_eq!(snapshot.calls[0].child_start_node_id, "Child_Start");
+    let child_events = repository::list_events(&fixture.db, &fixture.owner, &child_id, 0, 100)
+        .unwrap().0;
+    assert!(child_events.iter().any(|event| event.kind == "end_reached"
+        && event.node_id.as_deref() == Some("Child_End")));
+    assert!(!child_events.iter().any(|event| event.node_id.as_deref()
+        == Some("Other_End")));
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let retained = repository::runtime_snapshot(&reopened, &fixture.owner, &child_id).unwrap();
+    assert_eq!(retained.instance.process_id, snapshot.instance.process_id);
+    assert_eq!(retained.instance.start_node_id, snapshot.instance.start_node_id);
+    assert_eq!(serde_json::to_value(&retained.calls).unwrap(),
+        serde_json::to_value(&snapshot.calls).unwrap());
 }
 
 pub(super) fn child_id(f: &Fixture, parent: &str) -> String {
@@ -97,7 +253,7 @@ fn returned_call_cannot_replay_its_factual_termination_as_a_standalone_entry() {
         ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() };
     model.nodes.push(ProcessNode { id: "FinalEnd".into(), name: "Finish parent".into(),
         kind: ProcessNodeKind::End,
-        repeat: None, });
+        repeat: None,   activity_io: None,});
     model.sequence_flows.push(edge("AfterScopeWork", "RootEnd_Scope", "FinalEnd"));
     let version = publish_model(&fixture, &model);
     let parent = messages::test_support::start_version(&fixture, &version);
@@ -148,29 +304,33 @@ fn events(f: &Fixture, id: &str) -> Vec<ProcessEvent> {
         .0
 }
 
+pub(super) const TRANSITION_TABLES: [&str; 18] = [
+    "bpmn_instances",
+    "bpmn_scopes",
+    "bpmn_tokens",
+    "bpmn_gateway_receipts",
+    "bpmn_user_tasks",
+    "bpmn_jobs",
+    "bpmn_service_invocations",
+    "bpmn_activity_io_witnesses",
+    "bpmn_incidents",
+    "bpmn_timers",
+    "bpmn_event_subscriptions",
+    "bpmn_event_races",
+    "bpmn_messages",
+    "bpmn_calls",
+    "bpmn_events",
+    "bpmn_commands",
+    "bpmn_repetition_groups",
+    "bpmn_repetition_occurrences",
+];
+
 pub(super) fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     let conn = f.db.read().unwrap();
-    [
-        "bpmn_instances",
-        "bpmn_scopes",
-        "bpmn_tokens",
-        "bpmn_gateway_receipts",
-        "bpmn_user_tasks",
-        "bpmn_jobs",
-        "bpmn_incidents",
-        "bpmn_timers",
-        "bpmn_event_subscriptions",
-        "bpmn_event_races",
-        "bpmn_messages",
-        "bpmn_calls",
-        "bpmn_events",
-        "bpmn_commands",
-        "bpmn_repetition_groups",
-        "bpmn_repetition_occurrences",
-    ]
-    .iter()
-    .map(|table| super::call_pin_tests::table_rows(&conn, table, "rowid"))
-    .collect()
+    TRANSITION_TABLES
+        .iter()
+        .map(|table| super::call_pin_tests::table_rows(&conn, table, "rowid"))
+        .collect()
 }
 
 fn parallel_caller(target: &ProcessVersion) -> ProcessModel {
@@ -194,6 +354,7 @@ fn parallel_caller(target: &ProcessVersion) -> ProcessModel {
             name: id.into(),
             kind,
             repeat: None,
+            activity_io: None,
         });
     }
     model.sequence_flows = vec![
@@ -243,6 +404,7 @@ fn with_error_handler(mut model: ProcessModel, reference: Option<&str>) -> Proce
             ]),
         },
         repeat: None,
+        activity_io: None,
     });
     model
         .sequence_flows
@@ -260,7 +422,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
     let at = chrono::Utc::now().timestamp_millis();
     let command = stamp("start exact call tree");
     let plan = runtime::plan_start(
-        &outer.model,
+        &outer.model, &outer.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&outer.model),
         &id,
         &f.owner,
         &outer.definition_id,
@@ -278,7 +440,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         &id,
         &outer.definition_id,
         outer.version,
-        &json!({}),
+        &json!({}), None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
@@ -322,7 +484,7 @@ fn fast_nested_calls_use_distinct_roots_and_replay_without_another_child() {
         &Uuid::new_v4().to_string(),
         &outer.definition_id,
         outer.version,
-        &json!({}),
+        &json!({}), None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
@@ -948,7 +1110,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
     let at = chrono::Utc::now().timestamp_millis();
     let command = stamp("atomic fast child");
     let plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &id,
         &f.owner,
         &version.definition_id,
@@ -968,7 +1130,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         &id,
         &version.definition_id,
         version.version,
-        &json!({}),
+        &json!({}), None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
@@ -986,7 +1148,7 @@ fn storage_failure_after_child_start_rolls_back_parent_child_link_and_command() 
         &id,
         &version.definition_id,
         version.version,
-        &json!({}),
+        &json!({}), None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at,
     )
@@ -1154,6 +1316,7 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
                     kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                         else { ProcessNodeKind::ParallelGateway },
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "ChildJoin".into(),
@@ -1161,6 +1324,7 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
                     kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                         else { ProcessNodeKind::ParallelGateway },
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "OtherWork".into(),
@@ -1170,6 +1334,7 @@ fn parent_and_child_gateway_receipts_are_isolated_in_both_completion_orders() {
                         output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
             ]);
             inner.sequence_flows = vec![
@@ -1285,6 +1450,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_parent_interrup
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         source.nodes.insert(
@@ -1296,12 +1462,15 @@ fn completed_called_descendant_outbox_survives_normal_return_and_parent_interrup
                     message_ref: "Evidence".into(),
                     target: ProcessMessageTargetSpec::Start {
                         definition_id: fast_receiver.definition_id.clone(),
+                        process_id: None,
+                        start_node_id: None,
                     },
                     correlation_expression: "'case-1'".into(),
                     payload_expression: "{'delivered': 42}".into(),
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         source.sequence_flows = vec![
@@ -1321,6 +1490,7 @@ fn completed_called_descendant_outbox_survives_normal_return_and_parent_interrup
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         middle.sequence_flows = vec![
@@ -1520,7 +1690,7 @@ fn corrupt_persisted_version_cycle_is_rejected_without_partial_caller_publicatio
         None,
     )
     .unwrap_err();
-    assert!(format!("{failure:#}").contains("version dependency cycle"));
+    assert!(format!("{failure:#}").contains("process call body dependency cycle"));
     assert_eq!(transition_rows(&f), before);
     assert!(
         repository::list_versions(&f.db, &f.owner, &draft.definition_id, 0, 20)
@@ -1775,12 +1945,14 @@ fn actual_call_tree_lifetime_and_active_variable_caps_leave_only_exact_waiting_i
             name: "Split independent calls".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
         ProcessNode {
             id: "Join".into(),
             name: "Join independent calls".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
     ]);
     model.sequence_flows = vec![
@@ -1893,13 +2065,55 @@ fn called_input_defaults_and_explicit_mapping_cannot_admit_a_129_key_root() {
     target.variables.insert("default_key".into(), json!(true));
     let target = publish_model(&f, &target);
     let mut model = caller(&target, BTreeMap::new());
-    let ProcessNodeKind::CallActivity { input_mapping, .. } = &mut model.nodes[1].kind else {
+    let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &mut model.nodes[1].kind else {
         unreachable!()
     };
     *input_mapping = (0..128)
         .map(|index| (format!("key_{index}"), "1".into()))
         .collect();
     let version = publish_model(&f, &model);
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let variables = serde_json::to_value(&version.model.variables).unwrap();
+    let command = stamp("reject forged Call admission request closure");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &f.owner,
+        &version.definition_id, version.version, variables.clone(),
+        runtime::StartCause::Manual, at_ms, runtime::test_support::manual_input(&command),
+        None).unwrap();
+    let before = super::signal_proof_tests::all_transition_rows(&f);
+    for mutation in 0..7 {
+        let inspected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = inspected.clone();
+        repository::CALL_PLAN_TEST_MUTATOR.with(|mutator| {
+            *mutator.borrow_mut() = Some(Box::new(move |composite| {
+                let step = composite.call_steps.iter_mut().find(|step|
+                    matches!(step, repository::CallStep::Advance { .. }))
+                    .expect("real rejected child admission");
+                let repository::CallStep::Advance { request, plan, .. } = step else {
+                    unreachable!()
+                };
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                match mutation {
+                    0 => request.call_id = uuid::Uuid::new_v4().to_string(),
+                    1 => request.parent_scope_id = uuid::Uuid::new_v4().to_string(),
+                    2 => request.parent_token_id = uuid::Uuid::new_v4().to_string(),
+                    3 => request.call_node_id = "UnrelatedCall".into(),
+                    4 => request.child_instance_id = uuid::Uuid::new_v4().to_string(),
+                    5 => request.variables["key_0"] = json!(2),
+                    6 => plan.event_ids.clear(),
+                    _ => unreachable!(),
+                }
+            }));
+        });
+        let forged = repository::start_instance(&f.db, &f.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms);
+        repository::CALL_PLAN_TEST_MUTATOR.with(|mutator| *mutator.borrow_mut() = None);
+        assert!(inspected.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(forged.is_err(), "Call admission mutation {mutation}");
+        assert_eq!(super::signal_proof_tests::all_transition_rows(&f), before,
+            "Call admission mutation {mutation} rolls back every transition fact");
+    }
     let actual = messages::test_support::start_version(&f, &version);
     assert_eq!(actual.status, ProcessInstanceStatus::Incident);
     assert_eq!(actual.active_node_ids, vec!["Call_1"]);
@@ -1923,6 +2137,23 @@ fn called_input_defaults_and_explicit_mapping_cannot_admit_a_129_key_root() {
             .unwrap(),
         0
     );
+    drop(conn);
+    let canonical_id = uuid::Uuid::new_v4().to_string();
+    let canonical_command = stamp("retain canonical rejected child admission");
+    let canonical = repository::start_instance(&f.db, &f.owner, &canonical_command,
+        &canonical_id, &version.definition_id, version.version, &variables, None, None,
+        repository::ProcessPlanInput::Canonical, at_ms).unwrap();
+    assert_eq!(canonical.status, ProcessInstanceStatus::Incident);
+    assert_eq!(canonical.active_node_ids, vec!["Call_1"]);
+    assert_eq!(canonical.incidents.len(), 1);
+    assert_eq!(canonical.incidents[0].code, "CALL_ADMISSION_ERROR");
+    let persisted = super::signal_proof_tests::all_transition_rows(&f);
+    let reopened = crate::db::init(&f.directory.path().join("processes.db")).unwrap();
+    let replay = repository::start_instance(&reopened, &f.owner, &canonical_command,
+        &canonical_id, &version.definition_id, version.version, &variables, None, None,
+        repository::ProcessPlanInput::Canonical, at_ms).unwrap();
+    assert_eq!(replay, canonical);
+    assert_eq!(super::signal_proof_tests::all_transition_rows(&f), persisted);
 }
 
 #[test]

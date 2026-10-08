@@ -3,12 +3,14 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::processes::{
     PinnedFlowInfo, ProcessNodeKind, ProcessOptionFlow, ProcessOptionUser, ProcessPayload as P,
+    ProcessSimulationClock, ProcessSimulationEvent, ProcessSimulationSource,
+    ProcessSimulationTraceStep, ProcessSimulationView,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
 use super::HandlerContext;
 use crate::flow_engine::dispatcher::FlowDispatcher;
-use crate::processes::{bpmn, repository, runtime};
+use crate::processes::{bpmn, repository, runtime, simulation};
 use repository::{CommandStamp, PinnedServiceSnapshot, ProcessActor};
 
 fn error(error: anyhow::Error) -> ProtocolError {
@@ -95,6 +97,64 @@ fn stamp(payload: &P, command_id: &str) -> Result<CommandStamp, ProtocolError> {
     })
 }
 
+fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulationView, anyhow::Error> {
+    Ok(ProcessSimulationView {
+        simulation_id: view.simulation_id,
+        source: ProcessSimulationSource {
+            simulation_id: view.source.simulation_id,
+            definition_id: view.source.definition_id,
+            version: view.source.version,
+            model_sha256: view.source.model_sha256,
+            selected_process_id: view.source.selected_process_id,
+            start_node_id: view.source.start_node_id,
+        },
+        clock: ProcessSimulationClock {
+            start_ms: view.clock.start_ms,
+            now_ms: view.clock.now_ms,
+            horizon_ms: view.clock.horizon_ms,
+            tick_duration_ms: view.clock.tick_duration_ms,
+            step_index: view.clock.step_index,
+            revision: view.clock.revision,
+        },
+        instance: view.instance,
+        user_tasks: view.user_tasks,
+        timers: view.timers,
+        incidents: view.incidents,
+        events: view
+            .events
+            .into_iter()
+            .map(|event| ProcessSimulationEvent {
+                event_id: event.event_id,
+                seq: event.seq,
+                at_ms: event.at_ms,
+                kind: event.kind,
+                node_id: event.node_id,
+                actor_user_id: event.actor_user_id,
+                data: event.data,
+                scope_id: event.scope_id,
+            })
+            .collect(),
+        trace_steps: view
+            .trace_steps
+            .into_iter()
+            .map(|step| ProcessSimulationTraceStep {
+                trace_step_id: step.trace_step_id,
+                ordinal: step.ordinal,
+                action: step.action,
+                at_ms: step.at_ms,
+                request_sha256: step.request_sha256,
+                result_sha256: step.result_sha256,
+                data: step.data,
+            })
+            .collect(),
+        activity_io_witnesses: view
+            .activity_io_witnesses
+            .into_iter()
+            .map(|witness| serde_json::to_value(witness).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
 fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolError> {
     let members =
         crate::services::org::repo::list_memberships_for_org(&ctx.state.db, &actor.org_id)
@@ -177,13 +237,9 @@ pub fn process_dispatch(
             }
         }
         P::DefinitionGetRequest { definition_id } => {
-            let (definition, timer_start, message_start) =
+            let (definition, start_catalog) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
-            P::DefinitionGetResponse {
-                definition,
-                timer_start,
-                message_start,
-            }
+            P::DefinitionGetResponse { definition, start_catalog }
         }
         P::DefinitionSaveRequest {
             command_id,
@@ -221,7 +277,7 @@ pub fn process_dispatch(
                     version,
                 }));
             }
-            let (definition, _, _) =
+            let (definition, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
             let mut snapshots = Vec::new();
@@ -302,9 +358,10 @@ pub fn process_dispatch(
         P::VersionGetRequest {
             definition_id,
             version,
-        } => P::VersionGetResponse {
-            version: repository::get_version(pool, &actor, definition_id, *version)
-                .map_err(error)?,
+        } => {
+            let (version, start_catalog) = repository::get_version(
+                pool, &actor, definition_id, *version).map_err(error)?;
+            P::VersionGetResponse { version, start_catalog }
         },
         P::XmlImportRequest { xml } => {
             let (model, diagnostics) = bpmn::import_xml(xml);
@@ -318,7 +375,7 @@ pub fn process_dispatch(
                 Some(version) => {
                     repository::get_version(pool, &actor, definition_id, *version)
                         .map_err(error)?
-                        .model
+                        .0.model
                 }
                 None => {
                     repository::get_definition(pool, &actor, definition_id)
@@ -336,6 +393,8 @@ pub fn process_dispatch(
             definition_id,
             version,
             variables,
+            process_id,
+            start_node_id,
         } => {
             let stamp = stamp(payload, command_id)?;
             let instance = if let Some(prior) =
@@ -354,6 +413,8 @@ pub fn process_dispatch(
                     definition_id,
                     *version,
                     variables,
+                    process_id.as_deref(),
+                    start_node_id.as_deref(),
                     repository::ProcessPlanInput::Canonical,
                     at_ms,
                 )
@@ -611,6 +672,116 @@ pub fn process_dispatch(
             )
             .map_err(error)?,
         },
+        P::SimulationStartRequest {
+            definition_id,
+            version,
+            selected_process_id,
+            start_node_id,
+            variables,
+            start_ms,
+            horizon_ms,
+            tick_duration_ms,
+        } => {
+            let source = repository::capture_simulation_source(
+                pool,
+                &actor,
+                definition_id,
+                *version,
+                selected_process_id,
+                start_node_id,
+                variables,
+                *start_ms,
+                *horizon_ms,
+                *tick_duration_ms,
+            )
+            .map_err(error)?;
+            let start_reservation = ctx
+                .state
+                .simulation_registry
+                .reserve_start(&source.input().owner_user_id)
+                .map_err(error)?;
+            let mut store = simulation::SimulationStore::create(source).map_err(error)?;
+            let source_pin = store.source().clone();
+            let authorization = repository::authorize_simulation_action(
+                pool,
+                &actor,
+                &source_pin,
+            )
+            .map_err(error)?;
+            let view = store.start(authorization, variables.clone()).map_err(error)?;
+            let simulation_id = view.simulation_id.clone();
+            let response_view = simulation_view(view).map_err(error)?;
+            start_reservation
+                .commit(simulation_id.clone(), store.into_database())
+                .map_err(error)?;
+            P::SimulationStartResponse {
+                view: response_view,
+            }
+        }
+        P::SimulationViewRequest { simulation_id } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.view(authorization)
+                })
+                .map_err(error)?;
+            P::SimulationViewResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
+        P::SimulationAdvanceRequest { simulation_id } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.advance(authorization)
+                })
+                .map_err(error)?;
+            P::SimulationAdvanceResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
+        P::SimulationUserTaskCompleteRequest {
+            simulation_id,
+            user_task_id,
+            outputs,
+        } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.complete_user_task(authorization, user_task_id, outputs.clone())
+                })
+                .map_err(error)?;
+            P::SimulationUserTaskCompleteResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
+        P::SimulationManualTaskAcknowledgeRequest {
+            simulation_id,
+            user_task_id,
+        } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.acknowledge_manual_task(authorization, user_task_id)
+                })
+                .map_err(error)?;
+            P::SimulationManualTaskAcknowledgeResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
+        P::SimulationReleaseRequest { simulation_id } => {
+            ctx.state
+                .simulation_registry
+                .release(pool, &actor, simulation_id)
+                .map_err(error)?;
+            P::SimulationReleaseResponse {
+                simulation_id: simulation_id.clone(),
+            }
+        }
         P::MessageSendResponse { .. }
         | P::MessageGetResponse { .. }
         | P::MessageListResponse { .. }
@@ -635,7 +806,13 @@ pub fn process_dispatch(
         | P::UserTaskCompleteResponse { .. }
         | P::InstanceCancelResponse { .. }
         | P::JobRetryResponse { .. }
-        | P::HistoryResponse { .. } => {
+        | P::HistoryResponse { .. }
+        | P::SimulationStartResponse { .. }
+        | P::SimulationViewResponse { .. }
+        | P::SimulationAdvanceResponse { .. }
+        | P::SimulationUserTaskCompleteResponse { .. }
+        | P::SimulationManualTaskAcknowledgeResponse { .. }
+        | P::SimulationReleaseResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "process responses are not accepted as requests",
             ))
@@ -685,6 +862,12 @@ register_request!("ProcessMessageGetRequest");
 register_request!("ProcessMessageListRequest");
 register_request!("ProcessMessageResolveRequest");
 register_request!("ProcessMessageCancelRequest");
+register_request!("ProcessSimulationStartRequest");
+register_request!("ProcessSimulationViewRequest");
+register_request!("ProcessSimulationAdvanceRequest");
+register_request!("ProcessSimulationUserTaskCompleteRequest");
+register_request!("ProcessSimulationManualTaskAcknowledgeRequest");
+register_request!("ProcessSimulationReleaseRequest");
 
 #[cfg(test)]
 mod tests {
@@ -765,6 +948,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_simulation_starts_keep_both_runs_viewable_and_releasable() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-owner");
+        let ctx = context(&state, &actor);
+        let definition = save(&ctx, test_support::user_model(Some(&actor.user_id))).await;
+        let P::DefinitionPublishResponse {
+            definition: published,
+            ..
+        } = request(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await
+        else {
+            panic!("published definition expected")
+        };
+
+        let start = P::SimulationStartRequest {
+            definition_id: published.definition_id.clone(),
+            version: 1,
+            selected_process_id: "Process_1".into(),
+            start_node_id: "Start_1".into(),
+            variables: json!({}),
+            start_ms: 10_000,
+            horizon_ms: 20_000,
+            tick_duration_ms: 500,
+        };
+        let P::SimulationStartResponse { view: first } = request(&ctx, start.clone()).await else {
+            panic!("first private simulation start expected")
+        };
+        let P::SimulationStartResponse { view: second } = request(&ctx, start.clone()).await else {
+            panic!("second private simulation start expected")
+        };
+        assert_ne!(first.simulation_id, second.simulation_id);
+
+        let P::SimulationViewResponse { view: first_view } = request(
+            &ctx,
+            P::SimulationViewRequest {
+                simulation_id: first.simulation_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("first private simulation view expected")
+        };
+        assert_eq!(first_view.simulation_id, first.simulation_id);
+
+        let P::SimulationReleaseResponse { simulation_id } = request(
+            &ctx,
+            P::SimulationReleaseRequest {
+                simulation_id: first.simulation_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("simulation release response expected")
+        };
+        assert_eq!(simulation_id, first.simulation_id);
+        let error = refused(
+            &ctx,
+            P::SimulationViewRequest {
+                simulation_id: first.simulation_id,
+            },
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::NotFound);
+
+        let P::SimulationViewResponse { view: second_view } = request(
+            &ctx,
+            P::SimulationViewRequest {
+                simulation_id: second.simulation_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("second private simulation view expected")
+        };
+        assert_eq!(second_view.simulation_id, second.simulation_id);
+
+        let registry = ctx.state.simulation_registry.clone();
+        let pool = state.db.clone();
+        let operation_actor = actor.clone();
+        let in_flight_simulation_id = second.simulation_id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let operation = tokio::task::spawn_blocking(move || {
+            registry.with_authorized_store(
+                &pool,
+                &operation_actor,
+                &in_flight_simulation_id,
+                |store, authorization| {
+                    started_tx
+                        .send(())
+                        .expect("in-flight simulation step receiver remains active");
+                    continue_rx
+                        .recv()
+                        .expect("simulation step continuation signal remains active");
+                    store.advance(authorization)
+                },
+            )
+        });
+        started_rx
+            .await
+            .expect("simulation advance entered its in-flight operation");
+        let P::SimulationReleaseResponse { simulation_id } = request(
+            &ctx,
+            P::SimulationReleaseRequest {
+                simulation_id: second.simulation_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("in-flight simulation release response expected")
+        };
+        assert_eq!(simulation_id, second.simulation_id);
+        continue_tx
+            .send(())
+            .expect("simulation advance continuation receiver remains active");
+        operation
+            .await
+            .expect("in-flight simulation operation task joins")
+            .expect("in-flight simulation step completes");
+        assert_eq!(
+            refused(
+                &ctx,
+                P::SimulationViewRequest {
+                    simulation_id: second.simulation_id.clone(),
+                },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+
+        let P::SimulationStartResponse { view: third } = request(&ctx, start).await else {
+            panic!("third private simulation start expected")
+        };
+
+        request(
+            &ctx,
+            P::DefinitionArchiveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: published.definition_id.clone(),
+                expected_revision: published.draft_revision,
+                archived: true,
+            },
+        )
+        .await;
+        let outsider = test_support::actor(&state.db, "simulation-outsider");
+        let outsider_ctx = context(&state, &outsider);
+        assert_eq!(
+            refused(
+                &outsider_ctx,
+                P::SimulationReleaseRequest {
+                    simulation_id: third.simulation_id.clone(),
+                },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        let P::SimulationReleaseResponse { simulation_id } = request(
+            &ctx,
+            P::SimulationReleaseRequest {
+                simulation_id: third.simulation_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("archived simulation release response expected")
+        };
+        assert_eq!(simulation_id, third.simulation_id);
+        assert_eq!(
+            refused(
+                &ctx,
+                P::SimulationViewRequest {
+                    simulation_id: third.simulation_id,
+                },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+    }
+
+    #[tokio::test]
     async fn ordinary_authors_have_private_definitions_and_current_assignees_complete_their_tasks()
     {
         let state = AppState::for_test();
@@ -823,6 +1197,8 @@ mod tests {
                 definition_id: definition.definition_id.clone(),
                 version: 1,
                 variables: json!({}),
+                process_id: None,
+                start_node_id: None,
             },
         )
         .await
@@ -965,21 +1341,21 @@ mod tests {
         let participant_ctx = context(&state, &participant);
         let mut model = crate::processes::model::starter_model();
         model.nodes.splice(1..1, [
-            ProcessNode { repeat: None, id: "Split".into(), name: "Run three branches".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "Split".into(), name: "Run three branches".into(),
                 kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "LeftWork".into(), name: "Reach the join first".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "LeftWork".into(), name: "Reach the join first".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
                     output_mapping: Default::default() } },
-            ProcessNode { repeat: None, id: "RightWork".into(), name: "Remain at the join".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "RightWork".into(), name: "Remain at the join".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(owner.user_id.clone()),
                     output_mapping: Default::default() } },
-            ProcessNode { repeat: None, id: "TerminateWork".into(), name: "Terminate after the join arrival".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "TerminateWork".into(), name: "Terminate after the join arrival".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(participant.user_id.clone()),
                     output_mapping: std::collections::BTreeMap::from([
                         ("decision".into(), "outputs.decision".into())]) } },
-            ProcessNode { repeat: None, id: "Join".into(), name: "Join ordinary branches".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "Join".into(), name: "Join ordinary branches".into(),
                 kind: ProcessNodeKind::ParallelGateway },
-            ProcessNode { repeat: None, id: "Terminate".into(), name: "Stop the process".into(),
+            ProcessNode { repeat: None, activity_io: None, id: "Terminate".into(), name: "Stop the process".into(),
                 kind: ProcessNodeKind::TerminateEnd },
         ]);
         model.sequence_flows = vec![
@@ -1001,7 +1377,7 @@ mod tests {
         }).await;
         let P::InstanceStartResponse { instance: started } = request(&owner_ctx,
             P::InstanceStartRequest { command_id: uuid::Uuid::new_v4().to_string(),
-                definition_id: definition.definition_id, version: 1, variables: json!({}) }).await
+                definition_id: definition.definition_id, version: 1, variables: json!({}), process_id: None, start_node_id: None }).await
         else { panic!("three actual waiting branches expected") };
         assert_eq!(started.status, ProcessInstanceStatus::Waiting);
         assert_eq!(started.user_tasks.len(), 3);
@@ -1326,8 +1702,7 @@ mod tests {
         };
         let P::DefinitionGetResponse {
             definition,
-            timer_start: Some(summary),
-            message_start: _,
+            start_catalog,
         } = request(
             &ctx,
             P::DefinitionGetRequest {
@@ -1338,6 +1713,9 @@ mod tests {
         else {
             panic!("actual persisted schedule expected")
         };
+        let [entry] = start_catalog.as_slice() else { panic!("one TimerStart expected") };
+        let tentaflow_protocol::processes::ProcessStartTrigger::TimerStart { persisted_timer: Some(summary), .. } = &entry.trigger
+        else { panic!("persisted TimerStart expected") };
         assert_eq!(summary.kind, ProcessTimerKind::Start);
         assert_eq!(summary.status, ProcessTimerStatus::Pending);
         assert_eq!(summary.timezone, "Europe/Warsaw");
@@ -1360,6 +1738,8 @@ mod tests {
                 definition_id: definition.definition_id.clone(),
                 version: version.version,
                 variables: json!({}),
+                process_id: Some(entry.process_id.clone()),
+                start_node_id: Some(entry.start_node_id.clone()),
             },
         )
         .await;
@@ -1367,7 +1747,7 @@ mod tests {
         assert!(denial.message.contains("cannot be started manually"));
         request(&ctx, publish).await;
         let P::DefinitionGetResponse {
-            timer_start: Some(replayed),
+            start_catalog: replayed_catalog,
             ..
         } = request(
             &ctx,
@@ -1379,6 +1759,9 @@ mod tests {
         else {
             panic!("replayed schedule expected")
         };
+        let [entry] = replayed_catalog.as_slice() else { panic!("one TimerStart expected") };
+        let tentaflow_protocol::processes::ProcessStartTrigger::TimerStart { persisted_timer: Some(replayed), .. } = &entry.trigger
+        else { panic!("replayed TimerStart expected") };
         assert_eq!(replayed, summary);
         let P::InstanceListResponse {
             total, instances, ..
@@ -1407,7 +1790,7 @@ mod tests {
         let reviewer = context(&state, &participant);
         let mut model = test_support::user_model(Some(&participant.user_id));
         model.timer_timezone = Some("UTC".into());
-        model.nodes.push(ProcessNode { repeat: None,
+        model.nodes.push(ProcessNode { repeat: None, activity_io: None,
             id: "Wait".into(),
             name: "Wait after human work".into(),
             kind: ProcessNodeKind::TimerCatch {
@@ -1437,6 +1820,8 @@ mod tests {
                 definition_id: definition.definition_id.clone(),
                 version: 1,
                 variables: json!({}),
+                process_id: None,
+                start_node_id: None,
             },
         )
         .await
@@ -1747,6 +2132,8 @@ mod tests {
                 definition_id: definition.definition_id.clone(),
                 version: 1,
                 variables: json!({}),
+                process_id: None,
+                start_node_id: None,
             },
         )
         .await
@@ -2018,7 +2405,7 @@ mod tests {
         )
         .await;
         let P::DefinitionGetResponse {
-            message_start: Some(start),
+            start_catalog,
             ..
         } = request(
             &owner_ctx,
@@ -2030,8 +2417,11 @@ mod tests {
         else {
             panic!("message start summary expected")
         };
-        assert!(start.can_send);
-        assert_eq!(start.message_name, "EvidenceReady");
+        let [entry] = start_catalog.as_slice() else { panic!("one MessageStart expected") };
+        let tentaflow_protocol::processes::ProcessStartTrigger::MessageStart { message_name, can_send, .. } = &entry.trigger
+        else { panic!("MessageStart expected") };
+        assert!(*can_send);
+        assert_eq!(message_name, "EvidenceReady");
         refused(
             &owner_ctx,
             P::InstanceStartRequest {
@@ -2039,6 +2429,8 @@ mod tests {
                 definition_id: start_definition.definition_id,
                 version: 1,
                 variables: json!({}),
+                process_id: None,
+                start_node_id: None,
             },
         )
         .await;

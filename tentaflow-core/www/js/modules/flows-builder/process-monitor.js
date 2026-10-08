@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processCommand, processEditorLabels, processHasMessageStart, processHasTimerStart, processJson, processStatusLabel } from './bpmn.js';
+import { checkProcessValue, processBody, processCommand, processEditorLabels, processJson, processStatusLabel } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
@@ -62,12 +62,48 @@ function jsonSection(label, value, editable = true) {
   return section;
 }
 
-export function openProcessCallPreview(version) {
+function activityInputsSection(task) {
+  if (!Array.isArray(task.activityInputs) || task.activityInputs.length === 0) return null;
+  const section = document.createElement('section');
+  section.className = 'fb-process-activity-inputs';
+  section.innerHTML = `<h3>${escapeHtml(text('activity_input_values'))}</h3>
+    <p class="fb-process-activity-inputs-hint">${escapeHtml(text('activity_input_values_hint'))}</p>`;
+  for (const input of task.activityInputs) {
+    const row = document.createElement('div');
+    row.className = 'fb-process-activity-input';
+    const label = input.name || input.declarationId || text('activity_input_unnamed');
+    const title = document.createElement('h4');
+    title.textContent = `${label} · ${input.declarationId || ''}`;
+    row.append(title);
+    const missing = input.value === 'Missing';
+    if (missing) {
+      const chip = document.createElement('tf-chip');
+      chip.setAttribute('status', 'neutral');
+      chip.textContent = text('activity_input_missing');
+      row.append(chip);
+    } else {
+      const editor = document.createElement('tf-code-editor');
+      editor.setAttribute('language', 'json');
+      editor.setAttribute('readonly', '');
+      editor.setAttribute('aria-label', label);
+      editor.labels = processEditorLabels();
+      const present = input.value !== null && typeof input.value === 'object'
+        && Object.hasOwn(input.value, 'Present');
+      const value = present ? input.value.Present : null;
+      editor.value = JSON.stringify(value, null, 2);
+      row.append(editor);
+    }
+    section.append(row);
+  }
+  return section;
+}
+
+export function openProcessCallPreview(version, processId) {
   const win = readWindow(text('call_preview'), 'layers', 940);
   const host = win.querySelector('[data-content]');
   host.innerHTML = `<h2>${escapeHtml(text('version_number', { version: version.version }))}</h2>
     <p>${escapeHtml(text('call_preview_readonly'))}</p>`;
-  host.append(jsonSection(text('call_published_model'), version.model, false));
+  host.append(jsonSection(text('call_published_model'), processBody(version.model, [], processId), false));
   return win;
 }
 
@@ -137,6 +173,10 @@ export function processEventText(event) {
   if (event.kind === 'signal_admitted') return text('event_signal_admitted', { node });
   if (event.kind === 'signal_catch_opened') return text('event_signal_catch_opened', { node });
   if (event.kind === 'signal_received') return text('event_signal_received', { node });
+  if (event.kind === 'link_thrown') return text('event_link_thrown', { node,
+    target: event.data.catch_node_id });
+  if (event.kind === 'link_caught') return text('event_link_caught', { node,
+    source: event.data.source_token_id });
   if (event.kind === 'inclusive_split') return text('event_inclusive_split', { node,
     count: event.data.selected_branch_edge_ids.length,
     default: event.data.default_selected ? text('inclusive_default_selected') : '' });
@@ -270,7 +310,10 @@ export async function openProcessSchedule(definitionId) {
       if (!win.isConnected || current !== generation) return;
       host.querySelector('[data-schedule-summary]').textContent = `${response.definition.name} · ${response.definition.publishedVersion ? text('version_number', { version: response.definition.publishedVersion }) : text('draft')}`;
       const timers = host.querySelector('[data-timers]');
-      if (response.timerStart) renderTimers(timers, [response.timerStart]);
+      const persisted = response.startCatalog
+        .filter((entry) => entry.trigger?.TimerStart?.persistedTimer != null)
+        .map((entry) => entry.trigger.TimerStart.persistedTimer);
+      if (persisted.length) renderTimers(timers, persisted);
       else timers.textContent = text('timer_schedule_empty');
       host.querySelector('[data-schedule-instances]').removeAttribute('disabled');
       win.querySelector('[data-error]').hidden = true;
@@ -296,7 +339,7 @@ function processIncidentText(incident) {
   if (incident.code === 'SCRIPT_EVALUATION_FAILED' || incident.code === 'SCRIPT_MAPPING_FAILED') {
     return `${text(`incident_${incident.code.toLowerCase()}`)} ${text('incident_script_guidance')}`;
   }
-  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE'];
+  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE', 'IMMEDIATE_TRANSITION_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 
@@ -457,8 +500,9 @@ export async function openProcessInstance(instanceId, initial = null) {
       instructions.className = 'fb-process-work';
       instructions.innerHTML = `<tf-textarea readonly autogrow rows="3" label="${escapeAttr(text('manual_instructions'))}" value="${escapeAttr(task.instructions)}"></tf-textarea>`;
       const command = processCommand();
+      const inputSection = activityInputsSection(task);
       const workWindow = openFormWindow({ title: text('acknowledge_manual'), icon: 'check', subject: task.name,
-        note: { text: text('manual_acknowledgment_notice') }, sections: [instructions],
+        note: { text: text('manual_acknowledgment_notice') }, sections: [instructions, inputSection].filter(Boolean),
         submitLabel: text('acknowledge_manual'),
         canSubmit: () => available && win.isConnected && [instance.selectedUserTask, ...instance.userTasks]
           .some((current) => current?.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open'),
@@ -483,9 +527,10 @@ export async function openProcessInstance(instanceId, initial = null) {
     if (task.kind === 'Verification') approval.innerHTML = `<tf-select label="${escapeAttr(text('review_result'))}" data-approved>
       <option value="">${escapeHtml(text('choose_review'))}</option><option value="true">${escapeHtml(text('approve_result'))}</option><option value="false">${escapeHtml(text('reject_result'))}</option></tf-select>`;
     const command = processCommand();
+    const inputSection = activityInputsSection(task);
     const workWindow = openFormWindow({ title: text(task.kind === 'Verification' ? 'verification_human' : 'complete_work'), icon: 'check', subject: task.name,
       note: { text: text(task.kind === 'Verification' ? 'review_hint' : 'work_hint') },
-      sections: [outputs, approval], submitLabel: text('complete_work'),
+      sections: [inputSection, outputs, approval].filter(Boolean), submitLabel: text('complete_work'),
       validate: () => task.kind === 'Verification' || validateJson(outputs),
       canSubmit: () => available && win.isConnected && [instance.selectedUserTask, ...instance.userTasks].some((current) => current?.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open')
         && (task.kind !== 'Verification' || approval.querySelector('tf-select').value !== ''),
@@ -736,6 +781,11 @@ export async function openProcessInstance(instanceId, initial = null) {
         unavailable.textContent = text('repeat_value_unavailable');
         detail.append(unavailable);
       }
+      if (selected.summary.acceptedSourceEventId) {
+        const source = document.createElement('p');
+        source.textContent = `${text('repeat_accepted_source_event')}: ${selected.summary.acceptedSourceEventId}`;
+        detail.append(source);
+      }
       if (selected.acceptedOrigin) {
         const origin = document.createElement('p');
         origin.textContent = `${text('repeat_result_origin')}: ${text(`repeat_origin_${selected.acceptedOrigin.toLowerCase()}`)}`;
@@ -777,16 +827,30 @@ export async function openProcessInstance(instanceId, initial = null) {
   return win;
 }
 
-export function openProcessRun(definition, versions) {
+export function openProcessRun(definition, versions, startCatalog, selectedStart) {
   const selection = document.createElement('div');
-  selection.innerHTML = `<tf-select data-version label="${escapeAttr(text('published_version'))}">${versions.map((version) => `<option value="${version.version}">${escapeHtml(text('version_number', { version: version.version }))}</option>`).join('')}</tf-select>`;
+  const manualStarts = startCatalog.filter((entry) => entry.trigger?.Start?.canStart);
+  selection.innerHTML = `<tf-select data-version label="${escapeAttr(text('published_version'))}">${versions.map((version) => `<option value="${version.version}">${escapeHtml(text('version_number', { version: version.version }))}</option>`).join('')}</tf-select>
+    <tf-select data-start wrap-selected label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(entry.processName || entry.processId)} · ${escapeHtml(entry.startNodeName || entry.startNodeId)}</option>`).join('')}</tf-select>`;
   const variables = jsonSection(text('initial_variables'), definition.model.variables);
+  const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
+    && entry.startNodeId === selectedStart?.startNodeId);
+  selection.querySelector('[data-start]').value = selectedIndex < 0 ? '' : String(selectedIndex);
   const command = processCommand();
   return openFormWindow({ title: text('run'), icon: 'play', subject: definition.name,
-    note: { text: text(processHasTimerStart(definition.model) ? 'timer_start_manual_hint' : processHasMessageStart(definition.model) ? 'message_start_manual_hint' : 'run_hint') }, sections: [selection, variables], submitLabel: text('run'),
+    note: { text: text('run_hint') }, sections: [selection, variables], submitLabel: text('run'),
     validate: () => validateJson(variables, true),
-    canSubmit: () => versions.length > 0 && !definition.archived && !processHasTimerStart(definition.model) && !processHasMessageStart(definition.model),
-    collect: () => ({ definitionId: definition.definitionId, version: Number(selection.querySelector('tf-select').value), variables: variables.jsonValue }),
+    canSubmit: () => versions.length > 0 && manualStarts.length > 0 && !definition.archived
+      && selection.querySelector('[data-start]').value !== '',
+    collect: () => {
+      const value = selection.querySelector('[data-start]').value;
+      const selected = value === '' ? undefined : manualStarts[Number(value)];
+      if (!selected) throw new Error(text('start_entry_changed'));
+      return { definitionId: definition.definitionId,
+        version: Number(selection.querySelector('[data-version]').value),
+        processId: selected.processId, startNodeId: selected.startNodeId,
+        variables: variables.jsonValue };
+    },
     onSubmit: async (payload) => {
       const response = await ApiBinary.one('processInstanceStartRequest', command(payload));
       await openProcessInstance(response.instance.instanceId, response.instance);
@@ -857,6 +921,344 @@ export function openProcessDeclarations(model, readOnly, onSave) {
     submitLabel: text('apply'), canSubmit: () => !readOnly, collect,
     onSubmit: async (declarations) => { onSave(declarations); return { message: text('declarations_updated') }; },
   });
+}
+
+export function openProcessModeling(model, path, processId, readOnly, onSave) {
+  const draft = structuredClone(model);
+  const body = processBody(draft, path, processId);
+  const hadModeling = body.modeling != null;
+  body.modeling ??= { laneSets: [], dataObjects: [], dataObjectReferences: [], textAnnotations: [], associations: [], dataStoreReferences: [] };
+  const modeling = body.modeling;
+  modeling.dataStoreReferences ??= [];
+  draft.dataStores ??= [];
+  body.diagram.modelingShapes ??= [];
+  body.diagram.modelingEdges ??= [];
+  const section = document.createElement('section');
+  const id = (prefix) => `${prefix}_${crypto.randomUUID().replaceAll('-', '_')}`;
+  const bodyShapes = body.diagram.modelingShapes;
+  const bodyEdges = body.diagram.modelingEdges;
+  const shape = (elementId) => bodyShapes.find((item) => item.elementId === elementId);
+  const nextShape = (elementId, x, y, width, height) => ({
+    diId: id('Shape'), elementId, x, y, width, height,
+  });
+  const laneRows = () => {
+    const rows = [];
+    const visit = (sets, depth) => {
+      for (const set of sets) for (const lane of set.lanes) {
+        rows.push({ lane, set, depth });
+        visit(lane.childLaneSets || [], depth + 1);
+      }
+    };
+    visit(modeling.laneSets, 0);
+    return rows;
+  };
+  const allBodies = [draft, ...(draft.additionalProcesses || [])];
+  const nodesInBody = (selectedBody) => selectedBody.nodes.flatMap((node) => [node,
+    ...(node.kind?.SubProcess ? nodesInBody(node.kind.SubProcess.body) : [])]);
+  const storeReferenced = (storeId) => {
+    const pending = [...allBodies];
+    while (pending.length) {
+      const selectedBody = pending.pop();
+      if ((selectedBody.modeling?.dataStoreReferences || []).some((reference) => reference.dataStoreRef === storeId)) return true;
+      pending.push(...selectedBody.nodes.filter((node) => node.kind?.SubProcess).map((node) => node.kind.SubProcess.body));
+    }
+    return false;
+  };
+  const namespaceUri = draft.targetNamespace || 'https://tentaflow.app/bpmn/1';
+  const geometry = (owner, item) => {
+    const bounds = owner.find((entry) => entry.elementId === item.id);
+    if (!bounds) return readOnly ? '' : `<tf-button variant="secondary" data-place="${escapeAttr(item.id)}">${escapeHtml(text('modeling_place'))}</tf-button>`;
+    return `<div data-geometry="${escapeAttr(item.id)}">${[['x', 'modeling_x'], ['y', 'modeling_y'],
+      ['width', 'modeling_width'], ['height', 'modeling_height']].map(([key, label]) =>
+      `<tf-input type="number" step="1" data-geometry-field="${key}" value="${bounds[key]}" label="${escapeAttr(text(label))}" ${readOnly ? 'disabled' : ''}></tf-input>`).join('')}</div>`;
+  };
+  const optionList = (items, selected, blank = '') => `<option value="">${escapeHtml(blank)}</option>${items.map(([value, label]) =>
+    `<option value="${escapeAttr(value)}" ${value === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}`;
+  const edgeGeometry = (edges, item) => {
+    const edge = edges.find((entry) => entry.elementId === item.id);
+    if (!edge) return '';
+    return `<div data-edge-geometry="${escapeAttr(item.id)}">${edge.waypoints.map((point, index) =>
+      `<div data-point-index="${index}">${[['x', 'modeling_x'], ['y', 'modeling_y']].map(([field, label]) =>
+        `<tf-input type="number" step="1" data-point-field="${field}" value="${point[field]}" label="${escapeAttr(`${text(label)} ${index + 1}`)}" ${readOnly ? 'disabled' : ''}></tf-input>`).join('')}</div>`).join('')}</div>`;
+  };
+  const render = () => {
+    const lanes = laneRows();
+    const refs = modeling.dataObjectReferences;
+    const annotationIds = modeling.textAnnotations.map((item) => [item.id, item.text || item.id]);
+    const endpoints = [...body.nodes.map((item) => [item.id, item.name || item.id]),
+      ...refs.map((item) => [item.id, item.name ?? item.id]),
+      ...modeling.dataStoreReferences.map((item) => [item.id, item.name ?? item.id]), ...annotationIds];
+    const variableOptions = Object.keys(body.variables).map((key) => [key, key]);
+    const collaboration = draft.collaboration;
+    const participantShapes = collaboration?.diagram.modelingShapes || [];
+    const participantOptions = (collaboration?.participants || []).map((item) => [item.id, item.name ?? item.id]);
+    const messageEndpoints = [...participantOptions,
+      ...allBodies.flatMap((item) => nodesInBody(item).map((node) => [node.id, node.name || node.id]))];
+    section.innerHTML = `<p>${escapeHtml(text('modeling_hint'))}</p>
+      <h3>${escapeHtml(text('modeling_lanes'))}</h3>
+      <div data-modeling-lanes>${lanes.map(({ lane, depth }) => `<div data-modeling-kind="lane" data-modeling-id="${escapeAttr(lane.id)}">
+        <tf-input data-modeling-field="name" value="${escapeAttr(lane.name ?? '')}" label="${escapeAttr(`${text('modeling_lane')} ${depth + 1}`)}" ${readOnly ? 'disabled' : ''}></tf-input>
+        ${geometry(bodyShapes, lane)}
+        <tf-select data-modeling-node="${escapeAttr(lane.id)}" wrap-selected label="${escapeAttr(text('modeling_assign_node'))}" ${readOnly ? 'disabled' : ''}>${optionList(body.nodes.map((node) => [node.id, node.name || node.id]), '', text('modeling_choose'))}</tf-select>
+        ${readOnly ? '' : `<tf-button variant="secondary" data-assign-node="${escapeAttr(lane.id)}">${escapeHtml(text('modeling_assign_node'))}</tf-button>
+          ${depth < 3 ? `<tf-button variant="secondary" data-add-child-lane="${escapeAttr(lane.id)}">${escapeHtml(text('modeling_add_child_lane'))}</tf-button>` : ''}
+          <tf-button variant="danger" data-remove-modeling="${escapeAttr(lane.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+        <div>${lane.flowNodeRefs.map((nodeId) => `<tf-chip status="info">${escapeHtml(body.nodes.find((node) => node.id === nodeId)?.name || nodeId)}</tf-chip>${readOnly ? '' : `<tf-button variant="ghost" data-remove-node="${escapeAttr(lane.id)}" data-node-id="${escapeAttr(nodeId)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}`).join('')}</div>
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="lane">${escapeHtml(text('modeling_add_lane'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_stores'))}</h3>
+      <div data-modeling-stores>${draft.dataStores.map((store) => `<div data-modeling-kind="store" data-modeling-id="${escapeAttr(store.id)}">
+        <tf-input data-modeling-field="name" value="${escapeAttr(store.name ?? '')}" label="${escapeAttr(text('modeling_store'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+        <tf-input type="number" step="1" min="0" max="9007199254740991" data-modeling-field="capacity" value="${store.capacity ?? ''}" label="${escapeAttr(text('modeling_store_capacity'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+        <tf-select data-modeling-field="isUnlimited" label="${escapeAttr(text('modeling_store_unlimited'))}" ${readOnly ? 'disabled' : ''}>${optionList([['true', I18n.t('common.yes')], ['false', I18n.t('common.no')]], store.isUnlimited == null ? '' : String(store.isUnlimited), text('modeling_descriptive'))}</tf-select>
+        ${readOnly || storeReferenced(store.id) ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(store.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="store">${escapeHtml(text('modeling_add_store'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_store_references'))}</h3>
+      <div data-modeling-store-references>${modeling.dataStoreReferences.map((reference) => `<div data-modeling-kind="storeReference" data-modeling-id="${escapeAttr(reference.id)}">
+        <tf-input data-modeling-field="name" value="${escapeAttr(reference.name ?? '')}" label="${escapeAttr(text('modeling_store_reference'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+        <tf-select data-modeling-field="dataStoreRef" wrap-selected label="${escapeAttr(text('modeling_store'))}" ${readOnly ? 'disabled' : ''}>${optionList(draft.dataStores.map((store) => [store.id, store.name ?? store.id]), reference.dataStoreRef, text('modeling_choose'))}</tf-select>
+        ${geometry(bodyShapes, reference)}
+        ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(reference.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly || !draft.dataStores.length ? '' : `<tf-button variant="secondary" data-add-modeling="storeReference">${escapeHtml(text('modeling_add_store_reference'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_data'))}</h3>
+      <div data-modeling-data>${refs.map((reference) => {
+        const object = modeling.dataObjects.find((item) => item.id === reference.dataObjectRef);
+        return `<div data-modeling-kind="reference" data-modeling-id="${escapeAttr(reference.id)}">
+          <tf-input data-modeling-field="objectName" value="${escapeAttr(object?.name ?? '')}" label="${escapeAttr(text('modeling_data_object'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+          <tf-input data-modeling-field="name" value="${escapeAttr(reference.name ?? '')}" label="${escapeAttr(text('modeling_data_reference'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+          <tf-select data-modeling-field="variableBindingKey" wrap-selected label="${escapeAttr(text('modeling_binding'))}" ${readOnly ? 'disabled' : ''}>${optionList(variableOptions, reference.variableBindingKey, text('modeling_descriptive'))}</tf-select>
+          ${geometry(bodyShapes, reference)}
+          ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(reference.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+        </div>`;
+      }).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="reference">${escapeHtml(text('modeling_add_data'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_annotations'))}</h3>
+      <div data-modeling-annotations>${modeling.textAnnotations.map((annotation) => `<div data-modeling-kind="annotation" data-modeling-id="${escapeAttr(annotation.id)}">
+        <tf-textarea data-modeling-field="text" value="${escapeAttr(annotation.text)}" label="${escapeAttr(text('modeling_annotation'))}" autogrow rows="3" ${readOnly ? 'disabled' : ''}></tf-textarea>
+        ${geometry(bodyShapes, annotation)}
+        ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(annotation.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="annotation">${escapeHtml(text('modeling_add_annotation'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_associations'))}</h3>
+      <div data-modeling-associations>${modeling.associations.map((association) => `<div data-modeling-kind="association" data-modeling-id="${escapeAttr(association.id)}">
+        <tf-select data-modeling-field="sourceRef" wrap-selected label="${escapeAttr(text('modeling_source'))}" ${readOnly ? 'disabled' : ''}>${optionList(endpoints, association.sourceRef)}</tf-select>
+        <tf-select data-modeling-field="targetRef" wrap-selected label="${escapeAttr(text('modeling_target'))}" ${readOnly ? 'disabled' : ''}>${optionList(endpoints, association.targetRef)}</tf-select>
+        ${edgeGeometry(bodyEdges, association)}
+        ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(association.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="association">${escapeHtml(text('modeling_add_association'))}</tf-button>`}
+      ${path.length ? '' : `<h3>${escapeHtml(text('modeling_pools'))}</h3>
+      <div data-modeling-participants>${(collaboration?.participants || []).map((participant) => `<div data-modeling-kind="participant" data-modeling-id="${escapeAttr(participant.id)}">
+        <tf-input data-modeling-field="name" value="${escapeAttr(participant.name ?? '')}" label="${escapeAttr(text('modeling_pool'))}" ${readOnly ? 'disabled' : ''}></tf-input>
+        <tf-select data-modeling-field="processRef" wrap-selected label="${escapeAttr(text('modeling_pool_body'))}" ${readOnly ? 'disabled' : ''}>${optionList(allBodies.map((item) => [item.processId, item.processName || item.processId]), participant.processRef?.processId, text('modeling_black_box'))}</tf-select>
+        ${geometry(participantShapes, participant)}
+        ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(participant.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="participant">${escapeHtml(text('modeling_add_pool'))}</tf-button>`}
+      <h3>${escapeHtml(text('modeling_message_flows'))}</h3>
+      <div data-modeling-message-flows>${(collaboration?.messageFlows || []).map((flow) => `<div data-modeling-kind="messageFlow" data-modeling-id="${escapeAttr(flow.id)}">
+        <tf-select data-modeling-field="sourceRef" wrap-selected label="${escapeAttr(text('modeling_source'))}" ${readOnly ? 'disabled' : ''}>${optionList(messageEndpoints, flow.sourceRef)}</tf-select>
+        <tf-select data-modeling-field="targetRef" wrap-selected label="${escapeAttr(text('modeling_target'))}" ${readOnly ? 'disabled' : ''}>${optionList(messageEndpoints, flow.targetRef)}</tf-select>
+        <tf-select data-modeling-field="messageRef" wrap-selected label="${escapeAttr(text('message_reference'))}" ${readOnly ? 'disabled' : ''}>${optionList((draft.messages || []).map((message) => [message.messageId, message.name]), flow.messageRef, text('modeling_descriptive'))}</tf-select>
+        ${edgeGeometry(collaboration.diagram.modelingEdges, flow)}
+        ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(flow.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
+      </div>`).join('')}</div>
+      ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="messageFlow">${escapeHtml(text('modeling_add_message_flow'))}</tf-button>`}`}`;
+    section.querySelectorAll('tf-select[data-modeling-field], tf-select[data-modeling-node]').forEach((select) => {
+      const options = [...select.querySelectorAll('option')].map((option) => ({ value: option.value, label: option.textContent }));
+      const selected = select.querySelector('option[selected]')?.value ?? '';
+      select.setOptions(options, selected);
+    });
+  };
+  const locate = (kind, itemId) => kind === 'lane' ? laneRows().find(({ lane }) => lane.id === itemId)?.lane
+    : kind === 'store' ? draft.dataStores.find((item) => item.id === itemId)
+      : kind === 'storeReference' ? modeling.dataStoreReferences.find((item) => item.id === itemId)
+    : kind === 'reference' ? modeling.dataObjectReferences.find((item) => item.id === itemId)
+      : kind === 'annotation' ? modeling.textAnnotations.find((item) => item.id === itemId)
+        : kind === 'association' ? modeling.associations.find((item) => item.id === itemId)
+          : kind === 'participant' ? draft.collaboration?.participants.find((item) => item.id === itemId)
+            : draft.collaboration?.messageFlows.find((item) => item.id === itemId);
+  const removeLinks = (itemId) => {
+    modeling.associations = modeling.associations.filter((item) => item.sourceRef !== itemId && item.targetRef !== itemId && item.id !== itemId);
+    const linked = new Set(modeling.associations.map((item) => item.id));
+    for (let index = bodyEdges.length - 1; index >= 0; index -= 1) {
+      if (!linked.has(bodyEdges[index].elementId)) bodyEdges.splice(index, 1);
+    }
+  };
+  section.addEventListener('change', (event) => {
+    if (readOnly) return;
+    const row = event.target.closest('[data-modeling-kind]');
+    const field = event.target.dataset.modelingField;
+    if (!row || !field) return;
+    const item = locate(row.dataset.modelingKind, row.dataset.modelingId);
+    if (!item) return;
+    if (field === 'objectName') {
+      const object = modeling.dataObjects.find((candidate) => candidate.id === item.dataObjectRef);
+      if (object) object.name = event.target.value;
+    } else if (field === 'variableBindingKey') {
+      if (event.target.value) item.variableBindingKey = event.target.value;
+      else delete item.variableBindingKey;
+    } else if (field === 'capacity') {
+      if (event.target.value === '') delete item.capacity;
+      else item.capacity = Number(event.target.value);
+    } else if (field === 'isUnlimited') {
+      if (event.target.value === '') delete item.isUnlimited;
+      else item.isUnlimited = event.target.value === 'true';
+    } else if (field === 'processRef') {
+      if (event.target.value) item.processRef = { namespaceUri, processId: event.target.value };
+      else delete item.processRef;
+    } else if (field === 'messageRef') {
+      if (event.target.value) item.messageRef = event.target.value;
+      else delete item.messageRef;
+    } else {
+      item[field] = event.target.value;
+      if (field === 'dataStoreRef') render();
+    }
+  });
+  section.addEventListener('change', (event) => {
+    const container = event.target.closest('[data-geometry]');
+    const field = event.target.dataset.geometryField;
+    if (!container || !field || readOnly) return;
+    const owner = draft.collaboration?.participants.some((item) => item.id === container.dataset.geometry)
+      ? draft.collaboration.diagram.modelingShapes : bodyShapes;
+    const bounds = owner.find((item) => item.elementId === container.dataset.geometry);
+    if (bounds && Number.isFinite(Number(event.target.value))) bounds[field] = Number(event.target.value);
+  });
+  section.addEventListener('change', (event) => {
+    const container = event.target.closest('[data-edge-geometry]');
+    const point = event.target.closest('[data-point-index]');
+    const field = event.target.dataset.pointField;
+    if (!container || !point || !field || readOnly) return;
+    const edges = draft.collaboration?.messageFlows.some((item) => item.id === container.dataset.edgeGeometry)
+      ? draft.collaboration.diagram.modelingEdges : bodyEdges;
+    const edge = edges.find((item) => item.elementId === container.dataset.edgeGeometry);
+    const coordinate = Number(event.target.value);
+    if (edge && Number.isFinite(coordinate)) edge.waypoints[Number(point.dataset.pointIndex)][field] = coordinate;
+  });
+  section.addEventListener('click', (event) => {
+    if (readOnly) return;
+    const button = event.target.closest('tf-button');
+    if (!button || !section.contains(button)) return;
+    const kind = button.dataset.addModeling;
+    if (kind === 'lane') {
+      if (!modeling.laneSets.length) modeling.laneSets.push({ id: id('LaneSet'), lanes: [] });
+      const laneId = id('Lane');
+      modeling.laneSets[0].lanes.push({ id: laneId, flowNodeRefs: [], childLaneSets: [] });
+      bodyShapes.push(nextShape(laneId, 60, 60, 720, 360));
+    } else if (button.dataset.addChildLane) {
+      const parent = locate('lane', button.dataset.addChildLane);
+      if (parent) {
+        const laneId = id('Lane');
+        parent.childLaneSets.push({ id: id('LaneSet'), lanes: [{ id: laneId, flowNodeRefs: [], childLaneSets: [] }] });
+        bodyShapes.push(nextShape(laneId, 100, 100, 520, 220));
+      }
+    } else if (kind === 'store') {
+      draft.dataStores.push({ id: id('DataStore') });
+    } else if (kind === 'storeReference') {
+      if (!draft.dataStores.length) return;
+      const referenceId = id('DataStoreRef');
+      modeling.dataStoreReferences.push({ id: referenceId, dataStoreRef: '' });
+      bodyShapes.push(nextShape(referenceId, 300, 460, 160, 90));
+    } else if (kind === 'reference') {
+      const objectId = id('DataObject'), referenceId = id('DataObjectRef');
+      modeling.dataObjects.push({ id: objectId });
+      modeling.dataObjectReferences.push({ id: referenceId, dataObjectRef: objectId });
+      bodyShapes.push(nextShape(referenceId, 300, 340, 150, 90));
+    } else if (kind === 'annotation') {
+      const annotationId = id('Annotation');
+      modeling.textAnnotations.push({ id: annotationId, text: '' });
+      bodyShapes.push(nextShape(annotationId, 470, 340, 190, 100));
+    } else if (kind === 'association' || kind === 'messageFlow') {
+      if (kind === 'messageFlow' && !draft.collaboration) return;
+      const endpoints = kind === 'association'
+        ? [...body.nodes.map((item) => item.id), ...modeling.dataObjectReferences.map((item) => item.id),
+          ...modeling.dataStoreReferences.map((item) => item.id), ...modeling.textAnnotations.map((item) => item.id)]
+        : [...(draft.collaboration?.participants || []).map((item) => item.id), ...allBodies.flatMap((item) => nodesInBody(item).map((node) => node.id))];
+      if (endpoints.length < 2) return;
+      const flowId = id(kind === 'association' ? 'Association' : 'MessageFlow');
+      const flow = { id: flowId, sourceRef: endpoints[0], targetRef: endpoints[1] };
+      const owner = kind === 'association' ? modeling.associations : draft.collaboration.messageFlows;
+      const edges = kind === 'association' ? bodyEdges : draft.collaboration.diagram.modelingEdges;
+      owner.push(flow);
+      edges.push({ diId: id('Edge'), elementId: flowId,
+        waypoints: [{ x: 180, y: 200 }, { x: 400, y: 200 }] });
+    } else if (kind === 'participant') {
+      draft.collaboration ??= { id: id('Collaboration'), participants: [], messageFlows: [],
+        diagram: { shapes: [], edges: [], modelingShapes: [], modelingEdges: [] } };
+      const participantId = id('Participant');
+      draft.collaboration.participants.push({ id: participantId });
+      draft.collaboration.diagram.modelingShapes.push(nextShape(participantId, 20, 20, 900, 520));
+    } else if (button.dataset.assignNode) {
+      const lane = locate('lane', button.dataset.assignNode);
+      const nodeId = section.querySelector(`[data-modeling-node="${CSS.escape(button.dataset.assignNode)}"]`)?.value;
+      if (lane && nodeId && !lane.flowNodeRefs.includes(nodeId)) lane.flowNodeRefs.push(nodeId);
+    } else if (button.dataset.removeNode) {
+      const lane = locate('lane', button.dataset.removeNode);
+      if (lane) lane.flowNodeRefs = lane.flowNodeRefs.filter((value) => value !== button.dataset.nodeId);
+    } else if (button.dataset.place) {
+      const owner = draft.collaboration?.participants.some((item) => item.id === button.dataset.place)
+        ? draft.collaboration.diagram.modelingShapes : bodyShapes;
+      owner.push(nextShape(button.dataset.place, 100, 100, 240, 120));
+    } else if (button.dataset.removeModeling) {
+      const itemId = button.dataset.removeModeling;
+      if (draft.dataStores.some((item) => item.id === itemId) && storeReferenced(itemId)) return;
+      draft.dataStores = draft.dataStores.filter((item) => item.id !== itemId);
+      const lane = laneRows().find(({ lane: item }) => item.id === itemId);
+      const removed = new Set([itemId]);
+      if (lane) {
+        const collect = (item) => {
+          removed.add(item.id);
+          for (const set of item.childLaneSets || []) for (const child of set.lanes) collect(child);
+        };
+        collect(lane.lane);
+        lane.set.lanes = lane.set.lanes.filter((item) => item.id !== itemId);
+      }
+      const reference = modeling.dataObjectReferences.find((item) => item.id === itemId);
+      modeling.dataObjectReferences = modeling.dataObjectReferences.filter((item) => item.id !== itemId);
+      modeling.dataStoreReferences = modeling.dataStoreReferences.filter((item) => item.id !== itemId);
+      if (reference && !modeling.dataObjectReferences.some((item) => item.dataObjectRef === reference.dataObjectRef))
+        modeling.dataObjects = modeling.dataObjects.filter((item) => item.id !== reference.dataObjectRef);
+      modeling.textAnnotations = modeling.textAnnotations.filter((item) => item.id !== itemId);
+      for (const elementId of removed) removeLinks(elementId);
+      for (let index = bodyShapes.length - 1; index >= 0; index -= 1) {
+        if (removed.has(bodyShapes[index].elementId)) bodyShapes.splice(index, 1);
+      }
+      if (draft.collaboration) {
+        draft.collaboration.participants = draft.collaboration.participants.filter((item) => item.id !== itemId);
+        draft.collaboration.messageFlows = draft.collaboration.messageFlows.filter((item) => item.id !== itemId
+          && item.sourceRef !== itemId && item.targetRef !== itemId);
+        draft.collaboration.diagram.modelingShapes = draft.collaboration.diagram.modelingShapes.filter((item) => item.elementId !== itemId);
+        const ids = new Set(draft.collaboration.messageFlows.map((item) => item.id));
+        draft.collaboration.diagram.modelingEdges = draft.collaboration.diagram.modelingEdges.filter((item) => ids.has(item.elementId));
+      }
+    } else return;
+    render();
+  });
+  const win = openFormWindow({ title: text('modeling_title'), icon: 'layers', width: 820,
+    sections: [section], submitLabel: text('apply'), canSubmit: () => !readOnly,
+    validate: () => {
+      const bounds = [...(body.diagram.modelingShapes || []), ...(draft.collaboration?.diagram.modelingShapes || [])];
+      const edges = [...(body.diagram.modelingEdges || []), ...(draft.collaboration?.diagram.modelingEdges || [])];
+      return bounds.every((item) => [item.x, item.y, item.width, item.height].every(Number.isFinite)
+        && item.width > 0 && item.height > 0)
+        && draft.dataStores.every((store) => store.capacity == null
+          || (Number.isSafeInteger(store.capacity) && store.capacity >= 0))
+        && modeling.dataStoreReferences.every((reference) => draft.dataStores.some((store) => store.id === reference.dataStoreRef))
+        && edges.every((edge) => edge.waypoints.length >= 2 && edge.waypoints.every((point) =>
+          Number.isFinite(point.x) && Number.isFinite(point.y)));
+    },
+    collect: () => ({ modeling: hadModeling || modeling.laneSets.length || modeling.dataObjects.length
+      || modeling.dataObjectReferences.length || modeling.dataStoreReferences.length
+      || modeling.textAnnotations.length || modeling.associations.length
+      ? body.modeling : null,
+      modelingShapes: body.diagram.modelingShapes || [], modelingEdges: body.diagram.modelingEdges || [],
+      collaboration: draft.collaboration || null, dataStores: draft.dataStores }),
+    onSubmit: async (value) => { onSave(value); return { message: text('modeling_updated') }; },
+  });
+  render();
+  return win;
 }
 
 export function openProcessMessageSend(target, names, onSent = () => {}) {

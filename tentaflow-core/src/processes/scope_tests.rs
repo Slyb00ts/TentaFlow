@@ -29,17 +29,19 @@ fn fast_model() -> tentaflow_protocol::processes::ProcessModel {
                 name: "Start locally".into(),
                 kind: ProcessNodeKind::Start,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "LocalEnd".into(),
                 name: "End locally".into(),
                 kind: ProcessNodeKind::End,
                 repeat: None,
+                activity_io: None,
             },
         ],
         sequence_flows: vec![edge("LocalFlow", "LocalStart", "LocalEnd")],
         variables: BTreeMap::from([("local_ID".into(), json!("kept"))]),
-        diagram: ProcessDiagram::default(),
+        diagram: ProcessDiagram::default(), modeling: None,
     };
     model.nodes.insert(
         1,
@@ -52,6 +54,7 @@ fn fast_model() -> tentaflow_protocol::processes::ProcessModel {
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -96,6 +99,7 @@ fn terminating_scope_model(
         name: "Accept actual child input".into(),
         kind,
         repeat: None,
+        activity_io: None,
     });
     child.sequence_flows = vec![
         edge("ChildEntry", "Start_1", "ChildInput"),
@@ -126,12 +130,12 @@ fn immediate_terminal_body(
 ) -> ProcessSubProcess {
     ProcessSubProcess {
         nodes: vec![
-            ProcessNode { id: start_id.into(), name: "Enter child".into(), kind: ProcessNodeKind::Start, repeat: None, },
-            ProcessNode { id: end_id.into(), name: "Terminate child".into(), kind: ProcessNodeKind::TerminateEnd, repeat: None, },
+            ProcessNode { id: start_id.into(), name: "Enter child".into(), kind: ProcessNodeKind::Start, repeat: None,   activity_io: None,},
+            ProcessNode { id: end_id.into(), name: "Terminate child".into(), kind: ProcessNodeKind::TerminateEnd, repeat: None,   activity_io: None,},
         ],
         sequence_flows: vec![edge(flow_id, start_id, end_id)],
         variables: BTreeMap::from([(local_key.into(), json!(local_value))]),
-        diagram: ProcessDiagram::default(),
+        diagram: ProcessDiagram::default(), modeling: None,
     }
 }
 
@@ -152,6 +156,7 @@ fn nested_model(
                 name: "Start inner".into(),
                 kind: ProcessNodeKind::Start,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "InnerWork".into(),
@@ -161,12 +166,14 @@ fn nested_model(
                     output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "InnerEnd".into(),
                 name: "End inner".into(),
                 kind: ProcessNodeKind::End,
                 repeat: None,
+                activity_io: None,
             },
         ],
         sequence_flows: vec![
@@ -177,7 +184,7 @@ fn nested_model(
             ("innerBig".into(), json!(inner_large)),
             ("inner_ID".into(), json!("original")),
         ]),
-        diagram: ProcessDiagram::default(),
+        diagram: ProcessDiagram::default(), modeling: None,
     };
     let outer = ProcessSubProcess {
         nodes: vec![
@@ -186,6 +193,7 @@ fn nested_model(
                 name: "Start outer".into(),
                 kind: ProcessNodeKind::Start,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Inner".into(),
@@ -202,12 +210,14 @@ fn nested_model(
                     )]),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "OuterEnd".into(),
                 name: "End outer".into(),
                 kind: ProcessNodeKind::End,
                 repeat: None,
+                activity_io: None,
             },
         ],
         sequence_flows: vec![
@@ -218,7 +228,7 @@ fn nested_model(
             ("shadow".into(), json!("local")),
             ("outerBig".into(), json!(outer_large)),
         ]),
-        diagram: ProcessDiagram::default(),
+        diagram: ProcessDiagram::default(), modeling: None,
     };
     model.nodes.insert(
         1,
@@ -237,6 +247,7 @@ fn nested_model(
                 )]),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -283,6 +294,8 @@ fn outbox_model(
         },
         None => ProcessMessageTargetSpec::Start {
             definition_id: receiver_id.into(),
+            process_id: None,
+            start_node_id: None,
         },
     };
     let mut inner = starter_model();
@@ -303,6 +316,7 @@ fn outbox_model(
                 ttl_seconds: 120,
             },
             repeat: None,
+            activity_io: None,
         },
     );
     inner.sequence_flows = vec![
@@ -323,12 +337,15 @@ fn outbox_model(
                     message_ref: "PendingDeclaration".into(),
                     target: ProcessMessageTargetSpec::Start {
                         definition_id: pending_receiver_id.into(),
+                        process_id: None,
+                        start_node_id: None,
                     },
                     correlation_expression: "'case-1'".into(),
                     payload_expression: "{'customer_ID': 24}".into(),
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         inner.sequence_flows = vec![
@@ -348,6 +365,7 @@ fn outbox_model(
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     outer.sequence_flows = vec![
@@ -372,6 +390,7 @@ fn outbox_model(
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         });
         model
             .sequence_flows
@@ -390,7 +409,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
     let actor = &fixture.owner;
     let command = stamp("embedded-fast-start");
     let first_plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &first_id,
         actor,
         &version.definition_id,
@@ -408,7 +427,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         &first_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&first_plan),
         1_000,
     )
@@ -444,7 +463,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
 
     let replacement_id = Uuid::new_v4().to_string();
     let replacement_plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &replacement_id,
         actor,
         &version.definition_id,
@@ -462,7 +481,7 @@ fn nested_fast_scope_persists_root_child_and_replays_one_start() {
         &replacement_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&replacement_plan),
         2_000,
     )
@@ -876,6 +895,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     outer_body.sequence_flows = vec![
@@ -1544,6 +1564,7 @@ fn embedded_human_error_end_catch_then_root_terminate_preserves_ordered_values_a
             ]),
         },
         repeat: None,
+        activity_io: None,
     });
     model.sequence_flows.push(edge("CaughtToTerminate", "CatchChildError", "RootEnd_Scope"));
 
@@ -1639,28 +1660,28 @@ fn embedded_terminate_keeps_a_foreign_sibling_incident_and_parent_join_activatio
     model.nodes.extend([
         ProcessNode { id: "RootSplit".into(), name: "Run both branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerWork".into(), name: "Review sibling".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerChoice".into(), name: "Evaluate sibling".into(),
             kind: ProcessNodeKind::ExclusiveGateway { default_flow_id: Some("PeerDefault".into()) },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerConditionalWork".into(), name: "Conditional sibling work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerDefaultWork".into(), name: "Default sibling work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerMerge".into(), name: "Merge sibling choice".into(),
             kind: ProcessNodeKind::ExclusiveGateway { default_flow_id: None },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootJoin".into(), name: "Wait for both".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     let mut invalid_condition = edge("PeerConditional", "PeerChoice", "PeerConditionalWork");
     invalid_condition.condition = Some("1".into());
@@ -1725,15 +1746,15 @@ fn embedded_terminate_closes_a_real_open_fork_without_a_join_receipt() {
     child.nodes.extend([
         ProcessNode { id: "ChildSplit".into(), name: "Run both child branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "TerminatingWork".into(), name: "Complete and stop the scope".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "SiblingWork".into(), name: "Outstanding sibling work".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     child.sequence_flows = vec![
         edge("ChildSplitEntry", "Start_1", "ChildSplit"),
@@ -2009,24 +2030,24 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     model.nodes.extend([
         ProcessNode { id: "Split".into(), name: "Start two children".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ScopeA".into(), name: "First child".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: immediate_terminal_body("StartA", "TerminateA", "FlowA", "local_a", 11),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::from([("parent_a".into(), "outputs.local_a".into())]),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ScopeB".into(), name: "Second child".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: immediate_terminal_body("StartB", "TerminateB", "FlowB", "local_b", 22),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::from([("parent_b".into(), "outputs.local_b".into())]),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "Join".into(), name: "Join both children".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     model.sequence_flows = vec![
         edge("StartSplit", "Start_1", "Split"),
@@ -2041,7 +2062,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     let variables = serde_json::to_value(&model.variables).unwrap();
     let command = stamp("start two factual immediate embedded terminal children");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
         at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
@@ -2053,7 +2074,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     assert_ne!(sources[0].parent_token_id, sources[1].parent_token_id);
     assert_ne!(sources[0].source_event_id, sources[1].source_event_id);
     let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables, json!({
         "parent_marker":"kept","parent_a":11,"parent_b":22,
@@ -2076,7 +2097,7 @@ fn two_disjoint_embedded_terminations_map_distinct_parent_keys_in_one_start_redu
     assert_eq!(persisted.scopes, completed.scopes);
     let rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), rows);
 }
@@ -2094,10 +2115,10 @@ fn child_termination_then_root_termination_in_one_start_retains_both_factual_sou
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::from([("received".into(), "outputs.child_value".into())]),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootTerminate".into(), name: "Terminate parent after return".into(),
             kind: ProcessNodeKind::TerminateEnd,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     model.sequence_flows = vec![
         edge("RootChild", "Start_1", "Scope"),
@@ -2108,7 +2129,7 @@ fn child_termination_then_root_termination_in_one_start_retains_both_factual_sou
     let variables = serde_json::to_value(&model.variables).unwrap();
     let command = stamp("start child then terminate its ancestor in one reduction");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
         at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let sources = plan.termination_attempts.iter().filter_map(|attempt| match attempt {
@@ -2120,7 +2141,7 @@ fn child_termination_then_root_termination_in_one_start_retains_both_factual_sou
     assert_eq!(sources[1].source_scope_id, instance_id);
     assert_ne!(sources[0].source_event_id, sources[1].source_event_id);
     let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     assert_eq!(completed.variables, json!({"parent_marker":"kept","received":41}));
     let child = completed.scopes.iter().find(|scope| scope.subprocess_node_id.as_deref() == Some("Scope"))
@@ -2157,27 +2178,27 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
         .find(|node| node.id == "Call_1").unwrap().kind;
     let peer = ProcessSubProcess {
         nodes: vec![
-            ProcessNode { id: "PeerStart".into(), name: "Enter peer".into(), kind: ProcessNodeKind::Start, repeat: None, },
+            ProcessNode { id: "PeerStart".into(), name: "Enter peer".into(), kind: ProcessNodeKind::Start, repeat: None,   activity_io: None,},
             ProcessNode { id: "PeerThrow".into(), name: "Queue peer evidence".into(),
                 kind: ProcessNodeKind::MessageThrow {
                     message_ref: "EvidenceDeclaration".into(),
-                    target: ProcessMessageTargetSpec::Start { definition_id: receiver.definition_id.clone() },
+                    target: ProcessMessageTargetSpec::Start { definition_id: receiver.definition_id.clone(), process_id: None, start_node_id: None },
                     correlation_expression: "'case-1'".into(),
                     payload_expression: "{'customer_ID': 23}".into(), ttl_seconds: 120,
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "PeerSplit".into(), name: "Keep two peer controls open".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
-            ProcessNode { id: "PeerCall".into(), name: "Call pinned child".into(), kind: call_kind, repeat: None, },
+                repeat: None,   activity_io: None,},
+            ProcessNode { id: "PeerCall".into(), name: "Call pinned child".into(), kind: call_kind, repeat: None,   activity_io: None,},
             ProcessNode { id: "PeerHuman".into(), name: "Keep peer human open".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                     output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "PeerJoin".into(), name: "Join peer controls".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
-            ProcessNode { id: "PeerEnd".into(), name: "Finish peer".into(), kind: ProcessNodeKind::End, repeat: None, },
+                repeat: None,   activity_io: None,},
+            ProcessNode { id: "PeerEnd".into(), name: "Finish peer".into(), kind: ProcessNodeKind::End, repeat: None,   activity_io: None,},
         ],
         sequence_flows: vec![
             edge("PeerEntry", "PeerStart", "PeerThrow"),
@@ -2188,7 +2209,7 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
             edge("HumanToPeerJoin", "PeerHuman", "PeerJoin"),
             edge("PeerJoinEnd", "PeerJoin", "PeerEnd"),
         ],
-        variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+        variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
     };
     let mut model = terminating_scope_model(&fixture.owner.user_id, "human", false);
     model.messages.push(ProcessMessageDeclaration {
@@ -2197,14 +2218,14 @@ fn embedded_termination_cannot_close_live_sibling_call_outbox_or_invent_sibling_
     model.nodes.extend([
         ProcessNode { id: "RootSplit".into(), name: "Open both embedded branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "PeerScope".into(), name: "Retain actual peer work".into(),
             kind: ProcessNodeKind::SubProcess { body: peer,
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootJoin".into(), name: "Join both embedded branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     model.sequence_flows = vec![
         edge("RootStartSplit", "RootStart_Scope", "RootSplit"),
@@ -2355,27 +2376,27 @@ fn waiting_human_activation_cannot_be_recast_as_ready_termination_input() {
         ProcessNode { id: "HumanEntry".into(), name: "Accept human input".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "Split".into(), name: "Open two actual child scopes".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ScopeA".into(), name: "First terminating child".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: immediate_terminal_body("StartA", "TerminateA", "FlowA", "local_a", 11),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::from([("parent_a".into(), "outputs.local_a".into())]),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ScopeB".into(), name: "Second terminating child".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: immediate_terminal_body("StartB", "TerminateB", "FlowB", "local_b", 22),
                 input_mapping: BTreeMap::new(),
                 output_mapping: BTreeMap::from([("parent_b".into(), "outputs.local_b".into())]),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "Join".into(), name: "Join both child returns".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     model.sequence_flows = vec![
         edge("StartHuman", "Start_1", "HumanEntry"),
@@ -2448,10 +2469,10 @@ fn terminating_xor_cannot_select_the_false_or_unselected_default_edge() {
             ProcessNode { id: "HumanChoice".into(), name: "Choose after human input".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                     output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "Choice".into(), name: "Choose the pinned branch".into(),
                 kind: ProcessNodeKind::ExclusiveGateway { default_flow_id: Some("ChoiceDefault".into()) },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         let mut true_edge = edge("ChoiceTrue", "Choice", "End_1");
         true_edge.condition = Some("vars.choose_true == true".into());
@@ -2546,34 +2567,34 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
     model.nodes.extend([
         ProcessNode { id: "Split".into(), name: "Open root and child work".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootHuman".into(), name: "Choose root termination".into(),
             kind: ProcessNodeKind::UserTask { assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new() },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ChildScope".into(), name: "Retain active child work".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
                         ProcessNode { id: "ChildStart".into(), name: "Enter child".into(),
                             kind: ProcessNodeKind::Start,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildRace".into(), name: "Wait for the first child event".into(),
                             kind: ProcessNodeKind::EventBasedGateway,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildTimerA".into(), name: "First child timer".into(),
                             kind: ProcessNodeKind::TimerCatch {
                                 timer: ProcessTimerSpec::Duration { seconds: 10 },
                             },
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildTimerB".into(), name: "Second child timer".into(),
                             kind: ProcessNodeKind::TimerCatch {
                                 timer: ProcessTimerSpec::Duration { seconds: 20 },
                             },
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildEnd".into(), name: "Complete child".into(),
                             kind: ProcessNodeKind::End,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                     ],
                     sequence_flows: vec![
                         edge("ChildEntry", "ChildStart", "ChildRace"),
@@ -2582,11 +2603,11 @@ fn terminating_root_requires_exact_factual_descendant_cancellation_event() {
                         edge("TimerAEnd", "ChildTimerA", "ChildEnd"),
                         edge("TimerBEnd", "ChildTimerB", "ChildEnd"),
                     ],
-                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
                 },
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None, activity_io: None, },
     ]);
     model.sequence_flows = vec![
         edge("StartSplit", "Start_1", "Split"),
@@ -2717,32 +2738,32 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
     model.nodes.extend([
         ProcessNode { id: "RootSplit".into(), name: "Arm child before terminating".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RaceScope".into(), name: "Arm an embedded event race".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
                         ProcessNode { id: "ChildStart".into(), name: "Enter child".into(),
                             kind: ProcessNodeKind::Start,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildRace".into(), name: "Wait for first input".into(),
                             kind: ProcessNodeKind::EventBasedGateway,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildTimer".into(), name: "Timer branch".into(),
                             kind: ProcessNodeKind::TimerCatch {
                                 timer: ProcessTimerSpec::Duration { seconds: 600 },
                             },
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildMessage".into(), name: "Message branch".into(),
                             kind: ProcessNodeKind::MessageCatch {
                                 message_ref: "RaceMessage".into(),
                                 correlation_expression: "'case-1'".into(),
                                 output_mapping: BTreeMap::new(),
                             },
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "ChildEnd".into(), name: "Finish child".into(),
                             kind: ProcessNodeKind::End,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                     ],
                     sequence_flows: vec![
                         edge("ChildEntry", "ChildStart", "ChildRace"),
@@ -2751,28 +2772,28 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
                         edge("TimerToEnd", "ChildTimer", "ChildEnd"),
                         edge("MessageToEnd", "ChildMessage", "ChildEnd"),
                     ],
-                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
                 },
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None, activity_io: None, },
         ProcessNode { id: "SourceDelay".into(), name: "Complete a factual sibling scope".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
                         ProcessNode { id: "DelayStart".into(), name: "Enter sibling".into(),
                             kind: ProcessNodeKind::Start,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "DelayEnd".into(), name: "Finish sibling".into(),
                             kind: ProcessNodeKind::End,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                     ],
                     sequence_flows: vec![edge("DelayFlow", "DelayStart", "DelayEnd")],
-                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
                 },
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
-            },
-            repeat: None, },
+},
+            repeat: None, activity_io: None, },
     ]);
     model.sequence_flows = vec![
         edge("RootEntry", "Start_1", "RootSplit"),
@@ -2786,7 +2807,7 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
     let variables = serde_json::to_value(&model.variables).unwrap();
     let command = stamp("start and close a newly armed embedded race");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
         at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     let timer = plan.create_timers.iter().find(|timer| timer.node_id == "ChildTimer").unwrap();
@@ -2817,14 +2838,14 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
         ("foreign activation cancellation", foreign_cancel),
     ] {
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
+            &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).is_err(), "{case} must reject the whole start");
         assert_eq!(super::call_tests::transition_rows(&fixture), before,
             "{case} changed durable process rows");
     }
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let committed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
@@ -2839,7 +2860,7 @@ fn same_start_embedded_race_arms_its_timer_before_terminal_closure() {
         && event.data["source_event_id"] == source.event_id).count(), 1);
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap(), committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 }
@@ -2862,7 +2883,7 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
                 attached_to_id: "ChildInput".into(), cancel_activity: true,
                 timer: ProcessTimerSpec::Duration { seconds: 600 },
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "AttachedMessage".into(), name: "Work message".into(),
             kind: ProcessNodeKind::BoundaryMessage {
                 attached_to_id: "ChildInput".into(), cancel_activity: false,
@@ -2870,22 +2891,22 @@ fn completing_child_work_disarms_its_boundaries_once_before_two_terminations() {
                 correlation_expression: "'case-1'".into(),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "TimerWork".into(), name: "Timer continuation".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "MessageWork".into(), name: "Message continuation".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "BoundaryEnd".into(), name: "Other boundary end".into(),
             kind: ProcessNodeKind::End,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
     ]);
     body.sequence_flows.extend([
         edge("TimerContinuation", "AttachedTimer", "TimerWork"),
@@ -3124,19 +3145,19 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         nodes: vec![
             ProcessNode { id: "ChildStart".into(), name: "Enter producer scope".into(),
                 kind: ProcessNodeKind::Start,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "AttachedWork".into(), name: "Keep attached work open".into(),
                 kind: ProcessNodeKind::UserTask {
                     assignee_user_id: Some(fixture.owner.user_id.clone()),
                     output_mapping: BTreeMap::new(),
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "AttachedTimer".into(), name: "Arm attached timer".into(),
                 kind: ProcessNodeKind::BoundaryTimer {
                     attached_to_id: "AttachedWork".into(), cancel_activity: true,
                     timer: ProcessTimerSpec::Duration { seconds: 600 },
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "AttachedMessage".into(), name: "Arm attached message".into(),
                 kind: ProcessNodeKind::BoundaryMessage {
                     attached_to_id: "AttachedWork".into(), cancel_activity: false,
@@ -3144,22 +3165,22 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
                     correlation_expression: "vars.case_key".into(),
                     output_mapping: BTreeMap::new(),
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "AttachedTimerWork".into(), name: "Timer continuation".into(),
                 kind: ProcessNodeKind::UserTask {
                     assignee_user_id: Some(fixture.owner.user_id.clone()),
                     output_mapping: BTreeMap::new(),
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "AttachedMessageWork".into(), name: "Message continuation".into(),
                 kind: ProcessNodeKind::UserTask {
                     assignee_user_id: Some(fixture.owner.user_id.clone()),
                     output_mapping: BTreeMap::new(),
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "ChildEnd".into(), name: "Finish producer scope".into(),
                 kind: ProcessNodeKind::End,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ],
         sequence_flows: vec![
             edge("ChildEntry", "ChildStart", "AttachedWork"),
@@ -3169,7 +3190,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
             edge("TimerContinuationEnd", "AttachedTimerWork", "ChildEnd"),
             edge("MessageContinuationEnd", "AttachedMessageWork", "ChildEnd"),
         ],
-        variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+        variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
     };
     let mut model = starter_model();
     model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
@@ -3183,73 +3204,75 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
     model.nodes.extend([
         ProcessNode { id: "RootSplit".into(), name: "Arm all real producers".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ProducerScope".into(), name: "Arm attached controls".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: child, input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootTimer".into(), name: "Arm root timer".into(),
             kind: ProcessNodeKind::TimerCatch {
                 timer: ProcessTimerSpec::Duration { seconds: 600 },
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootMessage".into(), name: "Arm root message".into(),
             kind: ProcessNodeKind::MessageCatch {
                 message_ref: "ClosureMessage".into(),
                 correlation_expression: "vars.case_key".into(),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootRace".into(), name: "Arm root event race".into(),
             kind: ProcessNodeKind::EventBasedGateway,
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RaceTimer".into(), name: "Arm race timer".into(),
             kind: ProcessNodeKind::TimerCatch {
                 timer: ProcessTimerSpec::Duration { seconds: 600 },
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RaceMessage".into(), name: "Arm race message".into(),
             kind: ProcessNodeKind::MessageCatch {
                 message_ref: "ClosureMessage".into(),
                 correlation_expression: "vars.case_key".into(),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "RootThrow".into(), name: "Queue a real addressed message".into(),
             kind: ProcessNodeKind::MessageThrow {
                 message_ref: "ClosureMessage".into(),
                 target: ProcessMessageTargetSpec::Start {
                     definition_id: receiver.definition_id.clone(),
+                    process_id: None,
+                    start_node_id: None,
                 },
                 correlation_expression: "vars.case_key".into(),
                 payload_expression: "vars.opaque_business_key".into(),
                 ttl_seconds: 300,
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "ThrowHold".into(), name: "Retain the throw branch until closure".into(),
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: Some(fixture.owner.user_id.clone()),
                 output_mapping: BTreeMap::new(),
             },
-            repeat: None, },
+            repeat: None,   activity_io: None,},
         ProcessNode { id: "SourceDelay".into(), name: "Complete a factual sibling scope".into(),
             kind: ProcessNodeKind::SubProcess {
                 body: ProcessSubProcess {
                     nodes: vec![
                         ProcessNode { id: "DelayStart".into(), name: "Enter sibling".into(),
                             kind: ProcessNodeKind::Start,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                         ProcessNode { id: "DelayEnd".into(), name: "Finish sibling".into(),
                             kind: ProcessNodeKind::End,
-                            repeat: None, },
+                            repeat: None,   activity_io: None,},
                     ],
                     sequence_flows: vec![edge("DelayFlow", "DelayStart", "DelayEnd")],
-                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(),
+                    variables: BTreeMap::new(), diagram: ProcessDiagram::default(), modeling: None,
                 },
                 input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
-            },
-            repeat: None, },
+},
+            repeat: None, activity_io: None, },
     ]);
     model.sequence_flows = vec![
         edge("RootEntry", "Start_1", "RootSplit"),
@@ -3275,7 +3298,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
     let variables = serde_json::to_value(&model.variables).unwrap();
     let command = stamp("start then close every actual same-plan producer");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
         at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
@@ -3307,14 +3330,14 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         ("foreign activation cancellation", foreign_cancel),
     ] {
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged),
+            &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&forged),
             at_ms).is_err(), "{case} must reject the entire source plan");
         assert_eq!(super::call_tests::transition_rows(&fixture), before,
             "{case} changed durable process rows");
     }
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let committed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap();
     assert_eq!(committed.status, ProcessInstanceStatus::Completed);
     let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
@@ -3343,7 +3366,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         0, 10).unwrap().0.is_empty());
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan),
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan),
         at_ms).unwrap(), committed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
     let queued_source = history.iter().find(|event| event.kind == "message_queued"
@@ -3393,13 +3416,13 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Open two terminal paths".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "Choice".into(), name: "Select a terminal path".into(),
                 kind: ProcessNodeKind::ExclusiveGateway { default_flow_id: None },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "ChoiceTerminate".into(), name: "End selected path".into(),
                 kind: ProcessNodeKind::TerminateEnd,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         let mut selected = edge("ChoiceTrue", "Choice", "ChoiceTerminate");
         selected.condition = Some(condition.into());
@@ -3421,7 +3444,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let variables = serde_json::to_value(&model.variables).unwrap();
     let command = stamp("start a factual XOR selection beside a terminating branch");
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, variables.clone(), StartCause::Manual,
         at_ms, runtime::test_support::manual_input(&command), None).unwrap();
     assert_eq!(plan.termination_attempts.len(), 1);
@@ -3459,7 +3482,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert_eq!(forged.events.len(), plan.events.len());
     let before = super::call_tests::transition_rows(&fixture);
     let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&forged), at_ms)
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&forged), at_ms)
         .unwrap_err();
     assert!(format!("{error:#}").contains(
         "termination XOR has a selected pinned flow, not a failure wait"),
@@ -3467,7 +3490,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let completed = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
     let events = repository::list_events(&reopened, &fixture.owner, &instance_id, 0, 200).unwrap().0;
     assert_eq!(events.iter().filter(|event| event.kind == "exclusive_selected"
@@ -3476,7 +3499,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert!(events.iter().all(|event| event.kind != "incident"));
     let committed_rows = super::call_tests::transition_rows(&fixture);
     let replay = repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &variables, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &variables, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_eq!(replay, completed);
     assert_eq!(super::call_tests::transition_rows(&fixture), committed_rows);
 
@@ -3489,6 +3512,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
             output_mapping: BTreeMap::new(),
         },
         repeat: None,
+        activity_io: None,
     });
     fault_model.nodes.push(ProcessNode {
         id: "FaultGateHuman".into(), name: "Enter the factual XOR branch".into(),
@@ -3497,6 +3521,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
             output_mapping: BTreeMap::new(),
         },
         repeat: None,
+        activity_io: None,
     });
     fault_model.sequence_flows[1] = edge("SplitFaultGate", "Split", "FaultGateHuman");
     fault_model.sequence_flows[2] = edge("SplitHuman", "Split", "HumanTerminate");
@@ -3507,7 +3532,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     let fault_variables = serde_json::to_value(&fault_model.variables).unwrap();
     let fault_command = stamp("start two factual human branches before evaluating the XOR");
     let fault_at_ms = chrono::Utc::now().timestamp_millis();
-    let fault_plan = runtime::plan_start(&fault_version.model, &fault_instance_id,
+    let fault_plan = runtime::plan_start(&fault_version.model, &fault_version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&fault_version.model), &fault_instance_id,
         &fault_fixture.owner, &fault_version.definition_id, fault_version.version,
         fault_variables.clone(), StartCause::Manual, fault_at_ms,
         runtime::test_support::manual_input(&fault_command), None).unwrap();
@@ -3515,7 +3540,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
     assert!(fault_plan.add_incidents.is_empty());
     let fault_started = repository::start_instance(&fault_fixture.db, &fault_fixture.owner,
         &fault_command, &fault_instance_id, &fault_version.definition_id, fault_version.version,
-        &fault_variables, repository::ProcessPlanInput::Supplied(&fault_plan), fault_at_ms).unwrap();
+        &fault_variables, None, None, repository::ProcessPlanInput::Supplied(&fault_plan), fault_at_ms).unwrap();
     assert_eq!(fault_started.status, ProcessInstanceStatus::Waiting);
     let fault_reopened = crate::db::init(&fault_fixture.directory.path().join("processes.db")).unwrap();
     let start_snapshot = repository::runtime_snapshot(&fault_reopened, &fault_fixture.owner,
