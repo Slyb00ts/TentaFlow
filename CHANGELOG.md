@@ -254,7 +254,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nie wykonuje: zmiana zreplikowana na ten node przed zapisem zmienia czas
   zmiany zasady, więc okno otwarte na starej wersji jest odrzucane, a zmiana,
   która dotrze po zapisie, stosuje się jak każda replikowana (ostatnia w
-  kolejności HLC wygrywa). Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
+  kolejności HLC wygrywa). Usunięcie zasady porównuje się tak samo
+  (`FieldPolicyDeleteRequest.expected_updated_at_ms`, dopisane z `#[serde(default)]`):
+  okno „Usuń” na starej wersji zasady nic nie usuwa i pokazuje tę samą notatkę.
+  Wpisów dostępu do topiku nie da się już wyczyścić ścieżką uprawnień IAM
+  (`IamClearPermissionRequest` odrzuca `topic`, jak ustawianie) — tylko w TentaBus,
+  ze sprawdzeniem administratora topiku i wpisem audytu `bus.acl.set`. Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
   dla wybranych osób zamknie topik dla systemów z kluczem API; nikogo nie
   wybiera za administratora.
 - Lista zasad topiku (`FieldPolicyListRequest`) jest tylko dla administratora

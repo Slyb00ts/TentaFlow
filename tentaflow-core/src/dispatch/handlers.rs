@@ -9742,6 +9742,14 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             subject_type,
             subject_id,
         } => {
+            // Clearing a topic entry here would skip the topic-admin check,
+            // the organisation scope and the `bus.acl.set` audit row that
+            // TentaBus applies, so it is refused like the setter above.
+            if resource_type == "topic" {
+                return Err(ProtocolError::bad_request(
+                    "topic access entries are cleared in TentaBus (BusAclSetRequest)",
+                ));
+            }
             repository::resource_permissions::clear(
                 db,
                 resource_type,
@@ -9750,10 +9758,6 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 subject_id,
             )
             .map_err(db_err)?;
-            // Open TentaBus consumers re-check their topics on the next fetch.
-            if resource_type == "topic" {
-                crate::services::bus_authorizer::bump_acl_generation();
-            }
             P::ResOk
         }
         P::ReqListPermsForResource {

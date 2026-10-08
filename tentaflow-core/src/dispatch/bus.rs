@@ -7733,6 +7733,22 @@ mod tests {
         assert_eq!(remaining(&operator, &topic).await, 2, "nothing was cleared");
 
         let site_admin = handler_ctx(db, org_context(&org, &operator_id, &["org.admin"]));
+        // The IAM permission path would skip the topic-admin check and the
+        // bus audit row, so it refuses topic entries even for a site admin.
+        let iam_clear = MessageBody::IamBody(tentaflow_protocol::IamPayload::ReqClearPermission {
+            resource_type: "topic".to_string(),
+            resource_id: crate::services::bus_authorizer::topic_acl_resource_id(
+                instance.as_str(),
+                &org,
+                &topic,
+            ),
+            subject_type: "user".to_string(),
+            subject_id: "u-patient-reader".to_string(),
+        });
+        let err = crate::dispatch::handlers::iam_dispatch(&iam_clear, &site_admin)
+            .expect_err("topic entries are cleared in TentaBus only");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{err:?}");
+        assert_eq!(remaining(&operator, &topic).await, 2, "the IAM path cleared nothing");
         for (subject, action) in [
             ("u-patient-reader", "read"),
             (operator_id.as_str(), "admin"),
