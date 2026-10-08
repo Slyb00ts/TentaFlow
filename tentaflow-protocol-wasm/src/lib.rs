@@ -2500,8 +2500,11 @@ pub fn encode_bus_field_policy_list_request(
 }
 
 /// `direction` is 'write' | 'read'; `required_fields` must be a subset of
-/// `fields` (validated server-side).
+/// `fields` (validated server-side). `expected_updated_at_ms` is the
+/// `updated_at_ms` of the rule being changed, `expect_absent` marks an add;
+/// both unset writes unconditionally.
 #[wasm_bindgen(js_name = encodeBusFieldPolicySetRequest)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_bus_field_policy_set_request(
     instance_id: String,
     topic: String,
@@ -2510,6 +2513,8 @@ pub fn encode_bus_field_policy_set_request(
     direction: String,
     fields: Vec<String>,
     required_fields: Vec<String>,
+    expected_updated_at_ms: Option<i64>,
+    expect_absent: bool,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2520,6 +2525,8 @@ pub fn encode_bus_field_policy_set_request(
             direction,
             fields,
             required_fields,
+            expected_updated_at_ms,
+            expect_absent,
         },
     }))
     .map_err(|e| JsError::new(&e))

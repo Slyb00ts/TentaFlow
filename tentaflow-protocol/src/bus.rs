@@ -1276,6 +1276,18 @@ pub enum BusPayload {
         fields: Vec<String>,
         #[serde(default)]
         required_fields: Vec<String>,
+        /// Compare-and-set against the stored row, checked in the same
+        /// transaction as the write. `Some(ts)`: the rule must exist and
+        /// carry exactly this `updated_at_ms` (what the list returned),
+        /// otherwise `bus.field_policy_changed`. `None` together with
+        /// `expect_absent == false` writes unconditionally (older clients).
+        #[serde(default)]
+        expected_updated_at_ms: Option<i64>,
+        /// The rule must not exist yet (an "add"); a rule that appeared
+        /// meanwhile is refused with `bus.field_policy_changed`. Sent
+        /// together with `expected_updated_at_ms` it is `InvalidArgument`.
+        #[serde(default)]
+        expect_absent: bool,
     },
     FieldPolicySetResponse,
     FieldPolicyDeleteRequest {
@@ -2472,6 +2484,18 @@ mod tests {
             direction: "read".to_string(),
             fields: vec!["patient_id".to_string()],
             required_fields: vec![],
+            expected_updated_at_ms: Some(2000),
+            expect_absent: false,
+        });
+        round_trip(BusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+            direction: "write".to_string(),
+            fields: vec![],
+            required_fields: vec![],
+            expected_updated_at_ms: None,
+            expect_absent: true,
         });
         round_trip(BusPayload::FieldPolicySetResponse);
         round_trip(BusPayload::FieldPolicyDeleteRequest {
@@ -2610,8 +2634,16 @@ mod tests {
         let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
         match decoded {
             BusPayload::FieldPolicySetRequest {
-                required_fields, ..
-            } => assert!(required_fields.is_empty()),
+                required_fields,
+                expected_updated_at_ms,
+                expect_absent,
+                ..
+            } => {
+                assert!(required_fields.is_empty());
+                // Older clients write unconditionally.
+                assert_eq!(expected_updated_at_ms, None);
+                assert!(!expect_absent);
+            }
             other => panic!("expected FieldPolicySetRequest, got {other:?}"),
         }
     }

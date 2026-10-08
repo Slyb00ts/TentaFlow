@@ -363,6 +363,7 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
         | BusServiceError::FieldPolicyPayloadMalformed { .. }
+        | BusServiceError::FieldPolicyChanged { .. }
         | BusServiceError::KeyNeedsTopicWideRule { .. } => AbiError::GateNotSatisfied,
         // PLAN §7.2: the org's `bus.autocreate` ceiling refused the
         // auto-creation this call opted into — "blocked by policy", the same

@@ -32284,18 +32284,46 @@ pub(crate) fn publish_bus_field_policy_capture(
     Ok(Some(recorded.op_id))
 }
 
+/// What a data-hiding rule write expects to find stored, checked in the same
+/// writer transaction as the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusFieldPolicyExpect {
+    /// Write whatever is stored (or nothing is).
+    Any,
+    /// No rule may exist for the key yet.
+    Absent,
+    /// A rule must exist and carry exactly this `updated_at_ms`.
+    UpdatedAt(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusFieldPolicyWrite {
+    Written,
+    /// The topic does not exist (nothing written).
+    TopicMissing,
+    /// The stored rule is not what `BusFieldPolicyExpect` named (nothing written).
+    Changed,
+}
+
 /// Upsert — one row per `(instance_id, org_id, topic, subject_type,
 /// subject_id, direction)`. Always captured as `SqlWriteAction::Update`:
 /// like `resource_permissions::set`, the materializer's own `INSERT ... ON
 /// CONFLICT DO UPDATE` treats Insert and Update identically, so the
 /// insert-vs-update distinction carries no information a replica needs.
 ///
-/// Written only while the topic exists, checked in the same writer
-/// transaction a topic delete takes (`bus_topic_delete`), so a delete cannot
-/// land between the check and the write and leave the rule behind.
-/// `Ok(false)` when the topic is missing (nothing written).
-pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<bool> {
-    let written = with_writer_tx(pool, |tx| {
+/// Written only while the topic exists and the stored rule is what `expect`
+/// names, both checked in the same writer transaction a topic delete takes
+/// (`bus_topic_delete`), so neither a delete nor a second administrator's
+/// write can land between the check and the write. A replacing write always
+/// gets an `updated_at_ms` above the stored one, so two writes within one
+/// millisecond cannot share the value `BusFieldPolicyExpect::UpdatedAt`
+/// compares.
+pub fn bus_field_policy_set(
+    pool: &DbPool,
+    row: &DbBusFieldPolicy,
+    expect: BusFieldPolicyExpect,
+) -> Result<BusFieldPolicyWrite> {
+    let (outcome, stored) = with_writer_tx(pool, |tx| {
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM bus_topics \
              WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3)",
@@ -32303,7 +32331,35 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<boo
             |r| r.get(0),
         )?;
         if !exists {
-            return Ok(false);
+            return Ok((BusFieldPolicyWrite::TopicMissing, row.clone()));
+        }
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT updated_at_ms FROM bus_field_policies \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+                   AND subject_id = ?5 AND direction = ?6",
+                rusqlite::params![
+                    row.instance_id,
+                    row.org_id,
+                    row.topic,
+                    row.subject_type,
+                    row.subject_id,
+                    row.direction
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let as_expected = match expect {
+            BusFieldPolicyExpect::Any => true,
+            BusFieldPolicyExpect::Absent => current.is_none(),
+            BusFieldPolicyExpect::UpdatedAt(ts) => current == Some(ts),
+        };
+        if !as_expected {
+            return Ok((BusFieldPolicyWrite::Changed, row.clone()));
+        }
+        let mut stored = row.clone();
+        if let Some(current) = current {
+            stored.updated_at_ms = stored.updated_at_ms.max(current + 1);
         }
         tx.execute(
             &format!(
@@ -32316,28 +32372,28 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<boo
                  updated_at_ms = excluded.updated_at_ms"
             ),
             rusqlite::params![
-                row.instance_id,
-                row.org_id,
-                row.topic,
-                row.subject_type,
-                row.subject_id,
-                row.direction,
-                row.fields_json,
-                row.required_fields_json,
-                row.created_at_ms,
-                row.updated_at_ms,
+                stored.instance_id,
+                stored.org_id,
+                stored.topic,
+                stored.subject_type,
+                stored.subject_id,
+                stored.direction,
+                stored.fields_json,
+                stored.required_fields_json,
+                stored.created_at_ms,
+                stored.updated_at_ms,
             ],
         )?;
-        Ok(true)
+        Ok((BusFieldPolicyWrite::Written, stored))
     })?;
-    if written {
+    if outcome == BusFieldPolicyWrite::Written {
         let _ = publish_bus_field_policy_capture(
             pool,
-            row,
+            &stored,
             crate::sync::runtime::SqlWriteAction::Update,
         )?;
     }
-    Ok(written)
+    Ok(outcome)
 }
 
 pub fn bus_field_policy_get(
@@ -33731,12 +33787,78 @@ mod bus_repository_tests {
     fn field_policy_set_refuses_a_missing_topic() {
         let db = fresh_db();
         let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
-        assert!(!bus_field_policy_set(&db, &row).unwrap());
-        assert!(bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap(),
+            BusFieldPolicyWrite::TopicMissing
+        );
+        assert!(
+            bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
+                .unwrap()
+                .is_empty()
+        );
         bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
-        assert!(bus_field_policy_set(&db, &row).unwrap());
+        assert_eq!(
+            bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap(),
+            BusFieldPolicyWrite::Written
+        );
+    }
+
+    /// The expectation is judged in the write's own transaction, and a
+    /// replacing write never repeats the stamp a compare-and-set reads —
+    /// two writes in one millisecond would otherwise look like no write.
+    #[test]
+    fn field_policy_set_checks_what_it_expects_and_moves_the_stamp() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
+        let get = || {
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "read").unwrap()
+        };
+        let write = |expect| bus_field_policy_set(&db, &row, expect).unwrap();
+
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Changed,
+            "nothing stored yet"
+        );
+        assert!(get().is_none());
+        assert_eq!(
+            write(BusFieldPolicyExpect::Absent),
+            BusFieldPolicyWrite::Written
+        );
+        assert_eq!(get().unwrap().updated_at_ms, 1_000);
+        assert_eq!(
+            write(BusFieldPolicyExpect::Absent),
+            BusFieldPolicyWrite::Changed,
+            "now it exists"
+        );
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(999)),
+            BusFieldPolicyWrite::Changed
+        );
+
+        // The same millisecond again: the stamp still moves.
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Written
+        );
+        assert_eq!(get().unwrap().updated_at_ms, 1_001);
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Changed,
+            "the first reader lost"
+        );
+        assert_eq!(
+            write(BusFieldPolicyExpect::Any),
+            BusFieldPolicyWrite::Written
+        );
+
+        let missing = field_policy_row(T1, "org-1", "gone", "any", "*", "read");
+        assert_eq!(
+            bus_field_policy_set(&db, &missing, BusFieldPolicyExpect::Absent).unwrap(),
+            BusFieldPolicyWrite::TopicMissing,
+            "a missing topic is reported before the expectation"
+        );
     }
 
     #[test]
@@ -33744,7 +33866,7 @@ mod bus_repository_tests {
         let db = fresh_db();
         bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
         let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
-        bus_field_policy_set(&db, &row).unwrap();
+        bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap();
 
         let fetched =
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
@@ -33756,7 +33878,7 @@ mod bus_repository_tests {
         let mut updated_row = row.clone();
         updated_row.required_fields_json = Some(r#"["status"]"#.to_string());
         updated_row.updated_at_ms = 2_000;
-        bus_field_policy_set(&db, &updated_row).unwrap();
+        bus_field_policy_set(&db, &updated_row, BusFieldPolicyExpect::Any).unwrap();
 
         let updated =
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
@@ -33771,7 +33893,7 @@ mod bus_repository_tests {
         assert_eq!(updated.created_at_ms, 1_000);
 
         let read_row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
-        bus_field_policy_set(&db, &read_row).unwrap();
+        bus_field_policy_set(&db, &read_row, BusFieldPolicyExpect::Any).unwrap();
         let listed = bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated").unwrap();
         assert_eq!(listed.len(), 2);
 
@@ -34584,16 +34706,19 @@ mod bus_repository_tests {
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-1", "labs.results", "any", "*", "read"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-2", "invoices.created", "any", "*", "write"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
 

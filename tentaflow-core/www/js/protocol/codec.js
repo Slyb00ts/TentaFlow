@@ -3353,8 +3353,11 @@ export const encode = {
 
   /**
    * BusPayload::FieldPolicySetRequest. payload: { topic, subjectType, subjectId, direction:
-   * 'write'|'read', fields: string[], requiredFields: string[] }. `requiredFields` must be a
-   * subset of `fields` (validated server-side).
+   * 'write'|'read', fields: string[], requiredFields: string[], expectedUpdatedAtMs?: number,
+   * expectAbsent?: boolean }. `requiredFields` must be a subset of `fields` (validated
+   * server-side). `expectedUpdatedAtMs` is the `updatedAtMs` of the rule being changed and
+   * `expectAbsent` marks an add; the server refuses with `bus.field_policy_changed` when the
+   * stored rule is no longer that. Neither set writes unconditionally.
    */
   busFieldPolicySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -3366,6 +3369,8 @@ export const encode = {
       String(payload.direction ?? 'write'),
       (payload.fields ?? []).map(String),
       (payload.requiredFields ?? payload.required_fields ?? []).map(String),
+      payload.expectedUpdatedAtMs == null ? undefined : BigInt(payload.expectedUpdatedAtMs),
+      payload.expectAbsent === true,
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

@@ -965,6 +965,11 @@ pub enum BusServiceError {
     /// implemented.
     #[error("topic '{topic}' has a field policy but the payload does not parse as {format}")]
     FieldPolicyPayloadMalformed { topic: String, format: &'static str },
+    /// A data-hiding rule write named the rule it expected to find (absent,
+    /// or last changed at a given time) and the stored rule is another one:
+    /// a second administrator changed it since this one read it.
+    #[error("the data-hiding rule on topic '{topic}' changed since it was read")]
+    FieldPolicyChanged { topic: String },
     /// Package K: a general API key meets only the topic-wide data-hiding
     /// rule, and `topic` has rules for this direction but not that one —
     /// letting the key through would read or write past rules written for
@@ -12123,6 +12128,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["MSH-9", "PID-3"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
         fail_to_dlq(
@@ -14965,6 +14971,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
         field_policies::set_policy(
@@ -14977,6 +14984,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
         register_schema(&svc, "org-a", "orders", SCHEMA_V1_ID_REQUIRED);
@@ -17648,6 +17656,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17701,6 +17710,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&["status"]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17734,6 +17744,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17777,6 +17788,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17829,6 +17841,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17877,6 +17890,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
         // Exact user row for "tester": also allows "status".
@@ -17890,6 +17904,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17925,6 +17940,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -17970,6 +17986,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap_err();
         assert!(matches!(err, BusServiceError::TopicNotFound { .. }));
@@ -18007,6 +18024,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["id", "status"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -18056,6 +18074,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id", "name"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -18083,6 +18102,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["1st-element"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap_err();
         assert!(
@@ -18113,6 +18133,7 @@ mod tests {
                 "MSH-12", "PID-1", "PID-2", "PID-3", "PID-4", "PID-6", "PID-7", "PID-8",
             ]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -18160,6 +18181,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["MSH-9", "PID-3"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -18190,6 +18212,7 @@ mod tests {
                 field_policies::Direction::Read,
                 &set_field_set(&[bad]),
                 &set_field_set(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
             )
             .unwrap_err();
             assert!(
@@ -19262,6 +19285,7 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["a", "b"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -19315,6 +19339,7 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 
@@ -20398,6 +20423,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
             },
+            crate::db::repository::BusFieldPolicyExpect::Any,
         )
         .unwrap();
 

@@ -2166,6 +2166,7 @@ mod tests {
                 field_policies::Direction::Read,
                 &fields(allowed),
                 &fields(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
             )
             .expect("set policy")
         };
@@ -2393,6 +2394,7 @@ mod tests {
                 direction,
                 &fields(allowed),
                 &fields(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
             )
             .expect("set policy")
         };

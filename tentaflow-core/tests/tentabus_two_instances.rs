@@ -563,6 +563,7 @@ fn two_tentabus_instances_never_see_each_others_data() {
         field_policies::Direction::Read,
         &fields,
         &BTreeSet::new(),
+        field_policies::BusFieldPolicyExpect::Any,
     )
     .expect("set field policy on 'test'");
 
