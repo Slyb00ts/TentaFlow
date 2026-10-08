@@ -19,8 +19,11 @@
 //   - `avro` / `protobuf` / `thrift` are storage-only until F4
 //     (`stored_only`): `compile` is a shape smoke-check, every other
 //     operation returns `SchemaError::Unsupported`.
-//   - XSD is out of scope entirely (no pure-Rust validator; libxml2 would
-//     be a native dependency).
+//   - `xsd` and `hl7v2_profile` (F4 B0) are stored-only the same way until
+//     their validators land: a hand-written XSD subset (no pure-Rust
+//     validator exists; libxml2 would be a native dependency) and a JSON
+//     profile over the HL7 v2 parser. Unlike the binary kinds they are
+//     bound to ONE payload format each (`required_payload_format`).
 //
 // Everything expensive or rejectable happens in `compile` (admin time).
 // `validate` runs on the publish hot path for opted-in topics only and must
@@ -29,6 +32,8 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::bus::payload_format::PayloadFormat;
 
 mod json_schema;
 pub mod registry;
@@ -44,15 +49,19 @@ pub enum SchemaType {
     Avro,
     Protobuf,
     Thrift,
+    Xsd,
+    Hl7v2Profile,
 }
 
 impl SchemaType {
     /// Every kind the registry stores, in the order the UI lists them.
-    pub const ALL: [SchemaType; 4] = [
+    pub const ALL: [SchemaType; 6] = [
         SchemaType::JsonSchema,
         SchemaType::Avro,
         SchemaType::Protobuf,
         SchemaType::Thrift,
+        SchemaType::Xsd,
+        SchemaType::Hl7v2Profile,
     ];
 
     /// Persisted form (`bus_schema_subjects.schema_type` CHECK constraint).
@@ -62,6 +71,8 @@ impl SchemaType {
             SchemaType::Avro => "avro",
             SchemaType::Protobuf => "protobuf",
             SchemaType::Thrift => "thrift",
+            SchemaType::Xsd => "xsd",
+            SchemaType::Hl7v2Profile => "hl7v2_profile",
         }
     }
 
@@ -71,13 +82,15 @@ impl SchemaType {
             "avro" => Some(SchemaType::Avro),
             "protobuf" => Some(SchemaType::Protobuf),
             "thrift" => Some(SchemaType::Thrift),
+            "xsd" => Some(SchemaType::Xsd),
+            "hl7v2_profile" => Some(SchemaType::Hl7v2Profile),
             _ => None,
         }
     }
 
     /// Whether this build can actually evaluate payloads against schemas
     /// of this type — gates `bus_topics.validation != off` (PLAN-F3 §3
-    /// rule 3). F4 flips the binary kinds to `true` by adding validators.
+    /// rule 3). F4 flips each kind to `true` by adding its validator.
     pub fn has_validator(self) -> bool {
         matches!(self, SchemaType::JsonSchema)
     }
@@ -88,6 +101,22 @@ impl SchemaType {
             SchemaType::Avro => &stored_only::AVRO_OPS,
             SchemaType::Protobuf => &stored_only::PROTOBUF_OPS,
             SchemaType::Thrift => &stored_only::THRIFT_OPS,
+            SchemaType::Xsd => &stored_only::XSD_OPS,
+            SchemaType::Hl7v2Profile => &stored_only::HL7V2_PROFILE_OPS,
+        }
+    }
+
+    /// The one payload format a topic must carry to bind a subject of this
+    /// kind; `None` for kinds that describe their own wire encoding
+    /// (the binary ones) and so bind independently of `content_type`.
+    /// `json_schema` is JSON-only today, `xsd` validates XML documents and
+    /// an HL7 v2 profile validates ER7 messages.
+    pub fn required_payload_format(self) -> Option<PayloadFormat> {
+        match self {
+            SchemaType::JsonSchema => Some(PayloadFormat::Json),
+            SchemaType::Xsd => Some(PayloadFormat::Xml),
+            SchemaType::Hl7v2Profile => Some(PayloadFormat::Hl7V2),
+            SchemaType::Avro | SchemaType::Protobuf | SchemaType::Thrift => None,
         }
     }
 }
@@ -134,7 +163,7 @@ pub enum SchemaError {
     /// `old` -> `new` is not compatible under the requested mode.
     Incompatible(String),
     /// The operation is not implemented for this schema type in this build
-    /// (binary kinds until F4).
+    /// (kinds without a validator).
     Unsupported {
         schema_type: SchemaType,
         operation: &'static str,
@@ -166,7 +195,7 @@ impl std::fmt::Display for SchemaError {
 #[derive(Debug)]
 pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
-    /// Binary kinds carry no compiled form until F4 — the variant exists so
+    /// Kinds without a validator yet carry no compiled form — the variant exists so
     /// a stored-only subject still yields a `CompiledSchema` from
     /// `compile` and can be cached uniformly.
     StoredOnly(SchemaType),
@@ -315,10 +344,12 @@ mod tests {
                 SchemaType::JsonSchema
                 | SchemaType::Avro
                 | SchemaType::Protobuf
-                | SchemaType::Thrift => {}
+                | SchemaType::Thrift
+                | SchemaType::Xsd
+                | SchemaType::Hl7v2Profile => {}
             }
         }
-        assert_eq!(SchemaType::ALL.len(), 4);
+        assert_eq!(SchemaType::ALL.len(), 6);
         for c in [
             Compatibility::None,
             Compatibility::Backward,
@@ -327,7 +358,32 @@ mod tests {
         ] {
             assert_eq!(Compatibility::parse(c.as_str()), Some(c));
         }
-        assert_eq!(SchemaType::parse("xsd"), None);
+        assert_eq!(SchemaType::parse("xsd"), Some(SchemaType::Xsd));
+        assert_eq!(
+            SchemaType::parse("hl7v2_profile"),
+            Some(SchemaType::Hl7v2Profile)
+        );
+        assert_eq!(SchemaType::parse("XSD"), None);
+        assert_eq!(SchemaType::parse("hl7v2"), None);
+    }
+
+    #[test]
+    fn payload_format_requirement_per_kind() {
+        assert_eq!(
+            SchemaType::JsonSchema.required_payload_format(),
+            Some(PayloadFormat::Json)
+        );
+        assert_eq!(
+            SchemaType::Xsd.required_payload_format(),
+            Some(PayloadFormat::Xml)
+        );
+        assert_eq!(
+            SchemaType::Hl7v2Profile.required_payload_format(),
+            Some(PayloadFormat::Hl7V2)
+        );
+        for t in [SchemaType::Avro, SchemaType::Protobuf, SchemaType::Thrift] {
+            assert_eq!(t.required_payload_format(), None);
+        }
     }
 
     #[test]
@@ -336,6 +392,8 @@ mod tests {
         assert!(!SchemaType::Avro.has_validator());
         assert!(!SchemaType::Protobuf.has_validator());
         assert!(!SchemaType::Thrift.has_validator());
+        assert!(!SchemaType::Xsd.has_validator());
+        assert!(!SchemaType::Hl7v2Profile.has_validator());
     }
 
     #[test]

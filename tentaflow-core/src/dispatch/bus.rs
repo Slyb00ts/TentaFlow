@@ -3887,7 +3887,7 @@ async fn schema_register_v1(
     let g = gate_admin(ctx, instance_id)?;
     let kind = schema_registry::SchemaType::parse(&schema_type).ok_or_else(|| {
         ProtocolError::bad_request(
-            "bus.invalid_argument: schema_type must be one of json_schema|avro|protobuf|thrift",
+            "bus.invalid_argument: schema_type must be one of json_schema|avro|protobuf|thrift|xsd|hl7v2_profile",
         )
     })?;
     let compat = compatibility

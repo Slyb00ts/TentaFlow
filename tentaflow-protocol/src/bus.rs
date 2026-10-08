@@ -599,7 +599,7 @@ pub struct BusFieldActionWire {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusSchemaSubjectWire {
     pub subject: String,
-    /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+    /// 'json_schema' | 'avro' | 'protobuf' | 'thrift' | 'xsd' | 'hl7v2_profile'.
     pub schema_type: String,
     /// 'none' | 'backward' | 'forward' | 'full'.
     pub compatibility: String,
@@ -1350,7 +1350,7 @@ pub enum BusPayload {
     },
     SchemaRegisterRequest {
         subject: String,
-        /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+        /// 'json_schema' | 'avro' | 'protobuf' | 'thrift' | 'xsd' | 'hl7v2_profile'.
         schema_type: String,
         schema_text: String,
         /// 'none' | 'backward' | 'forward' | 'full'; `None` = leave/default

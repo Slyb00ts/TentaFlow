@@ -19235,6 +19235,186 @@ mod tests {
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
     }
 
+    /// Registers a subject of a kind without a validator and tries to bind it
+    /// to a fresh topic of `content_type` through `create_topic`; returns the
+    /// resulting validation mode or the refusal.
+    fn bind_stored_subject_at_create(
+        kind: schema_registry::SchemaType,
+        text: &str,
+        content_type: &str,
+        validation: Option<topics::ValidationMode>,
+    ) -> Result<topics::ValidationMode, BusServiceError> {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "staged",
+            kind,
+            text,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                content_type: Some(content_type.to_string()),
+                schema_id: Some("staged".to_string()),
+                validation,
+                ..Default::default()
+            },
+        )
+        .map(|cfg| cfg.validation)
+    }
+
+    #[test]
+    fn xsd_binds_only_to_xml_topics() {
+        use schema_registry::SchemaType::Xsd;
+        for ct in ["application/xml", "text/xml"] {
+            assert_eq!(
+                bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap(),
+                topics::ValidationMode::Off,
+                "{ct}: an xsd subject binds to an XML topic with validation staying off"
+            );
+        }
+        for ct in [
+            "application/json",
+            "application/octet-stream",
+            "application/hl7-v2",
+        ] {
+            let err = bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                    if reason.contains("is xsd but")),
+                "{ct}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hl7v2_profile_binds_only_to_hl7_topics() {
+        use schema_registry::SchemaType::Hl7v2Profile;
+        let profile = r#"{"required_segments":["PID"]}"#;
+        for ct in ["application/hl7-v2", "x-application/hl7-v2+er7"] {
+            assert_eq!(
+                bind_stored_subject_at_create(Hl7v2Profile, profile, ct, None).unwrap(),
+                topics::ValidationMode::Off,
+                "{ct}"
+            );
+        }
+        for ct in ["application/json", "application/xml", "text/xml"] {
+            let err = bind_stored_subject_at_create(Hl7v2Profile, profile, ct, None).unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                    if reason.contains("is hl7v2_profile but")),
+                "{ct}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_schema_still_binds_only_to_json_topics() {
+        use schema_registry::SchemaType::JsonSchema;
+        assert!(bind_stored_subject_at_create(
+            JsonSchema,
+            r#"{"type":"object"}"#,
+            "application/json",
+            None
+        )
+        .is_ok());
+        for ct in ["application/xml", "application/hl7-v2"] {
+            let err = bind_stored_subject_at_create(JsonSchema, r#"{"type":"object"}"#, ct, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, BusServiceError::InvalidTopicConfig { .. }),
+                "{ct}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_subjects_bind_to_any_payload_format() {
+        use schema_registry::SchemaType::{Avro, Protobuf, Thrift};
+        for (kind, text) in [
+            (Avro, r#"{"type":"record","name":"X","fields":[]}"#),
+            (Protobuf, "syntax = \"proto3\"; message X {}"),
+            (Thrift, "struct X {}"),
+        ] {
+            for ct in [
+                "application/json",
+                "application/xml",
+                "application/hl7-v2",
+                "application/octet-stream",
+            ] {
+                assert_eq!(
+                    bind_stored_subject_at_create(kind, text, ct, None).unwrap(),
+                    topics::ValidationMode::Off,
+                    "{kind:?} on {ct}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enabling_validation_on_a_subject_without_a_validator_is_refused_for_the_new_kinds() {
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        for (kind, text, ct) in [
+            (Xsd, "<xs:schema/>", "application/xml"),
+            (
+                Hl7v2Profile,
+                r#"{"required_segments":[]}"#,
+                "application/hl7-v2",
+            ),
+        ] {
+            let err =
+                bind_stored_subject_at_create(kind, text, ct, Some(topics::ValidationMode::Warn))
+                    .unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                    if reason.contains("no validator")),
+                "{kind:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xsd_and_profile_subjects_are_stored_only_like_the_binary_kinds() {
+        let (_tmp, svc) = test_service();
+        for (kind, text) in [
+            (schema_registry::SchemaType::Xsd, "<xs:schema/>"),
+            (
+                schema_registry::SchemaType::Hl7v2Profile,
+                r#"{"required_segments":["PID"]}"#,
+            ),
+        ] {
+            let register = |compat| {
+                schema_registry::registry::register(
+                    &svc.db,
+                    svc.instance_id(),
+                    "org-1",
+                    kind.as_str(),
+                    kind,
+                    text,
+                    compat,
+                    None,
+                )
+            };
+            // The default `backward` mode needs a compatibility check no
+            // stored-only kind can perform: refused, not waved through.
+            let err = register(None).unwrap_err();
+            assert!(
+                matches!(err, BusServiceError::SchemaTypeUnsupported { .. }),
+                "{kind:?}: {err:?}"
+            );
+            // Explicitly unchecked, the subject is stored and versioned.
+            let outcome = register(Some(schema_registry::Compatibility::None)).unwrap();
+            assert_eq!(outcome.version, 1, "{kind:?}");
+        }
+    }
+
     #[test]
     fn update_topic_rejects_binding_a_schema_to_a_dlq_topic() {
         let (_tmp, svc) = test_service();

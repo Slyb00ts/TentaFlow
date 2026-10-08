@@ -60,6 +60,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
+  `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
+  i znaczniki usunięcia bez zmian). Na razie są tylko przechowywane, jak
+  `avro`/`protobuf`/`thrift`: nie mają walidatora, więc `GET capabilities`
+  nadal wymienia wyłącznie `json_schema`, włączenie walidacji na takim wzorcu
+  jest odrzucane, a druga wersja przy zgodności innej niż `none` także
+  (brak porównania, którego można by udawać). Wzorzec `xsd` wiąże się tylko
+  z tematem `application/xml`/`text/xml`, `hl7v2_profile` tylko
+  z `application/hl7-v2`, `json_schema` nadal tylko z JSON-em; formaty
+  binarne wiążą się niezależnie od `content_type`. Węzeł bez migracji 179
+  odrzuca replikowany wzorzec nowego typu (konflikt w skrzynce, bez
+  zatrzymania synchronizacji) — uaktualnij węzły sieci razem, zanim ktoś
+  zarejestruje wzorzec XSD lub profil HL7.
+
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo
   addonów (`BusSubjectWire`: rodzaj, identyfikator, nazwa, liczba członków

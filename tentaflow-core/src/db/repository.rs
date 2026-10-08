@@ -33679,7 +33679,7 @@ pub mod bus_test_support {
                 instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 subject TEXT NOT NULL,
-                schema_type TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift')),
+                schema_type TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift','xsd','hl7v2_profile')),
                 compatibility TEXT NOT NULL DEFAULT 'backward' CHECK(compatibility IN ('none','backward','forward','full')),
                 deprecated_at_ms INTEGER,
                 created_by TEXT,

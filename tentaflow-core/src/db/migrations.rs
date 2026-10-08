@@ -1111,6 +1111,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_depth_camera_offset",
             MigrationStep::Rust(cameras_add_depth_offset_columns),
         ),
+        (
+            179,
+            "bus_schema_registry_widen_types",
+            MigrationStep::RustSelfManaged(bus_schema_registry_widen_types),
+        ),
     ]
 }
 
@@ -10057,6 +10062,79 @@ CREATE INDEX idx_resperm_subject ON resource_permissions(subject_type, subject_i
 CREATE INDEX idx_resperm_resource ON resource_permissions(resource_type, resource_id);
 ";
 
+/// v179 — `bus_schema_subjects.schema_type` also accepts `'xsd'` and
+/// `'hl7v2_profile'` (TentaBus F4 B0). SQLite cannot alter a CHECK, so the
+/// table is rebuilt; every row and column (176's `deprecated_versions_json`
+/// and `generation` included) is copied unchanged. `bus_schema_versions`
+/// references the subjects table with `ON DELETE CASCADE`, so the rebuild
+/// runs with `foreign_keys = OFF` outside a transaction (`DROP TABLE` of the
+/// parent would otherwise cascade-delete every version) and is
+/// `RustSelfManaged`. Neither `bus_schema_versions` nor the tombstones carry
+/// a type CHECK, and the parent has no secondary index or trigger.
+///
+/// SYNC: a node that has not taken this rung rejects a replicated subject of
+/// the new types at the CHECK. The inbox records that op as a conflict and
+/// the subject's version ops, which defer until it exists, escalate to
+/// conflicts after their retry budget; nothing crashes or blocks the inbox.
+/// The subject reaches such a node when it is next written after the node
+/// upgraded (rows replicate whole), so upgrade the nodes of a mesh together
+/// before registering an XSD or HL7 profile subject.
+fn bus_schema_registry_widen_types(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "
+            CREATE TABLE bus_schema_subjects_new (
+                instance_id               TEXT NOT NULL,
+                org_id                    TEXT NOT NULL,
+                subject                   TEXT NOT NULL,
+                schema_type               TEXT NOT NULL CHECK(schema_type IN
+                    ('json_schema','avro','protobuf','thrift','xsd','hl7v2_profile')),
+                compatibility             TEXT NOT NULL DEFAULT 'backward'
+                    CHECK(compatibility IN ('none','backward','forward','full')),
+                deprecated_at_ms          INTEGER,
+                created_by                TEXT,
+                created_at_ms             INTEGER NOT NULL,
+                updated_at_ms             INTEGER NOT NULL,
+                deprecated_versions_json  TEXT NOT NULL DEFAULT '[]',
+                generation                INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (instance_id, org_id, subject)
+            );
+            INSERT INTO bus_schema_subjects_new
+                (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms,
+                 created_by, created_at_ms, updated_at_ms, deprecated_versions_json, generation)
+                SELECT instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms,
+                       created_by, created_at_ms, updated_at_ms, deprecated_versions_json,
+                       generation
+                FROM bus_schema_subjects;
+            DROP TABLE bus_schema_subjects;
+            ALTER TABLE bus_schema_subjects_new RENAME TO bus_schema_subjects;
+            ",
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "bus_schema_registry_widen_types: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
 const BUS_TOPIC_INCARNATIONS: &str = r#"
 ALTER TABLE bus_topics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE bus_partition_assignments ADD COLUMN topic_generation INTEGER NOT NULL DEFAULT 0;
@@ -13935,6 +14013,126 @@ mod tests {
                 [],
             )
             .is_err());
+    }
+
+    /// v179 on a database at v178: subjects (deprecations, generation) and
+    /// their versions survive the rebuild, the versions keep their foreign
+    /// key to the rebuilt parent and its cascade, the tombstones stay, and
+    /// the widened CHECK takes the two new types while still refusing others.
+    #[test]
+    fn migration_179_widens_the_schema_type_check_and_keeps_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 178);
+        conn.execute_batch(
+            "INSERT INTO bus_schema_subjects
+                 (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms,
+                  created_by, created_at_ms, updated_at_ms, deprecated_versions_json, generation)
+             VALUES
+                 ('tentabus-00000001', 'org-1', 'orders', 'json_schema', 'full', 5, 'admin-1', 1, 2,
+                  '[{\"version\":1}]', 3),
+                 ('tentabus-00000001', 'org-1', 'events', 'avro', 'none', NULL, NULL, 4, 4, '[]', 0);
+             INSERT INTO bus_schema_versions
+                 (instance_id, org_id, subject, version, schema_text, content_hash, schema_ref_id,
+                  created_by, created_at_ms, subject_generation)
+             VALUES
+                 ('tentabus-00000001', 'org-1', 'orders', 1, '{}', 'h1', 11, 'admin-1', 1, 3),
+                 ('tentabus-00000001', 'org-1', 'events', 1, '{}', 'h2', 12, NULL, 4, 0);
+             INSERT INTO bus_schema_subject_tombstones (instance_id, org_id, subject, generation)
+             VALUES ('tentabus-00000001', 'org-1', 'gone', 2);",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO bus_schema_subjects
+                     (instance_id, org_id, subject, schema_type, created_at_ms, updated_at_ms)
+                 VALUES ('tentabus-00000001', 'org-1', 'x', 'xsd', 0, 0)",
+                [],
+            )
+            .is_err(),
+            "the v178 CHECK must still refuse xsd, or this test proves nothing"
+        );
+        // `quote()` keeps NULL distinguishable from an empty string.
+        let subjects = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT quote(subject) || quote(schema_type) || quote(compatibility) \
+                 || quote(deprecated_at_ms) || quote(created_by) || quote(created_at_ms) \
+                 || quote(updated_at_ms) || quote(deprecated_versions_json) \
+                 || quote(generation) FROM bus_schema_subjects ORDER BY subject",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = subjects(&conn);
+
+        run(&conn).unwrap();
+
+        let applied: String = conn
+            .query_row(
+                "SELECT name FROM _migrations WHERE version = 179",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, "bus_schema_registry_widen_types");
+        assert_eq!(subjects(&conn), before);
+        let versions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bus_schema_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 2, "the rebuild must not cascade-delete versions");
+        let tombstones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bus_schema_subject_tombstones",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 1);
+
+        for kind in ["xsd", "hl7v2_profile"] {
+            conn.execute(
+                "INSERT INTO bus_schema_subjects
+                     (instance_id, org_id, subject, schema_type, created_at_ms, updated_at_ms)
+                 VALUES ('tentabus-00000001', 'org-1', ?1, ?1, 0, 0)",
+                [kind],
+            )
+            .unwrap_or_else(|e| panic!("the widened CHECK must accept {kind}: {e}"));
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO bus_schema_subjects
+                     (instance_id, org_id, subject, schema_type, created_at_ms, updated_at_ms)
+                 VALUES ('tentabus-00000001', 'org-1', 'bad', 'yaml', 0, 0)",
+                [],
+            )
+            .is_err());
+
+        // The versions still point at the rebuilt parent: an orphan is refused
+        // and deleting a subject still removes its versions.
+        assert!(conn
+            .execute(
+                "INSERT INTO bus_schema_versions
+                     (instance_id, org_id, subject, version, schema_text, content_hash,
+                      schema_ref_id, created_at_ms)
+                 VALUES ('tentabus-00000001', 'org-1', 'missing', 1, '{}', 'h9', 99, 0)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "DELETE FROM bus_schema_subjects WHERE subject = 'orders'",
+            [],
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bus_schema_versions WHERE subject = 'orders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
