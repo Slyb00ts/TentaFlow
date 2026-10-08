@@ -431,6 +431,8 @@ pub fn set_policy(
     }
 }
 
+/// Removes a rule; with `expected_updated_at_ms` only while it still carries
+/// that value (`FieldPolicyChanged` otherwise, nothing removed).
 #[allow(clippy::too_many_arguments)]
 pub fn delete_policy(
     pool: &DbPool,
@@ -440,8 +442,9 @@ pub fn delete_policy(
     subject_type: &str,
     subject_id: &str,
     direction: Direction,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<(), BusServiceError> {
-    repository::bus_field_policy_delete(
+    let removed = repository::bus_field_policy_delete(
         pool,
         instance_id,
         org_id,
@@ -449,8 +452,15 @@ pub fn delete_policy(
         subject_type,
         subject_id,
         direction.as_str(),
+        expected_updated_at_ms,
     )?;
-    Ok(())
+    if removed {
+        Ok(())
+    } else {
+        Err(BusServiceError::FieldPolicyChanged {
+            topic: topic.to_string(),
+        })
+    }
 }
 
 pub fn list_policies(

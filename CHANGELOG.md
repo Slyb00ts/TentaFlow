@@ -266,9 +266,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (`AclSetRequest`). `SchemaDerivedGetRequest` był dostępny dla każdego
   czytelnika instancji i pozwalał odczytać wzór pochodny dowolnej zasady
   oraz sprawdzić, czy zasada istnieje; nie używa go żaden ekran ani addon,
-  więc jest tylko dla administratora topiku. Usunięcie wpisu dostępu
-  (`clear`) zostaje na poziomie administratora instancji z rolą Admin, żeby
-  zakaz administracji topikiem dało się zdjąć.
+  więc jest tylko dla administratora topiku. Ta sama zasada obejmuje usuwanie
+  wpisu dostępu (`clear`): operator, któremu zakazano administracji topiku, nie
+  zdejmie ani własnego zakazu, ani cudzego zakazu odczytu lub zapisu. Jedynym
+  wyjątkiem jest administrator serwera, który zawsze może usunąć wpis — to droga
+  powrotu do topiku, w którym każdy administrator dostał zakaz. Prawo klucza API
+  do topiku (tworzenie klucza z zakresem topiku i `ApiKeyScopeSetRequest`) też
+  wymaga administracji tym topikiem; odebranie prawa działa jak dotąd.
 - „Dodaj zasadę” wybiera osobę, grupę, addon z katalogu (tylko tych, którzy nie
   mają jeszcze zasady w tym kierunku) albo Wszystkich, kierunek i dla każdego
   pola Pokaż / Ukryj (przy zapisie: Dozwolone / Wymagane / Niedozwolone);

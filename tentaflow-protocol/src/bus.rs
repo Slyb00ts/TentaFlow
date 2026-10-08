@@ -1295,6 +1295,12 @@ pub enum BusPayload {
         subject_type: String,
         subject_id: String,
         direction: String,
+        /// The rule must still carry exactly this `updated_at_ms` (what the
+        /// list returned), checked in the delete's own transaction; a rule
+        /// that changed or vanished is refused with `bus.field_policy_changed`
+        /// and nothing is removed. `None` deletes unconditionally.
+        #[serde(default)]
+        expected_updated_at_ms: Option<i64>,
     },
     FieldPolicyDeleteResponse,
 
@@ -2503,6 +2509,14 @@ mod tests {
             subject_type: "user".to_string(),
             subject_id: "u-1".to_string(),
             direction: "read".to_string(),
+            expected_updated_at_ms: None,
+        });
+        round_trip(BusPayload::FieldPolicyDeleteRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            direction: "read".to_string(),
+            expected_updated_at_ms: Some(1_790_000_000_123),
         });
         round_trip(BusPayload::FieldPolicyDeleteResponse);
     }
@@ -2645,6 +2659,35 @@ mod tests {
                 assert!(!expect_absent);
             }
             other => panic!("expected FieldPolicySetRequest, got {other:?}"),
+        }
+    }
+
+    /// A client built before `FieldPolicyDeleteRequest.expected_updated_at_ms`
+    /// existed still deletes, unconditionally.
+    #[test]
+    fn field_policy_delete_expected_updated_at_defaults_when_absent() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            FieldPolicyDeleteRequest {
+                topic: String,
+                subject_type: String,
+                subject_id: String,
+                direction: String,
+            },
+        }
+        let legacy = LegacyBusPayload::FieldPolicyDeleteRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+            direction: "read".to_string(),
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode");
+        match crate::cbor::decode::<BusPayload>(&bytes).expect("decode") {
+            BusPayload::FieldPolicyDeleteRequest {
+                expected_updated_at_ms,
+                ..
+            } => assert_eq!(expected_updated_at_ms, None),
+            other => panic!("expected FieldPolicyDeleteRequest, got {other:?}"),
         }
     }
 

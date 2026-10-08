@@ -3375,7 +3375,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read' }. */
+  /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read', expectedUpdatedAtMs? } (the rule's updated_at_ms the delete is based on). */
   busFieldPolicyDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusFieldPolicyDeleteRequest(
@@ -3384,6 +3384,7 @@ export const encode = {
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
       String(payload.subjectId ?? payload.subject_id ?? ''),
       String(payload.direction ?? 'write'),
+      payload.expectedUpdatedAtMs == null ? undefined : BigInt(payload.expectedUpdatedAtMs),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

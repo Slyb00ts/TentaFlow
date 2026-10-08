@@ -32447,6 +32447,13 @@ pub fn bus_field_policy_list_for_topic(
     Ok(rows)
 }
 
+/// Removes one rule. With `expected_updated_at_ms` the rule must still carry
+/// exactly that `updated_at_ms`, checked in the same writer transaction as the
+/// delete, so a second administrator's change cannot be deleted unseen; a rule
+/// that changed or vanished meanwhile returns `false` and nothing is removed.
+/// Without it the delete is unconditional and idempotent (older clients,
+/// internal callers). `true` means the rule is gone.
+#[allow(clippy::too_many_arguments)]
 pub fn bus_field_policy_delete(
     pool: &DbPool,
     instance_id: &str,
@@ -32455,15 +32462,38 @@ pub fn bus_field_policy_delete(
     subject_type: &str,
     subject_id: &str,
     direction: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let row: Option<DbBusFieldPolicy> = conn
-        .query_row(
-            &format!(
-                "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
-                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
-                   AND subject_id = ?5 AND direction = ?6"
-            ),
+    expected_updated_at_ms: Option<i64>,
+) -> Result<bool> {
+    let deleted: Option<Option<DbBusFieldPolicy>> = with_writer_tx(pool, |tx| {
+        let row: Option<DbBusFieldPolicy> = tx
+            .query_row(
+                &format!(
+                    "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+                       AND subject_id = ?5 AND direction = ?6"
+                ),
+                rusqlite::params![
+                    instance_id,
+                    org_id,
+                    topic,
+                    subject_type,
+                    subject_id,
+                    direction
+                ],
+                map_bus_field_policy_row,
+            )
+            .optional()?;
+        if let Some(expected) = expected_updated_at_ms {
+            if row.as_ref().map(|r| r.updated_at_ms) != Some(expected) {
+                return Ok(None);
+            }
+        }
+        let Some(row) = row else {
+            return Ok(Some(None));
+        };
+        tx.execute(
+            "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 \
+             AND topic = ?3 AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
             rusqlite::params![
                 instance_id,
                 org_id,
@@ -32472,26 +32502,20 @@ pub fn bus_field_policy_delete(
                 subject_id,
                 direction
             ],
-            map_bus_field_policy_row,
-        )
-        .optional()?;
-    let Some(row) = row else { return Ok(()) };
-    conn.execute(
-        "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 \
-         AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
-        rusqlite::params![
-            instance_id,
-            org_id,
-            topic,
-            subject_type,
-            subject_id,
-            direction
-        ],
-    )?;
-    drop(conn);
-    let _ =
-        publish_bus_field_policy_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
-    Ok(())
+        )?;
+        Ok(Some(Some(row)))
+    })?;
+    let Some(deleted) = deleted else {
+        return Ok(false);
+    };
+    if let Some(row) = deleted {
+        let _ = publish_bus_field_policy_capture(
+            pool,
+            &row,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        )?;
+    }
+    Ok(true)
 }
 
 /// Deletes every `bus_field_policies` row of one topic inside the caller's
@@ -33862,6 +33886,42 @@ mod bus_repository_tests {
     }
 
     #[test]
+    fn field_policy_delete_compares_the_stamp_in_the_write() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
+        bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap();
+        let delete = |expected| {
+            bus_field_policy_delete(
+                &db,
+                T1,
+                "org-1",
+                "patients.updated",
+                "any",
+                "*",
+                "read",
+                expected,
+            )
+            .unwrap()
+        };
+        let exists = || {
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "read")
+                .unwrap()
+                .is_some()
+        };
+
+        assert!(!delete(Some(row.updated_at_ms + 1)), "a stale stamp");
+        assert!(exists(), "nothing was removed");
+        assert!(delete(Some(row.updated_at_ms)));
+        assert!(!exists());
+        assert!(
+            !delete(Some(row.updated_at_ms)),
+            "a vanished rule is a change"
+        );
+        assert!(delete(None), "unconditional and idempotent");
+    }
+
+    #[test]
     fn field_policy_set_get_list_delete_round_trip() {
         let db = fresh_db();
         bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
@@ -33897,7 +33957,17 @@ mod bus_repository_tests {
         let listed = bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated").unwrap();
         assert_eq!(listed.len(), 2);
 
-        bus_field_policy_delete(&db, T1, "org-1", "patients.updated", "any", "*", "write").unwrap();
+        bus_field_policy_delete(
+            &db,
+            T1,
+            "org-1",
+            "patients.updated",
+            "any",
+            "*",
+            "write",
+            None,
+        )
+        .unwrap();
         assert!(
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
                 .unwrap()

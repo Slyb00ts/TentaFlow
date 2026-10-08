@@ -2572,7 +2572,8 @@ pub fn encode_bus_field_policy_preview_request(
     .map_err(|e| JsError::new(&e))
 }
 
-/// `direction` is 'write' | 'read'.
+/// `direction` is 'write' | 'read'. `expected_updated_at_ms` is the
+/// `updated_at_ms` of the rule being removed; unset deletes unconditionally.
 #[wasm_bindgen(js_name = encodeBusFieldPolicyDeleteRequest)]
 pub fn encode_bus_field_policy_delete_request(
     instance_id: String,
@@ -2580,6 +2581,7 @@ pub fn encode_bus_field_policy_delete_request(
     subject_type: String,
     subject_id: String,
     direction: String,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2588,6 +2590,7 @@ pub fn encode_bus_field_policy_delete_request(
             subject_type,
             subject_id,
             direction,
+            expected_updated_at_ms,
         },
     }))
     .map_err(|e| JsError::new(&e))

@@ -1523,6 +1523,7 @@ pub async fn bus_dispatch(
             subject_type,
             subject_id,
             direction,
+            expected_updated_at_ms,
         } => {
             field_policy_delete_v1(
                 ctx,
@@ -1531,6 +1532,7 @@ pub async fn bus_dispatch(
                 subject_type.clone(),
                 subject_id.clone(),
                 direction.clone(),
+                *expected_updated_at_ms,
             )
             .await?
         }
@@ -2219,13 +2221,14 @@ fn is_org_admin(ctx: &HandlerContext) -> bool {
     ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"))
 }
 
-/// The one check behind everything that reads or changes who is restricted
-/// from what on a topic (its data-hiding rules, the schema derived from
-/// them, its access list): the caller must administer THAT topic — a topic
-/// ACL deny on `admin` counts — and hold the organisation Admin role. The
-/// instance `bus.admin` tier alone is not enough; it is what an operator
-/// delegated by the matrix holds without being an administrator of every
-/// topic.
+/// The one check behind everything that changes who is restricted from what
+/// on a topic (its data-hiding rules, the schema derived from them, its access
+/// entries, and an API key's topic right) and behind listing the rules: the
+/// caller must administer THAT topic — a topic ACL deny on `admin` counts —
+/// and hold the organisation Admin role. The instance `bus.admin` tier alone
+/// is not enough; it is what an operator delegated by the matrix holds without
+/// being an administrator of every topic. Reading the access list itself
+/// (`acl_list_v1`) stays at `gate_read`.
 async fn require_topic_admin(
     ctx: &HandlerContext,
     g: &Gate,
@@ -2236,6 +2239,25 @@ async fn require_topic_admin(
     let topic_for_access = topic.to_string();
     let (_, _, topic_admin) =
         run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    topic_admin_verdict(ctx, topic_admin, topic)
+}
+
+/// `require_topic_admin` for the synchronous API key handlers, which cannot
+/// await; the same answer, asked of the same engine.
+fn require_topic_admin_blocking(
+    ctx: &HandlerContext,
+    g: &Gate,
+    topic: &str,
+) -> Result<(), ProtocolError> {
+    let (_, _, topic_admin) = g.svc.topic_access(&bus_ctx(ctx, g), topic);
+    topic_admin_verdict(ctx, topic_admin, topic)
+}
+
+fn topic_admin_verdict(
+    ctx: &HandlerContext,
+    topic_admin: bool,
+    topic: &str,
+) -> Result<(), ProtocolError> {
     if topic_admin && is_org_admin(ctx) {
         Ok(())
     } else {
@@ -2907,12 +2929,13 @@ async fn acl_set_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: authorization surface — admin tier.
     let g = gate_admin(ctx, instance_id)?;
-    // Granting or denying is administration of THIS topic, so a topic
-    // administrator's deny holds against an operator holding only the
-    // instance tier. A `clear` stays at the instance tier plus the
-    // organisation Admin role: it is how such a deny is removed again, and
-    // requiring topic admin there would lock everyone out of the topic.
-    if access_level != "clear" {
+    // Every access change — granting, denying and clearing alike — is
+    // administration of THIS topic, so a topic administrator's deny holds
+    // against an operator holding only the instance tier, and against that
+    // operator clearing it. The one exception is a site administrator, who
+    // may always clear: it is the way back into a topic whose every
+    // administrator ended up denied.
+    if access_level != "clear" || !SessionAuthKind::Admin.session_satisfies(&ctx.session) {
         require_topic_admin(ctx, &g, &topic).await?;
     }
     // plan-app-platform §7 W4 finding 8: validation only guards the SET
@@ -3088,9 +3111,10 @@ pub(crate) fn audit_acl_set(
 /// entry, however it is written. The API key handlers (`ApiKeyCreateRequest`
 /// scopes, `ApiKeyScopeSetRequest`/`ClearRequest`) are site-admin only, but
 /// that alone would let a site administrator open a topic of an organisation
-/// they do not administer; so they also pass the gate `AclSetRequest` does —
-/// `bus.admin` on the instance plus the organisation's admin role — for the
-/// organisation the entry names. Returns the caller's user id and the
+/// they do not administer; so they also pass the gates `AclSetRequest` does —
+/// `bus.admin` on the instance plus the organisation's admin role for the
+/// organisation the entry names, and administration of that topic (a topic
+/// deny on `admin` holds here too). Returns the caller's user id and the
 /// topic, for the `bus.acl.set` audit row.
 pub(crate) fn require_key_topic_rights_admin(
     ctx: &HandlerContext,
@@ -3109,6 +3133,7 @@ pub(crate) fn require_key_topic_rights_admin(
             "bus.org_mismatch: a topic right is granted from within its own organisation",
         ));
     }
+    require_topic_admin_blocking(ctx, &g, topic)?;
     Ok((g.user_id, topic.to_string()))
 }
 
@@ -3300,6 +3325,7 @@ async fn field_policy_delete_v1(
     subject_type: String,
     subject_id: String,
     direction: String,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
     require_topic_admin(ctx, &g, &topic).await?;
@@ -3323,6 +3349,7 @@ async fn field_policy_delete_v1(
             &subject_type2,
             &subject_id2,
             dir,
+            expected_updated_at_ms,
         )
         .map_err(map_bus_error)
     })
@@ -5249,6 +5276,17 @@ mod tests {
             state,
             org_context: Some(org),
         }
+    }
+
+    /// A context that holds the instance tier and the organisation role but
+    /// is not a site administrator (`handler_ctx` mints one).
+    fn operator_ctx(db: DbPool, org: crate::services::rbac::OrgContext) -> HandlerContext {
+        let mut ctx = handler_ctx(db, org);
+        ctx.session = SessionAuth::UserSession {
+            user_id: *uuid::Uuid::new_v4().as_bytes(),
+            role: Some("user".to_string()),
+        };
+        ctx
     }
 
     /// Test-only helper: opens a FRESH consumer handle for `(group, topic)`
@@ -7458,19 +7496,19 @@ mod tests {
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
     }
 
-    /// An administrator whose own admin right on the topic is denied by the
+    /// An operator whose own admin right on the topic is denied by the
     /// topic's ACL has the instance tier and the organisation role, and still
     /// neither lists, writes, deletes, previews nor derives from the topic's
-    /// rules, nor grants or denies access on it — the one check
-    /// (`require_topic_admin`) stands behind all of them. Clearing the deny
-    /// stays possible at the instance tier, or nobody could ever lift it.
+    /// rules, nor grants, denies or clears access on it — the one check
+    /// (`require_topic_admin`) stands behind all of them. Only a site
+    /// administrator may still clear (see the tests below).
     #[tokio::test]
     async fn rules_and_access_changes_need_admin_on_that_topic() {
         let (_guard, db) = bus_fixture();
         let instance = fixture_instance_id();
         let admin_id = format!("u-topic-deny-{}", uuid::Uuid::new_v4());
         let admin_org = seed_membership(&db, &admin_id, "org_admin");
-        let admin = handler_ctx(
+        let admin = operator_ctx(
             db.clone(),
             org_context(&admin_org, &admin_id, &["org.admin"]),
         );
@@ -7542,6 +7580,7 @@ mod tests {
                 "any".to_string(),
                 "*".to_string(),
                 "read".to_string(),
+                None,
             )
             .await,
         );
@@ -7586,8 +7625,26 @@ mod tests {
             .await,
         );
 
+        denied(
+            "acl clear of its own deny",
+            acl_set_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                "user".to_string(),
+                admin_id.clone(),
+                "clear".to_string(),
+                "admin".to_string(),
+            )
+            .await,
+        );
+
+        let site_admin = handler_ctx(
+            db.clone(),
+            org_context(&admin_org, &admin_id, &["org.admin"]),
+        );
         acl_set_v1(
-            &admin,
+            &site_admin,
             instance.as_str(),
             topic.clone(),
             "user".to_string(),
@@ -7596,7 +7653,7 @@ mod tests {
             "admin".to_string(),
         )
         .await
-        .expect("clearing the deny stays possible at the instance tier");
+        .expect("a site administrator may always clear");
         field_policy_delete_v1(
             &admin,
             instance.as_str(),
@@ -7604,9 +7661,87 @@ mod tests {
             "any".to_string(),
             "*".to_string(),
             "read".to_string(),
+            None,
         )
         .await
         .expect("with the deny gone the topic's rules are the administrator's again");
+    }
+
+    /// A deny is lifted by the topic's administrators and by a site
+    /// administrator, not by any operator who holds only the instance tier:
+    /// not another subject's read deny, and not the operator's own admin
+    /// deny.
+    #[tokio::test]
+    async fn clearing_an_access_entry_needs_admin_on_that_topic() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let operator_id = format!("u-clear-op-{}", uuid::Uuid::new_v4());
+        let org = seed_membership(&db, &operator_id, "org_admin");
+        let operator = operator_ctx(db.clone(), org_context(&org, &operator_id, &["org.admin"]));
+        let topic = format!("clear.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &operator,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        async fn acl(
+            ctx: &HandlerContext,
+            topic: &str,
+            subject: &str,
+            level: &str,
+            action: &str,
+        ) -> Result<BusPayload, ProtocolError> {
+            acl_set_v1(
+                ctx,
+                fixture_instance_id().as_str(),
+                topic.to_string(),
+                "user".to_string(),
+                subject.to_string(),
+                level.to_string(),
+                action.to_string(),
+            )
+            .await
+        }
+        async fn remaining(ctx: &HandlerContext, topic: &str) -> usize {
+            match acl_list_v1(ctx, fixture_instance_id().as_str(), topic.to_string())
+                .await
+                .expect("list")
+            {
+                BusPayload::AclListResponse { entries } => entries.len(),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        acl(&operator, &topic, "u-patient-reader", "deny", "read")
+            .await
+            .expect("the topic's administrator denies a reader");
+        acl(&operator, &topic, &operator_id, "deny", "admin")
+            .await
+            .expect("and is then denied administration itself");
+
+        for (subject, action) in [
+            ("u-patient-reader", "read"),
+            (operator_id.as_str(), "admin"),
+        ] {
+            let err = acl(&operator, &topic, subject, "clear", action)
+                .await
+                .expect_err("an operator who no longer administers the topic cannot clear");
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{err:?}");
+        }
+        assert_eq!(remaining(&operator, &topic).await, 2, "nothing was cleared");
+
+        let site_admin = handler_ctx(db, org_context(&org, &operator_id, &["org.admin"]));
+        for (subject, action) in [
+            ("u-patient-reader", "read"),
+            (operator_id.as_str(), "admin"),
+        ] {
+            acl(&site_admin, &topic, subject, "clear", action)
+                .await
+                .expect("a site administrator may always clear");
+        }
+        assert_eq!(remaining(&operator, &topic).await, 0);
     }
 
     /// The projection a rule gives a schema, and the fact that a rule exists
@@ -7795,6 +7930,107 @@ mod tests {
         assert_eq!(stamp().await.map(|s| s.1), Some(vec!["only".to_string()]));
     }
 
+    /// A delete is made against what the administrator last saw: a window
+    /// that listed the rule before someone changed it, or after someone
+    /// removed it, is refused as changed and removes nothing; a request that
+    /// names no stamp (older clients) still deletes.
+    #[tokio::test]
+    async fn field_policy_delete_is_compare_and_set() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let admin_id = format!("u-del-cas-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let ctx = handler_ctx(db, org_context(&admin_org, &admin_id, &["org.admin"]));
+        let topic = format!("delcas.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        let set = |fields: &[&str], expected: Option<i64>| {
+            let (ctx, topic) = (&ctx, topic.clone());
+            let fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            async move {
+                field_policy_set_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                    fields,
+                    vec![],
+                    expected,
+                    expected.is_none(),
+                )
+                .await
+            }
+        };
+        let stamp = || async {
+            match field_policy_list_v1(&ctx, instance.as_str(), topic.clone())
+                .await
+                .expect("list")
+            {
+                BusPayload::FieldPolicyListResponse { policies } => {
+                    policies.first().map(|p| p.updated_at_ms)
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        };
+        let delete = |expected: Option<i64>| {
+            let (ctx, topic) = (&ctx, topic.clone());
+            async move {
+                field_policy_delete_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                    expected,
+                )
+                .await
+            }
+        };
+        let changed = |r: Result<BusPayload, ProtocolError>| {
+            let err = r.expect_err("must be refused as changed");
+            assert_eq!(err.code, ProtocolErrorCode::Conflict, "{err:?}");
+            assert!(
+                err.message.starts_with("bus.field_policy_changed"),
+                "{err:?}"
+            );
+        };
+
+        set(&["a"], None).await.expect("add");
+        let first = stamp().await.expect("stored");
+        set(&["a", "b"], Some(first))
+            .await
+            .expect("a second administrator's change");
+        let second = stamp().await.expect("stored");
+
+        changed(delete(Some(first)).await);
+        assert_eq!(
+            stamp().await,
+            Some(second),
+            "the stale delete removed nothing"
+        );
+
+        delete(Some(second))
+            .await
+            .expect("a delete of the rule as listed");
+        assert_eq!(stamp().await, None);
+
+        changed(delete(Some(second)).await);
+        set(&["c"], None).await.expect("re-add");
+        delete(None)
+            .await
+            .expect("older clients delete unconditionally");
+        assert_eq!(stamp().await, None);
+    }
+
     #[tokio::test]
     async fn field_policy_set_list_delete_round_trip() {
         let (_guard, db) = bus_fixture();
@@ -7853,6 +8089,7 @@ mod tests {
             "any".to_string(),
             "*".to_string(),
             "write".to_string(),
+            None,
         )
         .await
         .expect("field policy delete must succeed");
@@ -11463,6 +11700,7 @@ mod tests {
             "user".to_string(),
             "legacy id".to_string(),
             "read".to_string(),
+            None,
         )
         .await
         .expect("any stored id can be deleted");
@@ -11479,6 +11717,7 @@ mod tests {
             "user".to_string(),
             String::new(),
             "read".to_string(),
+            None,
         )
         .await
         .expect_err("an empty id");

@@ -2709,6 +2709,51 @@ mod tests {
         assert!(acl_rows.iter().any(|d| d.contains("access_level=clear")));
     }
 
+    /// A deny on `admin` for the topic holds against a key's topic right too:
+    /// the caller has the instance tier and the organisation role, and still
+    /// neither issues a key with the topic right nor sets it afterwards.
+    /// Revoking is unaffected (`require_key_topic_rights_clear`).
+    #[test]
+    fn key_topic_rights_respect_a_topic_deny_on_admin() {
+        let fx = key_fixture("cccc3199");
+        let id = topic_acl_resource_id(fx.instance.as_str(), ORG, TOPIC);
+        let admin = topic_admin_ctx(&fx);
+        let uid = create_general_key(&admin, vec![topic_scope(&id, Some("read"))]).unwrap();
+
+        assert!(crate::db::repository::resource_permissions::set_topic_rule(
+            &fx.state.db,
+            &id,
+            "user",
+            &session_user(&admin),
+            "admin",
+            "deny",
+        )
+        .unwrap());
+
+        assert_code(
+            create_general_key(&admin, vec![topic_scope(&id, Some("read"))]),
+            ProtocolErrorCode::PolicyDenied,
+        );
+        assert_code(
+            scope_set(&admin, &uid, &id, Some("write")),
+            ProtocolErrorCode::PolicyDenied,
+        );
+        assert_eq!(
+            scope_list(&admin, &uid),
+            vec![("topic".to_string(), "read".to_string())]
+        );
+        dispatch_blocking(
+            &MessageBody::ApiKeyScopeClearRequest {
+                key_uid: uid.clone(),
+                resource_type: "topic".to_string(),
+                resource_id: id.clone(),
+                action: Some("read".to_string()),
+            },
+            &admin,
+        )
+        .expect("revoking stays possible");
+    }
+
     /// Package K, review 2: revoking must always work. A right on an
     /// instance that was disabled since is cleared by the topic's admin (no
     /// running engine is asked for), and one on an instance that is gone by
