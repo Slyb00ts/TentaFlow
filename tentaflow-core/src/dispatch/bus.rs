@@ -3126,10 +3126,12 @@ pub(crate) fn require_key_topic_rights_clear(
 // =============================================================================
 // Field policies (SUM/tentabus/POLITYKI-POL.md, F0 follow-up
 // SUM/tentabus/POLITYKI-POL-FORMATY.md — per-field access control, distinct
-// from the coarse per-topic ACL above). §4.3: List is `gate_read` (reading
-// policy shape is not itself privileged); Set/Delete are `gate_admin`
-// (authorization surface — a field policy gates exactly what PII a subject
-// can see or write).
+// from the coarse per-topic ACL above). List, Set and Delete are the admin
+// tier (authorization surface — a field policy gates exactly what PII a
+// subject can see or write, and listing it names who is restricted from what).
+// List is narrower than `gate_read` + instance admin: the caller must be an
+// administrator of THAT topic, the same check that gives the dashboard its
+// `can_admin`. A reader sees the topic only through their own hiding.
 // =============================================================================
 
 async fn field_policy_list_v1(
@@ -3138,6 +3140,17 @@ async fn field_policy_list_v1(
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let topic_for_access = topic.clone();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    if !(topic_admin && is_org_admin(ctx)) {
+        return Err(map_bus_error(BusServiceError::PermissionDenied {
+            action: bus::BusAction::Admin.as_str(),
+            topic,
+        }));
+    }
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -7066,14 +7079,9 @@ mod tests {
 
     // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
 
-    /// plan-app-platform §4.3: `FieldPolicyListRequest` is `gate_read`, not
-    /// `gate_admin` — "reading who may touch a topic is not itself
-    /// privileged" (same rationale as `AclListRequest`). This test used to
-    /// grant `bus.read` and assert DENIAL, i.e. it asserted the OLD,
-    /// admin-only boundary; the plan moves that boundary down to `bus.
-    /// read`, so the ASSERTION (not just the setup) changes to match — a
-    /// caller with NO grant at all is denied, one with only `bus.read`
-    /// (`field_policy_list_a_read_only_caller_is_allowed` below) succeeds.
+    /// `FieldPolicyListRequest` needs no grant at all to be refused: a caller
+    /// with nothing on the instance never reaches the topic check. (Readers
+    /// and other topics' administrators: the tests below.)
     #[tokio::test]
     async fn field_policy_list_denied_without_bus_read_permission() {
         let (_guard, db) = bus_fixture();
@@ -7340,20 +7348,66 @@ mod tests {
         }
     }
 
+    /// The list names who is restricted from what, so a reader (instance
+    /// `bus.read`, however many topics) is refused; only an administrator of
+    /// the topic itself is answered, and a deny on another topic's admin
+    /// right does not carry over.
     #[tokio::test]
-    async fn field_policy_list_a_read_only_caller_is_allowed() {
+    async fn field_policy_list_is_for_the_topic_administrator_only() {
         let (_guard, db) = bus_fixture();
-        let user_id = "u-read-only-field-policy".to_string();
-        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
-        let org = org_context(&org_id, &user_id, &[]);
-        let ctx = handler_ctx(db, org);
-        field_policy_list_v1(
-            &ctx,
-            fixture_instance_id().as_str(),
-            "patients.updated".to_string(),
+        let instance = fixture_instance_id();
+        let reader_id = "u-reader-field-policy".to_string();
+        let reader_org = seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&reader_org, &reader_id, &[]));
+        let err = field_policy_list_v1(&reader, instance.as_str(), "patients.updated".to_string())
+            .await
+            .expect_err("a reader must not list the rules");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        let admin_id = format!("u-fp-admin-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let admin = handler_ctx(db.clone(), org_context(&admin_org, &admin_id, &["org.admin"]));
+        let (own, other) = ("fp.list.own".to_string(), "fp.list.other".to_string());
+        for topic in [&own, &other] {
+            topic_create_v1(&admin, instance.as_str(), topic.clone(), BusTopicOptionsWire::default())
+                .await
+                .expect("topic create");
+        }
+        field_policy_list_v1(&admin, instance.as_str(), own.clone())
+            .await
+            .expect("the topic's administrator is answered");
+        acl_set_v1(
+            &admin,
+            instance.as_str(),
+            other.clone(),
+            "user".to_string(),
+            admin_id.clone(),
+            "deny".to_string(),
+            "admin".to_string(),
         )
         .await
-        .expect("bus.read alone must be enough to list field policies");
+        .expect("deny admin on the other topic");
+        let err = field_policy_list_v1(&admin, instance.as_str(), other)
+            .await
+            .expect_err("administering one topic is not administering another");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        field_policy_list_v1(&admin, instance.as_str(), own)
+            .await
+            .expect("the first topic is still listed");
+    }
+
+    /// An instance administrator who is not an organisation administrator
+    /// has no `can_admin` on the dashboard either, and gets no list.
+    #[tokio::test]
+    async fn field_policy_list_needs_the_organisation_administrator_too() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-fp-matrix-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let ctx = handler_ctx(db, org_context(&org_id, &user_id, &[]));
+        let err = field_policy_list_v1(&ctx, fixture_instance_id().as_str(), "patients.updated".to_string())
+            .await
+            .expect_err("matrix admin without org.admin");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
     }
 
     #[tokio::test]
