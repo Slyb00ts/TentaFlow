@@ -11004,7 +11004,8 @@
       "subject_is_addon": "This id belongs to an addon, not a user. Remove this entry and grant access to the addon (To whom: Addon).",
       "subject_not_found": "This person, key or addon was not found — it may have been removed or may not belong to this organisation. Refresh the page.",
       "org_mismatch": "A right to a topic can only be granted from the topic's own organisation.",
-      "record_not_found": "This partition has no message with that number."
+      "record_not_found": "This partition has no message with that number.",
+      "field_policy_changed": "The rule changed in the meantime, so nothing was saved. Refresh the list of rules and make the change again."
     },
     "shell": {
       "instance": "Instance",
@@ -11212,7 +11213,7 @@
       "version": {
         "title": "New version of pattern {name}",
         "text_label": "Pattern text — version {version}",
-        "draft_kept": "This is the text of the previous attempt, which the server did not accept. Fix it or change the pattern's compatibility first.",
+        "draft_kept": "This is the text from the last time this window was open — it was not added as a version.",
         "diff": "Difference from version {version}: {changes}.",
         "diff_added_optional": "new optional field “{field}”",
         "diff_added_required": "new required field “{field}”",
@@ -11233,7 +11234,8 @@
         "added_text_unused": "No topic uses this pattern yet.",
         "same_title": "No new version added",
         "same_text": "Version {version} already has the same text. Nothing changed.",
-        "load_failed": "Could not load the text of version {version}."
+        "load_failed": "Could not load the text of version {version}.",
+        "discard_kept": "This version has not been added yet. The text is kept and comes back when you open this window again. Close the window again, or go back to editing."
       },
       "incompat": {
         "lead": "This pattern has compatibility “{compat}”, and {reason}.",
@@ -11479,7 +11481,8 @@
         "kept_keys": "What stays: the API keys of external systems — they belong to the instance and the organisation; they only lose their rights to this topic.",
         "retype": "Type the topic name to confirm:",
         "confirm": "Delete topic {name}",
-        "lost_empty_partitions": "{count} empty {n|partition|partitions|partitions}"
+        "lost_empty_partitions": "{count} empty {n|partition|partitions|partitions}",
+        "lost_rules_unknown": "The data-hiding rules of this topic could not be counted — if it has any, they are deleted too."
       },
       "preview": {
         "title": "Message preview — {topic}",
@@ -12341,21 +12344,26 @@
         "write_typed": "Type at least one field that may be written. With no allowed field the rule would reject every message."
       },
       "impact": {
-        "read_only": "For “{who}” only these fields will be visible: {fields}. All others will be hidden.",
-        "read_hidden": "For “{who}” these fields disappear from messages: {fields}.",
-        "read_shown": "For “{who}” these fields appear in messages: {fields}.",
+        "read_only": "For {who} only these fields will be visible: {fields}. All others will be hidden.",
+        "read_hidden": "For {who} these fields disappear from messages: {fields}.",
+        "read_shown": "For {who} these fields appear in messages: {fields}.",
         "rest": "The other fields of the list stay as they are.",
         "read_unlisted": "Fields outside the list disappear too, unless you add them.",
-        "write_only": "A message from “{who}” is accepted only with the fields: {fields}. A message with any other field is rejected.",
-        "write_forbidden": "A message from “{who}” that contains any of the fields {fields} is rejected and does not reach the topic.",
-        "write_required": "A message from “{who}” that lacks any of the fields {fields} is rejected and does not reach the topic.",
+        "write_only": "A message from {whoFrom} is accepted only with the fields: {fields}. A message with any other field is rejected.",
+        "write_forbidden": "A message from {whoFrom} that contains any of the fields {fields} is rejected and does not reach the topic.",
+        "write_required": "A message from {whoFrom} that lacks any of the fields {fields} is rejected and does not reach the topic.",
         "write_rest": "The whole message is rejected, not just the field.",
         "write_unlisted": "A message with a field outside the list is rejected too, unless you add that field.",
         "keys_closed": "Outside systems with an API key will not be able to {action} this topic until you add a rule for everyone.",
-        "read_unlisted_only": "For “{who}”, fields outside the list disappear. Every field on the list stays visible.",
-        "write_unlisted_only": "A message from “{who}” is accepted only with the fields on the list. A message with any other field is rejected.",
-        "write_accepted": "Messages from “{who}” with the fields {fields} are accepted.",
-        "write_not_required": "These fields are no longer required from “{who}”: {fields}."
+        "read_unlisted_only": "For {who}, fields outside the list disappear. Every field on the list stays visible.",
+        "write_unlisted_only": "A message from {whoFrom} is accepted only with the fields on the list. A message with any other field is rejected.",
+        "write_accepted": "Messages from {whoFrom} with the fields {fields} are accepted.",
+        "write_not_required": "These fields are no longer required from {whoFrom}: {fields}.",
+        "write_unlisted_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you add its address.",
+        "write_unlisted_hl7_saved": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment is rejected.",
+        "write_unlisted_only_hl7": "Messages from {whoFrom} are accepted with the segments on the list, including their remaining positions (e.g. PID-4, MSH-11). A message with another segment, e.g. a Z segment, is rejected.",
+        "read_unlisted_saved": "Fields outside the list disappear too.",
+        "write_unlisted_saved": "A message with a field outside the list is rejected too."
       },
       "fields_label": "Fields",
       "source": {
@@ -12377,7 +12385,8 @@
       },
       "unlisted": {
         "read": "Fields that are not on the list are hidden too (also those that appear later), unless you type them below.",
-        "write": "A message with a field outside the list is rejected, unless you type that field below."
+        "write": "A message with a field outside the list is rejected, unless you type that field below.",
+        "write_hl7": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, MSH-11) are accepted. A message with another segment, e.g. a Z segment, is rejected, unless you type its address below."
       },
       "add": {
         "button": "Add a rule",
@@ -12457,10 +12466,11 @@
         "summary_none": "The rules hid no field of this message.",
         "limited_title": "This preview is narrower than what the chosen person, group or addon sees",
         "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that this subject will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you.",
-        "limited_missing": "Fields that may be missing here: {fields}. If the message has them, a rule that applies to you too hides them.",
+        "limited_missing": "These fields of the pattern are not in this preview: {fields}. A rule that applies to you too hid them, or the message does not have them.",
         "who_user": "user {name}",
         "who_group": "group {name}",
-        "who_addon": "addon {name}"
+        "who_addon": "addon {name}",
+        "summary_limited": "Fields that a rule applying to you too already hides are not listed."
       },
       "hl7": {
         "msh_3": "Sending application",
@@ -12533,7 +12543,14 @@
       "writes_rest": "Other fields or a missing required one: reject the message",
       "fields_search": "Search fields",
       "fields_none": "No field matches the search.",
-      "stale": "The rule changed in the meantime. The list was refreshed — check it and try again."
+      "who": {
+        "named": "“{name}”",
+        "everyone_for": "everyone",
+        "everyone_from": "everyone"
+      },
+      "visible_outside": "Also leaves visible: {fields}",
+      "changed_title": "Nothing was saved — the rule changed in the meantime",
+      "changed_text": "Someone changed, added or removed this rule before your change was saved, so nothing was overwritten. The table shows the rules as they are now — if you still want the change, make it again."
     }
   },
   "composer": {

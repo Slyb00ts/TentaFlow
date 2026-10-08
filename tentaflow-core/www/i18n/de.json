@@ -9769,7 +9769,8 @@
       "subject_is_addon": "Diese Kennung gehört zu einem Addon, nicht zu einem Benutzer. Entfernen Sie diesen Eintrag und gewähren Sie dem Addon Zugriff (Für wen: Addon).",
       "subject_not_found": "Diese Person, dieser Schlüssel oder dieses Addon wurde nicht gefunden — er wurde vielleicht entfernt oder gehört nicht zu dieser Organisation. Laden Sie die Seite neu.",
       "org_mismatch": "Ein Recht an einem Topic kann nur aus seiner eigenen Organisation gewährt werden.",
-      "record_not_found": "Diese Partition enthält keine Nachricht mit dieser Nummer."
+      "record_not_found": "Diese Partition enthält keine Nachricht mit dieser Nummer.",
+      "field_policy_changed": "Die Regel hat sich in der Zwischenzeit geändert, daher wurde nichts gespeichert. Aktualisieren Sie die Regelliste und nehmen Sie die Änderung noch einmal vor."
     },
     "shell": {
       "instance": "Instanz",
@@ -9977,7 +9978,7 @@
       "version": {
         "title": "Neue Version des Musters {name}",
         "text_label": "Mustertext — Version {version}",
-        "draft_kept": "Das ist der Text des vorigen Versuchs, den der Server nicht angenommen hat. Korrigieren Sie ihn oder ändern Sie zuerst die Kompatibilität des Musters.",
+        "draft_kept": "Das ist der Text vom vorigen Öffnen dieses Fensters – er wurde nicht als Version hinzugefügt.",
         "diff": "Unterschied zu Version {version}: {changes}.",
         "diff_added_optional": "neues optionales Feld „{field}“",
         "diff_added_required": "neues Pflichtfeld „{field}“",
@@ -9998,7 +9999,8 @@
         "added_text_unused": "Noch verwendet kein Topic dieses Muster.",
         "same_title": "Keine neue Version hinzugefügt",
         "same_text": "Version {version} hat bereits denselben Text. Nichts hat sich geändert.",
-        "load_failed": "Der Text von Version {version} konnte nicht geladen werden."
+        "load_failed": "Der Text von Version {version} konnte nicht geladen werden.",
+        "discard_kept": "Diese Version wurde noch nicht hinzugefügt. Der Text bleibt erhalten und erscheint wieder, wenn Sie dieses Fenster erneut öffnen. Schließen Sie das Fenster noch einmal oder bearbeiten Sie weiter."
       },
       "incompat": {
         "lead": "Dieses Muster hat die Kompatibilität „{compat}“, und {reason}.",
@@ -10244,7 +10246,8 @@
         "kept_keys": "Es bleiben: die API-Schlüssel externer Systeme — sie gehören zur Instanz und zur Organisation; sie verlieren nur die Rechte an diesem Topic.",
         "retype": "Geben Sie den Namen des Topics zur Bestätigung ein:",
         "confirm": "Topic {name} löschen",
-        "lost_empty_partitions": "{count} leere {n|Partition|Partitionen|Partitionen}"
+        "lost_empty_partitions": "{count} leere {n|Partition|Partitionen|Partitionen}",
+        "lost_rules_unknown": "Die Regeln zum Ausblenden von Daten dieses Topics konnten nicht gezählt werden – falls es welche hat, werden sie ebenfalls gelöscht."
       },
       "preview": {
         "title": "Nachrichtenvorschau — {topic}",
@@ -11106,21 +11109,26 @@
         "write_typed": "Geben Sie mindestens ein Feld ein, das geschrieben werden darf. Ohne erlaubtes Feld würde die Regel jede Nachricht ablehnen."
       },
       "impact": {
-        "read_only": "Für „{who}“ sind nur diese Felder sichtbar: {fields}. Alle anderen werden ausgeblendet.",
-        "read_hidden": "Für „{who}“ verschwinden diese Felder aus den Nachrichten: {fields}.",
-        "read_shown": "Für „{who}“ erscheinen diese Felder in den Nachrichten: {fields}.",
+        "read_only": "Für {who} sind nur diese Felder sichtbar: {fields}. Alle anderen werden ausgeblendet.",
+        "read_hidden": "Für {who} verschwinden diese Felder aus den Nachrichten: {fields}.",
+        "read_shown": "Für {who} erscheinen diese Felder in den Nachrichten: {fields}.",
         "rest": "Die übrigen Felder der Liste bleiben unverändert.",
         "read_unlisted": "Felder außerhalb der Liste verschwinden ebenfalls, es sei denn, Sie fügen sie hinzu.",
-        "write_only": "Eine Nachricht von „{who}“ wird nur mit den Feldern {fields} angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
-        "write_forbidden": "Eine Nachricht von „{who}“, die eines der Felder {fields} enthält, wird abgelehnt und gelangt nicht in das Topic.",
-        "write_required": "Eine Nachricht von „{who}“, der eines der Felder {fields} fehlt, wird abgelehnt und gelangt nicht in das Topic.",
+        "write_only": "Eine Nachricht von {whoFrom} wird nur mit den Feldern {fields} angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
+        "write_forbidden": "Eine Nachricht von {whoFrom}, die eines der Felder {fields} enthält, wird abgelehnt und gelangt nicht in das Topic.",
+        "write_required": "Eine Nachricht von {whoFrom}, der eines der Felder {fields} fehlt, wird abgelehnt und gelangt nicht in das Topic.",
         "write_rest": "Abgelehnt wird die ganze Nachricht, nicht nur das Feld.",
         "write_unlisted": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt, es sei denn, Sie fügen dieses Feld hinzu.",
         "keys_closed": "Externe Systeme mit API-Schlüssel können dieses Topic nicht {action}, bis Sie eine Regel für alle hinzufügen.",
-        "read_unlisted_only": "Für „{who}“ verschwinden Felder außerhalb der Liste. Alle Felder der Liste bleiben sichtbar.",
-        "write_unlisted_only": "Von „{who}“ wird eine Nachricht nur mit den Feldern der Liste angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
-        "write_accepted": "Nachrichten von „{who}“ mit den Feldern {fields} werden angenommen.",
-        "write_not_required": "Von „{who}“ sind diese Felder nicht mehr erforderlich: {fields}."
+        "read_unlisted_only": "Für {who} verschwinden Felder außerhalb der Liste. Alle Felder der Liste bleiben sichtbar.",
+        "write_unlisted_only": "Von {whoFrom} wird eine Nachricht nur mit den Feldern der Liste angenommen. Eine Nachricht mit einem anderen Feld wird abgelehnt.",
+        "write_accepted": "Nachrichten von {whoFrom} mit den Feldern {fields} werden angenommen.",
+        "write_not_required": "Von {whoFrom} sind diese Felder nicht mehr erforderlich: {fields}.",
+        "write_unlisted_hl7": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, MSH-11) werden angenommen. Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt, außer Sie ergänzen dessen Adresse.",
+        "write_unlisted_hl7_saved": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, MSH-11) werden angenommen. Eine Nachricht mit einem anderen Segment wird abgelehnt.",
+        "write_unlisted_only_hl7": "Nachrichten von {whoFrom} werden mit den Segmenten der Liste angenommen, auch in deren übrigen Positionen (z. B. PID-4, MSH-11). Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt.",
+        "read_unlisted_saved": "Felder außerhalb der Liste verschwinden ebenfalls.",
+        "write_unlisted_saved": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt."
       },
       "fields_label": "Felder",
       "source": {
@@ -11142,7 +11150,8 @@
       },
       "unlisted": {
         "read": "Felder, die nicht in der Liste stehen, werden ebenfalls ausgeblendet (auch solche, die später hinzukommen), außer Sie geben sie unten ein.",
-        "write": "Eine Nachricht mit einem Feld außerhalb der Liste wird abgelehnt, außer Sie geben dieses Feld unten ein."
+        "write": "Eine Nachricht mit einem Feld außerhalb der Liste wird abgelehnt, außer Sie geben dieses Feld unten ein.",
+        "write_hl7": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, MSH-11) werden angenommen. Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt, außer Sie geben dessen Adresse unten ein."
       },
       "add": {
         "button": "Regel hinzufügen",
@@ -11222,10 +11231,11 @@
         "summary_none": "Die Regeln haben kein Feld dieser Nachricht ausgeblendet.",
         "limited_title": "Diese Vorschau ist enger als die Ansicht der gewählten Person, Gruppe oder des gewählten Addons",
         "limited_text": "Eine Leseregel, die auch für Sie gilt (Ihre eigene, die Ihrer Gruppe oder die für alle), blendet Felder aus, die dieser Eintrag sieht: {who}. Eine Vorschau zeigt nie mehr, als Sie selbst sehen können, daher fehlen diese Felder hier. Die vollständige Sicht erscheint, wenn für Sie keine Leseregel gilt.",
-        "limited_missing": "Hier können Felder fehlen: {fields}. Enthält die Nachricht sie, blendet sie eine Regel aus, die auch für Sie gilt.",
+        "limited_missing": "Diese Felder des Musters fehlen in dieser Vorschau: {fields}. Entweder hat sie eine Regel ausgeblendet, die auch für Sie gilt, oder die Nachricht enthält sie nicht.",
         "who_user": "Benutzer {name}",
         "who_group": "Gruppe {name}",
-        "who_addon": "Addon {name}"
+        "who_addon": "Addon {name}",
+        "summary_limited": "Felder, die eine auch für Sie geltende Regel bereits ausblendet, werden nicht aufgeführt."
       },
       "hl7": {
         "msh_3": "Sendende Anwendung",
@@ -11298,7 +11308,14 @@
       "writes_rest": "Andere Felder oder ein fehlendes Pflichtfeld: Nachricht ablehnen",
       "fields_search": "Felder suchen",
       "fields_none": "Kein Feld passt zur Suche.",
-      "stale": "Die Regel hat sich in der Zwischenzeit geändert. Die Liste wurde aktualisiert – prüfen Sie sie und versuchen Sie es erneut."
+      "who": {
+        "named": "„{name}“",
+        "everyone_for": "alle",
+        "everyone_from": "allen"
+      },
+      "visible_outside": "Lässt außerdem sichtbar: {fields}",
+      "changed_title": "Nichts gespeichert – die Regel hat sich zwischenzeitlich geändert",
+      "changed_text": "Jemand hat diese Regel geändert, hinzugefügt oder entfernt, bevor Ihre Änderung gespeichert wurde, daher wurde nichts überschrieben. Die Tabelle zeigt die Regeln, wie sie jetzt sind – wenn Sie die Änderung weiterhin möchten, nehmen Sie sie noch einmal vor."
     }
   },
   "composer": {

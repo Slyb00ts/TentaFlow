@@ -55,6 +55,7 @@ export function openChangeWindow({
   title, icon, width = 620, cls = 'tb-change-window', fields, wire, draft, current, impact,
   save, describeError, errorHtml = null, onSaved, problem = null,
   saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'),
+  discardText = T('settings.discard_confirm'),
 }) {
   const win = windowEl({ title, icon, width, cls });
   win.innerHTML = `
@@ -62,7 +63,7 @@ export function openChangeWindow({
       ${fields()}
       <div class="tb-will-happen" data-role="impact" aria-live="polite"></div>
       <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<div data-role="error-text"></div></div>
-      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('settings.discard_confirm'))}</div></div>
+      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(discardText)}</div></div>
     </div>
     <div slot="footer">
       <tf-button variant="ghost" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>

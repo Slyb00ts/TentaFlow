@@ -654,7 +654,8 @@ export function openAccessGrant(ctx) {
       const paintPick = () => {
         const options = found.entries ? pickable(found.entries, ctx.rows) : [];
         select.setAttribute('label', T(`access.grant.pick.${kind}`));
-        select.setOptions(options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) })), options[0] ? `${options[0].subjectType}:${options[0].subjectId}` : '');
+        // Nobody is chosen for the administrator: the first name of a list is not a decision.
+        select.setOptions([{ value: '', label: T('hiding.add.choose') }, ...options.map((e) => ({ value: `${e.subjectType}:${e.subjectId}`, label: pickLabel(e) }))], '');
         select.toggleAttribute('disabled', options.length === 0);
         let text;
         if (found.error) text = ctx.describeError(found.error);

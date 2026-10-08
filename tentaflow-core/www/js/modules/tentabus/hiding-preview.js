@@ -52,7 +52,8 @@ function recordFields(bytes) {
  * The known fields of a pattern-checked topic that are neither in the record
  * nor named by the answer. When the administrator's own rule narrows the
  * preview they are gone from the record without a trace; a field the message
- * never had looks the same, so the sentence says "may".
+ * never had looks the same, so the sentence only says they are not in this
+ * preview and why that can be (never that the message has them).
  */
 export function missingFields({ resp, source }) {
   if (source?.mode !== 'schema') return [];
@@ -95,9 +96,13 @@ export function previewResultHtml({ resp, subject, source, nowMs = Date.now() })
     T('hiding.preview.limited_text', { who: whoPhrase(subject) }),
     missing.length ? T('hiding.preview.limited_missing', { fields: missing.join(', ') }) : '',
   ].filter(Boolean).join(' ');
-  const summary = hidden.length
-    ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.join(', ') })
-    : T('hiding.preview.summary_none');
+  // Fields the administrator's own rule already took out of the record are not in `applied` at all.
+  const summary = [
+    hidden.length
+      ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.join(', ') })
+      : T('hiding.preview.summary_none'),
+    resp.limitedByCaller ? T('hiding.preview.summary_limited') : '',
+  ].filter(Boolean).join(' ');
   return `
     ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(limitedText)}"></tf-alert>` : ''}
     <div class="tb-preview-record">

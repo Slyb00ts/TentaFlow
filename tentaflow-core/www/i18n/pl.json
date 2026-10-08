@@ -11004,7 +11004,8 @@
       "subject_is_addon": "Ten identyfikator należy do addonu, nie do użytkownika. Usuń ten wpis i nadaj dostęp addonowi (Komu: Addon).",
       "subject_not_found": "Nie znaleziono tej osoby, tego klucza ani addonu — mógł zostać usunięty albo nie należy do tej organizacji. Odśwież stronę.",
       "org_mismatch": "Prawo do topiku można nadać tylko z jego własnej organizacji.",
-      "record_not_found": "W tej partycji nie ma wiadomości o tym numerze."
+      "record_not_found": "W tej partycji nie ma wiadomości o tym numerze.",
+      "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz."
     },
     "shell": {
       "instance": "Instancja",
@@ -11212,7 +11213,7 @@
       "version": {
         "title": "Nowa wersja wzoru {name}",
         "text_label": "Tekst wzoru — wersja {version}",
-        "draft_kept": "To tekst z poprzedniej próby, której serwer nie przyjął. Popraw go albo najpierw zmień zgodność wzoru.",
+        "draft_kept": "To tekst z poprzedniego otwarcia tego okna — nie został dodany jako wersja.",
         "diff": "Różnica względem wersji {version}: {changes}.",
         "diff_added_optional": "nowe, nieobowiązkowe pole „{field}”",
         "diff_added_required": "nowe, wymagane pole „{field}”",
@@ -11233,7 +11234,8 @@
         "added_text_unused": "Żaden topik jeszcze nie używa tego wzoru.",
         "same_title": "Nie dodano nowej wersji",
         "same_text": "Taki sam tekst ma już wersja {version}. Nic się nie zmieniło.",
-        "load_failed": "Nie udało się wczytać tekstu wersji {version}."
+        "load_failed": "Nie udało się wczytać tekstu wersji {version}.",
+        "discard_kept": "Ta wersja nie jest jeszcze dodana. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie. Zamknij okno jeszcze raz albo wróć do edycji."
       },
       "incompat": {
         "lead": "Ten wzór ma zgodność „{compat}”, a {reason}.",
@@ -11479,7 +11481,8 @@
         "kept_keys": "Zostają: klucze API systemów zewnętrznych — należą do instancji i organizacji; stracą tylko prawa do tego topiku.",
         "retype": "Przepisz nazwę topiku, aby potwierdzić:",
         "confirm": "Usuń topik {name}",
-        "lost_empty_partitions": "{count} {n|pusta partycja|puste partycje|pustych partycji}"
+        "lost_empty_partitions": "{count} {n|pusta partycja|puste partycje|pustych partycji}",
+        "lost_rules_unknown": "Zasad ukrywania danych tego topiku nie udało się policzyć — jeśli jakieś ma, też zostaną usunięte."
       },
       "preview": {
         "title": "Podgląd wiadomości — {topic}",
@@ -12341,21 +12344,26 @@
         "write_typed": "Wpisz co najmniej jedno pole, które wolno zapisać. Bez żadnego dozwolonego pola zasada odrzucałaby każdą wiadomość."
       },
       "impact": {
-        "read_only": "Dla „{who}” widoczne będą tylko pola: {fields}. Wszystkie inne zostaną ukryte.",
-        "read_hidden": "Dla „{who}” znikną z wiadomości pola: {fields}.",
-        "read_shown": "Dla „{who}” pojawią się w wiadomościach pola: {fields}.",
+        "read_only": "Dla {who} widoczne będą tylko pola: {fields}. Wszystkie inne zostaną ukryte.",
+        "read_hidden": "Dla {who} znikną z wiadomości pola: {fields}.",
+        "read_shown": "Dla {who} pojawią się w wiadomościach pola: {fields}.",
         "rest": "Pozostałe pola z listy bez zmian.",
         "read_unlisted": "Pola spoza listy też znikną, chyba że je dopiszesz.",
-        "write_only": "Od „{who}” zostanie przyjęta wiadomość tylko z polami: {fields}. Wiadomość z innym polem zostanie odrzucona.",
-        "write_forbidden": "Wiadomość od „{who}”, w której jest którekolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
-        "write_required": "Wiadomość od „{who}”, w której brakuje któregokolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
+        "write_only": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami: {fields}. Wiadomość z innym polem zostanie odrzucona.",
+        "write_forbidden": "Wiadomość od {whoFrom}, w której jest którekolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
+        "write_required": "Wiadomość od {whoFrom}, w której brakuje któregokolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
         "write_rest": "Odrzucona zostaje cała wiadomość, a nie samo pole.",
         "write_unlisted": "Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.",
         "keys_closed": "Systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku, dopóki nie dodasz zasady dla wszystkich.",
-        "read_unlisted_only": "Dla „{who}” znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.",
-        "write_unlisted_only": "Od „{who}” zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.",
-        "write_accepted": "Od „{who}” będą przyjmowane wiadomości z polami: {fields}.",
-        "write_not_required": "Od „{who}” przestanie być wymagane: {fields}."
+        "read_unlisted_only": "Dla {who} znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.",
+        "write_unlisted_only": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.",
+        "write_accepted": "Od {whoFrom} będą przyjmowane wiadomości z polami: {fields}.",
+        "write_not_required": "Od {whoFrom} przestanie być wymagane: {fields}.",
+        "write_unlisted_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.",
+        "write_unlisted_hl7_saved": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.",
+        "write_unlisted_only_hl7": "Od {whoFrom} będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach (np. PID-4, MSH-11). Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona.",
+        "read_unlisted_saved": "Pola spoza listy też znikną.",
+        "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona."
       },
       "fields_label": "Pola",
       "source": {
@@ -12377,7 +12385,8 @@
       },
       "unlisted": {
         "read": "Pola, których nie ma na liście, też zostaną ukryte (także te, które pojawią się później), chyba że wpiszesz je niżej.",
-        "write": "Wiadomość z polem spoza listy zostanie odrzucona, chyba że wpiszesz je niżej."
+        "write": "Wiadomość z polem spoza listy zostanie odrzucona, chyba że wpiszesz je niżej.",
+        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, MSH-11) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej."
       },
       "add": {
         "button": "Dodaj zasadę",
@@ -12457,10 +12466,11 @@
         "summary_none": "Zasady nie ukryły żadnego pola tej wiadomości.",
         "limited_title": "Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu",
         "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.",
-        "limited_missing": "Mogą tu brakować pól: {fields}. Jeśli wiadomość je zawiera, ukrywa je zasada, która obowiązuje także Ciebie.",
+        "limited_missing": "W tym podglądzie nie ma pól wzoru: {fields}. Ukryła je zasada, która obowiązuje także Ciebie, albo wiadomość ich nie zawiera.",
         "who_user": "użytkownik {name}",
         "who_group": "grupa {name}",
-        "who_addon": "addon {name}"
+        "who_addon": "addon {name}",
+        "summary_limited": "Nie wymieniamy pól, które ukrywa już zasada obowiązująca także Ciebie."
       },
       "hl7": {
         "msh_3": "Aplikacja wysyłająca",
@@ -12533,7 +12543,14 @@
       "writes_rest": "Inne pola albo brak wymaganych: odrzuć wiadomość",
       "fields_search": "Szukaj pola",
       "fields_none": "Żadne pole nie pasuje do wyszukiwania.",
-      "stale": "Zasada zmieniła się w międzyczasie. Odświeżyliśmy listę — sprawdź ją i spróbuj jeszcze raz."
+      "who": {
+        "named": "„{name}”",
+        "everyone_for": "wszystkich",
+        "everyone_from": "wszystkich"
+      },
+      "visible_outside": "Zostawia też widoczne: {fields}",
+      "changed_title": "Nic nie zapisano — zasada zmieniła się w międzyczasie",
+      "changed_text": "Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz."
     }
   },
   "composer": {

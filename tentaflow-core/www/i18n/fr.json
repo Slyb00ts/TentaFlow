@@ -9769,7 +9769,8 @@
       "subject_is_addon": "Cet identifiant appartient à un addon, pas à un utilisateur. Supprimez cette entrée et accordez l’accès à l’addon (À qui : Addon).",
       "subject_not_found": "Cette personne, cette clé ou cet addon est introuvable — elle a peut-être été supprimée ou n'appartient pas à cette organisation. Actualisez la page.",
       "org_mismatch": "Un droit sur un topic ne peut être accordé que depuis sa propre organisation.",
-      "record_not_found": "Cette partition n'a aucun message portant ce numéro."
+      "record_not_found": "Cette partition n'a aucun message portant ce numéro.",
+      "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification."
     },
     "shell": {
       "instance": "Instance",
@@ -9977,7 +9978,7 @@
       "version": {
         "title": "Nouvelle version du modèle {name}",
         "text_label": "Texte du modèle — version {version}",
-        "draft_kept": "C’est le texte de la tentative précédente, que le serveur n’a pas accepté. Corrigez-le ou changez d’abord la compatibilité du modèle.",
+        "draft_kept": "C’est le texte de la dernière ouverture de cette fenêtre — il n’a pas été ajouté comme version.",
         "diff": "Différence avec la version {version} : {changes}.",
         "diff_added_optional": "nouveau champ facultatif « {field} »",
         "diff_added_required": "nouveau champ obligatoire « {field} »",
@@ -9998,7 +9999,8 @@
         "added_text_unused": "Aucun topic n’utilise encore ce modèle.",
         "same_title": "Aucune nouvelle version ajoutée",
         "same_text": "La version {version} a déjà le même texte. Rien n’a changé.",
-        "load_failed": "Impossible de charger le texte de la version {version}."
+        "load_failed": "Impossible de charger le texte de la version {version}.",
+        "discard_kept": "Cette version n’est pas encore ajoutée. Le texte est conservé et revient quand vous rouvrez cette fenêtre. Refermez la fenêtre, ou reprenez la saisie."
       },
       "incompat": {
         "lead": "Ce modèle a la compatibilité « {compat} », et {reason}.",
@@ -10244,7 +10246,8 @@
         "kept_keys": "Restent : les clés API des systèmes externes — elles appartiennent à l’instance et à l’organisation ; elles perdent seulement leurs droits sur ce topic.",
         "retype": "Saisissez le nom du topic pour confirmer :",
         "confirm": "Supprimer le topic {name}",
-        "lost_empty_partitions": "{count} {n|partition vide|partitions vides|partitions vides}"
+        "lost_empty_partitions": "{count} {n|partition vide|partitions vides|partitions vides}",
+        "lost_rules_unknown": "Les règles de masquage des données de ce topic n’ont pas pu être comptées ; s’il en a, elles sont supprimées aussi."
       },
       "preview": {
         "title": "Aperçu des messages — {topic}",
@@ -11106,21 +11109,26 @@
         "write_typed": "Saisissez au moins un champ qu'il est permis d'écrire. Sans champ autorisé, la règle rejetterait chaque message."
       },
       "impact": {
-        "read_only": "Pour « {who} », seuls ces champs seront visibles : {fields}. Tous les autres seront dissimulés.",
-        "read_hidden": "Pour « {who} », ces champs disparaissent des messages : {fields}.",
-        "read_shown": "Pour « {who} », ces champs apparaissent dans les messages : {fields}.",
+        "read_only": "Pour {who}, seuls ces champs seront visibles : {fields}. Tous les autres seront dissimulés.",
+        "read_hidden": "Pour {who}, ces champs disparaissent des messages : {fields}.",
+        "read_shown": "Pour {who}, ces champs apparaissent dans les messages : {fields}.",
         "rest": "Les autres champs de la liste restent inchangés.",
         "read_unlisted": "Les champs absents de la liste disparaissent aussi, sauf si vous les ajoutez.",
-        "write_only": "Un message de « {who} » n'est accepté qu'avec les champs : {fields}. Un message avec un autre champ est rejeté.",
-        "write_forbidden": "Un message de « {who} » qui contient l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
-        "write_required": "Un message de « {who} » auquel manque l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
+        "write_only": "Un message de {whoFrom} n'est accepté qu'avec les champs : {fields}. Un message avec un autre champ est rejeté.",
+        "write_forbidden": "Un message de {whoFrom} qui contient l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
+        "write_required": "Un message de {whoFrom} auquel manque l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
         "write_rest": "Le message entier est rejeté, pas seulement le champ.",
         "write_unlisted": "Un message avec un champ absent de la liste est aussi rejeté, sauf si vous ajoutez ce champ.",
         "keys_closed": "Les systèmes externes avec une clé d’API ne pourront pas {action} ce topic tant que vous n’aurez pas ajouté une règle pour tout le monde.",
-        "read_unlisted_only": "Pour « {who} », les champs absents de la liste disparaissent. Tous les champs de la liste restent visibles.",
-        "write_unlisted_only": "De « {who} », un message n’est accepté qu’avec les champs de la liste. Un message avec un autre champ est rejeté.",
-        "write_accepted": "Les messages de « {who} » avec les champs {fields} sont acceptés.",
-        "write_not_required": "Ces champs ne sont plus exigés de « {who} » : {fields}."
+        "read_unlisted_only": "Pour {who}, les champs absents de la liste disparaissent. Tous les champs de la liste restent visibles.",
+        "write_unlisted_only": "De {whoFrom}, un message n’est accepté qu’avec les champs de la liste. Un message avec un autre champ est rejeté.",
+        "write_accepted": "Les messages de {whoFrom} avec les champs {fields} sont acceptés.",
+        "write_not_required": "Ces champs ne sont plus exigés de {whoFrom} : {fields}.",
+        "write_unlisted_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous ajoutez son adresse.",
+        "write_unlisted_hl7_saved": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment est rejeté.",
+        "write_unlisted_only_hl7": "Les messages de {whoFrom} sont acceptés avec les segments de la liste, y compris leurs autres positions (p. ex. PID-4, MSH-11). Un message avec un autre segment, p. ex. un segment Z, est rejeté.",
+        "read_unlisted_saved": "Les champs absents de la liste disparaissent aussi.",
+        "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté."
       },
       "fields_label": "Champs",
       "source": {
@@ -11142,7 +11150,8 @@
       },
       "unlisted": {
         "read": "Les champs absents de la liste sont dissimulés aussi (y compris ceux qui apparaîtront plus tard), sauf si vous les saisissez ci-dessous.",
-        "write": "Un message avec un champ hors de la liste est rejeté, sauf si vous saisissez ce champ ci-dessous."
+        "write": "Un message avec un champ hors de la liste est rejeté, sauf si vous saisissez ce champ ci-dessous.",
+        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, MSH-11) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous."
       },
       "add": {
         "button": "Ajouter une règle",
@@ -11222,10 +11231,11 @@
         "summary_none": "Les règles n'ont dissimulé aucun champ de ce message.",
         "limited_title": "Cet aperçu est plus étroit que la vue de la personne, du groupe ou de l’addon choisi",
         "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
-        "limited_missing": "Des champs peuvent manquer ici : {fields}. Si le message les contient, une règle qui s’applique aussi à vous les masque.",
+        "limited_missing": "Ces champs du modèle ne figurent pas dans cet aperçu : {fields}. Une règle qui s’applique aussi à vous les a masqués, ou le message ne les contient pas.",
         "who_user": "utilisateur {name}",
         "who_group": "groupe {name}",
-        "who_addon": "addon {name}"
+        "who_addon": "addon {name}",
+        "summary_limited": "Les champs qu’une règle valable aussi pour vous masque déjà ne sont pas cités."
       },
       "hl7": {
         "msh_3": "Application émettrice",
@@ -11298,7 +11308,14 @@
       "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
       "fields_search": "Rechercher un champ",
       "fields_none": "Aucun champ ne correspond à la recherche.",
-      "stale": "La règle a changé entre-temps. La liste a été actualisée : vérifiez-la et réessayez."
+      "who": {
+        "named": "« {name} »",
+        "everyone_for": "tous",
+        "everyone_from": "tous"
+      },
+      "visible_outside": "Laisse aussi visibles : {fields}",
+      "changed_title": "Rien n’a été enregistré : la règle a changé entre-temps",
+      "changed_text": "Quelqu’un a modifié, ajouté ou supprimé cette règle avant l’enregistrement de votre modification, donc rien n’a été écrasé. Le tableau montre les règles telles qu’elles sont maintenant ; si vous voulez toujours cette modification, refaites-la."
     }
   },
   "composer": {

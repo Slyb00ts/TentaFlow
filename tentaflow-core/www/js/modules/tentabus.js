@@ -1528,15 +1528,13 @@ function openHidingWindow(name, action) {
     format,
     source,
     rules,
-    listPolicies: async () => (await ApiBinary.one('busFieldPolicyListRequest', { instanceId, topic: name }))?.policies || [],
-    reload: () => { if (still()) loadTopicHiding(name); },
     directory,
     setPolicy: reloadAfter((request) => ApiBinary.action('busFieldPolicySetRequest', request)),
     deleteRule: reloadAfter((request) => ApiBinary.action('busFieldPolicyDeleteRequest', request)),
     describeError: describeBusError,
     onSaved: async (notice) => {
       if (!still()) return;
-      state.detailNotice = { section: 'hiding', tone: 'success', title: notice.title, text: notice.text };
+      state.detailNotice = { section: 'hiding', tone: notice.tone || 'success', title: notice.title, text: notice.text };
       await loadTopicHiding(name);
     },
   };

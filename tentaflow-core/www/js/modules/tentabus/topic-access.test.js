@@ -279,8 +279,12 @@ test('"Nadaj dostęp": groups without an entry, a stale answer ignored, the righ
   await tick();
   const select = win.querySelector('[data-role="subject"]');
   assert.equal(select.getAttribute('label'), 'Która grupa');
-  assert.deepEqual([...select.querySelectorAll('select option')].map((o) => o.textContent), ['Rejestracja (5 osób)', 'Pielęgniarki (9 osób)'], 'Księgowość already has an entry; the late user list never lands');
+  assert.deepEqual([...select.querySelectorAll('select option')].map((o) => o.textContent), ['Wybierz…', 'Rejestracja (5 osób)', 'Pielęgniarki (9 osób)'], 'Księgowość already has an entry; the late user list never lands');
+  assert.equal(select.value, '', 'nobody is chosen for the administrator — not the first name of the list');
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /Wybierz, komu nadać dostęp/);
+  assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'), 'with nobody chosen there is nothing to save');
   assert.equal(win.querySelector('[data-role="pick-note"]').textContent, 'Na liście są grupy, które nie mają jeszcze wpisu.');
+  pick(select, 'group:g-rej');
   assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
     'Co się stanie po zapisaniu: 5 osób z grupy Rejestracja będzie mogło czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.');
   pick(win.querySelector('tf-segmented[data-right="read"]'), '');
@@ -310,6 +314,8 @@ test('"Nadaj dostęp" to an addon, and a refusal stays in the window in plain wo
   pick(win.querySelector('[data-role="kind"]'), 'addon');
   await tick();
   assert.equal(win.querySelector('[data-role="subject"]').getAttribute('label'), 'Który addon');
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /Wybierz, komu nadać dostęp/, 'the only addon is not chosen for the administrator either');
+  pick(win.querySelector('[data-role="subject"]'), 'addon:notatki');
   assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Addon „Notatki” dostanie w topiku wyniki-badan: czytanie\./);
   win.querySelector('[data-act="save"]').click();
   await tick();

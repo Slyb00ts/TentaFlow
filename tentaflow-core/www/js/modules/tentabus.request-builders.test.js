@@ -258,7 +258,7 @@ const ERROR_CODES = [
   'blocking_task_failed', 'max_groups_exceeded',
   'key_needs_topic_wide_rule', 'subject_is_addon', 'subject_not_found', 'org_mismatch',
   // What a data-hiding rule or its preview can be refused with.
-  'record_not_found', 'partition_out_of_range', 'field_not_allowed', 'required_field_missing', 'field_policy_payload_malformed',
+  'record_not_found', 'partition_out_of_range', 'field_not_allowed', 'required_field_missing', 'field_policy_payload_malformed', 'field_policy_changed',
 ];
 
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {

@@ -7,11 +7,13 @@
 // before it saves (`Co się stanie po zapisaniu`), and the fields are drawn
 // like the access rights: the field and its name, one segmented control.
 //
-// Before a rule is sent the window asks the server for the rules once more:
-// the server stores whatever it is sent, so a window opened before somebody
-// else saved a rule would silently overwrite it. A rule that appeared (add) or
-// changed or vanished (change) in the meantime is refused and the table
-// reloads.
+// A window opened before somebody else saved the same rule must not overwrite
+// it. The request therefore says what the window started from — "no such rule
+// yet" for an add, the rule's `updatedAtMs` for a change — and the server
+// refuses it (`bus.field_policy_changed`) when the stored rule is another one,
+// in the same transaction as the write. The window then closes with a note
+// saying nothing was saved, and the table shows the rules as they are now: a
+// window left open on a rule that has moved on would only refuse again.
 //
 // Fields come from the topic (`source`, see `fieldSource`): a row per known
 // field, and below them the typed-in ones — the server keeps only what is
@@ -24,7 +26,7 @@ import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/window
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import {
   SUBJECT_KINDS, DIRECTIONS, ANY_ID, whoTitle, whoSub, fieldPhrase, ruleFacts, actionOptions, blankForm, formFromRule, serializeForm,
-  parseForm, formProblem, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
+  parseForm, formProblem, typedProblems, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
 } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-select.js';
@@ -74,6 +76,7 @@ function extraHtml(role, label, hint) {
     <div class="field">
       <label>${escapeHtml(label)}</label>
       <tf-tag-input dedupe data-role="${role}" aria-label="${escapeAttr(label)}"></tf-tag-input>
+      <div class="tb-field-error" role="alert" data-role="${role}-problems" hidden></div>
       <div class="muted">${escapeHtml(hint)}</div>
     </div>`;
 }
@@ -100,8 +103,31 @@ function paintFields(win, { direction, form, source, format, sync }) {
   host.querySelector('[data-role="extra-shown"]').tags = form.extraShown;
   const required = host.querySelector('[data-role="extra-required"]');
   if (required) required.tags = form.extraRequired;
-  for (const input of host.querySelectorAll('tf-tag-input')) input.addEventListener('change', sync);
-  win.querySelector('[data-role="unlisted-note"]').textContent = listed ? T(`hiding.unlisted.${direction}`) : '';
+  const typedChanged = () => {
+    markTyped(win, format);
+    sync();
+  };
+  for (const input of host.querySelectorAll('tf-tag-input')) input.addEventListener('change', typedChanged);
+  markTyped(win, format);
+  // A HL7 writing rule also accepts the unnamed positions of the listed segments.
+  const unlisted = direction === 'write' && source.implicit.length ? 'write_hl7' : direction;
+  // A pattern that closes itself has no fields outside the list to warn about.
+  win.querySelector('[data-role="unlisted-note"]').textContent = listed && !source.complete ? T(`hiding.unlisted.${unlisted}`) : '';
+}
+
+/**
+ * Marks each typed-in address the format refuses on its chip and says why
+ * right under the field it was typed into — whether or not anyone is chosen
+ * yet, so a wrong address is never found only after the rest is filled in.
+ */
+function markTyped(win, format) {
+  for (const input of win.querySelectorAll('tf-tag-input[data-role]')) {
+    const problems = typedProblems(format, input.tags);
+    input.invalid = problems.map((p) => p.name);
+    const note = win.querySelector(`[data-role="${input.getAttribute('data-role')}-problems"]`);
+    note.textContent = problems.map((p) => p.text).join(' ');
+    note.hidden = problems.length === 0;
+  }
 }
 
 /** Shows the rows whose name or plain name holds what the field search holds. */
@@ -123,31 +149,33 @@ function filterRows(win) {
  * window has no control for and keeps as they are.
  */
 function readSerialized(win, source, hiddenImplicit = []) {
-  const actions = {};
+  const actions = Object.create(null);
   for (const seg of win.querySelectorAll('tf-segmented[data-field]')) actions[seg.getAttribute('data-field')] = seg.value || '';
   const tags = (role) => win.querySelector(`[data-role="${role}"]`)?.tags || [];
   return serializeForm({ actions, extraShown: tags('extra-shown'), extraRequired: tags('extra-required'), hiddenImplicit }, source);
 }
 
-/** The refusal of a rule that changed under an open window; `stale` tells it from the server's own refusals. */
-function staleError() {
-  return Object.assign(new Error('rule changed'), { stale: true });
-}
+/** Whether the server refused a write because the stored rule is no longer the one the window started from. */
+const isPolicyChanged = (err) => /\bbus\.field_policy_changed\b/.test(String(err?.message ?? ''));
 
 /**
- * Asks the server for the rules again and refuses the send when the one being
- * written is no longer what the window started from. `expected` = `null` for
- * a new rule (nobody may have stored it since) or the row being changed.
+ * Sends the rule; a rule that changed meanwhile is not an error of the window
+ * but its end: `{ changed: true }` closes it (see `savedNotice`).
  */
-async function ensureFresh(ctx, key, expected) {
-  const fresh = (await ctx.listPolicies()).find((p) => policyKey(p) === key) ?? null;
-  const unchanged = expected ? fresh != null && (fresh.updatedAtMs ?? null) === expected.updatedAtMs : fresh == null;
-  if (unchanged) return;
-  ctx.reload();
-  throw staleError();
+async function sendPolicy(ctx, request) {
+  try {
+    await ctx.setPolicy(request);
+    return { changed: false };
+  } catch (err) {
+    if (isPolicyChanged(err)) return { changed: true };
+    throw err;
+  }
 }
 
-const describeWith = (ctx) => (err) => (err?.stale ? T('hiding.stale') : ctx.describeError(err));
+/** The note after the window closed: what the rule does now, or that nothing was saved. */
+const savedNotice = (result, title, text) => (result.changed
+  ? { tone: 'warning', title: T('hiding.changed_title'), text: T('hiding.changed_text') }
+  : { title, text });
 
 // ---------------------------------------------------------------------------
 // Dodaj zasadę
@@ -155,9 +183,9 @@ const describeWith = (ctx) => (err) => (err?.stale ? T('hiding.stale') : ctx.des
 
 /**
  * "Dodaj zasadę". `ctx` = `{ instanceId, topic, format, source, rules (the
- * stored rows), directory({ kind, query }), listPolicies() (the rules now),
- * reload() (the section again), setPolicy(request),
- * describeError, onSaved(notice) }`.
+ * stored rows), directory({ kind, query }), setPolicy(request),
+ * describeError, onSaved(notice) }`; the notice carries a `tone` when it is
+ * not a success.
  */
 export function openHidingAdd(ctx) {
   const { topic, source, format } = ctx;
@@ -268,24 +296,27 @@ export function openHidingAdd(ctx) {
     },
     impact: (d) => {
       const subject = subjectOf(d.subject);
-      const lines = ruleImpact({ who: subject.label, direction: d.direction, form: formOf(d), current: null, source });
+      const lines = ruleImpact({ who: subject.label, everyone: subject.subjectType === 'any', direction: d.direction, form: formOf(d), current: null, source });
       if (closesTopicToKeys({ rules: ctx.rules, subjectType: subject.subjectType, direction: d.direction })) {
         lines.push(T('hiding.impact.keys_closed', { action: T(`hiding.direction_do.${d.direction}`) }));
       }
       return lines;
     },
-    save: async (d) => {
+    save: (d) => {
       const subject = subjectOf(d.subject);
-      await ensureFresh(ctx, `${subject.subjectType}:${subject.subjectId}:${d.direction}`, null);
-      return ctx.setPolicy(buildPolicyRequest({ instanceId: ctx.instanceId, topic, subject, direction: d.direction, form: formOf(d), source }));
-    },
-    describeError: describeWith(ctx),
-    onSaved: (d) => {
-      const subject = subjectOf(d.subject);
-      ctx.onSaved({
-        title: T('hiding.add.saved_title'),
-        text: ruleImpact({ who: subject.label, direction: d.direction, form: formOf(d), current: null, source }).join(' '),
+      return sendPolicy(ctx, {
+        ...buildPolicyRequest({ instanceId: ctx.instanceId, topic, subject, direction: d.direction, form: formOf(d), source }),
+        expectAbsent: true,
       });
+    },
+    describeError: ctx.describeError,
+    onSaved: (d, result) => {
+      const subject = subjectOf(d.subject);
+      ctx.onSaved(savedNotice(
+        result,
+        T('hiding.add.saved_title'),
+        ruleImpact({ who: subject.label, everyone: subject.subjectType === 'any', saved: true, direction: d.direction, form: formOf(d), current: null, source }).join(' '),
+      ));
     },
   });
 }
@@ -299,6 +330,7 @@ export function openHidingChange(row, ctx) {
   const { topic, source, format } = ctx;
   const stored = formFromRule(row, source);
   const who = whoTitle(row);
+  const everyone = row.subjectType === 'any';
   const current = { form: serializeForm(stored, source) };
   const formOf = (d) => parseForm(d.form, source) ?? stored;
   return openChangeWindow({
@@ -323,18 +355,19 @@ export function openHidingChange(row, ctx) {
     },
     draft: (w) => ({ form: readSerialized(w, source, stored.hiddenImplicit) }),
     problem: (d) => formProblem({ direction: row.direction, form: formOf(d), source, format }),
-    impact: (d) => ruleImpact({ who, direction: row.direction, form: formOf(d), current: stored, source }),
-    save: async (d) => {
-      await ensureFresh(ctx, row.key, row);
-      return ctx.setPolicy(buildPolicyRequest({
+    impact: (d) => ruleImpact({ who, everyone, direction: row.direction, form: formOf(d), current: stored, source }),
+    save: (d) => sendPolicy(ctx, {
+      ...buildPolicyRequest({
         instanceId: ctx.instanceId, topic, subject: { subjectType: row.subjectType, subjectId: row.subjectId }, direction: row.direction, form: formOf(d), source,
-      }));
-    },
-    describeError: describeWith(ctx),
-    onSaved: (d) => ctx.onSaved({
-      title: T('hiding.change.saved_title'),
-      text: ruleImpact({ who, direction: row.direction, form: formOf(d), current: stored, source }).join(' '),
+      }),
+      expectedUpdatedAtMs: row.updatedAtMs,
     }),
+    describeError: ctx.describeError,
+    onSaved: (d, result) => ctx.onSaved(savedNotice(
+      result,
+      T('hiding.change.saved_title'),
+      ruleImpact({ who, everyone, saved: true, direction: row.direction, form: formOf(d), current: stored, source }).join(' '),
+    )),
   });
 }
 

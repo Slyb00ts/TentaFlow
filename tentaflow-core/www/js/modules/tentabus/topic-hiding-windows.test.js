@@ -3,11 +3,12 @@
 // Description: The windows of Ukrywanie danych (U7): "Dodaj zasadę" (the
 // subject from the directory, only those without such a rule; reading or
 // writing; a row per known field from a pattern or the HL7 dictionary, typed-in
-// addresses checked before the request; "Wszyscy"), "Zmień" (subject and
-// direction fixed, the stored rule read back), "Usuń" (what the rule does now,
-// what follows); the exact FieldPolicySet / FieldPolicyDelete requests; a
-// refusal that stays in the window; a rule that changed under an open window
-// (refused, not overwritten); the warning that a first rule for chosen
+// addresses checked before the request and marked on their chips; "Wszyscy"),
+// "Zmień" (subject and direction fixed, the stored rule read back), "Usuń" (what
+// the rule does now, what follows); the exact FieldPolicySet / FieldPolicyDelete
+// requests; a refusal that stays in the window; a rule that changed under an
+// open window (the server's compare-and-set refuses it: the window closes with
+// a note and nothing is overwritten); the warning that a first rule for chosen
 // subjects closes the topic to API keys; the field search of a long list; and
 // the dirty-draft guard of the shared window ("Anuluj" included).
 // =============================================================================
@@ -63,15 +64,12 @@ function addContext(overrides = {}) {
   const sent = [];
   const saved = [];
   const asked = [];
-  const reloads = [];
   const ctx = {
     instanceId: INSTANCE,
     topic: TOPIC,
     format: 'json',
     source: json,
     rules: policyRows(POLICIES),
-    listPolicies: async () => POLICIES,
-    reload: () => reloads.push(1),
     directory: async (q) => { asked.push(q); return { entries: q.kind === 'group' ? GROUPS : q.kind === 'addon' ? [{ subjectType: 'addon', subjectId: 'asystent', label: 'Asystent lekarza' }] : [] }; },
     setPolicy: async (r) => { sent.push(r); },
     deleteRule: async (r) => { sent.push(r); },
@@ -79,7 +77,7 @@ function addContext(overrides = {}) {
     onSaved: (n) => saved.push(n),
     ...overrides,
   };
-  return { ctx, sent, saved, asked, reloads };
+  return { ctx, sent, saved, asked };
 }
 
 // ---------------------------------------------------------------------------
@@ -102,18 +100,18 @@ test('"Dodaj zasadę" for a group: only groups without a reading rule, a row per
   assert.deepEqual([...win.querySelectorAll('tf-segmented[data-field]')].map((s) => s.getAttribute('data-field')), ['pacjent', 'lekarz', 'termin', 'powod']);
   assert.deepEqual(optionLabels(rowFor(win, 'powod')), ['Pokaż', 'Ukryj']);
   assert.equal(norm(win.querySelector('[data-role="source-note"]').textContent), 'Pola pochodzą ze wzoru wiadomości wizyta, wersja 5.');
-  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /Pola, których nie ma na liście, też zostaną ukryte/);
+  assert.equal(win.querySelector('[data-role="unlisted-note"]').textContent, '', 'a pattern that closes itself has no other fields to warn about');
   assert.match(win.querySelector('[data-role="impact"]').textContent, /Ustaw co najmniej jedno pole na „Ukryj”/);
   assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'));
   pick(rowFor(win, 'powod'), 'hide');
   assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
-    'Co się stanie po zapisaniu: Dla „Księgowość” znikną z wiadomości pola: powód wizyty (powod). Pozostałe pola z listy bez zmian. Pola spoza listy też znikną, chyba że je dopiszesz.');
+    'Co się stanie po zapisaniu: Dla „Księgowość” znikną z wiadomości pola: powód wizyty (powod). Pozostałe pola z listy bez zmian.');
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
-    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [],
-  }]);
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], expectAbsent: true,
+  }], 'an add says there must be no such rule yet');
   assert.equal(saved[0].title, 'Zapisano zasadę');
   assert.match(saved[0].text, /^Dla „Księgowość” znikną z wiadomości pola: powód wizyty \(powod\)\./);
 });
@@ -127,19 +125,18 @@ test('the same group is offered again for writing; switching the direction redra
   assert.deepEqual([...win.querySelector('[data-role="subject"]').querySelectorAll('select option')].map((o) => o.textContent), ['Wybierz…', 'Rejestracja (5 osób)', 'Księgowość (4 osoby)']);
   chooseSubject(win, 'group:g-rej');
   assert.deepEqual(optionLabels(rowFor(win, 'pacjent')), ['Dozwolone', 'Wymagane', 'Niedozwolone']);
-  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /Wiadomość z polem spoza listy zostanie odrzucona/);
   assert.match(win.querySelector('[data-role="impact"]').textContent, /„Wymagane” albo „Niedozwolone”/);
   pick(rowFor(win, 'pacjent'), 'require');
   pick(rowFor(win, 'powod'), 'forbid');
   setTags(win, 'extra-required', ['nr']);
   assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
     'Co się stanie po zapisaniu: Wiadomość od „Rejestracja”, w której jest którekolwiek z pól: powód wizyty (powod), zostanie odrzucona i nie trafi do topiku. '
-    + 'Wiadomość od „Rejestracja”, w której brakuje któregokolwiek z pól: nr, dane pacjenta (pacjent), zostanie odrzucona i nie trafi do topiku. Odrzucona zostaje cała wiadomość, a nie samo pole. Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.');
+    + 'Wiadomość od „Rejestracja”, w której brakuje któregokolwiek z pól: nr, dane pacjenta (pacjent), zostanie odrzucona i nie trafi do topiku. Odrzucona zostaje cała wiadomość, a nie samo pole.');
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'write',
-    fields: ['lekarz', 'nr', 'pacjent', 'termin'], requiredFields: ['nr', 'pacjent'],
+    fields: ['lekarz', 'nr', 'pacjent', 'termin'], requiredFields: ['nr', 'pacjent'], expectAbsent: true,
   }]);
 });
 
@@ -155,7 +152,7 @@ test('"Wszyscy": no directory question, and a rule for everyone that exists is s
   assert.match(win.querySelector('[data-role="pick-note"]').textContent, /Systemy z kluczem API podlegają tylko tej zasadzie\./);
   assert.doesNotMatch(win.querySelector('[data-role="pick-note"]').textContent, /podmiot/);
   pick(rowFor(win, 'termin'), 'hide');
-  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Dla „Wszyscy” znikną z wiadomości pola: termin\./);
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Dla wszystkich znikną z wiadomości pola: termin\./);
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual([sent[0].subjectType, sent[0].subjectId, sent[0].direction, sent[0].fields], ['any', '*', 'read', ['lekarz', 'pacjent', 'powod']]);
@@ -189,6 +186,12 @@ test('an HL7 topic: the dictionary\'s fields with their names, a typed address c
   assert.match(problems, /„pid5” wygląda na literówkę\. Czy chodziło o PID-5\?/, 'every wrong address is answered, not only the first');
   assert.doesNotMatch(problems, /ZZZ-3/);
   assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'), 'the server would refuse it, so the window does not send it');
+  // The wrong chips are marked and explained under the field itself.
+  const chips = [...win.querySelectorAll('[data-role="extra-shown"] tf-chip')];
+  assert.deepEqual(chips.map((c) => [c.getAttribute('label'), c.getAttribute('tone')]), [['PID-0', 'critical'], ['pid5', 'critical'], ['ZZZ-3', 'neutral']]);
+  const under = win.querySelector('[data-role="extra-shown-problems"]');
+  assert.equal(under.hidden, false);
+  assert.match(norm(under.textContent), /„PID-0” nie jest adresem pola HL7.*„pid5” wygląda na literówkę/);
   setTags(win, 'extra-shown', ['PID-31']);
   assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną z wiadomości pola: Imię i nazwisko pacjenta \(PID-5\), Numer identyfikacyjny \(np\. PESEL\) \(PID-19\)\./);
   win.querySelector('[data-act="save"]').click();
@@ -197,8 +200,70 @@ test('an HL7 topic: the dictionary\'s fields with their names, a typed address c
   assert.equal(sent[0].fields.includes('PID-19'), false);
   assert.equal(sent[0].fields.includes('PID-31'), true, 'a typed field stays visible');
   assert.equal(sent[0].fields.includes('PID-3'), true);
-  assert.equal(sent[0].fields.length, hl7.fields.length - 2 + hl7.implicit.length, 'the unnamed positions of the dictionary\'s segments stay allowed');
-  assert.ok(['MSH-11', 'MSH-12', 'PID-1', 'PID-4', 'EVN-1'].every((f) => sent[0].fields.includes(f)));
+  assert.equal(sent[0].fields.length, hl7.fields.length - 2 + 1, 'a reading rule lets through what the window lists and what was typed — nothing else');
+  assert.ok(['PID-1', 'PID-4', 'PID-20', 'NK1-6', 'IN1-9'].every((f) => !sent[0].fields.includes(f)), 'the unnamed positions are hidden, as the window says');
+  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /Pola, których nie ma na liście, też zostaną ukryte/);
+});
+
+test('a wrong typed address is marked on its chip and explained under the field before anyone is chosen', async () => {
+  closeAll();
+  const { ctx } = addContext({ format: 'hl7v2', source: hl7, directory: async () => ({ entries: [] }) });
+  const win = openHidingAdd(ctx);
+  await tick();
+  setTags(win, 'extra-shown', ['MSH-2', 'PID-5', 'pid5']);
+  assert.deepEqual([...win.querySelectorAll('[data-role="extra-shown"] tf-chip')].map((c) => c.getAttribute('tone')), ['critical', 'neutral', 'critical']);
+  const under = norm(win.querySelector('[data-role="extra-shown-problems"]').textContent);
+  assert.match(under, /MSH-2 to separatory samej wiadomości/);
+  assert.match(under, /„pid5” wygląda na literówkę/);
+  assert.ok(under.indexOf('MSH-2') < under.indexOf('pid5'), 'in the order typed');
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Wybierz, dla kogo jest zasada\./, 'nobody chosen yet, and the address is still marked');
+  setTags(win, 'extra-shown', ['PID-5']);
+  assert.equal(win.querySelector('[data-role="extra-shown-problems"]').hidden, true, 'the mark goes with the mistake');
+  assert.ok([...win.querySelectorAll('[data-role="extra-shown"] tf-chip')].every((c) => c.getAttribute('tone') === 'neutral'));
+});
+
+test('an HL7 WRITING rule allows the unnamed positions of the listed segments and says so; a missing rule is expected absent', async () => {
+  closeAll();
+  const { ctx, sent } = addContext({ format: 'hl7v2', source: hl7, rules: [], directory: async () => ({ entries: [{ subjectType: 'group', subjectId: 'g-ksieg', label: 'Księgowość', memberCount: 4 }] }) });
+  const win = openHidingAdd(ctx);
+  await tick();
+  pick(win.querySelector('[data-role="direction"]'), 'write');
+  chooseSubject(win, 'group:g-ksieg');
+  assert.match(win.querySelector('[data-role="unlisted-note"]').textContent, /^Pozostałe pozycje segmentów z listy \(np\. PID-1, PID-4, MSH-11\) są przyjmowane\./);
+  pick(rowFor(win, 'PID-19'), 'forbid');
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Pozostałe pozycje segmentów z listy .* są przyjmowane\. Wiadomość z innym segmentem, np\. segmentem Z, zostanie odrzucona/);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.ok(hl7.implicit.every((f) => sent[0].fields.includes(f)), 'a real message passes');
+  assert.equal(sent[0].fields.includes('PID-19'), false);
+  assert.equal(sent[0].expectAbsent, true);
+});
+
+test('a field called __proto__ keeps its choice through the window', async () => {
+  closeAll();
+  const odd = fieldSource({ format: 'json', schema: { subject: 's', version: 1, text: '{"properties":{"__proto__":{},"a":{}}}' } });
+  const { ctx, sent } = addContext({ source: odd });
+  const win = openHidingAdd(ctx);
+  await tick();
+  chooseSubject(win, 'group:g-ksieg');
+  pick(rowFor(win, '__proto__'), 'hide');
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną z wiadomości pola: __proto__\./);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(sent[0].fields, ['a'], 'hidden: not in the allowed list');
+});
+
+test('"Zmień" of a reading rule that lets unnamed HL7 positions through lists them as typed-in fields the administrator can take out', async () => {
+  closeAll();
+  const stored = { ...policyRows(POLICIES)[1], fields: [...hl7.fields.map((f) => f.name), 'PID-4', 'PID-20'], requiredFields: [] };
+  const { ctx, sent } = addContext({ format: 'hl7v2', source: hl7 });
+  const win = openHidingChange(stored, ctx);
+  assert.deepEqual(win.querySelector('[data-role="extra-shown"]').tags, ['PID-20', 'PID-4']);
+  setTags(win, 'extra-shown', ['PID-4']);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(sent[0].fields.includes('PID-20'), false, 'taken out');
+  assert.equal(sent[0].fields.includes('PID-4'), true);
 });
 
 test('a long field list has a search: it narrows the rows by address or plain name and says when nothing matches', async () => {
@@ -342,34 +407,39 @@ test('the add window says whether the directory is empty or everyone on it alrea
   assert.equal(taken.querySelector('[data-role="pick-note"]').textContent, 'Każdy z tej listy ma już taką zasadę w tym topiku.');
 });
 
-test('a rule that appeared since the window opened is not overwritten: the new one is refused, the section reloads', async () => {
+// What the server says when the stored rule is not the one a request expected.
+const changedError = () => new Error('protocol error Conflict: bus.field_policy_changed: topic \'wizyty\'');
+
+test('a rule that appeared since the window opened is refused by the server: the window closes with a note, nothing is overwritten', async () => {
   closeAll();
-  const appeared = [...POLICIES, { subjectType: 'group', subjectId: 'g-ksieg', direction: 'read', fields: ['pacjent'], requiredFields: [], updatedAtMs: NOW, subjectLabel: 'Księgowość', memberCount: 4 }];
-  const { ctx, sent, saved, reloads } = addContext({ listPolicies: async () => appeared });
+  const { ctx, saved } = addContext({ setPolicy: async () => { throw changedError(); } });
   const win = openHidingAdd(ctx);
   await tick();
   chooseSubject(win, 'group:g-ksieg');
   pick(rowFor(win, 'powod'), 'hide');
   win.querySelector('[data-act="save"]').click();
-  await tick();
-  assert.deepEqual(sent, [], 'nothing was written');
-  assert.equal(norm(win.querySelector('[data-role="error"]').textContent), 'Zasada zmieniła się w międzyczasie. Odświeżyliśmy listę — sprawdź ją i spróbuj jeszcze raz.');
-  assert.equal(win.isConnected, true);
-  assert.deepEqual(saved, []);
-  assert.equal(reloads.length, 1);
+  await tick(350);
+  assert.equal(win.isConnected, false, 'a window left open on a rule that has moved on would only refuse again');
+  assert.deepEqual(saved, [{
+    tone: 'warning',
+    title: 'Nic nie zapisano — zasada zmieniła się w międzyczasie',
+    text: 'Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz.',
+  }]);
+  assert.ok(!JSON.stringify(saved).includes('spróbuj jeszcze raz'), 'no promise a second try in the same window could keep');
 });
 
-test('a failing re-read of the rules sends nothing either', async () => {
+test('only that refusal closes the window: any other one stays in it with its reason', async () => {
   closeAll();
-  const { ctx, sent } = addContext({ listPolicies: async () => { throw new Error('Unavailable'); } });
+  const { ctx, saved } = addContext({ setPolicy: async () => { throw new Error('protocol error PolicyDenied: bus.permission_denied: admin on \'wizyty\''); } });
   const win = openHidingAdd(ctx);
   await tick();
   chooseSubject(win, 'group:g-ksieg');
   pick(rowFor(win, 'powod'), 'hide');
   win.querySelector('[data-act="save"]').click();
-  await tick();
-  assert.deepEqual(sent, []);
-  assert.equal(norm(win.querySelector('[data-role="error"]').textContent), 'błąd: Unavailable');
+  await tick(350);
+  assert.equal(win.isConnected, true);
+  assert.match(norm(win.querySelector('[data-role="error"]').textContent), /^błąd: protocol error PolicyDenied/);
+  assert.deepEqual(saved, []);
 });
 
 test('"Anuluj" asks once like the close button and Escape when the draft is changed; an untouched window leaves at once', async () => {
@@ -412,13 +482,13 @@ test('"Zmień": subject and direction fixed, the stored rule read back as hidden
   pick(rowFor(win, 'termin'), 'hide');
   assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
     'Co się stanie po zapisaniu: Dla „Rejestracja” znikną z wiadomości pola: termin. '
-    + 'Dla „Rejestracja” pojawią się w wiadomościach pola: powód wizyty (powod). Pozostałe pola z listy bez zmian. Pola spoza listy też znikną, chyba że je dopiszesz.');
+    + 'Dla „Rejestracja” pojawią się w wiadomościach pola: powód wizyty (powod). Pozostałe pola z listy bez zmian.');
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'read',
-    fields: ['lekarz', 'pacjent', 'powod'], requiredFields: [],
-  }]);
+    fields: ['lekarz', 'pacjent', 'powod'], requiredFields: [], expectedUpdatedAtMs: NOW,
+  }], 'a change says which version of the rule it was made from');
   assert.equal(saved[0].title, 'Zapisano zmianę zasady');
   assert.doesNotMatch(saved[0].text, /niżej/, 'the note outlives the window, so it points at nothing below');
 
@@ -440,30 +510,32 @@ test('a stored field outside the known list comes back in the typed-in list and 
   assert.deepEqual(sent[0].fields, ['pacjent', 'powod', 'telefon']);
 });
 
-test('a rule that changed or vanished since "Zmień" opened is not overwritten', async () => {
+test('a rule that changed or vanished since "Zmień" opened is refused by the server; the window closes with the note', async () => {
   closeAll();
   const [, group] = policyRows(POLICIES);
-  const edit = async (listPolicies) => {
-    const harness = addContext({ listPolicies });
-    const win = openHidingChange(group, harness.ctx);
-    pick(rowFor(win, 'termin'), 'hide');
-    win.querySelector('[data-act="save"]').click();
-    await tick();
-    return { ...harness, win };
-  };
-  const newer = POLICIES.map((p) => (p.subjectId === 'g-rej' ? { ...p, updatedAtMs: NOW + 1000, fields: ['pacjent'] } : p));
-  const changed = await edit(async () => newer);
-  assert.deepEqual(changed.sent, [], 'the newer rule stays');
-  assert.equal(norm(changed.win.querySelector('[data-role="error"]').textContent), 'Zasada zmieniła się w międzyczasie. Odświeżyliśmy listę — sprawdź ją i spróbuj jeszcze raz.');
-  assert.equal(changed.reloads.length, 1);
+  const harness = addContext({ setPolicy: async () => { throw changedError(); } });
+  const win = openHidingChange(group, harness.ctx);
+  pick(rowFor(win, 'termin'), 'hide');
+  win.querySelector('[data-act="save"]').click();
+  await tick(350);
+  assert.equal(win.isConnected, false);
+  assert.equal(harness.saved.length, 1);
+  assert.equal(harness.saved[0].tone, 'warning');
+  assert.equal(harness.saved[0].title, 'Nic nie zapisano — zasada zmieniła się w międzyczasie');
+});
+
+test('a window does not guess about the rule it started from: it sends what it was given, so the server alone decides', async () => {
   closeAll();
-  const gone = await edit(async () => POLICIES.filter((p) => p.subjectId !== 'g-rej'));
-  assert.deepEqual(gone.sent, [], 'a deleted rule is not brought back by a stale editor');
-  assert.match(gone.win.querySelector('[data-role="error"]').textContent, /Zasada zmieniła się w międzyczasie/);
-  closeAll();
-  const same = await edit(async () => POLICIES);
-  assert.equal(same.sent.length, 1, 'an unchanged rule is saved');
-  assert.equal(same.reloads.length, 0);
+  const [, group] = policyRows(POLICIES);
+  const { ctx, sent, saved } = addContext();
+  const win = openHidingChange({ ...group, updatedAtMs: 1234 }, ctx);
+  pick(rowFor(win, 'termin'), 'hide');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].expectedUpdatedAtMs, 1234);
+  assert.equal(sent[0].expectAbsent, undefined);
+  assert.equal(saved[0].tone, undefined, 'a saved rule is a success note');
 });
 
 // ---------------------------------------------------------------------------

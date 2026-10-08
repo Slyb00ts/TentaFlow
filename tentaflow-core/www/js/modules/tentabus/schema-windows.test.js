@@ -279,7 +279,25 @@ test('"Nowa wersja": starts from the newest text, says the difference, is refuse
   closeAll();
   const reopened = openSchemaVersion({ instanceId: 'i', subject: wizyta, latestText: V1, draftText: next, register: async () => ({ version: 3, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: () => {} });
   assert.equal(reopened.querySelector('[data-role="text"]').value, next);
-  assert.match(reopened.querySelector('.tb-explain-box').textContent, /z poprzedniej próby/);
+  assert.match(reopened.querySelector('.tb-explain-box').textContent, /To tekst z poprzedniego otwarcia tego okna — nie został dodany jako wersja\./);
+});
+
+test('"Nowa wersja": the question before closing a changed draft says the text is kept, because it is', async () => {
+  closeAll();
+  const drafts = [];
+  const win = openSchemaVersion({ instanceId: 'i', subject: wizyta, latestText: V1, draftText: null, register: async () => ({ version: 3, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: (t) => drafts.push(t) });
+  const next = JSON.stringify({ ...JSON.parse(V1), title: 'inna' });
+  type(win.querySelector('[data-role="text"]'), next);
+  win.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(win.isConnected, true, 'the first close only asks');
+  const asked = norm(win.querySelector('[data-role="discard"]').textContent);
+  assert.match(asked, /Ta wersja nie jest jeszcze dodana\. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie\./);
+  assert.doesNotMatch(asked, /porzuc/, 'nothing is discarded');
+  win.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(win.isConnected, false);
+  assert.deepEqual(drafts, [next], 'and it is kept, as the question said');
 });
 
 test('"Nowa wersja": a new version and the same text again both close with the answer', async () => {

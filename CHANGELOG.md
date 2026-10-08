@@ -219,21 +219,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   daje wzór wiadomości topiku JSON (właściwości, także z `allOf`, `oneOf`,
   `anyOf`, `if`/`then`/`else` i lokalnych `$ref`; wzór z odwołaniem do innego
   pliku, `patternProperties` albo `additionalProperties` jako schematem
-  traktujemy jak brak listy), podręczny słownik około sześćdziesięciu pól HL7 v2
-  z nazwami w pięciu językach (pozostałe pozycje tych segmentów, np. MSH-11,
-  PID-1, PID-4, EVN-1, są domyślnie dozwolone, więc zwykła wiadomość nie jest
-  odrzucana; adres spoza słownika wpisuje się ręcznie i jest sprawdzany przed
-  wysłaniem tak jak na serwerze, każdy błędny osobno) albo, gdy listy nie ma
+  traktujemy jak brak listy; tak samo wzór zagłębiony ponad 32 poziomy,
+  `$ref` do schematu `true`/`false`, `unevaluatedProperties` jako schemat
+  i `dependentSchemas`), podręczny słownik około sześćdziesięciu pól HL7 v2
+  z nazwami w pięciu językach. Przy **zapisie** pozostałe pozycje tych
+  segmentów (MSH-11, PID-1, PID-4, EVN-1, …; do szerokości z HL7 v2.8, także
+  PV2, PD1, ROL, GT1, IN2, SFT, TQ1, SPM, MSA, ERR, MRG i NTE-1…9) są domyślnie
+  dozwolone, więc zwykła wiadomość nie jest odrzucana, a okno mówi, że
+  odrzucony zostanie dopiero inny segment (np. Z). Zasada **odczytu** nigdy
+  ich nie dodaje: co nie jest na liście, jest ukryte, tak jak mówi okno
+  (wcześniej nowa zasada odczytu zostawiała widoczne ok. 290 pozycji, np.
+  PID-4, PID-20, NK1-*, IN1-*). Zapisana wcześniej zasada odczytu, która
+  przepuszcza takie pozycje, pokazuje je w „Zmień” jako wpisane pola (można je
+  usunąć), a tabela wymienia je w „Zostawia też widoczne”. Adres spoza
+  słownika wpisuje się ręcznie i jest sprawdzany przed wysłaniem tak jak na
+  serwerze; błędny adres jest zaznaczony na swoim chipie i opisany pod polem,
+  także zanim wybrano, dla kogo jest zasada albo, gdy listy nie ma
   (XML, JSON bez wzoru), pola do pozostawienia wpisuje się w całości. Długą
   listę pól można przeszukać. Topik z treścią binarną nie jest tu edytowany,
   a sekcja mówi dlaczego i odsyła do ustawień topiku.
-- Zapis zasady sprawdza najpierw, czy nikt jej w międzyczasie nie dodał ani nie
-  zmienił; jeśli tak, okno mówi „Zasada zmieniła się w międzyczasie” i nic nie
-  nadpisuje. Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
+- Zapis zasady jest porównywany z tym, co jest zapisane, **na serwerze, w tej
+  samej transakcji co zapis** (`FieldPolicySetRequest.expected_updated_at_ms`
+  — zasada ma istnieć z dokładnie tym czasem zmiany — albo `expect_absent` —
+  zasady jeszcze nie ma; oba pola dopisane na końcu z `#[serde(default)]`,
+  więc starsi klienci zapisują bezwarunkowo, a oba naraz to
+  `bus.invalid_argument`). Rozbieżność daje `bus.field_policy_changed`
+  (`Conflict`): okno zamyka się z notatką „Nic nie zapisano — zasada zmieniła
+  się w międzyczasie”, tabela pokazuje aktualne zasady i nic nie jest
+  nadpisane. Zapis, który zastępuje zasadę, zawsze ustawia czas zmiany
+  powyżej poprzedniego, żeby dwa zapisy w tej samej milisekundzie nie miały
+  wspólnej wartości porównania. Odczyt przed zapisem po stronie przeglądarki
+  został usunięty. Synchronizacja tabeli `bus_field_policies` między nodami
+  (ledger, operacje stosowane w kolejności HLC) nie jest ruszana i porównania
+  nie wykonuje: zmiana zreplikowana na ten node przed zapisem zmienia czas
+  zmiany zasady, więc okno otwarte na starej wersji jest odrzucane, a zmiana,
+  która dotrze po zapisie, stosuje się jak każda replikowana (ostatnia w
+  kolejności HLC wygrywa). Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
   dla wybranych osób zamknie topik dla systemów z kluczem API; nikogo nie
   wybiera za administratora.
 - Lista zasad topiku (`FieldPolicyListRequest`) jest tylko dla administratora
   tego topiku; czytelnik widzi wyłącznie podgląd wiadomości z własnym ukrywaniem.
+  Jedno sprawdzenie (`require_topic_admin`: administrator tego topiku według
+  jego ACL, w tym zakaz `admin`, i rola Admin w organizacji) stoi teraz za
+  listą, zapisem i usunięciem zasady, podglądem, wzorem pochodnym
+  (`SchemaDerivedGetRequest`) i nadawaniem albo zabranianiem dostępu
+  (`AclSetRequest`). `SchemaDerivedGetRequest` był dostępny dla każdego
+  czytelnika instancji i pozwalał odczytać wzór pochodny dowolnej zasady
+  oraz sprawdzić, czy zasada istnieje; nie używa go żaden ekran ani addon,
+  więc jest tylko dla administratora topiku. Usunięcie wpisu dostępu
+  (`clear`) zostaje na poziomie administratora instancji z rolą Admin, żeby
+  zakaz administracji topikiem dało się zdjąć.
 - „Dodaj zasadę” wybiera osobę, grupę, addon z katalogu (tylko tych, którzy nie
   mają jeszcze zasady w tym kierunku) albo Wszystkich, kierunek i dla każdego
   pola Pokaż / Ukryj (przy zapisie: Dozwolone / Wymagane / Niedozwolone);
@@ -246,12 +281,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ukrytych pól. Okno mówi, że każdy podgląd zapisuje się w dzienniku audytu,
   a gdy zasada obowiązująca samego administratora ukrywa pola, które zobaczy
   wybrany odbiorca (`limited_by_caller`), wyjaśnia, że podgląd jest węższy niż
-  jego widok, i wymienia pola, których może brakować. Wynik znika, gdy zmieni
-  się osoba, grupa albo wiadomość.
+  jego widok, wymienia pola wzoru, których w podglądzie nie ma (ukryła je
+  zasada, która obowiązuje także administratora, albo wiadomość ich nie ma),
+  i mówi, że pól ukrytych już przez jego zasadę nie wymienia w „Co zrobiły
+  zasady”. Wynik znika, gdy zmieni się osoba, grupa albo wiadomość.
   Pod tabelą widać, w którym kierunku topik jest zamknięty dla kluczy API (są
   zasady dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich).
 - Błędy: `bus.record_not_found` ma tłumaczenie, a `bus.subject_not_found`
-  mówi o osobie, kluczu albo addonie (nie tylko o kluczu).
+  mówi o osobie, kluczu albo addonie (nie tylko o kluczu); nowy
+  `bus.field_policy_changed`.
+- Notatka po zapisie nie odsyła do zamkniętego okna („chyba że je dopiszesz”),
+  a dla wzoru zamkniętego (`additionalProperties: false`) nie mówi o polach
+  spoza listy. W zdaniach o skutkach zasada dla wszystkich brzmi „dla
+  wszystkich”, a nie „dla „Wszyscy””. Pola nazwane `__proto__` albo
+  `constructor` zachowują swoje ustawienie.
+- „Usuń topik” mówi, że zasad ukrywania danych nie udało się policzyć, gdy
+  lista zasad nie odpowiedziała, zamiast liczyć je jako zero. „Nowa wersja”
+  wzoru mówi przed zamknięciem, że tekst zostanie zachowany (bo tak jest).
+  „Nadaj dostęp” nie wybiera za administratora pierwszej grupy z listy, a
+  kreator topiku pyta przed porzuceniem wpisanych danych tak jak inne okna.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

@@ -55,3 +55,16 @@ test('the unnamed positions of the dictionary\'s segments are allowed by default
   assert.ok(['MSH-1', 'MSH-2'].every((a) => !HL7_IMPLICIT_FIELDS.includes(a)));
   assert.ok(['MSH-8', 'MSH-11', 'MSH-12'].every((a) => HL7_FIELDS.includes(a)), 'the structural fields every message carries have rows');
 });
+
+test('the common segments beyond the first dozen are covered up to the width HL7 v2.8 defines, so an ordinary message is not refused', () => {
+  const widest = {
+    PV2: 49, PD1: 22, ROL: 13, GT1: 57, IN2: 85, SFT: 6, TQ1: 14, SPM: 30, MSA: 6, ERR: 12, MRG: 7, NTE: 9,
+  };
+  for (const [segment, width] of Object.entries(widest)) {
+    for (const n of [1, 2, width]) assert.ok(HL7_IMPLICIT_FIELDS.includes(`${segment}-${n}`), `${segment}-${n}`);
+    assert.ok(!HL7_IMPLICIT_FIELDS.includes(`${segment}-${width + 1}`), `${segment} stops at ${width}`);
+  }
+  assert.ok(HL7_IMPLICIT_FIELDS.includes('NTE-9'), 'NTE has nine fields since v2.7, not four');
+  assert.ok(!HL7_IMPLICIT_FIELDS.includes('ZPI-1'), 'a Z segment is the administrator\'s to name');
+});
+

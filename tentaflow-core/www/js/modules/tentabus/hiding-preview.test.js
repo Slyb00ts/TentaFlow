@@ -95,15 +95,17 @@ test('a preview narrowed by the administrator\'s own rule says so, in plain word
   assert.ok(html.indexOf('data-role="limited"') < html.indexOf('tb-preview-record'), 'the explanation comes before the record it qualifies');
 });
 
-test('a narrowed preview names the known fields that are neither in the record nor in the answer — the administrator\'s own rule may hide them', () => {
+test('a narrowed preview names the pattern\'s fields that are not in it, without claiming the message has them, and says what it leaves out', () => {
   const narrowed = { record: { ...record, payloadPreview: bytes('{"pacjent":"x"}') }, applied: [{ field: 'pacjent', action: 'show' }], limitedByCaller: true };
   assert.deepEqual(missingFields({ resp: narrowed, source: json }), ['lekarz', 'powod']);
   const host = document.createElement('div');
   host.innerHTML = previewResultHtml({ resp: narrowed, subject: { subjectType: 'group', label: 'Rejestracja' }, source: json, nowMs: NOW });
   assert.match(host.querySelector('[data-role="limited"]').getAttribute('message'),
-    / Mogą tu brakować pól: lekarz, powod\. Jeśli wiadomość je zawiera, ukrywa je zasada, która obowiązuje także Ciebie\.$/);
+    / W tym podglądzie nie ma pól wzoru: lekarz, powod\. Ukryła je zasada, która obowiązuje także Ciebie, albo wiadomość ich nie zawiera\.$/);
+  assert.match(norm(host.querySelector('[data-role="summary"]').textContent), /Nie wymieniamy pól, które ukrywa już zasada obowiązująca także Ciebie\.$/,
+    'the fields the administrator\'s own rule hid are not in "Co zrobiły zasady", and that is said');
   const full = previewResultHtml({ resp: { ...narrowed, limitedByCaller: false }, subject: { subjectType: 'group', label: 'Rejestracja' }, source: json, nowMs: NOW });
-  assert.doesNotMatch(full, /Mogą tu brakować/, 'only a narrowed preview has anything to explain');
+  assert.doesNotMatch(full, /nie ma pól wzoru|Nie wymieniamy/, 'only a narrowed preview has anything to explain');
   assert.deepEqual(missingFields({ resp: narrowed, source: fieldSource({ format: 'hl7v2', schema: null }) }), [], 'a dictionary lists what most messages carry, not what this one should');
   const empty = { ...narrowed, record: { ...record, payloadPreview: bytes('{}') }, applied: [] };
   assert.deepEqual(missingFields({ resp: empty, source: json }), ['pacjent', 'lekarz', 'powod'], 'an empty record does not look like a full one');

@@ -6,7 +6,9 @@
 //   chip × button or Backspace on the empty entry.
 //   Attributes: placeholder, disabled, max-tags, dedupe.
 //   Property: .tags (array of strings — the committed chip values), .separators
-//   (array of single-char separator strings, default [',']).
+//   (array of single-char separator strings, default [',']), .invalid (array of
+//   tag values the caller found wrong: their chips turn critical and carry
+//   aria-invalid; the component itself does not judge a value).
 //   Events: add (detail: {tag}), remove (detail: {tag, index}), change
 //   (detail: {tags}). All bubble. Chips reuse <tf-chip removable>.
 // =============================================================================
@@ -22,6 +24,7 @@ class TfTagInput extends HTMLElement {
     this._chipHost = null;
     this._input = null;
     this._tags = [];
+    this._invalid = new Set();
     this._separators = [','];
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onBlur = this._onBlur.bind(this);
@@ -42,6 +45,13 @@ class TfTagInput extends HTMLElement {
 
   set tags(arr) {
     this._tags = Array.isArray(arr) ? arr.map((t) => String(t)) : [];
+    this._renderTags();
+  }
+
+  get invalid() { return [...this._invalid]; }
+
+  set invalid(arr) {
+    this._invalid = new Set(Array.isArray(arr) ? arr.map((t) => String(t)) : []);
     this._renderTags();
   }
 
@@ -113,7 +123,9 @@ class TfTagInput extends HTMLElement {
       const tag = this._tags[i];
       const chip = document.createElement('tf-chip');
       chip.setAttribute('variant', 'tag');
-      chip.setAttribute('tone', 'neutral');
+      const wrong = this._invalid.has(tag);
+      chip.setAttribute('tone', wrong ? 'critical' : 'neutral');
+      if (wrong) chip.setAttribute('aria-invalid', 'true');
       if (!this.hasAttribute('disabled')) chip.setAttribute('removable', '');
       chip.setAttribute('label', tag);
       chip.addEventListener('remove', () => this._removeAt(i));

@@ -663,6 +663,10 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await name.locator('input').fill('wyniki-z-pracowni');
   await expect(name.locator('.tf-error-text')).toBeHidden();
   await expect(creator(page).locator('[data-role="heading"]')).toHaveText('wyniki-z-pracowni');
+  // "Anuluj" with a name typed asks first, like the close button and Escape in the other windows.
+  await creator(page).locator('[data-act="cancel"]').click();
+  await expect(creator(page).locator('[data-role="discard"]')).toBeVisible();
+  await expect(creator(page)).toHaveCount(1);
   await expect(creator(page).locator('#tb-cr-kind tf-choice-card')).toHaveCount(3);
   await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/json"]').click();
   await creator(page).locator('#tb-cr-partitions .tf-input-step--inc').click();
@@ -886,7 +890,10 @@ test('T11 Szkolenia: the empty list leads to the creator with one copy and no pa
   await expect(creator(page).locator('.tb-explain-box')).toContainText('W instancji Szkolenia nie ma jeszcze wzorów wiadomości');
   await expect(creator(page).locator('.tb-kv-grid')).toContainText('bez wzoru');
   await page.screenshot({ path: path.join(SHOTS, 't11-szkolenia-nowy-krok3.png') });
-  // Closing leaves the instance as empty as it was.
+  // Closing leaves the instance as empty as it was — after asking once, because a name is typed.
+  await page.keyboard.press('Escape');
+  await expect(creator(page).locator('[data-role="discard"]')).toBeVisible();
+  await expect(creator(page)).toHaveCount(1);
   await page.keyboard.press('Escape');
   await expect(creator(page)).toHaveCount(0);
   await expect(empty).toBeVisible();
@@ -2266,7 +2273,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
 
   // "Nowa wersja" comes back with the refused text.
   await p.locator('[data-role="new-version"]').click();
-  await expect(win.locator('.tb-explain-box')).toContainText('z poprzedniej próby');
+  await expect(win.locator('.tb-explain-box')).toContainText('z poprzedniego otwarcia tego okna');
   await expect(win.locator('[data-role="text"] textarea')).toHaveValue(REFERRAL_V2);
   await win.locator('[data-act="save"]').click();
   await expect(win).toHaveCount(0, { timeout: 15000 });
@@ -2504,6 +2511,9 @@ test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, 
     const win = accessWindow(page);
     await expect(win).toHaveCount(1);
     await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    // Nobody is chosen for the administrator: not the first group of the list.
+    await expect(win.locator('[data-role="subject"] select')).toHaveValue('');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
     await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
     await expect(win.locator('[data-role="impact"]')).toContainText(`1 osoba z grupy ${groupName} będzie mogła czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.`);
     await windowFits(page, 'tf-window.tb-access-window', DESKTOP.width);
@@ -2839,6 +2849,18 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zmianę zasady');
     expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:read`].fields).toEqual(['gabinet', 'pacjent']);
 
+    // Zmień on a rule somebody else saved meanwhile: the server refuses the stale save, the window
+    // closes with a plain note, and what the other administrator stored stays.
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await expect(win).toHaveCount(1);
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Ukryj');
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: 'wizyty', subjectType: 'group', subjectId: groupId, direction: 'read', fields: ['gabinet', 'pacjent'], requiredFields: [] });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Nic nie zapisano — zasada zmieniła się w międzyczasie');
+    await expect(s.locator('[data-role="notice"] tf-alert')).not.toHaveAttribute('message', /spróbuj jeszcze raz/);
+    expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:read`].fields).toEqual(['gabinet', 'pacjent']);
+
     // Podgląd, jak widzi…: the newest message as the group reads it, and the audit entry.
     const audits = auditCount('bus.field_policy.preview');
     await s.locator('tf-button[data-go="hiding-preview"]').click();
@@ -2958,6 +2980,9 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
     await tags.press('Enter');
     await expect(win.locator('[data-role="impact"]')).toContainText('„PID-0” nie jest adresem pola HL7. Adres ma postać SEGMENT-numer, np. PID-5.');
     await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    // The wrong address is marked on its chip and explained under the field itself.
+    await expect(win.locator('tf-tag-input[data-role="extra-shown"] tf-chip').first()).toHaveAttribute('tone', 'critical');
+    await expect(win.locator('[data-role="extra-shown-problems"]')).toContainText('„PID-0” nie jest adresem pola HL7.');
     await win.locator('tf-tag-input[data-role="extra-shown"] tf-chip').first().evaluate((chip) => chip.dispatchEvent(new CustomEvent('remove')));
     await tags.fill('PID-31');
     await tags.press('Enter');
@@ -2981,8 +3006,12 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
     await pickSegment(preview, '[data-role="kind"]', 'Wszyscy');
     await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
     await preview.locator('[data-act="show"]').click();
-    // The unnamed positions of the dictionary's segments (MSH-11, PID-1, …) stay allowed, so the rule hides the two chosen fields and nothing else of the message.
-    await expect(preview.locator('[data-role="summary"]')).toHaveText('Zasady ukryły 2 pola: PID-5, PID-8.', { timeout: 15000 });
+    // A reading rule hides what it does not list — the positions nobody named (PID-1, PID-4, …) too, as its window says.
+    await expect(preview.locator('[data-role="summary"]')).toContainText('Zasady ukryły', { timeout: 15000 });
+    const hiddenFields = await preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"] .mono').allInnerTexts();
+    expect(hiddenFields).toEqual(expect.arrayContaining(['PID-1', 'PID-4', 'PID-5', 'PID-8']));
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]')).not.toHaveCount(0);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]', { hasText: 'PID-5' })).toHaveCount(0);
     await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]', { hasText: 'PID-5' })).toContainText('Imię i nazwisko pacjenta');
     const message = await preview.locator('[data-role="payload"]').innerText();
     expect(message).toContain('MSH|');
