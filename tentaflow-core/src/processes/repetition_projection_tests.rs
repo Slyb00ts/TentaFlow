@@ -35,6 +35,7 @@ fn real_twenty_group_and_occurrence_pages_preserve_selected_aggregate_within_nat
             name: "Independent repeated activities".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
     );
     model.nodes.insert(
@@ -44,6 +45,7 @@ fn real_twenty_group_and_occurrence_pages_preserve_selected_aggregate_within_nat
             name: "One factual parent join".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -75,6 +77,7 @@ fn real_twenty_group_and_occurrence_pages_preserve_selected_aggregate_within_nat
                     output_collection_variable: output,
                 }
             }),
+            activity_io: None,
         });
         model
             .sequence_flows

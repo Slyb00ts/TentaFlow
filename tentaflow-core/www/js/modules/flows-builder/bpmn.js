@@ -3,41 +3,43 @@
 import { I18n } from '/js/i18n.js';
 
 const ELEMENTS = [
-  ['Start', 'start', 'play', 'events', 56, 56],
-  ['End', 'end', 'stop', 'events', 56, 56],
-  ['ErrorEnd', 'error_end', 'alert-triangle', 'events', 56, 56],
-  ['TerminateEnd', 'terminate_end', 'ban', 'events', 56, 56],
+  ['Start', 'start', 'bpmn-none-start', 'events', 56, 56],
+  ['End', 'end', 'bpmn-none-end', 'events', 56, 56],
+  ['ErrorEnd', 'error_end', 'bpmn-error-filled', 'events', 56, 56],
+  ['TerminateEnd', 'terminate_end', 'bpmn-terminate', 'events', 56, 56],
   ['TimerStart', 'timer_start', 'clock', 'events', 56, 56],
   ['TimerCatch', 'timer_catch', 'clock', 'events', 56, 56],
   ['BoundaryTimer', 'boundary_timer', 'clock', 'events', 56, 56],
-  ['MessageStart', 'message_start', 'play', 'events', 56, 56],
-  ['MessageCatch', 'message_catch', 'mail', 'events', 56, 56],
-  ['MessageThrow', 'message_throw', 'send', 'events', 56, 56],
-  ['SignalThrow', 'signal_throw', 'send', 'events', 56, 56],
-  ['SignalCatch', 'signal_catch', 'mail', 'events', 56, 56],
-  ['BoundaryMessage', 'boundary_message', 'mail', 'events', 56, 56],
-  ['BoundaryError', 'boundary_error', 'alert-triangle', 'events', 56, 56],
-  ['BoundaryEscalation', 'boundary_escalation', 'alert-triangle', 'events', 56, 56],
+  ['MessageStart', 'message_start', 'bpmn-message-catch', 'events', 56, 56],
+  ['MessageCatch', 'message_catch', 'bpmn-message-catch', 'events', 56, 56],
+  ['MessageThrow', 'message_throw', 'bpmn-message-throw', 'events', 56, 56],
+  ['SignalThrow', 'signal_throw', 'bpmn-signal-throw', 'events', 56, 56],
+  ['SignalCatch', 'signal_catch', 'bpmn-signal-catch', 'events', 56, 56],
+  ['LinkThrow', 'link_throw', 'link-throw', 'events', 56, 56],
+  ['LinkCatch', 'link_catch', 'link-catch', 'events', 56, 56],
+  ['BoundaryMessage', 'boundary_message', 'bpmn-message-catch', 'events', 56, 56],
+  ['BoundaryError', 'boundary_error', 'bpmn-error', 'events', 56, 56],
+  ['BoundaryEscalation', 'boundary_escalation', 'bpmn-escalation-catch', 'events', 56, 56],
   ['UserTask', 'user_task', 'user', 'tasks', 240, 96],
-  ['ServiceTask', 'service_task', 'flow', 'tasks', 240, 96],
-  ['ScriptTask', 'script_task', 'code', 'tasks', 240, 96],
-  ['ManualTask', 'manual_task', 'check', 'tasks', 240, 96],
-  ['SendTask', 'send_task', 'send', 'tasks', 240, 96],
-  ['ReceiveTask', 'receive_task', 'mail', 'tasks', 240, 96],
-  ['SubProcess', 'sub_process', 'layers', 'tasks', 240, 96],
-  ['CallActivity', 'call_activity', 'layers', 'tasks', 240, 96],
-  ['ExclusiveGateway', 'exclusive_gateway', 'branch', 'gateways', 72, 72],
-  ['ParallelGateway', 'parallel_gateway', 'plus', 'gateways', 72, 72],
-  ['InclusiveGateway', 'inclusive_gateway', 'branch', 'gateways', 72, 72],
-  ['EventBasedGateway', 'event_based_gateway', 'branch', 'gateways', 72, 72],
+  ['ServiceTask', 'service_task', 'bpmn-service-task', 'tasks', 240, 96],
+  ['ScriptTask', 'script_task', 'bpmn-script-task', 'tasks', 240, 96],
+  ['ManualTask', 'manual_task', 'bpmn-manual-task', 'tasks', 240, 96],
+  ['SendTask', 'send_task', 'bpmn-message-throw', 'tasks', 240, 96],
+  ['ReceiveTask', 'receive_task', 'bpmn-message-catch', 'tasks', 240, 96],
+  ['SubProcess', 'sub_process', 'bpmn-subprocess', 'tasks', 240, 96],
+  ['CallActivity', 'call_activity', 'bpmn-subprocess', 'tasks', 240, 96],
+  ['ExclusiveGateway', 'exclusive_gateway', 'bpmn-gateway-exclusive', 'gateways', 72, 72],
+  ['ParallelGateway', 'parallel_gateway', 'bpmn-gateway-parallel', 'gateways', 72, 72],
+  ['InclusiveGateway', 'inclusive_gateway', 'bpmn-gateway-inclusive', 'gateways', 72, 72],
+  ['EventBasedGateway', 'event_based_gateway', 'bpmn-gateway-event-based', 'gateways', 72, 72],
 ];
 
 export function processTemplates() {
   return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: ['Start', 'TimerStart', 'MessageStart', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
-    output_ports: ['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) ? [] : ['full'],
+    input_ports: ['Start', 'TimerStart', 'MessageStart', 'LinkCatch', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
+    output_ports: ['End', 'ErrorEnd', 'TerminateEnd', 'LinkThrow'].includes(kind) ? [] : ['full'],
     width, height,
   }));
 }
@@ -62,6 +64,10 @@ export function processNodeConfig(kind) {
     correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
   if (kind === 'SignalThrow') return { signalRef: '', payloadExpression: '', ttlSeconds: 3600 };
   if (kind === 'SignalCatch') return { signalRef: '', outputMapping: {} };
+  if (kind === 'LinkThrow' || kind === 'LinkCatch') return { definition: {
+    id: `LinkDefinition_${crypto.randomUUID().replaceAll('-', '_')}`,
+    name: '', sourceRefs: [], targetRef: null,
+  } };
   if (kind === 'SendTask') return { messageRef: '', target: { Start: { definitionId: '' } },
     correlationExpression: '', payloadExpression: '', ttlSeconds: 3600 };
   if (kind === 'ReceiveTask') return { messageRef: '', correlationExpression: '', outputMapping: {} };
@@ -86,20 +92,23 @@ export function processNodeConfig(kind) {
 }
 
 export function processHasTimerStart(model) {
-  return model.nodes.some((node) => typeof node.kind === 'object' && 'TimerStart' in node.kind);
+  return [model, ...(model.additionalProcesses || [])].some((body) =>
+    body.nodes.some((node) => typeof node.kind === 'object' && 'TimerStart' in node.kind));
 }
 
 export function processHasMessageStart(model) {
-  return model.nodes.some((node) => typeof node.kind === 'object' && 'MessageStart' in node.kind);
+  return [model, ...(model.additionalProcesses || [])].some((body) =>
+    body.nodes.some((node) => typeof node.kind === 'object' && 'MessageStart' in node.kind));
 }
 
 export function processHasTimer(model) {
-  return model.nodes.some((node) => {
+  const bodyHasTimer = (body) => body.nodes.some((node) => {
     if (typeof node.kind !== 'object') return false;
     const kind = Object.keys(node.kind)[0];
     return ['TimerStart', 'TimerCatch', 'BoundaryTimer'].includes(kind)
-      || (kind === 'SubProcess' && processHasTimer(node.kind.SubProcess.body));
+      || (kind === 'SubProcess' && bodyHasTimer(node.kind.SubProcess.body));
   });
+  return [model, ...(model.additionalProcesses || [])].some(bodyHasTimer);
 }
 
 export function processBoundaryKind(type) {
@@ -119,8 +128,10 @@ export function emptyProcessModel() {
   };
 }
 
-export function processBody(model, path = []) {
-  let body = model;
+export function processBody(model, path = [], processId = model.processId) {
+  let body = processId === model.processId
+    ? model : model.additionalProcesses?.find((candidate) => candidate.processId === processId);
+  if (!body) throw new Error(I18n.t('bpmn.unsupported_element'));
   for (const nodeId of path) {
     const node = body.nodes.find((candidate) => candidate.id === nodeId);
     if (!node || typeof node.kind !== 'object' || !node.kind.SubProcess) throw new Error(I18n.t('bpmn.unsupported_element'));
@@ -129,16 +140,97 @@ export function processBody(model, path = []) {
   return body;
 }
 
+function remapActivityIo(io, remap, objectReference) {
+  for (const input of io.dataInputs) input.id = remap(input.id, 'DataInput');
+  for (const output of io.dataOutputs) output.id = remap(output.id, 'DataOutput');
+  io.inputSetId = remap(io.inputSetId, 'InputSet');
+  io.outputSetId = remap(io.outputSetId, 'OutputSet');
+  io.inputSet = io.inputSet.map((id) => remap(id, 'DataInput'));
+  io.outputSet = io.outputSet.map((id) => remap(id, 'DataOutput'));
+  for (const association of io.inputAssociations) {
+    const value = association.DirectRef || association.CelAssignment;
+    value.id = remap(value.id, 'InputAssociation');
+    if (association.DirectRef) value.sourceObjectRefId = objectReference(value.sourceObjectRefId);
+    value.targetInputId = remap(value.targetInputId, 'DataInput');
+  }
+  for (const association of io.outputAssociations) {
+    association.id = remap(association.id, 'OutputAssociation');
+    association.sourceOutputId = remap(association.sourceOutputId, 'DataOutput');
+    association.targetObjectRefId = objectReference(association.targetObjectRefId);
+  }
+  if (io.coordinatorOutput) {
+    const output = io.coordinatorOutput;
+    for (const item of output.dataOutputs) item.id = remap(item.id, 'CoordinatorDataOutput');
+    output.outputSetId = remap(output.outputSetId, 'CoordinatorOutputSet');
+    output.outputSet = output.outputSet.map((id) => remap(id, 'CoordinatorDataOutput'));
+    for (const association of output.outputAssociations) {
+      association.id = remap(association.id, 'CoordinatorOutputAssociation');
+      association.sourceOutputId = remap(association.sourceOutputId, 'CoordinatorDataOutput');
+      association.targetObjectRefId = objectReference(association.targetObjectRefId);
+    }
+  }
+}
+
+export function cloneProcessActivityIo(io) {
+  const copy = structuredClone(io);
+  const ids = new Map();
+  const remap = (id, prefix) => {
+    if (!ids.has(id)) ids.set(id, `${prefix}_${crypto.randomUUID().replaceAll('-', '_')}`);
+    return ids.get(id);
+  };
+  remapActivityIo(copy, remap, (id) => id);
+  return copy;
+}
+
 export function cloneProcessBody(body) {
   const copy = structuredClone(body);
   const ids = new Map();
-  for (const node of copy.nodes) ids.set(node.id, `Node_${crypto.randomUUID().replaceAll('-', '_')}`);
+  const remap = (id, prefix = 'Element') => {
+    if (!ids.has(id)) ids.set(id, `${prefix}_${crypto.randomUUID().replaceAll('-', '_')}`);
+    return ids.get(id);
+  };
+  for (const node of copy.nodes) remap(node.id, 'Node');
+  for (const node of copy.nodes) {
+    const kind = typeof node.kind === 'object' && Object.keys(node.kind)[0];
+    if (kind === 'LinkThrow' || kind === 'LinkCatch') {
+      remap(node.kind[kind].definition.id, 'LinkDefinition');
+    }
+  }
   const flows = new Map();
   for (const flow of copy.sequenceFlows) flows.set(flow.id, `Flow_${crypto.randomUUID().replaceAll('-', '_')}`);
+  const modeling = copy.modeling;
+  const remapLaneSet = (set) => {
+    set.id = remap(set.id, 'LaneSet');
+    for (const lane of set.lanes) {
+      lane.id = remap(lane.id, 'Lane');
+      lane.flowNodeRefs = lane.flowNodeRefs.map((id) => ids.get(id));
+      for (const child of lane.childLaneSets || []) remapLaneSet(child);
+    }
+  };
+  for (const set of modeling?.laneSets || []) remapLaneSet(set);
+  for (const object of modeling?.dataObjects || []) object.id = remap(object.id, 'DataObject');
+  for (const reference of modeling?.dataObjectReferences || []) {
+    reference.id = remap(reference.id, 'DataObjectRef');
+    reference.dataObjectRef = ids.get(reference.dataObjectRef);
+  }
+  for (const annotation of modeling?.textAnnotations || []) annotation.id = remap(annotation.id, 'Annotation');
+  for (const association of modeling?.associations || []) {
+    association.id = remap(association.id, 'Association');
+    association.sourceRef = ids.get(association.sourceRef);
+    association.targetRef = ids.get(association.targetRef);
+  }
   for (const node of copy.nodes) {
     node.id = ids.get(node.id);
+    if (node.activityIo) {
+      remapActivityIo(node.activityIo, remap, (id) => ids.get(id));
+    }
     if (typeof node.kind !== 'object') continue;
     const [kind, config] = Object.entries(node.kind)[0];
+    if (kind === 'LinkThrow' || kind === 'LinkCatch') {
+      config.definition.id = ids.get(config.definition.id);
+      config.definition.sourceRefs = config.definition.sourceRefs.map((id) => ids.get(id) || id);
+      if (config.definition.targetRef) config.definition.targetRef = ids.get(config.definition.targetRef) || config.definition.targetRef;
+    }
     if (kind === 'SubProcess') config.body = cloneProcessBody(config.body);
     if (['ExclusiveGateway', 'InclusiveGateway'].includes(kind) && config.defaultFlowId) config.defaultFlowId = flows.get(config.defaultFlowId);
     if (['BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind)) config.attachedToId = ids.get(config.attachedToId);
@@ -150,11 +242,19 @@ export function cloneProcessBody(body) {
   }
   for (const shape of copy.diagram.shapes) shape.elementId = ids.get(shape.elementId);
   for (const edge of copy.diagram.edges) edge.sequenceFlowId = flows.get(edge.sequenceFlowId);
+  for (const shape of copy.diagram.modelingShapes || []) {
+    shape.diId = remap(shape.diId, 'Shape');
+    shape.elementId = ids.get(shape.elementId);
+  }
+  for (const edge of copy.diagram.modelingEdges || []) {
+    edge.diId = remap(edge.diId, 'Edge');
+    edge.elementId = ids.get(edge.elementId);
+  }
   return copy;
 }
 
-export function processToCanvas(model, path = []) {
-  const body = processBody(model, path);
+export function processToCanvas(model, path = [], processId = model.processId) {
+  const body = processBody(model, path, processId);
   const shapes = new Map(body.diagram.shapes.map((shape) => [shape.elementId, shape]));
   const routes = new Map(body.diagram.edges.map((edge) => [edge.sequenceFlowId, edge.waypoints]));
   const nodes = body.nodes.map((node, index) => {
@@ -165,6 +265,7 @@ export function processToCanvas(model, path = []) {
     return { id: node.id, type: `bpmn_${element[1]}`, label: node.name,
       config: typeof node.kind === 'string' ? {} : structuredClone(node.kind[kind]),
       ...(node.repeat == null ? {} : { repeat: structuredClone(node.repeat) }),
+      ...(node.activityIo == null ? {} : { activityIo: structuredClone(node.activityIo) }),
       x: shape?.x ?? index * 280, y: shape?.y ?? 160,
       width: shape?.width ?? element[4], height: shape?.height ?? element[5] };
   });
@@ -183,40 +284,33 @@ export function processToCanvas(model, path = []) {
   const edges = body.sequenceFlows.map((edge) => ({ id: edge.id,
     from_node: edge.sourceId, to_node: edge.targetId, from_port: 'full', to_port: 'in',
     condition: edge.condition, waypoints: structuredClone(routes.get(edge.id) || []),
+    ...(edge.callStartNodeId == null ? {} : { callStartNodeId: edge.callStartNodeId }),
     originalEndpoints: [byId.get(edge.sourceId)?.x, byId.get(edge.sourceId)?.y,
       byId.get(edge.targetId)?.x, byId.get(edge.targetId)?.y] }));
   return { nodes, edges };
 }
 
-export function canvasToProcess(model, nodes, edges, edgePoints, path = []) {
+export function canvasToProcess(model, nodes, edges, edgePoints, path = [], processId = model.processId) {
   const graph = {
     nodes: nodes.map((node) => {
       const kind = processNodeKind(node.type);
       return { id: node.id, name: node.label || '',
         kind: ['Start', 'End', 'TerminateEnd', 'ParallelGateway', 'EventBasedGateway'].includes(kind) ? kind : { [kind]: structuredClone(node.config) },
-        ...(node.repeat == null ? {} : { repeat: structuredClone(node.repeat) }) };
+        ...(node.repeat == null ? {} : { repeat: structuredClone(node.repeat) }),
+        ...(node.activityIo == null ? {} : { activityIo: structuredClone(node.activityIo) }) };
     }),
-    sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null })),
+    sequenceFlows: edges.map((edge) => ({ id: edge.id, sourceId: edge.from_node, targetId: edge.to_node, condition: edge.condition ?? null,
+      ...(edge.callStartNodeId == null ? {} : { callStartNodeId: edge.callStartNodeId }) })),
     diagram: { shapes: nodes.map((node) => ({ elementId: node.id, x: node.x, y: node.y, width: node.width, height: node.height })),
-      edges: edges.map((edge) => ({ sequenceFlowId: edge.id, waypoints: edgePoints(edge) })) },
+      edges: edges.map((edge) => ({ sequenceFlowId: edge.id, waypoints: edgePoints(edge) })),
+      ...(processBody(model, path, processId).diagram.modelingShapes == null ? {} : {
+        modelingShapes: structuredClone(processBody(model, path, processId).diagram.modelingShapes) }),
+      ...(processBody(model, path, processId).diagram.modelingEdges == null ? {} : {
+        modelingEdges: structuredClone(processBody(model, path, processId).diagram.modelingEdges) }) },
   };
-  if (path.length) {
-    const full = structuredClone(model);
-    Object.assign(processBody(full, path), graph);
-    return full;
-  }
-  return { schemaVersion: model.schemaVersion, processId: model.processId,
-    variables: structuredClone(model.variables),
-    ...(model.timerTimezone == null ? {} : { timerTimezone: model.timerTimezone }),
-    ...(model.workCalendar == null ? {} : { workCalendar: structuredClone(model.workCalendar) }),
-    ...(model.calendarPin == null ? {} : { calendarPin: structuredClone(model.calendarPin) }),
-    ...(model.messages?.length ? { messages: structuredClone(model.messages) } : {}),
-    ...(model.errors?.length ? { errors: structuredClone(model.errors) } : {}),
-    ...(model.escalations?.length ? { escalations: structuredClone(model.escalations) } : {}),
-    ...(model.signals?.length ? { signals: structuredClone(model.signals) } : {}),
-    ...(model.targetNamespace == null ? {} : { targetNamespace: model.targetNamespace }),
-    ...graph,
-  };
+  const full = structuredClone(model);
+  Object.assign(processBody(full, path, processId), graph);
+  return full;
 }
 
 export function processStatusLabel(status) { return I18n.t(`bpmn.status_${status.toLowerCase()}`); }

@@ -20,7 +20,7 @@ fn send_task_rejects_omitted_or_forged_admission_before_canonical_commit() {
     let command = stamp("send-source-proof");
     let vars = serde_json::to_value(&source.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&source.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&source.model, &source.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&source.model), &instance_id, &fixture.owner,
         &source.definition_id, source.version, vars.clone(), runtime::StartCause::Manual,
         at_ms, manual_input(&command), None).unwrap();
     assert_eq!(plan.create_messages.len(), 1);
@@ -29,39 +29,39 @@ fn send_task_rejects_omitted_or_forged_admission_before_canonical_commit() {
     omitted.events.iter_mut().find(|event| event.kind == "send_task_admitted")
         .unwrap().kind = "node_completed".into();
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&omitted), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&omitted), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut forged = plan.clone();
     forged.create_messages[0].message.payload = json!({"value":43});
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut wrong_target = plan.clone();
     wrong_target.create_messages[0].message.target = catch_target(&receiving,
         Some(&Uuid::new_v4().to_string()), Some(&receiver.subscriptions[0].subscription_id));
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&wrong_target), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&wrong_target), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut wrong_ttl = plan.clone();
     wrong_ttl.create_messages[0].message.ttl_seconds += 1;
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&wrong_ttl), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&wrong_ttl), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut wrong_event = plan.clone();
     wrong_event.create_messages[0].source_event_index = plan.events.len() - 1;
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&wrong_event), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&wrong_event), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut foreign = plan.clone();
     foreign.create_messages[0].source_activation_id = Uuid::new_v4().to_string();
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&foreign), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&foreign), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut duplicate = plan.clone();
     duplicate.events.push(plan.events.iter().find(|event| event.kind == "send_task_admitted")
         .unwrap().clone());
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&duplicate), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&duplicate), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     let mut extra_successor = plan.clone();
     let direct = plan.create_tokens.iter().find(|token|
@@ -72,10 +72,10 @@ fn send_task_rejects_omitted_or_forged_admission_before_canonical_commit() {
     extra_successor.token_sources.insert(extra.token_id.clone(), source_id);
     extra_successor.create_tokens.push(extra);
     assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&extra_successor), at_ms).is_err());
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&extra_successor), at_ms).is_err());
     assert_eq!(transition_rows(&fixture), before);
     repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &source.definition_id, source.version, &vars, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &instance_id, &source.definition_id, source.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     assert_ne!(transition_rows(&fixture), before);
 }
 
@@ -191,7 +191,7 @@ fn interrupting_receive_timer_cancels_only_the_pinned_own_subscription() {
     let candidate = repository::due_timers(&fixture.db, at_ms, 32).unwrap().into_iter()
         .find(|row| row.timer_id == timer.timer_id).unwrap();
     let selected = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
-    let plan = super::timers::plan_timer_fire(&selected, at_ms, None).unwrap();
+    let plan = super::timers::plan_timer_fire(&selected, at_ms, None, None).unwrap();
     assert_eq!(plan.subscription_updates.iter().filter(|update|
         update.subscription_id == own.subscription_id
             && update.status == ProcessSubscriptionStatus::Cancelled).count(), 1);
@@ -343,7 +343,7 @@ fn receive_task_rejects_missing_duplicate_foreign_and_reordered_completion_befor
     let command = stamp("receive-arm-kind-proof");
     let vars = serde_json::to_value(&version.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let start = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let start = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, vars.clone(), runtime::StartCause::Manual,
         at_ms, manual_input(&command), None).unwrap();
     let opened = start.events.iter().find(|event| event.kind == "receive_task_opened").unwrap();
@@ -353,19 +353,19 @@ fn receive_task_rejects_missing_duplicate_foreign_and_reordered_completion_befor
     wrong_kind.events.iter_mut().find(|event| event.kind == "receive_task_opened")
         .unwrap().data["kind"] = json!("ReceiveTask");
     let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &vars, repository::ProcessPlanInput::Supplied(&wrong_kind), at_ms)
+        &instance_id, &version.definition_id, version.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&wrong_kind), at_ms)
         .unwrap_err();
     assert!(format!("{error:#}").contains("ReceiveTask correlation differs from its pinned entry variables"));
     assert_eq!(transition_rows(&fixture), before_start);
     repository::start_instance(&fixture.db, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &vars, repository::ProcessPlanInput::Supplied(&start), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&start), at_ms).unwrap();
     let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
     let events = repository::list_events(&reopened, &fixture.owner, &instance_id, 0, 200).unwrap().0;
     assert_eq!(events.iter().filter(|event| event.kind == "receive_task_opened"
         && event.data["kind"] == "receive_task").count(), 1);
     let committed_start = transition_rows(&fixture);
     repository::start_instance(&reopened, &fixture.owner, &command,
-        &instance_id, &version.definition_id, version.version, &vars, repository::ProcessPlanInput::Supplied(&start), at_ms).unwrap();
+        &instance_id, &version.definition_id, version.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&start), at_ms).unwrap();
     assert_eq!(transition_rows(&fixture), committed_start);
     let receiver = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
     let foreign_receiver = start_version(&fixture, &version);

@@ -1,17 +1,21 @@
 // ============ File: runtime.rs — durable process token transitions and worker lifetime ============
 
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ActivityVerification, ProcessIncident, ProcessInstanceStatus,
+    ProcessActivityIo, ProcessBodyModeling, ProcessCallActivity, ProcessInputAssociation,
     ProcessModel, ProcessMultiInstanceInput, ProcessMultiInstanceMode, ProcessNode,
     ProcessNodeKind, ProcessRepeatSpec, ProcessRepetitionGroupMode,
     ProcessRepetitionGroupStatus, ProcessRepetitionOccurrenceStatus, ProcessScopeSummary, ProcessTimerKind,
-    ProcessTimerStatus, ProcessUserTask, ProcessUserTaskKind, ProcessUserTaskStatus,
+    ProcessTimerStatus, ProcessUserTask, ProcessUserTaskInput, ProcessUserTaskInputValue,
+    ProcessUserTaskKind, ProcessUserTaskStatus, ProcessPayload,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -22,13 +26,47 @@ use super::repository::{
     GatewayReceipt, BoundaryEventIncident, CancelledJobClaim, ForkFrame, PlannedEvent, PlannedScope,
     PlannedSignal,
     ProcessActor, ProcessJob, ProcessTimer, ProcessToken, RuntimePlan, RuntimeSnapshot,
-    RepetitionCapacitySource, RepetitionDeniedBytes, RepetitionGroup, RepetitionOccurrence,
-    ScopeUpdate, VariableEffect,
+    ServiceDispatchFact, ClosedServiceDispatch, RepetitionCapacitySource, RepetitionDeniedBytes, RepetitionGroup, RepetitionOccurrence,
+    ScopeUpdate, VariableEffect, IoObservedInput, IoObservedOutput, IoObservedValue,
+    ActivityIoInputFact, ActivityIoResultDisposition, ActivityIoResultFact,
+    ActivityIoContinuationFact, ActivityIoRetainedFate, ActivityIoWitness,
+    ScopeReturnFailure, RecoveredServiceIncident,
 };
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::flow_engine::envelope::FlowValue;
 use crate::flow_engine::expr::{self, ExprScope};
+
+/// Supplies runtime row identifiers to a transition. Production transitions use a random source;
+/// private simulations inject a deterministic UUID-v5 source without changing the planner logic.
+pub trait RuntimeIdSource {
+    fn next_id(&mut self, kind: &str) -> String;
+    fn error(&self) -> Option<String>;
+    fn accepts(&self, _id: &str) -> bool {
+        true
+    }
+}
+
+pub type RuntimeIdSourceHandle = Rc<RefCell<dyn RuntimeIdSource>>;
+
+#[derive(Debug, Default)]
+pub struct RandomRuntimeIdSource {
+    error: Option<String>,
+}
+
+impl RuntimeIdSource for RandomRuntimeIdSource {
+    fn next_id(&mut self, _kind: &str) -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+}
+
+pub fn random_runtime_id_source() -> RuntimeIdSourceHandle {
+    Rc::new(RefCell::new(RandomRuntimeIdSource::default()))
+}
 
 pub fn validate_output(value: &Value) -> Result<()> {
     ensure!(
@@ -41,6 +79,20 @@ pub fn validate_output(value: &Value) -> Result<()> {
             "activity output exceeds 128 keys"
         );
     }
+    Ok(())
+}
+
+pub(super) fn ensure_user_task_wire_budget(task: &ProcessUserTask) -> Result<()> {
+    let frame = tentaflow_protocol::cbor::encode(
+        &tentaflow_protocol::message_body::MessageBody::ProcessBody(
+            ProcessPayload::UserTaskGetResponse { task: task.clone() },
+        ),
+    )
+    .map_err(anyhow::Error::msg)?;
+    ensure!(
+        frame.len() <= 900 * 1024,
+        "process user task detail exceeds the wire budget"
+    );
     Ok(())
 }
 
@@ -112,18 +164,222 @@ pub(super) fn evaluate(
     )?)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("activity IO association {association_id} at position {position} failed: {source}")]
+pub(super) struct ActivityIoAssociationFailure {
+    pub position: usize,
+    pub association_id: String,
+    #[source]
+    pub source: anyhow::Error,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ActivityIoOutputOwner {
+    Ordinal,
+    Coordinator,
+}
+
+pub(super) fn evaluate_activity_inputs(
+    io: &ProcessActivityIo,
+    modeling: &ProcessBodyModeling,
+    local: &Value,
+    effective: &Value,
+    extra: &[(String, Value)],
+) -> Result<Vec<IoObservedInput>> {
+    let local = local.as_object().context("activity IO local variables must be an object")?;
+    let mut ordered = Vec::with_capacity(io.input_set.len());
+    for (position, declaration_id) in io.input_set.iter().enumerate() {
+        ensure!(io.data_inputs.iter().any(|input| input.id == *declaration_id),
+            "activity IO input set references an undeclared input");
+        let association = io.input_associations.iter().find(|association| match association {
+            ProcessInputAssociation::DirectRef { target_input_id, .. }
+            | ProcessInputAssociation::CelAssignment { target_input_id, .. } =>
+                target_input_id == declaration_id,
+        }).context("activity IO input is missing its association")?;
+        let (association_id, source_object_ref_id, observed) = match association {
+            ProcessInputAssociation::DirectRef { id, source_object_ref_id, .. } => {
+                let binding = modeling.data_object_references.iter()
+                    .find(|reference| reference.id == *source_object_ref_id)
+                    .and_then(|reference| reference.variable_binding_key.as_deref())
+                    .context("activity IO input lacks its selected-body binding")?;
+                let observed = match local.get(binding) {
+                    Some(value) => IoObservedValue::Present { value: value.clone() },
+                    None => IoObservedValue::Missing,
+                };
+                (id.clone(), Some(source_object_ref_id.clone()), observed)
+            }
+            ProcessInputAssociation::CelAssignment { id, from_expression, .. } => {
+                let value = evaluate(from_expression, effective, &Value::Null, extra)
+                    .map_err(|source| ActivityIoAssociationFailure {
+                        position, association_id: id.clone(), source,
+                    })?;
+                validate_output(&value).map_err(|source| ActivityIoAssociationFailure {
+                    position, association_id: id.clone(), source,
+                })?;
+                (id.clone(), None, IoObservedValue::Present { value })
+            }
+        };
+        ordered.push(IoObservedInput {
+            position, declaration_id: declaration_id.clone(), association_id,
+            source_object_ref_id, observed,
+        });
+    }
+    Ok(ordered)
+}
+
+/// Projects the authenticated ordered IO witness into the one CEL namespace
+/// used by activity bodies and deferred mappings. The ordered vector remains
+/// the durable proof; this object is only the expression-facing projection.
+pub(super) fn activity_inputs_extra(
+    inputs: &[IoObservedInput],
+) -> Result<Vec<(String, Value)>> {
+    let mut values = serde_json::Map::new();
+    let mut declaration_ids = HashSet::new();
+    for input in inputs {
+        ensure!(declaration_ids.insert(input.declaration_id.as_str()),
+            "activity IO input projection contains a duplicate declaration");
+        if let IoObservedValue::Present { value } = &input.observed {
+            values.insert(input.declaration_id.clone(), value.clone());
+        }
+    }
+    Ok(if inputs.is_empty() {
+        Vec::new()
+    } else {
+        vec![("inputs".to_owned(), Value::Object(values))]
+    })
+}
+
+fn merge_activity_inputs_extra(
+    base: &[(String, Value)],
+    inputs: Option<&[IoObservedInput]>,
+) -> Result<Vec<(String, Value)>> {
+    let projected = inputs
+        .map(activity_inputs_extra)
+        .transpose()?
+        .unwrap_or_default();
+    let mut merged = base.to_vec();
+    ensure!(!merged.iter().any(|(name, _)| name == "inputs"),
+        "activity IO input projection has more than one expression owner");
+    merged.extend(projected);
+    Ok(merged)
+}
+
+pub(super) fn activity_inputs_for_task(
+    node: &ProcessNode,
+    inputs: &[IoObservedInput],
+) -> Result<Vec<ProcessUserTaskInput>> {
+    let declarations = node.activity_io.as_ref()
+        .map(|io| &io.data_inputs[..]).unwrap_or(&[]);
+    inputs.iter().map(|input| {
+        Ok(ProcessUserTaskInput {
+            position: u16::try_from(input.position)
+                .context("activity IO input position exceeds task wire range")?,
+            declaration_id: input.declaration_id.clone(),
+            name: declarations.iter().find(|declaration|
+                declaration.id == input.declaration_id).and_then(|declaration|
+                    declaration.name.clone()),
+            value: match &input.observed {
+                IoObservedValue::Missing => ProcessUserTaskInputValue::Missing,
+                IoObservedValue::Present { value } =>
+                    ProcessUserTaskInputValue::Present(value.clone()),
+            },
+        })
+    }).collect()
+}
+
+pub(super) fn evaluate_activity_outputs(
+    io: &ProcessActivityIo,
+    modeling: &ProcessBodyModeling,
+    local: &Value,
+    effective: &Value,
+    accepted_result: &IoObservedValue,
+    extra: &[(String, Value)],
+    owner: ActivityIoOutputOwner,
+) -> Result<(Vec<IoObservedOutput>, Value)> {
+    let (data_outputs, output_set, output_associations) = match owner {
+        ActivityIoOutputOwner::Ordinal =>
+            (&io.data_outputs, &io.output_set, &io.output_associations),
+        ActivityIoOutputOwner::Coordinator => {
+            let output = io.coordinator_output.as_ref()
+                .context("repeated activity has no configured coordinator output")?;
+            (&output.data_outputs, &output.output_set, &output.output_associations)
+        }
+    };
+    let accepted_result = match accepted_result {
+        IoObservedValue::Present { value } => value,
+        IoObservedValue::Missing if output_associations.is_empty() => {
+            ensure!(output_set.is_empty(),
+                "activity IO output set has no associations");
+            validate_variables(local)?;
+            return Ok((Vec::new(), local.clone()));
+        }
+        IoObservedValue::Missing => {
+            let first = output_set.first()
+                .context("activity IO output association has no ordered declaration")?;
+            let association = output_associations.iter()
+                .find(|association| association.source_output_id == *first)
+                .context("activity IO output association is missing its source")?;
+            return Err(ActivityIoAssociationFailure {
+                position: 0,
+                association_id: association.id.clone(),
+                source: anyhow::anyhow!("activity IO output requires a present accepted result"),
+            }.into());
+        }
+    };
+    validate_variables(local)?;
+    let mut patched = local.as_object()
+        .context("activity IO local variables must be an object")?.clone();
+    let mut ordered = Vec::with_capacity(output_set.len());
+    for (position, declaration_id) in output_set.iter().enumerate() {
+        let declaration = data_outputs.iter()
+            .find(|output| output.id == *declaration_id)
+            .context("activity IO output set references an undeclared output")?;
+        let association = output_associations.iter()
+            .find(|association| association.source_output_id == *declaration_id)
+            .context("activity IO output is missing its association")?;
+        let binding = modeling.data_object_references.iter()
+            .find(|reference| reference.id == association.target_object_ref_id)
+            .and_then(|reference| reference.variable_binding_key.as_deref())
+            .context("activity IO output lacks its selected-body binding")?;
+        let value = evaluate(&declaration.value_expression, effective, accepted_result, extra)
+            .map_err(|source| ActivityIoAssociationFailure {
+                position, association_id: association.id.clone(), source,
+            })?;
+        validate_output(&value).map_err(|source| ActivityIoAssociationFailure {
+            position, association_id: association.id.clone(), source,
+        })?;
+        patched.insert(binding.to_owned(), value.clone());
+        validate_variables(&Value::Object(patched.clone())).map_err(|source|
+            ActivityIoAssociationFailure {
+                position, association_id: association.id.clone(), source,
+            })?;
+        ordered.push(IoObservedOutput {
+            position, declaration_id: declaration_id.clone(),
+            association_id: association.id.clone(),
+            target_object_ref_id: association.target_object_ref_id.clone(),
+            variable_binding_key: binding.to_owned(),
+            observed: IoObservedValue::Present { value },
+        });
+    }
+    let patch = Value::Object(patched);
+    Ok((ordered, patch))
+}
+
 pub(super) fn condition(expression: &str, variables: &Value, outputs: &Value) -> Result<bool> {
     evaluate(expression, variables, outputs, &[])?
         .as_bool()
         .context("process condition must evaluate to a boolean")
 }
 
-pub(super) fn script_evaluate(expression: &str, variables: &Value, outputs: &Value) -> Result<Value> {
+pub(super) fn script_evaluate(
+    expression: &str, variables: &Value, outputs: &Value, extra: &[(String, Value)],
+) -> Result<Value> {
     let vars = variables.as_object().context("process variables must be an object")?
         .iter().map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
         .collect::<BTreeMap<_, _>>();
     let payload = FlowValue::Json(variables.clone());
-    let extras = [("outputs", outputs.clone())];
+    let mut extras = vec![("outputs", outputs.clone())];
+    extras.extend(extra.iter().map(|(key, value)| (key.as_str(), value.clone())));
     let scope = ExprScope {
         vars: &vars, payload: &payload, artifacts: &HashMap::new(),
         meta: &BTreeMap::new(), extras: &extras,
@@ -138,10 +394,11 @@ pub(super) fn script_evaluate(expression: &str, variables: &Value, outputs: &Val
 
 pub(super) fn patch_script_variables(
     mapping: &BTreeMap<String, String>, local: &Value, effective: &Value, outputs: &Value,
+    extra: &[(String, Value)],
 ) -> Result<Value> {
     let mut patched = local.as_object().context("process variables must be an object")?.clone();
     for (key, expression) in mapping {
-        let mapped = script_evaluate(expression, effective, outputs)?;
+        let mapped = script_evaluate(expression, effective, outputs, extra)?;
         patched.insert(key.clone(), mapped);
         validate_variables(&Value::Object(patched.clone()))?;
     }
@@ -170,27 +427,54 @@ pub fn prepare_service_input(
 
 pub(super) fn repetition_immediate_reservation(
     node: &ProcessNode, group_id: &str, ordinal: u32, item: &Value,
-    input_variables: &Value,
+    input_variables: &Value, activity_inputs: Option<&[IoObservedInput]>,
 ) -> Result<u64> {
     match &node.kind {
-        ProcessNodeKind::UserTask { .. } => Ok(4),
+        ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. } => Ok(4),
+        ProcessNodeKind::SendTask { .. } | ProcessNodeKind::ReceiveTask { .. }
+        | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity(_)
+        | ProcessNodeKind::ScriptTask { .. } => Ok(0),
         ProcessNodeKind::ServiceTask { input_mapping, .. } => {
-            let input = match prepare_service_input(input_mapping, input_variables,
-                &[("repeat".to_owned(), json!({
-                    "group_id":group_id,"index":ordinal,"item":item
-                }))]) {
+            let mut extra = vec![("repeat".to_owned(), json!({
+                "group_id":group_id,"index":ordinal,"item":item
+            }))];
+            if let Some(inputs) = activity_inputs {
+                extra.extend(activity_inputs_extra(inputs)?);
+            }
+            let input = match prepare_service_input(input_mapping, input_variables, &extra) {
                 Ok(input) => input,
                 Err(_) => return Ok(0),
             };
             u64::try_from(serde_json::to_vec(&input)?.len())?
                 .checked_add(repetition_claim_reservation()?)
+                .and_then(|bytes| bytes.checked_add(MAX_OBSERVED_SERVICE_RESULT_BYTES))
+                .and_then(|bytes| bytes.checked_add(
+                    MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES))
                 .context("repetition immediate Service reservation overflow")
         }
         _ => anyhow::bail!("repetition immediate reservation is not an activity"),
     }
 }
 
-pub(super) fn repetition_claim_reservation() -> Result<u64> {
+pub(crate) const MAX_OBSERVED_SERVICE_RESULT_BYTES: u64 = 384 * 1024 - 4096;
+pub(crate) const MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES: u64 = 32 * 1024 + 512;
+
+pub(crate) fn repetition_service_reservation_flags(
+    status: &str, phase: Option<&str>, evidence: &str, has_observation: bool,
+) -> (bool, bool, bool) {
+    let prepared = evidence == "no_boundary"
+        && phase.is_none_or(|phase| phase == "prepared")
+        && matches!(status, "queued" | "running");
+    let committed_unknown = evidence == "committed_boundary"
+        && matches!(phase, Some("may_have_executed" | "uncertain"));
+    let observed_live = evidence == "committed_boundary"
+        && phase == Some("observed") && status == "running";
+    (prepared && status == "queued",
+        (prepared || committed_unknown) && !has_observation,
+        prepared || committed_unknown || observed_live)
+}
+
+pub(crate) fn repetition_claim_reservation() -> Result<u64> {
     let claim = json!({
         "job_id":"00000000-0000-0000-0000-000000000000",
         "attempt":u64::MAX,"fence":u64::MAX,
@@ -230,6 +514,7 @@ pub(super) struct SendAdmissionFailure {
 #[derive(Clone)]
 struct Transition<'a> {
     model: &'a ProcessModel,
+    selected_process_id: &'a str,
     instance_id: &'a str,
     org_id: &'a str,
     initiator: &'a str,
@@ -240,17 +525,23 @@ struct Transition<'a> {
     scopes: Vec<ProcessScopeSummary>,
     retained_scope_count: usize,
     scope_variables: BTreeMap<String, Value>,
+    initial_scope_variables: BTreeMap<String, Value>,
     tokens: Vec<ProcessToken>,
     jobs: Vec<ProcessJob>,
+    service_dispatches: Vec<ServiceDispatchFact>,
     tasks: Vec<ProcessUserTask>,
     receipts: Vec<GatewayReceipt>,
     incidents: Vec<ProcessIncident>,
     timers: Vec<ProcessTimer>,
     boundary_incidents: Vec<BoundaryEventIncident>,
+    /// Incidents resolved earlier in this transition; closing a dispatch still cites them.
+    resolved_incident_rows: Vec<ProcessIncident>,
     subscriptions: Vec<super::repository::EventSubscription>,
     event_races: Vec<super::repository::EventRace>,
     repetition_groups: Vec<RepetitionGroup>,
     repetition_occurrences: Vec<RepetitionOccurrence>,
+    activity_io_witnesses: Vec<ActivityIoWitness>,
+    end_sources: Vec<super::repository::ProcessEndSource>,
     initial_repetition_groups: Vec<RepetitionGroup>,
     initial_repetition_occurrences: Vec<RepetitionOccurrence>,
     initial_jobs: Vec<ProcessJob>,
@@ -263,11 +554,13 @@ struct Transition<'a> {
     token_inputs: HashMap<String, AcceptedInputRef>,
     expected_instance_revision: u64,
     plan: RuntimePlan,
+    id_source: RuntimeIdSourceHandle,
 }
 
 impl<'a> Transition<'a> {
-    fn new(
+    fn new_with_id_source(
         model: &'a ProcessModel,
+        selected_process_id: &'a str,
         instance_id: &'a str,
         org_id: &'a str,
         initiator: &'a str,
@@ -276,10 +569,12 @@ impl<'a> Transition<'a> {
         variables: Value,
         now_ms: i64,
         signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
+        id_source: RuntimeIdSourceHandle,
     ) -> Result<Self> {
         validate_variables(&variables)?;
         Ok(Self {
             model,
+            selected_process_id,
             instance_id,
             org_id,
             initiator,
@@ -302,17 +597,22 @@ impl<'a> Transition<'a> {
             }],
             retained_scope_count: 1,
             scope_variables: BTreeMap::new(),
+            initial_scope_variables: BTreeMap::new(),
             tokens: Vec::new(),
             jobs: Vec::new(),
+            service_dispatches: Vec::new(),
             tasks: Vec::new(),
             receipts: Vec::new(),
             incidents: Vec::new(),
             timers: Vec::new(),
             boundary_incidents: Vec::new(),
+            resolved_incident_rows: Vec::new(),
             subscriptions: Vec::new(),
             event_races: Vec::new(),
             repetition_groups: Vec::new(),
             repetition_occurrences: Vec::new(),
+            activity_io_witnesses: Vec::new(),
+            end_sources: Vec::new(),
             initial_repetition_groups: Vec::new(),
             initial_repetition_occurrences: Vec::new(),
             initial_jobs: Vec::new(),
@@ -325,16 +625,19 @@ impl<'a> Transition<'a> {
             token_inputs: HashMap::new(),
             expected_instance_revision: 1,
             plan: RuntimePlan::initial(variables),
+            id_source,
         })
     }
 
-    fn from_snapshot(
+    fn from_snapshot_with_id_source(
         snapshot: &'a RuntimeSnapshot,
         now_ms: i64,
         signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
+        id_source: RuntimeIdSourceHandle,
     ) -> Result<Self> {
-        let mut transition = Self::new(
+        let mut transition = Self::new_with_id_source(
             &snapshot.model,
+            &snapshot.instance.process_id,
             &snapshot.instance.instance_id,
             &snapshot.org_id,
             &snapshot.instance.initiator_user_id,
@@ -343,12 +646,15 @@ impl<'a> Transition<'a> {
             snapshot.instance.variables.clone(),
             now_ms,
             signal_admission,
+            id_source,
         )?;
         transition.tokens = snapshot.tokens.clone();
         transition.scopes = snapshot.scopes.clone();
         transition.retained_scope_count = snapshot.retained_scope_count;
         transition.scope_variables = snapshot.scope_variables.clone();
+        transition.initial_scope_variables = snapshot.scope_variables.clone();
         transition.jobs = snapshot.jobs.clone();
+        transition.service_dispatches = snapshot.service_dispatches.clone();
         transition.tasks = snapshot.user_tasks.clone();
         transition.receipts = snapshot.receipts.clone();
         transition.incidents = snapshot.incidents.clone();
@@ -358,6 +664,8 @@ impl<'a> Transition<'a> {
         transition.event_races = snapshot.event_races.clone();
         transition.repetition_groups = snapshot.repetition_groups.clone();
         transition.repetition_occurrences = snapshot.repetition_occurrences.clone();
+        transition.activity_io_witnesses = snapshot.activity_io_witnesses.clone();
+        transition.end_sources = snapshot.end_sources.clone();
         transition.initial_repetition_groups = snapshot.repetition_groups.clone();
         transition.initial_repetition_occurrences = snapshot.repetition_occurrences.clone();
         transition.initial_jobs = snapshot.jobs.clone();
@@ -366,9 +674,44 @@ impl<'a> Transition<'a> {
         Ok(transition)
     }
 
+    fn from_snapshot(
+        snapshot: &'a RuntimeSnapshot,
+        now_ms: i64,
+        signal_admission: Option<&'a SignalAdmissionResolver<'a>>,
+    ) -> Result<Self> {
+        Self::from_snapshot_with_id_source(
+            snapshot, now_ms, signal_admission, random_runtime_id_source(),
+        )
+    }
+
+    fn next_id(&self, kind: &str) -> String {
+        self.id_source.borrow_mut().next_id(kind)
+    }
+
+    fn record_event_id(&mut self, event_index: usize) -> String {
+        let id = self.next_id("event");
+        self.plan.event_ids.insert(event_index, id.clone());
+        id
+    }
+
+    fn ensure_event_id(&mut self, event_index: usize) -> String {
+        if let Some(id) = self.plan.event_ids.get(&event_index) {
+            return id.clone();
+        }
+        self.record_event_id(event_index)
+    }
+
+    fn ensure_id_source_healthy(&self) -> Result<()> {
+        if let Some(error) = self.id_source.borrow().error() {
+            anyhow::bail!("runtime identifier source failed: {error}");
+        }
+        Ok(())
+    }
+
     fn node(&self, id: &str) -> Result<&ProcessNode> {
         super::repository::scope_node(
             self.model,
+            self.selected_process_id,
             &self.scopes,
             self.instance_id,
             &self.current_scope,
@@ -384,7 +727,8 @@ impl<'a> Transition<'a> {
     )> {
         let path =
             super::repository::scope_path(&self.scopes, self.instance_id, &self.current_scope)?;
-        let (nodes, flows, _) = super::model::scope_body(self.model, &path)?;
+        let body = super::model::selected_body(self.model, self.selected_process_id, &path)?;
+        let (nodes, flows) = (body.nodes, body.sequence_flows);
         Ok((nodes, flows))
     }
 
@@ -467,27 +811,55 @@ impl<'a> Transition<'a> {
         outputs: &Value,
         extra: &[(String, Value)],
     ) -> Result<()> {
-        let result = patch_variables(
-            mapping,
-            self.local()?,
-            &self.effective()?,
-            outputs,
-            extra,
-        )?;
+        let node = self.node(node_id)?.clone();
+        let captured_inputs = self.captured_activity_inputs(node_id, source_token_id)?;
+        let effective_extra = merge_activity_inputs_extra(extra, captured_inputs.as_deref())?;
+        let effective = self.effective()?;
+        let result = patch_variables(mapping, self.local()?, &effective, outputs, &effective_extra)?;
+        let (activity_io_outputs, result) = if let Some(io) = &node.activity_io {
+            let body_path = super::repository::scope_path(
+                &self.scopes, self.instance_id, &self.current_scope)?;
+            let body = super::model::selected_body(
+                self.model, self.selected_process_id, &body_path)?;
+            let modeling = super::model::io_modeling(body.modeling);
+            let owner = if self.repetition_for_token(source_token_id).is_some() {
+                ActivityIoOutputOwner::Ordinal
+            } else if node.repeat.is_some() {
+                ActivityIoOutputOwner::Coordinator
+            } else {
+                ActivityIoOutputOwner::Ordinal
+            };
+            let (ordered, patched) = evaluate_activity_outputs(io, modeling, &result,
+                &effective, &IoObservedValue::Present { value: outputs.clone() }, &effective_extra,
+                owner)?;
+            (Some(ordered), patched)
+        } else {
+            (None, result)
+        };
+        let event_index = self.plan.events.len();
         let scope = self.scopes.iter().find(|scope| scope.scope_id == self.current_scope)
             .context("mapped scope is missing")?;
         let effect = VariableEffect::Mapped {
-            event_index: self.plan.events.len(),
+            event_index,
             scope_id: self.current_scope.clone(),
             parent_token_id: scope.parent_token_id.clone(),
             node_id: node_id.to_owned(),
             source_token_id: source_token_id.to_owned(),
             accepted_input: self.accepted_input.clone(),
             outputs: outputs.clone(),
-            extra: extra.to_vec(),
+            extra: effective_extra,
+            activity_io_outputs: activity_io_outputs.clone(),
             result: result.clone(),
         };
-        self.set_variables(result)?;
+        self.set_variables(result.clone())?;
+        if let Some(ordered) = &activity_io_outputs {
+            self.record_event_id(event_index);
+            self.event("activity_io_output_applied", Some(node_id.to_owned()), json!({
+                "source_token_id": source_token_id,
+                "ordered_outputs": ordered,
+                "local_patch": result,
+            }));
+        }
         self.plan.variable_effects.push(effect);
         Ok(())
     }
@@ -495,21 +867,49 @@ impl<'a> Transition<'a> {
     fn map_script_outputs(
         &mut self, node_id: &str, source_token_id: &str,
         mapping: &BTreeMap<String, String>, outputs: &Value,
+        extra: &[(String, Value)],
     ) -> Result<()> {
-        if mapping.is_empty() {
+        let node = self.node(node_id)?.clone();
+        if mapping.is_empty() && node.activity_io.is_none() {
             return Ok(());
         }
-        let result = patch_script_variables(mapping, self.local()?, &self.effective()?, outputs)?;
+        let captured_inputs = self.captured_activity_inputs(node_id, source_token_id)?;
+        let effective_extra = merge_activity_inputs_extra(extra, captured_inputs.as_deref())?;
+        let effective = self.effective()?;
+        let result = patch_script_variables(mapping, self.local()?, &effective, outputs, &effective_extra)?;
+        let (activity_io_outputs, result) = if let Some(io) = &node.activity_io {
+            let body_path = super::repository::scope_path(
+                &self.scopes, self.instance_id, &self.current_scope)?;
+            let body = super::model::selected_body(
+                self.model, self.selected_process_id, &body_path)?;
+            let modeling = super::model::io_modeling(body.modeling);
+            let (ordered, patched) = evaluate_activity_outputs(io, modeling, &result,
+                &effective, &IoObservedValue::Present { value: outputs.clone() }, &effective_extra,
+                ActivityIoOutputOwner::Ordinal)?;
+            (Some(ordered), patched)
+        } else {
+            (None, result)
+        };
+        let event_index = self.plan.events.len();
         let scope = self.scopes.iter().find(|scope| scope.scope_id == self.current_scope)
             .context("mapped Script scope is missing")?;
         let effect = VariableEffect::Mapped {
-            event_index: self.plan.events.len(), scope_id: self.current_scope.clone(),
+            event_index, scope_id: self.current_scope.clone(),
             parent_token_id: scope.parent_token_id.clone(), node_id: node_id.to_owned(),
             source_token_id: source_token_id.to_owned(),
             accepted_input: self.accepted_input.clone(), outputs: outputs.clone(),
-            extra: Vec::new(), result: result.clone(),
+            extra: effective_extra, activity_io_outputs: activity_io_outputs.clone(),
+            result: result.clone(),
         };
-        self.set_variables(result)?;
+        self.set_variables(result.clone())?;
+        if let Some(ordered) = &activity_io_outputs {
+            self.record_event_id(event_index);
+            self.event("activity_io_output_applied", Some(node_id.to_owned()), json!({
+                "source_token_id": source_token_id,
+                "ordered_outputs": ordered,
+                "local_patch": result,
+            }));
+        }
         self.plan.variable_effects.push(effect);
         Ok(())
     }
@@ -524,7 +924,7 @@ impl<'a> Transition<'a> {
     }
 
     fn create_token(&mut self, mut token: ProcessToken, predecessor: Option<&str>) -> String {
-        token.token_id = Uuid::new_v4().to_string();
+        token.token_id = self.next_id("runtime");
         let id = token.token_id.clone();
         if let Some(predecessor) = predecessor {
             self.plan.token_sources.insert(id.clone(), predecessor.to_owned());
@@ -544,6 +944,34 @@ impl<'a> Transition<'a> {
         }
     }
 
+    fn immediate_predecessors(&self, token_id: &str) -> Result<usize> {
+        let mut current = token_id;
+        let mut count = 0;
+        while let Some(parent) = self.plan.token_sources.get(current) {
+            count += 1;
+            ensure!(count <= 255, "immediate token lineage exceeded its trace bound");
+            current = parent;
+        }
+        Ok(count)
+    }
+
+    fn limit_immediate_lineage(&mut self, token: &ProcessToken) -> Result<()> {
+        let planned = self.plan.create_tokens.iter_mut().find(|created|
+            created.token_id == token.token_id && created.status == "ready")
+            .context("immediate limit did not select a planned ready token")?;
+        planned.status = "waiting".into();
+        let live = self.tokens.iter_mut().find(|current|
+            current.token_id == token.token_id && current.status == "ready")
+            .context("immediate limit lost its ready token")?;
+        live.status = "waiting".into();
+        let message = format!(
+            "Immediate transition limit reached at token {} after 255 predecessor links",
+            token.token_id,
+        );
+        self.incident(&token.node_id, None, "IMMEDIATE_TRANSITION_LIMIT", message);
+        Ok(())
+    }
+
     fn wait(&mut self, token: &ProcessToken, status: &str) -> String {
         self.consume(&token.token_id);
         self.create_token(ProcessToken {
@@ -552,14 +980,14 @@ impl<'a> Transition<'a> {
         }, Some(&token.token_id))
     }
 
-    fn follow(&mut self, token: &ProcessToken, edge_id: &str) -> Result<()> {
+    fn follow(&mut self, token: &ProcessToken, edge_id: &str) -> Result<String> {
         let edge = self
             .body()?
             .1
             .iter()
             .find(|flow| flow.id == edge_id)
             .context("sequence flow is missing")?;
-        self.create_token(ProcessToken {
+        let successor_id = self.create_token(ProcessToken {
             token_id: String::new(),
             scope_id: self.current_scope.clone(),
             node_id: edge.target_id.clone(),
@@ -567,7 +995,7 @@ impl<'a> Transition<'a> {
             fork_stack: token.fork_stack.clone(),
             status: "ready".into(),
         }, Some(&token.token_id));
-        Ok(())
+        Ok(successor_id)
     }
 
     fn outgoing(&self, node_id: &str) -> Vec<String> {
@@ -584,7 +1012,7 @@ impl<'a> Transition<'a> {
         let node_name = self.node(node_id).ok().map(|node| node.name.clone());
         self.plan.add_incidents.push(ProcessIncident {
             scope_id: self.current_scope.clone(),
-            incident_id: Uuid::new_v4().to_string(),
+            incident_id: self.next_id("runtime"),
             node_id: Some(node_id.to_owned()),
             node_name,
             job_id,
@@ -611,7 +1039,7 @@ impl<'a> Transition<'a> {
         let incident_id = self.plan.add_incidents.last()
             .context("pending Send failure incident was not created")?.incident_id.clone();
         self.plan.event_sources.insert(self.plan.events.len(), token.token_id.clone());
-        self.plan.event_ids.insert(self.plan.events.len(), Uuid::new_v4().to_string());
+        self.record_event_id(self.plan.events.len());
         self.event("send_admission_failed", Some(node.id.clone()), json!({
             "pending_token_id":token.token_id,"pending_event_id":pending_event_id,
             "incident_id":incident_id,"code":code,"reason":reason,
@@ -625,11 +1053,19 @@ impl<'a> Transition<'a> {
         kind: ProcessUserTaskKind,
         assignee: String,
         outputs: Value,
+        mut activity_inputs: Vec<ProcessUserTaskInput>,
         token_id: &str,
-    ) {
+    ) -> Result<()> {
+        if let Some(io) = &node.activity_io {
+            for input in &mut activity_inputs {
+                input.name = io.data_inputs.iter()
+                    .find(|declaration| declaration.id == input.declaration_id)
+                    .and_then(|declaration| declaration.name.clone());
+            }
+        }
         let task = ProcessUserTask {
             scope_id: self.current_scope.clone(),
-            user_task_id: Uuid::new_v4().to_string(),
+            user_task_id: self.next_id("runtime"),
             node_id: node.id.clone(),
             name: node.name.clone(),
             assignee_user_id: assignee.clone(),
@@ -643,7 +1079,9 @@ impl<'a> Transition<'a> {
                 ProcessNodeKind::ManualTask { instructions, .. } => Some(instructions.clone()),
                 _ => None,
             },
+            activity_inputs,
         };
+        ensure_user_task_wire_budget(&task)?;
         if task.kind == ProcessUserTaskKind::Manual {
             self.event("manual_task_opened", Some(node.id.clone()),
                 json!({"user_task_id":task.user_task_id,"assignee_user_id":assignee}));
@@ -652,6 +1090,7 @@ impl<'a> Transition<'a> {
         }
         self.tasks.push(task.clone());
         self.plan.create_user_tasks.push(task);
+        Ok(())
     }
 
     fn write_repetition_group(&mut self, mut group: RepetitionGroup) -> Result<()> {
@@ -704,6 +1143,452 @@ impl<'a> Transition<'a> {
         Some((group.clone(), occurrence.clone()))
     }
 
+    fn activity_io_inputs(
+        &self, node: &ProcessNode, source: &ProcessToken,
+    ) -> Result<Option<Vec<IoObservedInput>>> {
+        let Some(io) = &node.activity_io else { return Ok(None); };
+        let path = super::repository::scope_path(&self.scopes,
+            self.instance_id, &self.current_scope)?;
+        let selected = super::model::selected_body(self.model,
+            self.selected_process_id, &path)?;
+        let modeling = super::model::io_modeling(selected.modeling);
+        let repeated = self.repetition_for_token(&source.token_id);
+        let (local, effective, extra) = if let Some((group, occurrence)) = repeated {
+            let values = occurrence.input_variables;
+            let extra = Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item);
+            (values.clone(), values, extra)
+        } else {
+            (self.local()?.clone(), self.effective()?, Vec::new())
+        };
+        evaluate_activity_inputs(io, modeling, &local, &effective, &extra).map(Some)
+    }
+
+    fn repetition_activity_io_inputs(
+        &self,
+        node: &ProcessNode,
+        group: &RepetitionGroup,
+        occurrence: &RepetitionOccurrence,
+    ) -> Result<Option<Vec<IoObservedInput>>> {
+        let Some(io) = &node.activity_io else { return Ok(None); };
+        let path = super::repository::scope_path(
+            &self.scopes, self.instance_id, &group.scope_id)?;
+        let selected = super::model::selected_body(
+            self.model, self.selected_process_id, &path)?;
+        let modeling = super::model::io_modeling(selected.modeling);
+        let extra = Self::repeat_extra(&group.group_id, occurrence.ordinal,
+            occurrence.item.clone());
+        evaluate_activity_inputs(io, modeling, &occurrence.input_variables,
+            &occurrence.input_variables, &extra).map(Some)
+    }
+
+    fn captured_activity_inputs(
+        &self, node_id: &str, activation_token_id: &str,
+    ) -> Result<Option<Vec<IoObservedInput>>> {
+        let mut candidates = self.plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+            ActivityIoInputFact::Captured {
+                scope_id, node_id: fact_node_id, activation_token_id: fact_token_id,
+                inputs, ..
+            } if scope_id == &self.current_scope && fact_node_id == node_id
+                && fact_token_id == activation_token_id => Some(inputs.clone()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        candidates.extend(self.activity_io_witnesses.iter().filter_map(|witness| {
+            if witness.scope_id == self.current_scope
+                && witness.node_id == node_id
+                && witness.token_id == activation_token_id
+                && witness.input_values.is_some() {
+                witness.input_values.clone()
+            } else {
+                None
+            }
+        }));
+        ensure!(candidates.len() <= 1,
+            "activity IO activation has multiple captured input witnesses");
+        Ok(candidates.pop())
+    }
+
+    fn activity_inputs_extra_for_activation(
+        &self, node_id: &str, activation_token_id: &str,
+    ) -> Result<Vec<(String, Value)>> {
+        self.captured_activity_inputs(node_id, activation_token_id)?
+            .map_or_else(|| Ok(Vec::new()), |inputs| activity_inputs_extra(&inputs))
+    }
+
+    fn activity_inputs_for_user_task(
+        &self, node: &ProcessNode, activation_token_id: &str,
+    ) -> Result<Vec<ProcessUserTaskInput>> {
+        self.captured_activity_inputs(&node.id, activation_token_id)?
+            .map_or_else(|| Ok(Vec::new()), |inputs|
+                activity_inputs_for_task(node, &inputs))
+    }
+
+    fn capture_activity_io_inputs(
+        &mut self, node: &ProcessNode, source: &ProcessToken,
+        activation_token_id: &str, inputs: Vec<IoObservedInput>,
+    ) {
+        let repeated = self.repetition_for_token(&source.token_id);
+        let event_index = self.plan.events.len();
+        self.record_event_id(event_index);
+        self.event("activity_io_input_captured", Some(node.id.clone()),
+            json!({"source_token_id":source.token_id,
+                "activation_token_id":activation_token_id,"inputs":inputs}));
+        self.plan.activity_io_inputs.push(ActivityIoInputFact::Captured {
+            witness_id: self.next_id("runtime"),
+            scope_id: self.current_scope.clone(), node_id: node.id.clone(),
+            source_token_id: source.token_id.clone(),
+            activation_token_id: activation_token_id.to_owned(), event_index,
+            inputs,
+            group_id: repeated.as_ref().map(|(group, _)| group.group_id.clone()),
+            occurrence_id: repeated.as_ref().map(|(_, occurrence)| occurrence.occurrence_id.clone()),
+            ordinal: repeated.as_ref().map(|(_, occurrence)| occurrence.ordinal),
+        });
+    }
+
+    fn capture_coordinator_activity_io_inputs(
+        &mut self, node: &ProcessNode, source: &ProcessToken,
+        activation_token_id: &str, group_id: &str, inputs: Vec<IoObservedInput>,
+    ) {
+        let event_index = self.plan.events.len();
+        self.record_event_id(event_index);
+        self.event("activity_io_input_captured", Some(node.id.clone()),
+            json!({"source_token_id":source.token_id,
+                "activation_token_id":activation_token_id,"inputs":inputs}));
+        self.plan.activity_io_inputs.push(ActivityIoInputFact::Captured {
+            witness_id: self.next_id("runtime"),
+            scope_id: self.current_scope.clone(), node_id: node.id.clone(),
+            source_token_id: source.token_id.clone(),
+            activation_token_id: activation_token_id.to_owned(), event_index,
+            inputs, group_id: Some(group_id.to_owned()), occurrence_id: None,
+            ordinal: None,
+        });
+    }
+
+    fn fail_activity_io_input(
+        &mut self, node: &ProcessNode, source: &ProcessToken,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+            anyhow::bail!("configured activity IO input failed without an association: {error:#}");
+        };
+        let repeated = self.repetition_for_token(&source.token_id);
+        let waiting_token_id = self.wait(source, "waiting");
+        let event_index = self.plan.events.len();
+        self.record_event_id(event_index);
+        self.incident(&node.id, None, "ACTIVITY_IO_INPUT_FAILED",
+            super::repository::bounded_failure_message(&error.to_string()));
+        let incident = self.plan.add_incidents.last()
+            .context("activity IO input failure lacks its incident")?;
+        let incident_id = incident.incident_id.clone();
+        let event = self.plan.events.get_mut(event_index)
+            .context("activity IO input failure lost its event")?;
+        event.data = json!({
+            "incident_id": incident_id,
+            "activation_token_id": waiting_token_id,
+            "code": incident.code,
+            "message": incident.message,
+        });
+        self.plan.activity_io_inputs.push(ActivityIoInputFact::Failed {
+            witness_id: self.next_id("runtime"),
+            scope_id: self.current_scope.clone(), node_id: node.id.clone(),
+            source_token_id: source.token_id.clone(),
+            waiting_token_id: waiting_token_id.clone(),
+            incident_event_index: event_index, incident_id: incident_id.clone(),
+            association_id: failure.association_id.clone(), position: failure.position,
+            group_id: repeated.as_ref().map(|(group, _)| group.group_id.clone()),
+            occurrence_id: repeated.as_ref().map(|(_, occurrence)| occurrence.occurrence_id.clone()),
+            ordinal: repeated.as_ref().map(|(_, occurrence)| occurrence.ordinal),
+        });
+        if let Some((mut group, mut occurrence)) = repeated {
+            occurrence.token_id = waiting_token_id;
+            occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+            occurrence.updated_at_ms = self.now_ms;
+            self.write_repetition_occurrence(occurrence)?;
+            group.status = ProcessRepetitionGroupStatus::Incident;
+            group.terminal_incident_id = Some(incident_id);
+            group.terminal_event_id = None;
+            group.updated_at_ms = self.now_ms;
+            self.write_repetition_group(group)?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn record_service_io_result(
+        &mut self,
+        job: &ProcessJob,
+        observed: &super::repository::ObservedActivityResult,
+        result_event_index: usize,
+        disposition: ActivityIoResultDisposition,
+    ) -> Result<()> {
+        if self.node(&job.node_id)?.activity_io.is_none() {
+            return Ok(());
+        }
+        let inputs = self.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == job.scope_id && witness.node_id == job.node_id
+                && witness.token_id == job.token_id
+                && witness.phase == "input_captured")
+            .collect::<Vec<_>>();
+        ensure!(inputs.len() == 1, "accepted Service IO has no unique captured activation");
+        let source_event_id = self.plan.event_ids.get(&result_event_index)
+            .context("accepted Service IO lost its result event UUID")?.clone();
+        let event = self.plan.events.get(result_event_index)
+            .context("accepted Service IO lost its result event")?;
+        ensure!(event.kind == "service_result" && event.scope_id == job.scope_id
+            && event.node_id.as_deref() == Some(job.node_id.as_str())
+            && source_event_id == job.observed_result_event_id.as_deref()
+                .context("Service IO result has no durable observed UUID")?,
+            "accepted Service IO differs from its observed result event");
+        let dispatches = self.service_dispatches.iter().filter(|dispatch|
+            dispatch.job_id == job.job_id && dispatch.scope_id == job.scope_id
+                && dispatch.node_id == job.node_id && dispatch.token_id == job.token_id
+                && dispatch.reserved_result_event_id.as_deref() == Some(source_event_id.as_str()))
+            .collect::<Vec<_>>();
+        ensure!(dispatches.len() == 1 && dispatches[0].phase == "observed",
+            "accepted Service IO has no unique fenced observation");
+        self.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id: inputs[0].witness_id.clone(), scope_id: job.scope_id.clone(),
+            node_id: job.node_id.clone(), token_id: job.token_id.clone(),
+            result_event_index, source_instance_id: self.instance_id.to_owned(),
+            source_event_id: source_event_id.clone(),
+            result_sources: vec![source_event_id],
+            observed: IoObservedValue::Present { value: observed.result.outputs.clone() },
+            accepted_origin: Some(observed.origin.clone()),
+            resource_id: Some(job.job_id.clone()), resource_revision: Some(job.fence),
+            service_invocation_id: Some(dispatches[0].invocation_id.clone()),
+            child_scope_id: None, call_id: None, child_instance_id: None,
+            child_expected_revision: None, child_status: None,
+            parent_wait_token_id: None, disposition,
+        });
+        Ok(())
+    }
+
+    fn record_scope_io_result(
+        &mut self, scope: &ProcessScopeSummary, token: &ProcessToken,
+        node: &ProcessNode, outputs: &Value, witness_id: &str,
+        result_event_index: usize, result_sources: Vec<String>,
+        disposition: ActivityIoResultDisposition,
+    ) -> Result<()> {
+        let source_event_id = self.plan.event_ids.get(&result_event_index)
+            .context("SubProcess accepted result lost its event UUID")?.clone();
+        self.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id: witness_id.to_owned(), scope_id: token.scope_id.clone(),
+            node_id: node.id.clone(), token_id: token.token_id.clone(),
+            result_event_index, source_instance_id: self.instance_id.to_owned(),
+            source_event_id, result_sources,
+            observed: IoObservedValue::Present { value: outputs.clone() },
+            accepted_origin: None, resource_id: None, resource_revision: None,
+            service_invocation_id: None, child_scope_id: Some(scope.scope_id.clone()),
+            call_id: None, child_instance_id: None,
+            child_expected_revision: Some(scope.revision),
+            child_status: Some(super::repository::status_text(&scope.status).to_owned()),
+            parent_wait_token_id: Some(token.token_id.clone()), disposition,
+        });
+        Ok(())
+    }
+
+    fn record_service_io_applied(
+        &mut self, job: &ProcessJob,
+        observed: &super::repository::ObservedActivityResult,
+        result_event_index: usize, output_event_index: usize,
+    ) -> Result<()> {
+        if self.node(&job.node_id)?.activity_io.is_none() {
+            return Ok(());
+        }
+        let (ordered_outputs, local_patch) = match self.plan.variable_effects.last() {
+            Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                source_token_id, activity_io_outputs: Some(outputs), result, .. })
+                if *event_index == output_event_index && scope_id == &job.scope_id
+                    && node_id == &job.node_id && source_token_id == &job.token_id =>
+                    (outputs.clone(), result.clone()),
+            _ => anyhow::bail!("Service IO output has no exact single mapped effect"),
+        };
+        ensure!(self.plan.events.get(output_event_index).is_some_and(|event|
+            event.kind == "activity_io_output_applied"
+                && event.scope_id == job.scope_id
+                && event.node_id.as_deref() == Some(job.node_id.as_str())),
+            "Service IO output has no exact applied event");
+        self.record_service_io_result(job, observed, result_event_index,
+            ActivityIoResultDisposition::Applied {
+                output_event_index, ordered_outputs, local_patch,
+            })
+    }
+
+    fn record_service_io_verification(
+        &mut self, job: &ProcessJob,
+        observed: &super::repository::ObservedActivityResult,
+        result_event_index: usize,
+    ) -> Result<()> {
+        if self.node(&job.node_id)?.activity_io.is_none() {
+            return Ok(());
+        }
+        let accepted_result = serde_json::to_value(&observed.result)?;
+        let tasks = self.plan.create_user_tasks.iter().filter(|task|
+            task.scope_id == job.scope_id && task.node_id == job.node_id
+                && task.token_id.as_deref() == Some(job.token_id.as_str())
+                && task.kind == ProcessUserTaskKind::Verification
+                && task.status == ProcessUserTaskStatus::Open
+                && task.outputs == accepted_result)
+            .collect::<Vec<_>>();
+        ensure!(tasks.len() == 1,
+            "accepted Service IO has no unique factual verification task");
+        let task_id = tasks[0].user_task_id.clone();
+        let route_event_index = self.plan.events.iter().enumerate().filter(|(index, event)|
+            *index > result_event_index && event.kind == "user_task_opened"
+                && event.scope_id == job.scope_id
+                && event.node_id.as_deref() == Some(job.node_id.as_str())
+                && event.data["user_task_id"] == task_id)
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        ensure!(route_event_index.len() == 1,
+            "accepted Service IO verification has no unique opening event");
+        let route_event_index = route_event_index[0];
+        self.ensure_event_id(route_event_index);
+        self.record_service_io_result(job, observed, result_event_index,
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::AwaitingVerification { user_task_id: task_id },
+                route_event_index,
+            })
+    }
+
+    fn apply_repetition_activity_io(
+        &mut self,
+        node: &ProcessNode,
+        token: &ProcessToken,
+        output_mapping: &BTreeMap<String, String>,
+        outputs: &Value,
+        extra: &[(String, Value)],
+        result_event_index: usize,
+        result_event_id: &str,
+        observed: IoObservedValue,
+        resource_id: Option<String>,
+        resource_revision: Option<u64>,
+        service_invocation_id: Option<String>,
+        accepted_origin: Option<super::repository::ActivityResultOrigin>,
+        script_mapping: bool,
+    ) -> Result<bool> {
+        let Some(_) = node.activity_io.as_ref() else { return Ok(true); };
+        ensure!(self.repetition_for_token(&token.token_id).is_some(),
+            "ordinal activity IO result has no repeated occurrence");
+        if let Some(existing) = self.plan.activity_io_results.iter().find(|fact|
+            fact.scope_id == token.scope_id && fact.node_id == node.id
+                && fact.token_id == token.token_id) {
+            return Ok(matches!(&existing.disposition,
+                ActivityIoResultDisposition::Applied { .. }));
+        }
+        let inputs = self.plan.activity_io_inputs.iter().filter_map(|input| match input {
+            ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                activation_token_id, group_id: Some(_), occurrence_id: Some(_), .. }
+                if scope_id == &token.scope_id && node_id == &node.id
+                    && activation_token_id == &token.token_id => Some(witness_id.clone()),
+            _ => None,
+        }).chain(self.activity_io_witnesses.iter().filter_map(|witness|
+            (witness.scope_id == token.scope_id && witness.node_id == node.id
+                && witness.token_id == token.token_id && witness.phase == "input_captured"
+                && witness.phase_owner == "ordinal"
+                && witness.group_id.is_some() && witness.occurrence_id.is_some())
+                .then_some(witness.witness_id.clone()))).collect::<Vec<_>>();
+        ensure!(inputs.len() == 1,
+            "ordinal activity IO result has no unique captured input witness");
+        let disposition = match if script_mapping {
+            self.map_script_outputs(&node.id, &token.token_id, output_mapping, outputs, extra)
+        } else {
+            self.map_outputs(&node.id, &token.token_id, output_mapping, outputs, extra)
+        } {
+            Ok(()) => {
+                let (output_event_index, ordered_outputs, local_patch) =
+                    match self.plan.variable_effects.last() {
+                        Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                            source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                            if *event_index > result_event_index
+                                && scope_id == &token.scope_id && node_id == &node.id
+                                && source_token_id == &token.token_id =>
+                            (*event_index, ordered.clone(), result.clone()),
+                        _ => anyhow::bail!("ordinal activity IO output has no exact mapped effect"),
+                    };
+                ActivityIoResultDisposition::Applied {
+                    output_event_index, ordered_outputs, local_patch,
+                }
+            }
+            Err(error) => {
+                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+                    .context("ordinal activity IO output failed without an association")?;
+                let incident_event_index = self.plan.events.len();
+                self.record_event_id(incident_event_index);
+                self.incident(&node.id, resource_id.clone(), "ACTIVITY_IO_OUTPUT_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                let incident_id = self.plan.add_incidents.last()
+                    .context("ordinal activity IO output blockage lost its incident")?
+                    .incident_id.clone();
+                let event = self.plan.events.get_mut(incident_event_index)
+                    .context("ordinal activity IO output blockage lost its event")?;
+                event.data["incident_id"] = json!(incident_id);
+                event.data["activation_token_id"] = json!(token.token_id);
+                ActivityIoResultDisposition::Blocked {
+                    incident_event_index, incident_id,
+                    association_id: Some(failure.association_id.clone()),
+                    position: Some(failure.position),
+                }
+            }
+        };
+        let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+        self.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id: inputs[0].clone(), scope_id: token.scope_id.clone(),
+            node_id: node.id.clone(), token_id: token.token_id.clone(), result_event_index,
+            source_instance_id: self.instance_id.to_owned(),
+            source_event_id: result_event_id.to_owned(), result_sources: vec![result_event_id.to_owned()],
+            observed, accepted_origin, resource_id, resource_revision, service_invocation_id,
+            child_scope_id: None, call_id: None, child_instance_id: None,
+            child_expected_revision: None, child_status: None, parent_wait_token_id: None,
+            disposition,
+        });
+        Ok(applied)
+    }
+
+    fn block_service_io_output(
+        &mut self, job: &ProcessJob,
+        observed: &super::repository::ObservedActivityResult,
+        result_event_index: usize, error: &anyhow::Error,
+    ) -> Result<()> {
+        let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+            .context("Service IO output blockage has no authored association")?;
+        let incident_event_index = self.plan.events.len();
+        self.record_event_id(incident_event_index);
+        self.incident(&job.node_id, Some(job.job_id.clone()),
+            "ACTIVITY_IO_OUTPUT_FAILED",
+            super::repository::bounded_failure_message(&error.to_string()));
+        let incident_id = self.plan.add_incidents.last()
+            .context("Service IO output blockage lost its incident")?.incident_id.clone();
+        let event = self.plan.events.get_mut(incident_event_index)
+            .context("Service IO output blockage lost its incident event")?;
+        event.data["incident_id"] = json!(incident_id);
+        event.data["activation_token_id"] = json!(job.token_id);
+        self.record_service_io_result(job, observed, result_event_index,
+            ActivityIoResultDisposition::Blocked {
+                incident_event_index, incident_id,
+                association_id: Some(failure.association_id.clone()),
+                position: Some(failure.position),
+            })
+    }
+
+    fn repetition_boundary_parent(&self, token: &ProcessToken) -> Result<Option<ProcessToken>> {
+        let Some((group, occurrence)) = self.repetition_for_token(&token.token_id) else {
+            return Ok(None);
+        };
+        ensure!(occurrence.scope_id == token.scope_id && group.scope_id == token.scope_id
+            && group.node_id == token.node_id && !group.terminal_capacity
+            && matches!(group.status,
+                ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident),
+            "repeated source differs from its live boundary coordinator");
+        let parent = self.tokens.iter().find(|row|
+            row.token_id == group.parent_token_id && row.scope_id == group.scope_id
+                && row.node_id == group.node_id && row.status == "waiting")
+            .context("repeated source lost its waiting boundary coordinator")?;
+        Ok(Some(parent.clone()))
+    }
+
     fn projected_repetition_retained_bytes(&self) -> Result<u64> {
         let size = |value: &Value| -> Result<i128> {
             Ok(i128::try_from(serde_json::to_vec(value)?.len())?)
@@ -740,6 +1625,31 @@ impl<'a> Transition<'a> {
             } else { 0 };
             bytes += current - previous;
         }
+        for scope in &self.scopes {
+            let Some(occurrence) = scope.parent_token_id.as_ref().and_then(|token_id|
+                self.repetition_occurrences.iter().find(|row|
+                    row.token_id.as_str() == token_id.as_str())) else {
+                continue;
+            };
+            let Some(current) = self.scope_variables.get(&scope.scope_id) else {
+                ensure!(matches!(scope.status, ProcessInstanceStatus::Completed
+                    | ProcessInstanceStatus::Cancelled | ProcessInstanceStatus::Error)
+                    && !self.initial_scope_variables.contains_key(&scope.scope_id)
+                    && !self.plan.create_scopes.iter().any(|created|
+                        created.scope_id == scope.scope_id)
+                    && !self.plan.scope_updates.iter().any(|update|
+                        update.scope_id == scope.scope_id)
+                    && self.initial_repetition_occurrences.iter().any(|prior|
+                        prior.occurrence_id == occurrence.occurrence_id
+                            && prior.group_id == occurrence.group_id
+                            && prior.token_id == occurrence.token_id)
+                    && self.initial_repetition_groups.iter().any(|prior|
+                        prior.group_id == occurrence.group_id),
+                    "repeated child scope lost its local variables");
+                continue;
+            };
+            bytes += size(current)? - optional_size(self.initial_scope_variables.get(&scope.scope_id))?;
+        }
         for job in &self.plan.create_jobs {
             if self.repetition_occurrences.iter().any(|row|
                 row.job_id.as_deref() == Some(job.job_id.as_str())) {
@@ -764,10 +1674,63 @@ impl<'a> Transition<'a> {
                 bytes += size(&task.outputs)?;
             }
         }
+        for message in &self.plan.create_messages {
+            if self.repetition_occurrences.iter().any(|row|
+                row.token_id == message.source_activation_id) {
+                bytes += size(&message.message.payload)?;
+            }
+        }
+        for subscription in &self.plan.create_subscriptions {
+            if self.repetition_occurrences.iter().any(|row|
+                row.token_id == subscription.token_id) {
+                bytes += i128::try_from(subscription.message_name.as_ref().map_or(0, String::len))?
+                    + i128::try_from(subscription.correlation_key.as_ref().map_or(0, String::len))?;
+            }
+        }
+        for request in &self.plan.call_requests {
+            if self.repetition_occurrences.iter().any(|row|
+                row.token_id == request.parent_token_id) {
+                bytes += size(&request.variables)?;
+            }
+        }
         if let Some((task_id, outputs)) = &self.accepted_repetition_task {
             let prior = self.initial_tasks.iter().find(|task| task.user_task_id == *task_id)
                 .context("accepted repeated Work task has no prior row")?;
             bytes += size(outputs)? - size(&prior.outputs)?;
+        }
+        for input in &self.plan.activity_io_inputs {
+            if let ActivityIoInputFact::Captured { inputs, group_id: Some(group_id), .. } = input {
+                ensure!(self.repetition_groups.iter().any(|group|
+                    group.group_id == *group_id),
+                    "repeated IO input lost its physical retention owner");
+                bytes += i128::try_from(serde_json::to_vec(inputs)?.len())?;
+            }
+        }
+        for result in &self.plan.activity_io_results {
+            let group_id = self.activity_io_witnesses.iter().find(|witness|
+                witness.witness_id == result.witness_id)
+                .and_then(|witness| witness.group_id.as_deref())
+                .or_else(|| self.plan.activity_io_inputs.iter().find_map(|input|
+                    match input {
+                        ActivityIoInputFact::Captured { witness_id, group_id, .. }
+                        | ActivityIoInputFact::Failed { witness_id, group_id, .. }
+                            if witness_id == &result.witness_id => group_id.as_deref(),
+                        _ => None,
+                    }));
+            if let Some(group_id) = group_id {
+                ensure!(self.repetition_groups.iter().any(|group|
+                    group.group_id == group_id),
+                    "repeated IO result lost its physical retention owner");
+                bytes += i128::try_from(serde_json::to_vec(&result.result_sources)?.len())?;
+                if let IoObservedValue::Present { value } = &result.observed {
+                    bytes += size(value)?;
+                }
+                if let ActivityIoResultDisposition::Applied {
+                    ordered_outputs, local_patch, .. } = &result.disposition {
+                    bytes += i128::try_from(serde_json::to_vec(ordered_outputs)?.len())?;
+                    bytes += size(local_patch)?;
+                }
+            }
         }
         for (index, event) in self.plan.events.iter().enumerate() {
             let direct_group = event.data.get("group_id").and_then(Value::as_str)
@@ -799,17 +1762,44 @@ impl<'a> Transition<'a> {
                 let group = self.repetition_groups.iter().find(|row|
                     row.group_id == occurrence.group_id)
                     .context("pending ordinal has no durable group")?;
-                let node = super::repository::scope_node(self.model, &self.scopes,
+                let node = super::repository::scope_node(self.model,
+                    self.selected_process_id, &self.scopes,
                     self.instance_id, &group.scope_id, &group.node_id)?;
+                // A failing authored association parks this ordinal later; it reserves
+                // nothing here, and only infrastructure errors stop the admission.
+                let activity_inputs = match self.repetition_activity_io_inputs(
+                    node, group, occurrence) {
+                    Ok(inputs) => inputs,
+                    Err(error) if error.downcast_ref::<ActivityIoAssociationFailure>()
+                        .is_some() => None,
+                    Err(error) => return Err(error),
+                };
                 bytes = bytes.checked_add(repetition_immediate_reservation(node,
                     &group.group_id, occurrence.ordinal, &occurrence.item,
-                    &occurrence.input_variables)?)
+                    &occurrence.input_variables, activity_inputs.as_deref())?)
                     .context("pending repetition admission byte count overflow")?;
             } else if let Some(job_id) = &occurrence.job_id {
-                if self.jobs.iter().any(|job| job.job_id == *job_id
-                    && matches!(job.status.as_str(), "queued" | "error")) {
-                    bytes = bytes.checked_add(repetition_claim_reservation()?)
-                        .context("queued repetition claim byte count overflow")?;
+                if let Some(job) = self.jobs.iter().find(|job| job.job_id == *job_id) {
+                    let phase = self.service_dispatches.iter()
+                        .find(|source| source.job_id == job.job_id)
+                        .map(|source| source.phase.as_str());
+                    let (claim, observation, incident) = repetition_service_reservation_flags(
+                        &job.status, phase,
+                        if phase.is_some() { "committed_boundary" } else { "no_boundary" },
+                        job.observed_result_event_id.is_some());
+                    if claim {
+                        bytes = bytes.checked_add(repetition_claim_reservation()?)
+                            .context("queued repetition claim byte count overflow")?;
+                    }
+                    if observation {
+                        bytes = bytes.checked_add(MAX_OBSERVED_SERVICE_RESULT_BYTES)
+                            .context("repeated Service observation reservation overflow")?;
+                    }
+                    if incident {
+                        bytes = bytes.checked_add(
+                            MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES)
+                            .context("repeated Service incident reservation overflow")?;
+                    }
                 }
             }
         }
@@ -868,7 +1858,7 @@ impl<'a> Transition<'a> {
             token_id: String::new(), status: "ready".into(), ..parent.clone()
         }, Some(&parent.token_id));
         let occurrence = RepetitionOccurrence {
-            occurrence_id: Uuid::new_v4().to_string(), instance_id: self.instance_id.to_owned(),
+            occurrence_id: self.next_id("runtime"), instance_id: self.instance_id.to_owned(),
             scope_id: group.scope_id.clone(), group_id: group.group_id.clone(), ordinal,
             status: ProcessRepetitionOccurrenceStatus::Pending, token_id,
             user_task_id: None, job_id: None, verification_user_task_id: None,
@@ -911,7 +1901,7 @@ impl<'a> Transition<'a> {
         let incident_id = self.plan.add_incidents.last()
             .context("capacity latch has no incident")?.incident_id.clone();
         let event_index = self.plan.events.len();
-        let event_id = Uuid::new_v4().to_string();
+        let event_id = self.next_id("runtime");
         let last_source = self.repetition_occurrences.iter()
             .filter(|row| row.group_id == group_id)
             .max_by_key(|row| row.ordinal)
@@ -959,7 +1949,7 @@ impl<'a> Transition<'a> {
         error: &anyhow::Error,
     ) -> Result<()> {
         let parent_token_id = self.wait(token, "waiting");
-        let group_id = Uuid::new_v4().to_string();
+        let group_id = self.next_id("runtime");
         let message = super::repository::bounded_failure_message(&format!("{error:#}"));
         self.incident(&node.id, None, "REPETITION_INPUT_ERROR", message);
         let incident_id = self.plan.add_incidents.last()
@@ -1022,9 +2012,28 @@ impl<'a> Transition<'a> {
 
     fn enter_repetition(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
         let repeat = node.repeat.as_ref().context("repetition configuration missing")?;
-        ensure!(matches!(node.kind, ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }),
+        ensure!(matches!(node.kind, ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
+            | ProcessNodeKind::ManualTask { .. } | ProcessNodeKind::SendTask { .. }
+            | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SubProcess { .. }
+            | ProcessNodeKind::CallActivity(_) | ProcessNodeKind::ScriptTask { .. }),
             "only activities can be repeated");
         let entry_variables = self.effective()?;
+        let coordinator_inputs = if node.activity_io.as_ref()
+            .and_then(|io| io.coordinator_output.as_ref()).is_some() {
+            match self.activity_io_inputs(node, token) {
+                Ok(Some(inputs)) => Some(inputs),
+                Ok(None) => anyhow::bail!("configured repeated coordinator IO lost its authored input"),
+                Err(error) => {
+                    if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                        return Err(error);
+                    }
+                    self.fail_activity_io_input(node, token, &error)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let (mode, items, total_count, max_iterations, loop_state, output_collection_variable) = match repeat {
             ProcessRepeatSpec::MultiInstance { mode, input, output_collection_variable } => {
                 let items = match input {
@@ -1066,7 +2075,7 @@ impl<'a> Transition<'a> {
         };
         let parked_id = self.wait(token, "waiting");
         let mut group = RepetitionGroup {
-            group_id: Uuid::new_v4().to_string(), instance_id: self.instance_id.to_owned(),
+            group_id: self.next_id("runtime"), instance_id: self.instance_id.to_owned(),
             scope_id: self.current_scope.clone(), definition_id: self.definition_id.to_owned(),
             version: self.version, node_id: node.id.clone(), mode,
             status: ProcessRepetitionGroupStatus::Open,
@@ -1096,6 +2105,11 @@ impl<'a> Transition<'a> {
             json!({"group_id":group.group_id,"source_token_id":group.source_token_id,
                 "parent_token_id":group.parent_token_id,"mode":group.mode,"total":group.total_count}));
         self.write_repetition_group(group.clone())?;
+        if let Some(inputs) = coordinator_inputs {
+            self.capture_coordinator_activity_io_inputs(node, token, &group.parent_token_id,
+                &group.group_id, inputs);
+        }
+        self.arm_boundaries(node, &group.parent_token_id)?;
         if lifetime_limit {
             let retained_bytes = self.projected_repetition_retained_bytes()?;
             return self.latch_repetition_capacity(&group.group_id, "group_lifetime", retained_bytes, None);
@@ -1207,24 +2221,118 @@ impl<'a> Transition<'a> {
                     source_event_id:last_source,
                 }, candidate_bytes)));
         }
-        self.plan.variable_effects.push(VariableEffect::RepetitionAggregate {
-            event_index: self.plan.events.len(), scope_id: group.scope_id.clone(),
-            group_id: group.group_id.clone(), parent_token_id: group.parent_token_id.clone(),
-            output_target: group.output_collection_variable.clone(),
-            accepted_input: self.accepted_input.clone(), aggregate, result: patched.clone(),
-        });
-        self.set_variables(patched)?;
-        self.disarm_boundaries(&parent.token_id, "activity_completed", None)?;
-        self.resolve_boundary_incidents(&parent.token_id);
-        self.consume(&parent.token_id);
         group.status = ProcessRepetitionGroupStatus::Completed;
         if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
             group.total_count = Some(group.completed_count);
         }
         group.updated_at_ms = self.now_ms;
+        let aggregate_event_index = self.plan.events.len();
+        let aggregate_event_id = self.next_id("runtime");
+        self.plan.variable_effects.push(VariableEffect::RepetitionAggregate {
+            event_index: aggregate_event_index, scope_id: group.scope_id.clone(),
+            group_id: group.group_id.clone(), parent_token_id: group.parent_token_id.clone(),
+            output_target: group.output_collection_variable.clone(),
+            accepted_input: self.accepted_input.clone(), aggregate: aggregate.clone(),
+            activity_io_outputs: None, output_event_index: None, result: patched.clone(),
+        });
+        self.set_variables(patched.clone())?;
+        self.plan.event_ids.insert(aggregate_event_index, aggregate_event_id.clone());
         self.event("repetition_completed", Some(group.node_id.clone()),
             json!({"group_id":group.group_id,"completed":group.completed_count,
                 "parent_token_id":group.parent_token_id}));
+        let coordinator = self.node(&group.node_id)?.clone();
+        if let Some(io) = coordinator.activity_io.as_ref()
+            .filter(|io| io.coordinator_output.is_some()) {
+            let witness_id = self.plan.activity_io_inputs.iter().find_map(|input| match input {
+                ActivityIoInputFact::Captured { witness_id, group_id: Some(candidate),
+                    occurrence_id: None, .. } if candidate == &group.group_id =>
+                    Some(witness_id.clone()),
+                _ => None,
+            }).or_else(|| self.activity_io_witnesses.iter().find_map(|witness|
+                (witness.group_id.as_deref() == Some(group.group_id.as_str())
+                    && witness.occurrence_id.is_none()
+                    && witness.phase_owner == "coordinator"
+                    && witness.phase == "input_captured")
+                    .then_some(witness.witness_id.clone())))
+                .context("repetition coordinator output has no captured input witness")?;
+            let body_path = super::repository::scope_path(
+                &self.scopes, self.instance_id, &self.current_scope)?;
+            let body = super::model::selected_body(
+                self.model, self.selected_process_id, &body_path)?;
+            let modeling = super::model::io_modeling(body.modeling);
+            let observed = IoObservedValue::Present { value: aggregate.clone() };
+            let effective = self.effective()?;
+            let coordinator_extra = self.activity_inputs_extra_for_activation(
+                &coordinator.id, &group.parent_token_id,
+            )?;
+            let disposition = match evaluate_activity_outputs(io, modeling, &patched, &effective,
+                &observed, &coordinator_extra, ActivityIoOutputOwner::Coordinator) {
+                Ok((ordered_outputs, local_patch)) => {
+                    let output_event_index = self.plan.events.len();
+                    self.record_event_id(output_event_index);
+                    self.set_variables(local_patch.clone())?;
+                    self.event("activity_io_output_applied", Some(coordinator.id.clone()), json!({
+                        "source_token_id":group.parent_token_id,
+                        "ordered_outputs":ordered_outputs,
+                        "local_patch":local_patch,
+                    }));
+                    if let Some(VariableEffect::RepetitionAggregate {
+                        activity_io_outputs, output_event_index: planned_output_event,
+                        result, ..
+                    }) = self.plan.variable_effects.last_mut() {
+                        *activity_io_outputs = Some(ordered_outputs.clone());
+                        *planned_output_event = Some(output_event_index);
+                        *result = local_patch.clone();
+                    } else {
+                        bail!("repetition coordinator output lost its aggregate effect");
+                    }
+                    ActivityIoResultDisposition::Applied {
+                        output_event_index, ordered_outputs, local_patch,
+                    }
+                }
+                Err(error) => {
+                    if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                        return Err(error);
+                    }
+                    let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+                        .context("repetition coordinator output failed without an association")?;
+                    let incident_event_index = self.plan.events.len();
+                    self.record_event_id(incident_event_index);
+                    self.incident(&coordinator.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                        super::repository::bounded_failure_message(&error.to_string()));
+                    let incident_id = self.plan.add_incidents.last()
+                        .context("repetition coordinator output blockage lost its incident")?
+                        .incident_id.clone();
+                    let event = self.plan.events.get_mut(incident_event_index)
+                        .context("repetition coordinator output blockage lost its event")?;
+                    event.data["incident_id"] = json!(incident_id);
+                    event.data["activation_token_id"] = json!(group.parent_token_id);
+                    ActivityIoResultDisposition::Blocked {
+                        incident_event_index, incident_id,
+                        association_id: Some(failure.association_id.clone()),
+                        position: Some(failure.position),
+                    }
+                }
+            };
+            self.plan.activity_io_results.push(ActivityIoResultFact {
+                witness_id, scope_id: group.scope_id.clone(), node_id: coordinator.id.clone(),
+                token_id: group.parent_token_id.clone(), result_event_index: aggregate_event_index,
+                source_instance_id: self.instance_id.to_owned(), source_event_id: aggregate_event_id.clone(),
+                result_sources: vec![aggregate_event_id], observed,
+                accepted_origin: None, resource_id: None, resource_revision: None,
+                service_invocation_id: None, child_scope_id: None, call_id: None,
+                child_instance_id: None, child_expected_revision: None, child_status: None,
+                parent_wait_token_id: None, disposition,
+            });
+            if self.plan.activity_io_results.last().is_some_and(|fact|
+                matches!(&fact.disposition, ActivityIoResultDisposition::Blocked { .. })) {
+                self.write_repetition_group(group)?;
+                return Ok(());
+            }
+        }
+        self.disarm_boundaries(&parent.token_id, "activity_completed", None)?;
+        self.resolve_boundary_incidents(&parent.token_id);
+        self.consume(&parent.token_id);
         self.write_repetition_group(group.clone())?;
         for edge in self.outgoing(&group.node_id) {
             self.follow(&parent, &edge)?;
@@ -1264,14 +2372,34 @@ impl<'a> Transition<'a> {
         if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
             let mapping = match &node.kind {
                 ProcessNodeKind::UserTask { output_mapping, .. }
-                | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
+                | ProcessNodeKind::ServiceTask { output_mapping, .. }
+                | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+                | ProcessNodeKind::SubProcess { output_mapping, .. }
+                | ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. })
+                | ProcessNodeKind::ScriptTask { output_mapping, .. } => Some(output_mapping),
+                ProcessNodeKind::ManualTask { .. } | ProcessNodeKind::SendTask { .. } => None,
                 _ => anyhow::bail!("repeated node is not an activity"),
             };
             let prior = group.loop_state.as_ref().context("structured loop state is missing")?;
-            let next = match patch_variables(mapping, prior, prior, outputs,
-                &Self::repeat_extra(&group.group_id, occurrence.ordinal, Value::Null)) {
+            let mut extra = Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item.clone());
+            if let Some(inputs) = self.captured_activity_inputs(
+                &node.id, &occurrence.token_id,
+            )? {
+                extra.extend(activity_inputs_extra(&inputs)?);
+            }
+            let next = match mapping.map_or_else(|| Ok(prior.clone()), |mapping| {
+                if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                    patch_script_variables(mapping, prior, prior, outputs, &extra)
+                } else {
+                    patch_variables(mapping, prior, prior, outputs, &extra)
+                }
+            }) {
                 Ok(next) => next,
                 Err(error) => {
+                    if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                        return Err(error);
+                    }
                     return self.block_repetition_group(&group.group_id,
                         "REPETITION_MAPPING_FAILED",
                         super::repository::bounded_failure_message(&error.to_string()),
@@ -1279,8 +2407,10 @@ impl<'a> Transition<'a> {
                 }
             };
             let mut patch = serde_json::Map::new();
-            for key in mapping.keys() {
-                patch.insert(key.clone(), next[key].clone());
+            if let Some(mapping) = mapping {
+                for key in mapping.keys() {
+                    patch.insert(key.clone(), next[key].clone());
+                }
             }
             occurrence.state_patch = Some(Value::Object(patch));
             occurrence.state_after = Some(next.clone());
@@ -1408,7 +2538,8 @@ impl<'a> Transition<'a> {
         };
         let timer = ProcessTimer {
             scope_id: Some(self.current_scope.clone()),
-            timer_id: Uuid::new_v4().to_string(),
+            start_process_id: None,
+            timer_id: self.next_id("runtime"),
             org_id: self.org_id.to_owned(),
             definition_id: self.definition_id.to_owned(),
             version: self.version,
@@ -1467,6 +2598,9 @@ impl<'a> Transition<'a> {
     }
 
     fn arm_boundaries(&mut self, activity: &ProcessNode, token_id: &str) -> Result<()> {
+        if activity.repeat.is_some() && self.repetition_for_token(token_id).is_some() {
+            return Ok(());
+        }
         let nodes = self
             .body()?
             .0
@@ -1571,7 +2705,11 @@ impl<'a> Transition<'a> {
     }
 
     fn resolve_incident(&mut self, id: &str) {
-        self.incidents.retain(|incident| incident.incident_id != id);
+        if let Some(position) = self.incidents.iter()
+            .position(|incident| incident.incident_id == id) {
+            let resolved = self.incidents.remove(position);
+            self.resolved_incident_rows.push(resolved);
+        }
         if !self
             .plan
             .resolve_incident_ids
@@ -1587,6 +2725,40 @@ impl<'a> Transition<'a> {
             token.fork_stack.is_empty(),
             "boundary interruption requires an empty parallel activation stack"
         );
+        if let Some(group) = self.repetition_groups.iter().find(|group|
+            group.parent_token_id == token.token_id && group.scope_id == token.scope_id
+                && group.node_id == token.node_id && !group.terminal_capacity
+                && matches!(group.status,
+                    ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident))
+            .cloned() {
+            let members = self.repetition_occurrences.iter().filter(|row|
+                row.group_id == group.group_id && !matches!(row.status,
+                    ProcessRepetitionOccurrenceStatus::Completed
+                        | ProcessRepetitionOccurrenceStatus::Cancelled))
+                .cloned().collect::<Vec<_>>();
+            for mut occurrence in members {
+                if let Some(inner) = self.tokens.iter().find(|candidate|
+                    candidate.token_id == occurrence.token_id
+                        && candidate.scope_id == group.scope_id
+                        && matches!(candidate.status.as_str(), "ready" | "waiting" | "joining"))
+                    .cloned() {
+                    self.interrupt_activity(&inner, winning_timer_id)?;
+                } else {
+                    ensure!(occurrence.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked,
+                        "active ordinal lost its factual wait before group interruption");
+                }
+                occurrence.status = ProcessRepetitionOccurrenceStatus::Cancelled;
+                occurrence.updated_at_ms = self.now_ms;
+                self.write_repetition_occurrence(occurrence)?;
+            }
+            if let Some(id) = &group.terminal_incident_id {
+                self.resolve_incident(id);
+            }
+            let mut cancelled = group;
+            cancelled.status = ProcessRepetitionGroupStatus::Cancelled;
+            cancelled.updated_at_ms = self.now_ms;
+            self.write_repetition_group(cancelled)?;
+        }
         if let Some(child) = self
             .scopes
             .iter()
@@ -1896,40 +3068,96 @@ impl<'a> Transition<'a> {
     }
 
     fn enter_call(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
-        let ProcessNodeKind::CallActivity { input_mapping, .. } = &node.kind else {
+        let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &node.kind else {
             anyhow::bail!("call entry requires a CallActivity");
         };
+        let io_inputs = match self.activity_io_inputs(node, token) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                self.fail_activity_io_input(node, token, &error)?;
+                return Ok(());
+            }
+        };
+        let configured_io = io_inputs.is_some();
+        let prepared_io_mapping = if configured_io {
+            let (source_variables, repeat_extra) =
+                if let Some((group, occurrence)) = self.repetition_for_token(&token.token_id) {
+                    (occurrence.input_variables,
+                        Self::repeat_extra(&group.group_id, occurrence.ordinal, occurrence.item))
+                } else {
+                    (self.effective()?, Vec::new())
+                };
+            let extra = merge_activity_inputs_extra(&repeat_extra, io_inputs.as_deref())?;
+            Some(patch_variables(input_mapping, &json!({}), &source_variables,
+                &Value::Null, &extra))
+        } else {
+            None
+        };
         let waiting = self.wait(token, "waiting");
+        if let Some(inputs) = io_inputs.as_ref() {
+            self.capture_activity_io_inputs(node, token, &waiting, inputs.clone());
+        }
+        if let Some((_, mut occurrence)) = self.repetition_for_token(&token.token_id) {
+            occurrence.token_id = waiting.clone();
+            occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+            occurrence.updated_at_ms = self.now_ms;
+            self.write_repetition_occurrence(occurrence)?;
+        }
         self.arm_boundaries(node, &waiting)?;
-        match patch_variables(
-            input_mapping,
-            &json!({}),
-            &self.effective()?,
-            &Value::Null,
-            &[],
-        ) {
+        let (source_variables, repeat_extra) = if let Some((group, occurrence)) =
+            self.repetition_for_token(&waiting) {
+            (occurrence.input_variables, Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item))
+        } else {
+            (self.effective()?, Vec::new())
+        };
+        let extra = if configured_io {
+            merge_activity_inputs_extra(&repeat_extra, io_inputs.as_deref())?
+        } else {
+            repeat_extra.clone()
+        };
+        match prepared_io_mapping.unwrap_or_else(|| patch_variables(
+            input_mapping, &json!({}), &source_variables, &Value::Null, &extra)) {
             Ok(variables) => {
                 let request = super::repository::CallRequest {
-                    call_id: Uuid::new_v4().to_string(),
+                    call_id: self.next_id("runtime"),
                     parent_scope_id: self.current_scope.clone(),
                     parent_token_id: waiting,
+                    parent_arrival_edge_id: token.arrival_edge_id.clone()
+                        .context("Call activation lacks its actual incoming flow")?,
                     call_node_id: node.id.clone(),
-                    child_instance_id: Uuid::new_v4().to_string(),
+                    child_instance_id: self.next_id("runtime"),
                     variables,
                 };
                 self.event(
                     "call_requested",
                     Some(node.id.clone()),
-                    json!({"call_id":request.call_id,"parent_token_id":request.parent_token_id}),
+                    json!({"call_id":request.call_id,"parent_token_id":request.parent_token_id,
+                        "parent_arrival_edge_id":request.parent_arrival_edge_id}),
                 );
                 self.plan.call_requests.push(request);
             }
-            Err(error) => self.incident(
-                &node.id,
-                None,
-                "CALL_ADMISSION_ERROR",
-                super::repository::bounded_failure_message(&format!("{error:#}")),
-            ),
+            Err(error) => {
+                self.incident(
+                    &node.id,
+                    None,
+                    "CALL_ADMISSION_ERROR",
+                    super::repository::bounded_failure_message(&format!("{error:#}")),
+                );
+                if configured_io {
+                    let incident = self.plan.add_incidents.last()
+                        .context("configured Call admission lacks its incident")?;
+                    let event = self.plan.events.last_mut()
+                        .context("configured Call admission lacks its incident event")?;
+                    let data = event.data.as_object_mut()
+                        .context("configured Call admission incident is not an object")?;
+                    data.insert("incident_id".into(), json!(incident.incident_id));
+                    data.insert("activation_token_id".into(), json!(waiting));
+                }
+            }
         }
         Ok(())
     }
@@ -1950,7 +3178,7 @@ impl<'a> Transition<'a> {
         ensure!(!code.is_empty(), "ErrorEnd needs a declared error code");
         let source_scope = self.current_scope.clone();
         let outputs = self.effective()?;
-        let event_id = Uuid::new_v4().to_string();
+        let event_id = self.next_id("runtime");
         let fact = tentaflow_protocol::processes::ProcessTerminalError {
             error_ref: error_ref.to_owned(),
             error_code: code.clone(),
@@ -1971,12 +3199,16 @@ impl<'a> Transition<'a> {
             let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
                 anyhow::bail!("error handler is not a BoundaryError")
             };
+            let mut boundary_extra = vec![("activity_result".into(), envelope)];
+            boundary_extra.extend(self.activity_inputs_extra_for_activation(
+                &attached.node_id, &attached.token_id,
+            )?);
             self.map_outputs(
                 &handler.id,
                 &attached.token_id,
                 output_mapping,
                 &outputs,
-                &[("activity_result".into(), envelope)],
+                &boundary_extra,
             )?;
             self.settle_subscription(
                 &subscription,
@@ -2050,9 +3282,32 @@ impl<'a> Transition<'a> {
         else {
             anyhow::bail!("scope entry requires an embedded subprocess");
         };
+        let io_inputs = match self.activity_io_inputs(node, token) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                self.fail_activity_io_input(node, token, &error)?;
+                return Ok(());
+            }
+        };
         let parent_scope = self.current_scope.clone();
         let waiting = self.wait(token, "waiting");
-        self.arm_boundaries(node, &waiting)?;
+        if self.retained_scope_count < 129 {
+            if let Some(inputs) = &io_inputs {
+                self.capture_activity_io_inputs(node, token, &waiting, inputs.clone());
+            }
+        }
+        if let Some((_, mut occurrence)) = self.repetition_for_token(&token.token_id) {
+            occurrence.token_id = waiting.clone();
+            occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+            occurrence.updated_at_ms = self.now_ms;
+            self.write_repetition_occurrence(occurrence)?;
+        }
+        if io_inputs.is_none() {
+            self.arm_boundaries(node, &waiting)?;
+        }
         if self.retained_scope_count >= 129 {
             self.incident(
                 &node.id,
@@ -2070,19 +3325,30 @@ impl<'a> Transition<'a> {
             self.event("scope_entry_failed", Some(node.id.clone()), json!({"parent_token_id":waiting,"scope_id":parent_scope,"subprocess_node_id":node.id,"incident_id":incident_id,"code":"SCOPE_LIMIT","reason":"scope_limit"}));
             return Ok(());
         }
+        if io_inputs.is_some() {
+            self.arm_boundaries(node, &waiting)?;
+        }
+        let (source_variables, repeat_extra) = if let Some((group, occurrence)) =
+            self.repetition_for_token(&waiting) {
+            (occurrence.input_variables, Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item))
+        } else {
+            (self.effective()?, Vec::new())
+        };
+        let body_extra = merge_activity_inputs_extra(&repeat_extra, io_inputs.as_deref())?;
         let local = patch_variables(
             input_mapping,
             &serde_json::to_value(&body.variables)?,
-            &self.effective()?,
+            &source_variables,
             &Value::Null,
-            &[],
+            &body_extra,
         )?;
         let start = body
             .nodes
             .iter()
             .find(|node| node.kind == ProcessNodeKind::Start)
             .context("embedded subprocess start missing")?;
-        let scope_id = Uuid::new_v4().to_string();
+        let scope_id = self.next_id("runtime");
         let depth = self
             .scopes
             .iter()
@@ -2255,9 +3521,19 @@ impl<'a> Transition<'a> {
             Some(self.model.signals.iter().find(|signal| &signal.signal_id == signal_ref)
                 .context("signal catch declaration is missing")?)
         } else { None };
-        let effective = self.effective()?;
+        let (effective, repeat_extra) = if let Some((group, occurrence)) =
+            self.repetition_for_token(token_id) {
+            (occurrence.input_variables, Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item))
+        } else {
+            (self.effective()?, Vec::new())
+        };
+        let body_extra = merge_activity_inputs_extra(
+            &repeat_extra,
+            self.captured_activity_inputs(&node.id, token_id)?.as_deref(),
+        )?;
         let predicate = correlation
-            .map(|expression| super::messages::evaluate_key(expression, &effective))
+            .map(|expression| super::messages::evaluate_key(expression, &effective, &body_extra))
             .transpose();
         let (key, status, reason) = match predicate {
             Ok(key) => (key, S::Open, None),
@@ -2268,7 +3544,7 @@ impl<'a> Transition<'a> {
             ),
         };
         let s = super::repository::EventSubscription {
-            subscription_id: Uuid::new_v4().to_string(),
+            subscription_id: self.next_id("runtime"),
             scope_id: self.current_scope.clone(),
             instance_id: self.instance_id.to_owned(),
             org_id: self.org_id.to_owned(),
@@ -2453,7 +3729,7 @@ impl<'a> Transition<'a> {
         Ok(())
     }
     fn enter_event_race(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
-        let id = Uuid::new_v4().to_string();
+        let id = self.next_id("runtime");
         let race = super::repository::EventRace {
             race_id: id.clone(),
             scope_id: self.current_scope.clone(),
@@ -2497,6 +3773,16 @@ impl<'a> Transition<'a> {
                 ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::SignalCatch { .. } => {
+                    if child.activity_io.is_some() {
+                        // A branch has no ready activation of its own: the consumed
+                        // gateway token is the source of the authored input capture.
+                        let inputs = self.activity_io_inputs(&child, token)
+                            .with_context(|| format!(
+                                "event race branch {} could not capture its authored inputs",
+                                child.id))?
+                            .context("configured race branch lost its authored IO")?;
+                        self.capture_activity_io_inputs(&child, token, &waiting, inputs);
+                    }
                     self.arm_subscription(&child, &waiting, Some(id.clone()))?
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
@@ -2516,9 +3802,26 @@ impl<'a> Transition<'a> {
         }
         Ok(())
     }
-    fn throw_message(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
-        let prepared = super::messages::prepare_throw(self.model, node, &self.effective()?)?;
+    fn throw_message(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<bool> {
+        let (variables, repeat_extra) = if let Some((group, occurrence)) =
+            self.repetition_for_token(&token.token_id) {
+            (occurrence.input_variables, Self::repeat_extra(&group.group_id,
+                occurrence.ordinal, occurrence.item))
+        } else {
+            (self.effective()?, Vec::new())
+        };
+        let body_extra = merge_activity_inputs_extra(
+            &repeat_extra,
+            self.captured_activity_inputs(&node.id, &token.token_id)?.as_deref(),
+        )?;
+        let prepared = super::messages::prepare_throw(self.model, node, &variables,
+            &body_extra)?;
         let event_index = self.plan.events.len();
+        let repeated = self.repetition_for_token(&token.token_id);
+        let event_id = self.next_id("runtime");
+        if repeated.is_some() || node.activity_io.is_some() {
+            self.plan.event_ids.insert(event_index, event_id.clone());
+        }
         self.plan.event_sources.insert(event_index, token.token_id.clone());
         self.event(if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {"send_task_admitted"} else {"message_queued"},Some(node.id.clone()),json!({"message_id":prepared.message_id,"source_activation_id":token.token_id,"target":prepared.target,"message_name":prepared.message_name,"correlation_key":prepared.correlation_key}));
         self.plan
@@ -2530,11 +3833,102 @@ impl<'a> Transition<'a> {
                 source_activation_id: token.token_id.clone(),
                 source_event_index: event_index,
             });
+        if matches!(&node.kind, ProcessNodeKind::SendTask { .. })
+            && node.activity_io.is_some() {
+            let planned = self.plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+                ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                    activation_token_id, .. }
+                    if scope_id == &self.current_scope && node_id == &node.id
+                        && activation_token_id == &token.token_id => Some(witness_id.clone()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            let persisted = self.activity_io_witnesses.iter().filter(|row|
+                row.scope_id == self.current_scope && row.node_id == node.id
+                    && row.token_id == token.token_id && row.phase == "input_captured")
+                .map(|row| row.witness_id.clone()).collect::<Vec<_>>();
+            ensure!(planned.len() + persisted.len() == 1,
+                "admitted Send IO has no unique captured activation");
+            let witness_id = planned.into_iter().chain(persisted).next()
+                .context("admitted Send IO lost its captured witness")?;
+            let payload = self.plan.create_messages.last()
+                .context("admitted Send IO lost its outbox message")?
+                .message.payload.clone();
+            let message_id = self.plan.create_messages.last()
+                .context("admitted Send IO lost its message identity")?
+                .message.message_id.clone();
+            let observed = IoObservedValue::Present { value: payload.clone() };
+            let disposition = match self.map_outputs(&node.id, &token.token_id,
+                &BTreeMap::new(), &payload, &repeat_extra) {
+                Ok(()) => {
+                    let output_event_index = self.plan.events.len() - 1;
+                    let (ordered_outputs, local_patch) = match self.plan.variable_effects.last() {
+                        Some(VariableEffect::Mapped { event_index,
+                            activity_io_outputs: Some(ordered), result, .. })
+                            if *event_index == output_event_index =>
+                                (ordered.clone(), result.clone()),
+                        _ => anyhow::bail!("Send IO applied output lost its mapped effect"),
+                    };
+                    ActivityIoResultDisposition::Applied {
+                        output_event_index, ordered_outputs, local_patch,
+                    }
+                }
+                Err(error) => {
+                    if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                        return Err(error);
+                    }
+                    let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+                        .context("Send IO output failed without a factual association")?;
+                    let incident_event_index = self.plan.events.len();
+                    self.record_event_id(incident_event_index);
+                    self.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                        super::repository::bounded_failure_message(&error.to_string()));
+                    let incident_id = self.plan.add_incidents.last()
+                        .context("Send IO output failure lost its incident")?
+                        .incident_id.clone();
+                    let event = self.plan.events.get_mut(incident_event_index)
+                        .context("Send IO output failure lost its event")?;
+                    event.data["incident_id"] = json!(incident_id);
+                    event.data["activation_token_id"] = json!(token.token_id);
+                    ActivityIoResultDisposition::Blocked {
+                        incident_event_index, incident_id,
+                        association_id: Some(failure.association_id.clone()),
+                        position: Some(failure.position),
+                    }
+                }
+            };
+            let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+            self.plan.activity_io_results.push(ActivityIoResultFact {
+                witness_id, scope_id: self.current_scope.clone(),
+                node_id: node.id.clone(), token_id: token.token_id.clone(),
+                result_event_index: event_index,
+                source_instance_id: self.instance_id.to_owned(),
+                source_event_id: event_id.clone(), result_sources: vec![event_id.clone()],
+                observed, accepted_origin: None,
+                resource_id: Some(message_id), resource_revision: None,
+                service_invocation_id: None, child_scope_id: None, call_id: None,
+                child_instance_id: None, child_expected_revision: None,
+                child_status: None, parent_wait_token_id: None, disposition,
+            });
+            if !applied {
+                if let Some((mut group, mut occurrence)) = self.repetition_for_token(&token.token_id) {
+                    occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                    occurrence.updated_at_ms = self.now_ms;
+                    self.write_repetition_occurrence(occurrence)?;
+                    group.updated_at_ms = self.now_ms;
+                    self.write_repetition_group(group)?;
+                }
+                return Ok(false)
+            }
+        }
         self.consume(&token.token_id);
+        if repeated.is_some() {
+            self.complete_repetition_occurrence(token, &Value::Null, event_id, None, None)?;
+            return Ok(true);
+        }
         for edge in self.outgoing(&node.id) {
             self.follow(token, &edge)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn throw_signal(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
@@ -2561,7 +3955,7 @@ impl<'a> Transition<'a> {
                 super::repository::bounded_failure_message(&error.to_string()));
             return Ok(());
         }
-        let signal_id = Uuid::new_v4().to_string();
+        let signal_id = self.next_id("runtime");
         let event_index = self.plan.events.len();
         let planned = PlannedSignal {
             signal_id, signal_namespace_uri: declaration.namespace_uri.clone(),
@@ -2589,7 +3983,7 @@ impl<'a> Transition<'a> {
             return Ok(());
         }
         self.plan.event_sources.insert(event_index, token.token_id.clone());
-        self.plan.event_ids.insert(event_index, Uuid::new_v4().to_string());
+        self.record_event_id(event_index);
         self.event("signal_admitted", Some(node.id.clone()), json!({
             "signal_id":planned.signal_id,"source_activation_id":token.token_id,
             "signal_namespace_uri":declaration.namespace_uri,
@@ -2689,7 +4083,7 @@ impl<'a> Transition<'a> {
         }
         let parent = self.scopes.iter().find(|scope| scope.scope_id == token.scope_id)
             .context("terminating source scope is missing")?.clone();
-        let source_event_id = Uuid::new_v4().to_string();
+        let source_event_id = self.next_id("runtime");
         let event_index = self.plan.events.len();
         let source = TerminationSource {
             source_instance_id: self.instance_id.to_owned(),
@@ -2719,14 +4113,22 @@ impl<'a> Transition<'a> {
             };
             let parent_local = self.local()?.clone();
             let parent_effective = self.effective()?;
-            let mapped = patch_variables(output_mapping, &parent_local, &parent_effective, &child_locals, &[]);
+            let mapped = if self.repetition_for_token(&parent_wait.token_id).is_some() {
+                Ok(parent_local.clone())
+            } else {
+                let parent_extra = self.activity_inputs_extra_for_activation(
+                    &parent_node.id, &parent_wait.token_id,
+                )?;
+                patch_variables(output_mapping, &parent_local, &parent_effective,
+                    &child_locals, &parent_extra)
+            };
             self.current_scope = token.scope_id.clone();
             match mapped {
                 Ok(patch) => return_patch = Some((parent_scope_id.clone(), parent_wait, parent_node, child_locals, patch)),
                 Err(error) => {
                     let message = super::repository::bounded_failure_message(&format!("{error:#}"));
                     let waiting_token_id = self.wait(token, "waiting");
-                    let incident_id = Uuid::new_v4().to_string();
+                    let incident_id = self.next_id("runtime");
                     self.plan.add_incidents.push(ProcessIncident {
                         incident_id: incident_id.clone(), scope_id: token.scope_id.clone(),
                         node_id: Some(node.id.clone()), node_name: Some(node.name.clone()), job_id: None,
@@ -2781,6 +4183,12 @@ impl<'a> Transition<'a> {
                 "source_event_id":source_event_id,
             }));
             self.current_scope = parent_scope_id;
+            if self.repetition_for_token(&parent_wait.token_id).is_some() {
+                self.consume(&parent_wait.token_id);
+                self.complete_repetition_occurrence(&parent_wait, &child_locals,
+                    source_event_id, None, None)?;
+                return Ok(());
+            }
             self.map_outputs(&parent_node.id, &parent_wait.token_id,
                 match &parent_node.kind {
                     ProcessNodeKind::SubProcess { output_mapping, .. } => output_mapping,
@@ -2800,7 +4208,12 @@ impl<'a> Transition<'a> {
         while let Some(token) = self
             .tokens
             .iter()
-            .find(|token| token.status == "ready")
+            .find(|token| token.status == "ready"
+                && !self.repetition_occurrences.iter().any(|occurrence|
+                    occurrence.token_id == token.token_id
+                        && self.repetition_groups.iter().any(|group|
+                            group.group_id == occurrence.group_id
+                                && group.status == ProcessRepetitionGroupStatus::Incident)))
             .cloned()
         {
             if self.plan.repetition_capacity.is_some() {
@@ -2817,6 +4230,10 @@ impl<'a> Transition<'a> {
                 }
             });
             self.current_scope = token.scope_id.clone();
+            if self.immediate_predecessors(&token.token_id)? == 255 {
+                self.limit_immediate_lineage(&token)?;
+                continue;
+            }
             let id = token.token_id.clone();
             let node = self.node(&token.node_id)?.clone();
             if node.repeat.is_some() && self.repetition_for_token(&id).is_none() {
@@ -2835,13 +4252,73 @@ impl<'a> Transition<'a> {
                         self.follow(&token, &edge)?;
                     }
                 }
-                ProcessNodeKind::End => {
+                ProcessNodeKind::LinkThrow { definition } => {
+                    let (catch_id, catch_definition_id, edge_id) = {
+                        let (nodes, flows) = self.body()?;
+                        let pairs = super::model::link_pairs(nodes)?;
+                        let catch_id = *pairs.get(node.id.as_str())
+                            .context("Link Throw has no selected-body Catch")?;
+                        let catch = nodes.iter().find(|candidate| candidate.id == catch_id)
+                            .context("selected-body Link Catch is absent")?;
+                        let ProcessNodeKind::LinkCatch { definition: catch_definition } = &catch.kind else {
+                            anyhow::bail!("Link destination is not a Catch");
+                        };
+                        let outgoing = flows.iter().filter(|edge| edge.source_id == catch_id)
+                            .collect::<Vec<_>>();
+                        ensure!(outgoing.len() == 1,
+                            "Link Catch needs one factual outgoing sequence flow");
+                        (catch_id.to_owned(), catch_definition.id.clone(), outgoing[0].id.clone())
+                    };
                     self.consume(&id);
-                    self.plan.event_sources.insert(self.plan.events.len(), id.clone());
-                    self.event("end_reached", Some(node.id), Value::Null);
+                    let successor_id = self.follow(&token, &edge_id)?;
+                    let thrown_event_id = self.next_id("runtime");
+                    let throw_index = self.plan.events.len();
+                    self.plan.event_sources.insert(throw_index, id.clone());
+                    self.plan.event_ids.insert(throw_index, thrown_event_id.clone());
+                    self.event("link_thrown", Some(node.id.clone()), json!({
+                        "source_token_id":id,"definition_id":definition.id,
+                        "catch_node_id":catch_id,"catch_definition_id":catch_definition_id,
+                        "successor_token_id":successor_id,"outgoing_edge_id":edge_id,
+                    }));
+                    let catch_index = self.plan.events.len();
+                    self.record_event_id(catch_index);
+                    self.event("link_caught", Some(catch_id), json!({
+                        "source_token_id":id,"throw_event_id":thrown_event_id,
+                        "successor_token_id":successor_id,"outgoing_edge_id":edge_id,
+                    }));
+                }
+                ProcessNodeKind::LinkCatch { .. } => {
+                    anyhow::bail!("Link Catch cannot be activated without its factual Throw");
+                }
+                ProcessNodeKind::End => {
+                    let scope = self.scopes.iter().find(|scope|
+                        scope.scope_id == token.scope_id)
+                        .context("End activation scope is missing")?;
+                    let typed_source = if let (Some(parent_scope_id), Some(parent_node_id)) =
+                        (&scope.parent_scope_id, &scope.subprocess_node_id) {
+                        super::repository::scope_node(self.model, self.selected_process_id,
+                            &self.scopes, self.instance_id, parent_scope_id,
+                            parent_node_id)?.activity_io.is_some()
+                    } else { false };
+                    self.consume(&id);
+                    let event_index = self.plan.events.len();
+                    self.plan.event_sources.insert(event_index, id.clone());
+                    if typed_source {
+                        let event_id = self.next_id("runtime");
+                        self.plan.event_ids.insert(event_index, event_id.clone());
+                        self.end_sources.push(super::repository::ProcessEndSource {
+                            event_id,
+                            scope_id: token.scope_id.clone(),
+                            node_id: node.id.clone(),
+                            source_token_id: id.clone(),
+                        });
+                    }
+                    self.event("end_reached", Some(node.id), if typed_source {
+                        json!({"source_token_id": id})
+                    } else { Value::Null });
                 }
                 ProcessNodeKind::TerminateEnd => self.terminate(&node, &token)?,
-                ProcessNodeKind::CallActivity { .. } => self.enter_call(&node, &token)?,
+                ProcessNodeKind::CallActivity(_) => self.enter_call(&node, &token)?,
                 ProcessNodeKind::ErrorEnd { error_ref } => {
                     self.error_end(&node, &token, &error_ref)?
                 }
@@ -2849,14 +4326,31 @@ impl<'a> Transition<'a> {
                 ProcessNodeKind::UserTask {
                     assignee_user_id, ..
                 } => {
+                    let io_inputs = match self.activity_io_inputs(&node, &token) {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                return Err(error);
+                            }
+                            self.fail_activity_io_input(&node, &token, &error)?;
+                            continue;
+                        }
+                    };
+                    let task_inputs = io_inputs.as_deref()
+                        .map(|inputs| activity_inputs_for_task(&node, inputs))
+                        .transpose()?.unwrap_or_default();
                     let token_id = self.wait(&token, "waiting");
+                    if let Some(inputs) = io_inputs {
+                        self.capture_activity_io_inputs(&node, &token, &token_id, inputs);
+                    }
                     self.user_task(
                         &node,
                         ProcessUserTaskKind::Work,
                         assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
                         Value::Null,
+                        task_inputs,
                         &token_id,
-                    );
+                    )?;
                     if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
                         occurrence.token_id = token_id.clone();
                         occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
@@ -2867,10 +4361,34 @@ impl<'a> Transition<'a> {
                     self.arm_boundaries(&node, &token_id)?;
                 }
                 ProcessNodeKind::ManualTask { assignee_user_id, .. } => {
+                    let io_inputs = match self.activity_io_inputs(&node, &token) {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                return Err(error);
+                            }
+                            self.fail_activity_io_input(&node, &token, &error)?;
+                            continue;
+                        }
+                    };
+                    let task_inputs = io_inputs.as_deref()
+                        .map(|inputs| activity_inputs_for_task(&node, inputs))
+                        .transpose()?.unwrap_or_default();
                     let token_id = self.wait(&token, "waiting");
+                    if let Some(inputs) = io_inputs {
+                        self.capture_activity_io_inputs(&node, &token, &token_id, inputs);
+                    }
                     self.user_task(&node, ProcessUserTaskKind::Manual,
                         assignee_user_id.unwrap_or_else(|| self.initiator.to_owned()),
-                        Value::Null, &token_id);
+                        Value::Null, task_inputs, &token_id)?;
+                    if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                        occurrence.token_id = token_id.clone();
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                        occurrence.user_task_id = self.plan.create_user_tasks.last()
+                            .map(|task| task.user_task_id.clone());
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence)?;
+                    }
                     self.arm_boundaries(&node, &token_id)?;
                 }
                 ProcessNodeKind::TimerCatch { timer } => {
@@ -2879,7 +4397,30 @@ impl<'a> Transition<'a> {
                 }
                 ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::SignalCatch { .. } => {
+                    let io_inputs = if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                        match self.activity_io_inputs(&node, &token) {
+                            Ok(inputs) => inputs,
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
+                        }
+                    } else { None };
                     let waiting = self.wait(&token, "waiting");
+                    if let Some(inputs) = io_inputs {
+                        self.capture_activity_io_inputs(&node, &token, &waiting, inputs.clone());
+                    }
+                    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                        if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                            occurrence.token_id = waiting.clone();
+                            occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                        }
+                    }
                     self.arm_subscription(&node, &waiting, None)?;
                     if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
                         self.arm_boundaries(&node, &waiting)?;
@@ -2890,35 +4431,361 @@ impl<'a> Transition<'a> {
                     | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } => attached_to_id == &node.id,
                     _ => false,
                 }) => {
+                    let observed_inputs = if node.activity_io.is_some() {
+                        match self.activity_io_inputs(&node, &token) {
+                            Ok(Some(inputs)) => Some(inputs),
+                            Ok(None) => anyhow::bail!("configured Send lost its authored IO"),
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
+                        }
+                    } else { None };
                     let pending_token_id = self.wait(&token, "waiting");
+                    if let Some(inputs) = observed_inputs {
+                        self.capture_activity_io_inputs(&node, &token,
+                            &pending_token_id, inputs);
+                    }
+                    if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                        occurrence.token_id = pending_token_id.clone();
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence)?;
+                    }
                     self.plan.event_sources.insert(self.plan.events.len(), id.clone());
-                    self.plan.event_ids.insert(self.plan.events.len(), Uuid::new_v4().to_string());
+                    self.record_event_id(self.plan.events.len());
                     self.event("send_task_pending", Some(node.id.clone()), json!({
                         "source_activation_id":id,"pending_token_id":pending_token_id,
                     }));
                     self.arm_boundaries(&node, &pending_token_id)?;
                 }
                 ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
-                    if let Err(error) = self.throw_message(&node, &token) {
-                        self.wait(&token, "waiting");
-                        if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
-                            self.plan.event_sources.insert(self.plan.events.len(), id.clone());
+                    if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence)?;
+                    }
+                    let observed_inputs = if matches!(&node.kind,
+                        ProcessNodeKind::SendTask { .. }) && node.activity_io.is_some() {
+                        match self.activity_io_inputs(&node, &token) {
+                            Ok(Some(inputs)) => Some(inputs),
+                            Ok(None) => anyhow::bail!("configured Send lost its authored IO"),
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
                         }
-                        self.incident(
-                            &node.id,
-                            None,
-                            "MESSAGE_EXPRESSION_ERROR",
-                            super::repository::bounded_failure_message(&error.to_string()),
-                        );
+                    } else { None };
+                    let activation = if let Some(inputs) = observed_inputs {
+                        let waiting = self.wait(&token, "waiting");
+                        self.capture_activity_io_inputs(&node, &token, &waiting, inputs.clone());
+                        if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                            occurrence.token_id = waiting.clone();
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                        }
+                        ProcessToken { token_id: waiting, status: "waiting".into(),
+                            ..token.clone() }
+                    } else { token.clone() };
+                    if let Err(error) = self.throw_message(&node, &activation) {
+                        if node.activity_io.is_some() {
+                            if error.downcast_ref::<super::messages::MessageExpressionFailed>()
+                                .is_none() {
+                                return Err(error);
+                            }
+                            let index = self.plan.events.len();
+                            self.record_event_id(index);
+                            self.incident(&node.id, None, "MESSAGE_EXPRESSION_ERROR",
+                                super::repository::bounded_failure_message(&error.to_string()));
+                            let incident_id = self.plan.add_incidents.last()
+                                .context("Send IO preparation failure lost its incident")?
+                                .incident_id.clone();
+                            let event = self.plan.events.get_mut(index)
+                                .context("Send IO preparation failure lost its event")?;
+                            event.data["incident_id"] = json!(incident_id);
+                            event.data["activation_token_id"] = json!(activation.token_id);
+                        } else {
+                            self.wait(&activation, "waiting");
+                            if matches!(&node.kind, ProcessNodeKind::SendTask { .. }) {
+                                self.plan.event_sources.insert(self.plan.events.len(),
+                                    activation.token_id.clone());
+                            }
+                            self.incident(&node.id, None, "MESSAGE_EXPRESSION_ERROR",
+                                super::repository::bounded_failure_message(&error.to_string()));
+                        }
                     }
                 }
                 ProcessNodeKind::SignalThrow { .. } => {
                     self.throw_signal(&node, &token)?;
                 }
                 ProcessNodeKind::ScriptTask { script, output_mapping } => {
-                    let source_variables = self.effective()?;
-                    match script_evaluate(&script, &source_variables, &Value::Null) {
-                        Ok(outputs) => match self.map_script_outputs(&node.id, &id, &output_mapping, &outputs) {
+                    if node.activity_io.is_some()
+                        && self.repetition_for_token(&id).is_some() {
+                        let inputs = match self.activity_io_inputs(&node, &token) {
+                            Ok(Some(inputs)) => inputs,
+                            Ok(None) => anyhow::bail!("configured repeated Script lost its authored IO"),
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
+                        };
+                        let waiting = self.wait(&token, "waiting");
+                        self.capture_activity_io_inputs(&node, &token, &waiting, inputs.clone());
+                        let (group, mut occurrence) = self.repetition_for_token(&id)
+                            .context("repeated Script lost its active ordinal")?;
+                        occurrence.token_id = waiting.clone();
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence.clone())?;
+                        let repeat_extra = Self::repeat_extra(&group.group_id, occurrence.ordinal,
+                            occurrence.item.clone());
+                        let mut extra = repeat_extra.clone();
+                        extra.extend(activity_inputs_extra(&inputs)?);
+                        let variables = occurrence.input_variables.clone();
+                        let outputs = match script_evaluate(&script, &variables, &Value::Null, &extra) {
+                            Ok(outputs) => outputs,
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED",
+                                    super::repository::bounded_failure_message(&error.to_string()));
+                                let incident_id = self.plan.add_incidents.last()
+                                    .context("repeated Script evaluation failure has no incident")?
+                                    .incident_id.clone();
+                                let mut blocked = group.clone();
+                                blocked.status = ProcessRepetitionGroupStatus::Incident;
+                                blocked.terminal_incident_id = Some(incident_id);
+                                blocked.updated_at_ms = self.now_ms;
+                                self.write_repetition_group(blocked)?;
+                                continue;
+                            }
+                        };
+                        let observed = IoObservedValue::Present { value: outputs.clone() };
+                        let result_event_index = self.plan.events.len();
+                        let result_event_id = self.next_id("runtime");
+                        self.plan.event_ids.insert(result_event_index,
+                            result_event_id.clone());
+                        self.event("script_result_evaluated", Some(node.id.clone()), json!({
+                            "source_activation_id":waiting,
+                            "outputs":outputs,
+                            "result_sha256":super::repository::activity_io_result_sha256(&observed)?,
+                        }));
+                        let applied = self.apply_repetition_activity_io(
+                            &node, &ProcessToken { token_id: waiting.clone(), status: "waiting".into(), ..token.clone() },
+                            &output_mapping, &outputs, &repeat_extra, result_event_index, &result_event_id,
+                            observed, None, None, None, None, true)?;
+                        if !applied {
+                            let (mut group, mut occurrence) = self.repetition_for_token(&waiting)
+                                .context("blocked repeated Script lost its ordinal")?;
+                            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                            group.updated_at_ms = self.now_ms;
+                            self.write_repetition_group(group)?;
+                            continue;
+                        }
+                        self.consume(&waiting);
+                        let completion_index = self.plan.events.len();
+                        let completion_id = self.next_id("runtime");
+                        self.plan.event_ids.insert(completion_index, completion_id.clone());
+                        self.plan.event_sources.insert(completion_index, waiting.clone());
+                        self.event("script_completed", Some(node.id.clone()),
+                            json!({"outputs":outputs}));
+                        let completed = ProcessToken { token_id: waiting, status: "waiting".into(),
+                            ..token.clone() };
+                        self.complete_repetition_occurrence(&completed, &outputs,
+                            completion_id, None, None)?;
+                        continue;
+                    }
+                    if node.activity_io.is_some()
+                        && self.repetition_for_token(&id).is_none() {
+                        let inputs = match self.activity_io_inputs(&node, &token) {
+                            Ok(Some(inputs)) => inputs,
+                            Ok(None) => anyhow::bail!("configured Script lost its authored IO"),
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
+                        };
+                        let waiting = self.wait(&token, "waiting");
+                        let body_extra = activity_inputs_extra(&inputs)?;
+                        self.capture_activity_io_inputs(&node, &token, &waiting, inputs.clone());
+                        let witness_id = match self.plan.activity_io_inputs.last() {
+                            Some(ActivityIoInputFact::Captured { witness_id, .. }) =>
+                                witness_id.clone(),
+                            _ => anyhow::bail!("Script IO input lost its captured witness"),
+                        };
+                        let mut activation = token.clone();
+                        activation.token_id = waiting.clone();
+                        activation.status = "waiting".into();
+                        let variables = self.effective()?;
+                        let outputs = match script_evaluate(&script, &variables,
+                            &Value::Null, &body_extra) {
+                            Ok(outputs) => outputs,
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                let parked = self.wait(&activation, "waiting");
+                                let event_index = self.plan.events.len();
+                                self.record_event_id(event_index);
+                                self.plan.event_sources.insert(event_index,
+                                    waiting.clone());
+                                self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED",
+                                    super::repository::bounded_failure_message(&error.to_string()));
+                                let incident_id = self.plan.add_incidents.last()
+                                    .context("Script IO evaluation failure lost its incident")?
+                                    .incident_id.clone();
+                                let event = self.plan.events.get_mut(event_index)
+                                    .context("Script IO evaluation failure lost its event")?;
+                                event.data["incident_id"] = json!(incident_id);
+                                event.data["activation_token_id"] = json!(waiting);
+                                event.data["parked_token_id"] = json!(parked);
+                                continue;
+                            }
+                        };
+                        let observed = IoObservedValue::Present { value: outputs.clone() };
+                        let result_event_index = self.plan.events.len();
+                        let result_event_id = self.next_id("runtime");
+                        self.plan.event_ids.insert(result_event_index,
+                            result_event_id.clone());
+                        self.event("script_result_evaluated", Some(node.id.clone()), json!({
+                            "source_activation_id":waiting,
+                            "outputs":outputs,
+                            "result_sha256":super::repository::activity_io_result_sha256(&observed)?,
+                        }));
+                        let local_before_mapping = self.local()?.clone();
+                        // The captured witness is the one owner of the `inputs` projection.
+                        let disposition = match self.map_script_outputs(
+                            &node.id, &waiting, &output_mapping, &outputs, &[]) {
+                            Ok(()) => {
+                                let output_event_index = self.plan.events.len() - 1;
+                                let (ordered_outputs, local_patch) = match self.plan.variable_effects.last() {
+                                    Some(VariableEffect::Mapped { event_index,
+                                        activity_io_outputs: Some(ordered), result, .. })
+                                        if *event_index == output_event_index =>
+                                            (ordered.clone(), result.clone()),
+                                    _ => anyhow::bail!("Script IO applied output lost its mapped effect"),
+                                };
+                                self.consume(&waiting);
+                                self.plan.event_sources.insert(self.plan.events.len(),
+                                    waiting.clone());
+                                self.event("script_completed", Some(node.id.clone()),
+                                    json!({"outputs":outputs}));
+                                for edge in outgoing {
+                                    self.follow(&activation, &edge)?;
+                                }
+                                ActivityIoResultDisposition::Applied {
+                                    output_event_index, ordered_outputs, local_patch,
+                                }
+                            }
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                let failure = error.downcast_ref::<ActivityIoAssociationFailure>();
+                                if failure.is_none()
+                                    && patch_script_variables(&output_mapping,
+                                        &local_before_mapping, &variables,
+                                        &outputs, &body_extra).err().is_none() {
+                                    return Err(error);
+                                }
+                                let code = if failure.is_some() {
+                                    "ACTIVITY_IO_OUTPUT_FAILED"
+                                } else { "SCRIPT_MAPPING_FAILED" };
+                                let parked = if failure.is_none() {
+                                    Some(self.wait(&activation, "waiting"))
+                                } else { None };
+                                let incident_event_index = self.plan.events.len();
+                                self.record_event_id(incident_event_index);
+                                if parked.is_some() {
+                                    self.plan.event_sources.insert(incident_event_index,
+                                        waiting.clone());
+                                }
+                                self.incident(&node.id, None, code,
+                                    super::repository::bounded_failure_message(&error.to_string()));
+                                let incident_id = self.plan.add_incidents.last()
+                                    .context("Script IO mapping failure lost its incident")?
+                                    .incident_id.clone();
+                                let event = self.plan.events.get_mut(incident_event_index)
+                                    .context("Script IO mapping failure lost its event")?;
+                                event.data["incident_id"] = json!(incident_id);
+                                event.data["activation_token_id"] = json!(waiting);
+                                if let Some(parked) = &parked {
+                                    event.data["parked_token_id"] = json!(parked);
+                                }
+                                if let Some(failure) = failure {
+                                    ActivityIoResultDisposition::Blocked {
+                                        incident_event_index, incident_id,
+                                        association_id: Some(failure.association_id.clone()),
+                                        position: Some(failure.position),
+                                    }
+                                } else {
+                                    ActivityIoResultDisposition::Retained {
+                                        fate: ActivityIoRetainedFate::ScriptMappingFailure,
+                                        route_event_index: incident_event_index,
+                                    }
+                                }
+                            }
+                        };
+                        self.plan.activity_io_results.push(ActivityIoResultFact {
+                            witness_id, scope_id: self.current_scope.clone(),
+                            node_id: node.id.clone(), token_id: waiting.clone(),
+                            result_event_index, source_instance_id: self.instance_id.to_owned(),
+                            source_event_id: result_event_id.clone(),
+                            result_sources: vec![result_event_id], observed,
+                            accepted_origin: None, resource_id: None, resource_revision: None,
+                            service_invocation_id: None, child_scope_id: None, call_id: None,
+                            child_instance_id: None, child_expected_revision: None,
+                            child_status: None, parent_wait_token_id: None, disposition,
+                        });
+                        continue;
+                    }
+                    if let Some((_, mut occurrence)) = self.repetition_for_token(&id) {
+                        if occurrence.status == ProcessRepetitionOccurrenceStatus::Pending {
+                            occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                        }
+                    }
+                    let repeated = self.repetition_for_token(&id);
+                    let source_variables = repeated.as_ref().map_or_else(
+                        || self.effective(), |(_, occurrence)| Ok(occurrence.input_variables.clone()))?;
+                    let extra = repeated.as_ref().map(|(group, occurrence)|
+                        Self::repeat_extra(&group.group_id, occurrence.ordinal, occurrence.item.clone()))
+                        .unwrap_or_default();
+                    match script_evaluate(&script, &source_variables, &Value::Null, &extra) {
+                        Ok(outputs) if repeated.is_some() => {
+                            self.consume(&id);
+                            let source_index = self.plan.events.len();
+                            let source_event_id = self.next_id("runtime");
+                            self.plan.event_sources.insert(source_index, id.clone());
+                            self.plan.event_ids.insert(source_index, source_event_id.clone());
+                            self.event("script_completed", Some(node.id.clone()), json!({"outputs":outputs}));
+                            self.complete_repetition_occurrence(&token, &outputs,
+                                source_event_id, None, None)?;
+                            if repeated.as_ref().is_some_and(|(group, _)|
+                                self.repetition_groups.iter().any(|current|
+                                    current.group_id == group.group_id
+                                        && current.status == ProcessRepetitionGroupStatus::Incident)) {
+                                break;
+                            }
+                        }
+                        Ok(outputs) => match self.map_script_outputs(&node.id, &id, &output_mapping,
+                            &outputs, &extra) {
                             Ok(()) => {
                                 self.consume(&id);
                                 self.plan.event_sources.insert(self.plan.events.len(), id.clone());
@@ -2936,6 +4803,26 @@ impl<'a> Transition<'a> {
                                 self.incident(&node.id, None, "SCRIPT_MAPPING_FAILED", error.to_string());
                             }
                         },
+                        Err(error) if repeated.is_some() => {
+                            if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                return Err(error);
+                            }
+                            let (mut group, mut occurrence) = repeated
+                                .context("failed repeated Script lost its active ordinal")?;
+                            let waiting = self.wait(&token, "waiting");
+                            self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED", error.to_string());
+                            let incident_id = self.plan.add_incidents.last()
+                                .context("failed repeated Script has no incident")?.incident_id.clone();
+                            group.status = ProcessRepetitionGroupStatus::Incident;
+                            group.terminal_incident_id = Some(incident_id);
+                            group.terminal_event_id = None;
+                            group.updated_at_ms = self.now_ms;
+                            self.write_repetition_group(group)?;
+                            occurrence.token_id = waiting;
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                            break;
+                        }
                         Err(error) => {
                             if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
                                 return Err(error);
@@ -2971,11 +4858,31 @@ impl<'a> Transition<'a> {
                     } else {
                         (self.effective()?, Vec::new())
                     };
-                    match prepare_service_input(&input_mapping, &variables, &extra) {
+                    let observed_inputs = if node.activity_io.is_some() {
+                        match self.activity_io_inputs(&node, &token) {
+                            Ok(Some(inputs)) => Some(inputs),
+                            Ok(None) => anyhow::bail!("configured activity IO lost its authored input"),
+                            Err(error) => {
+                                if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                self.fail_activity_io_input(&node, &token, &error)?;
+                                continue;
+                            }
+                        }
+                    } else { None };
+                    let mut body_extra = extra.clone();
+                    if let Some(inputs) = observed_inputs.as_deref() {
+                        body_extra.extend(activity_inputs_extra(inputs)?);
+                    }
+                    match prepare_service_input(&input_mapping, &variables, &body_extra) {
                         Ok(input) => {
                             let token_id = self.wait(&token, "waiting");
+                            if let Some(inputs) = observed_inputs {
+                                self.capture_activity_io_inputs(&node, &token, &token_id, inputs);
+                            }
                             let job = ProcessJob {
-                                job_id: Uuid::new_v4().to_string(),
+                                job_id: self.next_id("runtime"),
                                 instance_id: self.instance_id.to_owned(),
                                 scope_id: self.current_scope.clone(),
                                 node_id: node.id.clone(),
@@ -2989,6 +4896,7 @@ impl<'a> Transition<'a> {
                                 result: None,
 
                                 result_origin: None,
+                                observed_result_event_id: None,
                             };
                             self.event(
                                 "service_queued",
@@ -2996,6 +4904,8 @@ impl<'a> Transition<'a> {
                                 json!({"job_id": job.job_id}),
                             );
                             self.jobs.push(job.clone());
+                            self.plan.service_invocation_ids.insert(
+                                job.job_id.clone(), self.next_id("runtime"));
                             self.plan.create_jobs.push(job);
                             if let Some((_, mut occurrence)) = repeated {
                                 occurrence.token_id = token_id.clone();
@@ -3123,7 +5033,7 @@ impl<'a> Transition<'a> {
                             }
                             _ => unreachable!(),
                         };
-                        let activation_id = Uuid::new_v4().to_string();
+                        let activation_id = self.next_id("runtime");
                         self.consume(&id);
                         let kind = match gateway_kind {
                             GatewayKind::Parallel => "parallel_split",
@@ -3178,6 +5088,23 @@ impl<'a> Transition<'a> {
         scopes.sort_by_key(|scope| std::cmp::Reverse(scope.depth));
         let mut progressed = false;
         for scope in scopes {
+            if scope.parent_token_id.as_ref().is_some_and(|parent_token_id|
+                self.activity_io_witnesses.iter().any(|witness|
+                    witness.scope_id == scope.parent_scope_id.as_deref().unwrap_or_default()
+                        && witness.node_id == scope.subprocess_node_id.as_deref().unwrap_or_default()
+                        && witness.token_id == *parent_token_id
+                        && witness.phase == "output_blocked")) {
+                continue;
+            }
+            if self.plan.activity_io_results.iter().any(|fact|
+                fact.scope_id == scope.parent_scope_id.as_deref().unwrap_or_default()
+                    && fact.node_id == scope.subprocess_node_id.as_deref().unwrap_or_default()
+                    && fact.token_id == scope.parent_token_id.as_deref().unwrap_or_default()
+                    && fact.child_scope_id.as_deref() == Some(scope.scope_id.as_str())
+                    && matches!(&fact.disposition,
+                        super::repository::ActivityIoResultDisposition::Blocked { .. })) {
+                continue;
+            }
             if self
                 .tokens
                 .iter()
@@ -3238,7 +5165,7 @@ impl<'a> Transition<'a> {
                 })
                 .context("completing child lost its parent waiting activation")?
                 .clone();
-            self.current_scope = parent;
+            self.current_scope = parent.clone();
             let node = self.node(&token.node_id)?.clone();
             let ProcessNodeKind::SubProcess { output_mapping, .. } = &node.kind else {
                 anyhow::bail!("child completion parent activation is not a subprocess");
@@ -3248,10 +5175,132 @@ impl<'a> Transition<'a> {
                 .get(&scope.scope_id)
                 .context("completing child local variables missing")?
                 .clone();
-            if let Err(error) = self.map_outputs(&node.id, &token.token_id, output_mapping, &outputs, &[]) {
+            let accepted_io = if node.activity_io.is_some() {
+                let persisted = self.activity_io_witnesses.iter().filter(|witness|
+                    witness.scope_id == parent && witness.node_id == node.id
+                        && witness.token_id == token.token_id
+                        && witness.phase == "input_captured")
+                    .map(|witness| witness.witness_id.clone());
+                let planned = self.plan.activity_io_inputs.iter().filter_map(|input| match input {
+                    ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                        activation_token_id, .. }
+                        if scope_id == &parent && node_id == &node.id
+                            && activation_token_id == &token.token_id =>
+                            Some(witness_id.clone()),
+                    _ => None,
+                });
+                let witnesses = persisted.chain(planned).collect::<Vec<_>>();
+                ensure!(witnesses.len() == 1,
+                    "accepted SubProcess result has no unique captured activation");
+                let end_sources = self.end_sources.iter().filter(|source|
+                    source.scope_id == scope.scope_id)
+                    .map(|source| source.event_id.clone()).collect::<Vec<_>>();
+                let planned_ends = self.plan.events.iter().enumerate().filter(|(_, event)|
+                    event.scope_id == scope.scope_id && event.kind == "end_reached")
+                    .collect::<Vec<_>>();
+                let planned_end_ids = planned_ends.iter().filter_map(|(index, _)|
+                    self.plan.event_ids.get(index)).cloned().collect::<Vec<_>>();
+                ensure!(!end_sources.is_empty() && !planned_end_ids.is_empty()
+                    && planned_end_ids.iter().all(|id| end_sources.contains(id))
+                    && planned_end_ids.last() == end_sources.last(),
+                    "accepted SubProcess has no final factual child End");
+                let result_event_index = self.plan.events.len();
+                self.record_event_id(result_event_index);
+                let observed = IoObservedValue::Present { value: outputs.clone() };
+                self.event("scope_result_accepted", Some(node.id.clone()), json!({
+                    "child_scope_id": scope.scope_id,
+                    "parent_scope_id": parent.clone(),
+                    "parent_token_id": token.token_id.clone(),
+                    "child_revision": scope.revision,
+                    "child_status": super::repository::status_text(&scope.status),
+                    "end_source_event_ids": end_sources.clone(),
+                    "final_end_source_event_id": end_sources.last(),
+                    "result_presence": "present",
+                    "result": outputs.clone(),
+                    "result_sha256": super::repository::activity_io_result_sha256(&observed)?,
+                }));
+                Some((witnesses[0].clone(), result_event_index, end_sources))
+            } else { None };
+            let repeat_extra = self.repetition_for_token(&token.token_id)
+                .map(|(group, occurrence)| Self::repeat_extra(
+                    &group.group_id, occurrence.ordinal, occurrence.item,
+                ))
+                .unwrap_or_default();
+            if let Err(error) = self.map_outputs(
+                &node.id, &token.token_id, output_mapping, &outputs, &repeat_extra,
+            ) {
+                if let (Some((witness_id, result_event_index, end_sources)),
+                    Some(failure)) = (&accepted_io,
+                        error.downcast_ref::<ActivityIoAssociationFailure>()) {
+                    let incident_event_index = self.plan.events.len();
+                    self.record_event_id(incident_event_index);
+                    self.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                        super::repository::bounded_failure_message(&error.to_string()));
+                    let incident_id = self.plan.add_incidents.last()
+                        .context("SubProcess IO blockage lost its incident")?
+                        .incident_id.clone();
+                    let event = self.plan.events.get_mut(incident_event_index)
+                        .context("SubProcess IO blockage lost its incident event")?;
+                    event.data["incident_id"] = json!(incident_id);
+                    event.data["activation_token_id"] = json!(token.token_id);
+                    self.record_scope_io_result(&scope, &token, &node, &outputs,
+                        witness_id, *result_event_index, end_sources.clone(),
+                        ActivityIoResultDisposition::Blocked {
+                            incident_event_index, incident_id,
+                            association_id: Some(failure.association_id.clone()),
+                            position: Some(failure.position),
+                        })?;
+                    if let Some((mut group, mut occurrence)) = self.repetition_for_token(&token.token_id) {
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                        occurrence.updated_at_ms = self.now_ms;
+                        self.write_repetition_occurrence(occurrence)?;
+                        group.updated_at_ms = self.now_ms;
+                        self.write_repetition_group(group)?;
+                    }
+                    continue;
+                }
+                if accepted_io.is_some() {
+                    let effective = self.effective()?;
+                    let mut legacy_extra = repeat_extra.clone();
+                    legacy_extra.extend(self.activity_inputs_extra_for_activation(
+                        &node.id, &token.token_id,
+                    )?);
+                    let legacy = patch_variables(output_mapping, self.local()?,
+                        &effective, &outputs, &legacy_extra)
+                        .err().context("SubProcess IO return has no legacy mapping failure")?;
+                    if legacy.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                        return Err(error);
+                    }
+                }
+                let child_mapped_before_failure = self.plan.variable_effects.iter().any(|effect| {
+                    matches!(effect,
+                        VariableEffect::Mapped { event_index, scope_id, .. }
+                            if scope_id == &scope.scope_id
+                                && *event_index < self.plan.events.len())
+                });
+                let parent_effective = self.effective()?;
+                let parent_scope_id = self.current_scope.clone();
                 self.current_scope = scope.scope_id.clone();
-                let incident_id = Uuid::new_v4().to_string();
+                let incident_id = self.next_id("runtime");
                 let message = super::repository::bounded_failure_message(&format!("{error:#}"));
+                let end_event_indices = self.plan.events.iter().enumerate()
+                    .filter(|(_, event)| event.scope_id == scope.scope_id
+                        && event.kind == "end_reached")
+                    .map(|(index, _)| index).collect::<Vec<_>>();
+                self.plan.scope_return_failures.push(ScopeReturnFailure {
+                    child_scope_id: scope.scope_id.clone(),
+                    parent_scope_id: parent_scope_id.clone(),
+                    parent_token_id: token.token_id.clone(),
+                    incident_id: incident_id.clone(),
+                    incident_event_index: self.plan.events.len(),
+                    end_event_indices,
+                    child_locals: outputs.clone(),
+                    parent_effective,
+                    child_scope_revision: scope.revision,
+                    parent_scope_revision: self.scopes.iter()
+                        .find(|candidate| candidate.scope_id == parent_scope_id)
+                        .context("failed ordinary return lost its parent scope")?.revision,
+                });
                 self.plan.add_incidents.push(ProcessIncident {
                     incident_id: incident_id.clone(),
                     scope_id: scope.scope_id.clone(),
@@ -3263,22 +5312,68 @@ impl<'a> Transition<'a> {
                     at_ms: self.now_ms,
                     can_retry: false,
                 });
+                if accepted_io.is_some() {
+                    // The retained witness cites this incident as its route event.
+                    self.record_event_id(self.plan.events.len());
+                }
                 self.event("incident", None, json!({"incident_id":incident_id,"code":"SCOPE_RETURN_ERROR","message":message,"parent_token_id":waiting}));
-                self.update_scope(&scope.scope_id, ProcessInstanceStatus::Incident, None)?;
+                if let Some((witness_id, result_event_index, end_sources)) = &accepted_io {
+                    self.current_scope = parent_scope_id.clone();
+                    self.record_scope_io_result(&scope, &token, &node, &outputs,
+                        witness_id, *result_event_index, end_sources.clone(),
+                        ActivityIoResultDisposition::Retained {
+                            fate: ActivityIoRetainedFate::ScopeReturnFailure {
+                                incident_id: incident_id.clone(),
+                            },
+                            route_event_index: self.plan.events.len() - 1,
+                        })?;
+                    self.current_scope = scope.scope_id.clone();
+                }
+                self.update_scope(
+                    &scope.scope_id,
+                    ProcessInstanceStatus::Incident,
+                    child_mapped_before_failure.then_some(outputs.clone()),
+                )?;
                 continue;
+            }
+            if let Some((witness_id, result_event_index, end_sources)) = &accepted_io {
+                let output_event_index = self.plan.events.len() - 1;
+                let (ordered_outputs, local_patch) = match self.plan.variable_effects.last() {
+                    Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                        if *event_index == output_event_index && scope_id == &parent
+                            && node_id == &node.id && source_token_id == &token.token_id =>
+                            (ordered.clone(), result.clone()),
+                    _ => anyhow::bail!("SubProcess IO output has no exact mapped effect"),
+                };
+                self.record_scope_io_result(&scope, &token, &node, &outputs,
+                    witness_id, *result_event_index, end_sources.clone(),
+                    ActivityIoResultDisposition::Applied {
+                        output_event_index, ordered_outputs, local_patch,
+                    })?;
             }
             self.update_scope(
                 &scope.scope_id,
                 ProcessInstanceStatus::Completed,
-                Some(outputs),
+                Some(outputs.clone()),
             )?;
             let parent_scope = self.current_scope.clone();
             self.current_scope = scope.scope_id.clone();
+            let source_index = self.plan.events.len();
+            let source_id = self.next_id("runtime");
+            if self.repetition_for_token(waiting).is_some() {
+                self.plan.event_ids.insert(source_index, source_id.clone());
+            }
             self.event("scope_completed", None, json!({"scope_id":scope.scope_id,"parent_scope_id":parent_scope,"parent_token_id":waiting,"subprocess_node_id":node.id}));
             self.current_scope = parent_scope;
             self.disarm_boundaries(waiting, "activity_completed", None)?;
             self.resolve_boundary_incidents(waiting);
             self.consume(waiting);
+            if self.repetition_for_token(waiting).is_some() {
+                self.complete_repetition_occurrence(&token, &outputs, source_id, None, None)?;
+                progressed = true;
+                continue;
+            }
             for edge in self.outgoing(&node.id) {
                 self.follow(&token, &edge)?;
             }
@@ -3325,6 +5420,10 @@ impl<'a> Transition<'a> {
             {
                 return Ok(Some(((*handler).clone(), attached, hops)));
             }
+            if let Some(parent) = self.repetition_boundary_parent(&attached)? {
+                attached = parent;
+                continue;
+            }
             let scope = self
                 .scopes
                 .iter()
@@ -3348,6 +5447,90 @@ impl<'a> Transition<'a> {
     }
 
     fn finish(mut self) -> Result<RuntimePlan> {
+        self.ensure_id_source_healthy()?;
+        // The durable writer refuses oversized events, so planning must too: an
+        // admitted plan then never fails only at its first row.
+        for event in &self.plan.events {
+            ensure!(serde_json::to_vec(&event.data)?.len() <= 384 * 1024,
+                "process event data exceeds 384 KiB");
+        }
+        for job_id in self.plan.cancel_job_ids.clone() {
+            let Some(source) = self.service_dispatches.iter().find(|source|
+                source.job_id == job_id).cloned() else { continue };
+            let job = self.initial_jobs.iter().find(|job|
+                job.job_id == job_id && job.token_id == source.token_id
+                    && job.scope_id == source.scope_id && job.node_id == source.node_id)
+                .context("cancelled Service dispatch lost its factual job activation")?;
+            ensure!(job.attempt == source.attempt && job.fence == source.fence
+                && (job.status == "running"
+                    && job.worker_id.as_deref() == Some(source.worker_id.as_str())
+                    || source.phase == "uncertain" && job.status == "error"
+                        && job.worker_id.as_deref().is_none_or(|id| id == source.worker_id))
+                && matches!(source.phase.as_str(), "may_have_executed" | "uncertain" | "observed"),
+                "cancelled Service dispatch differs from its original job generation");
+            let (code, message) = if source.phase == "observed" {
+                ("EXTERNAL_RESULT_NOT_APPLIED",
+                    "The original result was observed after its activity closed")
+            } else {
+                ("EXTERNAL_OUTCOME_UNCERTAIN",
+                    "The external effect may have occurred; direct retry is unavailable")
+            };
+            let incident_id = if source.phase == "uncertain" {
+                source.uncertainty_incident_id.clone()
+                    .context("cancelled uncertain Service lost its factual incident")?
+            } else { self.next_id("runtime") };
+            let event_index = self.plan.events.len();
+            let node_name = super::repository::scope_node(self.model,
+                self.selected_process_id, &self.scopes, self.instance_id,
+                &source.scope_id, &source.node_id).ok().map(|node| node.name.clone());
+            if source.phase != "uncertain" {
+                self.plan.add_incidents.push(ProcessIncident {
+                    incident_id: incident_id.clone(), scope_id: source.scope_id.clone(),
+                    node_id: Some(source.node_id.clone()), node_name,
+                    job_id: Some(job_id.clone()), code: code.into(), message: message.into(),
+                    at_ms: self.now_ms, can_retry: false,
+                });
+            }
+            self.plan.events.push(PlannedEvent {
+                scope_id: source.scope_id.clone(), kind: if source.phase == "uncertain" {
+                    "incident_resolved".into()
+                } else { "incident".into() },
+                node_id: Some(source.node_id.clone()),
+                data: json!({"incident_id":incident_id,"invocation_id":source.invocation_id,
+                    "job_id":job_id,"code":code,"message":message,
+                    "reason":"activity_cancelled_after_dispatch",
+                    "resolution_reason":"activity_cancelled_after_dispatch",
+                    "dispatch_attempt":source.attempt,"dispatch_fence":source.fence,
+                    "source_token_id":source.token_id,
+                    "reserved_result_event_id":source.reserved_result_event_id}),
+            });
+            let infrastructure_incidents = self.incidents.iter()
+                .chain(self.resolved_incident_rows.iter()).filter(|incident|
+                incident.code == "SCRIPT_INFRASTRUCTURE_FAILED"
+                    && incident.job_id.as_deref() == Some(job_id.as_str())
+                    && incident.scope_id == source.scope_id
+                    && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+                .map(|incident| incident.incident_id.clone()).collect::<Vec<_>>();
+            ensure!(infrastructure_incidents.len() <= 1
+                && (source.phase == "observed" || infrastructure_incidents.is_empty()),
+                "cancelled Service has an ambiguous infrastructure incident");
+            let infrastructure_incident_id = infrastructure_incidents.into_iter().next();
+            if let Some(id) = &infrastructure_incident_id {
+                self.resolve_incident(id);
+                self.plan.events.push(PlannedEvent {
+                    scope_id: source.scope_id.clone(), kind: "incident_resolved".into(),
+                    node_id: Some(source.node_id.clone()),
+                    data: json!({"incident_id":id,"invocation_id":source.invocation_id,
+                        "job_id":job_id,"source_token_id":source.token_id,
+                        "reserved_result_event_id":source.reserved_result_event_id,
+                        "dispatch_attempt":source.attempt,"dispatch_fence":source.fence,
+                        "reason":"activity_cancelled_after_dispatch"}),
+                });
+            }
+            self.plan.closed_service_dispatches.push(ClosedServiceDispatch {
+                source, incident_id, event_index, infrastructure_incident_id,
+            });
+        }
         self.plan.status = if self.plan.terminal_error.is_some() {
             ProcessInstanceStatus::Error
         } else if self.plan.repetition_capacity.is_some() {
@@ -3361,6 +5544,8 @@ impl<'a> Transition<'a> {
                     .plan
                     .resolve_incident_ids
                     .contains(&incident.incident_id)
+                    && !self.plan.closed_service_dispatches.iter().any(|closed|
+                        closed.incident_id == incident.incident_id)
             }) {
             ProcessInstanceStatus::Incident
         } else if self.tokens.is_empty()
@@ -3386,6 +5571,8 @@ impl<'a> Transition<'a> {
                 "source_event_id":source.source_event_id,"source_scope_id":source.source_scope_id,
                 "source_node_id":source.source_node_id,"source_token_id":source.source_token_id,
             }));
+            let event_index = self.plan.events.len();
+            self.record_event_id(event_index);
             self.event("instance_completed", None, data);
             ProcessInstanceStatus::Completed
         } else if self
@@ -3417,6 +5604,8 @@ impl<'a> Transition<'a> {
                             .plan
                             .resolve_incident_ids
                             .contains(&incident.incident_id)
+                            && !self.plan.closed_service_dispatches.iter().any(|closed|
+                                closed.incident_id == incident.incident_id)
                 }) {
                 ProcessInstanceStatus::Incident
             } else if self.jobs.iter().any(|job| {
@@ -3454,6 +5643,20 @@ pub(super) fn project_snapshot(
     next.instance.status = plan.status.clone();
     next.instance.terminal_error = plan.terminal_error.clone();
     next.instance.updated_at_ms = now_ms;
+    for (index, event) in plan.events.iter().enumerate().filter(|(_, event)|
+        event.kind == "end_reached" && !event.data.is_null()) {
+        let event_id = plan.event_ids.get(&index)
+            .context("configured SubProcess End lacks a projected event ID")?;
+        let source_token_id = event.data["source_token_id"].as_str()
+            .context("configured SubProcess End lacks a projected source token")?;
+        next.end_sources.push(super::repository::ProcessEndSource {
+            event_id: event_id.clone(),
+            scope_id: event.scope_id.clone(),
+            node_id: event.node_id.clone()
+                .context("configured SubProcess End lacks its node")?,
+            source_token_id: source_token_id.to_owned(),
+        });
+    }
     next.tokens.extend(plan.create_tokens.clone());
     next.tokens.retain(|t| {
         !plan.consume_token_ids.contains(&t.token_id)
@@ -3477,6 +5680,9 @@ pub(super) fn project_snapshot(
         }
     }
     next.jobs.extend(plan.create_jobs.clone());
+    next.service_dispatches.retain(|source|
+        !plan.closed_service_dispatches.iter().any(|closed|
+            closed.source.invocation_id == source.invocation_id));
     for job in &mut next.jobs {
         if plan.complete_job_ids.contains(&job.job_id) {
             job.status = "completed".into();
@@ -3485,12 +5691,16 @@ pub(super) fn project_snapshot(
             job.status = "cancelled".into();
         }
     }
-    next.incidents
-        .retain(|i| !plan.resolve_incident_ids.contains(&i.incident_id));
-    next.incidents.extend(plan.add_incidents.clone());
+    next.incidents.retain(|i| !plan.resolve_incident_ids.contains(&i.incident_id)
+        && !plan.closed_service_dispatches.iter().any(|closed|
+            closed.incident_id == i.incident_id));
+    next.incidents.extend(plan.add_incidents.iter().filter(|incident|
+        !plan.closed_service_dispatches.iter().any(|closed|
+            closed.incident_id == incident.incident_id)).cloned());
     for child in &plan.create_scopes {
         let node = super::repository::scope_node(
             &snapshot.model,
+            &snapshot.instance.process_id,
             &next.scopes,
             &snapshot.instance.instance_id,
             &child.parent_scope_id,
@@ -3586,6 +5796,89 @@ pub(super) fn project_snapshot(
             next.repetition_occurrences.push(occurrence.clone());
         }
     }
+    for input in &plan.activity_io_inputs {
+        let ActivityIoInputFact::Captured {
+            witness_id,
+            scope_id,
+            node_id,
+            activation_token_id,
+            event_index,
+            inputs,
+            group_id,
+            occurrence_id,
+            ordinal,
+            ..
+        } = input
+        else {
+            continue;
+        };
+        if next
+            .activity_io_witnesses
+            .iter()
+            .any(|witness| witness.witness_id == *witness_id)
+        {
+            continue;
+        }
+        let node = super::repository::scope_node(
+            &snapshot.model,
+            &snapshot.instance.process_id,
+            &next.scopes,
+            &snapshot.instance.instance_id,
+            scope_id,
+            node_id,
+        )?;
+        let activity_kind = match &node.kind {
+            ProcessNodeKind::UserTask { .. } => "user",
+            ProcessNodeKind::ScriptTask { .. } => "script",
+            ProcessNodeKind::ServiceTask { .. } => "service",
+            ProcessNodeKind::ManualTask { .. } => "manual",
+            ProcessNodeKind::SendTask { .. } => "send",
+            ProcessNodeKind::ReceiveTask { .. } => "receive",
+            ProcessNodeKind::SubProcess { .. } => "subprocess",
+            ProcessNodeKind::CallActivity(_) => "call",
+            _ => anyhow::bail!("projected activity IO input is not an activity"),
+        };
+        let phase_owner = match (group_id, occurrence_id) {
+            (Some(_), Some(_)) => "ordinal",
+            (Some(_), None) => "coordinator",
+            (None, None) => "ordinary",
+            _ => anyhow::bail!("projected activity IO input has an incomplete owner"),
+        };
+        let input_event_id = plan
+            .event_ids
+            .get(event_index)
+            .cloned()
+            .context("projected activity IO input has no event UUID")?;
+        next.activity_io_witnesses.push(ActivityIoWitness {
+            witness_id: witness_id.clone(),
+            scope_id: scope_id.clone(),
+            node_id: node_id.clone(),
+            token_id: activation_token_id.clone(),
+            activity_kind: activity_kind.to_owned(),
+            phase_owner: phase_owner.to_owned(),
+            phase: "input_captured".into(),
+            revision: 1,
+            input_event_id: Some(input_event_id),
+            input_values: Some(inputs.clone()),
+            input_sha256: None,
+            result_event_id: None,
+            source_instance_id: None,
+            source_event_id: None,
+            result_sources: None,
+            result_presence: None,
+            result: None,
+            result_sha256: None,
+            retained_route_kind: None,
+            retained_route_event_id: None,
+            retained_route_resource_id: None,
+            service_invocation_id: None,
+            incident_id: None,
+            resource_id: None,
+            group_id: group_id.clone(),
+            occurrence_id: occurrence_id.clone(),
+            ordinal: *ordinal,
+        });
+    }
     if let Some(root) = next
         .scopes
         .iter_mut()
@@ -3598,6 +5891,9 @@ pub(super) fn project_snapshot(
     validate_variables(&next.instance.variables)?;
     for scope in next.scopes.iter().filter(|scope| {
         scope.parent_scope_id.is_some()
+            && !(scope.status == ProcessInstanceStatus::Incident
+                && plan.scope_return_failures.iter().any(|failure|
+                    failure.child_scope_id == scope.scope_id))
             && !matches!(
                 scope.status,
                 ProcessInstanceStatus::Completed
@@ -3645,8 +5941,11 @@ pub(super) fn plan_call_return(
     outputs: &Value,
     now_ms: i64,
     expected_child_revision: u64,
+    child_completed_event_id: &str,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    ensure!(Uuid::parse_str(child_completed_event_id).is_ok(),
+        "completed Call child source is not a UUID");
     let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(AcceptedInputRef::CallReturn {
         call_id: call.call_id.clone(),
@@ -3667,15 +5966,130 @@ pub(super) fn plan_call_return(
         .context("call return lost its exact waiting token")?
         .clone();
     let node = transition.node(&call.call_node_id)?.clone();
-    let ProcessNodeKind::CallActivity { output_mapping, .. } = &node.kind else {
+    let ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. }) = &node.kind else {
         anyhow::bail!("call return node is not CallActivity")
     };
-    transition.map_outputs(&node.id, &token.token_id, output_mapping, outputs, &[])
-        .map_err(|error| error.context(CallReturnMappingRejected))?;
+    let accepted_io = if node.activity_io.is_some() {
+        let inputs = transition.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == call.parent_scope_id && witness.node_id == node.id
+                && witness.token_id == token.token_id && witness.phase == "input_captured")
+            .map(|witness| witness.witness_id.clone())
+            .collect::<Vec<_>>();
+        ensure!(inputs.len() == 1,
+            "accepted Call result has no unique captured activation");
+        let result_event_index = transition.plan.events.len();
+        let result_event_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(result_event_index, result_event_id);
+        let observed = super::repository::IoObservedValue::Present { value: outputs.clone() };
+        transition.event("call_result_accepted", Some(node.id.clone()), json!({
+            "call_id": call.call_id,
+            "child_instance_id": call.child_instance_id,
+            "child_completed_event_id": child_completed_event_id,
+            "parent_token_id": token.token_id,
+            "child_revision": expected_child_revision,
+            "child_status": "completed",
+            "result_presence": "present",
+            "result": outputs,
+            "result_sha256": super::repository::activity_io_result_sha256(&observed)?,
+        }));
+        Some((inputs[0].clone(), result_event_index, observed))
+    } else {
+        None
+    };
+    let repeat_extra = transition.repetition_for_token(&token.token_id)
+        .map(|(group, occurrence)| Transition::repeat_extra(
+            &group.group_id, occurrence.ordinal, occurrence.item,
+        ))
+        .unwrap_or_default();
+    let disposition = match transition.map_outputs(&node.id, &token.token_id,
+        output_mapping, outputs, &repeat_extra) {
+        Ok(()) if accepted_io.is_some() => {
+            let output_event_index = transition.plan.events.len() - 1;
+            let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+                Some(super::repository::VariableEffect::Mapped { event_index, scope_id,
+                    node_id, source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                    if *event_index == output_event_index && scope_id == &call.parent_scope_id
+                        && node_id == &node.id && source_token_id == &token.token_id =>
+                    (ordered.clone(), result.clone()),
+                _ => anyhow::bail!("Call IO output has no exact mapped effect"),
+            };
+            Some(super::repository::ActivityIoResultDisposition::Applied {
+                output_event_index, ordered_outputs, local_patch,
+            })
+        }
+        Ok(()) => None,
+        Err(error) => {
+            if accepted_io.is_none() {
+                return Err(error.context(CallReturnMappingRejected));
+            }
+            if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                return Err(error);
+            }
+            let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+                .context("Call IO output failed without a factual association")?;
+            let incident_event_index = transition.plan.events.len();
+            transition.plan.event_ids.insert(incident_event_index,
+                transition.next_id("runtime"));
+            transition.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                super::repository::bounded_failure_message(&error.to_string()));
+            let incident_id = transition.plan.add_incidents.last()
+                .context("Call IO output blockage lost its incident")?.incident_id.clone();
+            let event = transition.plan.events.get_mut(incident_event_index)
+                .context("Call IO output blockage lost its incident event")?;
+            event.data["incident_id"] = json!(incident_id);
+            event.data["activation_token_id"] = json!(token.token_id);
+            Some(super::repository::ActivityIoResultDisposition::Blocked {
+                incident_event_index, incident_id,
+                association_id: Some(failure.association_id.clone()),
+                position: Some(failure.position),
+            })
+        }
+    };
+    if let Some((witness_id, result_event_index, observed)) = accepted_io {
+        let blocked = matches!(disposition,
+            Some(super::repository::ActivityIoResultDisposition::Blocked { .. }));
+        transition.plan.activity_io_results.push(
+            super::repository::ActivityIoResultFact {
+                witness_id, scope_id: call.parent_scope_id.clone(),
+                node_id: node.id.clone(), token_id: token.token_id.clone(),
+                result_event_index,
+                source_instance_id: call.child_instance_id.clone(),
+                source_event_id: child_completed_event_id.to_owned(),
+                result_sources: vec![child_completed_event_id.to_owned()],
+                observed, accepted_origin: None, resource_id: None,
+                resource_revision: None, service_invocation_id: None,
+                child_scope_id: None, call_id: Some(call.call_id.clone()),
+                child_instance_id: Some(call.child_instance_id.clone()),
+                child_expected_revision: Some(expected_child_revision),
+                child_status: Some("completed".to_owned()),
+                parent_wait_token_id: Some(token.token_id.clone()),
+                disposition: disposition.context("Call IO result lost its disposition")?,
+        });
+        if blocked {
+            if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+                occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                occurrence.updated_at_ms = now_ms;
+                transition.write_repetition_occurrence(occurrence)?;
+                group.updated_at_ms = now_ms;
+                transition.write_repetition_group(group)?;
+            }
+            return transition.finish();
+        }
+    }
     transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
     transition.resolve_boundary_incidents(&token.token_id);
     transition.consume(&token.token_id);
+    let source_index = transition.plan.events.len();
+    let source_id = transition.next_id("runtime");
+    if transition.repetition_for_token(&token.token_id).is_some() {
+        transition.plan.event_ids.insert(source_index, source_id.clone());
+    }
     transition.event("call_returned",Some(node.id.clone()),json!({"call_id":call.call_id,"child_instance_id":call.child_instance_id,"parent_token_id":call.parent_token_id}));
+    if transition.repetition_for_token(&token.token_id).is_some() {
+        transition.complete_repetition_occurrence(&token, outputs, source_id, None, None)?;
+        transition.advance()?;
+        return transition.finish();
+    }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
     }
@@ -3749,12 +6163,21 @@ pub(super) fn plan_call_error(
     let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
         anyhow::bail!("call error handler is not BoundaryError")
     };
+    let mut boundary_extra = vec![("activity_result".into(), activity_result)];
+    if attached.scope_id == call.parent_scope_id
+        && attached.token_id == call.parent_token_id
+        && attached.node_id == call.call_node_id
+    {
+        boundary_extra.extend(transition.activity_inputs_extra_for_activation(
+            &call.call_node_id, &call.parent_token_id,
+        )?);
+    }
     transition.map_outputs(
         &handler.id,
         &attached.token_id,
         output_mapping,
         &outputs,
-        &[("activity_result".into(), activity_result)],
+        &boundary_extra,
     )?;
     transition.settle_subscription(
         &subscription,
@@ -3779,6 +6202,8 @@ pub enum StartCause {
 
 pub fn plan_start(
     model: &ProcessModel,
+    selected_process_id: &str,
+    selected_start_node_id: &str,
     instance_id: &str,
     actor: &ProcessActor,
     definition_id: &str,
@@ -3789,6 +6214,28 @@ pub fn plan_start(
     start_input: StartInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_start_with_id_source(
+        model, selected_process_id, selected_start_node_id, instance_id, actor,
+        definition_id, version, variables, cause, now_ms, start_input, signal_admission,
+        random_runtime_id_source(),
+    )
+}
+
+pub fn plan_start_with_id_source(
+    model: &ProcessModel,
+    selected_process_id: &str,
+    selected_start_node_id: &str,
+    instance_id: &str,
+    actor: &ProcessActor,
+    definition_id: &str,
+    version: u32,
+    variables: Value,
+    cause: StartCause,
+    now_ms: i64,
+    start_input: StartInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     let source_matches = match (&cause, &start_input) {
         (StartCause::Manual, StartInputRef::Manual { .. } | StartInputRef::CallStart { .. }) => true,
         (StartCause::Timer { timer_id, occurrence }, StartInputRef::Timer { timer_id: selected, fired_occurrence, .. }) =>
@@ -3798,8 +6245,9 @@ pub fn plan_start(
         _ => false,
     };
     ensure!(source_matches, "process start accepted input differs from its start cause");
-    let mut transition = Transition::new(
+    let mut transition = Transition::new_with_id_source(
         model,
+        selected_process_id,
         instance_id,
         &actor.org_id,
         &actor.user_id,
@@ -3808,23 +6256,19 @@ pub fn plan_start(
         variables,
         now_ms,
         signal_admission,
+        id_source,
     )?;
     transition.accepted_input = Some(AcceptedInputRef::Start {
         instance_id: instance_id.to_owned(),
         cause: start_input,
     });
-    let start = model
-        .nodes
-        .iter()
-        .find(|node| {
-            matches!(
-                node.kind,
-                ProcessNodeKind::Start
-                    | ProcessNodeKind::TimerStart { .. }
-                    | ProcessNodeKind::MessageStart { .. }
-            )
-        })
-        .context("process start event missing")?;
+    let body = super::model::selected_body(model, selected_process_id, &[])?;
+    let start = body.nodes.iter().find(|node| node.id == selected_start_node_id)
+        .context("selected Start does not belong to its pinned process body")?;
+    ensure!(matches!(start.kind, ProcessNodeKind::Start
+        | ProcessNodeKind::TimerStart { .. }
+        | ProcessNodeKind::MessageStart { .. }),
+        "selected process entry is not a Start event");
     let facts = match (&start.kind, cause) {
         (ProcessNodeKind::Start, StartCause::Manual) => json!({"initiator_user_id":actor.user_id}),
         (
@@ -3853,6 +6297,11 @@ pub fn plan_start(
         }
         _ => anyhow::bail!("timer firing does not match the process start event"),
     };
+    let mut facts = facts;
+    let facts_object = facts.as_object_mut()
+        .context("Start event facts must be an object")?;
+    facts_object.insert("process_id".into(), Value::String(selected_process_id.to_owned()));
+    facts_object.insert("start_node_id".into(), Value::String(start.id.clone()));
     transition.plan.start_instance_id = Some(instance_id.to_owned());
     transition.plan.start_variables = Some(transition.plan.variables.clone());
     transition.create_token(ProcessToken {
@@ -3870,8 +6319,91 @@ pub fn plan_start(
 
 pub fn plan_advance(snapshot: &RuntimeSnapshot, now_ms: i64,
     signal_admission: Option<&SignalAdmissionResolver<'_>>) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    plan_advance_with_id_source(snapshot, now_ms, signal_admission, random_runtime_id_source())
+}
+
+pub fn plan_advance_with_id_source(snapshot: &RuntimeSnapshot, now_ms: i64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle) -> Result<RuntimePlan> {
+    let mut transition = Transition::from_snapshot_with_id_source(
+        snapshot, now_ms, signal_admission, id_source)?;
     transition.advance()?;
+    transition.finish()
+}
+
+pub(super) fn plan_service_retry(
+    snapshot: &RuntimeSnapshot,
+    old_job_id: &str,
+    old_invocation_id: &str,
+    incident_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+) -> Result<RuntimePlan> {
+    let AcceptedInputRef::Retry { old_job_id: selected_job,
+        old_invocation_id: selected_invocation, old_token_id,
+        expected_instance_revision, command_id, request_hash } = &accepted_input else {
+        anyhow::bail!("Service retry requires its typed accepted input")
+    };
+    ensure!(selected_job == old_job_id && selected_invocation == old_invocation_id
+        && *expected_instance_revision == snapshot.instance.revision,
+        "Service retry changed its selected immutable invocation");
+    let old_job = snapshot.jobs.iter().find(|job| job.job_id == old_job_id
+        && job.instance_id == snapshot.instance.instance_id
+        && job.token_id == *old_token_id && job.status == "error")
+        .context("Service retry old terminal job is missing")?;
+    let old_token = snapshot.tokens.iter().find(|token| token.token_id == *old_token_id
+        && token.scope_id == old_job.scope_id && token.node_id == old_job.node_id
+        && token.status == "waiting")
+        .context("Service retry old waiting activation is missing")?.clone();
+    ensure!(snapshot.incidents.iter().filter(|incident|
+        incident.incident_id == incident_id && incident.job_id.as_deref() == Some(old_job_id)
+            && incident.scope_id == old_job.scope_id && incident.can_retry).count() == 1,
+        "Service retry lacks its exact unresolved incident");
+    let command_id = command_id.clone();
+    let request_hash = request_hash.clone();
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
+    transition.accepted_input = Some(accepted_input);
+    transition.current_scope = old_token.scope_id.clone();
+    ensure!(matches!(&transition.node(&old_token.node_id)?.kind,
+        ProcessNodeKind::ServiceTask { .. }),
+        "Service retry targets another pinned activity kind");
+    transition.disarm_boundaries(&old_token.token_id, "activity_retried", None)?;
+    transition.consume(&old_token.token_id);
+    let ready_id = transition.create_token(ProcessToken {
+        status: "ready".into(),
+        ..old_token.clone()
+    }, Some(&old_token.token_id));
+    if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&old_token.token_id) {
+        ensure!(group.status == ProcessRepetitionGroupStatus::Open
+            && !group.terminal_capacity
+            && occurrence.status == ProcessRepetitionOccurrenceStatus::Active
+            && occurrence.job_id.as_deref() == Some(old_job_id),
+            "Service retry changed its factual repeated ordinal");
+        group.updated_at_ms = now_ms;
+        transition.write_repetition_group(group)?;
+        occurrence.status = ProcessRepetitionOccurrenceStatus::Active;
+        occurrence.token_id = ready_id.clone();
+        occurrence.job_id = None;
+        occurrence.updated_at_ms = now_ms;
+        transition.write_repetition_occurrence(occurrence)?;
+    }
+    transition.plan.resolve_incident_ids.push(incident_id.to_owned());
+    transition.incidents.retain(|incident| incident.incident_id != incident_id);
+    transition.advance()?;
+    let new_job = transition.plan.create_jobs.iter().find(|job|
+        job.scope_id == old_job.scope_id && job.node_id == old_job.node_id
+            && transition.plan.token_sources.get(&job.token_id).is_some_and(|source|
+                source == &ready_id)).context("Service retry did not create its new job")?.clone();
+    let new_invocation_id = transition.plan.service_invocation_ids.get(&new_job.job_id)
+        .context("Service retry did not reserve its new invocation")?.clone();
+    transition.event("job_retried", Some(old_job.node_id.clone()), json!({
+        "old_job_id":old_job_id,"old_invocation_id":old_invocation_id,
+        "old_token_id":old_token.token_id,"ready_token_id":ready_id,
+        "new_job_id":new_job.job_id,"new_invocation_id":new_invocation_id,
+        "new_token_id":new_job.token_id,
+        "incident_id":incident_id,"command_id":command_id,
+        "request_hash":request_hash
+    }));
     transition.finish()
 }
 
@@ -3911,14 +6443,16 @@ pub(super) fn plan_send_admission(
         return transition.finish();
     }
     match transition.throw_message(&node, &token) {
-        Ok(()) => {
+        Ok(applied) => {
             let admitted = transition.plan.events.iter().position(|event|
                 event.kind == "send_task_admitted" && event.scope_id == token.scope_id
                     && event.node_id.as_deref() == Some(node.id.as_str()))
                 .context("pending Send did not create its admission event")?;
-            transition.plan.event_ids.insert(admitted, Uuid::new_v4().to_string());
-            transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
-            transition.advance()?;
+            transition.ensure_event_id(admitted);
+            if applied {
+                transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+                transition.advance()?;
+            }
         }
         Err(error) if error.downcast_ref::<super::messages::MessageExpressionFailed>().is_some() => {
             transition.fail_send_admission(&node, &token, pending_event_id,
@@ -3938,10 +6472,25 @@ pub fn plan_manual_acknowledgment(
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_manual_acknowledgment_with_id_source(
+        snapshot, task_id, actor_user_id, now_ms, accepted_input, signal_admission,
+        random_runtime_id_source(),
+    )
+}
+
+pub fn plan_manual_acknowledgment_with_id_source(
+    snapshot: &RuntimeSnapshot,
+    task_id: &str,
+    actor_user_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     ensure!(matches!(&accepted_input,
         AcceptedInputRef::ManualAcknowledgment { task_id: selected, .. } if selected == task_id),
         "manual acknowledgment input differs from its task");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(accepted_input);
     let task = snapshot.user_tasks.iter().find(|task|
         task.user_task_id == task_id && task.status == ProcessUserTaskStatus::Open
@@ -3958,15 +6507,128 @@ pub fn plan_manual_acknowledgment(
             && token.node_id == node.id && token.scope_id == task.scope_id
             && token.status == "waiting")
         .context("manual task waiting token missing")?.clone();
+    if node.activity_io.is_some()
+        && transition.repetition_for_token(&token.token_id).is_some() {
+        let (group, occurrence) = transition.repetition_for_token(&token.token_id)
+            .context("repeated Manual IO lost its ordinal before acknowledgment")?;
+        let repeat_extra = Transition::repeat_extra(
+            &group.group_id, occurrence.ordinal, occurrence.item.clone());
+        let result_event_index = transition.plan.events.len();
+        let result_event_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
+        transition.event("manual_result_accepted", Some(node.id.clone()), json!({
+            "user_task_id":task_id,
+            "task_revision":task.revision,
+            "activation_token_id":token.token_id,
+            "acknowledged_by_user_id":actor_user_id,
+            "result_presence":"present",
+            "result":null,
+        }));
+        let applied = transition.apply_repetition_activity_io(
+            &node, &token, &BTreeMap::new(), &Value::Null, &repeat_extra, result_event_index,
+            &result_event_id, IoObservedValue::Present { value: Value::Null },
+            Some(task_id.to_owned()), Some(task.revision), None, None, false)?;
+        if !applied {
+            let (mut group, mut occurrence) = transition.repetition_for_token(&token.token_id)
+                .context("blocked Manual IO lost its repeated ordinal")?;
+            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+            occurrence.updated_at_ms = now_ms;
+            transition.write_repetition_occurrence(occurrence)?;
+            group.updated_at_ms = now_ms;
+            transition.write_repetition_group(group)?;
+            return transition.finish();
+        }
+    }
+    if node.activity_io.is_some()
+        && transition.repetition_for_token(&token.token_id).is_none() {
+        let inputs = transition.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == task.scope_id && witness.node_id == task.node_id
+                && witness.token_id == token.token_id
+                && witness.phase == "input_captured").collect::<Vec<_>>();
+        ensure!(inputs.len() == 1,
+            "Manual IO acknowledgment lost its captured activation");
+        let witness_id = inputs[0].witness_id.clone();
+        let result_event_index = transition.plan.events.len();
+        let result_event_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
+        transition.event("manual_result_accepted", Some(node.id.clone()), json!({
+            "user_task_id":task_id,"task_revision":task.revision,
+            "activation_token_id":token.token_id,
+            "acknowledged_by_user_id":actor_user_id,
+            "result_presence":"present","result":null,
+        }));
+        let output_event_index = transition.plan.events.len();
+        let disposition = match transition.map_outputs(&node.id, &token.token_id,
+            &BTreeMap::new(), &Value::Null, &[]) {
+            Ok(()) => {
+                let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+                    Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                        if *event_index == output_event_index && scope_id == &task.scope_id
+                            && node_id == &task.node_id && source_token_id == &token.token_id =>
+                        (ordered.clone(), result.clone()),
+                    _ => anyhow::bail!("Manual IO output has no exact mapped effect"),
+                };
+                ActivityIoResultDisposition::Applied {
+                    output_event_index, ordered_outputs, local_patch,
+                }
+            }
+            Err(error) => {
+                let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+                    return Err(error);
+                };
+                if failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                let incident_event_index = transition.plan.events.len();
+                transition.record_event_id(incident_event_index);
+                transition.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                let incident_id = transition.plan.add_incidents.last()
+                    .context("Manual IO output blockage lost its incident")?.incident_id.clone();
+                let event = transition.plan.events.get_mut(incident_event_index)
+                    .context("Manual IO output blockage lost its incident event")?;
+                event.data["incident_id"] = json!(incident_id);
+                event.data["activation_token_id"] = json!(token.token_id);
+                ActivityIoResultDisposition::Blocked {
+                    incident_event_index, incident_id,
+                    association_id: Some(failure.association_id.clone()),
+                    position: Some(failure.position),
+                }
+            }
+        };
+        let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+        transition.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id, scope_id: task.scope_id.clone(), node_id: task.node_id.clone(),
+            token_id: token.token_id.clone(), result_event_index,
+            source_instance_id: transition.instance_id.to_owned(),
+            source_event_id: result_event_id.clone(),
+            result_sources: vec![result_event_id],
+            observed: IoObservedValue::Present { value: Value::Null },
+            accepted_origin: None, resource_id: Some(task_id.to_owned()),
+            resource_revision: Some(task.revision), service_invocation_id: None,
+            child_scope_id: None, call_id: None, child_instance_id: None,
+            child_expected_revision: None, child_status: None,
+            parent_wait_token_id: None, disposition,
+        });
+        if !applied { return transition.finish(); }
+    }
     transition.plan.complete_user_task_ids.push(task_id.to_owned());
     transition.tasks.retain(|existing| existing.user_task_id != task_id);
     transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
     transition.resolve_boundary_incidents(&token.token_id);
     transition.consume(&token.token_id);
     let event_index = transition.plan.events.len();
-    transition.plan.event_ids.insert(event_index, Uuid::new_v4().to_string());
+    transition.record_event_id(event_index);
     transition.event("manual_task_acknowledged", Some(node.id.clone()),
         json!({"user_task_id":task_id,"acknowledged_by_user_id":actor_user_id}));
+    if transition.repetition_for_token(&token.token_id).is_some() {
+        let source_id = transition.plan.event_ids.get(&event_index)
+            .context("repeated Manual acknowledgment lost its factual source")?.clone();
+        transition.complete_repetition_occurrence(&token, &Value::Null, source_id, None, None)?;
+        transition.advance()?;
+        return transition.finish();
+    }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
     }
@@ -3983,10 +6645,26 @@ pub fn plan_user_completion(
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_user_completion_with_id_source(
+        snapshot, task_id, outputs, approved, now_ms, accepted_input, signal_admission,
+        random_runtime_id_source(),
+    )
+}
+
+pub fn plan_user_completion_with_id_source(
+    snapshot: &RuntimeSnapshot,
+    task_id: &str,
+    outputs: &Value,
+    approved: Option<bool>,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     validate_output(outputs)?;
     ensure!(matches!(&accepted_input, AcceptedInputRef::Human { task_id: selected, .. } if selected == task_id),
         "human completion input differs from its task");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(accepted_input);
     let task = snapshot
         .user_tasks
@@ -4059,7 +6737,53 @@ pub fn plan_user_completion(
         | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
         _ => anyhow::bail!("user task node is not an activity"),
     };
-    if let Some((_, occurrence)) = transition.repetition_for_token(&token.token_id) {
+    if let Some((group, occurrence)) = transition.repetition_for_token(&token.token_id)
+        .filter(|_| !(task.kind == ProcessUserTaskKind::Verification
+            && node.activity_io.is_some())) {
+        if task.kind == ProcessUserTaskKind::Work && node.activity_io.is_some() {
+            let repeat_extra = Transition::repeat_extra(
+                &group.group_id, occurrence.ordinal, occurrence.item.clone());
+            let result_event_index = transition.plan.events.len();
+            let result_event_id = transition.next_id("runtime");
+            transition.plan.event_ids.insert(result_event_index,
+                result_event_id.clone());
+            transition.event("user_result_accepted", Some(node.id.clone()), json!({
+                "user_task_id":task_id,
+                "task_revision":task.revision,
+                "activation_token_id":token.token_id,
+                "outputs":effective_outputs,
+            }));
+            let applied = transition.apply_repetition_activity_io(
+                &node, &token, mapping, &effective_outputs, &repeat_extra, result_event_index,
+                &result_event_id,
+                IoObservedValue::Present { value: effective_outputs.clone() },
+                Some(task_id.to_owned()), Some(task.revision), None, None, false)?;
+            if !applied {
+                let (mut group, mut occurrence) = transition.repetition_for_token(&token.token_id)
+                    .context("blocked User IO lost its repeated ordinal")?;
+                occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                occurrence.updated_at_ms = now_ms;
+                transition.write_repetition_occurrence(occurrence)?;
+                group.updated_at_ms = now_ms;
+                transition.write_repetition_group(group)?;
+                return transition.finish();
+            }
+            transition.accepted_repetition_task = Some((task_id.to_owned(), outputs.clone()));
+            transition.plan.complete_user_task_ids.push(task_id.to_owned());
+            transition.tasks.retain(|existing| existing.user_task_id != task_id);
+            transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+            transition.resolve_boundary_incidents(&token.token_id);
+            transition.consume(&token.token_id);
+            let completion_index = transition.plan.events.len();
+            let completion_id = transition.next_id("runtime");
+            transition.plan.event_ids.insert(completion_index, completion_id.clone());
+            transition.event("user_task_completed", Some(node.id.clone()),
+                json!({"user_task_id":task_id,"outputs":outputs}));
+            transition.complete_repetition_occurrence(&token, &effective_outputs,
+                completion_id, None, None)?;
+            transition.advance()?;
+            return transition.finish();
+        }
         if task.kind == ProcessUserTaskKind::Work {
             transition.accepted_repetition_task = Some((task_id.to_owned(), outputs.clone()));
         }
@@ -4069,7 +6793,7 @@ pub fn plan_user_completion(
         transition.resolve_boundary_incidents(&token.token_id);
         transition.consume(&token.token_id);
         let event_index = transition.plan.events.len();
-        let event_id = Uuid::new_v4().to_string();
+        let event_id = transition.next_id("runtime");
         transition.plan.event_ids.insert(event_index, event_id.clone());
         transition.event(
             if task.kind == ProcessUserTaskKind::Work { "user_task_completed" } else { "verification_approved" },
@@ -4097,6 +6821,220 @@ pub fn plan_user_completion(
             transition.block_repetition_group(&group.group_id, "REPETITION_MAPPING_FAILED",
                 super::repository::bounded_failure_message(&error.to_string()), Some(&event_id))?;
             return transition.finish();
+        }
+        transition.advance()?;
+        return transition.finish();
+    }
+    if task.kind == ProcessUserTaskKind::Verification && node.activity_io.is_some() {
+        let witnesses = transition.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == task.scope_id && witness.node_id == task.node_id
+                && witness.token_id == token.token_id
+                && witness.phase == "result_accepted"
+                && witness.retained_route_kind.as_deref() == Some("awaiting_verification")
+                && witness.retained_route_resource_id.as_deref() == Some(task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure!(witnesses.len() == 1,
+            "verification approval lost its one accepted IO result");
+        let accepted_result: ActivityResult = serde_json::from_value(task.outputs.clone())?;
+        let observed = IoObservedValue::Present {
+            value: accepted_result.outputs.clone(),
+        };
+        let result_sha256 = super::repository::activity_io_result_sha256(&observed)?;
+        ensure!(witnesses[0].result_sha256.as_deref()
+                == Some(result_sha256.as_str())
+            && witnesses[0].result.as_ref() == Some(&accepted_result.outputs),
+            "verification approval changed the original accepted result");
+        let repeat_extra = transition.repetition_for_token(&token.token_id)
+            .map(|(group, occurrence)| Transition::repeat_extra(
+                &group.group_id, occurrence.ordinal, occurrence.item,
+            ))
+            .unwrap_or_default();
+        let mut legacy_extra = repeat_extra.clone();
+        legacy_extra.extend(transition.activity_inputs_extra_for_activation(
+            &node.id, &token.token_id,
+        )?);
+        patch_variables(mapping, transition.local()?, &transition.effective()?,
+            &effective_outputs, &legacy_extra)?;
+        let witness_id = witnesses[0].witness_id.clone();
+        let expected_witness_revision = witnesses[0].revision;
+        transition.plan.complete_user_task_ids.push(task_id.to_owned());
+        transition.tasks.retain(|existing| existing.user_task_id != task_id);
+        let output_event_index = transition.plan.events.len();
+        let (disposition, blocked_approval_index) = match transition.map_outputs(&node.id, &token.token_id,
+            mapping, &effective_outputs, &repeat_extra) {
+            Ok(()) => {
+                let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+                    Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                        if *event_index == output_event_index
+                            && scope_id == &task.scope_id && node_id == &task.node_id
+                            && source_token_id == &token.token_id =>
+                        (ordered.clone(), result.clone()),
+                    _ => anyhow::bail!("verification IO output has no exact mapped effect"),
+                };
+                (ActivityIoResultDisposition::Applied {
+                    output_event_index, ordered_outputs, local_patch,
+                }, None)
+            }
+            Err(error) => {
+                let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+                    return Err(error);
+                };
+                if failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                let approval_event_index = transition.plan.events.len();
+                transition.record_event_id(approval_event_index);
+                transition.event("verification_approved", Some(node.id.clone()),
+                    json!({"user_task_id":task_id,"outputs":outputs}));
+                let incident_event_index = transition.plan.events.len();
+                transition.record_event_id(incident_event_index);
+                transition.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                let incident_id = transition.plan.add_incidents.last()
+                    .context("verification IO output lost its incident")?.incident_id.clone();
+                let event = transition.plan.events.get_mut(incident_event_index)
+                    .context("verification IO output lost its incident event")?;
+                event.data["incident_id"] = json!(incident_id);
+                event.data["activation_token_id"] = json!(token.token_id);
+                (ActivityIoResultDisposition::Blocked {
+                    incident_event_index, incident_id,
+                    association_id: Some(failure.association_id.clone()),
+                    position: Some(failure.position),
+                }, Some(approval_event_index))
+            }
+        };
+        let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+        if applied {
+            transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+            transition.resolve_boundary_incidents(&token.token_id);
+            transition.consume(&token.token_id);
+        }
+        let approval_event_index = if let Some(index) = blocked_approval_index {
+            index
+        } else {
+            let index = transition.plan.events.len();
+            transition.record_event_id(index);
+            transition.event("verification_approved", Some(node.id.clone()),
+                json!({"user_task_id":task_id,"outputs":outputs}));
+            index
+        };
+        transition.plan.activity_io_continuations.push(ActivityIoContinuationFact {
+            witness_id, expected_witness_revision,
+            scope_id: task.scope_id.clone(), node_id: task.node_id.clone(),
+            token_id: token.token_id.clone(), user_task_id: task_id.to_owned(),
+            approval_event_index, observed, disposition,
+        });
+        if !applied {
+            if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+                occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                occurrence.approval_event_id = transition.plan.event_ids
+                    .get(&approval_event_index).cloned();
+                occurrence.updated_at_ms = now_ms;
+                transition.write_repetition_occurrence(occurrence)?;
+                group.updated_at_ms = now_ms;
+                transition.write_repetition_group(group)?;
+            }
+            return transition.finish();
+        }
+        if let Some((_, occurrence)) = transition.repetition_for_token(&token.token_id) {
+            let source_id = witnesses[0].result_event_id.clone()
+                .context("repeated verification lost its accepted Service source")?;
+            let approval_id = transition.plan.event_ids.get(&approval_event_index).cloned()
+                .context("repeated verification lost its approval event UUID")?;
+            transition.complete_repetition_occurrence(&token, &effective_outputs,
+                source_id, Some(approval_id), occurrence.accepted_origin.clone())?;
+            transition.advance()?;
+            return transition.finish();
+        }
+        for edge in transition.outgoing(&node.id) {
+            transition.follow(&token, &edge)?;
+        }
+        transition.advance()?;
+        return transition.finish();
+    }
+    if task.kind == ProcessUserTaskKind::Work && node.activity_io.is_some() {
+        let inputs = transition.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == task.scope_id && witness.node_id == task.node_id
+                && witness.token_id == token.token_id && witness.phase == "input_captured")
+            .collect::<Vec<_>>();
+        ensure!(inputs.len() == 1,
+            "User IO completion lost its unique captured activation");
+        let witness_id = inputs[0].witness_id.clone();
+        let result_event_index = transition.plan.events.len();
+        let result_event_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
+        transition.event("user_result_accepted", Some(node.id.clone()), json!({
+            "user_task_id":task_id,"task_revision":task.revision,
+            "activation_token_id":token.token_id,"outputs":effective_outputs,
+        }));
+        let output_event_index = transition.plan.events.len();
+        let disposition = match transition.map_outputs(&node.id, &token.token_id,
+            mapping, &effective_outputs, &[]) {
+            Ok(()) => {
+                let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+                    Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                        if *event_index == output_event_index && scope_id == &task.scope_id
+                            && node_id == &task.node_id && source_token_id == &token.token_id =>
+                        (ordered.clone(), result.clone()),
+                    _ => anyhow::bail!("User IO output has no exact mapped effect"),
+                };
+                ActivityIoResultDisposition::Applied {
+                    output_event_index, ordered_outputs, local_patch,
+                }
+            }
+            Err(error) => {
+                let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+                    return Err(error);
+                };
+                if failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                let incident_event_index = transition.plan.events.len();
+                transition.record_event_id(incident_event_index);
+                transition.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                let incident_id = transition.plan.add_incidents.last()
+                    .context("User IO output blockage lost its incident")?.incident_id.clone();
+                let event = transition.plan.events.get_mut(incident_event_index)
+                    .context("User IO output blockage lost its incident event")?;
+                event.data["incident_id"] = json!(incident_id);
+                event.data["activation_token_id"] = json!(token.token_id);
+                ActivityIoResultDisposition::Blocked {
+                    incident_event_index, incident_id,
+                    association_id: Some(failure.association_id.clone()),
+                    position: Some(failure.position),
+                }
+            }
+        };
+        let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+        transition.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id, scope_id: task.scope_id.clone(), node_id: task.node_id.clone(),
+            token_id: token.token_id.clone(), result_event_index,
+            source_instance_id: transition.instance_id.to_owned(),
+            source_event_id: result_event_id.clone(),
+            result_sources: vec![result_event_id],
+            observed: IoObservedValue::Present { value: effective_outputs.clone() },
+            accepted_origin: None, resource_id: Some(task_id.to_owned()),
+            resource_revision: Some(task.revision), service_invocation_id: None,
+            child_scope_id: None, call_id: None, child_instance_id: None,
+            child_expected_revision: None, child_status: None,
+            parent_wait_token_id: None, disposition,
+        });
+        if !applied {
+            return transition.finish();
+        }
+        transition.plan.complete_user_task_ids.push(task_id.to_owned());
+        transition.tasks.retain(|existing| existing.user_task_id != task_id);
+        transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+        transition.resolve_boundary_incidents(&token.token_id);
+        transition.consume(&token.token_id);
+        transition.event("user_task_completed", Some(node.id.clone()),
+            json!({"user_task_id":task_id,"outputs":outputs}));
+        for edge in transition.outgoing(&node.id) {
+            transition.follow(&token, &edge)?;
         }
         transition.advance()?;
         return transition.finish();
@@ -4138,7 +7076,8 @@ pub fn plan_job_result(
     let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
     transition.accepted_input = Some(AcceptedInputRef::Service {
         job_id: job.job_id.clone(), attempt: job.attempt, fence: job.fence,
-        result_event_id: Uuid::new_v4().to_string(),
+        result_event_id: job.observed_result_event_id.clone()
+            .context("Service result was not durably observed before planning")?,
     });
     transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
@@ -4148,6 +7087,49 @@ pub fn plan_job_result(
         .find(|token| token.token_id == job.token_id && token.status == "waiting")
         .context("service task waiting token missing")?
         .clone();
+    let recovery_incidents = snapshot.incidents.iter().filter(|incident|
+        incident.code == "SCRIPT_INFRASTRUCTURE_FAILED"
+            && incident.job_id.as_deref() == Some(job.job_id.as_str()))
+        .collect::<Vec<_>>();
+    ensure!(recovery_incidents.len() <= 1,
+        "observed Service has duplicate infrastructure incidents");
+    if let Some(incident) = recovery_incidents.first() {
+        let dispatch = snapshot.service_dispatches.iter().filter(|dispatch|
+            dispatch.job_id == job.job_id && dispatch.phase == "observed"
+                && dispatch.scope_id == job.scope_id && dispatch.node_id == job.node_id
+                && dispatch.token_id == job.token_id && dispatch.attempt == job.attempt
+                && dispatch.fence == job.fence)
+            .collect::<Vec<_>>();
+        ensure!(dispatch.len() == 1 && incident.scope_id == job.scope_id
+            && incident.node_id.as_deref() == Some(job.node_id.as_str())
+            && incident.incident_id != "",
+            "observed Service infrastructure incident lacks its exact dispatch");
+        let reserved_result_event_id = dispatch[0].reserved_result_event_id.as_ref()
+            .context("observed Service infrastructure incident lost its result reservation")?;
+        ensure!(job.observed_result_event_id.as_deref()
+            == Some(reserved_result_event_id.as_str()),
+            "observed Service infrastructure incident changed its source event");
+        transition.plan.recovered_service_incidents.push(RecoveredServiceIncident {
+            incident_id: incident.incident_id.clone(),
+            invocation_id: dispatch[0].invocation_id.clone(),
+            job_id: job.job_id.clone(),
+            source_token_id: job.token_id.clone(),
+            reserved_result_event_id: reserved_result_event_id.clone(),
+            attempt: job.attempt,
+            fence: job.fence,
+        });
+        transition.resolve_incident(&incident.incident_id);
+        if job.scope_id != snapshot.instance.instance_id
+            && snapshot.incidents.iter().filter(|open|
+                open.scope_id == job.scope_id
+                    && open.incident_id != incident.incident_id).count() == 0
+            && transition.scopes.iter().any(|scope|
+                scope.scope_id == job.scope_id
+                    && scope.status == ProcessInstanceStatus::Incident)
+        {
+            transition.update_scope(&job.scope_id, ProcessInstanceStatus::Running, None)?;
+        }
+    }
     let ProcessNodeKind::ServiceTask {
         output_mapping,
         verification,
@@ -4160,19 +7142,64 @@ pub fn plan_job_result(
     transition
         .jobs
         .retain(|existing| existing.job_id != job.job_id);
+    let result_event_index = transition.plan.events.len();
+    if node.activity_io.is_some() {
+        let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
+            .context("configured Service IO lost its accepted invocation")? else {
+            anyhow::bail!("configured Service IO requires a fenced accepted invocation")
+        };
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
+    }
     transition.event("service_result", Some(node.id.clone()), {
         let mut data = serde_json::to_value(result)?;
         data["result_origin"] = json!(super::repository::result_origin_text(&observed.origin));
         data
     });
-    if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+    if let Some(recovered) = transition.plan.recovered_service_incidents.first().cloned() {
+        transition.event("incident_resolved", Some(node.id.clone()), json!({
+            "incident_id":recovered.incident_id,
+            "invocation_id":recovered.invocation_id,
+            "job_id":recovered.job_id,
+            "source_token_id":recovered.source_token_id,
+            "reserved_result_event_id":recovered.reserved_result_event_id,
+            "dispatch_attempt":recovered.attempt,
+            "dispatch_fence":recovered.fence,
+            "reason":"script_infrastructure_recovered",
+        }));
+    }
+    let repeated_boundary = if observed.origin == super::repository::ActivityResultOrigin::Contract {
+        if let Some(parent) = transition.repetition_boundary_parent(&token)? {
+            let kind = match &result.outcome {
+                ActivityOutcome::Error => Some(
+                    tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryError),
+                ActivityOutcome::NeedsHuman => Some(
+                    tentaflow_protocol::processes::ProcessSubscriptionKind::BoundaryEscalation),
+                _ => None,
+            };
+            kind.is_some_and(|kind| transition.subscriptions.iter().any(|subscription|
+                subscription.scope_id == token.scope_id
+                    && subscription.token_id == parent.token_id
+                    && subscription.kind == kind
+                    && subscription.status
+                        == tentaflow_protocol::processes::ProcessSubscriptionStatus::Open
+                    && (subscription.error_code.as_deref()
+                        .or(subscription.escalation_code.as_deref())
+                        .is_none_or(|code| Some(code) == result.code.as_deref()))))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id)
+        .filter(|_| !repeated_boundary) {
         transition.accepted_repetition_result = Some((job.job_id.clone(), result.clone()));
         let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
             .context("repeated Service lost its fenced source")? else {
             anyhow::bail!("repeated Service has no fenced source");
         };
         let result_event_id = result_event_id.clone();
-        transition.plan.event_ids.insert(0, result_event_id.clone());
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
         occurrence.accepted_source_event_id = Some(result_event_id.clone());
         occurrence.accepted_origin = Some(observed.origin.clone());
         if matches!(result.outcome, ActivityOutcome::Error | ActivityOutcome::Cancelled) {
@@ -4193,8 +7220,15 @@ pub fn plan_job_result(
         if result.outcome == ActivityOutcome::NeedsHuman
             || matches!(verification, ActivityVerification::Human)
         {
+            let task_inputs = transition.activity_inputs_for_user_task(
+                &node, &token.token_id,
+            )?;
             transition.user_task(&node, ProcessUserTaskKind::Verification,
-                transition.initiator.to_owned(), serde_json::to_value(result)?, &token.token_id);
+                transition.initiator.to_owned(), serde_json::to_value(result)?,
+                task_inputs, &token.token_id)?;
+            if node.activity_io.is_some() {
+                transition.record_service_io_verification(job, observed, result_event_index)?;
+            }
             occurrence.status = ProcessRepetitionOccurrenceStatus::AwaitingVerification;
             occurrence.verification_user_task_id = transition.plan.create_user_tasks.last()
                 .map(|task| task.user_task_id.clone());
@@ -4223,6 +7257,29 @@ pub fn plan_job_result(
             transition.incident(&node.id, Some(job.job_id.clone()), code, message);
             return transition.finish();
         }
+        if node.activity_io.is_some() {
+            let repeat_extra = Transition::repeat_extra(
+                &group.group_id, occurrence.ordinal, occurrence.item.clone());
+            let invocation_id = transition.service_dispatches.iter().find(|dispatch|
+                dispatch.job_id == job.job_id && dispatch.phase == "observed"
+                    && dispatch.reserved_result_event_id.as_deref()
+                        == Some(result_event_id.as_str()))
+                .map(|dispatch| dispatch.invocation_id.clone());
+            let applied = transition.apply_repetition_activity_io(
+                &node, &token, output_mapping, &result.outputs, &repeat_extra, result_event_index,
+                &result_event_id,
+                IoObservedValue::Present { value: result.outputs.clone() },
+                Some(job.job_id.clone()), Some(job.fence), invocation_id,
+                Some(observed.origin.clone()), false)?;
+            if !applied {
+                occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                occurrence.updated_at_ms = now_ms;
+                transition.write_repetition_occurrence(occurrence)?;
+                group.updated_at_ms = now_ms;
+                transition.write_repetition_group(group)?;
+                return transition.finish();
+            }
+        }
         transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
         transition.resolve_boundary_incidents(&token.token_id);
         transition.consume(&token.token_id);
@@ -4235,13 +7292,14 @@ pub fn plan_job_result(
             let (group, mut occurrence) = transition.repetition_for_token(&token.token_id)
                 .context("repeated Service source disappeared after mapping failure")?;
             occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
-            occurrence.accepted_source_event_id = transition.plan.event_ids.get(&0).cloned();
+            occurrence.accepted_source_event_id = transition.plan.event_ids.get(&result_event_index).cloned();
             occurrence.accepted_origin = Some(observed.origin.clone());
             occurrence.updated_at_ms = now_ms;
             transition.write_repetition_occurrence(occurrence)?;
+            let source_event_id = transition.plan.event_ids.get(&result_event_index).cloned();
             transition.block_repetition_group(&group.group_id, "REPETITION_MAPPING_FAILED",
                 super::repository::bounded_failure_message(&error.to_string()),
-                transition.plan.event_ids.get(&0).cloned().as_deref())?;
+                source_event_id.as_deref())?;
             return transition.finish();
         }
         transition.advance()?;
@@ -4253,6 +7311,8 @@ pub fn plan_job_result(
         use tentaflow_protocol::processes::{
             ProcessSubscriptionKind as K, ProcessSubscriptionStatus as S,
         };
+        let attached = transition.repetition_boundary_parent(&token)?
+            .unwrap_or_else(|| token.clone());
         let local = transition
             .subscriptions
             .iter()
@@ -4260,7 +7320,7 @@ pub fn plan_job_result(
                 subscription.kind == K::BoundaryEscalation
                     && subscription.status == S::Open
                     && subscription.scope_id == job.scope_id
-                    && subscription.token_id == token.token_id
+                    && subscription.token_id == attached.token_id
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4288,12 +7348,18 @@ pub fn plan_job_result(
                 else {
                     anyhow::bail!("selected escalation subscription is not a boundary");
                 };
+                let mut boundary_extra = vec![
+                    ("activity_result".into(), serde_json::to_value(result)?),
+                ];
+                boundary_extra.extend(transition.activity_inputs_extra_for_activation(
+                    &node.id, &token.token_id,
+                )?);
                 transition.map_outputs(
                     &handler.id,
-                    &token.token_id,
+                    &attached.token_id,
                     output_mapping,
                     &result.outputs,
-                    &[("activity_result".into(), serde_json::to_value(result)?)],
+                    &boundary_extra,
                 )?;
                 let AcceptedInputRef::Service { result_event_id, .. } = transition.accepted_input.as_ref()
                     .context("accepted service result has no fenced source identity")? else {
@@ -4303,27 +7369,42 @@ pub fn plan_job_result(
                 transition.plan.event_ids.insert(0, result_event_id.clone());
                 transition.settle_subscription(&subscription, S::Consumed, None);
                 if *cancel_activity {
-                    transition.interrupt_activity(&token, &subscription.subscription_id)?;
+                    transition.interrupt_activity(&attached, &subscription.subscription_id)?;
                     transition
                         .plan
                         .cancel_job_ids
                         .retain(|id| id != &job.job_id);
                 } else {
+                    let task_inputs = transition.activity_inputs_for_user_task(
+                        &node, &token.token_id,
+                    )?;
                     transition.user_task(
                         &node,
                         ProcessUserTaskKind::Verification,
                         transition.initiator.to_owned(),
                         serde_json::to_value(result)?,
+                        task_inputs,
                         &token.token_id,
-                    );
+                    )?;
+                    if let Some((_, mut occurrence)) =
+                        transition.repetition_for_token(&token.token_id) {
+                        occurrence.status = ProcessRepetitionOccurrenceStatus::AwaitingVerification;
+                        occurrence.accepted_source_event_id = Some(result_event_id.clone());
+                        occurrence.accepted_origin = Some(observed.origin.clone());
+                        occurrence.verification_user_task_id = transition.plan.create_user_tasks
+                            .last().map(|task| task.user_task_id.clone());
+                        occurrence.updated_at_ms = now_ms;
+                        transition.write_repetition_occurrence(occurrence)?;
+                    }
                 }
+                let route_event_index = transition.plan.events.len();
                 transition.event(
                     "escalation_caught",
                     Some(handler.id.clone()),
                     json!({
                         "subscription_id": subscription.subscription_id,
                         "boundary_id": handler.id,
-                        "attached_token_id": token.token_id,
+                        "attached_token_id": attached.token_id,
                         "source_token_id": token.token_id,
                         "source_scope_id": job.scope_id,
                         "job_id": job.job_id,
@@ -4336,8 +7417,23 @@ pub fn plan_job_result(
                         "matched_escalation_code": subscription.escalation_code,
                     }),
                 );
+                if node.activity_io.is_some() {
+                    if *cancel_activity {
+                        transition.ensure_event_id(route_event_index);
+                        transition.record_service_io_result(job, observed, result_event_index,
+                            ActivityIoResultDisposition::Retained {
+                                fate: ActivityIoRetainedFate::BoundaryEscalation {
+                                    subscription_id: subscription.subscription_id.clone(),
+                                },
+                                route_event_index,
+                            })?;
+                    } else {
+                        transition.record_service_io_verification(job, observed,
+                            result_event_index)?;
+                    }
+                }
                 for edge in transition.outgoing(&handler.id) {
-                    transition.follow(&token, &edge)?;
+                    transition.follow(&attached, &edge)?;
                 }
                 transition.escalation_continuation = true;
                 transition.advance()?;
@@ -4386,12 +7482,18 @@ pub fn plan_job_result(
             let ProcessNodeKind::BoundaryError { output_mapping, .. } = &handler.kind else {
                 anyhow::bail!("error subscription is not a boundary");
             };
+            let mut boundary_extra = vec![
+                ("activity_result".into(), serde_json::to_value(result)?),
+            ];
+            boundary_extra.extend(transition.activity_inputs_extra_for_activation(
+                &node.id, &token.token_id,
+            )?);
             transition.map_outputs(
                 &handler.id,
                 &attached.token_id,
                 output_mapping,
                 &result.outputs,
-                &[("activity_result".into(), serde_json::to_value(result)?)],
+                &boundary_extra,
             )?;
             transition.settle_subscription(
                 &subscription,
@@ -4411,7 +7513,18 @@ pub fn plan_job_result(
                     "source_result_index":result_index,
                 }));
             }
+            let route_event_index = transition.plan.events.len();
             transition.event("business_error_caught",Some(handler.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":attached.token_id,"job_id":job.job_id,"error_code":result.code,"result_origin":super::repository::result_origin_text(&observed.origin)}));
+            if node.activity_io.is_some() {
+                transition.ensure_event_id(route_event_index);
+                transition.record_service_io_result(job, observed, result_event_index,
+                    ActivityIoResultDisposition::Retained {
+                        fate: ActivityIoRetainedFate::BoundaryError {
+                            subscription_id: subscription.subscription_id.clone(),
+                        },
+                        route_event_index,
+                    })?;
+            }
             for edge in transition.outgoing(&handler.id) {
                 transition.follow(&attached, &edge)?;
             }
@@ -4451,39 +7564,86 @@ pub fn plan_job_result(
             result.code.as_deref().unwrap_or("SERVICE_ERROR"),
             result.summary.clone(),
         );
+        if node.activity_io.is_some() {
+            let route_event_index = transition.plan.events.len() - 1;
+            let incident_id = transition.plan.add_incidents.last()
+                .context("retained Service IO lost its final incident")?.incident_id.clone();
+            let route = transition.plan.events.get_mut(route_event_index)
+                .context("retained Service IO lost its final incident event")?;
+            route.data["incident_id"] = json!(incident_id);
+            route.data["activation_token_id"] = json!(token.token_id);
+            transition.ensure_event_id(route_event_index);
+            let fate = if result.outcome == ActivityOutcome::Error {
+                ActivityIoRetainedFate::UnhandledError
+            } else {
+                ActivityIoRetainedFate::Cancelled
+            };
+            transition.record_service_io_result(job, observed, result_event_index,
+                ActivityIoResultDisposition::Retained { fate, route_event_index })?;
+        }
         return transition.finish();
     }
+    let mut verification_opened = false;
     match verification {
         _ if result.outcome == ActivityOutcome::NeedsHuman => {
+            let task_inputs = transition.activity_inputs_for_user_task(
+                &node, &token.token_id,
+            )?;
             transition.user_task(
                 &node,
                 ProcessUserTaskKind::Verification,
                 transition.initiator.to_owned(),
                 serde_json::to_value(result)?,
+                task_inputs,
                 &token.token_id,
-            );
+            )?;
+            verification_opened = true;
         }
         ActivityVerification::Human => {
+            let task_inputs = transition.activity_inputs_for_user_task(
+                &node, &token.token_id,
+            )?;
             transition.user_task(
                 &node,
                 ProcessUserTaskKind::Verification,
                 transition.initiator.to_owned(),
                 serde_json::to_value(result)?,
+                task_inputs,
                 &token.token_id,
-            );
+            )?;
+            verification_opened = true;
         }
         ActivityVerification::Condition { expression } => {
+            let activity_input_extra = transition.activity_inputs_extra_for_activation(
+                &node.id, &token.token_id,
+            )?;
             match condition(expression, &transition.effective()?, &result.outputs) {
                 Ok(true) => match patch_variables(
                     output_mapping,
                     transition.local()?,
                     &transition.effective()?,
                     &result.outputs,
-                    &[],
+                    &activity_input_extra,
                 ) {
                     Ok(_) => {
-                        transition.map_outputs(&node.id, &token.token_id, output_mapping,
-                            &result.outputs, &[])?;
+                        let output_event_index = transition.plan.events.len();
+                        match transition.map_outputs(&node.id, &token.token_id, output_mapping,
+                            &result.outputs, &[]) {
+                            Ok(()) => transition.record_service_io_applied(job, observed,
+                                result_event_index, output_event_index)?,
+                            Err(error) if node.activity_io.is_some()
+                                && error.downcast_ref::<ActivityIoAssociationFailure>().is_some() => {
+                                let failure = error.downcast_ref::<ActivityIoAssociationFailure>()
+                                    .context("Service IO lost its attributed mapping failure")?;
+                                if failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                                    return Err(error);
+                                }
+                                transition.block_service_io_output(job, observed,
+                                    result_event_index, &error)?;
+                                return transition.finish();
+                            }
+                            Err(error) => return Err(error),
+                        }
                         transition.disarm_boundaries(
                             &token.token_id,
                             "activity_completed",
@@ -4522,6 +7682,9 @@ pub fn plan_job_result(
                 ),
             }
         }
+    }
+    if verification_opened {
+        transition.record_service_io_verification(job, observed, result_event_index)?;
     }
     transition.finish()
 }
@@ -4599,8 +7762,143 @@ pub(super) fn plan_message_catch(
         .find(|t| t.token_id == subscription.token_id && t.status == "waiting")
         .context("subscription activation is closed")?
         .clone();
-    transition.map_outputs(&node.id, &token.token_id, mapping, payload,
-        &[("message".into(), metadata.clone())])?;
+    let mut message_extra = vec![("message".to_owned(), metadata.clone())];
+    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+        if let Some((group, occurrence)) = transition.repetition_for_token(&token.token_id) {
+            message_extra.extend(Transition::repeat_extra(
+                &group.group_id, occurrence.ordinal, occurrence.item,
+            ));
+        }
+    }
+    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })
+        && node.activity_io.is_some() {
+        let repeated = transition.repetition_for_token(&token.token_id).is_some();
+        let inputs = transition.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == subscription.scope_id
+                && witness.node_id == subscription.node_id
+                && witness.token_id == token.token_id
+                && witness.phase == "input_captured").collect::<Vec<_>>();
+        let planned_inputs = transition.plan.activity_io_inputs.iter().filter_map(|input| match input {
+            ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                activation_token_id, .. }
+                if scope_id == &subscription.scope_id && node_id == &subscription.node_id
+                    && activation_token_id == &token.token_id => Some(witness_id.clone()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        ensure!(inputs.len() + planned_inputs.len() == 1,
+            "Receive IO delivery lost its captured activation");
+        let witness_id = inputs.first().map(|input| input.witness_id.clone())
+            .or_else(|| planned_inputs.first().cloned())
+            .context("Receive IO delivery lost its captured witness")?;
+        let result_event_index = transition.plan.events.len();
+        let result_event_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
+        let message_id = metadata["message_id"].clone();
+        transition.event("message_delivered", Some(node.id.clone()), json!({
+            "subscription_id":subscription.subscription_id,
+            "attached_token_id":subscription.token_id,
+            "message_id":message_id,"message":metadata,"payload":payload,
+        }));
+        let output_event_index = transition.plan.events.len();
+        let disposition = match transition.map_outputs(&node.id, &token.token_id,
+            mapping, payload, &message_extra) {
+            Ok(()) => {
+                let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+                    Some(VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(ordered), result, .. })
+                        if *event_index == output_event_index
+                            && scope_id == &subscription.scope_id
+                            && node_id == &subscription.node_id
+                            && source_token_id == &token.token_id =>
+                        (ordered.clone(), result.clone()),
+                    _ => anyhow::bail!("Receive IO output has no exact mapped effect"),
+                };
+                ActivityIoResultDisposition::Applied {
+                    output_event_index, ordered_outputs, local_patch,
+                }
+            }
+            Err(error) => {
+                let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+                    return Err(error);
+                };
+                if failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                    return Err(error);
+                }
+                let incident_event_index = transition.plan.events.len();
+                transition.record_event_id(incident_event_index);
+                transition.incident(&node.id, None, "ACTIVITY_IO_OUTPUT_FAILED",
+                    super::repository::bounded_failure_message(&error.to_string()));
+                let incident_id = transition.plan.add_incidents.last()
+                    .context("Receive IO output blockage lost its incident")?.incident_id.clone();
+                let event = transition.plan.events.get_mut(incident_event_index)
+                    .context("Receive IO output blockage lost its incident event")?;
+                event.data["incident_id"] = json!(incident_id);
+                event.data["activation_token_id"] = json!(token.token_id);
+                ActivityIoResultDisposition::Blocked {
+                    incident_event_index, incident_id,
+                    association_id: Some(failure.association_id.clone()),
+                    position: Some(failure.position),
+                }
+            }
+        };
+        let applied = matches!(&disposition, ActivityIoResultDisposition::Applied { .. });
+        transition.plan.activity_io_results.push(ActivityIoResultFact {
+            witness_id, scope_id: subscription.scope_id.clone(),
+            node_id: subscription.node_id.clone(), token_id: token.token_id.clone(),
+            result_event_index, source_instance_id: transition.instance_id.to_owned(),
+            source_event_id: result_event_id.clone(),
+            result_sources: vec![result_event_id],
+            observed: IoObservedValue::Present { value: payload.clone() },
+            accepted_origin: None,
+            resource_id: Some(subscription.subscription_id.clone()),
+            resource_revision: Some(subscription.revision),
+            service_invocation_id: None, child_scope_id: None, call_id: None,
+            child_instance_id: None, child_expected_revision: None,
+            child_status: None, parent_wait_token_id: None, disposition,
+        });
+        transition.settle_subscription(subscription,
+            tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed, None);
+        for link in snapshot.boundary_incidents.iter().filter(|link| matches!(
+            &link.activation, super::repository::BoundaryActivationId::Subscription(id)
+                if id == &subscription.subscription_id)) {
+            transition.resolve_incident(&link.incident_id);
+        }
+        if let Some(race) = &subscription.race_id {
+            transition.win_race(race, &node.id, Some(&subscription.subscription_id), None)?;
+        }
+        if !applied {
+            if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
+                occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
+                occurrence.updated_at_ms = now_ms;
+                transition.write_repetition_occurrence(occurrence)?;
+                group.updated_at_ms = now_ms;
+                transition.write_repetition_group(group)?;
+            }
+            return transition.finish();
+        }
+        transition.consume(&token.token_id);
+        let completion_index = transition.plan.events.len();
+        let completion_id = transition.next_id("runtime");
+        transition.plan.event_ids.insert(completion_index, completion_id.clone());
+        transition.event("receive_task_completed", Some(node.id.clone()), json!({
+            "subscription_id":subscription.subscription_id,
+            "attached_token_id":subscription.token_id,
+            "message_id":message_id,
+        }));
+        transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+        transition.resolve_boundary_incidents(&token.token_id);
+        if repeated {
+            transition.complete_repetition_occurrence(&token, payload, completion_id, None, None)?;
+            transition.advance()?;
+            return transition.finish();
+        }
+        for edge in transition.outgoing(&node.id) {
+            transition.follow(&token, &edge)?;
+        }
+        transition.advance()?;
+        return transition.finish();
+    }
+    transition.map_outputs(&node.id, &token.token_id, mapping, payload, &message_extra)?;
     transition.settle_subscription(
         subscription,
         tentaflow_protocol::processes::ProcessSubscriptionStatus::Consumed,
@@ -4616,12 +7914,23 @@ pub(super) fn plan_message_catch(
         None => transition.consume(&token.token_id),
     }
     let message_id = metadata["message_id"].clone();
+    let source_index = transition.plan.events.len();
+    let source_id = transition.next_id("runtime");
+    if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })
+        && transition.repetition_for_token(&token.token_id).is_some() {
+        transition.plan.event_ids.insert(source_index, source_id.clone());
+    }
     transition.event("message_delivered",Some(node.id.clone()),json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":message_id,"message":metadata,"payload":payload}));
     if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
         transition.event("receive_task_completed", Some(node.id.clone()),
             json!({"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"message_id":message_id}));
         transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
         transition.resolve_boundary_incidents(&token.token_id);
+        if transition.repetition_for_token(&token.token_id).is_some() {
+            transition.complete_repetition_occurrence(&token, payload, source_id, None, None)?;
+            transition.advance()?;
+            return transition.finish();
+        }
     }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
@@ -4713,6 +8022,7 @@ pub(super) fn plan_timer_catch(
     now_ms: i64,
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Catch
@@ -4722,7 +8032,9 @@ pub(super) fn plan_timer_catch(
             && timer.version == snapshot.instance.version,
         "catch timer does not match its pinned instance"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(
+        snapshot, now_ms, signal_admission, id_source,
+    )?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer.scope_id.clone().context("catch timer lacks scope")?;
     let token_id = timer
@@ -5042,12 +8354,38 @@ pub(crate) mod test_support {
         PinnedFlowInfo, ProcessInstance, ProcessSequenceFlow, ProcessVersion,
     };
 
+    pub fn ordinary_start_id(model: &ProcessModel) -> &str {
+        let starts = model.nodes.iter().filter(|node|
+            node.kind == ProcessNodeKind::Start).collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1, "fixture must have one ordinary Start");
+        &starts[0].id
+    }
+
     pub struct Fixture {
         pub directory: tempfile::TempDir,
         pub db: DbPool,
         pub router: Arc<Router>,
         pub owner: super::super::repository::ProcessActor,
         pub participant: super::super::repository::ProcessActor,
+    }
+
+    pub fn plan_recorded_result(
+        fixture: &Fixture,
+        claim: &super::super::repository::ClaimedProcessJob,
+        observed: &super::super::repository::ObservedActivityResult,
+        at_ms: i64,
+    ) -> Result<RuntimePlan> {
+        let snapshot = super::super::repository::runtime_snapshot(
+            &fixture.db, &fixture.owner, &claim.job.instance_id,
+        )?;
+        let job = snapshot.jobs.iter()
+            .find(|job| job.job_id == claim.job.job_id)
+            .context("observed Service job missing from durable snapshot")?;
+        ensure!(job.attempt == claim.job.attempt
+            && job.fence == claim.job.fence
+            && job.observed_result_event_id.is_some(),
+            "observed Service job lost its original fence or result event");
+        super::plan_job_result(&snapshot, job, observed, at_ms, None)
     }
 
     pub fn actor(pool: &DbPool, name: &str) -> super::super::repository::ProcessActor {
@@ -5134,6 +8472,7 @@ pub(crate) mod test_support {
             source_id: source.into(),
             target_id: target.into(),
             condition: None,
+            call_start_node_id: None,
         }
     }
 
@@ -5149,6 +8488,7 @@ pub(crate) mod test_support {
                     output_mapping: BTreeMap::from([("answer".into(), "outputs.answer".into())]),
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -5178,6 +8518,7 @@ pub(crate) mod test_support {
                     result_expression: None,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -5193,6 +8534,7 @@ pub(crate) mod test_support {
             sequence_flows: std::mem::take(&mut model.sequence_flows),
             variables: std::mem::take(&mut model.variables),
             diagram: std::mem::take(&mut model.diagram),
+            modeling: std::mem::take(&mut model.modeling),
         };
         let start_id = format!("RootStart_{scope_id}");
         let end_id = format!("RootEnd_{scope_id}");
@@ -5202,6 +8544,7 @@ pub(crate) mod test_support {
                 name: "Enter embedded work".into(),
                 kind: ProcessNodeKind::Start,
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: scope_id.into(),
@@ -5212,12 +8555,14 @@ pub(crate) mod test_support {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: end_id.clone(),
                 name: "Finish embedded work".into(),
                 kind: ProcessNodeKind::End,
                 repeat: None,
+                activity_io: None,
             },
         ];
         model.sequence_flows = vec![
@@ -5252,6 +8597,7 @@ pub(crate) mod test_support {
                     },
                 },
                 repeat: None,
+                activity_io: None,
             });
             model
                 .sequence_flows
@@ -5384,7 +8730,7 @@ pub(crate) mod test_support {
         let at_ms = chrono::Utc::now().timestamp_millis();
         let command = stamp("start");
         let plan = super::plan_start(
-            &version.model,
+            &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
             &id,
             actor,
             &version.definition_id,
@@ -5402,7 +8748,7 @@ pub(crate) mod test_support {
             &id,
             &version.definition_id,
             version.version,
-            &variables,
+            &variables, None, None,
             super::super::repository::ProcessPlanInput::Supplied(&plan),
             at_ms,
         )
@@ -5433,9 +8779,973 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::super::repository;
     use super::*;
     use test_support::*;
+    use tentaflow_protocol::processes::ProcessLinkEventDefinition;
+
+    #[test]
+    fn accepted_io_result_hash_preserves_missing_and_present_null() {
+        let missing = repository::activity_io_result_sha256(&IoObservedValue::Missing).unwrap();
+        let null = repository::activity_io_result_sha256(
+            &IoObservedValue::Present { value: Value::Null }).unwrap();
+        assert_ne!(missing, null);
+        assert_eq!(missing.len(), 64);
+        assert_eq!(null.len(), 64);
+        assert_eq!(null, repository::activity_io_result_sha256(
+            &IoObservedValue::Present { value: Value::Null }).unwrap());
+    }
+
+    #[test]
+    fn activity_input_capture_distinguishes_missing_from_present_null_in_authored_order() {
+        let io = ProcessActivityIo {
+            data_inputs: vec![
+                tentaflow_protocol::processes::ProcessIoDataInput {
+                    id: "Input_Present".into(), name: None,
+                },
+                tentaflow_protocol::processes::ProcessIoDataInput {
+                    id: "Input_Missing".into(), name: None,
+                },
+            ],
+            data_outputs: Vec::new(),
+            input_set_id: "InputSet_1".into(),
+            input_set: vec!["Input_Missing".into(), "Input_Present".into()],
+            output_set_id: "OutputSet_1".into(),
+            output_set: Vec::new(),
+            input_associations: vec![
+                ProcessInputAssociation::DirectRef {
+                    id: "Association_Present".into(),
+                    source_object_ref_id: "Ref_Present".into(),
+                    target_input_id: "Input_Present".into(),
+                },
+                ProcessInputAssociation::DirectRef {
+                    id: "Association_Missing".into(),
+                    source_object_ref_id: "Ref_Missing".into(),
+                    target_input_id: "Input_Missing".into(),
+                },
+            ],
+            output_associations: Vec::new(),
+            coordinator_output: None,
+        };
+        let modeling = ProcessBodyModeling {
+            data_object_references: vec![
+                tentaflow_protocol::processes::ProcessDataObjectReference {
+                    id: "Ref_Present".into(), name: None,
+                    data_object_ref: "Object_Present".into(),
+                    variable_binding_key: Some("present".into()),
+                },
+                tentaflow_protocol::processes::ProcessDataObjectReference {
+                    id: "Ref_Missing".into(), name: None,
+                    data_object_ref: "Object_Missing".into(),
+                    variable_binding_key: Some("missing".into()),
+                },
+            ],
+            ..ProcessBodyModeling::default()
+        };
+        let local = json!({"present":null});
+        let observed = evaluate_activity_inputs(&io, &modeling, &local, &local, &[]).unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].position, 0);
+        assert_eq!(observed[0].declaration_id, "Input_Missing");
+        assert_eq!(observed[0].observed, IoObservedValue::Missing);
+        assert_eq!(observed[1].position, 1);
+        assert_eq!(observed[1].declaration_id, "Input_Present");
+        assert_eq!(observed[1].observed, IoObservedValue::Present { value: Value::Null });
+        assert_ne!(serde_json::to_vec(&observed[0].observed).unwrap(),
+            serde_json::to_vec(&observed[1].observed).unwrap());
+
+        let mut failing = io.clone();
+        failing.input_associations[0] = ProcessInputAssociation::CelAssignment {
+            id: "Association_Present".into(), from_expression: "1 / 0".into(),
+            target_input_id: "Input_Present".into(),
+        };
+        let error = evaluate_activity_inputs(&failing, &modeling, &local, &local, &[])
+            .unwrap_err();
+        let attribution = error.downcast_ref::<ActivityIoAssociationFailure>().unwrap();
+        assert_eq!(attribution.position, 1);
+        assert_eq!(attribution.association_id, "Association_Present");
+    }
+
+    #[test]
+    fn activity_input_projection_is_the_single_body_binding_for_service_and_script() {
+        let inputs = vec![
+            IoObservedInput {
+                position: 0,
+                declaration_id: "Missing_Input".into(),
+                association_id: "Association_Missing".into(),
+                source_object_ref_id: None,
+                observed: IoObservedValue::Missing,
+            },
+            IoObservedInput {
+                position: 1,
+                declaration_id: "Nullable_Input".into(),
+                association_id: "Association_Nullable".into(),
+                source_object_ref_id: None,
+                observed: IoObservedValue::Present { value: Value::Null },
+            },
+            IoObservedInput {
+                position: 2,
+                declaration_id: "Text_Input".into(),
+                association_id: "Association_Text".into(),
+                source_object_ref_id: None,
+                observed: IoObservedValue::Present { value: json!("captured") },
+            },
+        ];
+        let extra = activity_inputs_extra(&inputs).unwrap();
+        assert_eq!(extra, vec![("inputs".into(), json!({
+            "Nullable_Input": null,
+            "Text_Input": "captured",
+        }))]);
+        let body = prepare_service_input(
+            &BTreeMap::from([
+                ("payload".into(), "inputs.Text_Input".into()),
+                ("nullable".into(), "inputs.Nullable_Input".into()),
+            ]),
+            &json!({"legacy": "unchanged"}),
+            &extra,
+        ).unwrap();
+        assert_eq!(body, json!({
+            "payload": "captured",
+            "variables": {"nullable": null},
+        }));
+        assert_eq!(script_evaluate(
+            "inputs.Text_Input",
+            &json!({"legacy": "unchanged"}),
+            &Value::Null,
+            &extra,
+        ).unwrap(), json!("captured"));
+        assert!(merge_activity_inputs_extra(
+            &[("inputs".into(), json!({"forged": true}))],
+            Some(&inputs),
+        ).is_err());
+    }
+
+    #[test]
+    fn user_task_wire_budget_accepts_schema_valid_boundary_and_rejects_oversize_detail() {
+        let build_task = |last_input_bytes: usize| {
+            let mut activity_inputs = (0..15)
+                .map(|position| {
+                    let value = Value::String("x".repeat(45 * 1024));
+                    validate_output(&value).unwrap();
+                    ProcessUserTaskInput {
+                        position,
+                        declaration_id: format!("Input_{position}"),
+                        name: Some(format!("Input {position}")),
+                        value: ProcessUserTaskInputValue::Present(value),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let value = Value::String("x".repeat(last_input_bytes));
+            validate_output(&value).unwrap();
+            activity_inputs.push(ProcessUserTaskInput {
+                position: 15,
+                declaration_id: "Input_15".into(),
+                name: Some("Input 15".into()),
+                value: ProcessUserTaskInputValue::Present(value),
+            });
+            ProcessUserTask {
+                user_task_id: "task-wire".into(),
+                node_id: "Review".into(),
+                name: "Review".into(),
+                assignee_user_id: "user".into(),
+                kind: ProcessUserTaskKind::Manual,
+                status: ProcessUserTaskStatus::Open,
+                outputs: Value::Null,
+                revision: 1,
+                can_complete: true,
+                token_id: Some("wait".into()),
+                scope_id: "instance".into(),
+                instructions: Some("i".repeat(32 * 1024)),
+                activity_inputs,
+            }
+        };
+
+        let maximum_input_bytes = MAX_VARIABLE_BYTES - 16;
+        assert!(ensure_user_task_wire_budget(&build_task(0)).is_ok());
+        assert!(ensure_user_task_wire_budget(&build_task(maximum_input_bytes)).is_err());
+
+        let mut low = 0;
+        let mut high = maximum_input_bytes;
+        while low < high {
+            let middle = low + (high - low + 1) / 2;
+            if ensure_user_task_wire_budget(&build_task(middle)).is_ok() {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        assert!(low < maximum_input_bytes);
+        assert!(ensure_user_task_wire_budget(&build_task(low)).is_ok());
+        assert!(ensure_user_task_wire_budget(&build_task(low + 1)).is_err());
+    }
+
+    #[test]
+    fn activity_output_evaluates_accepted_result_once_into_selected_body_local_patch() {
+        let io = ProcessActivityIo {
+            data_inputs: Vec::new(),
+            data_outputs: vec![tentaflow_protocol::processes::ProcessIoDataOutput {
+                id: "Output_Result".into(), name: None,
+                value_expression: "outputs.payload".into(),
+            }],
+            input_set_id: "InputSet_1".into(), input_set: Vec::new(),
+            output_set_id: "OutputSet_1".into(),
+            output_set: vec!["Output_Result".into()],
+            input_associations: Vec::new(),
+            output_associations: vec![tentaflow_protocol::processes::ProcessOutputAssociation {
+                id: "Association_Result".into(),
+                source_output_id: "Output_Result".into(),
+                target_object_ref_id: "Ref_Result".into(),
+            }],
+            coordinator_output: None,
+        };
+        let modeling = ProcessBodyModeling {
+            data_object_references: vec![tentaflow_protocol::processes::ProcessDataObjectReference {
+                id: "Ref_Result".into(), name: None,
+                data_object_ref: "Object_Result".into(),
+                variable_binding_key: Some("result".into()),
+            }],
+            ..ProcessBodyModeling::default()
+        };
+        let local = json!({"result":null,"preserved":true});
+        let (observed, patch) = evaluate_activity_outputs(
+            &io, &modeling, &local, &local,
+            &IoObservedValue::Present { value: json!({"payload":7}) }, &[], ActivityIoOutputOwner::Ordinal,
+        ).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].observed,
+            IoObservedValue::Present { value: json!(7) });
+        assert_eq!(patch, json!({"result":7,"preserved":true}));
+
+        let foreign_modeling = ProcessBodyModeling::default();
+        assert!(evaluate_activity_outputs(&io, &foreign_modeling, &local, &local,
+            &IoObservedValue::Present { value: json!({"payload":7}) }, &[], ActivityIoOutputOwner::Ordinal).is_err());
+        let missing = evaluate_activity_outputs(&io, &modeling, &local, &local,
+            &IoObservedValue::Missing, &[], ActivityIoOutputOwner::Ordinal).unwrap_err();
+        let missing = missing.downcast_ref::<ActivityIoAssociationFailure>().unwrap();
+        assert_eq!(missing.position, 0);
+        assert_eq!(missing.association_id, "Association_Result");
+        assert!(missing.to_string().contains("requires a present accepted result"));
+        let mut no_output = io.clone();
+        no_output.data_outputs.clear();
+        no_output.output_set.clear();
+        no_output.output_associations.clear();
+        assert_eq!(evaluate_activity_outputs(&no_output, &modeling, &local, &local,
+            &IoObservedValue::Missing, &[], ActivityIoOutputOwner::Ordinal).unwrap(),
+            (Vec::new(), local.clone()));
+
+        let before = json!({"result":null,"legacy":0,"preserved":true});
+        let legacy_mapping = BTreeMap::from([("legacy".to_owned(),
+            "outputs.payload".to_owned())]);
+        let legacy = patch_variables(&legacy_mapping, &before, &before,
+            &json!({"payload":7}), &[]).unwrap();
+        let mut mixed = io.clone();
+        mixed.data_outputs[0].value_expression = "vars.legacy".into();
+        let (ordered, after) = evaluate_activity_outputs(&mixed, &modeling,
+            &legacy, &before,
+            &IoObservedValue::Present { value: json!({"payload":7}) }, &[], ActivityIoOutputOwner::Ordinal).unwrap();
+        assert_eq!(ordered[0].observed, IoObservedValue::Present { value: json!(0) });
+        assert_eq!(after, json!({"result":0,"legacy":7,"preserved":true}));
+
+        let near_limit = json!({"result":null,"preserved":"a".repeat(200_000)});
+        validate_variables(&near_limit).unwrap();
+        let overflow = evaluate_activity_outputs(&io, &modeling,
+            &near_limit, &near_limit,
+            &IoObservedValue::Present {
+                value: json!({"payload":"b".repeat(100_000)}),
+            }, &[], ActivityIoOutputOwner::Ordinal,
+        ).unwrap_err();
+        let attributed = overflow.downcast_ref::<ActivityIoAssociationFailure>().unwrap();
+        assert_eq!(attributed.position, 0);
+        assert_eq!(attributed.association_id, "Association_Result");
+        assert_eq!(near_limit["result"], Value::Null);
+
+        let mut repeated = io.clone();
+        repeated.coordinator_output = Some(tentaflow_protocol::processes::ProcessCoordinatorOutputIo {
+            data_outputs: vec![tentaflow_protocol::processes::ProcessIoDataOutput {
+                id: "Output_Aggregate".into(), name: None,
+                value_expression: "outputs".into(),
+            }],
+            output_set_id: "OutputSet_Aggregate".into(),
+            output_set: vec!["Output_Aggregate".into()],
+            output_associations: vec![tentaflow_protocol::processes::ProcessOutputAssociation {
+                id: "Association_Aggregate".into(),
+                source_output_id: "Output_Aggregate".into(),
+                target_object_ref_id: "Ref_Result".into(),
+            }],
+        });
+        let accepted_aggregate = IoObservedValue::Present { value: json!([2, 4]) };
+        let (ordered, patched) = evaluate_activity_outputs(&repeated, &modeling,
+            &local, &local, &accepted_aggregate, &[], ActivityIoOutputOwner::Coordinator).unwrap();
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].association_id, "Association_Aggregate");
+        assert_eq!(ordered[0].observed,
+            IoObservedValue::Present { value: json!([2, 4]) });
+        assert_eq!(patched, json!({"result":[2,4],"preserved":true}));
+        let missing = evaluate_activity_outputs(&repeated, &modeling,
+            &local, &local, &IoObservedValue::Missing, &[], ActivityIoOutputOwner::Coordinator).unwrap_err();
+        let attributed = missing.downcast_ref::<ActivityIoAssociationFailure>().unwrap();
+        assert_eq!(attributed.position, 0);
+        assert_eq!(attributed.association_id, "Association_Aggregate");
+    }
+
+    #[test]
+    fn failed_input_parks_only_its_parallel_lineage_and_preserves_the_other_task() {
+      for repeated in [false, true] {
+        let fixture = Fixture::new();
+        let mut model = user_model(None);
+        model.modeling = Some(ProcessBodyModeling::default());
+        model.nodes.iter_mut().find(|node| node.id == "Work").unwrap().activity_io =
+            Some(ProcessActivityIo {
+                data_inputs: vec![tentaflow_protocol::processes::ProcessIoDataInput {
+                    id: "Input_Failed".into(), name: None,
+                }],
+                data_outputs: Vec::new(),
+                input_set_id: "InputSet_Failed".into(),
+                input_set: vec!["Input_Failed".into()],
+                output_set_id: "OutputSet_Failed".into(), output_set: Vec::new(),
+                input_associations: vec![ProcessInputAssociation::CelAssignment {
+                    id: "Association_Failed".into(), from_expression: "1 / 0".into(),
+                    target_input_id: "Input_Failed".into(),
+                }],
+                output_associations: Vec::new(), coordinator_output: None,
+            });
+        if repeated {
+            model.variables.insert("results".into(), json!([]));
+            model.nodes.iter_mut().find(|node| node.id == "Work").unwrap().repeat =
+                Some(tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance {
+                    mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Parallel,
+                    input: tentaflow_protocol::processes::ProcessMultiInstanceInput::Cardinality {
+                        count: 2,
+                    },
+                    output_collection_variable: "results".into(),
+                });
+        }
+        model.nodes.extend([
+            ProcessNode { id: "Split".into(), name: "Start independent work".into(),
+                kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None },
+            ProcessNode { id: "Peer".into(), name: "Independent review".into(),
+                kind: ProcessNodeKind::UserTask { assignee_user_id: None,
+                    output_mapping: BTreeMap::new() }, repeat: None, activity_io: None },
+            ProcessNode { id: "Join".into(), name: "Finish both reviews".into(),
+                kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None },
+        ]);
+        model.sequence_flows = vec![
+            edge("EnterSplit", "Start_1", "Split"),
+            edge("FailBranch", "Split", "Work"),
+            edge("PeerBranch", "Split", "Peer"),
+            edge("FailedJoin", "Work", "Join"),
+            edge("PeerJoin", "Peer", "Join"),
+            edge("LeaveJoin", "Join", "End_1"),
+        ];
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&version.model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start independent IO lineages");
+        let valid = plan_start(&version.model, &version.model.process_id,
+            ordinary_start_id(&version.model), &instance_id, &fixture.owner,
+            &version.definition_id, version.version, variables.clone(),
+            StartCause::Manual, at_ms, manual_input(&command), None).unwrap();
+        assert_eq!(valid.activity_io_inputs.len(), 1);
+        assert!(matches!(&valid.activity_io_inputs[0], ActivityIoInputFact::Failed {
+            association_id, position: 0, group_id, occurrence_id,
+            ordinal, .. } if association_id == "Association_Failed"
+                && group_id.is_some() == repeated && occurrence_id.is_some() == repeated
+                && ordinal.as_ref().map_or(!repeated, |value| repeated && *value == 0)));
+        if repeated {
+            assert_eq!(valid.repetition_groups.len(), 1);
+            assert_eq!(valid.repetition_groups[0].status,
+                ProcessRepetitionGroupStatus::Incident);
+            assert_eq!(valid.repetition_occurrences.len(), 2);
+            assert_eq!(valid.repetition_occurrences.iter().filter(|row|
+                row.status == ProcessRepetitionOccurrenceStatus::Active).count(), 1);
+            assert_eq!(valid.repetition_occurrences.iter().filter(|row|
+                row.status == ProcessRepetitionOccurrenceStatus::Pending).count(), 1);
+        }
+        assert_eq!(valid.create_user_tasks.iter().filter(|task|
+            task.node_id == "Peer").count(), 1);
+        assert!(!valid.create_user_tasks.iter().any(|task| task.node_id == "Work"));
+        assert_eq!(valid.add_incidents.iter().filter(|incident|
+            incident.code == "ACTIVITY_IO_INPUT_FAILED" && !incident.can_retry).count(), 1);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = valid.clone();
+        let peer_wait = valid.create_user_tasks.iter().find(|task| task.node_id == "Peer")
+            .and_then(|task| task.token_id.as_ref()).unwrap();
+        let peer_source = valid.token_sources.get(peer_wait).unwrap();
+        if let ActivityIoInputFact::Failed { source_token_id, .. } =
+            &mut forged.activity_io_inputs[0] {
+            *source_token_id = peer_source.clone();
+        }
+        let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables,
+            None, None, repository::ProcessPlanInput::Supplied(&forged), at_ms).unwrap_err();
+        assert!(error.to_string().contains(
+            "activity IO input changed its unique ready-to-waiting lineage"));
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        if repeated {
+            let mut forged_ordinal = valid.clone();
+            if let ActivityIoInputFact::Failed { ordinal, .. } =
+                &mut forged_ordinal.activity_io_inputs[0] {
+                *ordinal = Some(1);
+            }
+            let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
+                &instance_id, &version.definition_id, version.version, &variables,
+                None, None, repository::ProcessPlanInput::Supplied(&forged_ordinal), at_ms)
+                .unwrap_err();
+            assert!(error.to_string().contains(
+                "activity IO input changed its group, ordinal, or waiting token"));
+            assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+            let mut forged_group = valid.clone();
+            if let ActivityIoInputFact::Failed { group_id, .. } =
+                &mut forged_group.activity_io_inputs[0] {
+                *group_id = Some(Uuid::new_v4().to_string());
+            }
+            let error = repository::start_instance(&fixture.db, &fixture.owner, &command,
+                &instance_id, &version.definition_id, version.version, &variables,
+                None, None, repository::ProcessPlanInput::Supplied(&forged_group), at_ms)
+                .unwrap_err();
+            assert!(error.to_string().contains(
+                "activity IO input has no factual repeated group"));
+            assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        }
+        repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables,
+            None, None, repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let actual = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
+        assert_eq!(actual.instance.status, ProcessInstanceStatus::Incident);
+        assert_eq!(actual.user_tasks.iter().filter(|task| task.node_id == "Peer"
+            && task.status == ProcessUserTaskStatus::Open).count(), 1);
+        assert_eq!(actual.activity_io_witnesses.len(), 1);
+        assert_eq!(actual.activity_io_witnesses[0].phase, "input_failed");
+        assert_eq!(actual.activity_io_witnesses[0].node_id, "Work");
+        assert_eq!(actual.activity_io_witnesses[0].ordinal,
+            repeated.then_some(0));
+        if repeated {
+            assert_eq!(actual.repetition_groups[0].status,
+                ProcessRepetitionGroupStatus::Incident);
+            assert_eq!(actual.repetition_occurrences.iter().filter(|row|
+                row.status == ProcessRepetitionOccurrenceStatus::Pending).count(), 1);
+        }
+        assert_eq!(all_history(&reopened, &fixture.owner, &instance_id).iter().filter(|event|
+            event.kind == "incident" && event.data["code"] == "ACTIVITY_IO_INPUT_FAILED")
+            .count(), 1);
+      }
+    }
+
+    fn all_history(pool: &DbPool, actor: &repository::ProcessActor,
+        instance_id: &str) -> Vec<tentaflow_protocol::processes::ProcessEvent> {
+        let mut events = Vec::new();
+        let mut after = 0;
+        loop {
+            let (page, next, more) = repository::list_events(pool, actor, instance_id,
+                after, 200).unwrap();
+            assert!(!more || !page.is_empty());
+            events.extend(page);
+            if !more { return events; }
+            assert!(next > after);
+            after = next;
+        }
+    }
+
+    fn single_link_cycle_model() -> ProcessModel {
+        let mut model = super::super::model::starter_model();
+        model.variables.insert("loop".into(), Value::Bool(true));
+        model.nodes.extend([
+            ProcessNode {
+                activity_io: None,
+                repeat: None,
+                id: "Choice_1".into(),
+                name: "Continue?".into(),
+                kind: ProcessNodeKind::ExclusiveGateway {
+                    default_flow_id: Some("Flow_Exit".into()),
+                },
+            },
+            ProcessNode {
+                activity_io: None,
+                repeat: None,
+                id: "Script_1".into(),
+                name: "Advance".into(),
+                kind: ProcessNodeKind::ScriptTask {
+                    script: "null".into(),
+                    output_mapping: BTreeMap::new(),
+                },
+            },
+            ProcessNode {
+                activity_io: None,
+                repeat: None,
+                id: "LinkThrow_1".into(),
+                name: "Again".into(),
+                kind: ProcessNodeKind::LinkThrow {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Throw".into(),
+                        name: "repeat".into(),
+                        source_refs: Vec::new(),
+                        target_ref: Some("LinkDefinition_Catch".into()),
+                    },
+                },
+            },
+            ProcessNode {
+                activity_io: None,
+                repeat: None,
+                id: "LinkCatch_1".into(),
+                name: "Resume".into(),
+                kind: ProcessNodeKind::LinkCatch {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Catch".into(),
+                        name: "repeat".into(),
+                        source_refs: vec!["LinkDefinition_Throw".into()],
+                        target_ref: None,
+                    },
+                },
+            },
+        ]);
+        model.sequence_flows[0].target_id = "Choice_1".into();
+        model.sequence_flows.extend([
+            edge("Flow_Script", "Choice_1", "Script_1"),
+            edge("Flow_Exit", "Choice_1", "End_1"),
+            edge("Flow_Throw", "Script_1", "LinkThrow_1"),
+            edge("Flow_Resume", "LinkCatch_1", "Choice_1"),
+        ]);
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_Script")
+            .unwrap().condition = Some("vars.loop".into());
+        model
+    }
+
+    #[test]
+    fn immediate_link_cycle_parks_one_factual_lineage_and_rejects_forged_limit() {
+        let fixture = Fixture::new();
+        let model = single_link_cycle_model();
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start bounded Link cycle");
+        let valid = plan_start(&version.model, &version.model.process_id, "Start_1",
+            &instance_id, &fixture.owner, &version.definition_id, version.version,
+            variables.clone(), StartCause::Manual, at_ms, manual_input(&command), None)
+            .unwrap();
+        let parked = valid.create_tokens.iter().filter(|token| token.status == "waiting"
+            && !valid.consume_token_ids.contains(&token.token_id)).collect::<Vec<_>>();
+        assert_eq!(parked.len(), 1);
+        let limit = valid.events.iter().filter(|event| event.kind == "incident"
+            && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT").collect::<Vec<_>>();
+        assert_eq!(limit.len(), 1);
+        assert_eq!(valid.add_incidents.iter().filter(|incident|
+            incident.code == "IMMEDIATE_TRANSITION_LIMIT" && !incident.can_retry).count(), 1);
+        assert_eq!(limit[0].node_id.as_deref(), Some(parked[0].node_id.as_str()));
+        assert_eq!(limit[0].scope_id, parked[0].scope_id);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = valid.clone();
+        forged.create_tokens.iter_mut().find(|token|
+            token.token_id == parked[0].token_id).unwrap().status = "ready".into();
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let mut forged = valid.clone();
+        forged.add_incidents.iter_mut().find(|incident|
+            incident.code == "IMMEDIATE_TRANSITION_LIMIT").unwrap().message.push('!');
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let started = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
+        assert_eq!(started.instance_id, instance_id);
+        let events = all_history(&fixture.db, &fixture.owner, &instance_id);
+        assert_eq!(events.iter().filter(|event| event.kind == "incident"
+            && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT").count(), 1);
+    }
+
+    #[test]
+    fn later_script_failure_in_link_cycle_has_only_its_own_incident_source() {
+        let fixture = Fixture::new();
+        let mut model = single_link_cycle_model();
+        model.variables.insert("counter".into(), json!(0));
+        let script = model.nodes.iter_mut().find(|node| node.id == "Script_1").unwrap();
+        let ProcessNodeKind::ScriptTask { script, output_mapping } = &mut script.kind else {
+            unreachable!()
+        };
+        *script = "vars.counter < 3 ? null : 1 / 0".into();
+        output_mapping.insert("counter".into(), "vars.counter + 1".into());
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start Link cycle with later Script failure");
+        let valid = plan_start(&version.model, &version.model.process_id, "Start_1",
+            &instance_id, &fixture.owner, &version.definition_id, version.version,
+            variables.clone(), StartCause::Manual, at_ms, manual_input(&command), None).unwrap();
+        let completions = valid.events.iter().enumerate().filter(|(_, event)|
+            event.kind == "script_completed" && event.node_id.as_deref() == Some("Script_1"))
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        assert_eq!(completions.len(), 3);
+        let failures = valid.events.iter().enumerate().filter(|(_, event)|
+            event.kind == "incident" && event.data["code"] == "SCRIPT_EVALUATION_FAILED")
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(valid.add_incidents.iter().filter(|incident|
+            incident.code == "SCRIPT_EVALUATION_FAILED" && !incident.can_retry).count(), 1);
+        assert!(valid.add_incidents.iter().all(|incident|
+            incident.code != "IMMEDIATE_TRANSITION_LIMIT"));
+        let failed_source = valid.event_sources.get(&failures[0]).unwrap();
+        assert_eq!(valid.create_tokens.iter().filter(|token|
+            token.status == "waiting" && token.node_id == "Script_1"
+                && valid.token_sources.get(&token.token_id) == Some(failed_source)).count(), 1);
+        assert!(completions.iter().all(|index|
+            valid.event_sources.get(index) != Some(failed_source)));
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = valid.clone();
+        forged.event_sources.insert(failures[0],
+            valid.event_sources.get(&completions[0]).unwrap().clone());
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let started = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        assert_eq!(repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id)
+            .unwrap().instance, started);
+        assert_eq!(all_history(&reopened, &fixture.owner, &instance_id).iter().filter(|event|
+            event.kind == "incident" && event.data["code"] == "SCRIPT_EVALUATION_FAILED")
+            .count(), 1);
+    }
+
+    #[test]
+    fn parallel_link_cycles_park_each_lineage_and_preserve_both_after_reopen() {
+        let fixture = Fixture::new();
+        let mut model = super::super::model::starter_model();
+        model.variables.insert("loop".into(), Value::Bool(true));
+        model.sequence_flows[0].target_id = "Split".into();
+        model.nodes.extend([
+            ProcessNode {
+                activity_io: None, repeat: None, id: "Split".into(), name: "Fork".into(),
+                kind: ProcessNodeKind::ParallelGateway,
+            },
+            ProcessNode {
+                activity_io: None, repeat: None, id: "Join".into(), name: "Join".into(),
+                kind: ProcessNodeKind::ParallelGateway,
+            },
+        ]);
+        for branch in ["A", "B"] {
+            let choice = format!("Choice_{branch}");
+            let script = format!("Script_{branch}");
+            let throw = format!("LinkThrow_{branch}");
+            let catch = format!("LinkCatch_{branch}");
+            let throw_definition = format!("LinkDefinition_Throw_{branch}");
+            let catch_definition = format!("LinkDefinition_Catch_{branch}");
+            let loop_name = format!("repeat_{branch}");
+            let flow_script = format!("Flow_Script_{branch}");
+            let flow_exit = format!("Flow_Exit_{branch}");
+            model.nodes.extend([
+                ProcessNode {
+                    activity_io: None, repeat: None, id: choice.clone(), name: choice.clone(),
+                    kind: ProcessNodeKind::ExclusiveGateway {
+                        default_flow_id: Some(flow_exit.clone()),
+                    },
+                },
+                ProcessNode {
+                    activity_io: None, repeat: None, id: script.clone(), name: script.clone(),
+                    kind: ProcessNodeKind::ScriptTask {
+                        script: "null".into(), output_mapping: BTreeMap::new(),
+                    },
+                },
+                ProcessNode {
+                    activity_io: None, repeat: None, id: throw.clone(), name: throw.clone(),
+                    kind: ProcessNodeKind::LinkThrow {
+                        definition: ProcessLinkEventDefinition {
+                            id: throw_definition.clone(), name: loop_name.clone(),
+                            source_refs: Vec::new(), target_ref: Some(catch_definition.clone()),
+                        },
+                    },
+                },
+                ProcessNode {
+                    activity_io: None, repeat: None, id: catch.clone(), name: catch.clone(),
+                    kind: ProcessNodeKind::LinkCatch {
+                        definition: ProcessLinkEventDefinition {
+                            id: catch_definition, name: loop_name,
+                            source_refs: vec![throw_definition], target_ref: None,
+                        },
+                    },
+                },
+            ]);
+            model.sequence_flows.extend([
+                edge(&format!("Flow_Branch_{branch}"), "Split", &choice),
+                edge(&flow_script, &choice, &script),
+                edge(&flow_exit, &choice, "Join"),
+                edge(&format!("Flow_Throw_{branch}"), &script, &throw),
+                edge(&format!("Flow_Resume_{branch}"), &catch, &choice),
+            ]);
+            model.sequence_flows.iter_mut().find(|flow| flow.id == flow_script)
+                .unwrap().condition = Some("vars.loop".into());
+        }
+        model.sequence_flows.push(edge("Flow_Joined", "Join", "End_1"));
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start two bounded Link cycles");
+        let valid = plan_start(&version.model, &version.model.process_id, "Start_1",
+            &instance_id, &fixture.owner, &version.definition_id, version.version,
+            variables.clone(), StartCause::Manual, at_ms, manual_input(&command), None).unwrap();
+        let parked = valid.create_tokens.iter().filter(|token| token.status == "waiting"
+            && !valid.consume_token_ids.contains(&token.token_id)).collect::<Vec<_>>();
+        assert_eq!(parked.len(), 2);
+        assert_ne!(parked[0].token_id, parked[1].token_id);
+        assert_eq!(parked.iter().map(|token| token.fork_stack.last().unwrap().branch_edge_id.as_str())
+            .collect::<HashSet<_>>().len(), 2);
+        assert_eq!(valid.events.iter().filter(|event| event.kind == "incident"
+            && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT").count(), 2);
+        assert_eq!(valid.add_incidents.iter().filter(|incident|
+            incident.code == "IMMEDIATE_TRANSITION_LIMIT" && !incident.can_retry).count(), 2);
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = valid.clone();
+        forged.create_tokens.iter_mut().find(|token| token.token_id == parked[1].token_id)
+            .unwrap().status = "ready".into();
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let started = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let snapshot = repository::runtime_snapshot(&reopened, &fixture.owner, &instance_id).unwrap();
+        assert_eq!(snapshot.instance, started);
+        assert_eq!(snapshot.tokens.iter().filter(|token| token.status == "waiting"
+            && parked.iter().any(|limited| limited.token_id == token.token_id)).count(), 2);
+        let replay = repository::start_instance(&reopened, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
+        assert_eq!(replay, started);
+        assert_eq!(all_history(&reopened, &fixture.owner, &instance_id)
+            .iter().filter(|event| event.kind == "incident"
+                && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT").count(), 2);
+    }
+
+    #[test]
+    fn repeated_embedded_link_limit_retains_its_open_parent_and_active_ordinal() {
+        let fixture = Fixture::new();
+        let mut child = super::super::model::starter_model();
+        child.variables.insert("loop".into(), Value::Bool(true));
+        child.nodes.extend([
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "Choice_1".into(), name: "Continue?".into(),
+                kind: ProcessNodeKind::ExclusiveGateway {
+                    default_flow_id: Some("Flow_Exit".into()),
+                },
+            },
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "LinkThrow_1".into(), name: "Again".into(),
+                kind: ProcessNodeKind::LinkThrow {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Throw".into(), name: "repeat".into(),
+                        source_refs: Vec::new(), target_ref: Some("LinkDefinition_Catch".into()),
+                    },
+                },
+            },
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "LinkCatch_1".into(), name: "Resume".into(),
+                kind: ProcessNodeKind::LinkCatch {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Catch".into(), name: "repeat".into(),
+                        source_refs: vec!["LinkDefinition_Throw".into()], target_ref: None,
+                    },
+                },
+            },
+        ]);
+        child.sequence_flows[0].target_id = "Choice_1".into();
+        child.sequence_flows.extend([
+            edge("Flow_Throw", "Choice_1", "LinkThrow_1"),
+            edge("Flow_Exit", "Choice_1", "End_1"),
+            edge("Flow_Resume", "LinkCatch_1", "Choice_1"),
+        ]);
+        child.sequence_flows.iter_mut().find(|flow| flow.id == "Flow_Throw")
+            .unwrap().condition = Some("vars.loop".into());
+        let mut model = embedded_model(child, "RepeatedScope");
+        model.variables.insert("results".into(), json!([]));
+        model.nodes.iter_mut().find(|node| node.id == "RepeatedScope").unwrap().repeat =
+            Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Sequential,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "results".into(),
+            });
+        let version = publish_model(&fixture, &model);
+        let instance_id = Uuid::new_v4().to_string();
+        let variables = serde_json::to_value(&model.variables).unwrap();
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let command = stamp("start repeated embedded Link cycle");
+        let plan = plan_start(&version.model, &version.model.process_id,
+            "RootStart_RepeatedScope", &instance_id, &fixture.owner,
+            &version.definition_id, version.version, variables.clone(),
+            StartCause::Manual, at_ms, manual_input(&command), None).unwrap();
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = plan.clone();
+        forged.repetition_groups.iter_mut().find(|group| group.node_id == "RepeatedScope")
+            .unwrap().status = ProcessRepetitionGroupStatus::Completed;
+        assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let started = repository::start_instance(&fixture.db, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(snapshot.repetition_groups.len(), 1);
+        assert_eq!(snapshot.repetition_groups[0].status, ProcessRepetitionGroupStatus::Open);
+        assert_eq!(snapshot.repetition_groups[0].completed_count, 0);
+        assert_eq!(snapshot.repetition_occurrences.len(), 1);
+        assert_eq!(snapshot.repetition_occurrences[0].ordinal, 0);
+        assert_eq!(snapshot.repetition_occurrences[0].status,
+            ProcessRepetitionOccurrenceStatus::Active);
+        assert_eq!(snapshot.instance.variables["results"], json!([]));
+        let events = all_history(&fixture.db, &fixture.owner, &started.instance_id);
+        let limited = events.iter().filter(|event|
+            event.kind == "incident" && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT")
+            .collect::<Vec<_>>();
+        assert_eq!(limited.len(), 1);
+        let incident = snapshot.instance.incidents.iter().filter(|incident|
+            incident.code == "IMMEDIATE_TRANSITION_LIMIT" && !incident.can_retry)
+            .collect::<Vec<_>>();
+        assert_eq!(incident.len(), 1);
+        assert_eq!(incident[0].scope_id, limited[0].scope_id);
+        assert_eq!(incident[0].node_id, limited[0].node_id);
+        assert!(snapshot.tokens.iter().any(|token| token.status == "waiting"
+            && token.scope_id != started.instance_id
+            && limited[0].scope_id == token.scope_id
+            && limited[0].node_id.as_deref() == Some(token.node_id.as_str())));
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let persisted = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(serde_json::to_value(&persisted.repetition_groups).unwrap(),
+            serde_json::to_value(&snapshot.repetition_groups).unwrap());
+        assert_eq!(serde_json::to_value(&persisted.repetition_occurrences).unwrap(),
+            serde_json::to_value(&snapshot.repetition_occurrences).unwrap());
+        assert_eq!(persisted.instance.variables, snapshot.instance.variables);
+        let replay = repository::start_instance(&reopened, &fixture.owner, &command,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        assert_eq!(replay, started);
+        assert_eq!(all_history(&reopened, &fixture.owner,
+            &started.instance_id).iter().filter(|event|
+                event.kind == "repetition_completed" || event.kind == "repetition_group_blocked")
+            .count(), 0);
+    }
+
+    #[test]
+    fn link_transfer_after_durable_user_wait_reopens_and_replays_exact_facts() {
+        let fixture = Fixture::new();
+        let mut model = user_model(None);
+        model.nodes.extend([
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "LinkThrow_1".into(), name: "Continue".into(),
+                kind: ProcessNodeKind::LinkThrow {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Throw".into(), name: "handoff".into(),
+                        source_refs: Vec::new(), target_ref: Some("LinkDefinition_Catch".into()),
+                    },
+                },
+            },
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "LinkCatch_1".into(), name: "Resume".into(),
+                kind: ProcessNodeKind::LinkCatch {
+                    definition: ProcessLinkEventDefinition {
+                        id: "LinkDefinition_Catch".into(), name: "handoff".into(),
+                        source_refs: vec!["LinkDefinition_Throw".into()], target_ref: None,
+                    },
+                },
+            },
+            ProcessNode {
+                activity_io: None, repeat: None,
+                id: "WorkAfterLink".into(), name: "Review after handoff".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None, output_mapping: BTreeMap::new(),
+                },
+            },
+        ]);
+        model.sequence_flows.iter_mut().find(|flow| flow.id == "ToEnd")
+            .unwrap().target_id = "LinkThrow_1".into();
+        model.sequence_flows.extend([
+            edge("Flow_Resume", "LinkCatch_1", "WorkAfterLink"),
+            edge("Flow_AfterLink", "WorkAfterLink", "End_1"),
+        ]);
+        let waiting = start_model(&fixture, &model);
+        assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
+        let task_id = waiting.user_tasks[0].user_task_id.clone();
+        let path = fixture.directory.path().join("processes.db");
+        let reopened = crate::db::init(&path).unwrap();
+        let snapshot = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &waiting.instance_id).unwrap();
+        let command = stamp("complete before Link handoff");
+        let at_ms = chrono::Utc::now().timestamp_millis();
+        let output = json!({"answer":"reviewed"});
+        let plan = plan_user_completion(&snapshot, &task_id, &output, None, at_ms,
+            human_input(&snapshot, &task_id, &command), None).unwrap();
+        let throw_index = plan.events.iter().position(|event| event.kind == "link_thrown").unwrap();
+        let caught = &plan.events[throw_index + 1];
+        assert_eq!(caught.kind, "link_caught");
+        assert_eq!(caught.data["throw_event_id"], json!(plan.event_ids[&throw_index]));
+        assert_eq!(caught.data["outgoing_edge_id"], "Flow_Resume");
+        let before = super::super::call_tests::transition_rows(&fixture);
+        let mut forged = plan.clone();
+        forged.events[throw_index + 1].data["throw_event_id"] =
+            json!(Uuid::new_v4().to_string());
+        assert!(repository::complete_user_task(&reopened, &fixture.owner, &command,
+            &waiting.instance_id, &task_id, waiting.revision, &output, None,
+            repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
+        let continued = repository::complete_user_task(&reopened, &fixture.owner, &command,
+            &waiting.instance_id, &task_id, waiting.revision, &output, None,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
+        assert_eq!(continued.status, ProcessInstanceStatus::Waiting);
+        let downstream = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &waiting.instance_id).unwrap();
+        let downstream_task = downstream.user_tasks.iter().find(|task|
+            task.node_id == "WorkAfterLink" && task.status == ProcessUserTaskStatus::Open)
+            .unwrap();
+        let events = repository::list_events(&reopened, &fixture.owner,
+            &waiting.instance_id, 0, 200).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "link_thrown").count(), 1);
+        assert_eq!(events.iter().filter(|event| event.kind == "link_caught").count(), 1);
+        let replay = repository::complete_user_task(&reopened, &fixture.owner, &command,
+            &waiting.instance_id, &task_id, waiting.revision, &output, None,
+            repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap().instance;
+        assert_eq!(replay, continued);
+        assert_eq!(repository::list_events(&reopened, &fixture.owner,
+            &waiting.instance_id, 0, 200).unwrap().0, events);
+        let final_command = stamp("complete factual post-Link wait");
+        let final_at_ms = at_ms + 1;
+        let final_plan = plan_user_completion(&downstream, &downstream_task.user_task_id,
+            &Value::Null, None, final_at_ms,
+            human_input(&downstream, &downstream_task.user_task_id, &final_command), None)
+            .unwrap();
+        let completed = repository::complete_user_task(&reopened, &fixture.owner,
+            &final_command, &waiting.instance_id, &downstream_task.user_task_id,
+            downstream.instance.revision, &Value::Null, None,
+            repository::ProcessPlanInput::Supplied(&final_plan), final_at_ms).unwrap().instance;
+        assert_eq!(completed.status, ProcessInstanceStatus::Completed);
+        let final_events = repository::list_events(&reopened, &fixture.owner,
+            &waiting.instance_id, 0, 200).unwrap().0;
+        let final_replay = repository::complete_user_task(&reopened, &fixture.owner,
+            &final_command, &waiting.instance_id, &downstream_task.user_task_id,
+            downstream.instance.revision, &Value::Null, None,
+            repository::ProcessPlanInput::Supplied(&final_plan), final_at_ms).unwrap().instance;
+        assert_eq!(final_replay, completed);
+        assert_eq!(repository::list_events(&reopened, &fixture.owner,
+            &waiting.instance_id, 0, 200).unwrap().0, final_events);
+    }
 
     #[test]
     fn root_terminate_commits_one_source_and_rejects_unclosed_same_plan_token_atomically() {
@@ -5448,7 +9758,7 @@ mod tests {
         let variables = serde_json::to_value(&model.variables).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
         let command = stamp("terminate root");
-        let valid = plan_start(&version.model, &instance_id, &fixture.owner,
+        let valid = plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
             &version.definition_id, version.version, variables.clone(), StartCause::Manual,
             at_ms, manual_input(&command), None).unwrap();
         let source = valid.termination_attempts.iter().find_map(|attempt| match attempt {
@@ -5467,11 +9777,11 @@ mod tests {
         extra.token_id = Uuid::new_v4().to_string();
         forged.create_tokens.push(extra);
         assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
             repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
         let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
             repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         let events = repository::list_events(&fixture.db, &fixture.owner, &instance_id, 0, 32).unwrap().0;
@@ -5548,23 +9858,24 @@ mod tests {
                         nodes: vec![
                             ProcessNode { id: "ChildStart".into(), name: "Child start".into(),
                                 kind: ProcessNodeKind::Start,
-                                repeat: None, },
+                                repeat: None,   activity_io: None,},
                             ProcessNode { id: "ChildTerminate".into(), name: "Child termination".into(),
                                 kind: ProcessNodeKind::TerminateEnd,
-                                repeat: None, },
+                                repeat: None,   activity_io: None,},
                         ],
                         sequence_flows: vec![edge("ChildFlow", "ChildStart", "ChildTerminate")],
                         variables: BTreeMap::from([("child_value".into(), json!(41))]),
                         diagram: ProcessDiagram::default(),
+                        modeling: None,
                     },
                     input_mapping: BTreeMap::new(),
                     output_mapping: BTreeMap::from([("received".into(),
                         "outputs.child_value".into())]),
-                },
-                repeat: None, },
+},
+                repeat: None, activity_io: None, },
             ProcessNode { id: "RootTerminate".into(), name: "Root termination".into(),
                 kind: ProcessNodeKind::TerminateEnd,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![edge("RootChild", "Start_1", "Scope"),
             edge("ChildRootTerminate", "Scope", "RootTerminate")];
@@ -5573,7 +9884,7 @@ mod tests {
         let variables = serde_json::to_value(&model.variables).unwrap();
         let command = stamp("start child then root TerminateEnd with ordered variables");
         let at_ms = chrono::Utc::now().timestamp_millis();
-        let valid = plan_start(&version.model, &instance_id, &fixture.owner,
+        let valid = plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
             &version.definition_id, version.version, variables.clone(), StartCause::Manual,
             at_ms, manual_input(&command), None).unwrap();
         assert_eq!(valid.termination_attempts.len(), 2);
@@ -5616,13 +9927,13 @@ mod tests {
             ("different parent activation", wrong_activation),
             ("changed mapped result", changed_result)] {
             assert!(repository::start_instance(&fixture.db, &fixture.owner, &command,
-                &instance_id, &version.definition_id, version.version, &variables,
+                &instance_id, &version.definition_id, version.version, &variables, None, None,
                 repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err(), "{case} must fail closed");
             assert_eq!(super::super::call_tests::transition_rows(&fixture), before,
                 "{case} changed durable process rows");
         }
         let completed = repository::start_instance(&fixture.db, &fixture.owner, &command,
-            &instance_id, &version.definition_id, version.version, &variables,
+            &instance_id, &version.definition_id, version.version, &variables, None, None,
             repository::ProcessPlanInput::Supplied(&valid), at_ms).unwrap();
         assert_eq!(completed.status, ProcessInstanceStatus::Completed);
         assert_eq!(completed.variables["received"], 41);
@@ -5742,6 +10053,7 @@ mod tests {
                     name: "Parallel".into(),
                     kind: ProcessNodeKind::ParallelGateway,
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "Left".into(),
@@ -5751,6 +10063,7 @@ mod tests {
                         output_mapping: BTreeMap::new(),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "Right".into(),
@@ -5760,12 +10073,14 @@ mod tests {
                         output_mapping: BTreeMap::new(),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "Join".into(),
                     name: "All reviews".into(),
                     kind: ProcessNodeKind::ParallelGateway,
                     repeat: None,
+                    activity_io: None,
                 },
             ],
         );
@@ -5905,28 +10220,28 @@ mod tests {
             model.nodes.splice(1..1, [
                 ProcessNode { id: "Split".into(), name: "Run selected branches".into(),
                     kind: gateway(),
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "LeftWork".into(), name: "First join arrival".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
                         output_mapping: BTreeMap::new() },
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "RightWork".into(), name: "Outstanding join branch".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
                         output_mapping: BTreeMap::new() },
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "TerminateWork".into(), name: "Factual terminating input".into(),
                     kind: ProcessNodeKind::UserTask {
                         assignee_user_id: Some(fixture.owner.user_id.clone()),
                         output_mapping: BTreeMap::new() },
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "Join".into(), name: "Join normal branches".into(),
                     kind: gateway(),
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
                 ProcessNode { id: "Terminate".into(), name: "Stop this instance".into(),
                     kind: ProcessNodeKind::TerminateEnd,
-                    repeat: None, },
+                    repeat: None,   activity_io: None,},
             ]);
             model.sequence_flows = vec![
                 edge("StartSplit", "Start_1", "Split"),
@@ -6078,6 +10393,7 @@ mod tests {
                         default_flow_id: default.map(str::to_owned),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
             );
             model.nodes.push(ProcessNode {
@@ -6085,6 +10401,7 @@ mod tests {
                 name: "Alternative".into(),
                 kind: ProcessNodeKind::End,
                 repeat: None,
+                activity_io: None,
             });
             model.sequence_flows = vec![
                 edge("ToChoice", "Start_1", "Choice"),
@@ -6126,19 +10443,19 @@ mod tests {
         model.nodes.splice(1..1, [
             ProcessNode { id: "Split".into(), name: "Choose reviews".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: default.map(str::to_owned) },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "A".into(), name: "Review A".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "B".into(), name: "Review B".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "C".into(), name: "Review C".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "Join".into(), name: "Selected reviews".into(),
                 kind: ProcessNodeKind::InclusiveGateway { default_flow_id: None },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"), edge("To_A", "Split", "A"),
@@ -6235,23 +10552,23 @@ mod tests {
             model.nodes.insert(1, ProcessNode { id: "OuterSplit".into(), name: "Choose".into(),
                 kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
-                repeat: None, });
+                repeat: None,   activity_io: None,});
             model.nodes.insert(2, ProcessNode { id: "InnerSplit".into(), name: "Nested choice".into(),
                 kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
-                repeat: None, });
+                repeat: None,   activity_io: None,});
             model.nodes.insert(3, ProcessNode { id: "InnerJoin".into(), name: "Nested done".into(),
                 kind: if inner_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
-                repeat: None, });
+                repeat: None,   activity_io: None,});
             model.nodes.insert(4, ProcessNode { id: "OuterJoin".into(), name: "Selected done".into(),
                 kind: if outer_inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
-                repeat: None, });
+                repeat: None,   activity_io: None,});
             for id in ["A", "B", "C"] {
                 model.nodes.push(ProcessNode { id: id.into(), name: id.into(),
                     kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                    repeat: None, });
+                    repeat: None,   activity_io: None,});
             }
             model.sequence_flows = vec![
                 edge("StartOuter", "Start_1", "OuterSplit"),
@@ -6309,16 +10626,16 @@ mod tests {
         let mut model = super::super::model::starter_model();
         model.nodes.insert(1, ProcessNode { id: "Split".into(), name: "Parallel".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, });
+            repeat: None,   activity_io: None,});
         model.nodes.insert(2, ProcessNode { id: "Join".into(), name: "All branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
-            repeat: None, });
+            repeat: None,   activity_io: None,});
         model.sequence_flows = vec![edge("StartSplit", "Start_1", "Split")];
         for index in 0..9 {
             let node_id = format!("Branch_{index}");
             model.nodes.push(ProcessNode { id: node_id.clone(), name: node_id.clone(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None, output_mapping: BTreeMap::new() },
-                repeat: None, });
+                repeat: None,   activity_io: None,});
             model.sequence_flows.push(edge(&format!("To_{index}"), "Split", &node_id));
             model.sequence_flows.push(edge(&format!("From_{index}"), &node_id, "Join"));
         }
@@ -6850,8 +11167,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            assert_eq!(old.job.job_id, new.job.job_id);
-            assert!(new.job.attempt > old.job.attempt && new.job.fence > old.job.fence);
+            assert_ne!(old.job.job_id, new.job.job_id);
+            assert_ne!(old.job.token_id, new.job.token_id);
+            assert_ne!(old.invocation_id, new.invocation_id);
+            assert_eq!(new.job.attempt, 1);
+            assert!(new.job.fence > 0);
             let runtime = registry_runtime(&fixture, "new-worker");
             let cancel = CancellationToken::new();
             register_claim(&runtime, &new, &cancel);
@@ -7324,6 +11644,7 @@ mod tests {
                         name: "Start local parallel work".into(),
                         kind: ProcessNodeKind::ParallelGateway,
                         repeat: None,
+                        activity_io: None,
                     },
                     ProcessNode {
                         id: "ChildA".into(),
@@ -7333,6 +11654,7 @@ mod tests {
                             output_mapping: BTreeMap::new(),
                         },
                         repeat: None,
+                        activity_io: None,
                     },
                     ProcessNode {
                         id: "ChildB".into(),
@@ -7342,12 +11664,14 @@ mod tests {
                             output_mapping: BTreeMap::new(),
                         },
                         repeat: None,
+                        activity_io: None,
                     },
                     ProcessNode {
                         id: "ChildJoin".into(),
                         name: "Finish local parallel work".into(),
                         kind: ProcessNodeKind::ParallelGateway,
                         repeat: None,
+                        activity_io: None,
                     },
                 ],
             );
@@ -7366,6 +11690,7 @@ mod tests {
                     name: "Start parent parallel work".into(),
                     kind: ProcessNodeKind::ParallelGateway,
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "Peer".into(),
@@ -7375,12 +11700,14 @@ mod tests {
                         output_mapping: BTreeMap::new(),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
                 ProcessNode {
                     id: "ParentJoin".into(),
                     name: "Finish parent parallel work".into(),
                     kind: ProcessNodeKind::ParallelGateway,
                     repeat: None,
+                    activity_io: None,
                 },
             ]);
             model.sequence_flows = vec![
@@ -7744,7 +12071,7 @@ mod tests {
     #[tokio::test]
     async fn subprocess_nearest_contract_error_preserves_result_and_cancels_only_committed_child_generation(
     ) {
-        use super::super::repository::{ActivityResultOrigin, ObservedActivityResult};
+        use super::super::repository::ActivityResultOrigin;
         use tentaflow_protocol::processes::{ProcessErrorDeclaration, ProcessSubscriptionStatus};
         let fixture = Fixture::new();
         let business = json!({"outcome":"Error","code":"REJECTED","summary":"A real pinned business rejection","outputs":{"customer_ID":42},"evidence":["actual scoped execution"]});
@@ -7790,6 +12117,7 @@ mod tests {
                 name: "Start child branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
             other,
             ProcessNode {
@@ -7797,6 +12125,7 @@ mod tests {
                 name: "Finish child branches".into(),
                 kind: ProcessNodeKind::ParallelGateway,
                 repeat: None,
+                activity_io: None,
             },
         ]);
         child.sequence_flows = vec![
@@ -7826,6 +12155,7 @@ mod tests {
                     ]),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "NearWork".into(),
@@ -7835,6 +12165,7 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
         ]);
         inner.sequence_flows.extend([
@@ -7852,6 +12183,7 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "FarWork".into(),
@@ -7861,6 +12193,7 @@ mod tests {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
         ]);
         model.sequence_flows.extend([
@@ -7899,14 +12232,19 @@ mod tests {
         let snapshot =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                 .unwrap();
-        let observed = ObservedActivityResult {
-            result: serde_json::from_value(business.clone()).unwrap(),
-            origin: ActivityResultOrigin::Contract,
-            expression_observation: None,
-        };
+        let observed = super::super::repetition_service_tests::observed_flow_result(
+            &fixture, &source).await;
+        assert_eq!(observed.result, serde_json::from_value(business.clone()).unwrap());
+        assert_eq!(observed.origin, ActivityResultOrigin::Contract);
+        let observed_snapshot = repository::runtime_snapshot(
+            &fixture.db, &fixture.owner, &started.instance_id,
+        ).unwrap();
+        let observed_job = observed_snapshot.jobs.iter()
+            .find(|job| job.job_id == source.job.job_id).unwrap();
+        assert!(observed_job.observed_result_event_id.is_some());
         let canonical = plan_job_result(
-            &snapshot,
-            &source.job,
+            &observed_snapshot,
+            observed_job,
             &observed,
             chrono::Utc::now().timestamp_millis(),
         None)
@@ -7949,15 +12287,13 @@ mod tests {
                 &started.instance_id, 0, 200).unwrap().0, events_before);
         }
         assert!(!sibling_cancel.is_cancelled());
-        super::super::jobs::execute_claimed(
-            &fixture.db,
-            fixture.dispatcher(),
-            "scoped-error-worker",
-            source.clone(),
-            source_cancel.clone(),
-        )
-        .await
-        .unwrap();
+        let committed = repository::accept_job_result(
+            &fixture.db, &fixture.owner, &source.job.job_id, source.job.attempt,
+            source.job.fence, "scoped-error-worker", &observed,
+            snapshot.instance.revision, repository::ProcessPlanInput::Supplied(&canonical),
+            chrono::Utc::now().timestamp_millis(),
+        ).unwrap();
+        runtime.signal_cancelled_claims(&committed.cancelled_claims);
         let actual =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                 .unwrap();

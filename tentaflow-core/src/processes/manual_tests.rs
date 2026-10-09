@@ -14,7 +14,7 @@ pub(super) fn manual_model(assignee_user_id: Option<String>, terminate: bool) ->
     model.nodes.insert(1, ProcessNode { id: "Manual".into(), name: "Inspect the physical item".into(),
         kind: ProcessNodeKind::ManualTask { assignee_user_id,
             instructions: "Inspect the physical item and acknowledge that the work is done.".into() },
-        repeat: None });
+        repeat: None, activity_io: None,});
     if terminate { model.nodes[2].kind = ProcessNodeKind::TerminateEnd; }
     model.sequence_flows = vec![edge("ToManual", "Start_1", "Manual"),
         edge("FromManual", "Manual", "End_1")];
@@ -28,13 +28,13 @@ pub(super) fn start_manual(fixture: &Fixture, model: &ProcessModel,
     let command = stamp("manual-start");
     let vars = serde_json::to_value(&model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
-    let plan = runtime::plan_start(&version.model, &instance_id, &fixture.owner,
+    let plan = runtime::plan_start(&version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model), &instance_id, &fixture.owner,
         &version.definition_id, version.version, vars.clone(), runtime::StartCause::Manual,
         at_ms, manual_input(&command), None).unwrap();
     assert_eq!(plan.events.iter().filter(|event| event.kind == "manual_task_opened").count(), 1);
     assert!(!plan.events.iter().any(|event| event.kind == "user_task_opened"));
     repository::start_instance(&fixture.db, &fixture.owner, &command, &instance_id,
-        &version.definition_id, version.version, &vars, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+        &version.definition_id, version.version, &vars, None, None, repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
     (instance_id, version, command)
 }
 
@@ -139,7 +139,7 @@ fn manual_acknowledgment_advances_to_script_and_preserves_both_factual_actions()
     model.nodes.insert(2, ProcessNode { id: "Compute".into(), name: "Compute".into(),
         kind: ProcessNodeKind::ScriptTask { script: "41 + 1".into(),
             output_mapping: BTreeMap::from([("answer".into(), "outputs".into())]) },
-        repeat: None });
+        repeat: None, activity_io: None,});
     model.sequence_flows = vec![edge("ToManual", "Start_1", "Manual"),
         edge("ToCompute", "Manual", "Compute"), edge("ToEnd", "Compute", "End_1")];
     let (instance_id, _, _) = start_manual(&fixture, &model);
@@ -174,9 +174,9 @@ fn terminating_sibling_preempts_manual_entry_without_fabricating_acknowledgment(
     let fixture = Fixture::new();
     let mut model = manual_model(None, true);
     model.nodes.insert(1, ProcessNode { id: "Split".into(), name: "Fork".into(),
-        kind: ProcessNodeKind::ParallelGateway, repeat: None });
+        kind: ProcessNodeKind::ParallelGateway, repeat: None, activity_io: None,});
     model.nodes.push(ProcessNode { id: "Stop".into(), name: "Stop".into(),
-        kind: ProcessNodeKind::TerminateEnd, repeat: None });
+        kind: ProcessNodeKind::TerminateEnd, repeat: None, activity_io: None,});
     model.sequence_flows = vec![edge("ToSplit", "Start_1", "Split"),
         edge("A_Stop", "Split", "Stop"), edge("Z_Manual", "Split", "Manual"),
         edge("FromManual", "Manual", "End_1")];
@@ -198,7 +198,7 @@ fn embedded_manual_acknowledgment_returns_only_after_the_real_child_wait() {
     let mut model = embedded_model(manual_model(None, false), "Scope");
     model.nodes.insert(2, ProcessNode { id: "ParentScript".into(), name: "Continue after child".into(),
         kind: ProcessNodeKind::ScriptTask { script: "41 + 1".into(),
-            output_mapping: BTreeMap::new() }, repeat: None });
+            output_mapping: BTreeMap::new() }, repeat: None, activity_io: None,});
     model.sequence_flows = vec![edge("Enter_Scope", "RootStart_Scope", "Scope"),
         edge("ScopeToScript", "Scope", "ParentScript"),
         edge("ScriptToEnd", "ParentScript", "RootEnd_Scope")];
@@ -310,9 +310,9 @@ pub(super) fn manual_boundary_model(message: bool, interrupt: bool) -> ProcessMo
         })
     };
     model.nodes.push(ProcessNode { id: id.into(), name: "Manual boundary".into(),
-        kind, repeat: None });
+        kind, repeat: None, activity_io: None,});
     model.nodes.push(ProcessNode { id: "BoundaryEnd".into(), name: "Boundary end".into(),
-        kind: ProcessNodeKind::End, repeat: None });
+        kind: ProcessNodeKind::End, repeat: None, activity_io: None,});
     model.sequence_flows.push(edge("BoundaryFlow", id, "BoundaryEnd"));
     model
 }

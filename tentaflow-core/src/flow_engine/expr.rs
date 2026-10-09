@@ -354,6 +354,16 @@ pub fn validate_syntax(expr: &str, timeout: Option<Duration>) -> Result<(), Expr
     compile_checked(expr, timeout).map(|_| ())
 }
 
+/// Reports whether a parsed expression references a top-level CEL variable.
+///
+/// Configuration validation must inspect the parsed program rather than the
+/// source text: a name can occur inside a string literal, a field selector,
+/// or an escaped identifier without being a binding. The same cached compile
+/// path used by evaluation keeps this check aligned with runtime semantics.
+pub fn references_variable(expr: &str, variable: &str) -> Result<bool, ExprError> {
+    Ok(compile_checked(expr, None)?.references().has_variable(variable))
+}
+
 fn evaluate_cel(
     expr: &str,
     scope: &ExprScope,

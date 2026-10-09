@@ -6,6 +6,7 @@
 //       adapters` do czasu executor rewrite w stage 1c.
 // =============================================================================
 
+pub mod activity_result;
 pub mod addon;
 pub mod agent_block;
 pub mod agent_context;
@@ -83,6 +84,7 @@ pub mod vision_parse;
 pub mod vision_parse_pages;
 pub mod workspace_context;
 
+pub use activity_result::ActivityResultNodeAdapter;
 pub use addon::AddonNodeAdapter;
 pub use agent_block::{flow_for, AgentNodeAdapter, AGENT_RUN_FLOW_ID, CLI_AGENT_RUN_FLOW_ID};
 pub use agent_context::AgentContextNodeAdapter;

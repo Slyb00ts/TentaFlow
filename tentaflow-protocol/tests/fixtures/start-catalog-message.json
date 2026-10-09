@@ -1,0 +1,1 @@
+{"process_id":"Approval_1","process_name":null,"start_node_id":"Start_Message","start_node_name":"Receive request","version":7,"trigger":{"MessageStart":{"message_ref":"Message_1","message_name":"approval.requested","can_send":true}}}

@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -19,6 +19,12 @@ const NODE_H_APPROX = 110;
 // ~8 px, poniżej z bloku zostają same wartości.
 const READABLE_MIN_ZOOM = 0.75;
 const GRID = 10;
+
+function snapGridCoordinate(value) {
+  const snapped = Math.round(value / GRID) * GRID;
+  return Object.is(snapped, -0) ? 0 : snapped;
+}
+
 const MAX_HISTORY = 30;
 // Layout portów: header ma ~44px, porty zaczynają się od HEADER_OFFSET i są
 // rozłożone co PORT_STEP pikseli.
@@ -43,7 +49,7 @@ const TYPE_CATEGORY = {
   condition: 'logic', switch: 'logic',
   template: 'transform', transform: 'transform', router: 'transform',
   pii_filter: 'filter', tts_clean: 'filter',
-  output: 'output', end: 'output',
+  output: 'output', end: 'output', activity_result: 'output',
   persist_turn: 'memory',
   spawn: 'agent', await_subagents: 'agent', subagent_status: 'agent', interval: 'agent',
   workspace_context: 'code', exec_command: 'code', delegate_cli: 'code',
@@ -99,8 +105,8 @@ function markUnsupported(node, ports, side) {
 
 function portsForNode(node, template) {
   if (node.type.startsWith('bpmn_')) {
-    return { inputs: (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(node.type) || processBoundaryKind(node.type)) ? [] : [{ name: 'in', type: 'any' }],
-      outputs: ['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(node.type) ? [] : [{ name: 'full', type: 'any' }] };
+    return { inputs: (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start', 'bpmn_link_catch'].includes(node.type) || processBoundaryKind(node.type)) ? [] : [{ name: 'in', type: 'any' }],
+      outputs: ['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_link_throw'].includes(node.type) ? [] : [{ name: 'full', type: 'any' }] };
   }
   // `start` has no seeded `flow_node_templates` row (legacy in-memory type),
   // so it needs the literal fallback; every other entry-style node — trigger,
@@ -110,7 +116,7 @@ function portsForNode(node, template) {
   // off that category instead of an ever-growing type-name list is what lets a
   // node with zero real inputs suppress the synthesized phantom `in` port below.
   const isTrigger = node.type === 'trigger' || node.type === 'start' || template?.category === 'trigger';
-  const isOutput = node.type === 'output' || node.type === 'end';
+  const isOutput = node.type === 'output' || node.type === 'end' || node.type === 'activity_result';
 
   const readList = (raw, types) => {
     if (!raw) return null;
@@ -191,11 +197,13 @@ export class FlowCanvas {
     this.opts = opts;
     this.mode = opts.mode || 'flow';
     this.processPath = [];
+    this.selectedProcessId = null;
     this.nodes = [];
     this.edges = [];
     this.selectedIds = new Set();
     this.selectedEdgeId = null;
     this.view = { x: 0, y: 0, zoom: 1 };
+    this._pendingFitMinZoom = null;
     this.history = [];
     this.historyIndex = -1;
     this.onChange = opts.onChange || (() => {});
@@ -209,6 +217,8 @@ export class FlowCanvas {
     // nie identyfikuje bloku, więc node musi zapamiętać etykietę presetu.
     this.presetTypes = new Set();
     this._zTop = 1;
+    const edgeMarkerPrefix = `fb-edge-${crypto.randomUUID().replaceAll('-', '')}`;
+    this._edgeMarkerId = `${edgeMarkerPrefix}-normal`;
 
     this._rafPending = false;
     this._draggingNode = null;     // { ids, startClientX, startClientY, origs, moved, pointerId }
@@ -220,6 +230,10 @@ export class FlowCanvas {
 
     this._buildDom();
     this._bindEvents();
+    this._resizeObserver = new ResizeObserver(() => {
+      if (this._pendingFitMinZoom !== null) this.fitToContent(this._pendingFitMinZoom);
+    });
+    this._resizeObserver.observe(this.root);
   }
 
   setTemplates(list) {
@@ -273,6 +287,7 @@ export class FlowCanvas {
   }
 
   destroy() {
+    this._resizeObserver.disconnect();
     if (this._h) {
       this.root.removeEventListener('pointerdown', this._h.pd);
       window.removeEventListener('pointermove', this._h.pm);
@@ -337,8 +352,9 @@ export class FlowCanvas {
   setData(nodes, edges, { reset = true } = {}) {
     if (this.mode === 'bpmn') {
       this.processPath = [];
+      this.selectedProcessId = nodes.processId;
       this.processModel = structuredClone(nodes);
-      const data = processToCanvas(nodes, this.processPath);
+      const data = processToCanvas(nodes, this.processPath, this.selectedProcessId);
       nodes = data.nodes;
       edges = data.edges;
     }
@@ -383,7 +399,7 @@ export class FlowCanvas {
   getData() {
     if (this.mode === 'bpmn') {
       this.processModel = canvasToProcess(this.processModel, this.nodes, this.edges,
-        (edge) => this._processEdgePoints(edge), this.processPath);
+        (edge) => this._processEdgePoints(edge), this.processPath, this.selectedProcessId);
       return structuredClone(this.processModel);
     }
     this._normalizeEdgePorts();
@@ -427,12 +443,13 @@ export class FlowCanvas {
     };
   }
 
-  navigateProcessBody(path) {
+  navigateProcessBody(path, processId = this.selectedProcessId) {
     if (this.mode !== 'bpmn') return;
     const complete = this.getData();
-    processBody(complete, path);
+    processBody(complete, path, processId);
+    this.selectedProcessId = processId;
     this.processPath = [...path];
-    const graph = processToCanvas(complete, path);
+    const graph = processToCanvas(complete, path, processId);
     this.nodes = graph.nodes;
     this.edges = graph.edges;
     this._normalizeNodeLabels();
@@ -444,13 +461,49 @@ export class FlowCanvas {
     this.fitToContent(READABLE_MIN_ZOOM);
   }
 
+  addProcessBody() {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    const model = this.getData();
+    if ((model.additionalProcesses?.length || 0) >= 15) return;
+    const suffix = crypto.randomUUID().replaceAll('-', '_');
+    const processId = `Process_${suffix}`;
+    const start = `Start_${suffix}`, end = `End_${suffix}`;
+    model.additionalProcesses ||= [];
+    model.additionalProcesses.push({
+      processId, nodes: [{ id: start, name: '', kind: 'Start' },
+        { id: end, name: '', kind: 'End' }],
+      sequenceFlows: [{ id: `Flow_${suffix}`, sourceId: start,
+        targetId: end, condition: null }],
+      variables: {}, diagram: { shapes: [
+        { elementId: start, x: 80, y: 160, width: 56, height: 56 },
+        { elementId: end, x: 400, y: 160, width: 56, height: 56 },
+      ], edges: [{ sequenceFlowId: `Flow_${suffix}`,
+        waypoints: [{ x: 136, y: 188 }, { x: 400, y: 188 }] }] },
+    });
+    this.processModel = model;
+    this.navigateProcessBody([], processId);
+    this._pushHistory();
+    this.onChange();
+  }
+
+  updateSelectedProcessName(name) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    this.getData();
+    const body = processBody(this.processModel, [], this.selectedProcessId);
+    if (body.processName === name) return;
+    body.processName = name;
+    this._pushHistory();
+    this.onChange();
+  }
+
   // Waliduje klient-side przed zapisem: kazdy edge musi wskazywac istniejace
   // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
   // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
   validate() {
     if (this.mode === 'bpmn') {
       const errors = [];
-      if (this.processModel.workCalendar && !this.processModel.timerTimezone?.trim()) {
+      const selectedBody = processBody(this.processModel, [], this.selectedProcessId);
+      if (selectedBody.workCalendar && !selectedBody.timerTimezone?.trim()) {
         errors.push(I18n.t('bpmn.timer_timezone_required'));
       }
       for (const node of this.nodes) {
@@ -462,7 +515,7 @@ export class FlowCanvas {
         if (processBoundaryKind(node.type)) {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
           if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
-            || (['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type) && !parent.repeat))) {
+            || ['bpmn_script_task', 'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type))) {
             errors.push(I18n.t('bpmn.boundary_required'));
           }
           if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
@@ -472,7 +525,7 @@ export class FlowCanvas {
         const fields = kind === 'Daily'
           ? [['hour', 'timer_hour', 0, 23], ['minute', 'timer_minute', 0, 59]]
           : ['Duration', 'Cycle', 'WorkingDuration'].includes(kind) ? [['seconds', kind === 'WorkingDuration' ? 'timer_working_seconds' : 'timer_seconds', kind === 'Cycle' ? 300 : 1, 31536000]] : [];
-        if (kind === 'WorkingDuration' && !this.processModel.workCalendar) {
+        if (kind === 'WorkingDuration' && !selectedBody.workCalendar) {
           errors.push(I18n.t('bpmn.calendar_required'));
         }
         if (['Cycle', 'Daily'].includes(kind) && timer.totalFirings != null) fields.push(['totalFirings', 'timer_total', 1, 4294967295]);
@@ -485,7 +538,7 @@ export class FlowCanvas {
       for (const node of this.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_message')) {
         const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
         if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
-          || (['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type) && !parent.repeat))) {
+          || ['bpmn_script_task', 'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type))) {
           errors.push(I18n.t('bpmn.boundary_required'));
         }
       }
@@ -669,7 +722,8 @@ export class FlowCanvas {
     // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
     this.history = this.history.slice(0, this.historyIndex + 1);
     this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
-      ...(this.mode === 'bpmn' ? { processModel: this.getData(), processPath: this.processPath } : {}) }));
+      ...(this.mode === 'bpmn' ? { processModel: this.getData(), processPath: this.processPath,
+        selectedProcessId: this.selectedProcessId } : {}) }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -684,6 +738,7 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       this.processModel = snap.processModel;
       this.processPath = snap.processPath;
+      this.selectedProcessId = snap.selectedProcessId;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -702,6 +757,7 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       this.processModel = snap.processModel;
       this.processPath = snap.processPath;
+      this.selectedProcessId = snap.selectedProcessId;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -715,8 +771,9 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   updateProcessTimezone(value) {
     if (this.readOnly || this.mode !== 'bpmn') return;
-    if (value === '') delete this.processModel.timerTimezone;
-    else this.processModel.timerTimezone = value;
+    const body = processBody(this.processModel, [], this.selectedProcessId);
+    if (value === '') delete body.timerTimezone;
+    else body.timerTimezone = value;
     this._pushHistory();
     this.onChange();
   }
@@ -724,18 +781,19 @@ export class FlowCanvas {
   updateProcessVariables(values) {
     if (this.readOnly || this.mode !== 'bpmn') return;
     this.getData();
-    processBody(this.processModel, this.processPath).variables = structuredClone(values);
+    processBody(this.processModel, this.processPath, this.selectedProcessId).variables = structuredClone(values);
     this._pushHistory();
     this.onChange();
   }
 
   updateProcessCalendar(calendar) {
     if (this.readOnly || this.mode !== 'bpmn') return;
+    const body = processBody(this.processModel, [], this.selectedProcessId);
     if (calendar === null) {
-      delete this.processModel.workCalendar;
-      delete this.processModel.calendarPin;
+      delete body.workCalendar;
+      delete body.calendarPin;
     } else {
-      this.processModel.workCalendar = structuredClone(calendar);
+      body.workCalendar = structuredClone(calendar);
     }
     this._pushHistory();
     this.onChange();
@@ -754,11 +812,34 @@ export class FlowCanvas {
     this.onChange();
   }
 
+  updateProcessModeling({ modeling, modelingShapes, modelingEdges, collaboration, dataStores }) {
+    if (this.readOnly || this.mode !== 'bpmn') return;
+    this.getData();
+    const body = processBody(this.processModel, this.processPath, this.selectedProcessId);
+    if (modeling) body.modeling = structuredClone(modeling);
+    else delete body.modeling;
+    if (modelingShapes.length) body.diagram.modelingShapes = structuredClone(modelingShapes);
+    else delete body.diagram.modelingShapes;
+    if (modelingEdges.length) body.diagram.modelingEdges = structuredClone(modelingEdges);
+    else delete body.diagram.modelingEdges;
+    if (collaboration) this.processModel.collaboration = structuredClone(collaboration);
+    else delete this.processModel.collaboration;
+    if (dataStores.length) this.processModel.dataStores = structuredClone(dataStores);
+    else delete this.processModel.dataStores;
+    this._pushHistory();
+    this.render();
+    this.onChange();
+  }
+
   adoptPublishedProcessModel(model) {
     if (this.mode !== 'bpmn') return;
     this.processModel = structuredClone(model);
     for (const snapshot of this.history) {
-      if (snapshot.processModel.workCalendar) snapshot.processModel.calendarPin = structuredClone(model.calendarPin ?? null);
+      for (const body of [snapshot.processModel, ...(snapshot.processModel.additionalProcesses || [])]) {
+        const published = [model, ...(model.additionalProcesses || [])]
+          .find((candidate) => candidate.processId === body.processId);
+        if (published && body.workCalendar) body.calendarPin = structuredClone(published.calendarPin ?? null);
+      }
     }
     if (this.historyIndex >= 0) {
       this.history[this.historyIndex].processModel = structuredClone(model);
@@ -777,16 +858,16 @@ export class FlowCanvas {
       id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
       type: tpl.node_type,
       label: this.presetTypes.has(tpl.node_type) ? String(tpl.label || '') : '',
-      x: Math.round((pt.x - NODE_WIDTH / 2) / GRID) * GRID,
-      y: Math.round((pt.y - NODE_H_APPROX / 2) / GRID) * GRID,
+      x: snapGridCoordinate(pt.x - NODE_WIDTH / 2),
+      y: snapGridCoordinate(pt.y - NODE_H_APPROX / 2),
       config: defaultConfig,
     };
     if (this.mode === 'bpmn') {
       node.config = processNodeConfig(processNodeKind(node.type));
       node.width = tpl.width;
       node.height = tpl.height;
-      node.x = Math.round((pt.x - node.width / 2) / GRID) * GRID;
-      node.y = Math.round((pt.y - node.height / 2) / GRID) * GRID;
+      node.x = snapGridCoordinate(pt.x - node.width / 2);
+      node.y = snapGridCoordinate(pt.y - node.height / 2);
     }
     this.nodes.push(node);
     this._pushHistory();
@@ -806,15 +887,28 @@ export class FlowCanvas {
     // odbudowywaly DOM node'a i zrywaly selection ~sekunde po kliknieciu.
     let changed = false;
     for (const k of Object.keys(patch)) {
-      if ((k === 'repeat' ? n.repeat : n.config?.[k]) !== patch[k]) { changed = true; break; }
+      const current = k === 'repeat' ? n.repeat
+        : k === 'activityIo' ? n.activityIo : n.config?.[k];
+      if (current !== patch[k]) { changed = true; break; }
     }
     if (!changed) return;
     if (Object.hasOwn(patch, 'repeat')) {
       if (patch.repeat == null) delete n.repeat;
       else n.repeat = structuredClone(patch.repeat);
     }
-    const configPatch = Object.fromEntries(Object.entries(patch).filter(([key]) => key !== 'repeat'));
-    n.config = { ...n.config, ...configPatch };
+    if (Object.hasOwn(patch, 'activityIo')) {
+      if (patch.activityIo == null) delete n.activityIo;
+      else n.activityIo = structuredClone(patch.activityIo);
+    }
+    const configPatch = Object.fromEntries(Object.entries(patch)
+      .filter(([key]) => key !== 'repeat' && key !== 'activityIo'));
+    if (this.mode === 'bpmn' && n.type === 'bpmn_call_activity'
+      && (Object.hasOwn(configPatch, 'localBody') || Object.hasOwn(configPatch, 'calledDefinitionId'))) {
+      n.config = { inputMapping: n.config.inputMapping, outputMapping: n.config.outputMapping,
+        ...configPatch };
+    } else {
+      n.config = { ...n.config, ...configPatch };
+    }
     if (this.mode === 'bpmn' && processBoundaryKind(n.type) && Object.hasOwn(patch, 'attachedToId')) {
       this._positionBoundary(n);
     }
@@ -826,7 +920,7 @@ export class FlowCanvas {
   _positionBoundary(node) {
     const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
     if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity',
-      'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type)) return;
+      'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(parent.type)) return;
     const ports = [this._getPortWorldPos(parent.id, 'in', 'in'), this._getPortWorldPos(parent.id, 'full', 'out')];
     const clearsPorts = (x, y) => ports.every((port) => Math.hypot(x - port.x, y - port.y) >= Math.max(node.width, node.height) / 2 + 16);
     const centerX = node.x + node.width / 2;
@@ -921,6 +1015,7 @@ export class FlowCanvas {
         y: n.y + 30,
         config: structuredClone(n.config),
         ...(n.repeat == null ? {} : { repeat: structuredClone(n.repeat) }),
+        ...(n.activityIo == null ? {} : { activityIo: cloneProcessActivityIo(n.activityIo) }),
       };
       idMap.set(n.id, clone.id);
       if (this.mode === 'bpmn' && ['bpmn_exclusive_gateway', 'bpmn_inclusive_gateway'].includes(clone.type)) clone.config.defaultFlowId = null;
@@ -1077,7 +1172,7 @@ export class FlowCanvas {
     const source = this.nodes.find((node) => node.id === sourceId);
     const target = this.nodes.find((node) => node.id === targetId);
     if (!source || !target) return false;
-    if (this.mode === 'bpmn' && (['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(source.type) || (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) || processBoundaryKind(target.type)))) return false;
+    if (this.mode === 'bpmn' && (['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_link_throw'].includes(source.type) || (['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start', 'bpmn_link_catch'].includes(target.type) || processBoundaryKind(target.type)))) return false;
     if (this.edges.some((edge) => edge.from_node === sourceId && edge.to_node === targetId && edge.from_port === fromPort && edge.to_port === toPort)) return false;
     const edge = { id: `e_${crypto.randomUUID().replaceAll('-', '_')}`, from_node: sourceId, to_node: targetId, from_port: fromPort, to_port: toPort };
     if (this.mode === 'bpmn') edge.condition = null;
@@ -1116,10 +1211,82 @@ export class FlowCanvas {
   render() {
     this._renderRegions();
     this._renderNodes();
+    this._renderProcessModeling();
     this._layoutProcessLabels();
     this._renderEdges();
     this._applyView();
     if (this.hintEl) this.hintEl.style.display = this.nodes.length === 0 ? 'flex' : 'none';
+  }
+
+  _renderProcessModeling() {
+    if (this.mode !== 'bpmn') return;
+    const body = processBody(this.processModel, this.processPath, this.selectedProcessId);
+    const modeling = body.modeling;
+    const shapes = body.diagram.modelingShapes || [];
+    const byId = new Map(shapes.map((shape) => [shape.elementId, shape]));
+    const place = (element, shape) => {
+      element.style.position = 'absolute';
+      element.style.left = `${shape.x}px`;
+      element.style.top = `${shape.y}px`;
+      element.style.width = `${shape.width}px`;
+      element.style.height = `${shape.height}px`;
+      element.style.boxSizing = 'border-box';
+      element.style.pointerEvents = 'none';
+      element.style.overflow = 'visible';
+      element.style.overflowWrap = 'anywhere';
+      element.style.whiteSpace = 'pre-wrap';
+    };
+    const collaboration = this.processModel.collaboration;
+    if (!this.processPath.length && collaboration) {
+      const pools = new Map(collaboration.diagram.modelingShapes.map((shape) => [shape.elementId, shape]));
+      for (const participant of collaboration.participants) {
+        const shape = pools.get(participant.id);
+        if (!shape) continue;
+        const element = document.createElement('div');
+        element.dataset.modelingId = participant.id;
+        element.style.border = '3px solid var(--color-border, #64748b)';
+        element.style.background = 'rgba(100, 116, 139, 0.035)';
+        element.style.color = 'var(--color-text, #334155)';
+        element.style.padding = '6px';
+        element.textContent = participant.name ?? participant.id;
+        place(element, shape);
+        this.regionsLayer.appendChild(element);
+      }
+    }
+    const drawLaneSets = (sets) => {
+      for (const set of sets) for (const lane of set.lanes) {
+        const shape = byId.get(lane.id);
+        if (shape) {
+          const element = document.createElement('div');
+          element.dataset.modelingId = lane.id;
+          element.style.border = '2px solid var(--color-border, #64748b)';
+          element.style.background = 'rgba(100, 116, 139, 0.05)';
+          element.style.color = 'var(--color-text, #334155)';
+          element.style.padding = '6px';
+          element.textContent = lane.name ?? lane.id;
+          place(element, shape);
+          this.regionsLayer.appendChild(element);
+        }
+        drawLaneSets(lane.childLaneSets || []);
+      }
+    };
+    drawLaneSets(modeling?.laneSets || []);
+    for (const item of [...(modeling?.dataObjectReferences || []), ...(modeling?.dataStoreReferences || []),
+      ...(modeling?.textAnnotations || [])]) {
+      const shape = byId.get(item.id);
+      if (!shape) continue;
+      const element = document.createElement('div');
+      element.dataset.modelingId = item.id;
+      element.style.border = item.text == null ? '2px solid var(--color-border, #64748b)' : '2px dashed var(--color-border, #64748b)';
+      element.style.borderRadius = '4px';
+      element.style.background = 'var(--color-surface, #fff)';
+      element.style.color = 'var(--color-text, #334155)';
+      element.style.padding = '6px';
+      element.textContent = item.text ?? item.name ?? item.id;
+      place(element, shape);
+      this.nodesLayer.appendChild(element);
+    }
+
   }
 
   // Rysuje wizualne kontenery regionow petli: prostokat-tlo obejmujacy bounding
@@ -1221,8 +1388,9 @@ export class FlowCanvas {
       div.classList.add('fb-process-node', n.type);
       div.style.width = `${n.width}px`;
       div.style.height = `${n.height}px`;
-      const title = n.label || tmpl.label;
-      const event = (['bpmn_start', 'bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_message_start', 'bpmn_message_catch', 'bpmn_message_throw'].includes(n.type) || processBoundaryKind(n.type));
+      const title = getNodeDisplayTitle(n, tmpl);
+      const event = (['bpmn_start', 'bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_message_start', 'bpmn_message_catch', 'bpmn_message_throw', 'bpmn_signal_throw', 'bpmn_signal_catch', 'bpmn_link_throw', 'bpmn_link_catch'].includes(n.type) || processBoundaryKind(n.type));
+      const markerless = ['bpmn_start', 'bpmn_end'].includes(n.type);
       if (processBoundaryKind(n.type)) {
         div.classList.add(n.type === 'bpmn_boundary_error' || n.config.cancelActivity ? 'fb-boundary-interrupting' : 'fb-boundary-noninterrupting');
       }
@@ -1231,13 +1399,13 @@ export class FlowCanvas {
         : n.repeat?.MultiInstance?.mode === 'Sequential' ? 'sequential'
           : n.repeat?.MultiInstance?.mode === 'Parallel' ? 'parallel' : null;
       div.innerHTML = `
-        <div class="fb-process-symbol"><svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>
+        <div class="fb-process-symbol">${markerless ? '' : `<svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>`}
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}
           ${repeatMarker ? `<i class="fb-repeat-marker fb-repeat-marker-${repeatMarker}" aria-hidden="true">${repeatMarker === 'loop' ? '↻' : ''}</i>` : ''}</div>
         <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
         <span class="fb-process-label-leader" aria-hidden="true"></span>
-        ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
-        ${['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
+        ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start', 'bpmn_link_catch'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
+        ${['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_link_throw'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
       div.querySelectorAll('.fb-port').forEach((port) => { port.style.top = `${n.height / 2 - 8}px`; });
       div.setAttribute('aria-label', title);
       return div;
@@ -1454,10 +1622,33 @@ export class FlowCanvas {
     return { x: worldX, y: worldY };
   }
 
+  _appendBpmnEdgeMarkers() {
+    if (this.mode !== 'bpmn') return;
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const defs = document.createElementNS(svgNs, 'defs');
+    const marker = document.createElementNS(svgNs, 'marker');
+    marker.setAttribute('id', this._edgeMarkerId);
+    marker.setAttribute('viewBox', '0 0 10 8');
+    marker.setAttribute('markerWidth', '10');
+    marker.setAttribute('markerHeight', '8');
+    marker.setAttribute('refX', '9');
+    marker.setAttribute('refY', '4');
+    marker.setAttribute('markerUnits', 'userSpaceOnUse');
+    marker.setAttribute('orient', 'auto');
+    const path = document.createElementNS(svgNs, 'path');
+    path.setAttribute('d', 'M 0 0 L 9 4 L 0 8 Z');
+    path.setAttribute('fill', 'context-stroke');
+    path.setAttribute('stroke', 'none');
+    marker.appendChild(path);
+    defs.appendChild(marker);
+    this.svg.appendChild(defs);
+  }
+
   _renderEdges() {
     // Zbudujmy SVG na nowo — edges zwykle nieliczne.
     const svgNs = 'http://www.w3.org/2000/svg';
     this.svg.innerHTML = '';
+    this._appendBpmnEdgeMarkers();
     for (const e of this.edges) {
       const from = this.nodes.find((n) => n.id === e.from_node);
       const to = this.nodes.find((n) => n.id === e.to_node);
@@ -1492,6 +1683,9 @@ export class FlowCanvas {
       p.dataset.edgeId = e.id;
       const isSelected = this.selectedEdgeId === e.id;
       if (isSelected) p.classList.add('selected');
+      if (this.mode === 'bpmn') {
+        p.setAttribute('marker-end', `url(#${this._edgeMarkerId})`);
+      }
       this.svg.appendChild(p);
       if (this.mode === 'bpmn') {
         const text = document.createElementNS(svgNs, 'text');
@@ -1555,6 +1749,22 @@ export class FlowCanvas {
         this.svg.appendChild(g);
       }
     }
+    if (this.mode === 'bpmn') {
+      const body = processBody(this.processModel, this.processPath, this.selectedProcessId);
+      const modelingEdges = [...(body.diagram.modelingEdges || []),
+        ...(!this.processPath.length ? this.processModel.collaboration?.diagram.modelingEdges || [] : [])];
+      for (const edge of modelingEdges) {
+        const line = document.createElementNS(svgNs, 'polyline');
+        line.setAttribute('points', edge.waypoints.map((point) => `${point.x},${point.y}`).join(' '));
+        line.setAttribute('fill', 'none');
+        line.setAttribute('stroke', 'var(--color-border, #64748b)');
+        line.setAttribute('stroke-width', '2');
+        line.setAttribute('stroke-dasharray', '6 4');
+        line.style.pointerEvents = 'none';
+        line.dataset.modelingId = edge.elementId;
+        this.svg.appendChild(line);
+      }
+    }
     // Tymczasowa linia podczas łączenia
     if (this._connecting) {
       const { fromNode, fromPort, currentX, currentY } = this._connecting;
@@ -1588,12 +1798,22 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   // Pan / zoom
   // -------------------------------------------------------------------------
+  _positiveZoom() {
+    if (!Number.isFinite(this.view.zoom) || this.view.zoom <= 0) {
+      throw new RangeError('Canvas zoom must be positive and finite');
+    }
+    return this.view.zoom;
+  }
+
   /**
    * Bounding box wszystkich wezlow w world coords, albo `null` dla pustego
    * grafu. Uzywane i przez dopasowanie widoku, i przez ograniczenie panoramy.
    */
   _contentBounds() {
-    if (this.nodes.length === 0) return null;
+    const body = this.mode === 'bpmn' ? processBody(this.processModel, this.processPath, this.selectedProcessId) : null;
+    const modelingShapes = body ? [...(body.diagram.modelingShapes || []),
+      ...(!this.processPath.length ? this.processModel.collaboration?.diagram.modelingShapes || [] : [])] : [];
+    if (this.nodes.length === 0 && modelingShapes.length === 0) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of this.nodes) {
       minX = Math.min(minX, n.x);
@@ -1612,6 +1832,14 @@ export class FlowCanvas {
         }
       }
     }
+    for (const shape of modelingShapes) {
+      const label = this.regionsLayer.querySelector(`[data-modeling-id="${CSS.escape(shape.elementId)}"]`)
+        || this.nodesLayer.querySelector(`[data-modeling-id="${CSS.escape(shape.elementId)}"]`);
+      minX = Math.min(minX, shape.x);
+      minY = Math.min(minY, shape.y);
+      maxX = Math.max(maxX, shape.x + Math.max(shape.width, label?.scrollWidth || 0));
+      maxY = Math.max(maxY, shape.y + Math.max(shape.height, label?.scrollHeight || 0));
+    }
     return { minX, minY, maxX, maxY };
   }
 
@@ -1625,8 +1853,9 @@ export class FlowCanvas {
     const b = this._contentBounds();
     if (!b) return;
     const rect = this.root.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-    const z = this.view.zoom;
+    if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)
+      || rect.width <= 0 || rect.height <= 0) return;
+    const z = this._positiveZoom();
     const clampAxis = (value, lo, hi) => Math.min(Math.max(value, Math.min(lo, hi)), Math.max(lo, hi));
     this.view.x = clampAxis(
       this.view.x,
@@ -1641,22 +1870,26 @@ export class FlowCanvas {
   }
 
   _applyView() {
+    this._positiveZoom();
     this._clampView();
     this.world.style.transform = `translate(${this.view.x}px, ${this.view.y}px) scale(${this.view.zoom})`;
     this.onViewChange(this.view);
   }
 
   setZoom(zoom, cx, cy) {
+    if (!Number.isFinite(zoom)) return;
     const rect = this.root.getBoundingClientRect();
     if (cx === undefined) cx = rect.width / 2;
     if (cy === undefined) cy = rect.height / 2;
     const z = Math.max(0.2, Math.min(3, zoom));
     // Zoom względem punktu (cx,cy) w lokalnych współrz. canvasu
-    const worldX = (cx - this.view.x) / this.view.zoom;
-    const worldY = (cy - this.view.y) / this.view.zoom;
+    const currentZoom = this._positiveZoom();
+    const worldX = (cx - this.view.x) / currentZoom;
+    const worldY = (cy - this.view.y) / currentZoom;
     this.view.x = cx - worldX * z;
     this.view.y = cy - worldY * z;
     this.view.zoom = z;
+    this._pendingFitMinZoom = null;
     this._applyView();
   }
 
@@ -1666,6 +1899,7 @@ export class FlowCanvas {
 
   resetZoom() {
     this.view = { x: 0, y: 0, zoom: 1 };
+    this._pendingFitMinZoom = null;
     this._applyView();
   }
 
@@ -1686,8 +1920,19 @@ export class FlowCanvas {
     const rect = this.root.getBoundingClientRect();
     const w = maxX - minX + pad * 2;
     const h = maxY - minY + pad * 2;
+    if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)
+      || !Number.isFinite(w) || !Number.isFinite(h)
+      || rect.width <= 0 || rect.height <= 0 || w <= 0 || h <= 0) {
+      this._pendingFitMinZoom = minZoom;
+      return;
+    }
     const fit = Math.min(1, Math.min(rect.width / w, rect.height / h));
     const z = Math.max(fit, minZoom);
+    if (!Number.isFinite(z) || z <= 0) {
+      this._pendingFitMinZoom = minZoom;
+      return;
+    }
+    this._pendingFitMinZoom = null;
     this.view.zoom = z;
     if (z > fit) {
       this.view.x = pad * z - minX * z;
@@ -1701,9 +1946,10 @@ export class FlowCanvas {
 
   _clientToWorld(clientX, clientY) {
     const rect = this.root.getBoundingClientRect();
+    const zoom = this._positiveZoom();
     return {
-      x: (clientX - rect.left - this.view.x) / this.view.zoom,
-      y: (clientY - rect.top - this.view.y) / this.view.zoom,
+      x: (clientX - rect.left - this.view.x) / zoom,
+      y: (clientY - rect.top - this.view.y) / zoom,
     };
   }
 
@@ -1851,16 +2097,17 @@ export class FlowCanvas {
 
   _flushPointerMove(clientX, clientY) {
     if (this._draggingNode) {
-      const dx = (clientX - this._draggingNode.startClientX) / this.view.zoom;
-      const dy = (clientY - this._draggingNode.startClientY) / this.view.zoom;
-      if (!this._draggingNode.moved && Math.hypot(dx, dy) * this.view.zoom < DRAG_THRESHOLD) return;
+      const zoom = this._positiveZoom();
+      const dx = (clientX - this._draggingNode.startClientX) / zoom;
+      const dy = (clientY - this._draggingNode.startClientY) / zoom;
+      if (!this._draggingNode.moved && Math.hypot(dx, dy) * zoom < DRAG_THRESHOLD) return;
       this._draggingNode.moved = true;
       for (const id of this._draggingNode.ids) {
         const n = this.nodes.find((x) => x.id === id);
         const orig = this._draggingNode.origs.get(id);
         if (!n || !orig) continue;
-        n.x = Math.round((orig.x + dx) / GRID) * GRID;
-        n.y = Math.round((orig.y + dy) / GRID) * GRID;
+        n.x = snapGridCoordinate(orig.x + dx);
+        n.y = snapGridCoordinate(orig.y + dy);
         if (this.mode === 'bpmn' && processBoundaryKind(n.type) && !this._draggingNode.origs.has(n.config.attachedToId)) {
           this._positionBoundary(n);
         }

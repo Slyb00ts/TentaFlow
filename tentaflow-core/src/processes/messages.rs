@@ -87,7 +87,7 @@ pub fn validate_message(message: &PreparedMessage) -> Result<()> {
         "message TTL must be 1..604800 seconds"
     );
     let (definition_id, instance_id, subscription_id) = match &message.target {
-        ProcessMessageTarget::Start { definition_id } => (definition_id, None, None),
+        ProcessMessageTarget::Start { definition_id, .. } => (definition_id, None, None),
         ProcessMessageTarget::Catch {
             definition_id,
             instance_id,
@@ -114,8 +114,8 @@ pub fn validate_message(message: &PreparedMessage) -> Result<()> {
     }
     Ok(())
 }
-pub fn evaluate_key(expression: &str, variables: &Value) -> Result<String> {
-    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])
+pub fn evaluate_key(expression: &str, variables: &Value, extra: &[(String, Value)]) -> Result<String> {
+    let value = super::runtime::evaluate(expression, variables, &Value::Null, extra)
         .map_err(dynamic_expression_error)?;
     let key = value
         .as_str()
@@ -123,8 +123,8 @@ pub fn evaluate_key(expression: &str, variables: &Value) -> Result<String> {
     validate_key(key).map_err(|error| MessageExpressionFailed { cause: error.to_string() })?;
     Ok(key.to_owned())
 }
-fn expression_uuid(expression: &str, variables: &Value) -> Result<String> {
-    let value = super::runtime::evaluate(expression, variables, &Value::Null, &[])
+fn expression_uuid(expression: &str, variables: &Value, extra: &[(String, Value)]) -> Result<String> {
+    let value = super::runtime::evaluate(expression, variables, &Value::Null, extra)
         .map_err(dynamic_expression_error)?;
     let id = value
         .as_str()
@@ -138,6 +138,7 @@ pub fn prepare_throw(
     model: &ProcessModel,
     node: &ProcessNode,
     variables: &Value,
+    extra: &[(String, Value)],
 ) -> Result<PreparedMessage> {
     let (message_ref, target, correlation_expression, payload_expression, ttl_seconds) =
         match &node.kind {
@@ -154,8 +155,10 @@ pub fn prepare_throw(
         .name
         .clone();
     let target = match target {
-        ProcessMessageTargetSpec::Start { definition_id } => ProcessMessageTarget::Start {
+        ProcessMessageTargetSpec::Start { definition_id, process_id, start_node_id } => ProcessMessageTarget::Start {
             definition_id: definition_id.clone(),
+            process_id: process_id.clone(),
+            start_node_id: start_node_id.clone(),
         },
         ProcessMessageTargetSpec::Catch {
             definition_id,
@@ -165,11 +168,11 @@ pub fn prepare_throw(
             definition_id: definition_id.clone(),
             instance_id: instance_id_expression
                 .as_ref()
-                .map(|e| expression_uuid(e, variables))
+                .map(|e| expression_uuid(e, variables, extra))
                 .transpose()?,
             subscription_id: subscription_id_expression
                 .as_ref()
-                .map(|e| expression_uuid(e, variables))
+                .map(|e| expression_uuid(e, variables, extra))
                 .transpose()?,
         },
     };
@@ -177,8 +180,8 @@ pub fn prepare_throw(
         message_id: Uuid::new_v4().to_string(),
         target,
         message_name,
-        correlation_key: evaluate_key(correlation_expression, variables)?,
-        payload: super::runtime::evaluate(payload_expression, variables, &Value::Null, &[])
+        correlation_key: evaluate_key(correlation_expression, variables, extra)?,
+        payload: super::runtime::evaluate(payload_expression, variables, &Value::Null, extra)
             .map_err(dynamic_expression_error)?,
         ttl_seconds: *ttl_seconds,
     };
@@ -227,26 +230,29 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64,
             actor,
             version,
             instance_id,
+            process_id,
+            start_node_id,
         } => {
-            let start = version
-                .model
-                .nodes
-                .iter()
-                .find(|n| matches!(n.kind, ProcessNodeKind::MessageStart { .. }))
-                .context("message start missing")?;
+            let body = super::model::selected_body(&version.model, process_id, &[])?;
+            let start = body.nodes.iter()
+                .find(|node| node.id == *start_node_id
+                    && matches!(node.kind, ProcessNodeKind::MessageStart { .. }))
+                .context("message Start differs from its selected body")?;
             let ProcessNodeKind::MessageStart { output_mapping, .. } = &start.kind else {
                 anyhow::bail!("message start kind mismatch")
             };
             let vars = mapped_variables(
                 output_mapping,
-                &serde_json::to_value(&version.model.variables)?,
-                &serde_json::to_value(&version.model.variables)?,
+                &serde_json::to_value(body.variables)?,
+                &serde_json::to_value(body.variables)?,
                 payload,
                 "message",
                 metadata.clone(),
             )?;
             let mut plan = super::runtime::plan_start(
                 &version.model,
+                process_id,
+                start_node_id,
                 instance_id,
                 actor,
                 &version.definition_id,
@@ -403,6 +409,7 @@ pub(crate) mod test_support {
                         output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
                     },
                     repeat: None,
+                    activity_io: None,
                 },
             );
             model.sequence_flows = vec![
@@ -420,6 +427,7 @@ pub(crate) mod test_support {
                             output_mapping: BTreeMap::new(),
                         },
                         repeat: None,
+                        activity_io: None,
                     },
                 );
                 model.sequence_flows = vec![
@@ -437,7 +445,7 @@ pub(crate) mod test_support {
         let now = chrono::Utc::now().timestamp_millis();
         let command = stamp("start message fixture");
         let plan = runtime::plan_start(
-            &version.model,
+            &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
             &id,
             &f.owner,
             &version.definition_id,
@@ -455,7 +463,7 @@ pub(crate) mod test_support {
             &id,
             &version.definition_id,
             version.version,
-            &vars,
+            &vars, None, None,
             repository::ProcessPlanInput::Supplied(&plan),
             now,
         )
@@ -552,6 +560,7 @@ pub(crate) mod test_support {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             });
             model.nodes.push(ProcessNode {
                 id: format!("Side_{id}"),
@@ -561,6 +570,7 @@ pub(crate) mod test_support {
                     output_mapping: BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             });
             model.sequence_flows.extend([
                 edge(&format!("BoundaryPath_{id}"), id, &format!("Side_{id}")),
@@ -577,6 +587,7 @@ pub(crate) mod test_support {
             name: "First signal".into(),
             kind: ProcessNodeKind::EventBasedGateway,
             repeat: None,
+            activity_io: None,
         });
         model.nodes.push(ProcessNode {
             id: "Timer_1".into(),
@@ -585,6 +596,7 @@ pub(crate) mod test_support {
                 timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 2 },
             },
             repeat: None,
+            activity_io: None,
         });
         model.sequence_flows = vec![
             edge("ToRace", "Start_1", "Race_1"),
@@ -606,22 +618,22 @@ pub(crate) mod test_support {
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Independent races".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "OtherRace".into(), name: "Other first signal".into(),
                 kind: ProcessNodeKind::EventBasedGateway,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "OtherCatch".into(), name: "Other message".into(),
                 kind: ProcessNodeKind::MessageCatch {
                     message_ref: "OtherMessage".into(),
                     correlation_expression: "'case-1'".into(),
                     output_mapping: BTreeMap::new(),
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "OtherTimer".into(), name: "Other deadline".into(),
                 kind: ProcessNodeKind::TimerCatch {
                     timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 120 },
                 },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![
             edge("StartSplit", "Start_1", "Split"),
@@ -678,12 +690,14 @@ mod tests {
                 correlation_expression: "'case-1'".into(),
                 payload_expression: "null".into(), ttl_seconds: 120,
             },
+            activity_io: None,
         });
         source.nodes.insert(2, tentaflow_protocol::processes::ProcessNode {
             id: "Wait".into(), name: "Wait after admission".into(), repeat: None,
             kind: ProcessNodeKind::UserTask {
                 assignee_user_id: None, output_mapping: BTreeMap::new(),
             },
+            activity_io: None,
         });
         source.sequence_flows = vec![
             edge("ToThrow", "Start_1", "Throw"),
@@ -1188,6 +1202,7 @@ mod tests {
                     output_mapping: std::collections::BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Throw_1".into(),
@@ -1206,6 +1221,7 @@ mod tests {
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         ]);
         source_model.sequence_flows = vec![
@@ -1386,6 +1402,7 @@ mod tests {
                     output_mapping: std::collections::BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -1396,6 +1413,8 @@ mod tests {
         let mut message = envelope(
             ProcessMessageTarget::Start {
                 definition_id: version.definition_id.clone(),
+                process_id: None,
+                start_node_id: None,
             },
             json!({"literal":true}),
         );
@@ -1409,6 +1428,9 @@ mod tests {
         )
         .is_err());
         let admitted = send(&f, &message);
+        assert!(matches!(&admitted.target,
+            ProcessMessageTarget::Start { process_id: Some(process_id), start_node_id: Some(start_node_id), .. }
+                if process_id == &model.process_id && start_node_id == "Start_1"));
         let at = chrono::Utc::now().timestamp_millis();
         let candidate = repository::due_messages(&f.db, at, 32).unwrap().remove(0);
         let MessageSelection::Ready(snapshot) =
@@ -1508,6 +1530,8 @@ mod tests {
         let mut expires = envelope(
             ProcessMessageTarget::Start {
                 definition_id: version.definition_id,
+                process_id: None,
+                start_node_id: None,
             },
             Value::Null,
         );
@@ -1758,11 +1782,11 @@ mod tests {
         model.nodes.extend([
             ProcessNode { id: "Split".into(), name: "Concurrent paths".into(),
                 kind: ProcessNodeKind::ParallelGateway,
-                repeat: None, },
+                repeat: None,   activity_io: None,},
             ProcessNode { id: "SideWork".into(), name: "Independent open work".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
                     output_mapping: BTreeMap::new() },
-                repeat: None, },
+                repeat: None,   activity_io: None,},
         ]);
         model.sequence_flows = vec![
             runtime::test_support::edge("StartSplit", "Start_1", "Split"),
@@ -1964,12 +1988,15 @@ mod tests {
                     message_ref: "ThrowDecl".into(),
                     target: ProcessMessageTargetSpec::Start {
                         definition_id: receiver.definition_id.clone(),
+                process_id: None,
+                start_node_id: None,
                     },
                     correlation_expression: "'case-1'".into(),
                     payload_expression: "{'customer_ID': 23}".into(),
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -2023,6 +2050,8 @@ mod tests {
         let m = envelope(
             ProcessMessageTarget::Start {
                 definition_id: version.definition_id.clone(),
+                process_id: None,
+                start_node_id: None,
             },
             Value::Null,
         );
@@ -2035,7 +2064,7 @@ mod tests {
             panic!("ready start")
         };
         let plan = plan_message_delivery(&prepared, at, None).unwrap();
-        let (draft, _, _) =
+        let (draft, _) =
             repository::get_definition(&f.db, &f.owner, &version.definition_id).unwrap();
         let mut changed = draft.model.clone();
         changed.messages[0].name = "NewEvidence".into();
@@ -2072,6 +2101,8 @@ mod tests {
         let mut pending = envelope(
             ProcessMessageTarget::Start {
                 definition_id: version.definition_id.clone(),
+                process_id: None,
+                start_node_id: None,
             },
             Value::Null,
         );
@@ -2262,6 +2293,7 @@ mod tests {
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Merge_1".into(),
@@ -2270,6 +2302,7 @@ mod tests {
                     default_flow_id: None,
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Other_1".into(),
@@ -2279,6 +2312,7 @@ mod tests {
                     output_mapping: std::collections::BTreeMap::new(),
                 },
                 repeat: None,
+                activity_io: None,
             },
             ProcessNode {
                 id: "Join_1".into(),
@@ -2286,6 +2320,7 @@ mod tests {
                 kind: if inclusive { ProcessNodeKind::InclusiveGateway { default_flow_id: None } }
                     else { ProcessNodeKind::ParallelGateway },
                 repeat: None,
+                activity_io: None,
             },
         ]);
         model.sequence_flows = vec![
@@ -2369,6 +2404,7 @@ mod tests {
                     ttl_seconds: 120,
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         throw.sequence_flows = vec![
@@ -2379,7 +2415,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let command = stamp("atomic source capacity fail");
         let plan = runtime::plan_start(
-            &version.model,
+            &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
             &id,
             &f.owner,
             &version.definition_id,
@@ -2397,7 +2433,7 @@ mod tests {
             &id,
             &version.definition_id,
             1,
-            &json!({}),
+            &json!({}), None, None,
             repository::ProcessPlanInput::Supplied(&plan),
             at
         )
@@ -2407,7 +2443,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let command = stamp("missing race branch denied");
         let mut forged = runtime::plan_start(
-            &race.model,
+            &race.model, &race.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&race.model),
             &id,
             &f.owner,
             &race.definition_id,
@@ -2426,7 +2462,7 @@ mod tests {
             &id,
             &race.definition_id,
             1,
-            &json!({}),
+            &json!({}), None, None,
             repository::ProcessPlanInput::Supplied(&forged),
             at
         )

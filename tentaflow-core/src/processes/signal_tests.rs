@@ -37,6 +37,7 @@ pub(super) fn signal_catch_model() -> tentaflow_protocol::processes::ProcessMode
                 output_mapping: BTreeMap::from([("received".into(), "outputs".into())]),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -68,6 +69,7 @@ pub(super) fn signal_throw_model() -> tentaflow_protocol::processes::ProcessMode
                 ttl_seconds: 3600,
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -83,12 +85,14 @@ pub(super) fn signal_timer_race_model() -> ProcessModel {
     model.nodes.push(ProcessNode {
         id: "Race_1".into(), name: "First event".into(),
         kind: ProcessNodeKind::EventBasedGateway, repeat: None,
+        activity_io: None,
     });
     model.nodes.push(ProcessNode {
         id: "Timer_1".into(), name: "Deadline".into(),
         kind: ProcessNodeKind::TimerCatch {
             timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 2 },
         }, repeat: None,
+        activity_io: None,
     });
     model.sequence_flows = vec![
         edge("ToRace", "Start_1", "Race_1"),
@@ -110,12 +114,14 @@ pub(super) fn parallel_signal_catches(
         name: "Open signal waits".into(),
         kind: ProcessNodeKind::ParallelGateway,
         repeat: None,
+        activity_io: None,
     });
     model.nodes.push(ProcessNode {
         id: "Join".into(),
         name: "Join received signals".into(),
         kind: ProcessNodeKind::ParallelGateway,
         repeat: None,
+        activity_io: None,
     });
     model.sequence_flows = vec![
         edge("StartSplit", "Start_1", "Split"),
@@ -131,6 +137,7 @@ pub(super) fn parallel_signal_catches(
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         });
         model
             .sequence_flows
@@ -190,7 +197,7 @@ fn start_for_actor(
     let plan = (!canonical)
         .then(|| {
             runtime::plan_start(
-                &version.model,
+                &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
                 &instance_id,
                 actor,
                 &version.definition_id,
@@ -214,7 +221,7 @@ fn start_for_actor(
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         input,
         at_ms,
     )
@@ -1001,7 +1008,7 @@ fn signal_measurement_four_thousand_ninety_six_open_arms_reject_the_next_real_st
         &denied_instance_id,
         &single_version.definition_id,
         single_version.version,
-        &denied_variables,
+        &denied_variables, None, None,
         repository::ProcessPlanInput::Canonical,
         chrono::Utc::now().timestamp_millis(),
     )
@@ -1995,7 +2002,7 @@ fn signal_delivered_receipt_and_source_history_survive_payload_pruning_and_repla
         &source_instance_id,
         &source_version.definition_id,
         source_version.version,
-        &source_variables,
+        &source_variables, None, None,
         repository::ProcessPlanInput::Canonical,
         source_at_ms,
     )
@@ -2101,7 +2108,7 @@ fn signal_delivered_receipt_and_source_history_survive_payload_pruning_and_repla
         &source_instance_id,
         &source_version.definition_id,
         source_version.version,
-        &source_variables,
+        &source_variables, None, None,
         repository::ProcessPlanInput::Canonical,
         source_at_ms,
     )
@@ -2380,7 +2387,7 @@ fn direct_receive_and_signal_race_uses_only_the_first_fenced_source() {
                 assert!(worker.join().unwrap().unwrap().is_none());
                 let after_stale = super::signal_proof_tests::all_transition_rows(&fixture);
                 let mut expected = after_winner.clone();
-                let emission = expected[16].iter_mut().find(|row|
+                let emission = expected[super::call_tests::TRANSITION_TABLES.len()].iter_mut().find(|row|
                     row[0] == SqlValue::Text(stale_signal_id.clone())).unwrap();
                 assert_eq!(emission[18], SqlValue::Text("pending".into()));
                 assert_eq!(emission[19], SqlValue::Integer(1));
@@ -2388,7 +2395,7 @@ fn direct_receive_and_signal_race_uses_only_the_first_fenced_source() {
                 emission[18] = SqlValue::Text("settled".into());
                 emission[19] = SqlValue::Integer(2);
                 emission[20] = SqlValue::Integer(at_ms);
-                let receipt = expected[17].iter_mut().find(|row|
+                let receipt = expected[super::call_tests::TRANSITION_TABLES.len() + 1].iter_mut().find(|row|
                     row[0] == SqlValue::Text(stale_receipt_id.clone())).unwrap();
                 assert_eq!(receipt[1], SqlValue::Text(stale_signal_id));
                 assert_eq!(receipt[13], SqlValue::Text("claimed".into()));

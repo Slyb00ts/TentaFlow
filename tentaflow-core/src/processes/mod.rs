@@ -7,7 +7,14 @@ pub mod model;
 pub mod messages;
 pub mod repository;
 pub mod runtime;
+pub mod simulation;
+pub mod simulation_schema;
 pub mod timers;
+
+#[cfg(test)]
+mod activity_result_tests;
+#[cfg(test)]
+mod activity_io_tests;
 
 #[cfg(test)]
 mod scope_tests;
@@ -52,3 +59,8 @@ mod signal_proof_tests;
 mod send_boundary_tests;
 #[cfg(test)]
 mod send_boundary_proof_tests;
+#[cfg(test)]
+mod repetition_boundary_tests;
+
+#[cfg(test)]
+mod simulation_tests;

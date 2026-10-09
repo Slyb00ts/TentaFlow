@@ -401,8 +401,10 @@ function processMessageTarget(target, expressionTarget = false) {
   const [tag, body] = entries[0];
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new TypeError('message target body is required');
   if (tag === 'Start') {
-    processKnownFields(body, ['definitionId'], 'message start target');
-    return { Start: { definition_id: body.definitionId } };
+    processKnownFields(body, ['definitionId', 'processId', 'startNodeId'], 'message start target');
+    return { Start: { definition_id: body.definitionId,
+      ...(body.processId == null ? {} : { process_id: body.processId }),
+      ...(body.startNodeId == null ? {} : { start_node_id: body.startNodeId }) } };
   }
   if (tag === 'Catch') {
     const names = expressionTarget
@@ -474,14 +476,188 @@ function processRepeatSpec(repeat) {
   throw new TypeError('unsupported process repeat variant');
 }
 
-function processModel(model, nested = false) {
+function processDiagram(diagram = {}) {
+  processKnownFields(diagram, ['shapes', 'edges', 'modelingShapes', 'modelingEdges'], 'process diagram');
+  for (const name of ['shapes', 'edges', 'modelingShapes', 'modelingEdges']) {
+    if (diagram[name] != null && !Array.isArray(diagram[name])) throw new TypeError(`process diagram ${name} must be an array`);
+  }
+  return {
+    shapes: (diagram.shapes ?? []).map((shape) => {
+      processKnownFields(shape, ['elementId', 'x', 'y', 'width', 'height'], 'process shape');
+      return { element_id: String(shape.elementId), x: Number(shape.x), y: Number(shape.y),
+        width: Number(shape.width), height: Number(shape.height) };
+    }),
+    edges: (diagram.edges ?? []).map((edge) => {
+      processKnownFields(edge, ['sequenceFlowId', 'waypoints'], 'process edge');
+      return { sequence_flow_id: String(edge.sequenceFlowId),
+        waypoints: (edge.waypoints ?? []).map((point) => {
+          processKnownFields(point, ['x', 'y'], 'process waypoint');
+          return { x: Number(point.x), y: Number(point.y) };
+        }) };
+    }),
+    ...(diagram.modelingShapes?.length ? { modeling_shapes: diagram.modelingShapes.map((shape) => {
+      processKnownFields(shape, ['diId', 'elementId', 'x', 'y', 'width', 'height'], 'modeling shape');
+      return { di_id: shape.diId, element_id: shape.elementId, x: shape.x, y: shape.y,
+        width: shape.width, height: shape.height };
+    }) } : {}),
+    ...(diagram.modelingEdges?.length ? { modeling_edges: diagram.modelingEdges.map((edge) => {
+      processKnownFields(edge, ['diId', 'elementId', 'waypoints'], 'modeling edge');
+      return { di_id: edge.diId, element_id: edge.elementId,
+        waypoints: edge.waypoints.map((point) => {
+          processKnownFields(point, ['x', 'y'], 'modeling waypoint');
+          return { x: point.x, y: point.y };
+        }) };
+    }) } : {}),
+  };
+}
+
+function processBodyModeling(modeling) {
+  processKnownFields(modeling, ['laneSets', 'dataObjects', 'dataObjectReferences',
+    'textAnnotations', 'associations', 'dataStoreReferences'], 'body modeling');
+  for (const name of ['laneSets', 'dataObjects', 'dataObjectReferences',
+    'textAnnotations', 'associations', 'dataStoreReferences']) {
+    if (modeling[name] != null && !Array.isArray(modeling[name])) throw new TypeError(`body modeling ${name} must be an array`);
+  }
+  const laneSet = (set) => {
+    processKnownFields(set, ['id', 'lanes'], 'lane set');
+    return { id: set.id, lanes: set.lanes.map((lane) => {
+      processKnownFields(lane, ['id', 'name', 'flowNodeRefs', 'childLaneSets'], 'lane');
+      if (!Array.isArray(lane.flowNodeRefs) ||
+        (lane.childLaneSets != null && !Array.isArray(lane.childLaneSets))) {
+        throw new TypeError('lane requires node references and child lane sets');
+      }
+      return { id: lane.id, ...(lane.name == null ? {} : { name: lane.name }),
+        flow_node_refs: lane.flowNodeRefs,
+        ...(lane.childLaneSets?.length ? { child_lane_sets: lane.childLaneSets.map(laneSet) } : {}) };
+    }) };
+  };
+  return {
+    ...(modeling.laneSets?.length ? { lane_sets: modeling.laneSets.map(laneSet) } : {}),
+    ...(modeling.dataObjects?.length ? { data_objects: modeling.dataObjects.map((object) => {
+      processKnownFields(object, ['id', 'name'], 'data object');
+      return { id: object.id, ...(object.name == null ? {} : { name: object.name }) };
+    }) } : {}),
+    ...(modeling.dataObjectReferences?.length ? { data_object_references: modeling.dataObjectReferences.map((reference) => {
+      processKnownFields(reference, ['id', 'name', 'dataObjectRef', 'variableBindingKey'], 'data object reference');
+      return { id: reference.id, ...(reference.name == null ? {} : { name: reference.name }),
+        data_object_ref: reference.dataObjectRef,
+        ...(reference.variableBindingKey == null ? {} : { variable_binding_key: reference.variableBindingKey }) };
+    }) } : {}),
+    ...(modeling.textAnnotations?.length ? { text_annotations: modeling.textAnnotations.map((annotation) => {
+      processKnownFields(annotation, ['id', 'text'], 'text annotation');
+      return { id: annotation.id, text: annotation.text };
+    }) } : {}),
+    ...(modeling.associations?.length ? { associations: modeling.associations.map((association) => {
+      processKnownFields(association, ['id', 'sourceRef', 'targetRef'], 'association');
+      return { id: association.id, source_ref: association.sourceRef, target_ref: association.targetRef };
+    }) } : {}),
+    ...(modeling.dataStoreReferences?.length ? { data_store_references: modeling.dataStoreReferences.map((reference) => {
+      processKnownFields(reference, ['id', 'name', 'dataStoreRef'], 'data store reference');
+      return { id: reference.id, ...(reference.name == null ? {} : { name: reference.name }),
+        data_store_ref: reference.dataStoreRef };
+    }) } : {}),
+  };
+}
+
+function processActivityIo(io) {
+  processKnownFields(io, ['dataInputs', 'dataOutputs', 'inputSetId', 'inputSet', 'outputSetId',
+    'outputSet', 'inputAssociations', 'outputAssociations', 'coordinatorOutput'], 'activity IO');
+  return {
+    data_inputs: io.dataInputs.map((input) => {
+      processKnownFields(input, ['id', 'name'], 'data input');
+      return { id: input.id, ...(input.name == null ? {} : { name: input.name }) };
+    }),
+    data_outputs: io.dataOutputs.map((output) => {
+      processKnownFields(output, ['id', 'name', 'valueExpression'], 'data output');
+      return { id: output.id, ...(output.name == null ? {} : { name: output.name }),
+        value_expression: output.valueExpression };
+    }),
+    input_set_id: io.inputSetId, input_set: io.inputSet,
+    output_set_id: io.outputSetId, output_set: io.outputSet,
+    input_associations: io.inputAssociations.map((association) => {
+      processKnownFields(association, ['DirectRef', 'CelAssignment'], 'input association');
+      if (Object.keys(association).length !== 1) throw new TypeError('input association requires one kind');
+      const [kind, value] = Object.entries(association)[0];
+      if (kind === 'DirectRef') {
+        processKnownFields(value, ['id', 'sourceObjectRefId', 'targetInputId'], 'direct input association');
+        return { DirectRef: { id: value.id, source_object_ref_id: value.sourceObjectRefId,
+          target_input_id: value.targetInputId } };
+      }
+      if (kind === 'CelAssignment') {
+        processKnownFields(value, ['id', 'fromExpression', 'targetInputId'], 'CEL input association');
+        return { CelAssignment: { id: value.id, from_expression: value.fromExpression,
+          target_input_id: value.targetInputId } };
+      }
+      throw new TypeError('unsupported input association');
+    }),
+    output_associations: io.outputAssociations.map((association) => {
+      processKnownFields(association, ['id', 'sourceOutputId', 'targetObjectRefId'], 'output association');
+      return { id: association.id, source_output_id: association.sourceOutputId,
+        target_object_ref_id: association.targetObjectRefId };
+    }),
+    ...(io.coordinatorOutput == null ? {} : { coordinator_output: processCoordinatorOutput(io.coordinatorOutput) }),
+  };
+}
+
+function processCoordinatorOutput(output) {
+  processKnownFields(output, ['dataOutputs', 'outputSetId', 'outputSet', 'outputAssociations'],
+    'coordinator output');
+  if (!Array.isArray(output.dataOutputs) || !Array.isArray(output.outputSet) ||
+    !Array.isArray(output.outputAssociations)) {
+    throw new TypeError('coordinator output requires ordered lists');
+  }
+  return {
+    data_outputs: output.dataOutputs.map((item) => {
+      processKnownFields(item, ['id', 'name', 'valueExpression'], 'coordinator data output');
+      return { id: item.id, ...(item.name == null ? {} : { name: item.name }),
+        value_expression: item.valueExpression };
+    }),
+    output_set_id: output.outputSetId,
+    output_set: output.outputSet,
+    output_associations: output.outputAssociations.map((association) => {
+      processKnownFields(association, ['id', 'sourceOutputId', 'targetObjectRefId'],
+        'coordinator output association');
+      return { id: association.id, source_output_id: association.sourceOutputId,
+        target_object_ref_id: association.targetObjectRefId };
+    }),
+  };
+}
+
+function processCollaboration(collaboration) {
+  processKnownFields(collaboration, ['id', 'name', 'participants', 'messageFlows', 'diagram'], 'collaboration');
+  if (!Array.isArray(collaboration.participants) ||
+    (collaboration.messageFlows != null && !Array.isArray(collaboration.messageFlows))) {
+    throw new TypeError('collaboration requires participant and message flow lists');
+  }
+  return { id: collaboration.id, ...(collaboration.name == null ? {} : { name: collaboration.name }),
+    participants: collaboration.participants.map((participant) => {
+      processKnownFields(participant, ['id', 'name', 'processRef'], 'participant');
+      const reference = participant.processRef;
+      if (reference != null) processKnownFields(reference, ['namespaceUri', 'processId'], 'participant process reference');
+      return { id: participant.id, ...(participant.name == null ? {} : { name: participant.name }),
+        ...(reference == null ? {} : { process_ref: { namespace_uri: reference.namespaceUri,
+          process_id: reference.processId } }) };
+    }),
+    ...(collaboration.messageFlows?.length ? { message_flows: collaboration.messageFlows.map((flow) => {
+      processKnownFields(flow, ['id', 'sourceRef', 'targetRef', 'messageRef'], 'message flow');
+      return { id: flow.id, source_ref: flow.sourceRef, target_ref: flow.targetRef,
+        ...(flow.messageRef == null ? {} : { message_ref: flow.messageRef }) };
+    }) } : {}),
+    diagram: processDiagram(collaboration.diagram),
+  };
+}
+
+function processModel(model, bodyType = 'primary') {
   if (!model || typeof model !== 'object') throw new TypeError('process model is required');
   const nodes = (model.nodes ?? []).map((node) => {
+    processKnownFields(node, ['id', 'name', 'kind', 'repeat', 'activityIo'], 'process node');
     const kind = node.kind;
     const repeat = processRepeatSpec(node.repeat);
     if (typeof kind === 'string') return { id: String(node.id), name: String(node.name ?? ''), kind,
-      ...(repeat === undefined ? {} : { repeat }) };
+      ...(repeat === undefined ? {} : { repeat }),
+      ...(node.activityIo == null ? {} : { activity_io: processActivityIo(node.activityIo) }) };
     if (!kind || typeof kind !== 'object') throw new TypeError('process node kind is required');
+    if (Object.keys(kind).length !== 1) throw new TypeError('process node kind requires one variant');
     const [tag, body] = Object.entries(kind)[0] ?? [];
     if (!tag || !body) throw new TypeError('process node kind is invalid');
     let fields;
@@ -574,6 +750,20 @@ function processModel(model, nested = false) {
         throw new TypeError('signal catch requires a declaration and output mapping');
       }
       fields = { signal_ref: body.signalRef, output_mapping: body.outputMapping };
+    } else if (tag === 'LinkThrow' || tag === 'LinkCatch') {
+      processKnownFields(body, ['definition'], 'link event');
+      const definition = body.definition;
+      processKnownFields(definition, ['id', 'name', 'sourceRefs', 'targetRef'], 'link definition');
+      if (typeof definition.id !== 'string' || typeof definition.name !== 'string'
+        || (definition.sourceRefs != null && (!Array.isArray(definition.sourceRefs)
+          || definition.sourceRefs.some((ref) => typeof ref !== 'string')))
+        || (definition.targetRef != null && typeof definition.targetRef !== 'string')) {
+        throw new TypeError('link definition requires an ID, name and typed references');
+      }
+      fields = { definition: { id: definition.id, name: definition.name,
+        ...(definition.sourceRefs?.length ? { source_refs: definition.sourceRefs } : {}),
+        ...(definition.targetRef == null ? {} : { target_ref: definition.targetRef }),
+      } };
     } else if (tag === 'BoundaryMessage') {
       processKnownFields(body, ['attachedToId', 'cancelActivity', 'messageRef', 'correlationExpression', 'outputMapping'], 'boundary message');
       fields = { attached_to_id: body.attachedToId, cancel_activity: body.cancelActivity,
@@ -592,19 +782,25 @@ function processModel(model, nested = false) {
         cancel_activity: body.cancelActivity, output_mapping: body.outputMapping ?? {} };
     } else if (tag === 'SubProcess') {
       processKnownFields(body, ['body', 'inputMapping', 'outputMapping'], 'subprocess');
-      fields = { body: processModel(body.body, true), input_mapping: body.inputMapping ?? {},
+      fields = { body: processModel(body.body, 'subprocess'), input_mapping: body.inputMapping ?? {},
         output_mapping: body.outputMapping ?? {} };
     } else if (tag === 'CallActivity') {
-      processKnownFields(body, ['calledDefinitionId', 'calledVersion', 'calledElement', 'inputMapping', 'outputMapping'], 'call activity');
-      processKnownFields(body.calledElement, ['namespaceUri', 'processId'], 'called element');
-      if (typeof body.calledDefinitionId !== 'string' || !Number.isInteger(body.calledVersion) ||
-          body.calledVersion < 1 || body.calledVersion > 4294967295 ||
-          typeof body.calledElement.namespaceUri !== 'string' || typeof body.calledElement.processId !== 'string') {
-        throw new TypeError('call activity requires an exact target definition, version and callable reference');
+      processKnownFields(body, ['calledDefinitionId', 'calledVersion', 'calledElement', 'localBody',
+        'inputMapping', 'outputMapping'], 'call activity');
+      const local = body.localBody != null;
+      const reference = local ? body.localBody : body.calledElement;
+      processKnownFields(reference, ['namespaceUri', 'processId'], 'called element');
+      if (typeof reference.namespaceUri !== 'string' || typeof reference.processId !== 'string'
+        || (local ? (body.calledDefinitionId != null || body.calledVersion != null || body.calledElement != null)
+          : (typeof body.calledDefinitionId !== 'string' || !Number.isInteger(body.calledVersion)
+            || body.calledVersion < 1 || body.calledVersion > 4294967295))) {
+        throw new TypeError('call activity requires one exact local or published target');
       }
-      fields = { called_definition_id: body.calledDefinitionId, called_version: body.calledVersion,
-        called_element: { namespace_uri: body.calledElement.namespaceUri, process_id: body.calledElement.processId },
-        input_mapping: body.inputMapping ?? {}, output_mapping: body.outputMapping ?? {} };
+      fields = { ...(local ? { local_body: { namespace_uri: reference.namespaceUri,
+        process_id: reference.processId } } : { called_definition_id: body.calledDefinitionId,
+        called_version: body.calledVersion, called_element: { namespace_uri: reference.namespaceUri,
+          process_id: reference.processId } }),
+      input_mapping: body.inputMapping ?? {}, output_mapping: body.outputMapping ?? {} };
     } else if (tag === 'ErrorEnd') {
       processKnownFields(body, ['errorRef'], 'error end');
       if (typeof body.errorRef !== 'string') throw new TypeError('error end requires a declaration');
@@ -613,31 +809,40 @@ function processModel(model, nested = false) {
       throw new TypeError(`unsupported process node kind ${tag}`);
     }
     return { id: String(node.id), name: String(node.name ?? ''), kind: { [tag]: fields },
-      ...(repeat === undefined ? {} : { repeat }) };
+      ...(repeat === undefined ? {} : { repeat }),
+      ...(node.activityIo == null ? {} : { activity_io: processActivityIo(node.activityIo) }) };
   });
-  const diagram = model.diagram ?? {};
   const graph = {
     nodes,
-    sequence_flows: (processField(model, 'sequenceFlows') ?? []).map((flow) => ({
-      id: String(flow.id), source_id: String(processField(flow, 'sourceId') ?? ''),
-      target_id: String(processField(flow, 'targetId') ?? ''),
-      condition: flow.condition ?? null,
-    })),
+    sequence_flows: (processField(model, 'sequenceFlows') ?? []).map((flow) => {
+      processKnownFields(flow, ['id', 'sourceId', 'targetId', 'condition', 'callStartNodeId'], 'sequence flow');
+      return { id: String(flow.id), source_id: String(processField(flow, 'sourceId') ?? ''),
+        target_id: String(processField(flow, 'targetId') ?? ''), condition: flow.condition ?? null,
+        ...(flow.callStartNodeId == null ? {} : { call_start_node_id: flow.callStartNodeId }) };
+    }),
     variables: model.variables ?? {},
-    diagram: {
-      shapes: (diagram.shapes ?? []).map((shape) => ({
-        element_id: String(processField(shape, 'elementId') ?? ''),
-        x: Number(shape.x), y: Number(shape.y), width: Number(shape.width), height: Number(shape.height),
-      })),
-      edges: (diagram.edges ?? []).map((edge) => ({
-        sequence_flow_id: String(processField(edge, 'sequenceFlowId') ?? ''),
-        waypoints: (edge.waypoints ?? []).map((point) => ({ x: Number(point.x), y: Number(point.y) })),
-      })),
-    },
+    diagram: processDiagram(model.diagram ?? {}),
   };
-  if (nested) {
-    processKnownFields(model, ['nodes', 'sequenceFlows', 'variables', 'diagram'], 'subprocess body');
-    return graph;
+  if (bodyType === 'subprocess') {
+    processKnownFields(model, ['nodes', 'sequenceFlows', 'variables', 'diagram', 'modeling'], 'subprocess body');
+    return { ...graph, ...(model.modeling == null ? {} : { modeling: processBodyModeling(model.modeling) }) };
+  }
+  if (bodyType === 'additional') {
+    processKnownFields(model, ['processId', 'processName', 'nodes', 'sequenceFlows', 'variables', 'diagram',
+      'timerTimezone', 'workCalendar', 'calendarPin', 'modeling'], 'additional process');
+    return { process_id: model.processId,
+      ...(model.processName == null ? {} : { process_name: model.processName }), ...graph,
+      ...(model.timerTimezone == null ? {} : { timer_timezone: model.timerTimezone }),
+      ...(model.workCalendar == null ? {} : { work_calendar: processWorkCalendar(model.workCalendar) }),
+      ...(model.calendarPin == null ? {} : { calendar_pin: processCalendarPin(model.calendarPin) }),
+      ...(model.modeling == null ? {} : { modeling: processBodyModeling(model.modeling) }) };
+  }
+  processKnownFields(model, ['schemaVersion', 'processId', 'nodes', 'sequenceFlows', 'variables', 'diagram',
+    'timerTimezone', 'workCalendar', 'calendarPin', 'messages', 'errors', 'targetNamespace', 'escalations',
+    'signals', 'processName', 'additionalProcesses', 'modeling', 'collaboration', 'dataStores'], 'process model');
+  if ((model.additionalProcesses != null && !Array.isArray(model.additionalProcesses)) ||
+    (model.dataStores != null && !Array.isArray(model.dataStores))) {
+    throw new TypeError('process bodies and data stores must be arrays');
   }
   return {
     schema_version: Number(processField(model, 'schemaVersion') ?? 1),
@@ -666,6 +871,20 @@ function processModel(model, nested = false) {
         || typeof signal.name !== 'string') throw new TypeError('invalid signal declaration');
       return { signal_id: signal.signalId, namespace_uri: signal.namespaceUri, name: signal.name };
     }) } : {}),
+    ...(model.processName == null ? {} : { process_name: model.processName }),
+    ...(model.additionalProcesses?.length ? { additional_processes: model.additionalProcesses.map((body) =>
+      processModel(body, 'additional')) } : {}),
+    ...(model.modeling == null ? {} : { modeling: processBodyModeling(model.modeling) }),
+    ...(model.collaboration == null ? {} : { collaboration: processCollaboration(model.collaboration) }),
+    ...(model.dataStores?.length ? { data_stores: model.dataStores.map((store) => {
+      processKnownFields(store, ['id', 'name', 'capacity', 'isUnlimited'], 'data store');
+      if (store.capacity != null && (!Number.isSafeInteger(store.capacity) || store.capacity < 0)) {
+        throw new TypeError('data store capacity must be a nonnegative safe integer');
+      }
+      return { id: store.id, ...(store.name == null ? {} : { name: store.name }),
+        ...(store.capacity == null ? {} : { capacity: store.capacity }),
+        ...(store.isUnlimited == null ? {} : { is_unlimited: store.isUnlimited }) };
+    }) } : {}),
   };
 }
 
@@ -679,7 +898,7 @@ function processRequestBody(variant, payload) {
     DefinitionArchiveRequest: ['commandId', 'definitionId', 'expectedRevision', 'archived'],
     VersionListRequest: ['definitionId', 'offset', 'limit'], VersionGetRequest: ['definitionId', 'version'],
     XmlImportRequest: ['xml'], XmlExportRequest: ['definitionId', 'version'],
-    InstanceStartRequest: ['commandId', 'definitionId', 'version', 'variables'],
+    InstanceStartRequest: ['commandId', 'definitionId', 'version', 'variables', 'processId', 'startNodeId'],
     InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId', 'pages'],
     UserTaskGetRequest: ['instanceId', 'userTaskId'],
     UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
@@ -693,16 +912,26 @@ function processRequestBody(variant, payload) {
     MessageResolveRequest: ['commandId', 'messageId', 'expectedRevision', 'instanceId', 'subscriptionId'],
     MessageCancelRequest: ['commandId', 'messageId', 'expectedRevision'],
     ScopeGetRequest: ['instanceId', 'scopeId'],
+    SimulationStartRequest: ['definitionId', 'version', 'selectedProcessId', 'startNodeId', 'variables',
+      'startMs', 'horizonMs', 'tickDurationMs'],
+    SimulationViewRequest: ['simulationId'],
+    SimulationAdvanceRequest: ['simulationId'],
+    SimulationUserTaskCompleteRequest: ['simulationId', 'userTaskId', 'outputs'],
+    SimulationManualTaskAcknowledgeRequest: ['simulationId', 'userTaskId'],
+    SimulationReleaseRequest: ['simulationId'],
   }[variant];
   if (!fieldNames) throw new TypeError(`unknown process request ${variant}`);
   for (const name of fieldNames) {
     const key = name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
     const value = processField(payload, name);
     if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)
+      && !(variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name))
       && !(variant === 'InstanceGetRequest' && name === 'pages')
       && !(variant === 'MessageListRequest' && name === 'instanceId')) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
+    if (variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name)
+      && value == null) continue;
     fields[key] = name === 'model' ? processModel(value)
       : (name === 'pages' ? processInstancePages(value)
         : (name === 'target' ? processMessageTarget(value)
@@ -794,6 +1023,24 @@ export const encode = {
   },
   processScopeGetRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'ScopeGetRequest', payload);
+  },
+  processSimulationStartRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationStartRequest', payload);
+  },
+  processSimulationViewRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationViewRequest', payload);
+  },
+  processSimulationAdvanceRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationAdvanceRequest', payload);
+  },
+  processSimulationUserTaskCompleteRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationUserTaskCompleteRequest', payload);
+  },
+  processSimulationManualTaskAcknowledgeRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationManualTaskAcknowledgeRequest', payload);
+  },
+  processSimulationReleaseRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationReleaseRequest', payload);
   },
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {

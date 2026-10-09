@@ -1727,6 +1727,7 @@ fn build_registry(
         Arc::new(crate::flow_engine::node_adapters::BusPublishNodeAdapter::new()),
         Arc::new(crate::flow_engine::node_adapters::BusTransformNodeAdapter::new()),
         Arc::new(OutputNodeAdapter::new()),
+        Arc::new(crate::flow_engine::node_adapters::ActivityResultNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
         Arc::new(CombineNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),

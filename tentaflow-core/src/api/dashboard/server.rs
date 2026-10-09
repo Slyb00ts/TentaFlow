@@ -1049,6 +1049,9 @@ pub fn build_app_state(
         live_handles,
         ui_sessions,
         progress_broker: crate::flow_engine::progress_broker::global_broker(),
+        simulation_registry: Arc::new(
+            crate::processes::simulation::SimulationRegistry::new(),
+        ),
         agent_run_manager: crate::agents::agent_run_manager_global(),
     });
     state

@@ -36,6 +36,7 @@ export function isAutoNodeLabel(label, nodeType, fallbackLabel = '') {
 // subagenta" nie mowi o nich nic. Typ zostaje na nodzie (ikona, kolor, znacznik)
 // i w podtytule inspektora, wiec nic nie ginie.
 const IDENTITY_CONFIG_KEY = { spawn: 'agent_name', await_subagents: 'run_ids_var' };
+const BPMN_LINK_EVENT_TYPES = new Set(['bpmn_link_throw', 'bpmn_link_catch']);
 
 /** Nazwa z konfiguracji bloku albo pusty string, gdy blok jej nie niesie. */
 export function getNodeIdentity(node) {
@@ -47,8 +48,11 @@ export function getNodeIdentity(node) {
 
 export function getNodeDisplayTitle(node, template = null) {
   if (!node) return '';
-  if (!isAutoNodeLabel(node.label, node.type, template?.label)) {
-    return node.label;
-  }
-  return getNodeIdentity(node) || getNodeName(node.type, template?.label);
+  const title = !isAutoNodeLabel(node.label, node.type, template?.label)
+    ? node.label
+    : getNodeIdentity(node) || getNodeName(node.type, template?.label);
+  if (!BPMN_LINK_EVENT_TYPES.has(node.type)) return title;
+  const definitionName = node.config?.definition?.name;
+  return typeof definitionName === 'string' && definitionName && definitionName !== title
+    ? `${title} · ${definitionName}` : title;
 }

@@ -23,12 +23,14 @@ pub(super) fn timer_bound_send_model(
             timer: ProcessTimerSpec::Duration { seconds: 1 },
         },
         repeat: None,
+        activity_io: None,
     });
     model.nodes.push(ProcessNode {
         id: "TimeoutEnd".into(),
         name: "Deadline reached".into(),
         kind: ProcessNodeKind::End,
         repeat: None,
+        activity_io: None,
     });
     model
         .sequence_flows
@@ -53,12 +55,14 @@ fn message_bound_send_model(
             output_mapping: BTreeMap::new(),
         },
         repeat: None,
+        activity_io: None,
     });
     model.nodes.push(ProcessNode {
         id: "MessageEnd".into(),
         name: "Interrupted".into(),
         kind: ProcessNodeKind::End,
         repeat: None,
+        activity_io: None,
     });
     model
         .sequence_flows
@@ -86,6 +90,7 @@ pub(super) fn noninterrupting_timer_script_send_model(
         name: "Timer branch completed".into(),
         kind: ProcessNodeKind::End,
         repeat: None,
+        activity_io: None,
     });
     model.sequence_flows.push(edge("ScriptEndFlow", "TimeoutEnd", "TimerBranchEnd"));
     model
@@ -1411,6 +1416,8 @@ fn archived_start_target_yields_one_finite_unavailable_incident_without_outbox()
     };
     *address = ProcessMessageTargetSpec::Start {
         definition_id: target.definition_id.clone(),
+        process_id: None,
+        start_node_id: None,
     };
     let source = publish_model(&fixture, &model);
     let pending = start_version(&fixture, &source);
@@ -1627,6 +1634,7 @@ fn admitted_called_child_outbox_survives_later_parent_cancellation() {
         kind: ProcessNodeKind::UserTask {
             assignee_user_id: None, output_mapping: BTreeMap::new(),
         }, repeat: None,
+        activity_io: None,
     });
     model.sequence_flows.iter_mut().find(|edge| edge.id == "ToEnd")
         .unwrap().target_id = "AfterSendWork".into();
@@ -2173,7 +2181,8 @@ fn called_embedded_parent_cancel_closes_live_grandchild_and_retains_prior_outbox
                 id: "AfterSendWork".into(), name: "Retain child after Send".into(),
                 kind: ProcessNodeKind::UserTask { assignee_user_id: None,
                     output_mapping: BTreeMap::new() }, repeat: None,
-            });
+                    activity_io: None,
+                });
             body.sequence_flows.iter_mut().find(|flow| flow.id == "ToEnd")
                 .unwrap().target_id = "AfterSendWork".into();
             body.sequence_flows.push(edge("WorkEnd", "AfterSendWork", "End_1"));

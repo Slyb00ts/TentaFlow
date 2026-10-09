@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,6 +32,158 @@ pub struct ProcessModel {
     pub escalations: Vec<ProcessEscalationDeclaration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<ProcessSignalDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_processes: Vec<ProcessExecutableProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeling: Option<ProcessBodyModeling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration: Option<ProcessCollaboration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_stores: Vec<ProcessDataStore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExecutableProcess {
+    pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    pub nodes: Vec<ProcessNode>,
+    pub sequence_flows: Vec<ProcessSequenceFlow>,
+    pub variables: BTreeMap<String, Value>,
+    pub diagram: ProcessDiagram,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_calendar: Option<ProcessWorkCalendar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_pin: Option<ProcessCalendarPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeling: Option<ProcessBodyModeling>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessBodyModeling {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lane_sets: Vec<ProcessLaneSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_objects: Vec<ProcessDataObject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_object_references: Vec<ProcessDataObjectReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_annotations: Vec<ProcessTextAnnotation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub associations: Vec<ProcessAssociation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_store_references: Vec<ProcessDataStoreReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessLaneSet {
+    pub id: String,
+    pub lanes: Vec<ProcessLane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessLane {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub flow_node_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_lane_sets: Vec<ProcessLaneSet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDataObject {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDataObjectReference {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub data_object_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variable_binding_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDataStore {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_unlimited: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDataStoreReference {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub data_store_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTextAnnotation {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessAssociation {
+    pub id: String,
+    pub source_ref: String,
+    pub target_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCollaboration {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub participants: Vec<ProcessParticipant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_flows: Vec<ProcessMessageFlow>,
+    pub diagram: ProcessDiagram,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessParticipant {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_ref: Option<ProcessCallableReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessMessageFlow {
+    pub id: String,
+    pub source_ref: String,
+    pub target_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,7 +220,13 @@ pub struct ProcessSignalDeclaration {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ProcessMessageTargetSpec {
-    Start { definition_id: String },
+    Start {
+        definition_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_node_id: Option<String>,
+    },
     Catch {
         definition_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +350,72 @@ pub struct ProcessNode {
     pub kind: ProcessNodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<ProcessRepeatSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_io: Option<ProcessActivityIo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessActivityIo {
+    pub data_inputs: Vec<ProcessIoDataInput>,
+    pub data_outputs: Vec<ProcessIoDataOutput>,
+    pub input_set_id: String,
+    pub input_set: Vec<String>,
+    pub output_set_id: String,
+    pub output_set: Vec<String>,
+    pub input_associations: Vec<ProcessInputAssociation>,
+    pub output_associations: Vec<ProcessOutputAssociation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_output: Option<ProcessCoordinatorOutputIo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCoordinatorOutputIo {
+    pub data_outputs: Vec<ProcessIoDataOutput>,
+    pub output_set_id: String,
+    pub output_set: Vec<String>,
+    pub output_associations: Vec<ProcessOutputAssociation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIoDataInput {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIoDataOutput {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub value_expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcessInputAssociation {
+    DirectRef {
+        id: String,
+        source_object_ref_id: String,
+        target_input_id: String,
+    },
+    CelAssignment {
+        id: String,
+        from_expression: String,
+        target_input_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessOutputAssociation {
+    pub id: String,
+    pub source_output_id: String,
+    pub target_object_ref_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +454,8 @@ pub struct ProcessSubProcess {
     pub sequence_flows: Vec<ProcessSequenceFlow>,
     pub variables: BTreeMap<String, Value>,
     pub diagram: ProcessDiagram,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modeling: Option<ProcessBodyModeling>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,6 +463,152 @@ pub struct ProcessSubProcess {
 pub struct ProcessCallableReference {
     pub namespace_uri: String,
     pub process_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessCallTarget {
+    PublishedBody {
+        definition_id: String,
+        version: u32,
+        called_element: ProcessCallableReference,
+    },
+    LocalBody {
+        called_element: ProcessCallableReference,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessCallActivity {
+    pub target: ProcessCallTarget,
+    pub input_mapping: BTreeMap<String, String>,
+    pub output_mapping: BTreeMap<String, String>,
+}
+
+impl Serialize for ProcessCallActivity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.target {
+            ProcessCallTarget::PublishedBody {
+                definition_id,
+                version,
+                called_element,
+            } => {
+                let mut call = serializer.serialize_struct("ProcessCallActivity", 5)?;
+                call.serialize_field("called_definition_id", definition_id)?;
+                call.serialize_field("called_version", version)?;
+                call.serialize_field("called_element", called_element)?;
+                call.serialize_field("input_mapping", &self.input_mapping)?;
+                call.serialize_field("output_mapping", &self.output_mapping)?;
+                call.end()
+            }
+            ProcessCallTarget::LocalBody { called_element } => {
+                let mut call = serializer.serialize_struct("ProcessCallActivity", 3)?;
+                call.serialize_field("local_body", called_element)?;
+                call.serialize_field("input_mapping", &self.input_mapping)?;
+                call.serialize_field("output_mapping", &self.output_mapping)?;
+                call.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessCallActivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CallVisitor;
+
+        impl<'de> Visitor<'de> for CallVisitor {
+            type Value = ProcessCallActivity;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("one published or local CallActivity target")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut definition_id: Option<String> = None;
+                let mut version: Option<u32> = None;
+                let mut called_element: Option<ProcessCallableReference> = None;
+                let mut local_body: Option<ProcessCallableReference> = None;
+                let mut input_mapping: Option<BTreeMap<String, String>> = None;
+                let mut output_mapping: Option<BTreeMap<String, String>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "called_definition_id" => {
+                            if definition_id.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("called_definition_id"));
+                            }
+                        }
+                        "called_version" => {
+                            if version.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("called_version"));
+                            }
+                        }
+                        "called_element" => {
+                            if called_element.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("called_element"));
+                            }
+                        }
+                        "local_body" => {
+                            if local_body.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("local_body"));
+                            }
+                        }
+                        "input_mapping" => {
+                            if input_mapping.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("input_mapping"));
+                            }
+                        }
+                        "output_mapping" => {
+                            if output_mapping.replace(map.next_value()?).is_some() {
+                                return Err(de::Error::duplicate_field("output_mapping"));
+                            }
+                        }
+                        _ => return Err(de::Error::unknown_field(&key, &[
+                            "called_definition_id", "called_version", "called_element",
+                            "local_body", "input_mapping", "output_mapping",
+                        ])),
+                    }
+                }
+                let target = if let Some(local_reference) = local_body {
+                    if definition_id.is_some() || version.is_some() || called_element.is_some() {
+                        return Err(de::Error::custom("local and published Call targets are mixed"));
+                    }
+                    ProcessCallTarget::LocalBody { called_element: local_reference }
+                } else {
+                    let definition_id = definition_id
+                        .ok_or_else(|| de::Error::missing_field("called_definition_id"))?;
+                    let version = version
+                        .ok_or_else(|| de::Error::missing_field("called_version"))?;
+                    if version == 0 {
+                        return Err(de::Error::custom("published Call version must be positive"));
+                    }
+                    let called_element = called_element
+                        .ok_or_else(|| de::Error::missing_field("called_element"))?;
+                    ProcessCallTarget::PublishedBody {
+                        definition_id,
+                        version,
+                        called_element,
+                    }
+                };
+                Ok(ProcessCallActivity {
+                    target,
+                    input_mapping: input_mapping
+                        .ok_or_else(|| de::Error::missing_field("input_mapping"))?,
+                    output_mapping: output_mapping
+                        .ok_or_else(|| de::Error::missing_field("output_mapping"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(CallVisitor)
+    }
 }
 
 fn deserialize_manual_assignee<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -311,13 +685,7 @@ pub enum ProcessNodeKind {
         input_mapping: BTreeMap<String, String>,
         output_mapping: BTreeMap<String, String>,
     },
-    CallActivity {
-        called_definition_id: String,
-        called_version: u32,
-        called_element: ProcessCallableReference,
-        input_mapping: BTreeMap<String, String>,
-        output_mapping: BTreeMap<String, String>,
-    },
+    CallActivity(ProcessCallActivity),
     ErrorEnd {
         error_ref: String,
     },
@@ -361,6 +729,23 @@ pub enum ProcessNodeKind {
         signal_ref: String,
         output_mapping: BTreeMap<String, String>,
     },
+    LinkThrow {
+        definition: ProcessLinkEventDefinition,
+    },
+    LinkCatch {
+        definition: ProcessLinkEventDefinition,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessLinkEventDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -446,12 +831,37 @@ pub struct ProcessSequenceFlow {
     pub source_id: String,
     pub target_id: String,
     pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_start_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProcessDiagram {
     pub shapes: Vec<ProcessShape>,
     pub edges: Vec<ProcessEdgeDiagram>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modeling_shapes: Vec<ProcessModelingShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modeling_edges: Vec<ProcessModelingEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessModelingShape {
+    pub di_id: String,
+    pub element_id: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessModelingEdge {
+    pub di_id: String,
+    pub element_id: String,
+    pub waypoints: Vec<ProcessPoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -636,6 +1046,21 @@ pub enum ProcessUserTaskStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProcessUserTaskInputValue {
+    Missing,
+    Present(Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessUserTaskInput {
+    pub position: u16,
+    pub declaration_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub value: ProcessUserTaskInputValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessUserTask {
     pub user_task_id: String,
     pub node_id: String,
@@ -651,6 +1076,8 @@ pub struct ProcessUserTask {
     pub scope_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_inputs: Vec<ProcessUserTaskInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -698,7 +1125,13 @@ pub struct ProcessIncident {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ProcessMessageTarget {
-    Start { definition_id: String },
+    Start {
+        definition_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_node_id: Option<String>,
+    },
     Catch {
         definition_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -985,6 +1418,98 @@ pub struct ProcessMessageStartSummary {
     pub can_send: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProcessStartCatalogEntry {
+    pub process_id: String,
+    pub process_name: Option<String>,
+    pub start_node_id: String,
+    pub start_node_name: String,
+    pub version: u32,
+    pub trigger: ProcessStartTrigger,
+}
+
+#[derive(Deserialize)]
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de> Deserialize<'de> for ProcessStartCatalogEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            process_id: String,
+            process_name: RequiredNullable<String>,
+            start_node_id: String,
+            start_node_name: String,
+            version: u32,
+            trigger: ProcessStartTrigger,
+        }
+        let value = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            process_id: value.process_id,
+            process_name: value.process_name.0,
+            start_node_id: value.start_node_id,
+            start_node_name: value.start_node_name,
+            version: value.version,
+            trigger: value.trigger,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ProcessStartTrigger {
+    Start { can_start: bool },
+    MessageStart {
+        message_ref: String,
+        message_name: String,
+        can_send: bool,
+    },
+    TimerStart {
+        timer: ProcessTimerSpec,
+        timezone: String,
+        working_time: Option<ProcessWorkingTimeSummary>,
+        persisted_timer: Option<ProcessTimerSummary>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ProcessStartTrigger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        enum Wire {
+            Start { can_start: bool },
+            MessageStart {
+                message_ref: String,
+                message_name: String,
+                can_send: bool,
+            },
+            TimerStart {
+                timer: ProcessTimerSpec,
+                timezone: String,
+                working_time: RequiredNullable<ProcessWorkingTimeSummary>,
+                persisted_timer: RequiredNullable<ProcessTimerSummary>,
+            },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Start { can_start } => Self::Start { can_start },
+            Wire::MessageStart { message_ref, message_name, can_send } =>
+                Self::MessageStart { message_ref, message_name, can_send },
+            Wire::TimerStart { timer, timezone, working_time, persisted_timer } =>
+                Self::TimerStart {
+                    timer,
+                    timezone,
+                    working_time: working_time.0,
+                    persisted_timer: persisted_timer.0,
+                },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSubscriptionSummary {
@@ -1065,6 +1590,8 @@ pub struct ProcessInstance {
     pub repetition_groups: Vec<ProcessRepetitionGroupSummary>,
     pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
     pub selected_repetition_occurrence: Option<ProcessRepetitionOccurrenceDetail>,
+    pub process_id: String,
+    pub start_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1080,6 +1607,7 @@ pub struct ProcessInstanceSummary {
     pub updated_at_ms: i64,
     pub can_cancel: bool,
     pub can_retry: bool,
+    pub process_id: String,
 }
 
 impl From<&ProcessInstance> for ProcessInstanceSummary {
@@ -1096,6 +1624,7 @@ impl From<&ProcessInstance> for ProcessInstanceSummary {
             updated_at_ms: value.updated_at_ms,
             can_cancel: value.can_cancel,
             can_retry: value.can_retry,
+            process_id: value.process_id.clone(),
         }
     }
 }
@@ -1172,6 +1701,68 @@ pub struct ProcessOptionFlow {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationSource {
+    pub simulation_id: String,
+    pub definition_id: String,
+    pub version: u32,
+    pub model_sha256: String,
+    pub selected_process_id: String,
+    pub start_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationClock {
+    pub start_ms: i64,
+    pub now_ms: i64,
+    pub horizon_ms: i64,
+    pub tick_duration_ms: i64,
+    pub step_index: u64,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationEvent {
+    pub event_id: String,
+    pub seq: u64,
+    pub at_ms: i64,
+    pub kind: String,
+    pub node_id: Option<String>,
+    pub actor_user_id: Option<String>,
+    pub data: Value,
+    pub scope_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationTraceStep {
+    pub trace_step_id: String,
+    pub ordinal: u64,
+    pub action: String,
+    pub at_ms: i64,
+    pub request_sha256: String,
+    pub result_sha256: String,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationView {
+    pub simulation_id: String,
+    pub source: ProcessSimulationSource,
+    pub clock: ProcessSimulationClock,
+    pub instance: Option<ProcessInstance>,
+    pub user_tasks: Vec<ProcessUserTask>,
+    pub timers: Vec<ProcessTimerSummary>,
+    pub incidents: Vec<ProcessIncident>,
+    pub events: Vec<ProcessSimulationEvent>,
+    pub trace_steps: Vec<ProcessSimulationTraceStep>,
+    pub activity_io_witnesses: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProcessPayload {
     OptionsRequest {},
     OptionsResponse {
@@ -1192,10 +1783,7 @@ pub enum ProcessPayload {
     },
     DefinitionGetResponse {
         definition: ProcessDefinition,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timer_start: Option<ProcessTimerSummary>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        message_start: Option<ProcessMessageStartSummary>,
+        start_catalog: Vec<ProcessStartCatalogEntry>,
     },
     DefinitionSaveRequest {
         command_id: String,
@@ -1244,6 +1832,7 @@ pub enum ProcessPayload {
     },
     VersionGetResponse {
         version: ProcessVersion,
+        start_catalog: Vec<ProcessStartCatalogEntry>,
     },
     XmlImportRequest {
         xml: String,
@@ -1264,6 +1853,10 @@ pub enum ProcessPayload {
         definition_id: String,
         version: u32,
         variables: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_node_id: Option<String>,
     },
     InstanceStartResponse {
         instance: ProcessInstance,
@@ -1397,6 +1990,52 @@ pub enum ProcessPayload {
     ManualTaskAcknowledgeResponse {
         instance: ProcessInstance,
     },
+    SimulationStartRequest {
+        definition_id: String,
+        version: u32,
+        selected_process_id: String,
+        start_node_id: String,
+        variables: Value,
+        start_ms: i64,
+        horizon_ms: i64,
+        tick_duration_ms: i64,
+    },
+    SimulationStartResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationViewRequest {
+        simulation_id: String,
+    },
+    SimulationViewResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationAdvanceRequest {
+        simulation_id: String,
+    },
+    SimulationAdvanceResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationUserTaskCompleteRequest {
+        simulation_id: String,
+        user_task_id: String,
+        outputs: Value,
+    },
+    SimulationUserTaskCompleteResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationManualTaskAcknowledgeRequest {
+        simulation_id: String,
+        user_task_id: String,
+    },
+    SimulationManualTaskAcknowledgeResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationReleaseRequest {
+        simulation_id: String,
+    },
+    SimulationReleaseResponse {
+        simulation_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -1458,7 +2097,7 @@ mod tests {
             name: "Review & approve".into(),
             escalation_code: "NEEDS.HUMAN".into(),
         });
-        model.nodes.push(ProcessNode { repeat: None,
+        model.nodes.push(ProcessNode { repeat: None, activity_io: None,
             id: "Boundary_1".into(),
             name: "Review".into(),
             kind: ProcessNodeKind::BoundaryEscalation {
@@ -1586,6 +2225,7 @@ mod tests {
             target_namespace: None,
             escalations: Vec::new(),
             signals: Vec::new(),
+            process_name: None, additional_processes: Vec::new(), modeling: None, collaboration: None, data_stores: Vec::new(),
         };
         assert_eq!(serde_json::to_string(&old).unwrap(),
             "{\"schema_version\":1,\"process_id\":\"P_1\",\"nodes\":[],\"sequence_flows\":[],\"variables\":{},\"diagram\":{\"shapes\":[],\"edges\":[]}}");
@@ -1593,7 +2233,7 @@ mod tests {
         model.messages.push(ProcessMessageDeclaration { message_id: "Message_1".into(), name: "order.received".into() });
         model.errors.push(ProcessErrorDeclaration { error_id: "Error_1".into(), name: "Validation".into(), error_code: "BUSINESS.INVALID".into() });
         model.target_namespace = Some("urn:example:orders".into());
-        model.nodes.push(ProcessNode { repeat: None, id: "Start_1".into(), name: "Start".into(), kind: ProcessNodeKind::MessageStart {
+        model.nodes.push(ProcessNode { repeat: None, activity_io: None, id: "Start_1".into(), name: "Start".into(), kind: ProcessNodeKind::MessageStart {
             message_ref: "Message_1".into(), output_mapping: BTreeMap::from([("business_key".into(), "outputs.customer_ID".into())]),
         } });
         for kind in [
@@ -1605,11 +2245,11 @@ mod tests {
             ProcessNodeKind::EventBasedGateway,
             ProcessNodeKind::BoundaryError { attached_to_id: "Task_1".into(), error_ref: Some("Error_1".into()), output_mapping: BTreeMap::new() },
         ] {
-            model.nodes.push(ProcessNode { repeat: None, id: format!("Node_{}", model.nodes.len()), name: String::new(), kind });
+            model.nodes.push(ProcessNode { repeat: None, activity_io: None, id: format!("Node_{}", model.nodes.len()), name: String::new(), kind });
         }
         assert_eq!(crate::cbor::decode::<ProcessModel>(&crate::cbor::encode(&model).unwrap()).unwrap(), model);
         let request = ProcessPayload::MessageSendRequest { command_id: "cmd".into(), message_id: "msg".into(),
-            target: ProcessMessageTarget::Start { definition_id: "def".into() }, message_name: "order.received".into(),
+            target: ProcessMessageTarget::Start { definition_id: "def".into(), process_id: None, start_node_id: None }, message_name: "order.received".into(),
             correlation_key: "key".into(), payload: serde_json::json!({"customer_ID":{"attached_to_id":null}}), ttl_seconds: 60 };
         assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&request).unwrap()).unwrap(), request);
         assert!(serde_json::from_value::<ProcessMessageDeclaration>(serde_json::json!({"message_id":"M","name":"N","unknown":true})).is_err());
@@ -1620,7 +2260,7 @@ mod tests {
     fn available_json_null_message_payload_remains_distinct_from_unavailable_payload() {
         let summary = ProcessMessageSummary {
             message_id: "m".into(), sender_user_id: "u".into(), origin: ProcessMessageOrigin::Api,
-            target: ProcessMessageTarget::Start { definition_id: "d".into() },
+            target: ProcessMessageTarget::Start { definition_id: "d".into(), process_id: None, start_node_id: None },
             message_name: "order.received".into(), correlation_key: "key".into(), revision: 1,
             status: ProcessMessageStatus::Pending, received_at_ms: 1, expires_at_ms: 2,
             updated_at_ms: 1, delivered_at_ms: None, matched_instance_id: None,
@@ -1651,7 +2291,7 @@ mod tests {
             "updated_at_ms": 1, "can_cancel": true, "can_retry": false,
             "can_send_message": true, "calls": [],
             "repetition_groups": [], "repetition_occurrences": [],
-            "selected_repetition_occurrence": null
+            "selected_repetition_occurrence": null, "process_id":"P_1", "start_node_id":"Start_1"
         })).unwrap();
         let body = crate::message_body::MessageBody::ProcessBody(
             ProcessPayload::InstanceGetResponse { instance },
@@ -1684,6 +2324,7 @@ mod tests {
             target_namespace: None,
             escalations: Vec::new(),
             signals: Vec::new(),
+            process_name: None, additional_processes: Vec::new(), modeling: None, collaboration: None, data_stores: Vec::new(),
         };
         let baseline = serde_json::json!({"schema_version":1,"process_id":"P_1","nodes":[],"sequence_flows":[],"variables":{},"diagram":{"shapes":[],"edges":[]}});
         assert_eq!(serde_json::to_value(&timerless).unwrap(), baseline);
@@ -1698,7 +2339,7 @@ mod tests {
             let node_kind = if kind == "TimerCatch" { ProcessNodeKind::TimerCatch { timer } } else { ProcessNodeKind::TimerStart { timer } };
             let mut model = timerless.clone();
             model.timer_timezone = Some("Europe/Warsaw".into());
-            model.nodes.push(ProcessNode { repeat: None, id: "Start_1".into(), name: "Start".into(), kind: node_kind });
+            model.nodes.push(ProcessNode { repeat: None, activity_io: None, id: "Start_1".into(), name: "Start".into(), kind: node_kind });
             let bytes = crate::cbor::encode(&model).unwrap();
             let decoded: ProcessModel = crate::cbor::decode(&bytes).unwrap();
             assert_eq!(decoded, model);
@@ -1746,7 +2387,7 @@ mod tests {
             model: ProcessModel {
                 schema_version: 1,
                 process_id: "Process_1".into(),
-                nodes: vec![ProcessNode { repeat: None,
+                nodes: vec![ProcessNode { repeat: None, activity_io: None,
                     id: "Start_1".into(),
                     name: "Start".into(),
                     kind: ProcessNodeKind::Start,
@@ -1762,6 +2403,7 @@ mod tests {
                 target_namespace: None,
                 escalations: Vec::new(),
                 signals: Vec::new(),
+            process_name: None, additional_processes: Vec::new(), modeling: None, collaboration: None, data_stores: Vec::new(),
             },
         };
         let bytes = crate::cbor::encode(&payload).unwrap();
@@ -1814,6 +2456,7 @@ mod tests {
             token_id: None,
             scope_id: "i1".into(),
             instructions: None,
+            activity_inputs: Vec::new(),
         };
         let summary = ProcessUserTaskSummary::from(&task);
         let summary_json = serde_json::to_value(&summary).unwrap();
@@ -1828,6 +2471,40 @@ mod tests {
             3
         );
         assert!(detail["UserTaskGetResponse"]["task"].get("instructions").is_none());
+    }
+
+    #[test]
+    fn user_task_detail_round_trips_sixteen_near_limit_activity_inputs() {
+        let value = Value::String("x".repeat(256 * 1024 - 64));
+        let task = ProcessUserTask {
+            user_task_id: "task-large".into(),
+            node_id: "Review_1".into(),
+            name: "Review".into(),
+            assignee_user_id: "user-1".into(),
+            kind: ProcessUserTaskKind::Work,
+            status: ProcessUserTaskStatus::Open,
+            outputs: Value::Null,
+            revision: 1,
+            can_complete: true,
+            token_id: Some("waiting-1".into()),
+            scope_id: "i1".into(),
+            instructions: None,
+            activity_inputs: (0..16)
+                .map(|position| ProcessUserTaskInput {
+                    position,
+                    declaration_id: format!("input_{position}"),
+                    name: Some(format!("Input {position}")),
+                    value: ProcessUserTaskInputValue::Present(value.clone()),
+                })
+                .collect(),
+        };
+        let payload = ProcessPayload::UserTaskGetResponse { task: task.clone() };
+        let encoded = crate::cbor::encode(&payload).unwrap();
+        assert!(encoded.len() > 4 * 1024 * 1024);
+        let decoded: ProcessPayload = crate::cbor::decode(&encoded).unwrap();
+        assert_eq!(decoded, payload);
+        let summary = ProcessUserTaskSummary::from(&task);
+        assert!(serde_json::to_value(summary).unwrap().get("activity_inputs").is_none());
     }
 
     #[test]
@@ -1958,6 +2635,7 @@ mod tests {
             outputs: Value::Null, revision: 2, can_complete: false, token_id: None,
             scope_id: "i1".into(),
             instructions: None,
+            activity_inputs: Vec::new(),
         };
         assert!(serde_json::to_value(&older_task).unwrap().get("token_id").is_none());
         assert!(serde_json::to_value(&older_task).unwrap().get("instructions").is_none());
@@ -1975,13 +2653,13 @@ mod tests {
     fn embedded_scope_body_and_detail_round_trip_without_rewriting_opaque_variables() {
         let body = ProcessSubProcess {
             nodes: vec![
-                ProcessNode { repeat: None, id: "Child_Start".into(), name: "Enter".into(), kind: ProcessNodeKind::Start },
-                ProcessNode { repeat: None, id: "Child_End".into(), name: "Leave".into(), kind: ProcessNodeKind::End },
+                ProcessNode { repeat: None, activity_io: None, id: "Child_Start".into(), name: "Enter".into(), kind: ProcessNodeKind::Start },
+                ProcessNode { repeat: None, activity_io: None, id: "Child_End".into(), name: "Leave".into(), kind: ProcessNodeKind::End },
             ],
             sequence_flows: vec![ProcessSequenceFlow { id: "Child_Flow".into(),
-                source_id: "Child_Start".into(), target_id: "Child_End".into(), condition: None }],
+                source_id: "Child_Start".into(), target_id: "Child_End".into(), condition: None, call_start_node_id: None }],
             variables: BTreeMap::from([("customer_ID".into(), serde_json::json!({"original_key": 7}))]),
-            diagram: ProcessDiagram::default(),
+            diagram: ProcessDiagram::default(), modeling: None,
         };
         let kind = ProcessNodeKind::SubProcess { body, input_mapping: BTreeMap::from([
             ("local_ID".into(), "vars.customer_ID".into()),
@@ -2011,13 +2689,17 @@ mod tests {
             namespace_uri: "urn:example:approval:v1".into(),
             process_id: "Approval_1".into(),
         };
-        let call = ProcessNodeKind::CallActivity {
-            called_definition_id: "da53c1fd-c235-40ec-bde1-44cf57bb620d".into(),
-            called_version: 7,
-            called_element: reference.clone(),
+        let call = ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::PublishedBody {
+                definition_id: "da53c1fd-c235-40ec-bde1-44cf57bb620d".into(),
+                version: 7,
+                called_element: reference.clone(),
+            },
             input_mapping: BTreeMap::from([("customer_ID".into(), "vars.customer_ID".into())]),
             output_mapping: BTreeMap::from([("approved_value".into(), "outputs.business_key".into())]),
-        };
+        });
+        assert_eq!(serde_json::to_string(&call).unwrap(),
+            r#"{"CallActivity":{"called_definition_id":"da53c1fd-c235-40ec-bde1-44cf57bb620d","called_version":7,"called_element":{"namespace_uri":"urn:example:approval:v1","process_id":"Approval_1"},"input_mapping":{"customer_ID":"vars.customer_ID"},"output_mapping":{"approved_value":"outputs.business_key"}}}"#);
         assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&call).unwrap()).unwrap(), call);
         let json = serde_json::to_value(&call).unwrap();
         assert_eq!(json["CallActivity"]["called_element"]["namespace_uri"], "urn:example:approval:v1");
@@ -2028,9 +2710,48 @@ mod tests {
                 "called_element": {"namespace_uri": "urn:test", "process_id": "P", "unknown": true},
                 "input_mapping": {}, "output_mapping": {}}
         })).is_err());
+        for invalid in [
+            r#"{"CallActivity":{"local_body":{"namespace_uri":"urn:test","process_id":"P"},"called_definition_id":"d","input_mapping":{},"output_mapping":{}}}"#,
+            r#"{"CallActivity":{"local_body":{"namespace_uri":"urn:test","process_id":"P"},"local_body":{"namespace_uri":"urn:test","process_id":"Q"},"input_mapping":{},"output_mapping":{}}}"#,
+            r#"{"CallActivity":{"called_definition_id":"d","called_version":7,"called_element":{"namespace_uri":"urn:test","process_id":"P"},"input_mapping":{}}}"#,
+            r#"{"CallActivity":{"called_definition_id":"d","called_version":0,"called_element":{"namespace_uri":"urn:test","process_id":"P"},"input_mapping":{},"output_mapping":{}}}"#,
+            r#"{"CallActivity":{"local_body":{"namespace_uri":"urn:test","process_id":"P"},"input_mapping":{},"output_mapping":{},"unknown":1}}"#,
+        ] {
+            assert!(serde_json::from_str::<ProcessNodeKind>(invalid).is_err());
+        }
+        let local = ProcessNodeKind::CallActivity(ProcessCallActivity {
+            target: ProcessCallTarget::LocalBody { called_element: reference.clone() },
+            input_mapping: BTreeMap::new(), output_mapping: BTreeMap::new(),
+        });
+        assert_eq!(serde_json::to_string(&local).unwrap(),
+            r#"{"CallActivity":{"local_body":{"namespace_uri":"urn:example:approval:v1","process_id":"Approval_1"},"input_mapping":{},"output_mapping":{}}}"#);
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&local).unwrap()).unwrap(), local);
         let error_end = ProcessNodeKind::ErrorEnd { error_ref: "Error_1".into() };
         assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&error_end).unwrap()).unwrap(), error_end);
         assert_eq!(reference.process_id, "Approval_1");
+    }
+
+    #[test]
+    fn start_catalog_keeps_body_identity_and_absent_process_name_distinct() {
+        let entry = ProcessStartCatalogEntry {
+            process_id: "Approval_1".into(),
+            process_name: None,
+            start_node_id: "Start_1".into(),
+            start_node_name: "Begin".into(),
+            version: 7,
+            trigger: ProcessStartTrigger::MessageStart {
+                message_ref: "Message_1".into(),
+                message_name: "approval.requested".into(),
+                can_send: true,
+            },
+        };
+        assert_eq!(serde_json::to_string(&entry).unwrap(),
+            r#"{"process_id":"Approval_1","process_name":null,"start_node_id":"Start_1","start_node_name":"Begin","version":7,"trigger":{"MessageStart":{"message_ref":"Message_1","message_name":"approval.requested","can_send":true}}}"#);
+        assert_eq!(crate::cbor::decode::<ProcessStartCatalogEntry>(
+            &crate::cbor::encode(&entry).unwrap()).unwrap(), entry);
+        let mut authored_empty = entry;
+        authored_empty.process_name = Some(String::new());
+        assert_eq!(serde_json::to_value(&authored_empty).unwrap()["process_name"], "");
     }
 
     #[test]
@@ -2050,6 +2771,7 @@ mod tests {
             target_namespace: None,
             escalations: Vec::new(),
             signals: Vec::new(),
+            process_name: None, additional_processes: Vec::new(), modeling: None, collaboration: None, data_stores: Vec::new(),
         };
         let version = ProcessVersion {
             definition_id: "definition".into(),
@@ -2090,7 +2812,7 @@ mod tests {
             scopes: Vec::new(), calls: vec![ProcessCallSummary::Incoming { parent: None }],
             terminal_error: Some(terminal_error),
             repetition_groups: Vec::new(), repetition_occurrences: Vec::new(),
-            selected_repetition_occurrence: None,
+            selected_repetition_occurrence: None, process_id: "P_1".into(), start_node_id: "Start_1".into(),
         };
         let encoded = crate::cbor::encode(&instance).unwrap();
         assert_eq!(crate::cbor::decode::<ProcessInstance>(&encoded).unwrap(), instance);

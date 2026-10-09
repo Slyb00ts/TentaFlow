@@ -10,10 +10,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, PinnedFlowInfo, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
-    ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
+    ProcessCallActivity, ProcessCallTarget, ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
     ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection, ProcessInstance,
     ProcessInstancePageInfo, ProcessInstancePageRequest, ProcessInstanceStatus,
-    ProcessInstanceSummary, ProcessMessageDetail, ProcessMessageOrigin, ProcessMessageStartSummary,
+    ProcessInstanceSummary, ProcessStartCatalogEntry, ProcessStartTrigger, ProcessMessageDetail, ProcessMessageOrigin,
     ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessModel, ProcessNode,
     ProcessNodeKind, ProcessPageInfo, ProcessPageSpec, ProcessPayload, ProcessRelatedInstance,
     ProcessRepetitionGroupMode, ProcessRepetitionGroupStatus, ProcessRepetitionGroupSummary,
@@ -21,13 +21,17 @@ use tentaflow_protocol::processes::{
     ProcessRepetitionOccurrenceSummary, ProcessRepetitionValueKind, ProcessActivityResultOrigin,
     ProcessScopeSummary, ProcessSubscriptionKind, ProcessSubscriptionStatus,
     ProcessSubscriptionSummary, ProcessTerminalError, ProcessTimerKind, ProcessTimerSpec,
-    ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask, ProcessUserTaskKind,
-    ProcessUserTaskStatus, ProcessUserTaskSummary, ProcessVersion, ProcessVersionSummary,
+    ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask, ProcessUserTaskInput,
+    ProcessUserTaskInputValue, ProcessUserTaskKind, ProcessUserTaskStatus,
+    ProcessUserTaskSummary, ProcessVersion, ProcessVersionSummary,
 };
 use uuid::Uuid;
 
 use super::model::{starter_model, validate_model, validate_variables, GatewayKind, MAX_MODEL_BYTES};
 use super::runtime::validate_output;
+use super::simulation::{
+    self, AuthenticatedSimulationAction, AuthenticatedSimulationSource, SimulationSourcePin,
+};
 use crate::db::DbPool;
 
 #[cfg(test)]
@@ -94,12 +98,15 @@ pub struct CallActivation {
     pub parent_instance_id: String,
     pub parent_scope_id: String,
     pub parent_token_id: String,
+    pub parent_arrival_edge_id: String,
     pub call_node_id: String,
     pub child_instance_id: String,
     pub definition_id: String,
     pub version: u32,
     pub called_definition_id: String,
     pub called_version: u32,
+    pub called_process_id: String,
+    pub child_start_node_id: String,
     pub model_sha256: String,
     pub revision: u64,
     pub status: ProcessCallStatus,
@@ -120,6 +127,7 @@ pub struct CallRequest {
     pub call_id: String,
     pub parent_scope_id: String,
     pub parent_token_id: String,
+    pub parent_arrival_edge_id: String,
     pub call_node_id: String,
     pub child_instance_id: String,
     pub variables: Value,
@@ -147,6 +155,7 @@ pub enum CallStep {
     Advance {
         instance_id: String,
         expected_revision: u64,
+        request: CallRequest,
         plan: Box<RuntimePlan>,
     },
 }
@@ -226,6 +235,30 @@ pub struct ProcessJob {
     pub lease_until_ms: Option<i64>,
     pub result: Option<ActivityResult>,
     pub result_origin: Option<ActivityResultOrigin>,
+    pub observed_result_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDispatchFact {
+    pub invocation_id: String,
+    pub job_id: String,
+    pub scope_id: String,
+    pub node_id: String,
+    pub token_id: String,
+    pub phase: String,
+    pub attempt: u32,
+    pub fence: u64,
+    pub worker_id: String,
+    pub reserved_result_event_id: Option<String>,
+    pub uncertainty_incident_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosedServiceDispatch {
+    pub source: ServiceDispatchFact,
+    pub incident_id: String,
+    pub event_index: usize,
+    pub infrastructure_incident_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +456,8 @@ pub enum MessageDeliveryTarget {
         actor: ProcessActor,
         version: ProcessVersion,
         instance_id: String,
+        process_id: String,
+        start_node_id: String,
     },
     Catch {
         actor: ProcessActor,
@@ -443,6 +478,7 @@ pub struct ProcessTimer {
     pub org_id: String,
     pub definition_id: String,
     pub version: u32,
+    pub start_process_id: Option<String>,
     pub node_id: String,
     pub kind: ProcessTimerKind,
     pub instance_id: Option<String>,
@@ -470,6 +506,7 @@ pub struct DueTimer {
     pub org_id: String,
     pub definition_id: String,
     pub version: u32,
+    pub start_process_id: Option<String>,
     pub instance_id: Option<String>,
     pub token_id: Option<String>,
     pub occurrence: u64,
@@ -516,6 +553,7 @@ pub struct RuntimeSnapshot {
     pub user_tasks: Vec<ProcessUserTask>,
     pub tokens: Vec<ProcessToken>,
     pub jobs: Vec<ProcessJob>,
+    pub service_dispatches: Vec<ServiceDispatchFact>,
     pub receipts: Vec<GatewayReceipt>,
     pub service_snapshots: Vec<PinnedServiceSnapshot>,
     pub timers: Vec<ProcessTimer>,
@@ -530,6 +568,47 @@ pub struct RuntimeSnapshot {
     pub retained_scope_count: usize,
     pub repetition_groups: Vec<RepetitionGroup>,
     pub repetition_occurrences: Vec<RepetitionOccurrence>,
+    pub activity_io_witnesses: Vec<ActivityIoWitness>,
+    pub end_sources: Vec<ProcessEndSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessEndSource {
+    pub event_id: String,
+    pub scope_id: String,
+    pub node_id: String,
+    pub source_token_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityIoWitness {
+    pub witness_id: String,
+    pub scope_id: String,
+    pub node_id: String,
+    pub token_id: String,
+    pub activity_kind: String,
+    pub phase_owner: String,
+    pub phase: String,
+    pub revision: u64,
+    pub input_event_id: Option<String>,
+    pub input_values: Option<Vec<IoObservedInput>>,
+    pub input_sha256: Option<String>,
+    pub result_event_id: Option<String>,
+    pub source_instance_id: Option<String>,
+    pub source_event_id: Option<String>,
+    pub result_sources: Option<Vec<String>>,
+    pub result_presence: Option<String>,
+    pub result: Option<Value>,
+    pub result_sha256: Option<String>,
+    pub retained_route_kind: Option<String>,
+    pub retained_route_event_id: Option<String>,
+    pub retained_route_resource_id: Option<String>,
+    pub service_invocation_id: Option<String>,
+    pub incident_id: Option<String>,
+    pub resource_id: Option<String>,
+    pub group_id: Option<String>,
+    pub occurrence_id: Option<String>,
+    pub ordinal: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +676,134 @@ pub struct PlannedEvent {
     pub data: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IoObservedValue {
+    Missing,
+    Present { value: Value },
+}
+
+pub(super) fn activity_io_result_sha256(value: &IoObservedValue) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IoObservedInput {
+    pub position: usize,
+    pub declaration_id: String,
+    pub association_id: String,
+    pub source_object_ref_id: Option<String>,
+    pub observed: IoObservedValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IoObservedOutput {
+    pub position: usize,
+    pub declaration_id: String,
+    pub association_id: String,
+    pub target_object_ref_id: String,
+    pub variable_binding_key: String,
+    pub observed: IoObservedValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActivityIoInputFact {
+    Captured {
+        witness_id: String,
+        scope_id: String,
+        node_id: String,
+        source_token_id: String,
+        activation_token_id: String,
+        event_index: usize,
+        inputs: Vec<IoObservedInput>,
+        group_id: Option<String>,
+        occurrence_id: Option<String>,
+        ordinal: Option<u32>,
+    },
+    Failed {
+        witness_id: String,
+        scope_id: String,
+        node_id: String,
+        source_token_id: String,
+        waiting_token_id: String,
+        incident_event_index: usize,
+        incident_id: String,
+        association_id: String,
+        position: usize,
+        group_id: Option<String>,
+        occurrence_id: Option<String>,
+        ordinal: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityIoRetainedFate {
+    ScriptMappingFailure,
+    ScopeReturnFailure { incident_id: String },
+    AwaitingVerification { user_task_id: String },
+    BoundaryError { subscription_id: String },
+    BoundaryEscalation { subscription_id: String },
+    UnhandledError,
+    UnhandledEscalation,
+    VerificationRejected { user_task_id: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActivityIoResultDisposition {
+    Applied {
+        output_event_index: usize,
+        ordered_outputs: Vec<IoObservedOutput>,
+        local_patch: Value,
+    },
+    Blocked {
+        incident_event_index: usize,
+        incident_id: String,
+        association_id: Option<String>,
+        position: Option<usize>,
+    },
+    Retained {
+        fate: ActivityIoRetainedFate,
+        route_event_index: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityIoResultFact {
+    pub witness_id: String,
+    pub scope_id: String,
+    pub node_id: String,
+    pub token_id: String,
+    pub result_event_index: usize,
+    pub source_instance_id: String,
+    pub source_event_id: String,
+    pub result_sources: Vec<String>,
+    pub observed: IoObservedValue,
+    pub accepted_origin: Option<ActivityResultOrigin>,
+    pub resource_id: Option<String>,
+    pub resource_revision: Option<u64>,
+    pub service_invocation_id: Option<String>,
+    pub child_scope_id: Option<String>,
+    pub call_id: Option<String>,
+    pub child_instance_id: Option<String>,
+    pub child_expected_revision: Option<u64>,
+    pub child_status: Option<String>,
+    pub parent_wait_token_id: Option<String>,
+    pub disposition: ActivityIoResultDisposition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityIoContinuationFact {
+    pub witness_id: String,
+    pub expected_witness_revision: u64,
+    pub scope_id: String,
+    pub node_id: String,
+    pub token_id: String,
+    pub user_task_id: String,
+    pub approval_event_index: usize,
+    pub observed: IoObservedValue,
+    pub disposition: ActivityIoResultDisposition,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StartInputRef {
     Manual { command_id: String, request_hash: String },
@@ -607,12 +814,15 @@ pub enum StartInputRef {
         parent_instance_id: String,
         parent_scope_id: String,
         parent_token_id: String,
+        parent_arrival_edge_id: String,
         call_node_id: String,
         parent_instance_revision_at_step: u64,
         call_step_index: usize,
         child_instance_id: String,
         child_definition_id: String,
         child_version: u32,
+        child_process_id: String,
+        child_start_node_id: String,
         child_model_sha256: String,
     },
 }
@@ -621,6 +831,8 @@ pub enum StartInputRef {
 pub enum AcceptedInputRef {
     Start { instance_id: String, cause: StartInputRef },
     PersistedReady { token_id: String, expected_instance_revision: u64 },
+    Retry { old_job_id: String, old_invocation_id: String, old_token_id: String,
+        expected_instance_revision: u64, command_id: String, request_hash: String },
     SendAdmission { instance_id: String, scope_id: String, node_id: String,
         pending_token_id: String, pending_event_id: String,
         expected_instance_revision: u64 },
@@ -668,6 +880,31 @@ pub struct TerminationReturnFailure {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeReturnFailure {
+    pub child_scope_id: String,
+    pub parent_scope_id: String,
+    pub parent_token_id: String,
+    pub incident_id: String,
+    pub incident_event_index: usize,
+    pub end_event_indices: Vec<usize>,
+    pub child_locals: Value,
+    pub parent_effective: Value,
+    pub child_scope_revision: u64,
+    pub parent_scope_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredServiceIncident {
+    pub incident_id: String,
+    pub invocation_id: String,
+    pub job_id: String,
+    pub source_token_id: String,
+    pub reserved_result_event_id: String,
+    pub attempt: u32,
+    pub fence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TerminationAttempt {
     Success(TerminationSource),
     ReturnFailure(TerminationReturnFailure),
@@ -712,6 +949,7 @@ pub enum VariableEffect {
         accepted_input: Option<AcceptedInputRef>,
         outputs: Value,
         extra: Vec<(String, Value)>,
+        activity_io_outputs: Option<Vec<IoObservedOutput>>,
         result: Value,
     },
     ScopeEntry {
@@ -731,6 +969,8 @@ pub enum VariableEffect {
         output_target: String,
         accepted_input: Option<AcceptedInputRef>,
         aggregate: Value,
+        activity_io_outputs: Option<Vec<IoObservedOutput>>,
+        output_event_index: Option<usize>,
         result: Value,
     },
     RepetitionEntry {
@@ -746,10 +986,15 @@ pub enum VariableEffect {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimePlan {
+    pub activity_io_inputs: Vec<ActivityIoInputFact>,
+    pub activity_io_results: Vec<ActivityIoResultFact>,
+    pub activity_io_continuations: Vec<ActivityIoContinuationFact>,
     pub repetition_groups: Vec<RepetitionGroup>,
     pub repetition_occurrences: Vec<RepetitionOccurrence>,
     pub repetition_capacity: Option<RepetitionCapacitySource>,
     pub termination_attempts: Vec<TerminationAttempt>,
+    pub scope_return_failures: Vec<ScopeReturnFailure>,
+    pub recovered_service_incidents: Vec<RecoveredServiceIncident>,
     pub variable_effects: Vec<VariableEffect>,
     pub event_sources: BTreeMap<usize, String>,
     pub token_sources: BTreeMap<String, String>,
@@ -764,6 +1009,8 @@ pub struct RuntimePlan {
     pub complete_user_task_ids: Vec<String>,
     pub cancel_user_task_ids: Vec<String>,
     pub create_jobs: Vec<ProcessJob>,
+    pub service_invocation_ids: BTreeMap<String, String>,
+    pub closed_service_dispatches: Vec<ClosedServiceDispatch>,
     pub complete_job_ids: Vec<String>,
     pub cancel_job_ids: Vec<String>,
     pub add_incidents: Vec<ProcessIncident>,
@@ -815,10 +1062,15 @@ pub struct ScopeUpdate {
 impl RuntimePlan {
     pub fn initial(variables: Value) -> Self {
         Self {
+            activity_io_inputs: Vec::new(),
+            activity_io_results: Vec::new(),
+            activity_io_continuations: Vec::new(),
             repetition_groups: Vec::new(),
             repetition_occurrences: Vec::new(),
             repetition_capacity: None,
             termination_attempts: Vec::new(),
+            scope_return_failures: Vec::new(),
+            recovered_service_incidents: Vec::new(),
             variable_effects: Vec::new(),
             event_sources: BTreeMap::new(),
             token_sources: BTreeMap::new(),
@@ -833,6 +1085,8 @@ impl RuntimePlan {
             complete_user_task_ids: Vec::new(),
             cancel_user_task_ids: Vec::new(),
             create_jobs: Vec::new(),
+            service_invocation_ids: BTreeMap::new(),
+            closed_service_dispatches: Vec::new(),
             complete_job_ids: Vec::new(),
             cancel_job_ids: Vec::new(),
             add_incidents: Vec::new(),
@@ -872,6 +1126,16 @@ pub struct ClaimedProcessJob {
     pub actor: ProcessActor,
     pub job: ProcessJob,
     pub snapshot: RuntimeSnapshot,
+    pub invocation_id: String,
+    pub request_id: String,
+    pub result_event_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobObservationState {
+    Observed,
+    Blocked,
+    Accepted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,6 +1272,11 @@ fn timer_on(conn: &Connection, timer_id: &str) -> Result<ProcessTimer> {
         org_id,
         definition_id,
         version,
+        start_process_id: conn.query_row(
+            "SELECT start_process_id FROM bpmn_timers WHERE timer_id=?1",
+            [timer_id],
+            |row| row.get(0),
+        )?,
         node_id,
         kind: timer_kind_from_text(&kind)?,
         scope_id: conn.query_row(
@@ -1049,19 +1318,36 @@ fn timer_summary(
                 .name
                 .clone()
         }
-        (None, None) if timer.kind == ProcessTimerKind::Start => model
-            .nodes
-            .iter()
-            .find(|node| node.id == timer.node_id)
-            .context("start timer node missing")?
-            .name
-            .clone(),
+        (None, None) if timer.kind == ProcessTimerKind::Start => {
+            let process_id = timer.start_process_id.as_deref()
+                .context("Start timer has no durable selected process")?;
+            super::model::selected_body(model, process_id, &[])?.nodes
+                .iter().find(|node| node.id == timer.node_id)
+                .context("Start timer node is outside its pinned process body")?
+                .name.clone()
+        },
         _ => bail!("timer scope ownership is invalid"),
     };
     let total_firings = match &timer.rule {
         ProcessTimerSpec::Cycle { total_firings, .. }
         | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
         _ => None,
+    };
+    let selected_process_id = if timer.kind == ProcessTimerKind::Start {
+        timer.start_process_id.clone()
+            .context("Start timer has no durable selected process")?
+    } else {
+        let instance_id = timer.instance_id.as_deref()
+            .context("activity timer has no instance")?;
+        selected_process_id_on(conn, instance_id)?
+    };
+    let calendar_pin = if selected_process_id == model.process_id {
+        model.calendar_pin.as_ref()
+    } else {
+        model.additional_processes.iter()
+            .find(|body| body.process_id == selected_process_id)
+            .context("timer selected process is absent from its pinned model")?
+            .calendar_pin.as_ref()
     };
     Ok(ProcessTimerSummary {
         scope_id: timer.scope_id.clone(),
@@ -1082,7 +1368,7 @@ fn timer_summary(
         },
         working_time: super::calendar::working_time_summary(
             &timer.rule,
-            model.calendar_pin.as_ref(),
+            calendar_pin,
             timer.due_at_ms,
         )?,
     })
@@ -1104,9 +1390,17 @@ fn timer_activation_node<'a>(
         (Some(instance), Some(scope)) => {
             let scopes = scopes_on(conn, instance, model)?;
             let path = scope_path(&scopes, instance, scope)?;
-            super::model::scope_body(model, &path)?.0
+            let process_id: String = conn.query_row(
+                "SELECT selected_process_id FROM bpmn_instances WHERE instance_id=?1",
+                [instance], |row| row.get(0),
+            )?;
+            super::model::selected_body(model, &process_id, &path)?.nodes
         }
-        (None, None) if timer.kind == ProcessTimerKind::Start => model.nodes.as_slice(),
+        (None, None) if timer.kind == ProcessTimerKind::Start => {
+            let process_id = timer.start_process_id.as_deref()
+                .context("Start timer has no durable selected process")?;
+            super::model::selected_body(model, process_id, &[])?.nodes
+        },
         _ => bail!("timer scope ownership is invalid"),
     };
     let node = nodes
@@ -1141,8 +1435,9 @@ fn timer_activation_node<'a>(
                             | ProcessNodeKind::ReceiveTask { .. }
                             | ProcessNodeKind::SendTask { .. }
                             | ProcessNodeKind::ServiceTask { .. }
+                            | ProcessNodeKind::ScriptTask { .. }
                             | ProcessNodeKind::SubProcess { .. }
-                            | ProcessNodeKind::CallActivity { .. }
+                            | ProcessNodeKind::CallActivity(_)
                     )),
                 "boundary attachment is not an activity in its body"
             );
@@ -1240,10 +1535,26 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
         "process timer count differs from its literal rule"
     );
     let model = current_version_model_on(tx, &timer.definition_id, timer.version)?;
-    ensure!(
-        model.timer_timezone.as_deref() == Some(timer.timezone.as_str()),
-        "process timer timezone differs from pinned model"
-    );
+    let selected_process_id: String = if timer.kind == ProcessTimerKind::Start {
+        timer.start_process_id.clone()
+            .context("Start timer requires its exact durable process ID")?
+    } else {
+        ensure!(timer.start_process_id.is_none(),
+            "activity timer cannot claim a Start process pin");
+        let instance_id = timer.instance_id.as_deref()
+            .context("activity timer has no instance")?;
+        selected_process_id_on(tx, instance_id)?
+    };
+    super::model::selected_body(&model, &selected_process_id, &[])?;
+    let timezone = if selected_process_id == model.process_id {
+        model.timer_timezone.as_deref()
+    } else {
+        model.additional_processes.iter()
+            .find(|body| body.process_id == selected_process_id)
+            .and_then(|body| body.timer_timezone.as_deref())
+    };
+    ensure!(timezone == Some(timer.timezone.as_str()),
+        "process timer timezone differs from its pinned process body");
     timer_activation_node(tx, &model, timer)?;
     let actual_org: String = tx.query_row(
         "SELECT org_id FROM bpmn_definitions WHERE definition_id=?1",
@@ -1266,7 +1577,7 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
         let race = race_on(tx, id)?;
         let scopes = scopes_on(tx, race.instance_id.as_str(), &model)?;
         let path = scope_path(&scopes, &race.instance_id, &race.scope_id)?;
-        let flows = super::model::scope_body(&model, &path)?.1;
+        let flows = super::model::selected_body(&model, &selected_process_id, &path)?.sequence_flows;
         ensure!(
             timer.kind == ProcessTimerKind::Catch
                 && timer.instance_id.as_deref() == Some(race.instance_id.as_str())
@@ -1279,8 +1590,8 @@ fn insert_timer_on(tx: &Transaction<'_>, timer: &ProcessTimer) -> Result<()> {
         );
     }
     tx.execute(
-        "INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-        params![timer.timer_id,timer.org_id,timer.definition_id,timer.version,timer.node_id,timer_kind_text(&timer.kind),timer.instance_id,timer.token_id,json(&timer.rule)?,timer.timezone,timer.anchor_at_ms,timer.due_at_ms,sql_integer(timer.occurrence)?,sql_integer(timer.revision)?,timer_status_text(&timer.status),timer.last_reason,timer.next_check_at_ms,timer.created_at_ms,timer.updated_at_ms,timer.race_id,timer.scope_id],
+        "INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,last_reason,next_check_at_ms,created_at_ms,updated_at_ms,race_id,scope_id,start_process_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+        params![timer.timer_id,timer.org_id,timer.definition_id,timer.version,timer.node_id,timer_kind_text(&timer.kind),timer.instance_id,timer.token_id,json(&timer.rule)?,timer.timezone,timer.anchor_at_ms,timer.due_at_ms,sql_integer(timer.occurrence)?,sql_integer(timer.revision)?,timer_status_text(&timer.status),timer.last_reason,timer.next_check_at_ms,timer.created_at_ms,timer.updated_at_ms,timer.race_id,timer.scope_id,timer.start_process_id],
     )?;
     Ok(())
 }
@@ -1317,6 +1628,7 @@ fn due_candidate_matches(timer: &ProcessTimer, candidate: &DueTimer) -> bool {
         && timer.org_id == candidate.org_id
         && timer.definition_id == candidate.definition_id
         && timer.version == candidate.version
+        && timer.start_process_id == candidate.start_process_id
         && timer.instance_id == candidate.instance_id
         && timer.token_id == candidate.token_id
         && timer.occurrence == candidate.occurrence
@@ -1340,6 +1652,7 @@ pub fn due_timers(pool: &DbPool, at_ms: i64, limit: u32) -> Result<Vec<DueTimer>
                     org_id: timer.org_id,
                     definition_id: timer.definition_id,
                     version: timer.version,
+                    start_process_id: timer.start_process_id,
                     instance_id: timer.instance_id,
                     token_id: timer.token_id,
                     occurrence: timer.occurrence,
@@ -1358,7 +1671,7 @@ pub fn timer_snapshot(pool: &DbPool, candidate: &DueTimer) -> Result<TimerSnapsh
 fn timer_snapshot_on(conn: &Connection, candidate: &DueTimer) -> Result<TimerSnapshot> {
         let timer = timer_on(conn, &candidate.timer_id)?;
         ensure!(due_candidate_matches(&timer, candidate), "timer candidate changed");
-        if !timer_current_authority_on(conn, &timer)? {
+        if !timer_current_authority_on(conn, &timer, ExecutionMode::Durable)? {
             return Err(ProcessAuthorityDenied("timer authority is no longer current").into());
         }
         let owner_id: String = if timer.kind == ProcessTimerKind::Start {
@@ -1395,7 +1708,9 @@ fn timer_snapshot_on(conn: &Connection, candidate: &DueTimer) -> Result<TimerSna
         }
 }
 
-fn timer_current_authority_on(conn: &Connection, timer: &ProcessTimer) -> Result<bool> {
+fn timer_current_authority_on(
+    conn: &Connection, timer: &ProcessTimer, mode: ExecutionMode,
+) -> Result<bool> {
     if timer.kind != ProcessTimerKind::Start && !timer_activation_live_on(conn, timer)? {
         return Ok(false);
     }
@@ -1422,7 +1737,7 @@ fn timer_current_authority_on(conn: &Connection, timer: &ProcessTimer) -> Result
     {
         return Ok(false);
     }
-    if let Some(id) = &timer.instance_id {
+    if let (Some(id), ExecutionMode::Durable) = (&timer.instance_id, mode) {
         if let Err(error) = require_call_control_authority_on(conn, &actor, id) {
             if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
                 return Ok(false);
@@ -1441,6 +1756,9 @@ fn timer_current_authority_on(conn: &Connection, timer: &ProcessTimer) -> Result
                 return Ok(false);
             }
         }
+    }
+    if mode == ExecutionMode::Simulation {
+        return Ok(true);
     }
     let snapshots_json: String = conn.query_row(
         "SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
@@ -1479,7 +1797,7 @@ pub fn record_timer_blocked(
     if timer.kind != ProcessTimerKind::Start && !timer_activation_live_on(&tx, &timer)? {
         return Ok(false);
     }
-    if timer_current_authority_on(&tx, &timer)? {
+    if timer_current_authority_on(&tx, &timer, ExecutionMode::Durable)? {
         return Ok(false);
     }
     let summary = if timer.kind == ProcessTimerKind::Start {
@@ -1550,7 +1868,7 @@ pub fn record_timer_failed(
     {
         return Ok(false);
     }
-    if !timer_current_authority_on(&tx, &timer)? {
+    if !timer_current_authority_on(&tx, &timer, ExecutionMode::Durable)? {
         return Ok(false);
     }
     if timer.kind != ProcessTimerKind::Start && !timer_activation_live_on(&tx, &timer)? {
@@ -1657,7 +1975,8 @@ fn validate_boundary_plan_on(
     };
     let model = current_version_model_on(tx, &definition_id, version)?;
     let scopes = scopes_on(tx, &instance_id, &model)?;
-    let node = scope_node(&model, &scopes, &instance_id, &scope_id, &node_id)?;
+    let selected_process_id = selected_process_id_on(tx, &instance_id)?;
+    let node = scope_node(&model, &selected_process_id, &scopes, &instance_id, &scope_id, &node_id)?;
     let (attached_to_id, interrupt) = match &node.kind {
         ProcessNodeKind::BoundaryTimer {
             attached_to_id,
@@ -1711,19 +2030,73 @@ fn validate_boundary_plan_on(
         .filter(|link| link.token_id == token_id && (interrupt || &link.activation == activation))
         .map(|link| link.incident_id)
         .collect::<Vec<_>>();
-    let child = scopes.iter().find(|scope| {
-        scope.parent_token_id.as_deref() == Some(token_id.as_str())
-            && !matches!(
-                scope.status,
-                ProcessInstanceStatus::Completed
-                    | ProcessInstanceStatus::Cancelled
-                    | ProcessInstanceStatus::Error
-            )
-    });
+    let attached = scope_node(&model, &selected_process_id, &scopes, &instance_id, &scope_id, attached_to_id)?;
+    let group = repetition_groups_on(tx, &instance_id)?.into_iter().find(|row|
+        row.parent_token_id == token_id && row.scope_id == scope_id
+            && row.node_id == *attached_to_id);
+    ensure!(attached.repeat.is_none() || group.is_some(),
+        "repeated boundary lacks its factual coordinator");
+    let all_occurrences = if let Some(group) = &group {
+        ensure!(!group.terminal_capacity && matches!(group.status,
+            ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident),
+            "repeated boundary coordinator is not live");
+        repetition_occurrences_on(tx, &instance_id)?.into_iter().filter(|row|
+            row.group_id == group.group_id).collect::<Vec<_>>()
+    } else { Vec::new() };
+    let occurrences = all_occurrences.iter().filter(|row| !matches!(row.status,
+        ProcessRepetitionOccurrenceStatus::Completed
+            | ProcessRepetitionOccurrenceStatus::Cancelled)).collect::<Vec<_>>();
+    let member_tokens = occurrences.iter().map(|row| row.token_id.clone())
+        .collect::<HashSet<_>>();
+    let attached_tokens = std::iter::once(token_id.as_str())
+        .chain(member_tokens.iter().map(String::as_str)).collect::<HashSet<_>>();
+    if let Some(group) = &group {
+        let updates = plan.repetition_groups.iter().filter(|row| row.group_id == group.group_id)
+            .collect::<Vec<_>>();
+        ensure!(updates.len() == usize::from(interrupt)
+            && (!interrupt || updates[0].status == ProcessRepetitionGroupStatus::Cancelled
+                && updates[0].revision == group.revision + 1),
+            "boundary changed its coordinator without an interrupting winner");
+        let mut verified_ordinal_updates = 0;
+        for occurrence in &occurrences {
+            let updates = plan.repetition_occurrences.iter().filter(|row|
+                row.occurrence_id == occurrence.occurrence_id).collect::<Vec<_>>();
+            let verification = !interrupt && accepted_job_id.is_some_and(|job_id|
+                    occurrence.job_id.as_deref() == Some(job_id))
+                && occurrence.status == ProcessRepetitionOccurrenceStatus::Active
+                && updates.len() == 1
+                && updates[0].status == ProcessRepetitionOccurrenceStatus::AwaitingVerification
+                && updates[0].revision == occurrence.revision + 1
+                && updates[0].token_id == occurrence.token_id
+                && updates[0].accepted_source_event_id.as_ref() == plan.event_ids.get(&0)
+                && plan.events.first().is_some_and(|event|
+                    event.kind == "service_result" && event.scope_id == occurrence.scope_id
+                        && event.node_id.as_deref() == Some(attached_to_id.as_str()))
+                && plan.create_user_tasks.iter().filter(|task|
+                    task.kind == ProcessUserTaskKind::Verification
+                        && task.scope_id == occurrence.scope_id
+                        && task.token_id.as_deref() == Some(occurrence.token_id.as_str())
+                        && updates[0].verification_user_task_id.as_deref()
+                            == Some(task.user_task_id.as_str())).count() == 1;
+            verified_ordinal_updates += usize::from(verification);
+            ensure!(if interrupt {
+                    updates.len() == 1
+                        && updates[0].status == ProcessRepetitionOccurrenceStatus::Cancelled
+                        && updates[0].revision == occurrence.revision + 1
+                } else { updates.is_empty() || verification },
+                "boundary changed a live ordinal without its coordinator");
+        }
+        ensure!(plan.repetition_occurrences.iter().filter(|row|
+            row.group_id == group.group_id).count()
+                == occurrences.len() * usize::from(interrupt) + verified_ordinal_updates,
+            "boundary changed a completed or foreign coordinator ordinal");
+    }
     let expected_roots = if interrupt {
-        child
-            .map(|scope| vec![scope.scope_id.clone()])
-            .unwrap_or_default()
+        scopes.iter().filter(|scope|
+            scope.parent_token_id.as_deref().is_some_and(|id| attached_tokens.contains(id))
+                && !matches!(scope.status, ProcessInstanceStatus::Completed
+                    | ProcessInstanceStatus::Cancelled | ProcessInstanceStatus::Error))
+            .map(|scope| scope.scope_id.clone()).collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -1731,11 +2104,10 @@ fn validate_boundary_plan_on(
         equal_ids(&plan.cancel_scope_roots, &expected_roots),
         "boundary scope closure differs from its actual attached child"
     );
-    let closure = if let Some(root) = expected_roots.first() {
-        descendant_scope_ids(&scopes, root)?
-    } else {
-        HashSet::new()
-    };
+    let mut closure = HashSet::new();
+    for root in &expected_roots {
+        closure.extend(descendant_scope_ids(&scopes, root)?);
+    }
     let active_scopes = scopes
         .iter()
         .filter(|scope| {
@@ -1750,7 +2122,7 @@ fn validate_boundary_plan_on(
         .map(|scope| scope.scope_id.clone())
         .collect::<HashSet<_>>();
     let selected = |scope: &str, token: &str| {
-        active_scopes.contains(scope) || (interrupt && token == token_id)
+        active_scopes.contains(scope) || (interrupt && attached_tokens.contains(token))
     };
     let mut stmt = tx.prepare("SELECT token_id,scope_id FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
     let expected_tokens = stmt
@@ -1827,17 +2199,27 @@ fn validate_boundary_plan_on(
     {
         let own_job = if let Some(job) = job {
             tx.query_row(
-                "SELECT token_id=?1 FROM bpmn_jobs WHERE job_id=?2 AND instance_id=?3",
-                params![token_id, job, instance_id],
-                |row| row.get::<_, bool>(0),
+                "SELECT token_id FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2",
+                params![job, instance_id],
+                |row| row.get::<_, String>(0),
             )
             .optional()?
-            .unwrap_or(false)
+            .is_some_and(|id| attached_tokens.contains(id.as_str()))
         } else {
             false
         };
         if active_scopes.contains(&scope) || (interrupt && own_job) {
             own_incidents.push(id);
+        }
+    }
+    if interrupt {
+        if let Some(group) = &group {
+            if let Some(id) = &group.terminal_incident_id {
+                let open: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2 AND resolved_at_ms IS NULL)",
+                    params![instance_id, id], |row| row.get(0))?;
+                if open { own_incidents.push(id.clone()); }
+            }
         }
     }
     if interrupt {
@@ -1908,6 +2290,10 @@ fn validate_boundary_plan_on(
             "scope interruption lacks actual activation history"
         );
     }
+    own_incidents.extend(plan.recovered_service_incidents.iter()
+        .map(|recovered| recovered.incident_id.clone()));
+    own_incidents.extend(plan.closed_service_dispatches.iter()
+        .filter_map(|closed| closed.infrastructure_incident_id.clone()));
     own_incidents.sort();
     own_incidents.dedup();
     ensure!(
@@ -1922,7 +2308,7 @@ fn validate_boundary_plan_on(
         .filter(|timer| {
             (active_scopes.contains(timer.scope_id.as_deref().unwrap_or(""))
                 || (timer.kind == ProcessTimerKind::Boundary
-                    && timer.token_id.as_deref() == Some(token_id.as_str())))
+                    && timer.token_id.as_deref().is_some_and(|id| attached_tokens.contains(id))))
                 && matches!(
                     timer.status,
                     ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
@@ -1993,7 +2379,7 @@ fn validate_boundary_plan_on(
         .into_iter()
         .filter(|sub| {
             (active_scopes.contains(&sub.scope_id)
-                || (sub.token_id == token_id
+                || (attached_tokens.contains(sub.token_id.as_str())
                     && sub.kind != ProcessSubscriptionKind::MessageCatch))
                 && sub.status == ProcessSubscriptionStatus::Open
         })
@@ -2104,7 +2490,10 @@ pub fn fire_timer(
             let (source_id, initial) = if timer.kind == ProcessTimerKind::Start {
                 (plan.start_instance_id.as_deref()
                     .context("timer start lacks instance identity")?,
-                    Some((timer.definition_id.as_str(), timer.version, &input)))
+                    Some((timer.definition_id.as_str(), timer.version, &input,
+                        Some(timer.start_process_id.as_deref()
+                            .context("start timer lacks its pinned process ID")?),
+                        Some(timer.node_id.as_str()))))
             } else {
                 (timer.instance_id.as_deref()
                     .context("activity timer lacks instance identity")?, None)
@@ -2157,9 +2546,43 @@ pub fn fire_timer(
                 .context("timer Signal source instance is missing")?;
             signal_admission_on(&tx, actual_actor, source_instance, prefix, signal, accepted)
         };
-        canonical = super::timers::plan_timer_fire(&snapshot, at_ms, Some(&resolve))?;
+        canonical = super::timers::plan_timer_fire(&snapshot, at_ms, Some(&resolve), None)?;
         &canonical
     };
+    let result = fire_timer_on(
+        &tx,
+        candidate,
+        actor,
+        expected_instance_revision,
+        plan,
+        at_ms,
+        composite.is_none(),
+        ExecutionMode::Durable,
+    )?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub(crate) fn fire_timer_on(
+    tx: &Transaction<'_>,
+    candidate: &DueTimer,
+    actor: &ProcessActor,
+    expected_instance_revision: Option<u64>,
+    plan: &RuntimePlan,
+    at_ms: i64,
+    apply_canonical_call_steps: bool,
+    mode: ExecutionMode,
+) -> Result<Option<ProcessTransitionOutcome>> {
+    let timer = timer_on(tx, &candidate.timer_id)?;
+    if !due_candidate_matches(&timer, candidate)
+        || timer.next_check_at_ms > at_ms
+        || candidate.due_at_ms > at_ms
+    {
+        return Ok(None);
+    }
+    if timer.kind != ProcessTimerKind::Start && !timer_activation_live_on(tx, &timer)? {
+        return Ok(None);
+    }
     if let Some(instance_id) = timer.instance_id.as_deref() {
         let expected =
             expected_instance_revision.context("activity timer needs instance revision")?;
@@ -2180,7 +2603,7 @@ pub fn fire_timer(
     ensure!(updates.len() == 1, "timer fire requires one timer update");
     if timer.kind == ProcessTimerKind::Boundary {
         validate_boundary_plan_on(
-            &tx,
+            tx,
             &BoundaryActivationId::Timer(timer.timer_id.clone()),
             None,
             plan,
@@ -2192,7 +2615,7 @@ pub fn fire_timer(
                 .all(|update| update.timer_id == timer.timer_id
                     || (update.status == ProcessTimerStatus::Cancelled
                         && update.last_reason.as_deref() == Some("activity_completed")
-                        && timer_on(&tx, &update.timer_id).is_ok_and(|other| other.kind
+                        && timer_on(tx, &update.timer_id).is_ok_and(|other| other.kind
                             == ProcessTimerKind::Boundary
                             && other
                                 .token_id
@@ -2231,7 +2654,7 @@ pub fn fire_timer(
         );
     }
     let update = updates[0];
-    let pinned_model = current_version_model_on(&tx, &timer.definition_id, timer.version)?;
+    let pinned_model = current_version_model_on(tx, &timer.definition_id, timer.version)?;
     let advance = super::timers::next_timer_occurrence(
         &timer,
         at_ms,
@@ -2281,22 +2704,22 @@ pub fn fire_timer(
         actor.org_id == timer.org_id,
         "timer actor organization changed before firing"
     );
-    require_actor(&tx, actor)?;
-    if !timer_current_authority_on(&tx, &timer)? {
+    require_actor(tx, actor)?;
+    if !timer_current_authority_on(tx, &timer, mode)? {
         return Err(ProcessAuthorityDenied("timer authority is no longer current").into());
     }
     let mut cancelled_claims = Vec::new();
     let mut result = if timer.kind == ProcessTimerKind::Start {
         ensure!(expected_instance_revision.is_none(), "start timer has no existing instance");
-        require_owner(&tx, actor, &timer.definition_id)?;
-        let definition = definition_on(&tx, &timer.definition_id)?;
+        require_owner(tx, actor, &timer.definition_id)?;
+        let definition = definition_on(tx, &timer.definition_id)?;
         ensure!(
             !definition.archived && definition.published_version == Some(timer.version),
             "timer start is no longer the active published version"
         );
         let instance_id = plan.start_instance_id.as_deref()
             .context("timer start transition lacks its instance identity")?;
-        update_timer_on(&tx, update, at_ms)?;
+        update_timer_on(tx, update, at_ms)?;
         let mut instance_plan = plan.clone();
         instance_plan
             .timer_updates
@@ -2306,11 +2729,15 @@ pub fn fire_timer(
                 expected_timer_revision: timer.revision,
                 fired_occurrence: advance.selected_occurrence } };
         start_instance_on(
-            &tx, actor, instance_id, &timer.definition_id, timer.version,
-            &serde_json::json!({}), &instance_plan, at_ms,
+            tx, actor, instance_id, &timer.definition_id, timer.version,
+            &serde_json::json!({}),
+            Some(timer.start_process_id.as_deref().context("start timer lacks its pinned process ID")?),
+            Some(&timer.node_id),
+            &instance_plan, at_ms,
             Some((&timer.timer_id, advance.selected_occurrence)),
             None,
             &entry,
+            ExecutionMode::Durable,
         )?
     } else {
         ensure!(plan.start_instance_id.is_none(), "activity timer cannot start another instance");
@@ -2322,21 +2749,20 @@ pub fn fire_timer(
             |row| row.get(0),
         )?;
         for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
-            require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
+            require_flow_current(tx, actor, &snapshot.info.flow_id, None)?;
         }
         let entry = AcceptedInputRef::Timer { timer_id: timer.timer_id.clone(),
             expected_timer_revision: timer.revision,
             fired_occurrence: advance.selected_occurrence };
-        cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id, expected,
-            plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
-        instance_on(&tx, actor, instance_id, None)?
+        cancelled_claims = apply_plan_on(tx, instance_id, &actor.user_id, expected,
+            plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
+        instance_on(tx, actor, instance_id, None)?
     };
-    if composite.is_none() {
-        cancelled_claims.extend(apply_canonical_call_steps_on(&tx,
+    if apply_canonical_call_steps {
+        cancelled_claims.extend(apply_canonical_call_steps_on(tx,
             &result.instance_id, &actor.user_id, plan, at_ms)?);
-        result = instance_on(&tx, actor, &result.instance_id, None)?;
+        result = instance_on(tx, actor, &result.instance_id, None)?;
     }
-    tx.commit()?;
     Ok(Some(ProcessTransitionOutcome {
         instance: result,
         cancelled_claims,
@@ -2364,11 +2790,36 @@ fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     })
 }
 
+fn row_u32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u32> {
+    let value: i64 = row.get(index)?;
+    u32::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn row_optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
 pub fn request_hash<T: Serialize>(request: &T) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(request)?)))
 }
 
-fn canonical_json_value(value: &Value) -> Value {
+pub(crate) fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut keys = object.keys().collect::<Vec<_>>();
@@ -2658,65 +3109,88 @@ pub fn list_definitions(
     })
 }
 
+fn start_catalog_on(
+    conn: &Connection,
+    definition: &ProcessDefinition,
+    version: &ProcessVersion,
+) -> Result<Vec<ProcessStartCatalogEntry>> {
+    let model = &version.model;
+    let current = !definition.archived && definition.published_version == Some(version.version);
+    let mut catalog = Vec::new();
+    for (process_id, process_name, nodes, timezone, calendar_pin) in
+        std::iter::once((model.process_id.as_str(), model.process_name.as_ref(),
+            &model.nodes, model.timer_timezone.as_ref(), model.calendar_pin.as_ref()))
+            .chain(model.additional_processes.iter().map(|body|
+                (body.process_id.as_str(), body.process_name.as_ref(), &body.nodes,
+                    body.timer_timezone.as_ref(), body.calendar_pin.as_ref())))
+    {
+        for node in nodes {
+            let trigger = match &node.kind {
+                ProcessNodeKind::Start => ProcessStartTrigger::Start { can_start: current },
+                ProcessNodeKind::MessageStart { message_ref, .. } => {
+                    let declaration = model.messages.iter()
+                        .find(|declaration| declaration.message_id == *message_ref)
+                        .context("pinned MessageStart declaration missing")?;
+                    ProcessStartTrigger::MessageStart {
+                        message_ref: message_ref.clone(),
+                        message_name: declaration.name.clone(),
+                        can_send: current,
+                    }
+                }
+                ProcessNodeKind::TimerStart { timer } => {
+                    let timezone = timezone.cloned().context("pinned TimerStart timezone missing")?;
+                    let timer_id: Option<String> = conn.query_row(
+                        "SELECT timer_id FROM bpmn_timers WHERE definition_id=?1 AND version=?2 AND kind='start' AND start_process_id=?3 AND node_id=?4",
+                        params![version.definition_id, version.version, process_id, node.id],
+                        |row| row.get(0),
+                    ).optional()?;
+                    let persisted_timer = timer_id.as_deref()
+                        .map(|id| timer_summary(conn, &timer_on(conn, id)?, model))
+                        .transpose()?;
+                    let working_time = match &persisted_timer {
+                        Some(summary) => summary.working_time.clone(),
+                        None => super::calendar::working_time_summary(timer,
+                            calendar_pin, None)?,
+                    };
+                    ProcessStartTrigger::TimerStart {
+                        timer: timer.clone(),
+                        timezone,
+                        working_time,
+                        persisted_timer,
+                    }
+                }
+                _ => continue,
+            };
+            catalog.push(ProcessStartCatalogEntry {
+                process_id: process_id.to_owned(),
+                process_name: process_name.cloned(),
+                start_node_id: node.id.clone(),
+                start_node_name: node.name.clone(),
+                version: version.version,
+                trigger,
+            });
+        }
+    }
+    Ok(catalog)
+}
+
 pub fn get_definition(
     pool: &DbPool,
     actor: &ProcessActor,
     definition_id: &str,
-) -> Result<(
-    ProcessDefinition,
-    Option<ProcessTimerSummary>,
-    Option<ProcessMessageStartSummary>,
-)> {
+) -> Result<(ProcessDefinition, Vec<ProcessStartCatalogEntry>)> {
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         require_owner(conn, actor, definition_id)?;
         let definition = definition_on(conn, definition_id)?;
-        let timer_id: Option<String> = conn.query_row(
-            "SELECT timer_id FROM bpmn_timers WHERE definition_id=?1 AND version=?2 AND kind='start'",
-            params![definition_id, definition.published_version],
-            |row| row.get(0),
-        ).optional()?;
-        let timer_start =
-            if let (Some(id), Some(version)) = (timer_id, definition.published_version) {
-                let model = current_version_model_on(conn, definition_id, version)?;
-                Some(timer_summary(conn, &timer_on(conn, &id)?, &model)?)
-            } else {
-                None
-            };
-        let message_start = definition
-            .published_version
-            .map(|version| -> Result<Option<ProcessMessageStartSummary>> {
-                let model = current_version_model_on(conn, definition_id, version)?;
-                model
-                    .nodes
-                    .iter()
-                    .find_map(|node| {
-                        if let ProcessNodeKind::MessageStart { message_ref, .. } = &node.kind {
-                            Some((node, message_ref))
-                        } else {
-                            None
-                        }
-                    })
-                    .map(|(node, id)| {
-                        Ok(ProcessMessageStartSummary {
-                            node_id: node.id.clone(),
-                            node_name: node.name.clone(),
-                            message_name: model
-                                .messages
-                                .iter()
-                                .find(|d| &d.message_id == id)
-                                .context("message start declaration missing")?
-                                .name
-                                .clone(),
-                            version,
-                            can_send: !definition.archived,
-                        })
-                    })
-                    .transpose()
+        let start_catalog = definition.published_version
+            .map(|published| -> Result<Vec<ProcessStartCatalogEntry>> {
+                let version = version_on(conn, definition_id, published)?;
+                start_catalog_on(conn, &definition, &version)
             })
             .transpose()?
-            .flatten();
-        Ok((definition, timer_start, message_start))
+            .unwrap_or_default();
+        Ok((definition, start_catalog))
     })
 }
 
@@ -2837,7 +3311,7 @@ fn call_status_from_text(status: &str) -> Result<ProcessCallStatus> {
 }
 
 fn calls_on(conn: &Connection, instance_id: &str) -> Result<Vec<CallActivation>> {
-    let mut q=conn.prepare("SELECT call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms FROM bpmn_calls WHERE parent_instance_id=?1 OR child_instance_id=?1 ORDER BY CASE WHEN status='waiting' THEN 0 ELSE 1 END,created_at_ms,call_id")?;
+    let mut q=conn.prepare("SELECT call_id,parent_instance_id,parent_scope_id,parent_token_id,parent_arrival_edge_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,called_process_id,child_start_node_id,model_sha256,revision,status,created_at_ms,updated_at_ms FROM bpmn_calls WHERE parent_instance_id=?1 OR child_instance_id=?1 ORDER BY CASE WHEN status='waiting' THEN 0 ELSE 1 END,created_at_ms,call_id")?;
     let rows = q
         .query_map([instance_id], |r| {
             Ok((
@@ -2848,14 +3322,17 @@ fn calls_on(conn: &Connection, instance_id: &str) -> Result<Vec<CallActivation>>
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
-                r.get::<_, u32>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, u32>(9)?,
-                r.get::<_, String>(10)?,
-                row_u64(r, 11)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, u32>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, u32>(10)?,
+                r.get::<_, String>(11)?,
                 r.get::<_, String>(12)?,
-                r.get::<_, i64>(13)?,
-                r.get::<_, i64>(14)?,
+                r.get::<_, String>(13)?,
+                row_u64(r, 14)?,
+                r.get::<_, String>(15)?,
+                r.get::<_, i64>(16)?,
+                r.get::<_, i64>(17)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2866,12 +3343,15 @@ fn calls_on(conn: &Connection, instance_id: &str) -> Result<Vec<CallActivation>>
                 parent_instance_id,
                 parent_scope_id,
                 parent_token_id,
+                parent_arrival_edge_id,
                 call_node_id,
                 child_instance_id,
                 definition_id,
                 version,
                 called_definition_id,
                 called_version,
+                called_process_id,
+                child_start_node_id,
                 model_sha256,
                 revision,
                 status,
@@ -2883,12 +3363,15 @@ fn calls_on(conn: &Connection, instance_id: &str) -> Result<Vec<CallActivation>>
                     parent_instance_id,
                     parent_scope_id,
                     parent_token_id,
+                    parent_arrival_edge_id,
                     call_node_id,
                     child_instance_id,
                     definition_id,
                     version,
                     called_definition_id,
                     called_version,
+                    called_process_id,
+                    child_start_node_id,
                     model_sha256,
                     revision,
                     status: call_status_from_text(&status)?,
@@ -2963,6 +3446,7 @@ fn require_call_version_on(
     conn: &Connection,
     actor: &ProcessActor,
     version: &ProcessVersion,
+    process_id: &str,
     new_admission: bool,
 ) -> Result<()> {
     require_actor(conn, actor)?;
@@ -2970,14 +3454,9 @@ fn require_call_version_on(
     if new_admission && definition_on(conn, &version.definition_id)?.archived {
         return Err(CallTransitionRejected("called process definition is archived").into());
     }
-    ensure!(
-        version
-            .model
-            .nodes
-            .iter()
-            .any(|n| n.kind == ProcessNodeKind::Start),
-        "only an ordinary Start process can be called"
-    );
+    let body = super::model::selected_body(&version.model, process_id, &[])?;
+    ensure!(body.nodes.iter().any(|node| node.kind == ProcessNodeKind::Start),
+        "only a body with an ordinary Start can be called");
     require_version_execution_on(conn, actor, &version.definition_id, version.version)
 }
 
@@ -2985,21 +3464,22 @@ fn verify_call_pins_on(conn: &Connection, version: &ProcessVersion) -> Result<()
     let nodes = super::model::all_nodes(&version.model);
     let expected = nodes
         .iter()
-        .filter(|node| matches!(node.kind, ProcessNodeKind::CallActivity { .. }))
+        .filter(|node| matches!(node.kind, ProcessNodeKind::CallActivity(_)))
         .collect::<Vec<_>>();
     ensure!(
         expected.len() == version.call_activities.len(),
         "published direct call pin set differs from its actual model"
     );
     for node in expected {
-        let ProcessNodeKind::CallActivity {
-            called_definition_id,
-            called_version,
-            called_element,
-            ..
-        } = &node.kind
+        let ProcessNodeKind::CallActivity(call) = &node.kind
         else {
             unreachable!()
+        };
+        let (called_definition_id, called_version, called_element) = match &call.target {
+            ProcessCallTarget::PublishedBody { definition_id, version, called_element } =>
+                (definition_id.as_str(), *version, called_element),
+            ProcessCallTarget::LocalBody { called_element } =>
+                (version.definition_id.as_str(), version.version, called_element),
         };
         let pin = version
             .call_activities
@@ -3012,8 +3492,8 @@ fn verify_call_pins_on(conn: &Connection, version: &ProcessVersion) -> Result<()
             |row| row.get(0),
         )?;
         ensure!(
-            pin.called_definition_id == *called_definition_id
-                && pin.called_version == *called_version
+            pin.called_definition_id == called_definition_id
+                && pin.called_version == called_version
                 && pin.called_element == *called_element
                 && pin.model_sha256 == hash,
             "published direct call binding differs from immutable target"
@@ -3028,13 +3508,14 @@ fn collect_call_versions_on(
     definition_id: &str,
     version: u32,
     model: &ProcessModel,
+    process_id: &str,
     depth: usize,
-    visiting: &mut HashSet<(String, u32)>,
+    visiting: &mut HashSet<(String, u32, String)>,
     collected: &mut BTreeMap<(String, u32), PinnedCallVersion>,
-    expanded: &mut BTreeMap<(String, u32), usize>,
+    expanded: &mut BTreeMap<(String, u32, String), usize>,
     require_admission: bool,
 ) -> Result<usize> {
-    let key = (definition_id.to_owned(), version);
+    let key = (definition_id.to_owned(), version, process_id.to_owned());
     ensure!(
         visiting.insert(key.clone()),
         "process call version dependency cycle"
@@ -3048,105 +3529,105 @@ fn collect_call_versions_on(
         return Ok(height);
     }
     let mut height = 0;
-    for node in super::model::all_nodes(model) {
-        let ProcessNodeKind::CallActivity {
-            called_definition_id,
-            called_version,
-            called_element,
-            ..
-        } = &node.kind
-        else {
+    for node in super::model::all_nodes_in_body(model, process_id)? {
+        let ProcessNodeKind::CallActivity(call) = &node.kind else {
             continue;
         };
         ensure!(depth < 3, "process call dependency depth exceeds three");
-        let child_key = (called_definition_id.clone(), *called_version);
-        ensure!(
-            !visiting.contains(&child_key),
-            "process call version dependency cycle"
-        );
-        if !collected.contains_key(&child_key) {
-            ensure!(
-                collected.len() < 32,
-                "process call dependencies exceed 32 distinct versions"
-            );
-            #[cfg(test)]
-            CALL_VERSION_READS.with(|count| count.set(count.get() + 1));
-            let target = version_on(conn, called_definition_id, *called_version)?;
-            let (stored_model, services_json): (String, String) = conn.query_row(
-                "SELECT model_json,service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
-                params![called_definition_id, called_version], |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            ensure!(
-                target.model_sha256 == hex::encode(Sha256::digest(stored_model.as_bytes())),
-                "called process model hash mismatch"
-            );
-            let services: Vec<PinnedServiceSnapshot> = parse(services_json)?;
-            for service in &services {
-                ensure!(
-                    service.info.graph_sha256
-                        == hex::encode(Sha256::digest(service.graph_json.as_bytes())),
-                    "called service graph hash mismatch"
-                );
-            }
-            verify_call_pins_on(conn, &target)?;
-            if require_admission {
-                require_call_version_on(conn, actor, &target, true)?;
-            }
-            let admission_error = if require_admission {
-                None
-            } else {
-                match require_call_version_on(conn, actor, &target, true) {
-                    Ok(()) => None,
-                    Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some()
-                        || error.downcast_ref::<CallTransitionRejected>().is_some() =>
-                        Some(format!("{error:#}")),
-                    Err(error) => return Err(error),
+        let child_height = match &call.target {
+            ProcessCallTarget::LocalBody { called_element } => {
+                ensure!(model.target_namespace.as_deref()
+                    .unwrap_or("https://tentaflow.app/bpmn/1") == called_element.namespace_uri,
+                    "local Call QName namespace differs from its document");
+                let body = super::model::selected_body(model, &called_element.process_id, &[])?;
+                ensure!(body.nodes.iter().any(|node| node.kind == ProcessNodeKind::Start),
+                    "only a body with an ordinary Start can be called");
+                let child_key = (definition_id.to_owned(), version,
+                    called_element.process_id.clone());
+                ensure!(!visiting.contains(&child_key), "process call body dependency cycle");
+                if let Some(height) = expanded.get(&child_key).copied() {
+                    ensure!(depth + 1 + height <= 3,
+                        "process call dependency depth exceeds three");
+                    height
+                } else {
+                    collect_call_versions_on(conn, actor, definition_id, version, model,
+                        &called_element.process_id, depth + 1, visiting, collected, expanded,
+                        require_admission)?
                 }
-            };
-            collected.insert(
-                child_key.clone(),
-                PinnedCallVersion {
-                    version: target,
-                    services,
-                    name: definition_on(conn, called_definition_id)?.name,
-                    admission_error,
-                },
-            );
-        }
-        let target = collected
-            .get(&child_key)
-            .context("resolved called version missing")?;
-        ensure!(
-            target.version.model.process_id == called_element.process_id
-                && target
-                    .version
-                    .model
-                    .target_namespace
-                    .as_deref()
-                    .unwrap_or("https://tentaflow.app/bpmn/1")
-                    == called_element.namespace_uri,
-            "called process QName differs from exact published target"
-        );
-        let child_height = if let Some(height) = expanded.get(&child_key).copied() {
-            ensure!(
-                depth + 1 + height <= 3,
-                "process call dependency depth exceeds three"
-            );
-            height
-        } else {
-            let child_model = target.version.model.clone();
-            collect_call_versions_on(
-                conn,
-                actor,
-                called_definition_id,
-                *called_version,
-                &child_model,
-                depth + 1,
-                visiting,
-                collected,
-                expanded,
-                require_admission,
-            )?
+            }
+            ProcessCallTarget::PublishedBody {
+                definition_id: called_definition_id,
+                version: called_version,
+                called_element,
+            } => {
+                ensure!(called_definition_id != definition_id || *called_version != version,
+                    "published Call cannot target its own version");
+                let version_key = (called_definition_id.clone(), *called_version);
+                let child_key = (called_definition_id.clone(), *called_version,
+                    called_element.process_id.clone());
+                ensure!(!visiting.contains(&child_key), "process call body dependency cycle");
+                if !collected.contains_key(&version_key) {
+                    ensure!(collected.len() < 32,
+                        "process call dependencies exceed 32 distinct versions");
+                    #[cfg(test)]
+                    CALL_VERSION_READS.with(|count| count.set(count.get() + 1));
+                    let target = version_on(conn, called_definition_id, *called_version)?;
+                    let (stored_model, services_json): (String, String) = conn.query_row(
+                        "SELECT model_json,service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+                        params![called_definition_id, called_version],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    ensure!(target.model_sha256 ==
+                        hex::encode(Sha256::digest(stored_model.as_bytes())),
+                        "called process model hash mismatch");
+                    let services: Vec<PinnedServiceSnapshot> = parse(services_json)?;
+                    for service in &services {
+                        ensure!(service.info.graph_sha256 ==
+                            hex::encode(Sha256::digest(service.graph_json.as_bytes())),
+                            "called service graph hash mismatch");
+                    }
+                    verify_call_pins_on(conn, &target)?;
+                    if require_admission {
+                        require_call_version_on(conn, actor, &target,
+                            &called_element.process_id, true)?;
+                    }
+                    let admission_error = if require_admission {
+                        None
+                    } else {
+                        match require_call_version_on(conn, actor, &target,
+                            &called_element.process_id, true) {
+                            Ok(()) => None,
+                            Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some()
+                                || error.downcast_ref::<CallTransitionRejected>().is_some() =>
+                                Some(format!("{error:#}")),
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    collected.insert(version_key.clone(), PinnedCallVersion {
+                        version: target,
+                        services,
+                        name: definition_on(conn, called_definition_id)?.name,
+                        admission_error,
+                    });
+                }
+                let target = collected.get(&version_key)
+                    .context("resolved called version missing")?;
+                ensure!(target.version.model.target_namespace.as_deref()
+                    .unwrap_or("https://tentaflow.app/bpmn/1") == called_element.namespace_uri,
+                    "called process QName namespace differs from exact published target");
+                super::model::selected_body(&target.version.model,
+                    &called_element.process_id, &[])?;
+                if let Some(height) = expanded.get(&child_key).copied() {
+                    ensure!(depth + 1 + height <= 3,
+                        "process call dependency depth exceeds three");
+                    height
+                } else {
+                    let child_model = target.version.model.clone();
+                    collect_call_versions_on(conn, actor, called_definition_id,
+                        *called_version, &child_model, &called_element.process_id, depth + 1,
+                        visiting, collected, expanded, require_admission)?
+                }
+            }
         };
         height = height.max(child_height + 1);
     }
@@ -3163,18 +3644,12 @@ fn pinned_call_versions_on(
     model: &ProcessModel,
 ) -> Result<Vec<PinnedCallVersion>> {
     let mut versions = BTreeMap::new();
-    collect_call_versions_on(
-        conn,
-        actor,
-        definition_id,
-        version,
-        model,
-        0,
-        &mut HashSet::new(),
-        &mut versions,
-        &mut BTreeMap::new(),
-        false,
-    )?;
+    let mut expanded = BTreeMap::new();
+    for process_id in std::iter::once(model.process_id.as_str()).chain(
+        model.additional_processes.iter().map(|body| body.process_id.as_str())) {
+        collect_call_versions_on(conn, actor, definition_id, version, model,
+            process_id, 0, &mut HashSet::new(), &mut versions, &mut expanded, false)?;
+    }
     verify_call_pins_on(conn, &version_on(conn, definition_id, version)?)?;
     let mut statement=conn.prepare("SELECT called_definition_id,called_version,model_sha256 FROM bpmn_call_dependencies WHERE definition_id=?1 AND version=?2")?;
     let persisted = statement
@@ -3206,23 +3681,17 @@ fn publish_call_pins_on(
 ) -> Result<()> {
     if !super::model::all_nodes(model)
         .iter()
-        .any(|node| matches!(node.kind, ProcessNodeKind::CallActivity { .. }))
+        .any(|node| matches!(node.kind, ProcessNodeKind::CallActivity(_)))
     {
         return Ok(());
     }
     let mut versions = BTreeMap::new();
-    collect_call_versions_on(
-        tx,
-        actor,
-        definition_id,
-        version,
-        model,
-        0,
-        &mut HashSet::new(),
-        &mut versions,
-        &mut BTreeMap::new(),
-        true,
-    )?;
+    let mut expanded = BTreeMap::new();
+    for process_id in std::iter::once(model.process_id.as_str()).chain(
+        model.additional_processes.iter().map(|body| body.process_id.as_str())) {
+        collect_call_versions_on(tx, actor, definition_id, version, model,
+            process_id, 0, &mut HashSet::new(), &mut versions, &mut expanded, true)?;
+    }
     let mut bytes = model_json
         .len()
         .checked_add(services_json.len())
@@ -3249,20 +3718,27 @@ fn publish_call_pins_on(
         bytes <= 4 * 1024 * 1024,
         "process call pinned closure exceeds 4 MiB"
     );
+    let own_model_sha256 = hex::encode(Sha256::digest(model_json.as_bytes()));
     for node in super::model::all_nodes(model) {
-        let ProcessNodeKind::CallActivity {
-            called_definition_id,
-            called_version,
-            called_element,
-            ..
-        } = &node.kind
-        else {
+        let ProcessNodeKind::CallActivity(call) = &node.kind else {
             continue;
         };
-        let target = versions
-            .get(&(called_definition_id.clone(), *called_version))
-            .context("resolved call target missing")?;
-        tx.execute("INSERT INTO bpmn_call_pins(definition_id,version,node_id,called_definition_id,called_version,called_element_json,model_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![definition_id,version,node.id,called_definition_id,called_version,json(called_element)?,target.version.model_sha256])?;
+        let (called_definition_id, called_version, called_element, model_sha256) =
+            match &call.target {
+                ProcessCallTarget::LocalBody { called_element } =>
+                    (definition_id, version, called_element, own_model_sha256.as_str()),
+                ProcessCallTarget::PublishedBody {
+                    definition_id: called_definition_id,
+                    version: called_version,
+                    called_element,
+                } => {
+                    let target = versions.get(&(called_definition_id.clone(), *called_version))
+                        .context("resolved call target missing")?;
+                    (called_definition_id.as_str(), *called_version, called_element,
+                        target.version.model_sha256.as_str())
+                }
+            };
+        tx.execute("INSERT INTO bpmn_call_pins(definition_id,version,node_id,called_definition_id,called_version,called_element_json,model_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![definition_id,version,node.id,called_definition_id,called_version,json(called_element)?,model_sha256])?;
     }
     Ok(())
 }
@@ -3321,14 +3797,295 @@ pub fn get_version(
     actor: &ProcessActor,
     definition_id: &str,
     version: u32,
-) -> Result<ProcessVersion> {
+) -> Result<(ProcessVersion, Vec<ProcessStartCatalogEntry>)> {
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         require_owner(conn, actor, definition_id)?;
-        version_on(conn, definition_id, version)
+        let definition = definition_on(conn, definition_id)?;
+        let version = version_on(conn, definition_id, version)?;
+        let start_catalog = start_catalog_on(conn, &definition, &version)?;
+        Ok((version, start_catalog))
     })
 }
 
+/// Captures a simulation source only after the same organization, ownership,
+/// publication, and pinned-version checks used by process execution succeed.
+///
+/// The returned capability contains a detached source snapshot. It does not
+/// retain the production pool or connection, so the simulator can run on its
+/// own disposable database after this read transaction ends.
+pub(crate) fn capture_simulation_source(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    definition_id: &str,
+    version_number: u32,
+    selected_process_id: &str,
+    start_node_id: &str,
+    variables: &Value,
+    start_ms: i64,
+    horizon_ms: i64,
+    tick_duration_ms: i64,
+) -> Result<AuthenticatedSimulationSource> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        require_owner(conn, actor, definition_id)?;
+        let definition = definition_on(conn, definition_id)?;
+        ensure!(
+            !definition.archived && definition.published_version == Some(version_number),
+            "simulation requires the current published process version"
+        );
+        let version = version_on(conn, definition_id, version_number)?;
+        require_version_execution_on(conn, actor, definition_id, version_number)?;
+        let body = super::model::selected_body(&version.model, selected_process_id, &[])?;
+        let start = body
+            .nodes
+            .iter()
+            .find(|node| node.id == start_node_id)
+            .context("simulation Start is absent from the published process body")?;
+        ensure!(
+            matches!(&start.kind, ProcessNodeKind::Start),
+            "simulation requires a plain published Start node"
+        );
+        let mut permitted_user_ids = vec![definition.owner_user_id.clone()];
+        for node in super::model::all_nodes(&version.model) {
+            match &node.kind {
+                ProcessNodeKind::UserTask {
+                    assignee_user_id: Some(user_id),
+                    ..
+                }
+                | ProcessNodeKind::ManualTask {
+                    assignee_user_id: Some(user_id),
+                    ..
+                } if !permitted_user_ids
+                    .iter()
+                    .any(|candidate| candidate == user_id) =>
+                {
+                    permitted_user_ids.push(user_id.clone());
+                }
+                _ => {}
+            }
+        }
+        for user_id in &permitted_user_ids {
+            let active_member: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM user_accounts u JOIN org_memberships m ON m.user_id=u.id JOIN organizations o ON o.org_id=m.org_id WHERE u.id=?1 AND m.org_id=?2 AND u.is_active=1 AND o.status='active')",
+                params![user_id, actor.org_id],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                active_member,
+                "simulation ACL includes a user who is not active in the current organization"
+            );
+        }
+        simulation::capture_authenticated_source(
+            actor,
+            &definition.owner_user_id,
+            definition_id,
+            version_number,
+            &version.model,
+            &version.model_sha256,
+            selected_process_id,
+            start_node_id,
+            &permitted_user_ids,
+            variables,
+            start_ms,
+            horizon_ms,
+            tick_duration_ms,
+        )
+    })
+}
+
+/// Rechecks the live publication and execution ACL before one simulator read
+/// or transition. The returned capability carries only source identity; it
+/// does not retain the live connection or authorize a later source mutation.
+pub(crate) fn authorize_simulation_action(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    source: &SimulationSourcePin,
+) -> Result<AuthenticatedSimulationAction> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        let definition_org: String = conn.query_row(
+            "SELECT org_id FROM bpmn_definitions WHERE definition_id=?1",
+            [&source.definition_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            definition_org == source.org_id && actor.org_id == source.org_id,
+            "simulation source belongs to another organization"
+        );
+        let definition = definition_on(conn, &source.definition_id)?;
+        ensure!(
+            !definition.archived && definition.published_version == Some(source.version),
+            "simulation source is no longer the current published process version"
+        );
+        let version = version_on(conn, &source.definition_id, source.version)?;
+        ensure!(
+            version.model_sha256 == source.model_sha256,
+            "simulation source model digest is no longer current"
+        );
+        let model_json = json(&version.model)?;
+        ensure!(
+            model_json == source.model_json
+                && hex::encode(Sha256::digest(model_json.as_bytes())) == source.model_sha256,
+            "simulation source model bytes do not match the published digest"
+        );
+        require_version_execution_on(conn, actor, &source.definition_id, source.version)?;
+        let body = super::model::selected_body(&version.model, &source.selected_process_id, &[])?;
+        let start = body
+            .nodes
+            .iter()
+            .find(|node| node.id == source.start_node_id)
+            .context("simulation Start is absent from the current published body")?;
+        ensure!(
+            matches!(&start.kind, ProcessNodeKind::Start),
+            "simulation Start no longer points to a plain Start node"
+        );
+        let permitted = std::iter::once(definition.owner_user_id.as_str())
+            .chain(super::model::all_nodes(&version.model).into_iter().filter_map(|node| {
+                match &node.kind {
+                    ProcessNodeKind::UserTask {
+                        assignee_user_id: Some(user_id),
+                        ..
+                    }
+                    | ProcessNodeKind::ManualTask {
+                        assignee_user_id: Some(user_id),
+                        ..
+                    } => Some(user_id.as_str()),
+                    _ => None,
+                }
+            }))
+            .collect::<HashSet<_>>();
+        ensure!(
+            permitted.contains(actor.user_id.as_str()),
+            "simulation actor is no longer permitted by the published process ACL"
+        );
+        Ok(AuthenticatedSimulationAction::from_live(
+            &source.simulation_id,
+            actor,
+            &source.definition_id,
+            source.version,
+            &source.model_sha256,
+        ))
+    })
+}
+
+/// Authorizes cleanup of a detached simulation from the live actor identity.
+/// Cleanup deliberately does not require the pinned definition to remain
+/// published or executable: retaining a private database after archival must
+/// not prevent its original owner from releasing it, and this predicate never
+/// returns a transition capability.
+pub(crate) fn authorize_simulation_release(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    source_org_id: &str,
+    source_owner_user_id: &str,
+) -> Result<()> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        ensure!(
+            actor.org_id == source_org_id,
+            "simulation cleanup access denied: run belongs to another organization"
+        );
+        ensure!(
+            actor.user_id == source_owner_user_id,
+            "simulation cleanup access denied: only the retained simulation owner may release its private run"
+        );
+        Ok(())
+    })
+}
+
+/// Materializes only the authenticated source facts needed by the production
+/// process writer into a disposable database. The caller supplies a connection
+/// owned by `SimulationDatabase`; this function never opens or retains the
+/// live application database.
+pub(crate) fn install_simulation_source(
+    conn: &Connection,
+    source: &AuthenticatedSimulationSource,
+    model: &ProcessModel,
+) -> Result<()> {
+    let input = source.input();
+    let model_json = serde_json::to_string(model).context("encode simulation source model")?;
+    ensure!(
+        model_json == input.model_json,
+        "simulation source model bytes changed during capture"
+    );
+    let org_slug = format!(
+        "simulation-{}",
+        &hex::encode(Sha256::digest(input.org_id.as_bytes()))[..24]
+    );
+    let process_name = model
+        .process_name
+        .as_deref()
+        .unwrap_or("Simulation process");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO organizations(org_id,name,slug,status,created_at) VALUES(?1,?2,?3,'active',datetime('now'))",
+        params![input.org_id, process_name, org_slug],
+    )?;
+
+    let mut identities = HashSet::new();
+    identities.insert(input.owner_user_id.clone());
+    identities.insert(input.actor_user_id.clone());
+    for node in super::model::all_nodes(model) {
+        match &node.kind {
+            ProcessNodeKind::UserTask {
+                assignee_user_id: Some(user_id),
+                ..
+            }
+            | ProcessNodeKind::ManualTask {
+                assignee_user_id: Some(user_id),
+                ..
+            } => {
+                identities.insert(user_id.clone());
+            }
+            _ => {}
+        }
+    }
+    for user_id in identities {
+        tx.execute(
+            "INSERT INTO user_accounts(id,username,password_hash,is_active,role) VALUES(?1,?1,'simulation',1,'user')",
+            [&user_id],
+        )?;
+        ensure!(
+            tx.query_row(
+                "SELECT is_active FROM user_accounts WHERE id=?1",
+                [&user_id],
+                |row| row.get::<_, bool>(0),
+            )?,
+            "captured simulation assignee is inactive in the private source"
+        );
+        tx.execute(
+            "INSERT INTO org_memberships(org_id,user_id,role_id,granted_at,granted_by) VALUES(?1,?2,'role-org-admin',datetime('now'),?2)",
+            params![input.org_id, user_id],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'',1,?5,?6,0,?7,?7)",
+        params![
+            input.definition_id,
+            input.org_id,
+            input.owner_user_id,
+            process_name,
+            input.model_json,
+            input.version,
+            input.start_ms,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES(?1,?2,?3,?4,'[]',?5,?6)",
+        params![
+            input.definition_id,
+            input.version,
+            input.model_json,
+            input.model_sha256,
+            input.start_ms,
+            input.owner_user_id,
+        ],
+    )?;
+    tx.commit()
+        .context("commit private published process source")?;
+    Ok(())
+}
 pub fn publish_definition(
     pool: &DbPool,
     actor: &ProcessActor,
@@ -3341,7 +4098,7 @@ pub fn publish_definition(
     if let Some(result) = replay_definition_publication(pool, actor, stamp, definition_id)? {
         return Ok(result);
     }
-    let (original, _, _) = get_definition(pool, actor, definition_id)?;
+    let (original, _) = get_definition(pool, actor, definition_id)?;
     ensure!(
         !original.archived && original.draft_revision == expected_revision,
         "process draft revision conflict or archived definition"
@@ -3451,6 +4208,13 @@ pub fn publish_definition(
             "flow snapshot hash mismatch"
         );
         require_flow_current(&tx, actor, &snapshot.info.flow_id, Some(snapshot))?;
+        let service_node = super::model::all_nodes(&prepared_model).into_iter()
+            .find(|node| node.id == snapshot.info.node_id)
+            .context("pinned service task missing")?;
+        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { result_expression, .. } = &service_node.kind
+        else { bail!("pinned node is not a service task"); };
+        crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
+            &snapshot.graph_json, result_expression.as_deref())?;
     }
     let version = definition
         .published_version
@@ -3475,46 +4239,46 @@ pub fn publish_definition(
         "UPDATE bpmn_timers SET status='cancelled',last_reason='superseded_by_publication',due_at_ms=NULL,revision=revision+1,updated_at_ms=?1 WHERE definition_id=?2 AND kind='start' AND status IN ('pending','blocked','archived')",
         params![now, definition_id],
     )?;
-    if let Some(node) = prepared_model.nodes.iter().find(|node| {
-        matches!(
-            node.kind,
-            tentaflow_protocol::processes::ProcessNodeKind::TimerStart { .. }
-        )
-    }) {
-        let tentaflow_protocol::processes::ProcessNodeKind::TimerStart { timer: rule } = &node.kind else {
-            unreachable!("timer start node was selected by kind")
-        };
-        let timezone = prepared_model
-            .timer_timezone
-            .as_deref()
-            .context("timed process lacks its validated timezone")?;
-        let due = super::timers::resolve_timer_due(
-            rule,
-            timezone,
-            ProcessTimerKind::Start,
-            now,
-            prepared_model.calendar_pin.as_ref(),
-        )?;
-        let total_firings = match rule {
-            ProcessTimerSpec::Cycle { total_firings, .. }
-            | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
-            _ => Some(1),
-        };
-        insert_timer_on(
-            &tx,
-            &ProcessTimer {
+    let timer_bodies = std::iter::once((
+        prepared_model.process_id.as_str(),
+        prepared_model.nodes.as_slice(),
+        prepared_model.timer_timezone.as_deref(),
+        prepared_model.calendar_pin.as_ref(),
+    )).chain(prepared_model.additional_processes.iter().map(|body| (
+        body.process_id.as_str(),
+        body.nodes.as_slice(),
+        body.timer_timezone.as_deref(),
+        body.calendar_pin.as_ref(),
+    )));
+    for (process_id, nodes, timezone, calendar_pin) in timer_bodies {
+        for node in nodes.iter().filter(|node|
+            matches!(node.kind, ProcessNodeKind::TimerStart { .. })) {
+            let ProcessNodeKind::TimerStart { timer: rule } = &node.kind else {
+                unreachable!("TimerStart nodes were selected by kind")
+            };
+            let timezone = timezone.context("timed process body lacks its validated timezone")?;
+            let due = super::timers::resolve_timer_due(
+                rule, timezone, ProcessTimerKind::Start, now, calendar_pin,
+            )?;
+            let total_firings = match rule {
+                ProcessTimerSpec::Cycle { total_firings, .. }
+                | ProcessTimerSpec::Daily { total_firings, .. } => *total_firings,
+                _ => Some(1),
+            };
+            insert_timer_on(&tx, &ProcessTimer {
                 scope_id: None,
                 timer_id: Uuid::new_v4().to_string(),
                 org_id: actor.org_id.clone(),
                 definition_id: definition_id.to_string(),
                 version,
+                start_process_id: Some(process_id.to_owned()),
                 node_id: node.id.clone(),
                 kind: ProcessTimerKind::Start,
                 instance_id: None,
                 token_id: None,
                 rule: rule.clone(),
                 total_firings,
-                timezone: timezone.to_string(),
+                timezone: timezone.to_owned(),
                 anchor_at_ms: now,
                 due_at_ms: Some(due),
                 occurrence: 1,
@@ -3524,10 +4288,9 @@ pub fn publish_definition(
                 next_check_at_ms: due,
                 created_at_ms: now,
                 updated_at_ms: now,
-
                 race_id: None,
-            },
-        )?;
+            })?;
+        }
     }
     let model_changed = model_json != original_json;
     if model_changed {
@@ -3724,7 +4487,7 @@ pub fn archive_definition(
     Ok(result)
 }
 
-fn status_text(status: &ProcessInstanceStatus) -> &'static str {
+pub(super) fn status_text(status: &ProcessInstanceStatus) -> &'static str {
     match status {
         ProcessInstanceStatus::Running => "running",
         ProcessInstanceStatus::Waiting => "waiting",
@@ -3920,19 +4683,25 @@ pub(super) fn scope_path(
     Ok(path)
 }
 
+fn selected_process_id_on(conn: &Connection, instance_id: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT selected_process_id FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| row.get(0),
+    ).context("instance selected process pin is missing")
+}
+
 pub(super) fn scope_node<'a>(
     model: &'a ProcessModel,
+    selected_process_id: &str,
     scopes: &[ProcessScopeSummary],
     instance_id: &str,
     scope_id: &str,
     node_id: &str,
 ) -> Result<&'a ProcessNode> {
     let path = scope_path(scopes, instance_id, scope_id)?;
-    let (nodes, _, _) = super::model::scope_body(model, &path)?;
-    nodes
-        .iter()
-        .find(|node| node.id == node_id)
-        .context("node does not belong to its actual process scope")
+    let body = super::model::selected_body(model, selected_process_id, &path)?;
+    body.nodes.iter().find(|node| node.id == node_id)
+        .context("node does not belong to its actual selected process scope")
 }
 
 fn scopes_on(
@@ -3961,6 +4730,7 @@ fn scopes_on(
         !rows.is_empty() && rows.len() <= 129,
         "process scope inventory is missing or exceeds its lifetime limit"
     );
+    let selected_process_id = selected_process_id_on(conn, instance_id)?;
     let mut scopes = rows
         .into_iter()
         .map(
@@ -3998,7 +4768,7 @@ fn scopes_on(
             &scopes[index].parent_scope_id,
             &scopes[index].subprocess_node_id,
         ) {
-            let node = scope_node(model, &scopes, instance_id, parent, node_id)?;
+            let node = scope_node(model, &selected_process_id, &scopes, instance_id, parent, node_id)?;
             ensure!(
                 matches!(node.kind, ProcessNodeKind::SubProcess { .. }),
                 "child scope parent node is not a subprocess"
@@ -4017,7 +4787,8 @@ fn scoped_node_on<'a>(
     node_id: &str,
 ) -> Result<&'a ProcessNode> {
     let scopes = scopes_on(conn, instance_id, model)?;
-    scope_node(model, &scopes, instance_id, scope_id, node_id)
+    let selected_process_id = selected_process_id_on(conn, instance_id)?;
+    scope_node(model, &selected_process_id, &scopes, instance_id, scope_id, node_id)
 }
 
 fn scope_variables_on(conn: &Connection, instance_id: &str, scope_id: &str) -> Result<Value> {
@@ -4081,11 +4852,72 @@ pub(super) fn effective_scope_variables(
     Ok(effective)
 }
 
+fn task_output_blocked_on(
+    conn: &Connection, instance_id: &str, task_id: &str,
+    token_id: Option<&str>,
+) -> Result<bool> {
+    let Some(token_id) = token_id else { return Ok(false); };
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_activity_io_witnesses \
+         WHERE instance_id=?1 AND resource_id=?2 AND token_id=?3 \
+           AND activity_kind IN ('user','manual') AND phase='output_blocked')",
+        params![instance_id, task_id, token_id], |row| row.get(0))?)
+}
+
+fn task_activity_inputs_on(
+    conn: &Connection,
+    instance_id: &str,
+    task_id: &str,
+    token_id: Option<&str>,
+    kind: &ProcessUserTaskKind,
+) -> Result<Option<Vec<ProcessUserTaskInput>>> {
+    let Some(token_id) = token_id else { return Ok(None); };
+    let activity_kind = match kind {
+        ProcessUserTaskKind::Manual => "manual",
+        ProcessUserTaskKind::Work => "user",
+        ProcessUserTaskKind::Verification => "service",
+    };
+    let input: Option<(String, Option<String>)> = conn.query_row(
+        "SELECT w.input_values_json,w.input_sha256 FROM bpmn_activity_io_witnesses w \
+         JOIN bpmn_user_tasks t ON t.instance_id=w.instance_id \
+             AND t.user_task_id=?2 \
+         WHERE w.instance_id=?1 AND t.scope_id=w.scope_id AND t.node_id=w.node_id \
+           AND t.token_id=w.token_id AND w.token_id=?3 AND w.activity_kind=?4 \
+           AND w.input_values_json IS NOT NULL \
+           AND ((t.kind='verification' AND w.phase='result_accepted' \
+                 AND w.retained_route_kind='awaiting_verification' \
+                 AND w.retained_route_resource_id=t.user_task_id) \
+                OR (t.kind<>'verification' AND w.phase IN \
+                    ('input_captured','result_accepted','output_blocked','output_applied'))) \
+         ORDER BY w.updated_at_ms DESC,w.witness_id DESC LIMIT 1",
+        params![instance_id, task_id, token_id, activity_kind],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((input_json, input_sha256)) = input else { return Ok(None); };
+    let inputs = authenticated_activity_io_inputs(input_json, input_sha256)?;
+    inputs.into_iter().map(|input| {
+        if let IoObservedValue::Present { value } = &input.observed {
+            validate_output(value)?;
+        }
+        Ok(ProcessUserTaskInput {
+            position: u16::try_from(input.position)
+                .context("activity IO input position exceeds task wire range")?,
+            declaration_id: input.declaration_id,
+            name: None,
+            value: match input.observed {
+                IoObservedValue::Missing => ProcessUserTaskInputValue::Missing,
+                IoObservedValue::Present { value } => ProcessUserTaskInputValue::Present(value),
+            },
+        })
+    }).collect::<Result<Vec<_>>>().map(Some)
+}
+
 fn tasks_on(
     conn: &Connection,
     actor: &ProcessActor,
     instance_id: &str,
     user_task_id: Option<&str>,
+    include_activity_inputs: bool,
 ) -> Result<Vec<ProcessUserTask>> {
     let mut task_stmt = conn.prepare("SELECT user_task_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND (?2 IS NULL OR user_task_id=?2) ORDER BY created_at_ms,user_task_id")?;
     let task_rows = task_stmt
@@ -4119,8 +4951,17 @@ fn tasks_on(
             )| {
                 let kind = task_kind_from_text(&kind)?;
                 let status = task_status_from_text(&status)?;
-                let can_complete =
-                    status == ProcessUserTaskStatus::Open && assignee_user_id == actor.user_id;
+                let can_complete = status == ProcessUserTaskStatus::Open
+                    && assignee_user_id == actor.user_id
+                    && !task_output_blocked_on(conn, instance_id,
+                        &user_task_id, token_id.as_deref())?;
+                let activity_inputs = if include_activity_inputs {
+                    task_activity_inputs_on(
+                        conn, instance_id, &user_task_id, token_id.as_deref(), &kind)?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 Ok(ProcessUserTask {
                     user_task_id: user_task_id.clone(),
                     node_id,
@@ -4133,6 +4974,7 @@ fn tasks_on(
                     can_complete,
                     token_id,
                     instructions: None,
+                    activity_inputs,
                     scope_id: conn.query_row(
                         "SELECT scope_id FROM bpmn_user_tasks WHERE user_task_id=?1",
                         [&user_task_id],
@@ -4145,6 +4987,41 @@ fn tasks_on(
     Ok(user_tasks)
 }
 
+fn enrich_user_task_on(
+    instance_id: &str,
+    task: &mut ProcessUserTask,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    selected_process_id: &str,
+) -> Result<()> {
+    if task.kind == ProcessUserTaskKind::Manual || !task.activity_inputs.is_empty() {
+        let node = scope_node(
+            model,
+            selected_process_id,
+            scopes,
+            instance_id,
+            &task.scope_id,
+            &task.node_id,
+        )?;
+        if task.kind == ProcessUserTaskKind::Manual {
+            let ProcessNodeKind::ManualTask { instructions, .. } = &node.kind else {
+                bail!("manual task differs from its pinned node")
+            };
+            task.instructions = Some(instructions.clone());
+        }
+        if let Some(io) = &node.activity_io {
+            for input in &mut task.activity_inputs {
+                input.name = io
+                    .data_inputs
+                    .iter()
+                    .find(|declaration| declaration.id == input.declaration_id)
+                    .and_then(|declaration| declaration.name.clone());
+            }
+        }
+    }
+    super::runtime::ensure_user_task_wire_budget(task)
+}
+
 fn task_summaries_on(
     conn: &Connection,
     actor: &ProcessActor,
@@ -4153,7 +5030,7 @@ fn task_summaries_on(
     offset: u32,
     limit: u32,
 ) -> Result<Vec<ProcessUserTaskSummary>> {
-    let mut stmt = conn.prepare("SELECT user_task_id,node_id,name,assignee_user_id,kind,status,revision FROM bpmn_user_tasks WHERE instance_id=?1 AND (?2 IS NULL OR user_task_id=?2) ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END,created_at_ms DESC,user_task_id LIMIT ?3 OFFSET ?4")?;
+    let mut stmt = conn.prepare("SELECT user_task_id,node_id,name,assignee_user_id,kind,status,revision,token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND (?2 IS NULL OR user_task_id=?2) ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END,created_at_ms DESC,user_task_id LIMIT ?3 OFFSET ?4")?;
     let rows = stmt
         .query_map(params![instance_id, selected_id, limit, offset], |row| {
             Ok((
@@ -4164,15 +5041,18 @@ fn task_summaries_on(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row_u64(row, 6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
         .map(
-            |(user_task_id, node_id, name, assignee_user_id, kind, status, revision)| {
+            |(user_task_id, node_id, name, assignee_user_id, kind, status, revision, token_id)| {
                 let status = task_status_from_text(&status)?;
-                let can_complete =
-                    status == ProcessUserTaskStatus::Open && assignee_user_id == actor.user_id;
+                let can_complete = status == ProcessUserTaskStatus::Open
+                    && assignee_user_id == actor.user_id
+                    && !task_output_blocked_on(conn, instance_id,
+                        &user_task_id, token_id.as_deref())?;
                 Ok(ProcessUserTaskSummary {
                     scope_id: conn.query_row(
                         "SELECT scope_id FROM bpmn_user_tasks WHERE user_task_id=?1",
@@ -4235,6 +5115,13 @@ fn detail_ids_on(
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(ids)
 }
+fn job_direct_retryable_on(conn: &Connection, job_id: &str, instance_id: &str) -> Result<bool> {
+    let proved_no_effect: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id WHERE v.job_id=?1 AND v.instance_id=?2 AND v.phase='proved_no_effect' AND v.dispatch_evidence='no_boundary' AND v.stable_request_id IS NOT NULL AND v.dispatch_attempt IS NULL AND v.dispatch_fence IS NULL AND v.dispatch_worker_id IS NULL AND v.dispatch_committed_at_ms IS NULL AND j.status='error')",
+        params![job_id,instance_id], |row| row.get(0))?;
+    Ok(proved_no_effect && job_activation_live_on(conn, job_id)?)
+}
+
 fn incident_on(
     conn: &Connection,
     actor: &ProcessActor,
@@ -4244,7 +5131,9 @@ fn incident_on(
 ) -> Result<ProcessIncidentSelection> {
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
     let initiator = require_instance_reader(conn, actor, instance_id)?;
-    let can_retry=initiator&&resolved_at_ms.is_none()&&code != "SCRIPT_INFRASTRUCTURE_FAILED"&&match &job_id {Some(id)=>conn.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status IN ('completed','error') AND NOT (status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman'))",params![id,instance_id],|r|r.get::<_,bool>(0))?&&job_activation_live_on(conn,id)?,None=>false};
+    let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {
+        Some(id) => job_direct_retryable_on(conn,id,instance_id)?, None => false,
+    };
     let scope_id: String = conn.query_row(
         "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![id, instance_id],
@@ -4403,6 +5292,7 @@ fn repetition_group_page_on(
     scopes: &[ProcessScopeSummary],
     spec: Option<&ProcessPageSpec>,
 ) -> Result<(Vec<ProcessRepetitionGroupSummary>, ProcessPageInfo)> {
+    let selected_process_id = selected_process_id_on(conn, instance_id)?;
     let total: u32 = conn.query_row(
         "SELECT COUNT(*) FROM bpmn_repetition_groups WHERE instance_id=?1",
         [instance_id], |row| row.get(0),
@@ -4414,7 +5304,7 @@ fn repetition_group_page_on(
     while let Some(row) = rows.next()? {
         let node_id: String = row.get(1)?;
         let scope_id: String = row.get(2)?;
-        let node_name = scope_node(model, scopes, instance_id, &scope_id, &node_id)?.name.clone();
+        let node_name = scope_node(model, &selected_process_id, scopes, instance_id, &scope_id, &node_id)?.name.clone();
         let mode: String = row.get(4)?;
         let status: String = row.get(5)?;
         groups.push(ProcessRepetitionGroupSummary {
@@ -4517,7 +5407,7 @@ fn instance_state_on(
     pages: Option<&ProcessInstancePageRequest>,
     is_initiator: bool,
 ) -> Result<ProcessInstance> {
-    let (definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms):(String,u32,String,u64,String,String,i64,i64)=conn.query_row("SELECT definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",params![instance_id,actor.org_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,row_u64(r,3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).context("process instance not found")?;
+    let (definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,process_id,start_node_id):(String,u32,String,u64,String,String,i64,i64,String,String)=conn.query_row("SELECT definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,selected_process_id,start_node_id FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",params![instance_id,actor.org_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,row_u64(r,3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).context("process instance not found")?;
     let model = current_version_model_on(conn, &definition_id, version)?;
     let definition_name = conn.query_row(
         "SELECT name FROM bpmn_definitions WHERE definition_id=?1",
@@ -4659,6 +5549,8 @@ fn instance_state_on(
         repetition_groups,
         repetition_occurrences,
         selected_repetition_occurrence,
+        process_id,
+        start_node_id,
         terminal_error: conn
             .query_row(
                 "SELECT terminal_error_json FROM bpmn_instances WHERE instance_id=?1",
@@ -4759,36 +5651,37 @@ pub fn get_user_task(
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         let is_initiator = require_instance_reader(conn, actor, instance_id)?;
-        let mut task = tasks_on(conn, actor, instance_id, Some(user_task_id))?
+        let mut task = tasks_on(conn, actor, instance_id, Some(user_task_id), true)?
             .pop()
             .context("user task not found")?;
         ensure!(
             is_initiator || task.assignee_user_id == actor.user_id,
             "user task not found"
         );
-        if task.kind == ProcessUserTaskKind::Manual {
+        if task.kind == ProcessUserTaskKind::Manual || !task.activity_inputs.is_empty() {
             let (definition_id, version): (String, u32) = conn.query_row(
                 "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
                 [instance_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
             let model = current_version_model_on(conn, &definition_id, version)?;
             let scopes = scopes_on(conn, instance_id, &model)?;
-            let node = scope_node(&model, &scopes, instance_id,
+            let selected_process_id = selected_process_id_on(conn, instance_id)?;
+            let node = scope_node(&model, &selected_process_id, &scopes, instance_id,
                 &task.scope_id, &task.node_id)?;
-            let ProcessNodeKind::ManualTask { instructions, .. } = &node.kind else {
-                bail!("manual task differs from its pinned node")
-            };
-            task.instructions = Some(instructions.clone());
+            if task.kind == ProcessUserTaskKind::Manual {
+                let ProcessNodeKind::ManualTask { instructions, .. } = &node.kind else {
+                    bail!("manual task differs from its pinned node")
+                };
+                task.instructions = Some(instructions.clone());
+            }
+            if let Some(io) = &node.activity_io {
+                for input in &mut task.activity_inputs {
+                    input.name = io.data_inputs.iter()
+                        .find(|declaration| declaration.id == input.declaration_id)
+                        .and_then(|declaration| declaration.name.clone());
+                }
+            }
         }
-        let frame = tentaflow_protocol::cbor::encode(
-            &tentaflow_protocol::message_body::MessageBody::ProcessBody(
-                ProcessPayload::UserTaskGetResponse { task: task.clone() },
-            ),
-        )
-        .map_err(anyhow::Error::msg)?;
-        ensure!(
-            frame.len() <= 900 * 1024,
-            "process user task detail exceeds the wire budget"
-        );
+        super::runtime::ensure_user_task_wire_budget(&task)?;
         Ok(task)
     })
 }
@@ -4809,7 +5702,7 @@ pub fn list_instances(
             params![actor.org_id, actor.user_id, definition_id],
             |row| row.get(0),
         )?;
-        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND x.code!='SCRIPT_INFRASTRUCTURE_FAILED' AND j.status IN ('error','completed') AND NOT (j.status='completed' AND j.result_origin='contract' AND json_extract(j.result_json,'$.outcome')='NeedsHuman') AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
+        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,i.selected_process_id,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND v.phase='proved_no_effect' AND v.dispatch_evidence='no_boundary' AND v.stable_request_id IS NOT NULL AND v.dispatch_attempt IS NULL AND v.dispatch_fence IS NULL AND v.dispatch_worker_id IS NULL AND v.dispatch_committed_at_ms IS NULL AND j.status='error' AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -4825,7 +5718,8 @@ pub fn list_instances(
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
-                        row.get::<_, bool>(9)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, bool>(10)?,
                     ))
                 },
             )?
@@ -4843,6 +5737,7 @@ pub fn list_instances(
                     status,
                     created_at_ms,
                     updated_at_ms,
+                    process_id,
                     retryable,
                 )| {
                     let status = status_from_text(&status)?;
@@ -4865,6 +5760,7 @@ pub fn list_instances(
                         status,
                         created_at_ms,
                         updated_at_ms,
+                        process_id,
                     })
                 },
             )
@@ -5025,7 +5921,388 @@ fn repetition_occurrences_on(conn: &Connection, instance_id: &str) -> Result<Vec
     Ok(occurrences)
 }
 
-fn runtime_snapshot_on(
+fn activity_io_witnesses_on(conn: &Connection, instance_id: &str) -> Result<Vec<ActivityIoWitness>> {
+    let mut statement = conn.prepare(
+        "SELECT witness_id,scope_id,node_id,token_id,activity_kind,phase_owner,phase,revision, \
+         input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id, \
+         source_event_id,result_sources_json,result_presence,result_json,result_sha256, \
+         retained_route_kind,retained_route_event_id,retained_route_resource_id, \
+         service_invocation_id,incident_id,resource_id,group_id,occurrence_id,ordinal \
+         FROM bpmn_activity_io_witnesses WHERE instance_id=?1 \
+         AND phase IN ('input_failed','input_captured','result_accepted','output_blocked','output_applied') \
+         ORDER BY scope_id,node_id,token_id,witness_id",
+    )?;
+    let mut rows = statement.query([instance_id])?;
+    let mut witnesses = Vec::new();
+    while let Some(row) = rows.next()? {
+        let input: Option<String> = row.get(9)?;
+        let input_sha256: Option<String> = row.get(10)?;
+        let result_sources: Option<String> = row.get(14)?;
+        let result: Option<String> = row.get(16)?;
+        let input_values = input
+            .map(|raw| authenticated_activity_io_inputs(raw, input_sha256.clone()))
+            .transpose()?;
+        witnesses.push(ActivityIoWitness {
+            witness_id: row.get(0)?, scope_id: row.get(1)?, node_id: row.get(2)?,
+            token_id: row.get(3)?, activity_kind: row.get(4)?, phase_owner: row.get(5)?,
+            phase: row.get(6)?, revision: row_u64(row, 7)?, input_event_id: row.get(8)?,
+            input_values, input_sha256,
+            result_event_id: row.get(11)?, source_instance_id: row.get(12)?,
+            source_event_id: row.get(13)?,
+            result_sources: result_sources.map(parse).transpose()?,
+            result_presence: row.get(15)?, result: result.map(parse).transpose()?,
+            result_sha256: row.get(17)?, retained_route_kind: row.get(18)?,
+            retained_route_event_id: row.get(19)?,
+            retained_route_resource_id: row.get(20)?, service_invocation_id: row.get(21)?,
+            incident_id: row.get(22)?, resource_id: row.get(23)?, group_id: row.get(24)?,
+            occurrence_id: row.get(25)?, ordinal: row.get(26)?,
+        });
+    }
+    Ok(witnesses)
+}
+
+#[derive(Debug, Clone)]
+struct ActivityIoInputSource {
+    inputs: Vec<IoObservedInput>,
+    group_id: Option<String>,
+    occurrence_id: Option<String>,
+    ordinal: Option<u32>,
+}
+
+fn authenticated_activity_io_inputs(
+    input_json: String,
+    input_sha256: Option<String>,
+) -> Result<Vec<IoObservedInput>> {
+    let expected_sha256 = hex::encode(Sha256::digest(input_json.as_bytes()));
+    ensure!(input_sha256.as_deref() == Some(expected_sha256.as_str()),
+        "activity IO witness input values failed their persisted digest check");
+    let inputs: Vec<IoObservedInput> = parse(input_json)?;
+    ensure!(inputs.len() <= 16, "activity IO witness inputs exceed the model limit");
+    let mut positions = HashSet::new();
+    for input in &inputs {
+        ensure!(positions.insert(input.position),
+            "activity IO witness inputs contain duplicate positions");
+        if let IoObservedValue::Present { value } = &input.observed {
+            validate_output(value)?;
+        }
+    }
+    Ok(inputs)
+}
+
+fn activity_io_input_source_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    witness_id: &str,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<ActivityIoInputSource> {
+    let planned = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+        ActivityIoInputFact::Captured {
+            witness_id: candidate,
+            scope_id: candidate_scope,
+            node_id: candidate_node,
+            activation_token_id,
+            inputs,
+            group_id,
+            occurrence_id,
+            ordinal,
+            ..
+        } if candidate == witness_id => Some((
+            candidate_scope,
+            candidate_node,
+            activation_token_id,
+            inputs,
+            group_id,
+            occurrence_id,
+            ordinal,
+        )),
+        _ => None,
+    }).collect::<Vec<_>>();
+    if !planned.is_empty() {
+        ensure!(planned.len() == 1,
+            "activity IO witness has duplicate planned input captures");
+        let (candidate_scope, candidate_node, candidate_token, inputs,
+            group_id, occurrence_id, ordinal) = planned[0];
+        ensure!(candidate_scope == scope_id && candidate_node == node_id
+            && candidate_token == token_id,
+            "activity IO witness changed its activation while replaying inputs");
+        return Ok(ActivityIoInputSource {
+            inputs: inputs.clone(),
+            group_id: group_id.clone(),
+            occurrence_id: occurrence_id.clone(),
+            ordinal: *ordinal,
+        });
+    }
+
+    let (candidate_scope, candidate_node, candidate_token, phase, values_json,
+        input_sha256, group_id, occurrence_id, ordinal): (String, String, String, String,
+        String, Option<String>, Option<String>, Option<String>, Option<u32>) = tx.query_row(
+        "SELECT scope_id,node_id,token_id,phase,input_values_json,input_sha256,group_id,occurrence_id,ordinal \
+         FROM bpmn_activity_io_witnesses \
+         WHERE instance_id=?1 AND witness_id=?2 AND input_values_json IS NOT NULL",
+        params![instance_id, witness_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+    ).context("activity IO witness has no authenticated input values")?;
+    ensure!(candidate_scope == scope_id && candidate_node == node_id
+        && candidate_token == token_id
+        && matches!(phase.as_str(), "input_captured" | "result_accepted"
+            | "output_blocked" | "output_applied"),
+        "activity IO witness input values belong to another activation");
+    Ok(ActivityIoInputSource {
+        inputs: authenticated_activity_io_inputs(values_json, input_sha256)?,
+        group_id,
+        occurrence_id,
+        ordinal,
+    })
+}
+
+fn activity_io_replay_extra_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    witness_id: &str,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<Vec<(String, Value)>> {
+    let source = activity_io_input_source_on(
+        tx, instance_id, plan, witness_id, scope_id, node_id, token_id,
+    )?;
+    let mut extra = Vec::new();
+    if let (Some(group_id), Some(occurrence_id), Some(ordinal)) = (
+        source.group_id.as_deref(), source.occurrence_id.as_deref(), source.ordinal,
+    ) {
+        let occurrence = if let Some(row) = plan.repetition_occurrences.iter().find(|row|
+            row.occurrence_id == occurrence_id
+                && row.group_id == group_id
+                && row.ordinal == ordinal).cloned() {
+            row
+        } else {
+            repetition_occurrences_on(tx, instance_id)?.into_iter().find(|row|
+                row.occurrence_id == occurrence_id
+                    && row.group_id == group_id
+                    && row.ordinal == ordinal)
+                .context("activity IO witness has no authenticated repetition ordinal")?
+        };
+        let group = if let Some(row) = plan.repetition_groups.iter().find(|row|
+            row.group_id == group_id && row.scope_id == scope_id && row.node_id == node_id).cloned() {
+            row
+        } else {
+            repetition_groups_on(tx, instance_id)?.into_iter().find(|row|
+                row.group_id == group_id && row.scope_id == scope_id
+                    && row.node_id == node_id)
+                .context("activity IO witness has no authenticated repetition group")?
+        };
+        ensure!(occurrence.scope_id == scope_id && occurrence.token_id == token_id,
+            "activity IO witness changed its repeated activation");
+        extra.push(("repeat".to_owned(), serde_json::json!({
+            "group_id": group.group_id,
+            "index": occurrence.ordinal,
+            "item": occurrence.item,
+        })));
+    } else if let Some(group_id) = source.group_id.as_deref() {
+        ensure!(source.occurrence_id.is_none() && source.ordinal.is_none(),
+            "activity IO witness has an incomplete coordinator owner");
+        let group_exists = plan.repetition_groups.iter().any(|group|
+            group.group_id == group_id && group.scope_id == scope_id
+                && group.node_id == node_id)
+            || repetition_groups_on(tx, instance_id)?.iter().any(|group|
+                group.group_id == group_id && group.scope_id == scope_id
+                    && group.node_id == node_id);
+        ensure!(group_exists, "activity IO witness has no authenticated coordinator group");
+    } else {
+        ensure!(source.occurrence_id.is_none() && source.ordinal.is_none(),
+            "activity IO witness has an incomplete ordinary owner");
+    }
+    extra.extend(super::runtime::activity_inputs_extra(&source.inputs)?);
+    Ok(extra)
+}
+
+fn planned_activity_io_extra_for_activation(
+    plan: &RuntimePlan,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<Vec<(String, Value)>> {
+    let captures = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+        ActivityIoInputFact::Captured {
+            scope_id: candidate_scope,
+            node_id: candidate_node,
+            activation_token_id,
+            inputs,
+            group_id,
+            occurrence_id,
+            ordinal,
+            ..
+        } if candidate_scope == scope_id && candidate_node == node_id
+            && activation_token_id == token_id => Some((
+                inputs, group_id, occurrence_id, ordinal,
+            )),
+        _ => None,
+    }).collect::<Vec<_>>();
+    ensure!(captures.len() <= 1,
+        "activity IO activation has duplicate planned input captures");
+    let Some((inputs, group_id, occurrence_id, ordinal)) = captures.first() else {
+        return Ok(Vec::new());
+    };
+    let mut extra = Vec::new();
+    if let (Some(group_id), Some(occurrence_id), Some(ordinal)) = (
+        group_id.as_deref(), occurrence_id.as_deref(), **ordinal,
+    ) {
+        let occurrence = plan.repetition_occurrences.iter().find(|row|
+            row.occurrence_id == occurrence_id && row.group_id == group_id
+                && row.ordinal == ordinal)
+            .context("activity IO activation has no planned repetition ordinal")?;
+        let group = plan.repetition_groups.iter().find(|row|
+            row.group_id == group_id && row.scope_id == scope_id
+                && row.node_id == node_id)
+            .context("activity IO activation has no planned repetition group")?;
+        ensure!(occurrence.scope_id == scope_id && occurrence.token_id == token_id,
+            "activity IO activation changed its repeated token");
+        extra.push(("repeat".to_owned(), serde_json::json!({
+            "group_id": group.group_id,
+            "index": occurrence.ordinal,
+            "item": occurrence.item,
+        })));
+    } else {
+        ensure!(group_id.is_none() && occurrence_id.is_none() && ordinal.is_none()
+            || group_id.is_some() && occurrence_id.is_none() && ordinal.is_none(),
+            "activity IO activation has an incomplete repetition owner");
+    }
+    extra.extend(super::runtime::activity_inputs_extra(inputs)?);
+    Ok(extra)
+}
+
+fn persisted_activity_io_inputs_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<Option<Vec<IoObservedInput>>> {
+    let row: Option<(String, String, Option<String>)> = tx.query_row(
+        "SELECT phase,input_values_json,input_sha256 FROM bpmn_activity_io_witnesses \
+         WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 \
+           AND input_values_json IS NOT NULL \
+           AND phase IN ('input_captured','result_accepted','output_blocked','output_applied') \
+         ORDER BY revision DESC,witness_id DESC LIMIT 1",
+        params![instance_id, scope_id, node_id, token_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    row.map(|(phase, values_json, input_sha256)| {
+        ensure!(matches!(phase.as_str(), "input_captured" | "result_accepted"
+            | "output_blocked" | "output_applied"),
+            "activity IO witness input values belong to an invalid phase");
+        authenticated_activity_io_inputs(values_json, input_sha256)
+    }).transpose()
+}
+
+fn persisted_activity_io_inputs_for_activation_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<Option<Vec<IoObservedInput>>> {
+    let planned = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+        ActivityIoInputFact::Captured {
+            scope_id: candidate_scope,
+            node_id: candidate_node,
+            activation_token_id,
+            inputs,
+            ..
+        } if candidate_scope == scope_id && candidate_node == node_id
+            && activation_token_id == token_id => Some(inputs.clone()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    ensure!(planned.len() <= 1,
+        "activity IO mapping has duplicate planned input captures");
+    if let Some(inputs) = planned.into_iter().next() {
+        return Ok(Some(inputs));
+    }
+    persisted_activity_io_inputs_on(tx, instance_id, scope_id, node_id, token_id)
+}
+
+fn activity_io_extra_for_activation_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    scope_id: &str,
+    node_id: &str,
+    token_id: &str,
+) -> Result<Vec<(String, Value)>> {
+    let planned = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+        ActivityIoInputFact::Captured {
+            witness_id, scope_id: candidate_scope, node_id: candidate_node,
+            activation_token_id, ..
+        } if candidate_scope == scope_id && candidate_node == node_id
+            && activation_token_id == token_id => Some(witness_id.clone()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    ensure!(planned.len() <= 1,
+        "activity IO activation has duplicate planned input captures");
+    if let Some(witness_id) = planned.into_iter().next() {
+        return activity_io_replay_extra_on(
+            tx, instance_id, plan, &witness_id, scope_id, node_id, token_id,
+        );
+    }
+    let witness_id: Option<String> = tx.query_row(
+        "SELECT witness_id FROM bpmn_activity_io_witnesses \
+         WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 \
+           AND input_values_json IS NOT NULL \
+           AND phase IN ('input_captured','result_accepted','output_blocked','output_applied') \
+         ORDER BY revision DESC,witness_id DESC LIMIT 1",
+        params![instance_id, scope_id, node_id, token_id],
+        |row| row.get(0),
+    ).optional()?;
+    witness_id.map_or_else(|| Ok(Vec::new()), |witness_id|
+        activity_io_replay_extra_on(
+            tx, instance_id, plan, &witness_id, scope_id, node_id, token_id,
+        ))
+}
+
+fn mapped_activity_io_extra_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    scope_id: &str,
+    node: &ProcessNode,
+    source_token_id: &str,
+    output_event_index: usize,
+) -> Result<Vec<(String, Value)>> {
+    if node.activity_io.is_some() {
+        let results = plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == scope_id && fact.node_id == node.id
+                && fact.token_id == source_token_id
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index: index, .. }
+                        if *index == output_event_index))
+            .collect::<Vec<_>>();
+        ensure!(results.len() == 1,
+            "mapped activity IO has no unique accepted result witness");
+        return activity_io_replay_extra_on(
+            tx, instance_id, plan, &results[0].witness_id,
+            scope_id, &node.id, source_token_id,
+        );
+    }
+    let attached_to_id = match &node.kind {
+        ProcessNodeKind::BoundaryError { attached_to_id, .. }
+        | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } =>
+            Some(attached_to_id.as_str()),
+        _ => None,
+    };
+    let Some(attached_to_id) = attached_to_id else { return Ok(Vec::new()); };
+    persisted_activity_io_inputs_for_activation_on(
+        tx, instance_id, plan, scope_id, attached_to_id, source_token_id,
+    )?.map_or_else(|| Ok(Vec::new()), |inputs|
+        super::runtime::activity_inputs_extra(&inputs))
+}
+
+pub(crate) fn runtime_snapshot_on(
     conn: &Connection,
     actor: &ProcessActor,
     instance_id: &str,
@@ -5033,13 +6310,13 @@ fn runtime_snapshot_on(
     let is_initiator = require_instance_reader(conn, actor, instance_id)?;
     let instance = instance_state_on(conn, actor, instance_id, None, is_initiator)?;
     let model = current_version_model_on(conn, &instance.definition_id, instance.version)?;
-    let user_tasks = tasks_on(conn, actor, instance_id, None)?;
+    let user_tasks = tasks_on(conn, actor, instance_id, None, false)?;
     let snapshots_json: String = conn.query_row(
         "SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
         params![instance.definition_id, instance.version],
         |row| row.get(0),
     )?;
-    let service_snapshots = parse(snapshots_json)?;
+    let service_snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
     let mut token_stmt = conn.prepare("SELECT token_id,node_id,arrival_edge_id,fork_stack_json,status FROM bpmn_tokens WHERE instance_id=?1 AND status NOT IN ('consumed','cancelled') ORDER BY created_at_ms,token_id")?;
     let token_rows = token_stmt
         .query_map([instance_id], |row| {
@@ -5118,7 +6395,7 @@ fn runtime_snapshot_on(
                         [&job_id],
                         |row| row.get(0),
                     )?,
-                    job_id,
+                    job_id: job_id.clone(),
                     instance_id: instance_id.to_string(),
                     node_id,
                     token_id,
@@ -5131,10 +6408,22 @@ fn runtime_snapshot_on(
                     result: result_json.map(parse).transpose()?,
 
                     result_origin,
+                    observed_result_event_id: conn.query_row(
+                        "SELECT reserved_result_event_id FROM bpmn_service_invocations WHERE job_id=?1",
+                        [&job_id], |row| row.get(0))?,
                 })
             },
         )
         .collect::<Result<Vec<_>>>()?;
+    let mut dispatch_stmt = conn.prepare("SELECT invocation_id,job_id,scope_id,node_id,token_id,phase,dispatch_attempt,dispatch_fence,dispatch_worker_id,reserved_result_event_id,uncertainty_incident_id FROM bpmn_service_invocations WHERE instance_id=?1 AND dispatch_evidence='committed_boundary' AND phase IN ('may_have_executed','uncertain','observed')")?;
+    let service_dispatches = dispatch_stmt.query_map([instance_id], |row| Ok(ServiceDispatchFact {
+        invocation_id: row.get(0)?, job_id: row.get(1)?, scope_id: row.get(2)?,
+        node_id: row.get(3)?, token_id: row.get(4)?, phase: row.get(5)?,
+        attempt: row.get(6)?, fence: row_u64(row, 7)?, worker_id: row.get(8)?,
+        reserved_result_event_id: row.get(9)?,
+        uncertainty_incident_id: row.get(10)?,
+    }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(dispatch_stmt);
     let mut receipt_stmt = conn.prepare("SELECT join_node_id,activation_id,branch_edge_id,token_id,scope_id,gateway_kind FROM bpmn_gateway_receipts WHERE instance_id=?1")?;
     let receipts = receipt_stmt.query_map([instance_id], |row| {
         Ok(GatewayReceipt {
@@ -5187,13 +6476,38 @@ fn runtime_snapshot_on(
         },
     )?;
     let calls = calls_on(conn, instance_id)?;
-    let call_versions = pinned_call_versions_on(
+    let mut call_versions = pinned_call_versions_on(
         conn,
         actor,
         &instance.definition_id,
         instance.version,
         &model,
     )?;
+    call_versions.push(PinnedCallVersion {
+        version: version_on(conn, &instance.definition_id, instance.version)?,
+        services: service_snapshots.clone(),
+        name: instance.definition_name.clone(),
+        admission_error: None,
+    });
+    let mut end_stmt = conn.prepare(
+        "SELECT event_id,scope_id,node_id,data_json FROM bpmn_events \
+         WHERE instance_id=?1 AND kind='end_reached' \
+           AND json_type(data_json,'$.source_token_id')='text' ORDER BY seq",
+    )?;
+    let end_sources = end_stmt.query_map([instance_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter().map(|(event_id, scope_id, node_id, data_json)| {
+            let data: Value = parse(data_json)?;
+            let source_token_id = data["source_token_id"].as_str()
+                .context("typed End source token is missing")?.to_owned();
+            Ok(ProcessEndSource { event_id, scope_id, node_id, source_token_id })
+        }).collect::<Result<Vec<_>>>()?;
     Ok(RuntimeSnapshot {
         org_id: actor.org_id.clone(),
         instance,
@@ -5201,6 +6515,7 @@ fn runtime_snapshot_on(
         user_tasks,
         tokens,
         jobs,
+        service_dispatches,
         receipts,
         service_snapshots,
         timers,
@@ -5215,7 +6530,54 @@ fn runtime_snapshot_on(
         retained_scope_count,
         repetition_groups: repetition_groups_on(conn, instance_id)?,
         repetition_occurrences: repetition_occurrences_on(conn, instance_id)?,
+        activity_io_witnesses: activity_io_witnesses_on(conn, instance_id)?,
+        end_sources,
     })
+}
+
+pub(crate) fn simulation_user_tasks_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<Vec<ProcessUserTask>> {
+    require_instance_reader(conn, actor, instance_id)?;
+    let mut tasks = tasks_on(conn, actor, instance_id, None, true)?;
+    let (definition_id, version): (String, u32) = conn.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let model = current_version_model_on(conn, &definition_id, version)?;
+    let scopes = scopes_on(conn, instance_id, &model)?;
+    let selected_process_id = selected_process_id_on(conn, instance_id)?;
+    for task in &mut tasks {
+        enrich_user_task_on(
+            instance_id,
+            task,
+            &model,
+            &scopes,
+            &selected_process_id,
+        )?;
+    }
+    Ok(tasks)
+}
+
+pub(crate) fn simulation_timer_summaries_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<Vec<ProcessTimerSummary>> {
+    require_instance_reader(conn, actor, instance_id)?;
+    let (definition_id, version): (String, u32) = conn.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let model = current_version_model_on(conn, &definition_id, version)?;
+    timer_ids_on(conn, instance_id)?
+        .into_iter()
+        .map(|timer_id| timer_summary(conn, &timer_on(conn, &timer_id)?, &model))
+        .collect()
 }
 
 fn insert_event_on(
@@ -5359,6 +6721,7 @@ fn validate_scope_plan_on(
     plan: &RuntimePlan,
     at_ms: i64,
 ) -> Result<Vec<ProcessScopeSummary>> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let (definition_id, version): (String, u32) = tx.query_row(
         "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
@@ -5422,8 +6785,7 @@ fn validate_scope_plan_on(
             ),
             "new scope parent is terminal"
         );
-        let node = scope_node(
-            &model,
+        let node = scope_node(&model, &selected_process_id,
             &scopes,
             instance_id,
             &child.parent_scope_id,
@@ -5500,6 +6862,159 @@ fn validate_scope_plan_on(
         }
         scope.status = update.status.clone();
     }
+    let mut verified_return_failures = HashSet::new();
+    for failure in &plan.scope_return_failures {
+        let child_mapped_before_failure = plan.variable_effects.iter().any(|effect| matches!(
+            effect,
+            VariableEffect::Mapped { event_index, scope_id, .. }
+                if scope_id == &failure.child_scope_id
+                    && *event_index < failure.incident_event_index
+        ));
+        let child = scopes.iter().find(|scope| scope.scope_id == failure.child_scope_id)
+            .context("ordinary return failure has no child scope")?;
+        let parent = scopes.iter().find(|scope| scope.scope_id == failure.parent_scope_id)
+            .context("ordinary return failure has no parent scope")?;
+        let child_locals = locals.get(&failure.child_scope_id)
+            .context("ordinary return failure has no retained child variables")?;
+        ensure!(verified_return_failures.insert(failure.child_scope_id.as_str())
+            && child.status == ProcessInstanceStatus::Incident
+            && child.parent_scope_id.as_deref() == Some(failure.parent_scope_id.as_str())
+            && child.parent_token_id.as_deref() == Some(failure.parent_token_id.as_str())
+            && child.revision == failure.child_scope_revision
+            && parent.revision == failure.parent_scope_revision
+            && plan.scope_updates.iter().filter(|update|
+                update.scope_id == failure.child_scope_id
+                    && update.status == ProcessInstanceStatus::Incident
+                        && update.variables.as_ref()
+                        == child_mapped_before_failure.then_some(child_locals)
+            ).count() == 1,
+            "ordinary return failure changed its selected child or parent state");
+        let parent_token = termination_token_on(tx, instance_id, plan,
+            &failure.parent_token_id)?;
+        ensure!(parent_token.scope_id == failure.parent_scope_id
+            && parent_token.node_id == child.subprocess_node_id.as_deref().unwrap_or_default()
+            && parent_token.status == "waiting"
+            && !plan.consume_token_ids.contains(&failure.parent_token_id)
+            && !plan.cancel_token_ids.contains(&failure.parent_token_id),
+            "ordinary return failure lost its factual parent waiting activation");
+        let mut source_locals = BTreeMap::new();
+        source_locals.insert(instance_id.to_owned(), scope_variables_on(tx, instance_id, instance_id)?);
+        for scope in scopes.iter().filter(|scope| scope.scope_id != instance_id) {
+            let initial = if let Some(created) = plan.create_scopes.iter().find(|created|
+                created.scope_id == scope.scope_id) {
+                created.variables.clone()
+            } else {
+                scope_variables_on(tx, instance_id, &scope.scope_id)?
+            };
+            source_locals.insert(scope.scope_id.clone(), initial);
+        }
+        for effect in &plan.variable_effects {
+            match effect {
+                VariableEffect::Mapped { event_index, scope_id, result, .. }
+                | VariableEffect::ScopeEntry { event_index, scope_id, result, .. }
+                | VariableEffect::RepetitionAggregate { event_index, scope_id, result, .. }
+                    if *event_index < failure.incident_event_index => {
+                    ensure!(source_locals.contains_key(scope_id),
+                        "ordinary return failure references an unknown source-time scope");
+                    source_locals.insert(scope_id.clone(), result.clone());
+                }
+                _ => {}
+            }
+        }
+        let replayed_child_locals = source_locals.get(&failure.child_scope_id)
+            .context("ordinary return failure has no replayed child variables")?;
+        ensure!(failure.child_locals == *replayed_child_locals
+            && child_locals == replayed_child_locals,
+            "ordinary return failure changed its independently replayed child variables");
+        let parent_locals = source_locals.get(&failure.parent_scope_id)
+            .context("ordinary return failure has no source-time parent variables")?;
+        let root_at_failure = source_locals.get(instance_id)
+            .context("ordinary return failure has no source-time root variables")?;
+        let parent_effective = effective_scope_variables(&scopes, &source_locals, instance_id,
+            root_at_failure, &failure.parent_scope_id)?;
+        let parent_node_id = child.subprocess_node_id.as_deref()
+            .context("ordinary return failure has no parent subprocess node")?;
+        let parent_node = scope_node(&model, &selected_process_id, &scopes, instance_id,
+            &failure.parent_scope_id, parent_node_id)?;
+        let ProcessNodeKind::SubProcess { output_mapping, .. } = &parent_node.kind else {
+            bail!("ordinary return failure parent is not its pinned subprocess")
+        };
+        let parent_extra = activity_io_extra_for_activation_on(
+            tx, instance_id, plan, &failure.parent_scope_id,
+            parent_node_id, &failure.parent_token_id,
+        )?;
+        let mapping_error = super::runtime::patch_variables(output_mapping,
+            parent_locals, &parent_effective, child_locals, &parent_extra)
+            .err().context("ordinary return failure has a successful pinned mapping")?;
+        let message = bounded_failure_message(&format!("{mapping_error:#}"));
+        let incident = plan.add_incidents.iter().filter(|incident|
+            incident.incident_id == failure.incident_id
+                && incident.scope_id == failure.child_scope_id
+                && incident.node_id.is_none() && incident.job_id.is_none()
+                && incident.code == "SCOPE_RETURN_ERROR"
+                && incident.message == message && !incident.can_retry
+                && incident.at_ms == at_ms).count();
+        let event = plan.events.iter().enumerate().filter(|(index, event)|
+            *index == failure.incident_event_index
+                && event.kind == "incident" && event.scope_id == failure.child_scope_id
+                && event.node_id.is_none() && event.data == serde_json::json!({
+                    "incident_id":failure.incident_id,"code":"SCOPE_RETURN_ERROR",
+                    "message":message,"parent_token_id":failure.parent_token_id,
+                })).count();
+        ensure!(failure.child_locals == *child_locals
+            && failure.parent_effective == parent_effective
+            && incident == 1 && event == 1 && !failure.end_event_indices.is_empty(),
+            "ordinary return failure differs from its pinned mapping and incident");
+        let actual_end_indices = plan.events.iter().enumerate().filter(|(_, event)|
+            event.kind == "end_reached" && event.scope_id == failure.child_scope_id)
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        ensure!(failure.end_event_indices == actual_end_indices,
+            "ordinary return failure changed its child End sources");
+        let last_end = *failure.end_event_indices.last()
+            .context("ordinary return failure has no child End source")?;
+        ensure!(plan.variable_effects.iter().all(|effect| match effect {
+            VariableEffect::Mapped { event_index, scope_id, .. }
+            | VariableEffect::ScopeEntry { event_index, scope_id, .. }
+            | VariableEffect::RepetitionAggregate { event_index, scope_id, .. }
+            | VariableEffect::RepetitionEntry { event_index, scope_id, .. }
+                if scope_id == &failure.child_scope_id => *event_index <= last_end,
+            _ => true,
+        }), "ordinary return failure has a child effect after its final End");
+        let parent_token = termination_token_on(tx, instance_id, plan,
+            &failure.parent_token_id)?;
+        ensure!(parent_token.scope_id == failure.parent_scope_id,
+            "ordinary return failure lost its parent activation scope");
+        let typed_end = scope_node(&model, &selected_process_id, &scopes,
+            instance_id, &parent_token.scope_id, &parent_token.node_id)?
+            .activity_io.is_some();
+        for index in &failure.end_event_indices {
+            ensure!(*index < failure.incident_event_index,
+                "ordinary return failure incident precedes its child End source");
+            let source_id = plan.event_sources.get(index)
+                .context("ordinary return End lacks its token source")?;
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            ensure!(source.scope_id == failure.child_scope_id && source.status == "ready"
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
+                && scope_node(&model, &selected_process_id, &scopes, instance_id,
+                    &source.scope_id, &source.node_id)
+                    .is_ok_and(|node| node.kind == ProcessNodeKind::End)
+                && plan.events[*index].node_id.as_deref() == Some(source.node_id.as_str())
+                && (if typed_end {
+                    plan.event_ids.contains_key(index)
+                        && plan.events[*index].data == serde_json::json!({
+                            "source_token_id": source_id,
+                        })
+                } else { plan.events[*index].data.is_null() }),
+                "ordinary return failure has no factual consumed child End");
+        }
+    }
+    ensure!(plan.add_incidents.iter().filter(|incident|
+        incident.code == "SCOPE_RETURN_ERROR" && incident.node_id.is_none())
+        .count() == verified_return_failures.len()
+        && plan.add_incidents.iter().filter(|incident|
+            incident.code == "SCOPE_RETURN_ERROR" && incident.node_id.is_none())
+            .all(|incident| verified_return_failures.contains(incident.scope_id.as_str())),
+        "ordinary return incidents lack their independently replayed child source");
     validate_variables(&plan.variables)?;
     let mut active_bytes = if matches!(
         plan.status,
@@ -5538,13 +7053,15 @@ fn validate_scope_plan_on(
         active_bytes = active_bytes
             .checked_add(json(local)?.len())
             .context("active scope variable budget overflow")?;
-        effective_scope_variables(
-            &scopes,
-            &locals,
-            instance_id,
-            &plan.variables,
-            &scope.scope_id,
-        )?;
+        if !verified_return_failures.contains(scope.scope_id.as_str()) {
+            effective_scope_variables(
+                &scopes,
+                &locals,
+                instance_id,
+                &plan.variables,
+                &scope.scope_id,
+            )?;
+        }
     }
     ensure!(
         active_bytes <= 1024 * 1024,
@@ -5582,7 +7099,8 @@ fn validate_scope_plan_on(
             "new process token identity or terminal scope is invalid"
         );
         let path = scope_path(&scopes, instance_id, &token.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+        let selected = super::model::selected_body(&model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         ensure!(
             nodes.iter().any(|node| node.id == token.node_id),
             "new token node is outside its exact scope body"
@@ -5618,7 +7136,8 @@ fn validate_scope_plan_on(
             let node_id = event.node_id.as_deref().context("parallel split node missing")?;
             let activation = event.data["activation_id"].as_str().context("parallel split activation missing")?;
             let path = scope_path(&scopes, instance_id, &event.scope_id)?;
-            let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+            let selected = super::model::selected_body(&model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
             let pair = super::model::gateway_pairs(nodes, flows)?.remove(node_id)
                 .context("parallel split event has no paired model")?;
             ensure!(pair.kind == GatewayKind::Parallel,
@@ -5647,7 +7166,7 @@ fn validate_scope_plan_on(
             ensure!(!selected.is_empty() && selected.windows(2).all(|window| window[0] < window[1])
                 && event.data["default_selected"].is_boolean(),
                 "inclusive split event has invalid selected set");
-            let node = scope_node(&model, &scopes, instance_id, &event.scope_id, node_id)?;
+            let node = scope_node(&model, &selected_process_id, &scopes, instance_id, &event.scope_id, node_id)?;
             let ProcessNodeKind::InclusiveGateway { default_flow_id } = &node.kind else {
                 bail!("inclusive split event refers to another node kind")
             };
@@ -5685,7 +7204,7 @@ fn validate_scope_plan_on(
                 .node_id
                 .as_ref()
                 .context("ErrorEnd source node missing")?;
-            let node = scope_node(&model, &scopes, instance_id, &event.scope_id, node_id)?;
+            let node = scope_node(&model, &selected_process_id, &scopes, instance_id, &event.scope_id, node_id)?;
             let ProcessNodeKind::ErrorEnd { error_ref } = &node.kind else {
                 bail!("ErrorEnd facts reference another activity")
             };
@@ -5728,7 +7247,7 @@ fn validate_scope_plan_on(
             validate_variables(&event.data["outputs"])?;
         }
         if let Some(node_id) = &event.node_id {
-            let node = scope_node(&model, &scopes, instance_id, &event.scope_id, node_id)?;
+            let node = scope_node(&model, &selected_process_id, &scopes, instance_id, &event.scope_id, node_id)?;
             if event.kind == "end_reached" {
                 let mut statement=tx.prepare("SELECT token_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND status='ready'")?;
                 let existing = statement
@@ -5758,15 +7277,14 @@ fn validate_scope_plan_on(
                 && Uuid::parse_str(&request.child_instance_id).is_ok(),
             "call activation identities must be UUIDs"
         );
-        let node = scope_node(
-            &model,
+        let node = scope_node(&model, &selected_process_id,
             &scopes,
             instance_id,
             &request.parent_scope_id,
             &request.call_node_id,
         )?;
         ensure!(
-            matches!(node.kind, ProcessNodeKind::CallActivity { .. })
+            matches!(node.kind, ProcessNodeKind::CallActivity(_))
                 && plan
                     .create_tokens
                     .iter()
@@ -5795,7 +7313,7 @@ fn validate_scope_plan_on(
             "incident scope is outside its actual instance"
         );
         if let Some(node_id) = &incident.node_id {
-            scope_node(&model, &scopes, instance_id, &incident.scope_id, node_id)?;
+            scope_node(&model, &selected_process_id, &scopes, instance_id, &incident.scope_id, node_id)?;
         }
         if let Some(job_id) = &incident.job_id {
             let job = if let Some(job) = plan.create_jobs.iter().find(|job| &job.job_id == job_id) {
@@ -6167,6 +7685,8 @@ fn apply_call_steps_on(
     at_ms: i64,
     first_index: usize,
     skipped: &mut HashSet<String>,
+    staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
+    failed_requests: &mut HashMap<(String, String), String>,
 ) -> Result<Vec<CancelledJobClaim>> {
     let mut claims = Vec::new();
     for (offset, step) in steps.iter().enumerate() {
@@ -6186,6 +7706,25 @@ fn apply_call_steps_on(
                 skipped.insert(call.call.child_instance_id.clone());
             }
             continue;
+        }
+        let (request_instance, step_plan) = match step {
+            CallStep::Start { call, plan } => (&call.call.child_instance_id, plan.as_ref()),
+            CallStep::Return { call, plan, .. } => (&call.parent_instance_id, plan.as_ref()),
+            CallStep::Advance { instance_id, plan, .. } => (instance_id, plan.as_ref()),
+        };
+        let staged = staged_requests.entry(request_instance.clone()).or_default();
+        for request in &step_plan.call_requests {
+            if let Some(prior) = staged.iter().find(|prior| prior.call_id == request.call_id) {
+                ensure!(prior.parent_scope_id == request.parent_scope_id
+                    && prior.parent_token_id == request.parent_token_id
+                    && prior.parent_arrival_edge_id == request.parent_arrival_edge_id
+                    && prior.call_node_id == request.call_node_id
+                    && prior.child_instance_id == request.child_instance_id
+                    && prior.variables == request.variables,
+                    "composite Call request identity changed between steps");
+            } else {
+                staged.push(request.clone());
+            }
         }
         let savepoint = format!("process_call_{index}");
         tx.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
@@ -6217,28 +7756,78 @@ fn apply_call_steps_on(
                         .into_iter()
                         .find(|p| p.node_id == actual.call_node_id)
                         .context("called target pin missing")?;
-                    ensure!(
-                        matches!(&node.kind,ProcessNodeKind::CallActivity {called_definition_id,called_version,called_element,..} if called_definition_id==&actual.called_definition_id && *called_version==actual.called_version && called_element==&pin.called_element)
-                            && pin.model_sha256 == actual.model_sha256,
-                        "new call differs from actual immutable parent pin"
-                    );
+                    let ProcessNodeKind::CallActivity(call_model) = &node.kind else {
+                        bail!("new call node differs from its pinned CallActivity kind")
+                    };
+                    let (called_definition_id, called_version, called_element) =
+                        match &call_model.target {
+                            ProcessCallTarget::PublishedBody { definition_id, version,
+                                called_element } =>
+                                (definition_id.as_str(), *version, called_element),
+                            ProcessCallTarget::LocalBody { called_element } =>
+                                (actual.definition_id.as_str(), actual.version, called_element),
+                        };
+                    ensure!(called_definition_id == actual.called_definition_id
+                        && called_version == actual.called_version
+                        && *called_element == pin.called_element
+                        && called_element.process_id == actual.called_process_id
+                        && pin.model_sha256 == actual.model_sha256,
+                        "new call differs from actual immutable parent pin");
                     let target =
                         version_on(tx, &actual.called_definition_id, actual.called_version)?;
-                    require_call_version_on(tx, &actor, &target, true)?;
+                    ensure!(target.model.target_namespace.as_deref()
+                        .unwrap_or("https://tentaflow.app/bpmn/1")
+                        == called_element.namespace_uri,
+                        "new Call QName namespace differs from its pinned target document");
+                    require_call_version_on(tx, &actor, &target,
+                        &actual.called_process_id, true)?;
                     ensure!(
                         target.model_sha256 == actual.model_sha256,
                         "call target model hash changed"
                     );
                     let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",params![actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.call_node_id],|r|r.get(0))?;
                     ensure!(waiting, "call parent NEW waiting control is missing");
+                    let parent_process_id = selected_process_id_on(tx,
+                        &actual.parent_instance_id)?;
+                    let parent_scopes = scopes_on(tx, &actual.parent_instance_id,
+                        &parent_model)?;
+                    let parent_path = scope_path(&parent_scopes,
+                        &actual.parent_instance_id, &actual.parent_scope_id)?;
+                    let parent_body = super::model::selected_body(&parent_model,
+                        &parent_process_id, &parent_path)?;
+                    let arrival = parent_body.sequence_flows.iter().find(|flow|
+                        flow.id == actual.parent_arrival_edge_id
+                            && flow.target_id == actual.call_node_id)
+                        .context("called child has no pinned incoming parent flow")?;
+                    let token_arrival: Option<String> = tx.query_row(
+                        "SELECT arrival_edge_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting'",
+                        params![actual.parent_instance_id,actual.parent_scope_id,
+                            actual.parent_token_id,actual.call_node_id], |row| row.get(0))?;
+                    ensure!(token_arrival.as_deref() == Some(arrival.id.as_str()),
+                        "called child arrival differs from its factual waiting token");
+                    let called_body = super::model::selected_body(&target.model,
+                        &actual.called_process_id, &[])?;
+                    let eligible_starts = called_body.nodes.iter()
+                        .filter(|node| node.kind == ProcessNodeKind::Start)
+                        .collect::<Vec<_>>();
+                    let expected_start = if let Some(start_id) = &arrival.call_start_node_id {
+                        ensure!(eligible_starts.iter().any(|node| node.id == *start_id),
+                            "call arrival names no ordinary Start in its pinned child body");
+                        start_id.as_str()
+                    } else {
+                        ensure!(eligible_starts.len() == 1,
+                            "called body requires one selected ordinary Start");
+                        eligible_starts[0].id.as_str()
+                    };
+                    ensure!(actual.child_start_node_id == expected_start,
+                        "called child Start differs from its factual incoming flow");
                     let parent_revision: u64 = tx.query_row(
                         "SELECT revision FROM bpmn_instances WHERE instance_id=?1",
                         [&actual.parent_instance_id], |row| row_u64(row, 0),
                     )?;
-                    let ProcessNodeKind::CallActivity { input_mapping, .. } = &node.kind else {
+                    let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &node.kind else {
                         bail!("call start node changed from its pinned kind")
                     };
-                    let parent_scopes = scopes_on(tx, &actual.parent_instance_id, &parent_model)?;
                     let mut locals = BTreeMap::new();
                     for scope in &parent_scopes {
                         locals.insert(scope.scope_id.clone(), scope_variables_on(tx,
@@ -6248,8 +7837,37 @@ fn apply_call_steps_on(
                         .context("call parent root variables are missing")?;
                     let effective = effective_scope_variables(&parent_scopes, &locals,
                         &actual.parent_instance_id, root_variables, &actual.parent_scope_id)?;
+                    let repeated_input = repetition_occurrences_on(tx, &actual.parent_instance_id)?
+                        .into_iter().find(|occurrence|
+                            occurrence.token_id == actual.parent_token_id
+                                && occurrence.scope_id == actual.parent_scope_id
+                                && occurrence.status == ProcessRepetitionOccurrenceStatus::Active);
+                    let (effective, repeat_extra) = if let Some(occurrence) = repeated_input {
+                        let group = repetition_groups_on(tx, &actual.parent_instance_id)?
+                            .into_iter().find(|group| group.group_id == occurrence.group_id)
+                            .context("called child repetition group is missing")?;
+                        ensure!(group.node_id == actual.call_node_id
+                            && group.scope_id == actual.parent_scope_id
+                            && !group.terminal_capacity,
+                            "called child input lacks its active frozen ordinal");
+                        let extra = vec![("repeat".to_owned(), serde_json::json!({
+                            "group_id":group.group_id,"index":occurrence.ordinal,
+                            "item":occurrence.item}))];
+                        (occurrence.input_variables, extra)
+                    } else {
+                        (effective, Vec::new())
+                    };
+                    let mut call_extra = repeat_extra;
+                    if node.activity_io.is_some() {
+                        let inputs = persisted_activity_io_inputs_for_activation_on(
+                            tx, &actual.parent_instance_id, plan,
+                            &actual.parent_scope_id, &actual.call_node_id,
+                            &actual.parent_token_id,
+                        )?.context("called child input lost its captured activity witness")?;
+                        call_extra.extend(super::runtime::activity_inputs_extra(&inputs)?);
+                    }
                     let expected_variables = super::runtime::patch_variables(input_mapping,
-                        &serde_json::json!({}), &effective, &Value::Null, &[])?;
+                        &serde_json::json!({}), &effective, &Value::Null, &call_extra)?;
                     ensure!(call.variables == expected_variables,
                         "called child input differs from its pinned parent mapping");
                     if !plan.termination_attempts.is_empty() {
@@ -6260,21 +7878,26 @@ fn apply_call_steps_on(
                             };
                             matches!(accepted, AcceptedInputRef::Start { instance_id, cause:
                                 StartInputRef::CallStart { call_id, parent_instance_id,
-                                    parent_scope_id, parent_token_id, call_node_id,
+                                    parent_scope_id, parent_token_id,
+                                    parent_arrival_edge_id, call_node_id,
                                     parent_instance_revision_at_step, call_step_index,
                                     child_instance_id, child_definition_id, child_version,
+                                    child_process_id, child_start_node_id,
                                     child_model_sha256 } }
                                 if instance_id == &actual.child_instance_id
                                     && call_id == &actual.call_id
                                     && parent_instance_id == &actual.parent_instance_id
                                     && parent_scope_id == &actual.parent_scope_id
                                     && parent_token_id == &actual.parent_token_id
+                                    && parent_arrival_edge_id == &actual.parent_arrival_edge_id
                                     && call_node_id == &actual.call_node_id
                                     && *parent_instance_revision_at_step == parent_revision
                                     && *call_step_index == index
                                     && child_instance_id == &actual.child_instance_id
                                     && child_definition_id == &actual.called_definition_id
                                     && *child_version == actual.called_version
+                                    && child_process_id == &actual.called_process_id
+                                    && child_start_node_id == &actual.child_start_node_id
                                     && child_model_sha256 == &actual.model_sha256)
                         }), "called child termination has no genuine ordered call start");
                     }
@@ -6285,16 +7908,19 @@ fn apply_call_steps_on(
                             parent_instance_id: actual.parent_instance_id.clone(),
                             parent_scope_id: actual.parent_scope_id.clone(),
                             parent_token_id: actual.parent_token_id.clone(),
+                            parent_arrival_edge_id: actual.parent_arrival_edge_id.clone(),
                             call_node_id: actual.call_node_id.clone(),
                             parent_instance_revision_at_step: parent_revision,
                             call_step_index: index,
                             child_instance_id: actual.child_instance_id.clone(),
                             child_definition_id: actual.called_definition_id.clone(),
                             child_version: actual.called_version,
+                            child_process_id: actual.called_process_id.clone(),
+                            child_start_node_id: actual.child_start_node_id.clone(),
                             child_model_sha256: actual.model_sha256.clone(),
                         },
                     };
-                    tx.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1,'waiting',?12,?12)",params![actual.call_id,actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.call_node_id,actual.child_instance_id,actual.definition_id,actual.version,actual.called_definition_id,actual.called_version,actual.model_sha256,at_ms])?;
+                    tx.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,parent_arrival_edge_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,called_process_id,child_start_node_id,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,'waiting',?15,?15)",params![actual.call_id,actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.parent_arrival_edge_id,actual.call_node_id,actual.child_instance_id,actual.definition_id,actual.version,actual.called_definition_id,actual.called_version,actual.called_process_id,actual.child_start_node_id,actual.model_sha256,at_ms])?;
                     start_instance_on(
                         tx,
                         &actor,
@@ -6302,12 +7928,24 @@ fn apply_call_steps_on(
                         &actual.called_definition_id,
                         actual.called_version,
                         &call.variables,
+                        Some(&actual.called_process_id),
+                        Some(&actual.child_start_node_id),
                         plan,
                         at_ms,
                         None,
                         None,
                         &entry,
+                        ExecutionMode::Durable,
                     )?;
+                    let repeated_group: Option<String> = tx.query_row(
+                        "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3",
+                        params![actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id],
+                        |row| row.get(0),
+                    ).optional()?;
+                    if let Some(group_id) = repeated_group {
+                        refresh_repetition_retained_bytes_on(tx, &actual.parent_instance_id,
+                            &group_id)?;
+                    }
                     validate_call_tree_budget_on(tx, &actual.parent_instance_id)?;
                     let seq = tx.query_row(
                         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
@@ -6323,7 +7961,7 @@ fn apply_call_steps_on(
                             scope_id: actual.parent_scope_id.clone(),
                             kind: "call_entered".into(),
                             node_id: Some(actual.call_node_id.clone()),
-                            data: serde_json::json!({"call_id":actual.call_id,"child_instance_id":actual.child_instance_id,"called_definition_id":actual.called_definition_id,"called_version":actual.called_version,"parent_token_id":actual.parent_token_id}),
+                            data: serde_json::json!({"call_id":actual.call_id,"child_instance_id":actual.child_instance_id,"called_definition_id":actual.called_definition_id,"called_version":actual.called_version,"called_process_id":actual.called_process_id,"child_start_node_id":actual.child_start_node_id,"parent_token_id":actual.parent_token_id,"parent_arrival_edge_id":actual.parent_arrival_edge_id}),
                         },
                         at_ms,
                         None,
@@ -6409,8 +8047,8 @@ fn apply_call_steps_on(
                             )?;
                             hop = incoming.parent_instance_id;
                         }
-                    } else {
-                        let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_instances WHERE instance_id=?1 AND status='completed' AND definition_id=?2 AND version=?3)",params![actual.child_instance_id,actual.called_definition_id,actual.called_version],|r|r.get(0))?;
+                } else {
+                    let complete:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_instances WHERE instance_id=?1 AND status='completed' AND definition_id=?2 AND version=?3)",params![actual.child_instance_id,actual.called_definition_id,actual.called_version],|r|r.get(0))?;
                         ensure!(complete, "call return child is not factually Completed");
                     }
                     let parent_revision: u64 = tx.query_row(
@@ -6441,6 +8079,8 @@ fn apply_call_steps_on(
                         at_ms,
                         source.as_ref(),
                         EntryAuthority::Accepted(&entry),
+                        staged_requests.get(&actual.parent_instance_id)
+                            .map(Vec::as_slice).unwrap_or(&[]),
                     )?;
                     validate_call_tree_budget_on(tx, &actual.parent_instance_id)?;
                     Ok(claims)
@@ -6448,9 +8088,51 @@ fn apply_call_steps_on(
                 CallStep::Advance {
                     instance_id,
                     expected_revision,
+                    request,
                     plan,
-                } => apply_plan_on(tx, instance_id, actor_id, *expected_revision,
-                    plan, at_ms, None, EntryAuthority::CallAdmission),
+                } => {
+                    let requests = staged_requests.get(instance_id)
+                        .context("Call admission lacks its same-command requests")?;
+                    ensure!(requests.iter().filter(|actual|
+                        actual.call_id == request.call_id
+                            && actual.parent_scope_id == request.parent_scope_id
+                            && actual.parent_token_id == request.parent_token_id
+                            && actual.call_node_id == request.call_node_id
+                            && actual.child_instance_id == request.child_instance_id
+                            && actual.variables == request.variables).count() == 1,
+                        "Call admission differs from its exact staged request");
+                    ensure!(plan.add_incidents.len() == 1,
+                        "Call admission must create one exact incident");
+                    let incident = &plan.add_incidents[0];
+                    ensure!(incident.code == "CALL_ADMISSION_ERROR"
+                        && incident.scope_id == request.parent_scope_id
+                        && incident.node_id.as_deref() == Some(request.call_node_id.as_str()),
+                        "Call admission incident differs from its staged request");
+                    let events = plan.events.iter().enumerate().filter(|(_, event)|
+                        event.kind == "incident" && event.scope_id == incident.scope_id
+                            && event.node_id == incident.node_id
+                            && event.data == serde_json::json!({"code":incident.code,
+                                "message":incident.message})).collect::<Vec<_>>();
+                    ensure!(events.len() == 1,
+                        "Call admission lacks its unique same-plan incident event");
+                    let event_id = plan.event_ids.get(&events[0].0)
+                        .context("Call admission event lacks its producer-minted identity")?;
+                    let claims = apply_plan_on(tx, instance_id, actor_id, *expected_revision,
+                        plan, at_ms, None, EntryAuthority::CallAdmission, requests)?;
+                    let facts: u32 = tx.query_row(
+                        "SELECT COUNT(*) FROM bpmn_events e JOIN bpmn_incidents i ON i.instance_id=e.instance_id AND i.scope_id=e.scope_id AND i.node_id=e.node_id WHERE e.event_id=?1 AND e.instance_id=?2 AND e.scope_id=?3 AND e.node_id=?4 AND e.kind='incident' AND e.data_json=?5 AND i.incident_id=?6 AND i.code='CALL_ADMISSION_ERROR' AND i.message=?7 AND i.resolved_at_ms IS NULL",
+                        params![event_id,instance_id,request.parent_scope_id,
+                            request.call_node_id,json(&events[0].1.data)?,
+                            incident.incident_id,incident_message(&incident.message)],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(facts == 1,
+                        "Call admission did not commit its exact incident event and row");
+                    ensure!(failed_requests.insert((instance_id.clone(),
+                        request.call_id.clone()), event_id.clone()).is_none(),
+                        "Call admission failed twice for one staged request");
+                    Ok(claims)
+                },
             }
         })();
         match applied {
@@ -6469,6 +8151,16 @@ fn apply_call_steps_on(
                     CallStep::Advance { .. } => return Err(error),
                 };
                 call_incident_on(tx, call, actor_id, code, &format!("{error:#}"), at_ms)?;
+                if matches!(step, CallStep::Start { .. }) {
+                    let event_id: String = tx.query_row(
+                        "SELECT event_id FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='incident' AND node_id=?3 AND json_extract(data_json,'$.code')='CALL_ADMISSION_ERROR' AND json_extract(data_json,'$.call_id')=?4 AND json_extract(data_json,'$.parent_token_id')=?5 ORDER BY seq DESC LIMIT 1",
+                        params![call.parent_instance_id,call.parent_scope_id,call.call_node_id,
+                            call.call_id,call.parent_token_id], |row| row.get(0),
+                    )?;
+                    ensure!(failed_requests.insert((call.parent_instance_id.clone(),
+                        call.call_id.clone()), event_id).is_none(),
+                        "Call admission failed twice for one staged request");
+                }
                 if matches!(step, CallStep::Return { .. }) {
                     tx.execute("UPDATE bpmn_calls SET status='return_incident',revision=revision+1,updated_at_ms=?1 WHERE call_id=?2 AND revision=?3",params![at_ms,call.call_id,sql_incrementable(call.revision)?])?;
                 }
@@ -6494,6 +8186,7 @@ fn validate_gateway_join_plan_on(
     scopes: &[ProcessScopeSummary],
     plan: &RuntimePlan,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let mut affected: HashMap<(String, String, String), (ForkFrame, usize)> = HashMap::new();
     let mut stmt = tx.prepare("SELECT token_id,scope_id,fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
     let prior = stmt.query_map([instance_id], |row| Ok((row.get::<_, String>(0)?,
@@ -6562,7 +8255,8 @@ fn validate_gateway_join_plan_on(
         let key = (event.scope_id.clone(), join_id.to_owned(), activation_id.to_owned());
         ensure!(joined.insert(key.clone()), "gateway activation joined more than once");
         let path = scope_path(scopes, instance_id, &event.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let pair = super::model::gateway_pairs(nodes, flows)?
             .into_values().find(|pair| pair.join_node_id.as_deref() == Some(join_id))
             .context("gateway join event has no paired model")?;
@@ -6730,6 +8424,7 @@ fn validate_gateway_state_on(
     tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
     scopes: &[ProcessScopeSummary],
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let mut groups: HashMap<(String, String, String), (GatewayKind, Vec<String>)> = HashMap::new();
     let mut tokens: HashMap<String, (String, String, Option<String>, String, Vec<ForkFrame>)> = HashMap::new();
     let mut stmt = tx.prepare("SELECT token_id,scope_id,node_id,arrival_edge_id,status,fork_stack_json FROM bpmn_tokens WHERE instance_id=?1 AND status IN ('ready','waiting','joining')")?;
@@ -6738,7 +8433,8 @@ fn validate_gateway_state_on(
     for (token_id, scope_id, node_id, arrival_edge_id, status, stack_json) in rows {
         let frames: Vec<ForkFrame> = parse(stack_json)?;
         let path = scope_path(scopes, instance_id, &scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let pairs = super::model::gateway_pairs(nodes, flows)?;
         for frame in &frames {
             let pair = pairs.get(&frame.split_node_id).context("active fork pair missing from pinned scope")?;
@@ -6780,7 +8476,8 @@ fn validate_gateway_state_on(
             && selected.binary_search(&branch_id).is_ok(),
             "gateway receipt differs from its active selected joining token");
         let path = scope_path(scopes, instance_id, &scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let pairs = super::model::gateway_pairs(nodes, flows)?;
         let pair = pairs.get(&frame.split_node_id).context("gateway receipt pair missing")?;
         ensure!(pair.kind == kind && pair.join_node_id.as_deref() == Some(join_id.as_str())
@@ -6827,6 +8524,7 @@ fn validate_termination_variables_on(
     call_source: Option<&BusinessErrorSource>,
     entry: EntryAuthority<'_>,
 ) -> Result<Vec<BTreeMap<String, Value>>> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let root = scope_variables_on(tx, instance_id, instance_id)?;
     if let Some(start) = &plan.start_variables {
         ensure!(plan.start_instance_id.as_deref() == Some(instance_id) && start == &root,
@@ -6869,7 +8567,7 @@ fn validate_termination_variables_on(
                         && group.source_token_id == *source_token_id
                         && group.parent_token_id == *parent_token_id)
                     .context("repetition entry has no exact planned group")?;
-                let node = scope_node(model, scopes, instance_id, scope_id, &group.node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, scope_id, &group.node_id)?;
                 ensure!(node.repeat.is_some() && group.entry_variables == *entry_variables,
                     "repetition entry changed its pinned activity or variable snapshot");
                 let source = termination_token_on(tx, instance_id, plan, source_token_id)?;
@@ -6892,14 +8590,15 @@ fn validate_termination_variables_on(
                             && event.data["group_id"] == *group_id),
                     "repetition entry differs from its source-time effective variables");
             }
-            VariableEffect::RepetitionAggregate { scope_id, group_id, parent_token_id,
-                output_target, aggregate, result, .. } => {
+            VariableEffect::RepetitionAggregate { event_index, scope_id, group_id,
+                parent_token_id, output_target, aggregate, activity_io_outputs,
+                output_event_index, result, .. } => {
                 let group = plan.repetition_groups.iter().find(|group|
                     group.group_id == *group_id && group.scope_id == *scope_id
                         && group.parent_token_id == *parent_token_id
                         && group.status == ProcessRepetitionGroupStatus::Completed)
                     .context("repetition aggregate has no completed factual group")?;
-                let node = scope_node(model, scopes, instance_id, scope_id, &group.node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, scope_id, &group.node_id)?;
                 let target = match node.repeat.as_ref() {
                     Some(tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance {
                         output_collection_variable, .. })
@@ -6925,7 +8624,7 @@ fn validate_termination_variables_on(
                     row.aggregate_item.clone().context("repetition aggregate item is missing"))
                     .collect::<Result<Vec<_>>>()?);
                 ensure!(&expected == aggregate
-                    && plan.events.get(event_index).is_some_and(|event|
+                    && plan.events.get(*event_index).is_some_and(|event|
                         event.kind == "repetition_completed" && event.scope_id == *scope_id
                             && event.node_id.as_deref() == Some(group.node_id.as_str())
                             && event.data == serde_json::json!({
@@ -6933,6 +8632,31 @@ fn validate_termination_variables_on(
                                 "parent_token_id":parent_token_id
                             })),
                     "repetition aggregate changed its exact completion fact");
+                if node.activity_io.as_ref().is_some_and(|io|
+                    io.coordinator_output.is_some()) {
+                    let coordinator_facts = plan.activity_io_results.iter().filter(|fact|
+                        fact.result_event_index == *event_index
+                            && fact.scope_id == *scope_id
+                            && fact.node_id == group.node_id
+                            && fact.token_id == *parent_token_id)
+                        .collect::<Vec<_>>();
+                    ensure!(coordinator_facts.len() == 1,
+                        "configured repetition aggregate lacks one coordinator result fact");
+                    match &coordinator_facts[0].disposition {
+                        ActivityIoResultDisposition::Applied {
+                            output_event_index: fact_output_event_index, ..
+                        } => {
+                            ensure!(activity_io_outputs.is_some()
+                                && output_event_index == &Some(*fact_output_event_index),
+                                "coordinator aggregate omitted its applied output witness");
+                        }
+                        ActivityIoResultDisposition::Blocked { .. } => ensure!(
+                            activity_io_outputs.is_none() && output_event_index.is_none(),
+                            "blocked coordinator aggregate changed its retained output shape"),
+                        ActivityIoResultDisposition::Retained { .. } => bail!(
+                            "configured coordinator aggregate has an unsupported retained result"),
+                    }
+                }
                 let local = locals.get(scope_id)
                     .context("repetition aggregate parent locals are missing")?;
                 let mut expected_local = local.as_object()
@@ -6941,6 +8665,56 @@ fn validate_termination_variables_on(
                     "repetition aggregate target is absent from its parent locals");
                 expected_local.insert(target.clone(), expected);
                 let expected_local = Value::Object(expected_local);
+                let coordinator_replay_extra = plan.activity_io_results.iter()
+                    .find(|fact| fact.result_event_index == *event_index
+                        && fact.scope_id == *scope_id
+                        && fact.node_id == group.node_id
+                        && fact.token_id == *parent_token_id)
+                    .map(|fact| activity_io_replay_extra_on(
+                        tx, instance_id, plan, &fact.witness_id,
+                        scope_id, &group.node_id, parent_token_id,
+                    )).transpose()?.unwrap_or_default();
+                let expected_local = if let Some(ordered) = activity_io_outputs {
+                    let io = node.activity_io.as_ref()
+                        .context("repetition coordinator effect has no authored IO")?;
+                    let body_path = scope_path(scopes, instance_id, scope_id)?;
+                    let body = super::model::selected_body(model,
+                        &selected_process_id, &body_path)?;
+                    let modeling = super::model::io_modeling(body.modeling);
+                    let mut post_aggregate = locals.clone();
+                    post_aggregate.insert(scope_id.clone(), expected_local.clone());
+                    let root = post_aggregate.get(instance_id)
+                        .context("repetition coordinator effect has no root variables")?;
+                    let effective = effective_scope_variables(scopes, &post_aggregate,
+                        instance_id, root, scope_id)?;
+                        let (expected_outputs, expected_patch) =
+                            super::runtime::evaluate_activity_outputs(io, modeling,
+                            &expected_local, &effective,
+                            &IoObservedValue::Present { value: aggregate.clone() },
+                            &coordinator_replay_extra,
+                            super::runtime::ActivityIoOutputOwner::Coordinator)?;
+                    let output_index = output_event_index
+                        .context("repetition coordinator effect has no output event")?;
+                    ensure!(expected_outputs == *ordered
+                        && plan.events.get(output_index).is_some_and(|event|
+                            output_index > *event_index
+                            && event.kind == "activity_io_output_applied"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(group.node_id.as_str())
+                            && event.data == serde_json::json!({
+                                "source_token_id":parent_token_id,
+                                "ordered_outputs":ordered,
+                                "local_patch":expected_patch,
+                            }))
+                        && plan.event_ids.get(&output_index)
+                            .is_some_and(|id| Uuid::parse_str(id).is_ok()),
+                        "repetition coordinator effect changed its output-applied fact");
+                    expected_patch
+                } else {
+                    ensure!(output_event_index.is_none(),
+                        "repetition aggregate has an output event without outputs");
+                    expected_local
+                };
                 ensure!(&expected_local == result,
                     "repetition aggregate changed unrelated parent variables");
                 locals.insert(scope_id.clone(), expected_local);
@@ -6975,22 +8749,47 @@ fn validate_termination_variables_on(
                     && plan.create_tokens.iter().any(|token|
                         token.token_id == *parent_token_id && token.status == "waiting"),
                     "variable scope entry is not attached to its accepted parent wait");
-                let node = scope_node(model, scopes, instance_id, parent_scope_id, subprocess_node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, parent_scope_id, subprocess_node_id)?;
                 let ProcessNodeKind::SubProcess { body, input_mapping, .. } = &node.kind else {
                     bail!("variable scope entry has no pinned subprocess mapping")
                 };
                 let parent_local = locals.get(parent_scope_id)
                     .context("variable scope entry parent locals are missing")?;
-                let effective = effective_scope_variables(scopes, &locals, instance_id,
-                    locals.get(instance_id).context("root variables are missing")?, parent_scope_id)?;
+                let repeated = plan.repetition_occurrences.iter().find(|row|
+                    row.scope_id == *parent_scope_id && row.token_id == *parent_token_id);
+                let effective = if let Some(occurrence) = repeated {
+                    ensure!(plan.repetition_groups.iter().any(|group|
+                        group.group_id == occurrence.group_id
+                            && group.scope_id == *parent_scope_id
+                            && group.node_id == *subprocess_node_id),
+                        "variable scope entry lacks its pinned repetition group");
+                    occurrence.input_variables.clone()
+                } else {
+                    effective_scope_variables(scopes, &locals, instance_id,
+                        locals.get(instance_id).context("root variables are missing")?, parent_scope_id)?
+                };
+                let repeat_extra = repeated.map(|row| vec![("repeat".to_owned(),
+                    serde_json::json!({"group_id":row.group_id,"index":row.ordinal,
+                        "item":row.item}))]).unwrap_or_default();
+                let mut body_extra = repeat_extra;
+                if let Some(ActivityIoInputFact::Captured { inputs, .. }) =
+                    plan.activity_io_inputs.iter().find(|fact| matches!(fact,
+                        ActivityIoInputFact::Captured { scope_id: captured_scope,
+                            node_id: captured_node, activation_token_id, .. }
+                            if captured_scope == parent_scope_id
+                                && captured_node == subprocess_node_id
+                                && activation_token_id == parent_token_id)) {
+                    body_extra.extend(super::runtime::activity_inputs_extra(inputs)?);
+                }
                 let expected = super::runtime::patch_variables(input_mapping,
-                    &serde_json::to_value(&body.variables)?, &effective, &Value::Null, &[])?;
+                    &serde_json::to_value(&body.variables)?, &effective, &Value::Null,
+                    &body_extra)?;
                 ensure!(*result == expected && parent_local.is_object(),
                     "variable scope entry differs from its pinned mapping");
                 locals.insert(scope_id.clone(), expected);
             }
             VariableEffect::Mapped { event_index, scope_id, parent_token_id, node_id,
-                source_token_id, outputs, extra, result, .. } => {
+                source_token_id, outputs, extra, activity_io_outputs, result, .. } => {
                 ensure!(mapped_activations.insert((scope_id.clone(), node_id.clone(),
                     source_token_id.clone())),
                     "termination variable effect duplicates a mapped activation");
@@ -7001,12 +8800,13 @@ fn validate_termination_variables_on(
                 let source = termination_token_on(tx, instance_id, plan, source_token_id)?;
                 ensure!(source.scope_id == *scope_id,
                     "mapped variables changed their source scope");
-                let node = scope_node(model, scopes, instance_id, scope_id, node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, scope_id, node_id)?;
+                let empty_mapping = BTreeMap::new();
                 let mapping = match &node.kind {
                     ProcessNodeKind::UserTask { output_mapping, .. }
                     | ProcessNodeKind::ServiceTask { output_mapping, .. }
                     | ProcessNodeKind::SubProcess { output_mapping, .. }
-                    | ProcessNodeKind::CallActivity { output_mapping, .. }
+                    | ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. })
                     | ProcessNodeKind::BoundaryError { output_mapping, .. }
                     | ProcessNodeKind::BoundaryEscalation { output_mapping, .. }
                     | ProcessNodeKind::MessageCatch { output_mapping, .. }
@@ -7014,6 +8814,10 @@ fn validate_termination_variables_on(
                     | ProcessNodeKind::SignalCatch { output_mapping, .. }
                     | ProcessNodeKind::BoundaryMessage { output_mapping, .. }
                     | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping,
+                    ProcessNodeKind::ManualTask { .. } if node.activity_io.is_some() =>
+                        &empty_mapping,
+                    ProcessNodeKind::SendTask { .. } if node.activity_io.is_some() =>
+                        &empty_mapping,
                     _ => bail!("mapped variable effect has no pinned output mapping"),
                 };
                 let boundary_attachment = match &node.kind {
@@ -7028,20 +8832,167 @@ fn validate_termination_variables_on(
                     || boundary_attachment.is_some_and(|attached|
                         attached == source.node_id && source.status == "waiting"),
                     "mapped variables lack their factual local activity or boundary activation");
-                let (actual_outputs, actual_extra) = match (&node.kind, accepted) {
-                    (ProcessNodeKind::ScriptTask { script, .. }, _) => {
-                        ensure!(source.status == "ready" && source.node_id == *node_id
-                            && extra.is_empty()
-                            && plan.events.get(*event_index).is_some_and(|event|
-                                event.kind == "script_completed"
+                let mapped_activity_extra = mapped_activity_io_extra_on(
+                    tx, instance_id, plan, scope_id, node, source_token_id, *event_index,
+                )?;
+                let phase_owner = if node.activity_io.is_some() {
+                    let accepted_results = plan.activity_io_results.iter().filter(|fact|
+                        fact.scope_id == *scope_id
+                            && fact.node_id == *node_id
+                            && fact.token_id == *source_token_id
+                            && matches!(&fact.disposition,
+                                ActivityIoResultDisposition::Applied { output_event_index, .. }
+                                    if *output_event_index == *event_index))
+                        .collect::<Vec<_>>();
+                    ensure!(accepted_results.len() == 1,
+                        "mapped activity IO has no unique accepted result owner");
+                    let source = activity_io_input_source_on(
+                        tx, instance_id, plan, &accepted_results[0].witness_id,
+                        scope_id, node_id, source_token_id,
+                    )?;
+                    match (source.group_id.as_deref(), source.occurrence_id.as_deref()) {
+                        (Some(_), Some(_)) => "ordinal".to_owned(),
+                        (Some(_), None) => {
+                            ensure!(source.ordinal.is_none(),
+                                "mapped coordinator IO owner has an ordinal");
+                            "coordinator".to_owned()
+                        }
+                        (None, None) => {
+                            ensure!(source.ordinal.is_none(),
+                                "mapped ordinary IO owner has an ordinal");
+                            "ordinary".to_owned()
+                        }
+                        _ => bail!("mapped activity IO has an incomplete owner"),
+                    }
+                } else {
+                    let persisted_occurrences = repetition_occurrences_on(tx, instance_id)?;
+                    let persisted_groups = repetition_groups_on(tx, instance_id)?;
+                    let ordinal = plan.repetition_occurrences.iter().any(|occurrence|
+                        occurrence.scope_id == *scope_id
+                            && occurrence.token_id == *source_token_id)
+                        || persisted_occurrences.iter().any(|occurrence|
+                            occurrence.scope_id == *scope_id
+                                && occurrence.token_id == *source_token_id);
+                    let coordinator = plan.repetition_groups.iter().any(|group|
+                        group.scope_id == *scope_id && group.node_id == *node_id
+                            && (group.source_token_id == *source_token_id
+                                || group.parent_token_id == *source_token_id))
+                        || persisted_groups.iter().any(|group|
+                            group.scope_id == *scope_id && group.node_id == *node_id
+                                && (group.source_token_id == *source_token_id
+                                    || group.parent_token_id == *source_token_id));
+                    ensure!(!(ordinal && coordinator),
+                        "mapped activity has conflicting repeated owner identities");
+                    if ordinal {
+                        "ordinal".to_owned()
+                    } else if coordinator {
+                        "coordinator".to_owned()
+                    } else {
+                        ensure!(node.repeat.is_none(),
+                            "mapped repeated activity has no authenticated owner");
+                        "ordinary".to_owned()
+                    }
+                };
+                let (actual_outputs, mut actual_extra) = match (&node.kind, accepted) {
+                    (ProcessNodeKind::ManualTask { .. },
+                        AcceptedInputRef::ManualAcknowledgment { task_id,
+                            expected_task_revision, .. }) if node.activity_io.is_some() => {
+                        let (task_scope, task_node, task_token, kind, status,
+                            revision, assignee, stored):
+                            (String, String, String, String, String, u64, String, String) =
+                            tx.query_row(
+                                "SELECT scope_id,node_id,token_id,kind,status,revision, \
+                                 assignee_user_id,outputs_json FROM bpmn_user_tasks \
+                                 WHERE instance_id=?1 AND user_task_id=?2",
+                                params![instance_id,task_id],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                                    row.get(3)?,row.get(4)?,row_u64(row,5)?,
+                                    row.get(6)?,row.get(7)?)),
+                            )?;
+                        ensure!(task_scope == *scope_id && task_node == *node_id
+                            && task_token == *source_token_id && kind == "manual"
+                            && status == "open" && revision == *expected_task_revision
+                            && parse::<Value>(stored)?.is_null()
+                            && plan.complete_user_task_ids.iter().filter(|id|
+                                *id == task_id).count() == 1
+                            && plan.events.iter().enumerate().filter(|(index,event)|
+                                *index > *event_index
+                                    && event.kind == "manual_task_acknowledged"
                                     && event.scope_id == *scope_id
                                     && event.node_id.as_deref() == Some(node_id.as_str())
-                                    && event.data == serde_json::json!({"outputs": outputs})
-                                    && plan.event_sources.get(event_index) == Some(source_token_id)),
+                                    && event.data == serde_json::json!({
+                                        "user_task_id":task_id,
+                                        "acknowledged_by_user_id":assignee,
+                                    })).count() == 1,
+                            "mapped Manual output lacks its factual null acknowledgment");
+                        (Value::Null, Vec::new())
+                    }
+                    (ProcessNodeKind::ScriptTask { script, .. }, _) => {
+                        let script_io_action = node.activity_io.is_some()
+                            && source.status == "waiting"
+                            && plan.events.iter().enumerate().filter(|(index, event)|
+                                *index > *event_index
+                                    && event.scope_id == *scope_id
+                                    && event.node_id.as_deref() == Some(node_id.as_str())
+                                    && script_io_action_handoff_on(plan,
+                                        source_token_id, *index)).count() == 1
+                            && plan.activity_io_results.iter().any(|fact|
+                                fact.token_id == *source_token_id
+                                    && fact.scope_id == *scope_id
+                                    && fact.node_id == *node_id
+                                    && matches!(&fact.disposition,
+                                        ActivityIoResultDisposition::Applied {
+                                            output_event_index, .. }
+                                            if output_event_index == event_index));
+                        ensure!((source.status == "ready" && node.activity_io.is_none()
+                            || script_io_action)
+                            && source.node_id == *node_id
+                            && if node.activity_io.is_some() {
+                                plan.events.iter().enumerate().filter(|(index, event)|
+                                    *index > *event_index
+                                        && event.kind == "script_completed"
+                                        && event.scope_id == *scope_id
+                                        && event.node_id.as_deref() == Some(node_id.as_str())
+                                        && event.data == serde_json::json!({"outputs": outputs})
+                                        && plan.event_sources.get(index) == Some(source_token_id))
+                                    .count() == 1
+                            } else {
+                                plan.events.get(*event_index).is_some_and(|event|
+                                    event.kind == "script_completed"
+                                        && event.scope_id == *scope_id
+                                        && event.node_id.as_deref() == Some(node_id.as_str())
+                                        && event.data == serde_json::json!({"outputs": outputs})
+                                        && plan.event_sources.get(event_index) == Some(source_token_id))
+                            },
                             "mapped Script output lacks its exact ready action fact");
                         let effective = effective_scope_variables(scopes, &locals, instance_id,
                             locals.get(instance_id).context("root variables are missing")?, scope_id)?;
-                        (super::runtime::script_evaluate(script, &effective, &Value::Null)?, Vec::new())
+                        (super::runtime::script_evaluate(
+                            script, &effective, &Value::Null, &mapped_activity_extra,
+                        )?, Vec::new())
+                    }
+                    (ProcessNodeKind::SendTask { .. }, _) if node.activity_io.is_some() => {
+                        let admitted = plan.activity_io_results.iter().filter(|fact|
+                            fact.scope_id == *scope_id && fact.node_id == *node_id
+                                && fact.token_id == *source_token_id
+                                && matches!(&fact.disposition,
+                                    ActivityIoResultDisposition::Applied {
+                                        output_event_index, .. }
+                                        if output_event_index == event_index))
+                            .collect::<Vec<_>>();
+                        ensure!(admitted.len() == 1 && source.status == "waiting",
+                            "mapped Send output lost its exact admitted waiting source");
+                        let queued = plan.create_messages.iter().filter(|message|
+                            message.source_event_index == admitted[0].result_event_index
+                                && message.source_scope_id == *scope_id
+                                && message.source_node_id == *node_id
+                                && message.source_activation_id == *source_token_id)
+                            .collect::<Vec<_>>();
+                        ensure!(queued.len() == 1
+                            && admitted[0].observed == IoObservedValue::Present {
+                                value: queued[0].message.payload.clone() },
+                            "mapped Send output changed its immutable admitted payload");
+                        (queued[0].message.payload.clone(), Vec::new())
                     }
                     (ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. },
                         AcceptedInputRef::Human { task_id, .. }) => {
@@ -7076,19 +9027,89 @@ fn validate_termination_variables_on(
                     (ProcessNodeKind::ServiceTask { .. }
                         | ProcessNodeKind::BoundaryEscalation { .. }
                         | ProcessNodeKind::BoundaryError { .. },
-                        AcceptedInputRef::Service { job_id, result_event_id, .. }) => {
-                        let (job_scope, job_token, stored): (String, String, String) = tx.query_row(
-                            "SELECT scope_id,token_id,result_json FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
-                            params![instance_id, job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        AcceptedInputRef::Service { job_id, attempt, fence, result_event_id }) => {
+                        let (job_scope, job_node, job_token, stored): (String, String, String, String) = tx.query_row(
+                            "SELECT scope_id,node_id,token_id,result_json FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND status='running'",
+                            params![instance_id, job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                         )?;
+                        let result: ActivityResult = parse(stored)?;
+                        let result_code = serde_json::to_value(&result.code)?;
+                        let caught_kind = match (&node.kind, &result.outcome) {
+                            (ProcessNodeKind::BoundaryError { .. },
+                                tentaflow_protocol::processes::ActivityOutcome::Error) =>
+                                Some(("business_error_caught", ProcessSubscriptionKind::BoundaryError)),
+                            (ProcessNodeKind::BoundaryEscalation { .. },
+                                tentaflow_protocol::processes::ActivityOutcome::NeedsHuman) =>
+                                Some(("escalation_caught", ProcessSubscriptionKind::BoundaryEscalation)),
+                            _ => None,
+                        };
+                        let caught_boundary = if let Some((caught_kind, subscription_kind)) =
+                            caught_kind.filter(|_| job_token != *source_token_id) {
+                            let caught = plan.events.iter().enumerate().filter(|(index, event)|
+                                *index >= *event_index
+                                    && event.kind == caught_kind
+                                    && event.scope_id == *scope_id
+                                    && event.node_id.as_deref() == Some(node_id.as_str())
+                                    && event.data["attached_token_id"].as_str() == Some(source_token_id.as_str())
+                                    && event.data["job_id"].as_str() == Some(job_id.as_str())
+                                    && event.data["result_origin"] == "contract"
+                                    && if caught_kind == "business_error_caught" {
+                                        event.data["error_code"] == result_code
+                                    } else {
+                                        event.data["code"] == result_code
+                                            && event.data["boundary_id"].as_str() == Some(node_id.as_str())
+                                            && event.data["source_token_id"].as_str() == Some(job_token.as_str())
+                                            && event.data["source_scope_id"].as_str() == Some(job_scope.as_str())
+                                            && event.data["attempt"].as_u64() == Some(u64::from(*attempt))
+                                            && event.data["fence"].as_u64() == Some(*fence)
+                                            && event.data["result_event_id"].as_str() == Some(result_event_id.as_str())
+                                    })
+                                .collect::<Vec<_>>();
+                            if let [(_, event)] = caught.as_slice() {
+                                if let Some(subscription_id) = event.data["subscription_id"].as_str() {
+                                    let subscription = subscription_on(tx, subscription_id)?;
+                                    let matched_escalation_code =
+                                        serde_json::to_value(&subscription.escalation_code)?;
+                                    let mut attached_scope = job_scope.clone();
+                                    let mut attached_token = repeated_service_boundary_parent_on(
+                                        tx, instance_id, &job_scope, &job_node, &job_token, job_id)?
+                                        .unwrap_or_else(|| job_token.clone());
+                                    let mut depth = 0;
+                                    while attached_scope != *scope_id && depth < scopes.len() {
+                                        let Some(child_scope) = scopes.iter().find(|candidate|
+                                            candidate.scope_id == attached_scope) else { break };
+                                        let (Some(parent_scope), Some(parent_token)) =
+                                            (&child_scope.parent_scope_id, &child_scope.parent_token_id)
+                                            else { break };
+                                        attached_scope = parent_scope.clone();
+                                        attached_token = parent_token.clone();
+                                        depth += 1;
+                                    }
+                                    subscription.kind == subscription_kind
+                                        && subscription.status == ProcessSubscriptionStatus::Open
+                                        && subscription.instance_id == instance_id
+                                        && subscription.scope_id == *scope_id
+                                        && subscription.node_id == *node_id
+                                        && subscription.token_id == *source_token_id
+                                        && plan.subscription_updates.iter().filter(|update|
+                                            update.subscription_id == subscription_id
+                                                && update.status == ProcessSubscriptionStatus::Consumed)
+                                            .count() == 1
+                                        && attached_scope == *scope_id
+                                        && attached_token == *source_token_id
+                                        && (caught_kind != "escalation_caught"
+                                            || matches!(&node.kind,
+                                                ProcessNodeKind::BoundaryEscalation { cancel_activity, .. }
+                                                    if event.data["cancel_activity"] == *cancel_activity
+                                                        && event.data["matched_escalation_code"]
+                                                            == matched_escalation_code))
+                                } else { false }
+                            } else { false }
+                        } else { false };
                         ensure!(plan.complete_job_ids.contains(job_id)
                             && (job_token == *source_token_id
-                                || matches!(&node.kind, ProcessNodeKind::BoundaryError { .. })
-                                    && matches!(&plan.business_error,
-                                        Some(BusinessErrorSource::ServiceContract { job_id: source_job, .. })
-                                            if source_job == job_id)),
+                                || caught_boundary),
                             "mapped service output is not the accepted fenced job or propagated error");
-                        let result: ActivityResult = parse(stored)?;
                         ensure!(plan.events.iter().enumerate().filter(|(index,event)|
                             event.kind == "service_result"
                             && event.scope_id == job_scope
@@ -7165,7 +9186,7 @@ fn validate_termination_variables_on(
                             .context("mapped ErrorEnd lost its source event")?;
                         let error_token_id = envelope["source_token_id"].as_str()
                             .context("mapped ErrorEnd lost its source token")?;
-                        let error_node = scope_node(model, scopes, instance_id,
+                        let error_node = scope_node(model, &selected_process_id, scopes, instance_id,
                             error_scope_id, error_node_id)?;
                         let ProcessNodeKind::ErrorEnd { error_ref } = &error_node.kind else {
                             bail!("mapped error boundary source is not a pinned ErrorEnd")
@@ -7213,7 +9234,20 @@ fn validate_termination_variables_on(
                             "received_at_ms":message.received_at_ms,"expires_at_ms":message.expires_at_ms,
                             "payload_sha256":message.payload_sha256});
                         ensure!(plan.events.iter().enumerate().filter(|(index,event)|
-                            *event_index <= *index && event.kind == "message_delivered"
+                            (if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })
+                                && node.activity_io.is_some() {
+                                *index < *event_index
+                                    && plan.activity_io_results.iter().any(|fact|
+                                        fact.result_event_index == *index
+                                            && fact.scope_id == *scope_id
+                                            && fact.node_id == *node_id
+                                            && fact.token_id == *source_token_id
+                                            && matches!(&fact.disposition,
+                                                ActivityIoResultDisposition::Applied {
+                                                    output_event_index, ..
+                                                } if output_event_index == event_index))
+                            } else { *event_index <= *index })
+                            && event.kind == "message_delivered"
                             && event.scope_id == *scope_id
                             && event.node_id.as_deref() == Some(node_id.as_str())
                             && event.data["subscription_id"].as_str() == Some(subscription_id.as_str())
@@ -7267,7 +9301,7 @@ fn validate_termination_variables_on(
                             "mapped Signal output lacks its exact receipt source");
                         (payload, vec![("signal".to_owned(), metadata)])
                     }
-                    (ProcessNodeKind::CallActivity { .. },
+                    (ProcessNodeKind::CallActivity(_),
                         AcceptedInputRef::CallReturn { call_id, child_instance_id,
                             parent_token_id, .. }) => {
                         ensure!(parent_token_id == source_token_id,
@@ -7280,6 +9314,31 @@ fn validate_termination_variables_on(
                             && (call_source.is_none() && call_status == "returned"
                                 || call_source.is_some() && matches!(call_status.as_str(), "error" | "cancelled")),
                             "mapped call output changed its completed child");
+                        if node.activity_io.is_some() {
+                            ensure!(call_source.is_none(),
+                                "configured Call IO cannot use a business-error mapping");
+                            let accepted = plan.activity_io_results.iter().filter(|fact|
+                                fact.scope_id == *scope_id && fact.node_id == *node_id
+                                    && fact.token_id == *source_token_id
+                                    && fact.call_id.as_deref() == Some(call_id.as_str())
+                                    && fact.child_instance_id.as_deref()
+                                        == Some(child_instance_id.as_str())
+                                    && matches!(&fact.disposition,
+                                        ActivityIoResultDisposition::Applied { .. }))
+                                .collect::<Vec<_>>();
+                            ensure!(accepted.len() == 1,
+                                "mapped Call IO output lacks its one applied accepted result");
+                            let fact = accepted[0];
+                            let accepted_event = plan.events.get(fact.result_event_index)
+                                .context("mapped Call IO output lacks its accepted event")?;
+                            ensure!(accepted_event.kind == "call_result_accepted"
+                                && accepted_event.data["call_id"].as_str()
+                                    == Some(call_id.as_str())
+                                && accepted_event.data["child_instance_id"].as_str()
+                                    == Some(child_instance_id.as_str())
+                                && fact.result_sources.len() == 1,
+                                "mapped Call IO output changed its accepted child source");
+                        }
                         ensure!(plan.events.iter().filter(|event| event.kind == "call_returned"
                             && event.scope_id == *scope_id
                             && event.node_id.as_deref() == Some(node_id.as_str())
@@ -7302,12 +9361,45 @@ fn validate_termination_variables_on(
                             && event.data["parent_token_id"].as_str() == Some(source_token_id.as_str()))
                             .count() == 1,
                             "mapped embedded return lacks one exact child completion fact");
+                        if node.activity_io.is_some() {
+                            let accepted = plan.activity_io_results.iter().filter(|fact|
+                                fact.scope_id == *scope_id && fact.node_id == *node_id
+                                    && fact.token_id == *source_token_id
+                                    && fact.child_scope_id.as_deref()
+                                        == Some(children[0].scope_id.as_str())
+                                    && matches!(&fact.disposition,
+                                        ActivityIoResultDisposition::Applied { .. }))
+                                .collect::<Vec<_>>();
+                            ensure!(accepted.len() == 1,
+                                "mapped SubProcess IO output lacks its one applied accepted result");
+                            let accepted_event = plan.events.get(accepted[0].result_event_index)
+                                .context("mapped SubProcess IO output lacks its accepted event")?;
+                            ensure!(accepted_event.kind == "scope_result_accepted"
+                                && accepted_event.data["child_scope_id"].as_str()
+                                    == Some(children[0].scope_id.as_str())
+                                && !accepted[0].result_sources.is_empty(),
+                                "mapped SubProcess IO output changed its accepted End source");
+                        }
                         (locals.get(&children[0].scope_id)
                             .context("mapped embedded child source locals are missing")?.clone(),
                             Vec::new())
                     }
                     _ => bail!("termination variable effect has no authenticated input output"),
                 };
+                actual_extra.extend(mapped_activity_extra);
+                if phase_owner == "ordinal" && node.activity_io.is_none() {
+                    // A repeated ordinal evaluates its mapping inside its own item scope.
+                    let occurrence = plan.repetition_occurrences.iter().cloned()
+                        .chain(repetition_occurrences_on(tx, instance_id)?)
+                        .find(|occurrence| occurrence.scope_id == *scope_id
+                            && occurrence.token_id == *source_token_id)
+                        .context("mapped repeated ordinal lost its factual occurrence")?;
+                    actual_extra.push(("repeat".to_owned(), serde_json::json!({
+                        "group_id": occurrence.group_id,
+                        "index": occurrence.ordinal,
+                        "item": occurrence.item,
+                    })));
+                }
                 ensure!(outputs == &actual_outputs && extra == &actual_extra,
                     "termination mapping used caller-claimed outputs instead of accepted input");
                 let local = locals.get(scope_id).context("mapped scope locals are missing")?;
@@ -7323,10 +9415,46 @@ fn validate_termination_variables_on(
                             && event.data["expression"].as_str() == Some(expression.as_str())),
                         "mapped service result did not pass its pinned condition");
                 }
-                let expected = if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
-                    super::runtime::patch_script_variables(mapping, local, &effective, outputs)?
+                let legacy = if phase_owner == "coordinator" {
+                    local.clone()
+                } else if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                    super::runtime::patch_script_variables(mapping, local, &effective, outputs, extra)?
                 } else {
                     super::runtime::patch_variables(mapping, local, &effective, outputs, extra)?
+                };
+                let expected = if let Some(io) = &node.activity_io {
+                    let path = scope_path(scopes, instance_id, scope_id)?;
+                    let body = super::model::selected_body(model, &selected_process_id, &path)?;
+                    let modeling = super::model::io_modeling(body.modeling);
+                    let owner = match phase_owner.as_str() {
+                        "coordinator" => super::runtime::ActivityIoOutputOwner::Coordinator,
+                        "ordinary" | "ordinal" => super::runtime::ActivityIoOutputOwner::Ordinal,
+                        _ => bail!("mapped activity IO has an invalid authenticated owner"),
+                    };
+                    let (ordered, expected) = super::runtime::evaluate_activity_outputs(
+                        io, modeling, &legacy, &effective,
+                        &IoObservedValue::Present { value: actual_outputs.clone() },
+                        &actual_extra, owner)?;
+                    ensure!(activity_io_outputs.as_ref() == Some(&ordered),
+                        "mapped activity IO outputs differ from authored association order");
+                    ensure!(plan.events.get(*event_index).is_some_and(|event|
+                        event.kind == "activity_io_output_applied"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data == serde_json::json!({
+                                "source_token_id": source_token_id,
+                                "ordered_outputs": ordered,
+                                "local_patch": expected,
+                            }))
+                        && plan.event_ids.get(event_index).is_some_and(|id|
+                            Uuid::parse_str(id).is_ok())
+                        && !plan.event_sources.contains_key(event_index),
+                        "mapped activity IO lacks its exact output-applied fact");
+                    expected
+                } else {
+                    ensure!(activity_io_outputs.is_none(),
+                        "mapped activity has unconfigured IO outputs");
+                    legacy
                 };
                 ensure!(&expected == result,
                     "mapped variable effect differs from its pinned expression");
@@ -7336,6 +9464,34 @@ fn validate_termination_variables_on(
         states.push(locals.clone());
     }
     ensure!(plan.termination_attempts.is_empty() || plan.events.iter().all(|event| match event.kind.as_str() {
+        "activity_io_output_applied" => plan.variable_effects.iter().filter(|effect|
+            match effect {
+                VariableEffect::Mapped { event_index, scope_id, node_id,
+                    source_token_id, activity_io_outputs: Some(ordered), result, .. }
+                    if plan.events.get(*event_index).is_some_and(|candidate|
+                        std::ptr::eq(candidate, event))
+                        && scope_id == &event.scope_id
+                        && event.node_id.as_deref() == Some(node_id.as_str())
+                        && event.data == serde_json::json!({
+                            "source_token_id": source_token_id,
+                            "ordered_outputs": ordered,
+                            "local_patch": result,
+                        }) => true,
+                VariableEffect::RepetitionAggregate { output_event_index: Some(output_index),
+                    scope_id, group_id, parent_token_id, activity_io_outputs: Some(ordered), result, .. }
+                    if plan.events.get(*output_index).is_some_and(|candidate|
+                        std::ptr::eq(candidate, event))
+                        && scope_id == &event.scope_id
+                        && plan.repetition_groups.iter().any(|group|
+                            group.group_id == *group_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str()))
+                        && event.data == serde_json::json!({
+                            "source_token_id": parent_token_id,
+                            "ordered_outputs": ordered,
+                            "local_patch": result,
+                        }) => true,
+                _ => false,
+            }).count() == 1,
         "scope_entered" => plan.variable_effects.iter().any(|effect| matches!(effect,
             VariableEffect::ScopeEntry { scope_id, parent_token_id, .. }
                 if scope_id == &event.scope_id
@@ -7343,12 +9499,31 @@ fn validate_termination_variables_on(
         "scope_completed" => plan.variable_effects.iter().any(|effect| matches!(effect,
             VariableEffect::Mapped { scope_id, source_token_id, .. }
                 if event.data["parent_scope_id"].as_str() == Some(scope_id.as_str())
-                    && event.data["parent_token_id"].as_str() == Some(source_token_id.as_str()))),
+                    && event.data["parent_token_id"].as_str() == Some(source_token_id.as_str())))
+            || event.data["reason"].as_str() == Some("terminate_end")
+                && plan.repetition_occurrences.iter().any(|occurrence|
+                    event.data["parent_scope_id"].as_str() == Some(occurrence.scope_id.as_str())
+                        && event.data["parent_token_id"].as_str()
+                            == Some(occurrence.token_id.as_str())
+                        && event.data["source_event_id"].as_str()
+                            == occurrence.accepted_source_event_id.as_deref()
+                        && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed
+                        && plan.repetition_groups.iter().any(|group|
+                            group.group_id == occurrence.group_id
+                                && group.scope_id == occurrence.scope_id
+                                && event.data["subprocess_node_id"].as_str()
+                                    == Some(group.node_id.as_str()))
+                        && plan.events.iter().enumerate().filter(|(index,source)|
+                            source.kind == "terminate_end_reached"
+                                && source.scope_id == event.scope_id
+                                && plan.event_ids.get(index)
+                                    == occurrence.accepted_source_event_id.as_ref())
+                            .count() == 1),
         "message_delivered" if event.node_id.as_deref().is_some_and(|node_id|
-            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+            scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::MessageStart { .. }))) => true,
         "script_completed" => event.node_id.as_deref().is_some_and(|node_id|
-            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+            scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
                     ProcessNodeKind::ScriptTask { output_mapping, .. }
                         if output_mapping.is_empty()
@@ -7363,6 +9538,15 @@ fn validate_termination_variables_on(
             VariableEffect::Mapped { scope_id, node_id, .. }
                 if scope_id == &event.scope_id
                     && event.node_id.as_deref() == Some(node_id.as_str())))
+            || (event.kind == "verification_approved"
+                && plan.activity_io_continuations.iter().any(|fact|
+                    matches!(&fact.disposition,
+                        ActivityIoResultDisposition::Blocked { .. })
+                        && plan.events.get(fact.approval_event_index).is_some_and(|candidate|
+                            std::ptr::eq(candidate, event))
+                        && fact.scope_id == event.scope_id
+                        && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                        && event.data["user_task_id"] == fact.user_task_id))
             || (event.kind == "verification_passed" && plan.repetition_occurrences.iter().any(|row|
                 row.scope_id == event.scope_id && row.job_id.as_ref().is_some_and(|id|
                     plan.complete_job_ids.contains(id))
@@ -7403,6 +9587,12 @@ fn validate_termination_variables_on(
     Ok(states)
 }
 
+enum TerminationTraceStep {
+    Done,
+    Next(String),
+    Alternatives(Vec<String>),
+}
+
 fn trace_termination_source_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -7414,6 +9604,44 @@ fn trace_termination_source_on(
     accepted_input: &AcceptedInputRef,
     visiting: &mut HashSet<String>,
 ) -> Result<()> {
+    let mut pending = vec![(token_id.to_owned(), visiting.clone(), false)];
+    while let Some((current, mut branch, alternative)) = pending.pop() {
+        let step = trace_termination_source_step_on(tx, instance_id, model, scopes, plan,
+            &current, seed_token_id, accepted_input, &mut branch);
+        match step {
+            Ok(TerminationTraceStep::Done) => {
+                *visiting = branch;
+                return Ok(());
+            }
+            Ok(TerminationTraceStep::Next(parent)) => {
+                pending.push((parent, branch, alternative));
+            }
+            Ok(TerminationTraceStep::Alternatives(parents)) => {
+                for parent in parents.into_iter().rev() {
+                    pending.push((parent, branch.clone(), true));
+                }
+            }
+            Err(error) if alternative => {
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("termination source is not linked to its accepted input through pinned sequence flows")
+}
+
+fn trace_termination_source_step_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    model: &ProcessModel,
+    scopes: &[ProcessScopeSummary],
+    plan: &RuntimePlan,
+    token_id: &str,
+    seed_token_id: Option<&str>,
+    accepted_input: &AcceptedInputRef,
+    visiting: &mut HashSet<String>,
+) -> Result<TerminationTraceStep> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     ensure!(visiting.insert(token_id.to_owned()) && visiting.len() <= 256,
         "termination input lineage contains a cycle or exceeds its pinned body");
     let token = termination_token_on(tx, instance_id, plan, token_id)?;
@@ -7426,11 +9654,11 @@ fn trace_termination_source_on(
         ensure!(token.status == expected_status
             && !plan.create_tokens.iter().any(|created| created.token_id == token_id),
             "termination accepted input is not a persisted live activation");
-        return Ok(());
+        return Ok(TerminationTraceStep::Done);
     }
     if token.status == "waiting" && !plan.create_tokens.iter().any(|created|
         created.token_id == token_id) {
-        let node = scope_node(model, scopes, instance_id, &token.scope_id, &token.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &token.scope_id, &token.node_id)?;
         if node.repeat.is_some() {
             let groups = plan.repetition_groups.iter().filter(|group|
                 group.status == ProcessRepetitionGroupStatus::Completed
@@ -7461,11 +9689,22 @@ fn trace_termination_source_on(
                             && group_id == &group.group_id && parent_token_id == token_id
                             && input == accepted_input)).count() == 1,
                     "termination completed repetition lacks its accepted parent mapping");
+                let final_completion = plan.events.iter().enumerate().filter(|(index, event)|
+                    *index < completion_index
+                        && event.kind == "repetition_occurrence_completed"
+                        && event.scope_id == group.scope_id
+                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                        && event.data["group_id"] == group.group_id)
+                    .max_by_key(|(index, _)| *index)
+                    .context("termination completed repetition has no final ordinal fact")?;
                 let members = plan.repetition_occurrences.iter().filter(|occurrence|
                     occurrence.group_id == group.group_id
                         && occurrence.scope_id == group.scope_id
                         && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed
-                        && occurrence.ordinal.checked_add(1) == Some(group.completed_count))
+                        && final_completion.1.data["occurrence_id"] == occurrence.occurrence_id
+                        && final_completion.1.data["ordinal"] == occurrence.ordinal
+                        && final_completion.1.data["source_event_id"].as_str()
+                            == occurrence.accepted_source_event_id.as_deref())
                     .collect::<Vec<_>>();
                 ensure!(members.len() == 1,
                     "termination completed repetition has no unique final ordinal");
@@ -7477,21 +9716,133 @@ fn trace_termination_source_on(
                     *event_id == source_id).map(|(index, _)| *index).collect::<Vec<_>>();
                 ensure!(source_indices.len() == 1 && source_indices[0] < completion_index
                     && plan.events.get(source_indices[0]).is_some_and(|event|
-                        event.scope_id == member.scope_id
-                            && event.node_id.as_deref() == Some(group.node_id.as_str())
-                            && if member.approval_event_id.is_some() {
-                                event.kind == "verification_approved"
-                                    && event.data["user_task_id"].as_str()
-                                        == member.verification_user_task_id.as_deref()
-                            } else if let Some(task_id) = &member.user_task_id {
-                                event.kind == "user_task_completed"
-                                    && event.data["user_task_id"].as_str() == Some(task_id.as_str())
-                            } else {
-                                event.kind == "service_result" && member.job_id.is_some()
-                            }),
+                        if member.approval_event_id.is_some() {
+                            event.kind == "verification_approved"
+                                && event.scope_id == member.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data["user_task_id"].as_str()
+                                    == member.verification_user_task_id.as_deref()
+                        } else {
+                            match &node.kind {
+                                ProcessNodeKind::UserTask { .. } =>
+                                    event.kind == "user_task_completed"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && event.data["user_task_id"].as_str()
+                                            == member.user_task_id.as_deref(),
+                                ProcessNodeKind::ManualTask { .. } =>
+                                    event.kind == "manual_task_acknowledged"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && event.data["user_task_id"].as_str()
+                                            == member.user_task_id.as_deref(),
+                                ProcessNodeKind::ServiceTask { .. } =>
+                                    event.kind == "service_result" && member.job_id.is_some()
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str()),
+                                ProcessNodeKind::ScriptTask { .. } =>
+                                    event.kind == "script_completed"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && plan.event_sources.get(&source_indices[0])
+                                            == Some(&member.token_id),
+                                ProcessNodeKind::ReceiveTask { .. } =>
+                                    event.kind == "message_delivered"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && event.data["attached_token_id"].as_str()
+                                            == Some(member.token_id.as_str())
+                                        && event.data["subscription_id"].as_str().is_some_and(|id|
+                                            plan.subscription_updates.iter().any(|update|
+                                                update.subscription_id == id
+                                                    && update.status == ProcessSubscriptionStatus::Consumed)),
+                                ProcessNodeKind::SendTask { .. } =>
+                                    event.kind == "send_task_admitted"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && event.data["source_activation_id"].as_str()
+                                            == Some(member.token_id.as_str()),
+                                ProcessNodeKind::SubProcess { .. } =>
+                                    (event.kind == "scope_completed"
+                                        && event.data["parent_scope_id"].as_str()
+                                            == Some(group.scope_id.as_str())
+                                        && event.data["parent_token_id"].as_str()
+                                            == Some(member.token_id.as_str())
+                                        && event.data["subprocess_node_id"].as_str()
+                                            == Some(group.node_id.as_str()))
+                                    || (event.kind == "terminate_end_reached"
+                                        && scopes.iter().any(|scope|
+                                            scope.scope_id == event.scope_id
+                                                && scope.parent_scope_id.as_deref()
+                                                    == Some(group.scope_id.as_str())
+                                                && scope.parent_token_id.as_deref()
+                                                    == Some(member.token_id.as_str()))),
+                                ProcessNodeKind::CallActivity(_) =>
+                                    event.kind == "call_returned"
+                                        && event.scope_id == member.scope_id
+                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && event.data["parent_token_id"].as_str()
+                                            == Some(member.token_id.as_str()),
+                                _ => false,
+                            }
+                        }),
                     "termination completed repetition differs from its final accepted source");
-                return trace_termination_source_on(tx, instance_id, model, scopes, plan,
-                    &member.token_id, seed_token_id, accepted_input, visiting);
+                return Ok(TerminationTraceStep::Next((&member.token_id).to_string()));
+            }
+            let continuations = plan.repetition_groups.iter().filter(|group|
+                group.scope_id == token.scope_id && group.node_id == token.node_id
+                    && group.parent_token_id == token_id
+                    && matches!(group.mode, ProcessRepetitionGroupMode::MultiInstanceSequential
+                        | ProcessRepetitionGroupMode::StructuredLoop)
+                    && !group.terminal_capacity
+                    && matches!(group.status,
+                        ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
+                    && plan.events.iter().any(|event|
+                        event.kind == "repetition_occurrence_started"
+                            && event.scope_id == group.scope_id
+                            && event.data["group_id"].as_str() == Some(group.group_id.as_str())
+                            && event.data["token_id"].as_str().is_some_and(|id|
+                                visiting.contains(id)))).collect::<Vec<_>>();
+            if !continuations.is_empty() {
+                ensure!(continuations.len() == 1,
+                    "repetition continuation has ambiguous waiting coordinators");
+                let group = continuations[0];
+                let started = plan.events.iter().filter(|event|
+                    event.kind == "repetition_occurrence_started"
+                        && event.scope_id == group.scope_id
+                        && event.data["group_id"].as_str() == Some(group.group_id.as_str())
+                        && event.data["token_id"].as_str().is_some_and(|id|
+                            visiting.contains(id))).collect::<Vec<_>>();
+                ensure!(started.len() == 1,
+                    "repetition continuation has no unique next ordinal");
+                let ordinal = started[0].data["ordinal"].as_u64()
+                    .context("repetition continuation has no ordinal")?;
+                ensure!(ordinal == u64::from(group.completed_count),
+                    "repetition continuation skipped an accepted ordinal");
+                let previous = plan.repetition_occurrences.iter().filter(|occurrence|
+                    occurrence.group_id == group.group_id
+                        && u64::from(occurrence.ordinal).checked_add(1) == Some(ordinal)
+                        && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed)
+                    .collect::<Vec<_>>();
+                ensure!(previous.len() == 1 && plan.events.iter().enumerate().any(|(index, event)|
+                    previous[0].accepted_source_event_id.as_ref()
+                        == plan.event_ids.get(&index)
+                        && ((event.scope_id == group.scope_id
+                            && event.node_id.as_deref() == Some(group.node_id.as_str()))
+                            || (event.kind == "scope_completed"
+                                && event.data["parent_scope_id"].as_str()
+                                    == Some(group.scope_id.as_str())
+                                && event.data["parent_token_id"].as_str()
+                                    == Some(previous[0].token_id.as_str()))
+                            || (event.kind == "terminate_end_reached"
+                                && scopes.iter().any(|scope|
+                                    scope.scope_id == event.scope_id
+                                        && scope.parent_scope_id.as_deref()
+                                            == Some(group.scope_id.as_str())
+                                        && scope.parent_token_id.as_deref()
+                                            == Some(previous[0].token_id.as_str()))))),
+                    "repetition continuation lacks its accepted preceding ordinal");
+                return Ok(TerminationTraceStep::Next((&previous[0].token_id).to_string()));
             }
         }
         if matches!(&node.kind, ProcessNodeKind::SubProcess { .. }) {
@@ -7520,7 +9871,7 @@ fn trace_termination_source_on(
                         *index < completed_index && event.kind == "end_reached"
                             && event.scope_id == child.scope_id
                             && event.node_id.as_deref().is_some_and(|node_id|
-                                scope_node(model, scopes, instance_id, &child.scope_id, node_id)
+                                scope_node(model, &selected_process_id, scopes, instance_id, &child.scope_id, node_id)
                                     .is_ok_and(|node| node.kind == ProcessNodeKind::End))
                             && plan.event_sources.get(index).is_some()).collect::<Vec<_>>();
                     ensure!(ends.len() == 1
@@ -7552,8 +9903,7 @@ fn trace_termination_source_on(
                         && plan.event_sources.iter().any(|(index, source_id)|
                             *index > completed_index && visiting.contains(source_id)),
                         "completed child return lacks an ordered End source and parent action");
-                    return trace_termination_source_on(tx, instance_id, model, scopes, plan,
-                        child_source_id, seed_token_id, accepted_input, visiting);
+                    return Ok(TerminationTraceStep::Next((child_source_id).to_string()));
                 }
                 ensure!(children.len() == 1 && completed.len() == 1
                     && plan.consume_token_ids.iter().filter(|id| id.as_str() == token_id).count() == 1
@@ -7614,15 +9964,50 @@ fn trace_termination_source_on(
                             && source_token_id == token_id && input == accepted_input
                             && outputs == child_locals)).count() == 1,
                     "termination completed child return lacks its actual parent mapping");
-                return trace_termination_source_on(tx, instance_id, model, scopes, plan,
-                    &source.source_token_id, seed_token_id, accepted_input, visiting);
+                return Ok(TerminationTraceStep::Next((&source.source_token_id).to_string()));
             }
         }
     }
     ensure!(plan.create_tokens.iter().any(|created| created.token_id == token_id),
         "termination source is not descended from its accepted input");
+    if token.status == "ready" {
+        if let Some(parent_id) = plan.token_sources.get(token_id) {
+            let started = plan.events.iter().filter(|event|
+                event.kind == "repetition_occurrence_started"
+                    && event.scope_id == token.scope_id
+                    && event.data["token_id"].as_str() == Some(token_id)).collect::<Vec<_>>();
+            if !started.is_empty() {
+                ensure!(started.len() == 1, "repetition lineage has duplicate ordinal start facts");
+                let event = started[0];
+                let occurrences = plan.repetition_occurrences.iter().filter(|occurrence|
+                    occurrence.scope_id == token.scope_id
+                        && event.data["occurrence_id"].as_str()
+                            == Some(occurrence.occurrence_id.as_str())
+                        && (occurrence.token_id == token_id
+                            || plan.token_sources.get(&occurrence.token_id)
+                                .is_some_and(|source| source == token_id))).collect::<Vec<_>>();
+                ensure!(occurrences.len() == 1,
+                    "repetition lineage has no unique ordinal activation");
+                let occurrence = occurrences[0];
+                let groups = plan.repetition_groups.iter().filter(|group|
+                    group.group_id == occurrence.group_id
+                        && group.scope_id == token.scope_id
+                        && group.node_id == token.node_id
+                        && group.parent_token_id == *parent_id).collect::<Vec<_>>();
+                ensure!(groups.len() == 1 && event.node_id.as_deref() == Some(token.node_id.as_str())
+                    && event.data == serde_json::json!({
+                        "group_id":occurrence.group_id,"occurrence_id":occurrence.occurrence_id,
+                        "ordinal":occurrence.ordinal,"token_id":token_id,
+                    }) && occurrence.ordinal < groups[0].created_count
+                    && termination_token_on(tx, instance_id, plan, parent_id)?.status == "waiting",
+                    "repetition lineage changed its pinned group, ordinal, or parent wait");
+                return Ok(TerminationTraceStep::Next((parent_id).to_string()));
+            }
+        }
+    }
     let path = scope_path(scopes, instance_id, &token.scope_id)?;
-    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
     if token.status == "waiting" {
         if let Some(source_id) = plan.token_sources.get(token_id) {
             let predecessor = termination_token_on(tx, instance_id, plan, source_id)?;
@@ -7630,39 +10015,56 @@ fn trace_termination_source_on(
                 && predecessor.arrival_edge_id == token.arrival_edge_id {
                 let node = nodes.iter().find(|node| node.id == token.node_id)
                     .context("termination parent wait is outside its pinned body")?;
-                let entered = match &node.kind {
-                    ProcessNodeKind::SubProcess { .. } => plan.create_scopes.iter().any(|scope|
-                        scope.parent_scope_id == token.scope_id
-                            && scope.parent_token_id == token.token_id
-                            && scope.subprocess_node_id == token.node_id),
-                    ProcessNodeKind::CallActivity { .. } => plan.call_requests.iter().any(|call|
-                        call.parent_scope_id == token.scope_id
-                            && call.parent_token_id == token.token_id
-                            && call.call_node_id == token.node_id),
-                    ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
-                        if node.repeat.is_some() => plan.repetition_groups.iter().any(|group|
-                            group.scope_id == token.scope_id
-                                && group.node_id == token.node_id
-                                && group.source_token_id == *source_id
-                                && group.parent_token_id == token.token_id
-                                && plan.events.iter().filter(|event|
-                                    event.kind == "repetition_group_started"
-                                        && event.scope_id == group.scope_id
-                                        && event.node_id.as_deref() == Some(group.node_id.as_str())
-                                        && event.data == serde_json::json!({
-                                            "group_id":group.group_id,
-                                            "source_token_id":group.source_token_id,
-                                            "parent_token_id":group.parent_token_id,
-                                            "mode":group.mode,"total":group.total_count
-                                        })).count() == 1),
-                    _ => false,
+                let repeated = node.repeat.is_some() && plan.repetition_groups.iter().any(|group|
+                    group.scope_id == token.scope_id
+                        && group.node_id == token.node_id
+                        && group.source_token_id == *source_id
+                        && group.parent_token_id == token.token_id
+                        && plan.events.iter().filter(|event|
+                            event.kind == "repetition_group_started"
+                                && event.scope_id == group.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "group_id":group.group_id,
+                                    "source_token_id":group.source_token_id,
+                                    "parent_token_id":group.parent_token_id,
+                                    "mode":group.mode,"total":if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+                                        None
+                                    } else { group.total_count }
+                                })).count() == 1);
+                let ordinal_wait = plan.repetition_occurrences.iter().any(|occurrence|
+                    occurrence.scope_id == token.scope_id
+                        && occurrence.token_id == token.token_id
+                        && plan.repetition_groups.iter().any(|group|
+                            group.group_id == occurrence.group_id
+                                && group.node_id == token.node_id));
+                // Capturing the authored inputs is itself the entry into a configured
+                // activity: it parks the ready source behind this exact waiting token.
+                let io_entered = node.activity_io.is_some()
+                    && plan.activity_io_inputs.iter().any(|fact| match fact {
+                        ActivityIoInputFact::Captured { source_token_id, activation_token_id, .. } =>
+                            source_token_id == source_id && activation_token_id == token_id,
+                        ActivityIoInputFact::Failed { source_token_id, waiting_token_id, .. } =>
+                            source_token_id == source_id && waiting_token_id == token_id,
+                    });
+                let entered = io_entered || if node.repeat.is_some() && !ordinal_wait { repeated } else {
+                    match &node.kind {
+                        ProcessNodeKind::SubProcess { .. } => plan.create_scopes.iter().any(|scope|
+                            scope.parent_scope_id == token.scope_id
+                                && scope.parent_token_id == token.token_id
+                                && scope.subprocess_node_id == token.node_id),
+                        ProcessNodeKind::CallActivity(_) => plan.call_requests.iter().any(|call|
+                            call.parent_scope_id == token.scope_id
+                                && call.parent_token_id == token.token_id
+                                && call.call_node_id == token.node_id),
+                        _ => false,
+                    }
                 };
                 ensure!(entered && predecessor.status == "ready"
                     && predecessor.fork_stack == token.fork_stack
                     && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
                     "termination parent wait lacks its exact entered activation");
-                return trace_termination_source_on(tx, instance_id, model, scopes, plan,
-                    source_id, seed_token_id, accepted_input, visiting);
+                return Ok(TerminationTraceStep::Next((source_id).to_string()));
             }
         }
     }
@@ -7677,7 +10079,7 @@ fn trace_termination_source_on(
                 if started == instance_id)
                 && plan.start_instance_id.as_deref() == Some(instance_id),
                 "root termination origin differs from its accepted start");
-            return Ok(());
+            return Ok(TerminationTraceStep::Done);
         }
         let created_scope = plan.create_scopes.iter().find(|scope| scope.scope_id == token.scope_id)
             .context("local termination origin lacks an accepted subprocess entry")?;
@@ -7687,11 +10089,46 @@ fn trace_termination_source_on(
             && event.scope_id == token.scope_id
             && event.data["parent_token_id"].as_str() == Some(created_scope.parent_token_id.as_str())),
             "local termination origin lacks its factual scope entry");
-        return trace_termination_source_on(tx, instance_id, model, scopes, plan,
-            &created_scope.parent_token_id, seed_token_id, accepted_input, visiting);
+        return Ok(TerminationTraceStep::Next((&created_scope.parent_token_id).to_string()));
     };
     let edge = flows.iter().find(|flow| flow.id == arrival && flow.target_id == token.node_id)
         .context("termination source incoming edge is outside its pinned body")?;
+    if nodes.iter().any(|node| node.id == edge.source_id
+        && matches!(node.kind, ProcessNodeKind::LinkCatch { .. })) {
+        let catches = plan.events.iter().enumerate().filter(|(index, event)|
+            event.kind == "link_caught" && event.scope_id == token.scope_id
+                && event.node_id.as_deref() == Some(edge.source_id.as_str())
+                && event.data["successor_token_id"].as_str() == Some(token_id)
+                && event.data["outgoing_edge_id"].as_str() == Some(edge.id.as_str())
+                && plan.event_ids.get(index).is_some_and(|id| Uuid::parse_str(id).is_ok()))
+            .collect::<Vec<_>>();
+        ensure!(catches.len() == 1,
+            "termination Link successor lacks one factual Catch");
+        let (catch_index, caught) = catches[0];
+        ensure!(catch_index > 0,
+            "termination Link Catch has no preceding Throw");
+        let source_id = caught.data["source_token_id"].as_str()
+            .context("termination Link Catch lacks its source token")?;
+        let source = termination_token_on(tx, instance_id, plan, source_id)?;
+        let pairs = super::model::link_pairs(nodes)?;
+        ensure!(source.status == "ready" && source.scope_id == token.scope_id
+            && pairs.get(source.node_id.as_str()).copied() == Some(edge.source_id.as_str())
+            && plan.consume_token_ids.iter().filter(|id| id.as_str() == source_id).count() == 1
+            && plan.token_sources.get(token_id).is_some_and(|id| id == source_id)
+            && source.fork_stack == token.fork_stack,
+            "termination Link Catch changed its factual Throw, scope, or fork");
+        let thrown = &plan.events[catch_index - 1];
+        let thrown_id = plan.event_ids.get(&(catch_index - 1))
+            .context("termination Link Throw lacks its durable identity")?;
+        ensure!(thrown.kind == "link_thrown"
+            && thrown.scope_id == token.scope_id
+            && thrown.node_id.as_deref() == Some(source.node_id.as_str())
+            && plan.event_sources.get(&(catch_index - 1)).is_some_and(|id| id == source_id)
+            && plan.event_sources.get(&catch_index).is_none()
+            && caught.data["throw_event_id"].as_str() == Some(thrown_id.as_str()),
+            "termination Link events differ from their source activation");
+        return Ok(TerminationTraceStep::Next((source_id).to_string()));
+    }
     let mut candidates = plan.create_tokens.iter().filter(|candidate|
         candidate.scope_id == token.scope_id && candidate.node_id == edge.source_id
             && plan.consume_token_ids.contains(&candidate.token_id)).cloned().collect::<Vec<_>>();
@@ -7779,8 +10216,7 @@ fn trace_termination_source_on(
                             ensure!(caught.data["job_id"].as_str() == Some(job_id.as_str()),
                                 "service error boundary changed its accepted job");
                             let source_id = seed_token_id.context("service error has no job activation")?;
-                            return trace_termination_source_on(tx,instance_id,model,scopes,plan,
-                                source_id,seed_token_id,accepted_input,visiting);
+                            return Ok(TerminationTraceStep::Next((source_id).to_string()));
                         }
                         _ => {
                             let source_event_id = caught.data["source_event_id"].as_str()
@@ -7792,8 +10228,7 @@ fn trace_termination_source_on(
                                 .context("caught ErrorEnd has no factual local source")?;
                             let source_id = error.1.data["source_token_id"].as_str()
                                 .context("caught ErrorEnd has no source token identity")?;
-                            return trace_termination_source_on(tx,instance_id,model,scopes,plan,
-                                source_id,seed_token_id,accepted_input,visiting);
+                            return Ok(TerminationTraceStep::Next((source_id).to_string()));
                         }
                     }
                 }
@@ -7809,23 +10244,16 @@ fn trace_termination_source_on(
                             && event.data["job_id"].as_str() == Some(job_id.as_str())),
                         "escalation termination has no factual caught service result");
                 }
-                return trace_termination_source_on(tx,instance_id,model,scopes,plan,
-                    &attached,seed_token_id,accepted_input,visiting);
+                return Ok(TerminationTraceStep::Next((&attached).to_string()));
             }
         }
     }
-    for candidate in matched {
-        let mut branch = visiting.clone();
-        if trace_termination_source_on(tx,instance_id,model,scopes,plan,
-            &candidate.token_id,seed_token_id,accepted_input,&mut branch).is_ok() {
-            return Ok(());
-        }
-    }
-    bail!("termination source is not linked to its accepted input through pinned sequence flows")
+    Ok(TerminationTraceStep::Alternatives(matched.into_iter()
+        .map(|candidate| candidate.token_id).collect()))
 }
 
 fn validate_termination_immediate_failure_on(
-    instance_id: &str, model: &ProcessModel, scopes: &[ProcessScopeSummary],
+    instance_id: &str, selected_process_id: &str, model: &ProcessModel, scopes: &[ProcessScopeSummary],
     plan: &RuntimePlan, variable_states: &[BTreeMap<String, Value>],
     source: &ProcessToken, waiting: &ProcessToken,
 ) -> Result<()> {
@@ -7858,7 +10286,8 @@ fn validate_termination_immediate_failure_on(
         locals.get(instance_id).context("termination failure root variables are missing")?,
         &source.scope_id)?;
     let path = scope_path(scopes, instance_id, &source.scope_id)?;
-    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
     let node = nodes.iter().find(|node| node.id == source.node_id)
         .context("termination failure node is outside its pinned body")?;
     if matches!(&node.kind, ProcessNodeKind::SignalThrow { .. }) {
@@ -7934,7 +10363,19 @@ fn validate_termination_immediate_failure_on(
                 "source_token_id":source.token_id,"waiting_token_id":waiting.token_id}))
         }
         ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. } => {
-            let error = match super::messages::prepare_throw(model, node, &effective) {
+            let repeated = plan.repetition_occurrences.iter().find(|row|
+                row.token_id == source.token_id && row.scope_id == source.scope_id);
+            let source_variables = repeated.map_or(&effective, |row| &row.input_variables);
+            let mut repeat_extra = planned_activity_io_extra_for_activation(
+                plan, &source.scope_id, &node.id, &waiting.token_id,
+            )?;
+            if repeat_extra.is_empty() {
+                repeat_extra = repeated.map(|row| vec![("repeat".to_owned(),
+                    serde_json::json!({"group_id":row.group_id,"index":row.ordinal,
+                        "item":row.item}))]).unwrap_or_default();
+            }
+            let error = match super::messages::prepare_throw(model, node,
+                source_variables, &repeat_extra) {
                 Ok(_) => bail!("termination message throw has a prepared message, not a failure wait"),
                 Err(error) => error,
             };
@@ -7951,25 +10392,246 @@ fn validate_termination_immediate_failure_on(
 }
 
 fn mandatory_action_source_event(
-    model: &ProcessModel, scopes: &[ProcessScopeSummary], instance_id: &str,
+    model: &ProcessModel, selected_process_id: &str,
+    scopes: &[ProcessScopeSummary], instance_id: &str,
     plan: &RuntimePlan, event: &PlannedEvent,
 ) -> bool {
+    let pre_body_script_incident = event.kind == "incident"
+        && event.data["code"] == "SCRIPT_EVALUATION_FAILED"
+        && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, selected_process_id, scopes, instance_id,
+                &event.scope_id, node_id).is_ok_and(|node|
+                    matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })))
+        && plan.repetition_occurrences.iter().filter(|row|
+            row.scope_id == event.scope_id
+                && row.status == ProcessRepetitionOccurrenceStatus::Active
+                && row.accepted_source_event_id.is_none()
+                && row.aggregate_item.is_none()
+                && plan.token_sources.get(&row.token_id).is_some_and(|source|
+                    plan.consume_token_ids.contains(source))
+                && plan.repetition_groups.iter().any(|group|
+                    group.group_id == row.group_id
+                        && group.scope_id == event.scope_id
+                        && event.node_id.as_deref() == Some(group.node_id.as_str())
+                        && group.status == ProcessRepetitionGroupStatus::Incident
+                        && group.terminal_incident_id.as_ref().is_some_and(|id|
+                            plan.add_incidents.iter().any(|incident|
+                                incident.incident_id == *id
+                                    && incident.code == "SCRIPT_EVALUATION_FAILED"
+                                    && incident.scope_id == event.scope_id
+                                    && event.data["message"] == incident.message))))
+            .count() == 1;
+    let typed_io_immediate_incident = event.kind == "incident"
+        && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, selected_process_id, scopes, instance_id,
+                &event.scope_id, node_id).is_ok_and(|node|
+                    matches!(&node.kind,
+                        ProcessNodeKind::ScriptTask { .. }
+                            | ProcessNodeKind::SendTask { .. })))
+        && (plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+            ActivityIoInputFact::Failed { incident_event_index, .. }
+                if plan.events.get(*incident_event_index)
+                    .is_some_and(|candidate| std::ptr::eq(candidate, event))))
+            || plan.activity_io_results.iter().any(|fact| matches!(
+                &fact.disposition, ActivityIoResultDisposition::Blocked {
+                    incident_event_index, .. }
+                    if plan.events.get(*incident_event_index)
+                        .is_some_and(|candidate| std::ptr::eq(candidate, event)))));
+    let typed_send_prepare_incident = event.kind == "incident"
+        && event.data["code"] == "MESSAGE_EXPRESSION_ERROR"
+        && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, selected_process_id, scopes, instance_id,
+                &event.scope_id, node_id).is_ok_and(|node|
+                    matches!(&node.kind, ProcessNodeKind::SendTask { .. })
+                        && node.activity_io.is_some()))
+        && plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+            ActivityIoInputFact::Captured { activation_token_id, .. }
+                if event.data["activation_token_id"] == *activation_token_id));
+    let accepted_script_aggregate_incident = event.kind == "incident"
+        && matches!(event.data["code"].as_str(),
+            Some("REPETITION_MAPPING_FAILED" | "REPETITION_AGGREGATE_LIMIT"))
+        && event.node_id.as_deref().is_some_and(|node_id|
+            scope_node(model, selected_process_id, scopes, instance_id,
+                &event.scope_id, node_id).is_ok_and(|node|
+                    matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })))
+        && plan.repetition_groups.iter().any(|group|
+            group.scope_id == event.scope_id
+                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                && group.status == ProcessRepetitionGroupStatus::Incident
+                && group.terminal_incident_id.as_ref().is_some_and(|id|
+                    plan.add_incidents.iter().any(|incident|
+                        incident.incident_id == *id && incident.scope_id == group.scope_id
+                            && incident.node_id.as_deref() == Some(group.node_id.as_str())
+                            && event.data["code"] == incident.code
+                            && event.data["message"] == incident.message))
+                && plan.events.iter().any(|blocked|
+                    blocked.kind == "repetition_group_blocked"
+                        && blocked.scope_id == group.scope_id
+                        && blocked.data["group_id"] == group.group_id
+                        && blocked.data["incident_id"].as_str()
+                            == group.terminal_incident_id.as_deref()
+                        && blocked.data["code"] == event.data["code"]));
     matches!(event.kind.as_str(),
         "node_completed" | "exclusive_selected" | "parallel_split" | "inclusive_split"
         | "parallel_joined" | "inclusive_joined" | "end_reached"
         | "error_end_reached" | "terminate_end_reached" | "message_queued"
         | "send_task_pending" | "send_task_admitted" | "send_admission_failed"
-        | "signal_admitted"
+        | "signal_admitted" | "link_thrown"
         | "script_completed")
-        || event.kind == "incident" && !plan.events.iter().any(|failure|
+        || event.kind == "incident" && event.data["code"] != "IMMEDIATE_TRANSITION_LIMIT"
+            && !pre_body_script_incident && !typed_io_immediate_incident
+            && !typed_send_prepare_incident
+            && !accepted_script_aggregate_incident
+            && !plan.events.iter().any(|failure|
             failure.kind == "send_admission_failed" && failure.scope_id == event.scope_id
                 && failure.node_id == event.node_id)
             && event.node_id.as_deref().is_some_and(|node_id|
-            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+            scope_node(model, selected_process_id, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
                     ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
                     | ProcessNodeKind::SignalThrow { .. })))
         || event.kind == "incident" && event.data["source_kind"] == "terminate_end_return_failure"
+}
+
+fn validate_immediate_lineage_limit_on(plan: &RuntimePlan) -> Result<HashSet<String>> {
+    let events = plan.events.iter().enumerate().filter(|(_, event)|
+        event.kind == "incident" && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT")
+        .collect::<Vec<_>>();
+    let incidents = plan.add_incidents.iter().filter(|incident|
+        incident.code == "IMMEDIATE_TRANSITION_LIMIT").collect::<Vec<_>>();
+    ensure!(events.len() == incidents.len(),
+        "immediate transition limit has an unmatched incident fact");
+    let mut limited = HashSet::new();
+    for (index, event) in events {
+        let candidates = plan.create_tokens.iter().filter(|token| {
+            let message = format!(
+                "Immediate transition limit reached at token {} after 255 predecessor links",
+                token.token_id,
+            );
+            token.status == "waiting" && token.scope_id == event.scope_id
+                && event.node_id.as_deref() == Some(token.node_id.as_str())
+                && event.data == serde_json::json!({
+                    "code":"IMMEDIATE_TRANSITION_LIMIT","message":message,
+                })
+                && !plan.consume_token_ids.contains(&token.token_id)
+                && !plan.cancel_token_ids.contains(&token.token_id)
+                && !plan.token_sources.values().any(|parent| parent == &token.token_id)
+        }).collect::<Vec<_>>();
+        ensure!(candidates.len() == 1 && !plan.event_sources.contains_key(&index),
+            "immediate transition limit did not park one exact planned token");
+        let token = candidates[0];
+        let matching = incidents.iter().filter(|incident| !incident.can_retry
+            && incident.job_id.is_none() && incident.scope_id == event.scope_id
+            && incident.node_id == event.node_id
+            && incident.message == format!(
+                "Immediate transition limit reached at token {} after 255 predecessor links",
+                token.token_id,
+            )).count();
+        ensure!(matching == 1 && limited.insert(token.token_id.clone()),
+            "immediate transition limit has a duplicate or mismatched incident fact");
+        let mut current = token.token_id.as_str();
+        let mut depth = 0;
+        let mut seen = HashSet::new();
+        while let Some(parent) = plan.token_sources.get(current) {
+            ensure!(seen.insert(current) && depth < 255,
+                "immediate transition limit has a cyclic or excessive predecessor chain");
+            ensure!(plan.create_tokens.iter().any(|created| created.token_id == current),
+                "immediate transition limit has an unplanned predecessor");
+            current = parent;
+            depth += 1;
+        }
+        ensure!(depth == 255 && seen.insert(current)
+            && (plan.create_tokens.iter().any(|created|
+                created.token_id == current && plan.start_instance_id.is_some())
+                || !plan.create_tokens.iter().any(|created| created.token_id == current)),
+            "immediate transition limit lacks its exact accepted seed");
+    }
+    Ok(limited)
+}
+
+fn script_io_action_handoff_on(
+    plan: &RuntimePlan, activation_token_id: &str, action_event_index: usize,
+) -> bool {
+    if plan.events.get(action_event_index).is_some_and(|event|
+        event.kind == "incident"
+            && event.data["code"] == "SCRIPT_EVALUATION_FAILED") {
+        return plan.event_sources.get(&action_event_index)
+                .is_some_and(|source| source == activation_token_id)
+            && plan.activity_io_inputs.iter().filter(|input| matches!(input,
+                ActivityIoInputFact::Captured { scope_id, node_id,
+                    source_token_id, activation_token_id: captured_token,
+                    event_index, .. }
+                    if captured_token == activation_token_id
+                        && plan.token_sources.get(captured_token) == Some(source_token_id)
+                        && *event_index < action_event_index
+                        && plan.events.get(action_event_index).is_some_and(|event|
+                            event.scope_id == *scope_id
+                                && event.node_id.as_deref() == Some(node_id.as_str())))).count() == 1
+            && !plan.activity_io_results.iter().any(|result|
+                result.token_id == activation_token_id)
+            && plan.create_tokens.iter().filter(|token|
+                token.token_id == activation_token_id
+                    && token.status == "waiting").count() == 1;
+    }
+    plan.events.get(action_event_index).is_some_and(|event|
+        (event.kind == "script_completed"
+            || event.kind == "incident"
+                && event.data["code"] == "SCRIPT_MAPPING_FAILED")
+            && plan.event_sources.get(&action_event_index)
+                .is_some_and(|source| source == activation_token_id))
+        && plan.activity_io_results.iter().filter(|result|
+            result.token_id == activation_token_id
+                && match &result.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } =>
+                        plan.events.get(action_event_index).is_some_and(|event|
+                            event.kind == "script_completed")
+                            && result.result_event_index < *output_event_index
+                            && *output_event_index < action_event_index,
+                    ActivityIoResultDisposition::Retained {
+                        fate: ActivityIoRetainedFate::ScriptMappingFailure,
+                        route_event_index,
+                    } => *route_event_index == action_event_index
+                        && result.result_event_index < action_event_index,
+                    _ => false,
+                }
+                && plan.activity_io_inputs.iter().filter(|input| matches!(input,
+                    ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                        source_token_id, activation_token_id: captured_token,
+                        event_index, .. }
+                        if witness_id == &result.witness_id
+                            && scope_id == &result.scope_id
+                            && node_id == &result.node_id
+                            && captured_token == activation_token_id
+                            && plan.token_sources.get(captured_token) == Some(source_token_id)
+                            && *event_index < result.result_event_index)).count() == 1,
+        ).count() == 1
+        && plan.create_tokens.iter().filter(|token|
+            token.token_id == activation_token_id && token.status == "waiting").count() == 1
+}
+
+fn send_io_admission_handoff_on(
+    plan: &RuntimePlan, activation_token_id: &str,
+    admitted_event_index: usize, pending: bool,
+) -> bool {
+    plan.events.get(admitted_event_index).is_some_and(|event|
+        event.kind == "send_task_admitted"
+            && plan.event_sources.get(&admitted_event_index)
+                .is_some_and(|source| source == activation_token_id))
+        && plan.activity_io_results.iter().filter(|result|
+            result.token_id == activation_token_id
+                && result.result_event_index == admitted_event_index
+                && matches!(&result.disposition,
+                    ActivityIoResultDisposition::Applied { .. }
+                        | ActivityIoResultDisposition::Blocked { .. })
+                && (pending || plan.activity_io_inputs.iter().filter(|input| matches!(input,
+                    ActivityIoInputFact::Captured { witness_id,
+                        activation_token_id: captured, source_token_id,
+                        event_index, .. }
+                        if witness_id == &result.witness_id
+                            && captured == activation_token_id
+                            && *event_index < admitted_event_index
+                            && plan.token_sources.get(captured) == Some(source_token_id)))
+                    .count() == 1)).count() == 1
 }
 
 fn validate_action_sources_on(
@@ -7977,11 +10639,15 @@ fn validate_action_sources_on(
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    ensure!(plan.events.iter().filter(|event| event.kind == "link_thrown").count()
+        == plan.events.iter().filter(|event| event.kind == "link_caught").count(),
+        "Link history has an unpaired Throw or Catch");
     ensure!(plan.event_sources.len() == plan.events.iter().filter(|event|
-            mandatory_action_source_event(model, scopes, instance_id, plan, event)).count()
+            mandatory_action_source_event(model, &selected_process_id, scopes, instance_id, plan, event)).count()
         && plan.events.iter().enumerate().all(|(index,event)|
             plan.event_sources.contains_key(&index) ==
-                mandatory_action_source_event(model, scopes, instance_id, plan, event)),
+                mandatory_action_source_event(model, &selected_process_id, scopes, instance_id, plan, event)),
         "termination history has an extra or missing token action source");
     let mut acted = HashSet::new();
     for (index, source_id) in &plan.event_sources {
@@ -8002,16 +10668,26 @@ fn validate_action_sources_on(
             AcceptedInputRef::SendAdmission { pending_token_id, .. })
                 if pending_token_id == source_id)
             && matches!(event.kind.as_str(), "send_task_admitted" | "send_admission_failed");
+        let script_io_action = script_io_action_handoff_on(plan, source_id, *index);
+        let send_io_action = send_io_admission_handoff_on(
+            plan, source_id, *index, pending_send);
+        let send_io_blocked = send_io_action && plan.activity_io_results.iter().any(|fact|
+            fact.token_id == *source_id && fact.result_event_index == *index
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Blocked { .. }));
         ensure!(acted.insert(source_id.clone())
             && (source.status == "ready" && !pending_send
-                || source.status == "waiting" && pending_send)
+                || source.status == "waiting"
+                    && (pending_send || script_io_action || send_io_action))
             && source.scope_id == event.scope_id
             && event.node_id.as_deref() == Some(source.node_id.as_str())
             && plan.consume_token_ids.iter().filter(|id| *id == source_id).count()
-                == usize::from(event.kind != "send_admission_failed"),
+                == usize::from(event.kind != "send_admission_failed"
+                    && !send_io_blocked),
             "termination action did not consume one factual ready token");
         let path = scope_path(scopes, instance_id, &source.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let node = nodes.iter().find(|node| node.id == source.node_id)
             .context("termination action node is outside its pinned body")?;
         let children = plan.create_tokens.iter().filter(|token|
@@ -8025,9 +10701,68 @@ fn validate_action_sources_on(
                 outgoing.iter().map(|edge| edge.id.clone()).collect()
             }
             (ProcessNodeKind::End, "end_reached") => {
-                ensure!(event.data.is_null() && children.is_empty(),
+                let scope = scopes.iter().find(|scope| scope.scope_id == event.scope_id)
+                    .context("End source scope is missing")?;
+                let typed_source = if let (Some(parent_scope_id), Some(parent_node_id)) =
+                    (&scope.parent_scope_id, &scope.subprocess_node_id) {
+                    scope_node(model, &selected_process_id, scopes, instance_id,
+                        parent_scope_id, parent_node_id)?.activity_io.is_some()
+                } else { false };
+                let expected = if typed_source {
+                    ensure!(plan.event_ids.contains_key(index),
+                        "configured SubProcess End has no durable event identity");
+                    serde_json::json!({"source_token_id": source_id})
+                } else { Value::Null };
+                ensure!(event.data == expected && children.is_empty(),
                     "ordinary End invented a successor or changed its historical payload");
                 Vec::new()
+            }
+            (ProcessNodeKind::LinkThrow { definition }, "link_thrown") => {
+                let pairs = super::model::link_pairs(nodes)?;
+                let catch_id = pairs.get(node.id.as_str())
+                    .context("Link Throw has no selected-body Catch")?;
+                let catch = nodes.iter().find(|candidate| candidate.id == *catch_id)
+                    .context("Link Catch is absent from its selected body")?;
+                let ProcessNodeKind::LinkCatch { definition: catch_definition } = &catch.kind else {
+                    anyhow::bail!("Link destination changed its kind");
+                };
+                let catch_edges = flows.iter().filter(|edge| edge.source_id == catch.id)
+                    .collect::<Vec<_>>();
+                ensure!(catch_edges.len() == 1 && children.len() == 1,
+                    "Link transfer lacks one real Catch outgoing successor");
+                let child = children[0];
+                let edge = catch_edges[0];
+                let thrown_id = plan.event_ids.get(index)
+                    .context("Link Throw lacks durable event identity")?;
+                ensure!(Uuid::parse_str(thrown_id).is_ok()
+                    && event.data == serde_json::json!({
+                        "source_token_id":source_id,
+                        "definition_id":definition.id,
+                        "catch_node_id":catch.id,
+                        "catch_definition_id":catch_definition.id,
+                        "successor_token_id":child.token_id,
+                        "outgoing_edge_id":edge.id,
+                    }), "Link Throw differs from its selected-body pair");
+                let catch_index = *index + 1;
+                let caught = plan.events.get(catch_index)
+                    .context("Link Catch has no ordered durable event")?;
+                ensure!(caught.kind == "link_caught" && caught.scope_id == source.scope_id
+                    && caught.node_id.as_deref() == Some(catch.id.as_str())
+                    && plan.event_sources.get(&catch_index).is_none()
+                    && plan.event_ids.get(&catch_index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok() && id != thrown_id)
+                    && caught.data == serde_json::json!({
+                        "source_token_id":source_id,
+                        "throw_event_id":thrown_id,
+                        "successor_token_id":child.token_id,
+                        "outgoing_edge_id":edge.id,
+                    })
+                    && child.scope_id == source.scope_id
+                    && child.node_id == edge.target_id
+                    && child.arrival_edge_id.as_deref() == Some(edge.id.as_str())
+                    && child.fork_stack == source.fork_stack,
+                    "Link Catch changed its factual successor or fork");
+                vec![edge.id.clone()]
             }
             (ProcessNodeKind::ExclusiveGateway { default_flow_id }, "exclusive_selected") => {
                 let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
@@ -8192,10 +10927,49 @@ fn validate_action_sources_on(
                         "message_name":queued[0].message.message_name,
                         "correlation_key":queued[0].message.correlation_key}),
                     "termination message throw lacks its actual queued row");
-                outgoing.iter().map(|edge| edge.id.clone()).collect()
+                if send_io_blocked {
+                    ensure!(node.activity_io.is_some() && event.kind == "send_task_admitted"
+                        && children.is_empty(),
+                        "blocked Send IO invented a successor or changed its admitted source");
+                    Vec::new()
+                } else if node.repeat.is_some() {
+                    let accepted_id = plan.event_ids.get(index)
+                        .context("repeated Send has no admitted source identity")?;
+                    ensure!(event.kind == "send_task_admitted" && children.is_empty()
+                        && plan.repetition_occurrences.iter().filter(|row|
+                            row.scope_id == source.scope_id
+                                && row.token_id == *source_id
+                                && row.status == ProcessRepetitionOccurrenceStatus::Completed
+                                && row.accepted_source_event_id.as_ref() == Some(accepted_id)
+                                && plan.repetition_groups.iter().any(|group|
+                                    group.group_id == row.group_id
+                                        && group.scope_id == row.scope_id
+                                        && group.node_id == node.id)
+                                && plan.events.iter().filter(|completed|
+                                    completed.kind == "repetition_occurrence_completed"
+                                        && completed.scope_id == row.scope_id
+                                        && completed.node_id.as_deref() == Some(node.id.as_str())
+                                        && completed.data["occurrence_id"] == row.occurrence_id
+                                        && completed.data["source_event_id"] == *accepted_id)
+                                    .count() == 1).count() == 1,
+                        "repeated Send admission lacks its exact completed ordinal");
+                    Vec::new()
+                } else {
+                    outgoing.iter().map(|edge| edge.id.clone()).collect()
+                }
             }
-            (ProcessNodeKind::ScriptTask { .. }, "script_completed") =>
-                outgoing.iter().map(|edge| edge.id.clone()).collect(),
+            (ProcessNodeKind::ScriptTask { .. }, "script_completed") => {
+                if plan.repetition_occurrences.iter().any(|row|
+                    row.token_id == *source_id && row.scope_id == source.scope_id
+                        && row.accepted_source_event_id.as_deref()
+                            == plan.event_ids.get(index).map(String::as_str)
+                        && plan.repetition_groups.iter().any(|group|
+                            group.group_id == row.group_id && group.node_id == node.id)) {
+                    Vec::new()
+                } else {
+                    outgoing.iter().map(|edge| edge.id.clone()).collect()
+                }
+            }
             (ProcessNodeKind::ScriptTask { .. }, "incident") => Vec::new(),
             (ProcessNodeKind::SignalThrow { .. }, "signal_admitted") => {
                 let admitted = plan.create_signals.iter().filter(|signal|
@@ -8217,7 +10991,9 @@ fn validate_action_sources_on(
         };
         if !matches!(event.kind.as_str(), "parallel_joined" | "inclusive_joined") {
             let actual = children.iter().filter_map(|child| child.arrival_edge_id.as_deref())
-                .filter(|edge| outgoing.iter().any(|candidate| candidate.id == *edge))
+                .filter(|edge| outgoing.iter().any(|candidate| candidate.id == *edge)
+                    || matches!(node.kind, ProcessNodeKind::LinkThrow { .. })
+                        && expected_edges.iter().any(|expected| expected == *edge))
                 .collect::<Vec<_>>();
             ensure!(actual.len() == expected_edges.len()
                 && expected_edges.iter().all(|edge|
@@ -8233,14 +11009,16 @@ fn validate_termination_action_provenance_on(
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     variable_states: &[BTreeMap<String, Value>],
     call_source: Option<&BusinessErrorSource>, entry: EntryAuthority<'_>,
-    actor_id: &str,
+    actor_id: &str, expected_revision: u64, limited_token_ids: &HashSet<String>,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let mut unparented = 0;
     let mut selected_transient_join_arrivals = HashSet::new();
     for token in &plan.create_tokens {
         let Some(source_id) = plan.token_sources.get(&token.token_id) else {
             let path = scope_path(scopes, instance_id, &token.scope_id)?;
-            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let nodes = selected.nodes;
             ensure!(plan.start_instance_id.as_deref() == Some(instance_id)
                 && token.scope_id == instance_id && token.arrival_edge_id.is_none()
                 && token.status == "ready"
@@ -8261,9 +11039,12 @@ fn validate_termination_action_provenance_on(
                     && child.parent_token_id == *source_id)
                 .context("termination child start has no factual enclosing activation")?;
             let path = scope_path(scopes, instance_id, &token.scope_id)?;
-            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let nodes = selected.nodes;
             ensure!(source.node_id == child.subprocess_node_id
-                && source.status == "waiting" && token.status == "ready"
+                && source.status == "waiting"
+                && (token.status == "ready" || limited_token_ids.contains(&token.token_id)
+                    && token.status == "waiting")
                 && token.arrival_edge_id.is_none() && token.fork_stack.is_empty()
                 && nodes.iter().any(|node| node.id == token.node_id
                     && node.kind == ProcessNodeKind::Start),
@@ -8272,10 +11053,50 @@ fn validate_termination_action_provenance_on(
         }
         if token.node_id == source.node_id && token.arrival_edge_id == source.arrival_edge_id {
             let path = scope_path(scopes, instance_id, &source.scope_id)?;
-            let (nodes, _, _) = super::model::scope_body(model, &path)?;
+            let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let nodes = selected.nodes;
             let pinned = nodes.iter().find(|node| node.id == source.node_id)
                 .context("termination wait source is outside its pinned body")?;
-            if token.status == "ready" && source.status == "waiting"
+            if source.status == "waiting" && token.status == "waiting"
+                && source_live && matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
+                && plan.events.iter().enumerate().filter(|(index, event)|
+                    event.kind == "incident"
+                        && event.data["parked_token_id"].as_str()
+                            == Some(token.token_id.as_str())
+                        && script_io_action_handoff_on(plan, source_id, *index)).count() == 1 {
+                ensure!(token.scope_id == source.scope_id
+                    && token.fork_stack == source.fork_stack
+                    && plan.consume_token_ids.iter().filter(|id|
+                        *id == source_id).count() == 1,
+                    "Script IO retained route changed its parked successor");
+                continue;
+            }
+            if let EntryAuthority::Accepted(AcceptedInputRef::Retry {
+                old_job_id, old_invocation_id, old_token_id,
+                expected_instance_revision, ..
+            }) = entry {
+                if source_id == old_token_id && token.status == "ready"
+                    && source.status == "waiting" {
+                    let original: (String, String, String) = tx.query_row(
+                        "SELECT j.token_id,j.scope_id,j.node_id FROM bpmn_jobs j \
+                         JOIN bpmn_service_invocations v ON v.job_id=j.job_id \
+                         WHERE j.job_id=?1 AND j.instance_id=?2 \
+                         AND v.invocation_id=?3 AND v.phase='proved_no_effect' \
+                         AND v.dispatch_evidence='no_boundary' AND j.status='error'",
+                        params![old_job_id,instance_id,old_invocation_id],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                    )?;
+                    ensure!(*expected_instance_revision == expected_revision
+                        && original == (source_id.clone(),source.scope_id.clone(),source.node_id.clone())
+                        && matches!(&pinned.kind, ProcessNodeKind::ServiceTask { .. })
+                        && token.fork_stack == source.fork_stack && source_live
+                        && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
+                        "Service retry ready token differs from its original terminal activation");
+                    continue;
+                }
+            }
+            if (token.status == "ready" || limited_token_ids.contains(&token.token_id)
+                && token.status == "waiting") && source.status == "waiting"
                 && pinned.repeat.is_some() {
                 let groups = plan.repetition_groups.iter().filter(|group|
                     group.scope_id == token.scope_id && group.node_id == token.node_id
@@ -8296,10 +11117,21 @@ fn validate_termination_action_provenance_on(
                 | ProcessNodeKind::MessageThrow { .. } | ProcessNodeKind::SendTask { .. }
                 | ProcessNodeKind::SignalThrow { .. });
             let script_wait = matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
-                && plan.events.iter().enumerate().any(|(index, event)|
+                && (plan.events.iter().enumerate().any(|(index, event)|
                     event.kind == "incident" && event.scope_id == source.scope_id
                         && event.node_id.as_deref() == Some(source.node_id.as_str())
-                        && plan.event_sources.get(&index) == Some(source_id));
+                        && plan.event_sources.get(&index) == Some(source_id))
+                    || plan.repetition_occurrences.iter().any(|row|
+                        row.token_id == token.token_id && row.scope_id == source.scope_id
+                            && plan.repetition_groups.iter().any(|group|
+                                group.group_id == row.group_id && group.node_id == source.node_id
+                                    && group.status == ProcessRepetitionGroupStatus::Incident
+                                    && group.terminal_event_id.is_none()
+                                    && group.terminal_incident_id.is_some())
+                            && plan.events.iter().any(|event|
+                                event.kind == "incident" && event.scope_id == source.scope_id
+                                    && event.node_id.as_deref() == Some(source.node_id.as_str())
+                                    && event.data["code"] == "SCRIPT_EVALUATION_FAILED")));
             let repetition_wait = pinned.repeat.is_some()
                 && plan.repetition_groups.iter().filter(|group|
                     group.scope_id == token.scope_id && group.node_id == token.node_id
@@ -8318,8 +11150,28 @@ fn validate_termination_action_provenance_on(
                         && event.node_id.as_deref() == Some(source.node_id.as_str())
                         && plan.event_sources.get(&index) == Some(source_id)
                         && event.data["pending_token_id"] == token.token_id);
-            if token.status == "waiting" && immediate_wait && !pending_send {
-                validate_termination_immediate_failure_on(instance_id, model, scopes,
+            // The input validator proves capture and failure waits against their
+            // authored associations; neither is an immediate-failure wait.
+            let captured_io_wait = matches!(&pinned.kind,
+                    ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. })
+                && plan.activity_io_inputs.iter().filter(|fact| match fact {
+                    ActivityIoInputFact::Captured { scope_id, node_id,
+                        source_token_id, activation_token_id, .. } =>
+                        scope_id == &source.scope_id && node_id == &source.node_id
+                            && source_token_id == source_id
+                            && activation_token_id == &token.token_id,
+                    ActivityIoInputFact::Failed { scope_id, node_id,
+                        source_token_id, waiting_token_id, .. } =>
+                        scope_id == &source.scope_id && node_id == &source.node_id
+                            && source_token_id == source_id
+                            && waiting_token_id == &token.token_id,
+                }).count() == 1;
+            let immediate_limit_wait = limited_token_ids.contains(&token.token_id)
+                && token.status == "waiting";
+            if token.status == "waiting" && immediate_wait && !pending_send
+                && !immediate_limit_wait && !captured_io_wait
+                && !repetition_wait {
+                validate_termination_immediate_failure_on(instance_id, &selected_process_id, model, scopes,
                     plan, variable_states, &source, token)?;
             }
             let waiting = token.status == "waiting" && (matches!(&pinned.kind,
@@ -8327,9 +11179,11 @@ fn validate_termination_action_provenance_on(
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SignalCatch { .. }
-                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. })
+                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity(_))
                 || immediate_wait
+                || immediate_limit_wait
                 || script_wait
+                || captured_io_wait
                 || repetition_wait
                 || pinned.kind == ProcessNodeKind::TerminateEnd
                     && plan.termination_attempts.iter().any(|attempt| matches!(attempt,
@@ -8372,7 +11226,8 @@ fn validate_termination_action_provenance_on(
             continue;
         }
         let path = scope_path(scopes, instance_id, &token.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let edge = flows.iter().find(|edge|
             token.arrival_edge_id.as_deref() == Some(edge.id.as_str())
                 && edge.target_id == token.node_id)
@@ -8387,6 +11242,58 @@ fn validate_termination_action_provenance_on(
             _ => None,
         };
         let ordinary = source.node_id == edge.source_id && source.status == "ready" && source_live;
+        let linked = if source.status == "ready" && source_live {
+            let pairs = super::model::link_pairs(nodes)?;
+            if pairs.get(source.node_id.as_str()).copied() == Some(edge.source_id.as_str()) {
+                let throw = nodes.iter().find(|node| node.id == source.node_id)
+                    .context("Link Throw is outside its selected body")?;
+                let catch = nodes.iter().find(|node| node.id == edge.source_id)
+                    .context("Link Catch is outside its selected body")?;
+                let (ProcessNodeKind::LinkThrow { definition: throw_definition },
+                    ProcessNodeKind::LinkCatch { definition: catch_definition }) =
+                    (&throw.kind, &catch.kind) else {
+                    anyhow::bail!("Link pair changed its selected-body node kinds");
+                };
+                let thrown = plan.events.iter().enumerate().filter(|(index, event)|
+                    event.kind == "link_thrown" && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(source.node_id.as_str())
+                        && plan.event_sources.get(index) == Some(source_id)
+                        && event.data == serde_json::json!({
+                            "source_token_id":source_id,
+                            "definition_id":throw_definition.id,
+                            "catch_node_id":catch.id,
+                            "catch_definition_id":catch_definition.id,
+                            "successor_token_id":token.token_id,
+                            "outgoing_edge_id":edge.id,
+                        })).collect::<Vec<_>>();
+                ensure!(thrown.len() == 1,
+                    "Link successor lacks its unique factual Throw");
+                let (throw_index, _) = thrown[0];
+                let thrown_id = plan.event_ids.get(&throw_index)
+                    .context("Link Throw lacks a durable event identity")?;
+                ensure!(Uuid::parse_str(thrown_id).is_ok(),
+                    "Link Throw event identity is invalid");
+                let caught = plan.events.iter().enumerate().filter(|(index, event)|
+                    *index == throw_index + 1 && event.kind == "link_caught"
+                        && event.scope_id == source.scope_id
+                        && event.node_id.as_deref() == Some(catch.id.as_str())
+                        && plan.event_sources.get(index).is_none()
+                        && plan.event_ids.get(index).is_some_and(|id|
+                            Uuid::parse_str(id).is_ok() && id != thrown_id)
+                        && event.data == serde_json::json!({
+                            "source_token_id":source_id,
+                            "throw_event_id":thrown_id,
+                            "successor_token_id":token.token_id,
+                            "outgoing_edge_id":edge.id,
+                        })).count();
+                ensure!(caught == 1
+                    && plan.create_tokens.iter().filter(|candidate|
+                        plan.token_sources.get(&candidate.token_id) == Some(source_id))
+                        .count() == 1,
+                    "Link transfer added another successor or Catch fact");
+                true
+            } else { false }
+        } else { false };
         let returned = source.node_id == edge.source_id && source.status == "waiting"
             && source_live && plan.events.iter().any(|event|
                 event.data["parent_token_id"].as_str() == Some(source_id.as_str())
@@ -8396,7 +11303,7 @@ fn validate_termination_action_provenance_on(
                         || (event.kind == "scope_completed"
                             && event.data["parent_scope_id"].as_str()
                                 == Some(token.scope_id.as_str()))))
-            && (matches!(&pinned.kind, ProcessNodeKind::CallActivity { .. })
+            && (matches!(&pinned.kind, ProcessNodeKind::CallActivity(_))
                 && (matches!(entry, EntryAuthority::Accepted(
                     AcceptedInputRef::CallReturn { parent_token_id, .. })
                         if parent_token_id == source_id)
@@ -8519,6 +11426,22 @@ fn validate_termination_action_provenance_on(
                 event.kind == "send_task_admitted" && event.scope_id == source.scope_id
                     && event.node_id.as_deref() == Some(source.node_id.as_str())
                     && plan.event_sources.get(index) == Some(source_id)).count() == 1;
+        let completed_send_io = source.node_id == edge.source_id
+            && source.status == "waiting" && source_live
+            && matches!(&pinned.kind, ProcessNodeKind::SendTask { .. })
+            && plan.events.iter().enumerate().filter(|(index, event)|
+                event.kind == "send_task_admitted" && event.scope_id == source.scope_id
+                    && event.node_id.as_deref() == Some(source.node_id.as_str())
+                    && plan.event_sources.get(index) == Some(source_id)
+                    && send_io_admission_handoff_on(plan, source_id, *index, false))
+                .count() == 1;
+        let completed_script_io = source.node_id == edge.source_id
+            && source.status == "waiting" && source_live
+            && matches!(&pinned.kind, ProcessNodeKind::ScriptTask { .. })
+            && plan.events.iter().enumerate().filter(|(index, event)|
+                event.scope_id == source.scope_id
+                    && event.node_id.as_deref() == Some(source.node_id.as_str())
+                    && script_io_action_handoff_on(plan, source_id, *index)).count() == 1;
         let completed_repeat = source.node_id == edge.source_id
             && source.status == "waiting" && source_live
             && plan.repetition_groups.iter().any(|group|
@@ -8549,10 +11472,12 @@ fn validate_termination_action_provenance_on(
                     && event.data["attached_token_id"].as_str() == Some(source_id.as_str())
                     && matches!(event.kind.as_str(), "timer_fired" | "message_delivered"
                         | "business_error_caught" | "escalation_caught"));
-        ensure!(ordinary || returned || completed_wait || completed_send
+        ensure!(ordinary || linked || returned || completed_wait || completed_send
+            || completed_send_io || completed_script_io
             || completed_repeat || boundary,
             "termination successor has no authenticated predecessor transition");
         ensure!(token.status == "ready" || pinned.kind == ProcessNodeKind::EventBasedGateway
+            && token.status == "waiting" || limited_token_ids.contains(&token.token_id)
             && token.status == "waiting", "termination successor has an invalid status");
         let stack_matches = if let Some(pair) = super::model::gateway_pairs(nodes, flows)?
             .get(&source.node_id) {
@@ -8578,6 +11503,79 @@ fn validate_termination_action_provenance_on(
         && plan.token_sources.keys().all(|id|
             plan.create_tokens.iter().any(|token| &token.token_id == id)),
         "termination token provenance has an extra or missing source");
+    let persisted_ready_entry = matches!(entry, EntryAuthority::PersistedReady);
+    let accepted_manual_entry = matches!(entry,
+        EntryAuthority::Accepted(AcceptedInputRef::ManualAcknowledgment { .. }));
+    let accepted_receive_entry = if let EntryAuthority::Accepted(AcceptedInputRef::Message {
+        target_subscription_id: Some(subscription_id),
+        expected_subscription_revision: Some(revision), ..
+    }) = entry {
+        let subscription = subscription_on(tx, subscription_id)?;
+        subscription.instance_id == instance_id
+            && subscription.kind == ProcessSubscriptionKind::ReceiveTask
+            && subscription.status == ProcessSubscriptionStatus::Open
+            && subscription.revision == *revision
+            && plan.subscription_updates.iter().filter(|update|
+                update.subscription_id == *subscription_id
+                    && update.status == ProcessSubscriptionStatus::Consumed).count() == 1
+            && plan.events.iter().filter(|event|
+                event.kind == "message_delivered"
+                    && event.scope_id == subscription.scope_id
+                    && event.node_id.as_deref() == Some(subscription.node_id.as_str())
+                    && event.data["subscription_id"].as_str() == Some(subscription_id.as_str())
+                    && event.data["attached_token_id"].as_str()
+                        == Some(subscription.token_id.as_str())).count() == 1
+    } else { false };
+    let selected_child_ordinals = if persisted_ready_entry || accepted_manual_entry
+        || accepted_receive_entry {
+        let mut selected = HashSet::new();
+        for (index, event) in plan.events.iter().enumerate().filter(|(_, event)|
+            matches!(event.kind.as_str(), "end_reached" | "terminate_end_reached")) {
+            let Some(source_id) = plan.event_sources.get(&index) else { continue; };
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            let created_end = plan.create_tokens.iter().filter(|token|
+                token.token_id == *source_id && token.scope_id == source.scope_id
+                    && token.node_id == source.node_id && token.status == "ready").count();
+            if source.status != "ready" || source.scope_id != event.scope_id
+                || event.node_id.as_deref() != Some(source.node_id.as_str())
+                || (persisted_ready_entry && created_end != 0)
+                || ((accepted_manual_entry || accepted_receive_entry) && (created_end != 1
+                    || !plan.token_sources.contains_key(source_id)))
+                || plan.consume_token_ids.iter().filter(|id| *id == source_id).count() != 1
+                || !scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, &source.node_id)
+                    .is_ok_and(|node| matches!((&node.kind, event.kind.as_str()),
+                        (ProcessNodeKind::End, "end_reached")
+                            | (ProcessNodeKind::TerminateEnd, "terminate_end_reached")))
+                || !ordinary_action_source_matches_entry_on(tx, instance_id, model,
+                    scopes, plan, source_id, expected_revision, entry,
+                    persisted_ready_entry)? {
+                continue;
+            }
+            for child in scopes.iter().filter(|scope| scope.scope_id == event.scope_id) {
+                for occurrence in plan.repetition_occurrences.iter().filter(|row|
+                    child.parent_scope_id.as_deref() == Some(row.scope_id.as_str())
+                        && child.parent_token_id.as_deref() == Some(row.token_id.as_str())
+                        && row.status == ProcessRepetitionOccurrenceStatus::Completed) {
+                    let exact_source = occurrence.accepted_source_event_id.as_ref().is_some_and(|accepted_id|
+                        plan.events.iter().enumerate().filter(|(source_index, completion)|
+                            plan.event_ids.get(source_index) == Some(accepted_id)
+                                && completion.scope_id == child.scope_id
+                                && (completion.kind == "scope_completed"
+                                    && event.kind == "end_reached"
+                                    && completion.data["parent_token_id"].as_str()
+                                        == Some(occurrence.token_id.as_str())
+                                    || completion.kind == "terminate_end_reached"
+                                        && event.kind == "terminate_end_reached"
+                                        && *source_index == index))
+                            .count() == 1);
+                    if exact_source {
+                        selected.insert(occurrence.occurrence_id.clone());
+                    }
+                }
+            }
+        }
+        selected
+    } else { HashSet::new() };
     ensure!(plan.consume_token_ids.iter().all(|id|
         plan.token_sources.values().any(|source| source == id)
             || plan.event_sources.values().any(|source| source == id)
@@ -8589,20 +11587,60 @@ fn validate_termination_action_provenance_on(
                     && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed
                     && plan.repetition_groups.iter().any(|group|
                         group.group_id == occurrence.group_id
-                            && group.status == ProcessRepetitionGroupStatus::Completed
                             && group.scope_id == occurrence.scope_id
-                            && occurrence.ordinal.checked_add(1) == Some(group.completed_count)
-                            && plan.consume_token_ids.contains(&group.parent_token_id)
+                            && (!group.terminal_capacity
+                                || group.status == ProcessRepetitionGroupStatus::Incident
+                                    && plan.repetition_capacity.as_ref().is_some_and(|capacity|
+                                        capacity.instance_id == instance_id
+                                            && capacity.group_id == group.group_id
+                                            && capacity.scope_id == group.scope_id
+                                            && capacity.source_token_id == group.source_token_id
+                                            && capacity.parent_token_id == group.parent_token_id
+                                            && capacity.reason == "repetition_bytes"
+                                            && group.terminal_capacity
+                                            && group.created_count == group.completed_count
+                                            && matches!(&capacity.denied_candidate,
+                                                Some(RepetitionDeniedBytes::ParentAggregate {
+                                                    final_ordinal: Some(_),
+                                                    source_event_id: Some(_),
+                                                }))
+                                            && plan.events.iter().enumerate().filter(|(index, event)|
+                                                *index < capacity.event_index
+                                                    && event.kind == "repetition_occurrence_completed"
+                                                    && event.scope_id == group.scope_id
+                                                    && event.node_id.as_deref()
+                                                        == Some(group.node_id.as_str())
+                                                    && event.data["group_id"] == group.group_id)
+                                                .max_by_key(|(index, _)| *index)
+                                                .is_some_and(|(completion_index, event)|
+                                                    event.data["occurrence_id"]
+                                                        == occurrence.occurrence_id
+                                                        && event.data["ordinal"]
+                                                            == occurrence.ordinal
+                                                        && event.data["source_event_id"].as_str()
+                                                            == occurrence.accepted_source_event_id.as_deref()
+                                                        && occurrence.accepted_source_event_id.as_ref()
+                                                            .is_some_and(|accepted_id|
+                                                                plan.event_ids.iter().filter(|(index, id)|
+                                                                    **index < completion_index
+                                                                        && *id == accepted_id)
+                                                                    .count() == 1))))
+                            && occurrence.ordinal < group.created_count
+                            && group.completed_count > 0
                             && plan.events.iter().filter(|event|
                                 event.kind == "repetition_occurrence_completed"
                                     && event.scope_id == occurrence.scope_id
+                                    && event.node_id.as_deref() == Some(group.node_id.as_str())
                                     && event.data["occurrence_id"] == occurrence.occurrence_id
+                                    && event.data["group_id"] == occurrence.group_id
+                                    && event.data["ordinal"] == occurrence.ordinal
                                     && event.data["source_event_id"].as_str()
                                         == occurrence.accepted_source_event_id.as_deref())
                                 .count() == 1)
                     && occurrence.approval_event_id.as_ref()
                         .or(occurrence.accepted_source_event_id.as_ref())
-                        .is_some_and(|event_id| plan.event_ids.values().any(|id| id == event_id))
+                        .is_some_and(|event_id| plan.event_ids.values()
+                            .filter(|id| *id == event_id).count() == 1)
                     && (plan.termination_attempts.iter().any(|attempt| {
                         let accepted = match attempt {
                             TerminationAttempt::Success(source) => &source.accepted_input,
@@ -8619,7 +11657,39 @@ fn validate_termination_action_provenance_on(
                         task_id, .. }) if occurrence.user_task_id.as_ref() == Some(task_id)
                             || occurrence.verification_user_task_id.as_ref() == Some(task_id))
                     || matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Service {
-                        job_id, .. }) if occurrence.job_id.as_ref() == Some(job_id))))),
+                        job_id, .. }) if occurrence.job_id.as_ref() == Some(job_id))
+                    || ordinary_action_source_matches_entry_on(tx, instance_id, model,
+                        scopes, plan, &occurrence.token_id, expected_revision, entry,
+                        false).unwrap_or(false)
+                    || selected_child_ordinals.contains(&occurrence.occurrence_id)
+                    || matches!(entry, EntryAuthority::Accepted(
+                        AcceptedInputRef::PersistedReady { token_id, .. })
+                        if trace_termination_source_on(tx, instance_id, model, scopes,
+                            plan, &occurrence.token_id, Some(token_id),
+                            &AcceptedInputRef::PersistedReady {
+                                token_id: token_id.clone(),
+                                expected_instance_revision: expected_revision,
+                            }, &mut HashSet::new()).is_ok()
+                            || plan.events.iter().enumerate().any(|(index, event)|
+                                plan.event_sources.get(&index) == Some(token_id)
+                                    && matches!(event.kind.as_str(),
+                                        "end_reached" | "terminate_end_reached")
+                                    && scopes.iter().any(|scope|
+                                        scope.scope_id == event.scope_id
+                                            && scope.parent_scope_id.as_deref()
+                                                == Some(occurrence.scope_id.as_str())
+                                            && scope.parent_token_id.as_deref()
+                                                == Some(occurrence.token_id.as_str()))
+                                    && occurrence.accepted_source_event_id.as_ref().is_some_and(|source_id|
+                                        plan.events.iter().enumerate().any(|(source_index, source)|
+                                            plan.event_ids.get(&source_index) == Some(source_id)
+                                                && (source.kind == "scope_completed"
+                                                    && source.data["parent_token_id"].as_str()
+                                                        == Some(occurrence.token_id.as_str())
+                                                    || source.kind == "terminate_end_reached"
+                                                        && plan.event_sources.get(&source_index)
+                                                            == Some(token_id)))))
+                    )))),
         "termination consumed a token outside its factual selected prefix");
     for source_id in plan.token_sources.values().collect::<HashSet<_>>() {
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
@@ -8636,12 +11706,32 @@ fn validate_termination_action_provenance_on(
                 "termination advanced an unrelated retained ready token");
         }
         let path = scope_path(scopes, instance_id, &source.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let node = nodes.iter().find(|node| node.id == source.node_id)
             .context("termination token source is outside its pinned body")?;
         let children = plan.create_tokens.iter().filter(|child|
             plan.token_sources.get(&child.token_id) == Some(source_id)).collect::<Vec<_>>();
         if source.status == "ready" {
+            let repetition_wait = node.repeat.is_some()
+                && plan.repetition_groups.iter().filter(|group|
+                    group.scope_id == source.scope_id && group.node_id == source.node_id
+                        && group.source_token_id == source.token_id
+                        && children.iter().filter(|child|
+                            child.token_id == group.parent_token_id
+                                && child.scope_id == source.scope_id
+                                && child.node_id == source.node_id
+                                && child.arrival_edge_id == source.arrival_edge_id
+                                && child.fork_stack == source.fork_stack
+                                && child.status == "waiting").count() == 1
+                        && plan.events.iter().filter(|event|
+                            event.kind == "repetition_group_started"
+                                && event.scope_id == group.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data["group_id"] == group.group_id
+                                && event.data["source_token_id"] == group.source_token_id
+                                && event.data["parent_token_id"] == group.parent_token_id)
+                            .count() == 1).count() == 1;
             let waits = children.iter().filter(|child| child.scope_id == source.scope_id
                 && child.node_id == source.node_id
                 && child.arrival_edge_id == source.arrival_edge_id
@@ -8659,11 +11749,33 @@ fn validate_termination_action_provenance_on(
                         incident.scope_id != source.scope_id
                             || incident.node_id.as_deref() != Some(source.node_id.as_str())),
                         "pending Send lacks its unique factual wait"),
+                ProcessNodeKind::SendTask { .. } if repetition_wait =>
+                    ensure!(waits == 1 && joins == 0 && children.len() == 1,
+                        "repeated Send lacks its unique factual coordinator wait"),
+                ProcessNodeKind::SendTask { .. } | ProcessNodeKind::ScriptTask { .. }
+                    if node.activity_io.is_some()
+                    && plan.activity_io_inputs.iter().any(|fact| match fact {
+                        ActivityIoInputFact::Captured { source_token_id,
+                            activation_token_id, .. } =>
+                            source_token_id == source_id
+                                && children.iter().any(|child|
+                                    child.token_id == *activation_token_id),
+                        ActivityIoInputFact::Failed { source_token_id,
+                            waiting_token_id, .. } =>
+                            source_token_id == source_id
+                                && children.iter().any(|child|
+                                    child.token_id == *waiting_token_id),
+                    }) =>
+                    ensure!(waits == 1 && joins == 0 && children.len() == 1,
+                        "configured activity input capture lacks its unique staged wait"),
+                ProcessNodeKind::ScriptTask { .. } if repetition_wait =>
+                    ensure!(waits == 1 && joins == 0 && children.len() == 1,
+                        "repeated Script lacks its unique factual coordinator wait"),
                 ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. }
                 | ProcessNodeKind::ServiceTask { .. }
                 | ProcessNodeKind::TimerCatch { .. } | ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::ReceiveTask { .. } | ProcessNodeKind::SignalCatch { .. }
-                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity { .. } =>
+                | ProcessNodeKind::SubProcess { .. } | ProcessNodeKind::CallActivity(_) =>
                     ensure!(waits == 1 && joins == 0,
                         "termination activity has no unique factual durable wait"),
                 ProcessNodeKind::EventBasedGateway => {
@@ -8682,7 +11794,8 @@ fn validate_termination_action_provenance_on(
                         frame.join_node_id.as_deref() == Some(source.node_id.as_str()));
                     let incident_count = plan.add_incidents.iter().filter(|incident|
                         incident.scope_id == source.scope_id
-                            && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+                            && incident.node_id.as_deref() == Some(source.node_id.as_str())
+                            && incident.code != "IMMEDIATE_TRANSITION_LIMIT")
                         .count();
                     ensure!(joins == usize::from(is_join) && waits <= 1
                         && incident_count == waits && (!is_join || waits == 0),
@@ -8691,10 +11804,43 @@ fn validate_termination_action_provenance_on(
                 ProcessNodeKind::ExclusiveGateway { .. } | ProcessNodeKind::MessageThrow { .. }
                 | ProcessNodeKind::SendTask { .. } | ProcessNodeKind::SignalThrow { .. }
                 | ProcessNodeKind::ScriptTask { .. } => {
-                    let incident_count = plan.add_incidents.iter().filter(|incident|
+                    let ordinary_incident_count = plan.add_incidents.iter().filter(|incident|
                         incident.scope_id == source.scope_id
-                            && incident.node_id.as_deref() == Some(source.node_id.as_str()))
+                            && incident.node_id.as_deref() == Some(source.node_id.as_str())
+                            && incident.code != "IMMEDIATE_TRANSITION_LIMIT")
                         .count();
+                    let incident_count = if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                        let sourced = plan.events.iter().enumerate().filter(|(index, event)|
+                            event.kind == "incident" && event.scope_id == source.scope_id
+                                && event.node_id.as_deref() == Some(source.node_id.as_str())
+                                && event.data["code"] != "IMMEDIATE_TRANSITION_LIMIT"
+                                && plan.event_sources.get(index) == Some(source_id)).count();
+                        let repeated_failure = plan.repetition_occurrences.iter().filter(|occurrence|
+                            occurrence.scope_id == source.scope_id
+                                && occurrence.status == ProcessRepetitionOccurrenceStatus::Active
+                                && children.iter().any(|child| child.token_id == occurrence.token_id
+                                    && child.status == "waiting"
+                                    && child.scope_id == source.scope_id
+                                    && child.node_id == source.node_id
+                                    && child.arrival_edge_id == source.arrival_edge_id
+                                    && child.fork_stack == source.fork_stack)
+                                && plan.repetition_groups.iter().any(|group|
+                                    group.group_id == occurrence.group_id
+                                        && group.scope_id == source.scope_id
+                                        && group.node_id == source.node_id
+                                        && group.status == ProcessRepetitionGroupStatus::Incident
+                                        && group.terminal_incident_id.as_ref().is_some_and(|id|
+                                            plan.add_incidents.iter().any(|incident|
+                                                incident.incident_id.as_str() == id.as_str()
+                                                    && incident.scope_id == source.scope_id
+                                                    && incident.node_id.as_deref()
+                                                        == Some(source.node_id.as_str())
+                                                    && incident.code == "SCRIPT_EVALUATION_FAILED"))))
+                            .count();
+                        sourced + repeated_failure
+                    } else {
+                        ordinary_incident_count
+                    };
                     ensure!(waits <= 1 && incident_count == waits && joins == 0,
                         "termination immediate action added an unauthenticated wait");
                 }
@@ -8705,7 +11851,10 @@ fn validate_termination_action_provenance_on(
                     ensure!(waits == usize::from(failed) && joins == 0,
                         "termination source parked a token without a factual return failure");
                 }
-                _ => ensure!(waits == 0 && joins == 0,
+                _ => ensure!(joins == 0 && children.iter().all(|child|
+                    child.status != "joining"
+                        && (child.status != "waiting"
+                            || limited_token_ids.contains(&child.token_id))),
                     "termination immediate action added an unauthenticated wait"),
             }
         }
@@ -8761,7 +11910,7 @@ fn validate_termination_action_provenance_on(
             }).min().or_else(|| plan.events.iter().any(|event|
                 event.kind == "script_completed"
                     || event.kind == "incident" && event.node_id.as_deref().is_some_and(|id|
-                        scope_node(model, scopes, instance_id, &event.scope_id, id)
+                        scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, id)
                             .is_ok_and(|node| matches!(&node.kind,
                                 ProcessNodeKind::ScriptTask { .. })))).then_some(plan.events.len()));
             Some((task_id.clone(), token_id, scope_id, node_id, first_source_index))
@@ -8806,6 +11955,26 @@ fn validate_termination_action_provenance_on(
             Some(subscription)
         } else { None }
     } else { None };
+    let factual_groups = repetition_groups_on(tx, instance_id)?;
+    let repetition_disarm = |scope_id: &str, node_id: &str,
+        token_id: &str, event_index: usize| {
+        plan.repetition_groups.iter().any(|group|
+            group.scope_id == scope_id && group.node_id == node_id
+                && group.parent_token_id == token_id
+                && group.status == ProcessRepetitionGroupStatus::Completed
+                && group.total_count == Some(group.completed_count)
+                && factual_groups.iter().any(|prior| prior.group_id == group.group_id
+                    && prior.parent_token_id == token_id
+                    && prior.scope_id == scope_id && prior.node_id == node_id
+                    && prior.revision.checked_add(1) == Some(group.revision))
+                && plan.consume_token_ids.iter().filter(|id| *id == token_id).count() == 1
+                && plan.events.iter().enumerate().filter(|(index, event)|
+                    *index < event_index && event.kind == "repetition_completed"
+                        && event.scope_id == scope_id
+                        && event.node_id.as_deref() == Some(node_id)
+                        && event.data["group_id"].as_str() == Some(group.group_id.as_str())
+                        && event.data["parent_token_id"].as_str() == Some(token_id)).count() == 1)
+    };
     let accepted_activity_disarm = |scope_id: &str, node_id: &str,
         token_id: &str, event_index: usize| {
         let manual = manual_prefix.as_ref().is_some_and(|(id,scope,node,token)|
@@ -8830,12 +11999,12 @@ fn validate_termination_action_provenance_on(
                         && event.node_id.as_deref() == Some(subscription.node_id.as_str())
                         && event.data["subscription_id"].as_str()
                             == Some(subscription.subscription_id.as_str())).count() == 1);
-        manual || receive
+        manual || receive || repetition_disarm(scope_id, node_id, token_id, event_index)
     };
     let protected_disarm = human_prefix.is_some()
         || manual_prefix.is_some() || receive_prefix.is_some();
     for (event_index, event) in plan.events.iter().enumerate() {
-        if mandatory_action_source_event(model, scopes, instance_id, plan, event) { continue; }
+        if mandatory_action_source_event(model, &selected_process_id, scopes, instance_id, plan, event) { continue; }
         if event.kind.starts_with("repetition_") { continue; }
         let node = event.node_id.as_deref();
         let closure_source = plan.termination_attempts.iter().filter_map(|attempt|
@@ -8849,10 +12018,99 @@ fn validate_termination_action_provenance_on(
             }).max_by_key(|source| source.source_event_index);
         let count = |kind: &str, key: &str, value: &str| plan.events.iter().filter(|candidate|
             candidate.kind == kind && candidate.data[key].as_str() == Some(value)).count();
+        let escalation_source = if event.kind == "escalation_caught" {
+            let job_id = event.data["job_id"].as_str()
+                .context("escalation catch lacks its accepted job")?;
+            Some(tx.query_row(
+                "SELECT scope_id,node_id,token_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2",
+                params![instance_id,job_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?)),
+            )?)
+        } else {
+            None
+        };
         let linked = match event.kind.as_str() {
+            "activity_io_input_captured" => plan.activity_io_inputs.iter().filter(|fact|
+                matches!(fact, ActivityIoInputFact::Captured { event_index: index, .. }
+                    if *index == event_index)).count() == 1,
+            "user_result_accepted" | "manual_result_accepted" =>
+                plan.activity_io_results.iter().filter(|fact|
+                fact.result_event_index == event_index
+                    && fact.scope_id == event.scope_id
+                    && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && fact.resource_id.as_deref()
+                        == event.data["user_task_id"].as_str()
+                    && event.data["activation_token_id"] == fact.token_id
+                    && plan.event_ids.get(&event_index)
+                        == Some(&fact.source_event_id)
+                    && !plan.event_sources.contains_key(&event_index)).count() == 1,
+            "script_result_evaluated" => plan.activity_io_results.iter().filter(|fact|
+                fact.result_event_index == event_index
+                    && fact.scope_id == event.scope_id
+                    && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && event.data["source_activation_id"].as_str()
+                        == Some(fact.token_id.as_str())
+                    && plan.event_ids.get(&event_index) == Some(&fact.source_event_id)
+                    && !plan.event_sources.contains_key(&event_index)).count() == 1,
+            "scope_result_accepted" => plan.activity_io_results.iter().filter(|fact|
+                fact.result_event_index == event_index
+                    && fact.scope_id == event.scope_id
+                    && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && fact.child_scope_id.as_deref()
+                        == event.data["child_scope_id"].as_str()
+                    && event.data["parent_token_id"] == fact.token_id
+                    && plan.event_ids.get(&event_index) == Some(&fact.source_event_id)
+                    && !plan.event_sources.contains_key(&event_index)).count() == 1,
+            "call_result_accepted" => plan.activity_io_results.iter().filter(|fact|
+                fact.result_event_index == event_index
+                    && fact.scope_id == event.scope_id
+                    && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && fact.call_id.as_deref() == event.data["call_id"].as_str()
+                    && fact.child_instance_id.as_deref()
+                        == event.data["child_instance_id"].as_str()
+                    && event.data["parent_token_id"] == fact.token_id
+                    && fact.result_event_index == event_index
+                    && fact.result_sources.len() == 1
+                    && event.data["child_completed_event_id"].as_str()
+                        == Some(fact.result_sources[0].as_str())
+                    && !plan.event_sources.contains_key(&event_index)).count() == 1,
+            "activity_io_output_applied" => plan.variable_effects.iter().filter(|effect|
+                matches!(effect, VariableEffect::Mapped { event_index: index,
+                    scope_id, node_id, source_token_id,
+                    activity_io_outputs: Some(ordered), result, .. }
+                    if *index == event_index && scope_id == &event.scope_id
+                        && node == Some(node_id.as_str())
+                        && event.data == serde_json::json!({
+                            "source_token_id": source_token_id,
+                            "ordered_outputs": ordered,
+                            "local_patch": result,
+                        }))).count() == 1
+                && plan.event_ids.get(&event_index).is_some_and(|id|
+                    Uuid::parse_str(id).is_ok())
+                && !plan.event_sources.contains_key(&event_index),
             "instance_started" => plan.start_instance_id.as_deref() == Some(instance_id)
                 && event.scope_id == instance_id && node.is_none()
                 && plan.events.iter().filter(|candidate| candidate.kind == "instance_started").count() == 1,
+            "link_caught" => event_index.checked_sub(1).is_some_and(|throw_index|
+                plan.events.get(throw_index).is_some_and(|thrown|
+                    thrown.kind == "link_thrown" && thrown.scope_id == event.scope_id
+                        && node == thrown.data["catch_node_id"].as_str()
+                        && plan.event_sources.contains_key(&throw_index)
+                        && plan.event_ids.get(&throw_index).is_some_and(|throw_id|
+                            Uuid::parse_str(throw_id).is_ok()
+                                && event.data["throw_event_id"] == *throw_id)
+                        && plan.event_ids.get(&event_index).is_some_and(|catch_id|
+                            Uuid::parse_str(catch_id).is_ok()
+                                && plan.event_ids.get(&throw_index) != Some(catch_id))
+                        && event.data == serde_json::json!({
+                            "source_token_id":thrown.data["source_token_id"],
+                            "throw_event_id":event.data["throw_event_id"],
+                            "successor_token_id":thrown.data["successor_token_id"],
+                            "outgoing_edge_id":thrown.data["outgoing_edge_id"],
+                        })
+                        && event.data["successor_token_id"].as_str().is_some_and(|id|
+                            count("link_caught", "successor_token_id", id) == 1))),
             "user_task_opened" => event.data["user_task_id"].as_str().is_some_and(|id|
                 count("user_task_opened", "user_task_id", id) == 1
                 && plan.create_user_tasks.iter().any(|task|
@@ -8897,13 +12155,108 @@ fn validate_termination_action_provenance_on(
                 && plan.create_jobs.iter().any(|job| job.job_id == id
                     && job.scope_id == event.scope_id && node == Some(job.node_id.as_str())
                     && event.data == serde_json::json!({"job_id":id}))),
+            "job_retried" => {
+                let EntryAuthority::Accepted(AcceptedInputRef::Retry {
+                    old_job_id, old_invocation_id, old_token_id,
+                    expected_instance_revision, command_id, request_hash,
+                }) = entry else {
+                    bail!("Service retry event lacks its authenticated command")
+                };
+                let original: (String, String, String) = tx.query_row(
+                    "SELECT j.scope_id,j.node_id,j.token_id FROM bpmn_jobs j \
+                     JOIN bpmn_service_invocations v ON v.job_id=j.job_id \
+                     AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id \
+                     WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status='error' \
+                     AND v.invocation_id=?3 AND v.phase='proved_no_effect' \
+                     AND v.dispatch_evidence='no_boundary'",
+                    params![old_job_id,instance_id,old_invocation_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                )?;
+                let incident_id = event.data["incident_id"].as_str()
+                    .context("Service retry has no original incident")?;
+                let incident: u32 = tx.query_row(
+                    "SELECT COUNT(*) FROM bpmn_incidents WHERE incident_id=?1 \
+                     AND instance_id=?2 AND scope_id=?3 AND job_id=?4 AND resolved_at_ms IS NULL",
+                    params![incident_id,instance_id,original.0,old_job_id],
+                    |row| row.get(0),
+                )?;
+                let fresh = plan.create_jobs.iter().filter(|job|
+                    job.scope_id == original.0 && job.node_id == original.1
+                        && job.status == "queued" && job.job_id != *old_job_id)
+                    .collect::<Vec<_>>();
+                let ready = plan.create_tokens.iter().filter(|token|
+                    token.scope_id == original.0 && token.node_id == original.1
+                        && token.status == "ready"
+                        && plan.token_sources.get(&token.token_id) == Some(old_token_id))
+                    .collect::<Vec<_>>();
+                let prior_occurrence: Option<(String, String, u32, String)> = tx.query_row(
+                    "SELECT occurrence_id,group_id,ordinal,token_id FROM bpmn_repetition_occurrences \
+                     WHERE instance_id=?1 AND scope_id=?2 AND job_id=?3 AND status='active'",
+                    params![instance_id,original.0,old_job_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+                ).optional()?;
+                let repeated_matches = if let Some((occurrence_id, group_id, ordinal, prior_token))
+                    = prior_occurrence {
+                    let group: (String, i64) = tx.query_row(
+                        "SELECT status,terminal_capacity FROM bpmn_repetition_groups \
+                         WHERE instance_id=?1 AND scope_id=?2 AND group_id=?3 AND node_id=?4",
+                        params![instance_id,original.0,group_id,original.1],
+                        |row| Ok((row.get(0)?,row.get(1)?)),
+                    )?;
+                    prior_token == *old_token_id && group == ("open".to_owned(), 0)
+                        && fresh.first().is_some_and(|job|
+                            plan.repetition_occurrences.iter().filter(|row|
+                                row.occurrence_id == occurrence_id && row.group_id == group_id
+                                    && row.ordinal == ordinal && row.scope_id == original.0
+                                    && row.status == ProcessRepetitionOccurrenceStatus::Active
+                                    && row.token_id == job.token_id
+                                    && row.job_id.as_deref() == Some(job.job_id.as_str())
+                                    && row.accepted_source_event_id.is_none()
+                                    && row.aggregate_item.is_none()).count() == 1)
+                        && plan.repetition_occurrences.len() == 1
+                        && plan.repetition_groups.iter().filter(|row|
+                            row.group_id == group_id && row.status == ProcessRepetitionGroupStatus::Open
+                                && !row.terminal_capacity).count() == 1
+                        && plan.repetition_groups.len() == 1
+                } else {
+                    plan.repetition_occurrences.is_empty() && plan.repetition_groups.is_empty()
+                };
+                incident == 1 && *expected_instance_revision == expected_revision
+                    && original.2 == *old_token_id && node == Some(original.1.as_str())
+                    && event.scope_id == original.0 && fresh.len() == 1 && ready.len() == 1
+                    && plan.create_jobs.len() == 1 && plan.create_tokens.len() == 2
+                    && repeated_matches
+                    && Uuid::parse_str(&fresh[0].job_id).is_ok()
+                    && fresh[0].job_id != *old_job_id
+                    && ready[0].token_id != *old_token_id
+                    && plan.create_tokens.iter().any(|token|
+                        token.token_id == fresh[0].token_id && token.status == "waiting"
+                            && token.scope_id == original.0 && token.node_id == original.1)
+                    && plan.service_invocation_ids.get(&fresh[0].job_id).is_some_and(|id|
+                        id != old_invocation_id && Uuid::parse_str(id).is_ok())
+                    && plan.token_sources.get(&fresh[0].token_id) == Some(&ready[0].token_id)
+                    && plan.consume_token_ids.iter().filter(|id| *id == old_token_id).count() == 1
+                    && !plan.cancel_token_ids.contains(old_token_id)
+                    && plan.resolve_incident_ids == [incident_id.to_owned()]
+                    && event.data == serde_json::json!({
+                        "old_job_id":old_job_id,"old_invocation_id":old_invocation_id,
+                        "old_token_id":old_token_id,"ready_token_id":ready[0].token_id,
+                        "new_job_id":fresh[0].job_id,
+                        "new_invocation_id":plan.service_invocation_ids[&fresh[0].job_id],
+                        "new_token_id":fresh[0].token_id,
+                        "incident_id":incident_id,"command_id":command_id,
+                        "request_hash":request_hash,
+                    })
+                    && count("job_retried", "old_job_id", old_job_id) == 1
+            }
             "call_requested" => event.data["call_id"].as_str().is_some_and(|id|
                 count("call_requested", "call_id", id) == 1
                 && plan.call_requests.iter().any(|request| request.call_id == id
                     && request.parent_scope_id == event.scope_id
                     && node == Some(request.call_node_id.as_str())
                     && event.data == serde_json::json!({"call_id":id,
-                        "parent_token_id":request.parent_token_id}))),
+                        "parent_token_id":request.parent_token_id,
+                        "parent_arrival_edge_id":request.parent_arrival_edge_id}))),
             "event_race_armed" => event.data["race_id"].as_str().is_some_and(|id|
                 count("event_race_armed", "race_id", id) == 1
                 && plan.create_event_races.iter().any(|race| race.race_id == id
@@ -8922,8 +12275,182 @@ fn validate_termination_action_provenance_on(
             "instance_completed" => event.scope_id == instance_id && node.is_none()
                 && plan.status == ProcessInstanceStatus::Completed
                 && plan.events.iter().filter(|candidate| candidate.kind == "instance_completed").count() == 1,
+            "incident_resolved" => plan.closed_service_dispatches.iter().any(|closed|
+                closed.event_index == event_index && closed.source.phase == "uncertain")
+                || plan.closed_service_dispatches.iter().any(|closed|
+                    closed.infrastructure_incident_id.as_deref()
+                        == event.data["incident_id"].as_str()
+                    && closed.infrastructure_incident_id.is_some()
+                    && event.scope_id == closed.source.scope_id
+                    && event.node_id.as_deref() == Some(closed.source.node_id.as_str())
+                    && event.data == serde_json::json!({
+                        "incident_id":closed.infrastructure_incident_id,
+                        "invocation_id":closed.source.invocation_id,
+                        "job_id":closed.source.job_id,
+                        "source_token_id":closed.source.token_id,
+                        "reserved_result_event_id":closed.source.reserved_result_event_id,
+                        "dispatch_attempt":closed.source.attempt,
+                        "dispatch_fence":closed.source.fence,
+                        "reason":"activity_cancelled_after_dispatch",
+                    }))
+                || plan.recovered_service_incidents.iter().any(|recovered|
+                    event.data["incident_id"] == recovered.incident_id
+                    && event.data["invocation_id"] == recovered.invocation_id
+                    && event.data["job_id"] == recovered.job_id
+                    && event.data["source_token_id"] == recovered.source_token_id
+                    && event.data["reserved_result_event_id"] == recovered.reserved_result_event_id
+                    && event.data["dispatch_attempt"] == recovered.attempt
+                    && event.data["dispatch_fence"] == recovered.fence
+                    && event.data["reason"] == "script_infrastructure_recovered"
+                    && plan.events.iter().filter(|candidate|
+                        candidate.kind == "incident_resolved"
+                            && candidate.data["incident_id"] == recovered.incident_id
+                    ).count() == 1),
+            "incident" if plan.closed_service_dispatches.iter().any(|closed|
+                closed.event_index == event_index) => true,
             "incident" => plan.add_incidents.iter().any(|incident| {
-                let expected = match incident.code.as_str() {
+                let retained_final = plan.activity_io_results.iter().find(|fact|
+                    fact.scope_id == event.scope_id
+                        && fact.node_id == incident.node_id.as_deref().unwrap_or("")
+                        && matches!(&fact.disposition,
+                            ActivityIoResultDisposition::Retained {
+                                fate: ActivityIoRetainedFate::UnhandledError
+                                    | ActivityIoRetainedFate::Cancelled,
+                                route_event_index,
+                            } if *route_event_index == event_index));
+                let expected = if let Some(fact) = retained_final {
+                    Some(serde_json::json!({
+                        "incident_id":incident.incident_id,
+                        "activation_token_id":fact.token_id,
+                        "code":incident.code,
+                        "message":incident.message,
+                    }))
+                } else { match incident.code.as_str() {
+                    "ACTIVITY_IO_INPUT_FAILED" =>
+                        plan.activity_io_inputs.iter().find_map(|fact| match fact {
+                            ActivityIoInputFact::Failed { incident_id,
+                                waiting_token_id, incident_event_index, .. }
+                                if incident_id == &incident.incident_id
+                                    && *incident_event_index == event_index =>
+                                Some(serde_json::json!({
+                                    "incident_id": incident_id,
+                                    "activation_token_id": waiting_token_id,
+                                    "code": incident.code,
+                                    "message": incident.message,
+                                })),
+                            _ => None,
+                        }),
+                    "ACTIVITY_IO_OUTPUT_FAILED" =>
+                        plan.activity_io_results.iter().find_map(|fact|
+                            match &fact.disposition {
+                                ActivityIoResultDisposition::Blocked {
+                                    incident_event_index, incident_id, .. }
+                                    if *incident_event_index == event_index
+                                        && incident_id == &incident.incident_id =>
+                                    Some(fact.token_id.as_str()),
+                                _ => None,
+                            }).or_else(|| plan.activity_io_continuations.iter().find_map(|fact|
+                            match &fact.disposition {
+                                ActivityIoResultDisposition::Blocked {
+                                    incident_event_index, incident_id, .. }
+                                    if *incident_event_index == event_index
+                                        && incident_id == &incident.incident_id =>
+                                    Some(fact.token_id.as_str()),
+                                _ => None,
+                            })).map(|activation_token_id| serde_json::json!({
+                                "incident_id":incident.incident_id,
+                                "activation_token_id":activation_token_id,
+                                "code":incident.code,"message":incident.message,
+                            })),
+                    "SCRIPT_EVALUATION_FAILED" if node.is_some_and(|node_id|
+                        scope_node(model, &selected_process_id, scopes, instance_id,
+                            &event.scope_id, node_id).is_ok_and(|selected|
+                                selected.activity_io.is_some()
+                                    && matches!(&selected.kind,
+                                        ProcessNodeKind::ScriptTask { .. }))) =>
+                        plan.activity_io_inputs.iter().find_map(|fact| match fact {
+                            ActivityIoInputFact::Captured {
+                                activation_token_id, event_index: input_index, .. }
+                                if *input_index < event_index
+                                    && plan.event_sources.get(&event_index)
+                                        == Some(activation_token_id)
+                                    && script_io_action_handoff_on(plan,
+                                        activation_token_id, event_index) =>
+                                event.data["parked_token_id"].as_str().and_then(|parked|
+                                    plan.create_tokens.iter().find(|token|
+                                        token.token_id == parked
+                                            && token.status == "waiting"
+                                            && plan.token_sources.get(parked)
+                                                == Some(activation_token_id))
+                                ).map(|_| serde_json::json!({
+                                    "incident_id":incident.incident_id,
+                                    "activation_token_id":activation_token_id,
+                                    "parked_token_id":event.data["parked_token_id"],
+                                    "code":incident.code,"message":incident.message,
+                                })),
+                            _ => None,
+                        }),
+                    "SCRIPT_MAPPING_FAILED" if node.is_some_and(|node_id|
+                        scope_node(model, &selected_process_id, scopes, instance_id,
+                            &event.scope_id, node_id).is_ok_and(|selected|
+                                selected.activity_io.is_some()
+                                    && matches!(&selected.kind,
+                                        ProcessNodeKind::ScriptTask { .. }))) =>
+                        plan.activity_io_results.iter().find_map(|fact|
+                            match &fact.disposition {
+                                ActivityIoResultDisposition::Retained {
+                                    fate: ActivityIoRetainedFate::ScriptMappingFailure,
+                                    route_event_index,
+                                } if *route_event_index == event_index
+                                    && plan.event_sources.get(&event_index)
+                                        == Some(&fact.token_id) =>
+                                    Some(serde_json::json!({
+                                        "incident_id":incident.incident_id,
+                                        "activation_token_id":fact.token_id,
+                                        "parked_token_id":event.data["parked_token_id"],
+                                        "code":incident.code,"message":incident.message,
+                                    })),
+                                _ => None,
+                            }),
+                    "MESSAGE_EXPRESSION_ERROR" if node.is_some_and(|node_id|
+                        scope_node(model, &selected_process_id, scopes, instance_id,
+                            &event.scope_id, node_id).is_ok_and(|selected|
+                                selected.activity_io.is_some()
+                                    && matches!(&selected.kind,
+                                        ProcessNodeKind::SendTask { .. }))) =>
+                        plan.activity_io_inputs.iter().find_map(|fact| match fact {
+                            ActivityIoInputFact::Captured {
+                                scope_id, node_id, activation_token_id,
+                                event_index: input_index, .. }
+                                if scope_id == &event.scope_id
+                                    && Some(node_id.as_str()) == node
+                                    && *input_index < event_index
+                                    && event.data["activation_token_id"]
+                                        == *activation_token_id =>
+                                Some(serde_json::json!({
+                                    "incident_id":incident.incident_id,
+                                    "activation_token_id":activation_token_id,
+                                    "code":incident.code,"message":incident.message,
+                                })),
+                            _ => None,
+                        }),
+                    "CALL_ADMISSION_ERROR" =>
+                        plan.activity_io_inputs.iter().find_map(|fact| match fact {
+                            ActivityIoInputFact::Captured { scope_id, node_id,
+                                activation_token_id, event_index: input_index, .. }
+                                if scope_id == &event.scope_id
+                                    && Some(node_id.as_str()) == node
+                                    && *input_index < event_index
+                                    && event.data["activation_token_id"] == *activation_token_id =>
+                                Some(serde_json::json!({
+                                    "incident_id":incident.incident_id,
+                                    "activation_token_id":activation_token_id,
+                                    "code":incident.code,"message":incident.message,
+                                })),
+                            _ => None,
+                        }).or_else(|| Some(serde_json::json!({
+                            "code":incident.code,"message":incident.message,
+                        }))),
                     "SCOPE_RETURN_ERROR" => scopes.iter().find(|scope|
                         scope.scope_id == incident.scope_id)
                         .and_then(|scope| scope.parent_token_id.as_deref())
@@ -8945,7 +12472,7 @@ fn validate_termination_action_provenance_on(
                     }
                     _ => Some(serde_json::json!({
                         "code":incident.code,"message":incident.message})),
-                };
+                }};
                 incident.scope_id == event.scope_id
                     && node == incident.node_id.as_deref()
                     && expected.as_ref() == Some(&event.data)
@@ -8991,7 +12518,7 @@ fn validate_termination_action_provenance_on(
                             || event.data["reason"] != "activity_completed"
                             || !protected_disarm
                             || {
-                                let Ok(pinned) = scope_node(model, scopes, instance_id,
+                                let Ok(pinned) = scope_node(model, &selected_process_id, scopes, instance_id,
                                     &event.scope_id, &timer.node_id) else { return false; };
                                 let ProcessNodeKind::BoundaryTimer { attached_to_id, .. } = &pinned.kind else {
                                     return false;
@@ -9009,7 +12536,7 @@ fn validate_termination_action_provenance_on(
                                         "reason":"activity_completed","winning_timer_id":null})
                             })
                         && closure_source.is_none_or(|source| {
-                            let Ok(pinned) = scope_node(model, scopes, instance_id,
+                            let Ok(pinned) = scope_node(model, &selected_process_id, scopes, instance_id,
                                 &event.scope_id, &timer.node_id) else { return false; };
                             let attached_to_id = match &pinned.kind {
                                 ProcessNodeKind::BoundaryTimer { attached_to_id, .. } =>
@@ -9085,7 +12612,7 @@ fn validate_termination_action_provenance_on(
                             || event.data["reason"] != "activity_completed"
                             || !protected_disarm
                             || {
-                                let Ok(pinned) = scope_node(model, scopes, instance_id,
+                                let Ok(pinned) = scope_node(model, &selected_process_id, scopes, instance_id,
                                     &event.scope_id, &subscription.node_id) else { return false; };
                                 let (ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
                                     | ProcessNodeKind::BoundaryError { attached_to_id, .. }
@@ -9327,7 +12854,7 @@ fn validate_termination_action_provenance_on(
                             scope == event.scope_id && stored_attempt == *attempt
                             && stored_fence == *fence
                             && node == Some(node_id.as_str())
-                            && scope_node(model, scopes, instance_id, &scope, &node_id)
+                            && scope_node(model, &selected_process_id, scopes, instance_id, &scope, &node_id)
                                 .is_ok_and(|pinned| matches!(&pinned.kind,
                                     ProcessNodeKind::ServiceTask { .. }))
                             && parse::<ActivityResult>(result).is_ok_and(|actual|
@@ -9350,7 +12877,7 @@ fn validate_termination_action_provenance_on(
                         && prior.scope_id == event.scope_id && prior.node_id == event.node_id)
                 && plan.events.iter().filter(|candidate| candidate.kind == "verification_passed"
                 && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id).count() == 1
-                && node.is_some_and(|node_id| scope_node(model, scopes, instance_id,
+                && node.is_some_and(|node_id| scope_node(model, &selected_process_id, scopes, instance_id,
                     &event.scope_id, node_id).is_ok_and(|pinned| matches!(&pinned.kind,
                         ProcessNodeKind::ServiceTask { verification:
                             tentaflow_protocol::processes::ActivityVerification::Condition {
@@ -9443,11 +12970,24 @@ fn validate_termination_action_provenance_on(
                         && event.data["attached_token_id"].as_str()
                             == Some(subscription.token_id.as_str())
                         && if event.kind == "escalation_caught" {
+                            let Some((source_scope, source_node, source_token)) =
+                                escalation_source.as_ref() else { return false; };
+                            if event.data["source_scope_id"].as_str()
+                                != Some(source_scope.as_str())
+                                || event.data["source_token_id"].as_str()
+                                    != Some(source_token.as_str())
+                                || !plan.events.iter().any(|source|
+                                    source.kind == "service_result"
+                                        && source.scope_id == source_scope.as_str()
+                                        && source.node_id.as_deref()
+                                            == Some(source_node.as_str())) {
+                                return false;
+                            }
                             event.data == serde_json::json!({
                                 "subscription_id":id,"boundary_id":subscription.node_id,
                                 "attached_token_id":subscription.token_id,
-                                "source_token_id":subscription.token_id,
-                                "source_scope_id":event.data["source_scope_id"],
+                                "source_token_id":source_token,
+                                "source_scope_id":source_scope,
                                 "job_id":event.data["job_id"],
                                 "attempt":event.data["attempt"],"fence":event.data["fence"],
                                 "result_origin":"contract",
@@ -9577,7 +13117,25 @@ fn validate_termination_action_provenance_on(
                             cause: StartInputRef::Timer { timer_id, .. }, .. }
                             if timer_id == id)
                 })),
-            "scope_entry_failed" => event.data["incident_id"].as_str().is_some_and(|id|
+            "scope_entry_failed" => {
+                let retained = call_tree_ids_on(tx, instance_id)?.iter().try_fold(
+                    0usize, |total, id| -> Result<usize> {
+                        let count = usize::try_from(tx.query_row(
+                            "SELECT COUNT(*) FROM bpmn_scopes WHERE instance_id=?1",
+                            [id], |row| row_u64(row, 0))?)?;
+                        total.checked_add(count).context("scope lifetime count overflow")
+                    })?;
+                let entered_before = plan.events[..event_index].iter()
+                    .filter(|prior| prior.kind == "scope_entered").count();
+                retained.checked_add(entered_before).is_some_and(|count| count >= 129)
+                && event.data["parent_token_id"].as_str().is_some_and(|token_id|
+                    !plan.activity_io_inputs.iter().any(|fact| match fact {
+                        ActivityIoInputFact::Captured { activation_token_id, .. } =>
+                            activation_token_id == token_id,
+                        ActivityIoInputFact::Failed { waiting_token_id, .. } =>
+                            waiting_token_id == token_id,
+                    }))
+                && event.data["incident_id"].as_str().is_some_and(|id|
                 count("scope_entry_failed", "incident_id", id) == 1
                 && plan.add_incidents.iter().any(|incident| incident.incident_id == id
                     && incident.scope_id == event.scope_id
@@ -9591,7 +13149,8 @@ fn validate_termination_action_provenance_on(
                     && event.data == serde_json::json!({
                         "parent_token_id":token_id,"scope_id":event.scope_id,
                         "subprocess_node_id":node,"incident_id":id,
-                        "code":"SCOPE_LIMIT","reason":"scope_limit"}))),
+                        "code":"SCOPE_LIMIT","reason":"scope_limit"})))
+            },
             "message_error" => event.data["incident_id"].as_str().is_some_and(|id|
                 count("message_error", "incident_id", id) == 1
                 && plan.add_incidents.iter().any(|incident| incident.incident_id == id
@@ -9658,7 +13217,7 @@ fn validate_termination_action_provenance_on(
             matches!(event.kind.as_str(), "timer_armed" | "timer_error")
                 && event.data["timer_id"].as_str() == Some(timer.timer_id.as_str()))
             .context("termination timer lacks its unique arm fact")?;
-        let node = scope_node(model, scopes, instance_id,
+        let node = scope_node(model, &selected_process_id, scopes, instance_id,
             timer.scope_id.as_deref().context("termination timer scope is missing")?,
             &timer.node_id)?;
         let attached_to_id = match &node.kind {
@@ -9701,7 +13260,7 @@ fn validate_termination_action_provenance_on(
                     | "signal_catch_opened" | "error_boundary_armed"
                     | "escalation_boundary_armed"))
             .context("termination subscription lacks its unique arm fact")?;
-        let node = scope_node(model, scopes, instance_id,
+        let node = scope_node(model, &selected_process_id, scopes, instance_id,
             &subscription.scope_id, &subscription.node_id)?;
         let (kind, expected) = match &node.kind {
             ProcessNodeKind::BoundaryEscalation { attached_to_id, cancel_activity, .. } =>
@@ -9784,11 +13343,17 @@ fn validate_script_actions_on(
     scopes: &[ProcessScopeSummary], expected_revision: u64, plan: &RuntimePlan,
     variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let mut sources = HashSet::new();
+    let prior_occurrences = repetition_occurrences_on(tx, instance_id)?;
+    let limited_token_ids = validate_immediate_lineage_limit_on(plan)?;
     for (index, event) in plan.events.iter().enumerate() {
         if !matches!(event.kind.as_str(), "script_completed" | "send_task_pending"
             | "send_task_admitted" | "send_admission_failed" | "signal_admitted"
             | "incident") { continue; }
+        if event.kind == "incident" && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT" {
+            continue;
+        }
         let Some(node_id) = event.node_id.as_deref() else {
             ensure!(!matches!(event.kind.as_str(), "script_completed"
                 | "send_task_pending" | "send_task_admitted" | "send_admission_failed"
@@ -9796,7 +13361,7 @@ fn validate_script_actions_on(
                 "immediate activity completion has no pinned node");
             continue;
         };
-        let node = scope_node(model, scopes, instance_id, &event.scope_id, node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, node_id)?;
         if let ProcessNodeKind::SignalThrow {
             signal_ref, payload_expression, ttl_seconds,
         } = &node.kind {
@@ -9823,7 +13388,8 @@ fn validate_script_actions_on(
                 locals.get(instance_id).context("Signal root variables are missing")?,
                 &source.scope_id)?;
             let path = scope_path(scopes, instance_id, &source.scope_id)?;
-            let (_, flows, _) = super::model::scope_body(model, &path)?;
+            let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let flows = selected.sequence_flows;
             let outgoing = flows.iter().filter(|flow| flow.source_id == node.id)
                 .collect::<Vec<_>>();
             ensure!(outgoing.len() == 1, "SignalThrow has no pinned single successor");
@@ -9948,7 +13514,8 @@ fn validate_script_actions_on(
                         message.source_activation_id != *source_id),
                     "pending Send lacks its exact factual parked activation");
                 let path = scope_path(scopes, instance_id, &source.scope_id)?;
-                let (nodes, _, _) = super::model::scope_body(model, &path)?;
+                let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let nodes = selected.nodes;
                 let attached = nodes.iter().filter(|candidate| match &candidate.kind {
                     ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
                     | ProcessNodeKind::BoundaryMessage { attached_to_id, .. } =>
@@ -9956,28 +13523,75 @@ fn validate_script_actions_on(
                     _ => false,
                 }).collect::<Vec<_>>();
                 let waiting_id = &children[0].token_id;
-                ensure!(!attached.is_empty()
-                    && attached.iter().all(|boundary| match &boundary.kind {
-                        ProcessNodeKind::BoundaryTimer { .. } =>
-                            plan.create_timers.iter().filter(|timer|
-                                timer.token_id.as_deref() == Some(waiting_id.as_str())
-                                    && timer.node_id == boundary.id
-                                    && timer.kind == ProcessTimerKind::Boundary).count() == 1,
-                        ProcessNodeKind::BoundaryMessage { .. } =>
-                            plan.create_subscriptions.iter().filter(|subscription|
-                                subscription.token_id == *waiting_id
-                                    && subscription.node_id == boundary.id
-                                    && subscription.kind == ProcessSubscriptionKind::BoundaryMessage)
-                                .count() == 1,
+                let repeated_group = if node.repeat.is_some() {
+                    let occurrence = plan.repetition_occurrences.iter().filter(|row|
+                        row.scope_id == source.scope_id && row.token_id == *waiting_id)
+                        .collect::<Vec<_>>();
+                    ensure!(occurrence.len() == 1
+                        && occurrence[0].status == ProcessRepetitionOccurrenceStatus::Active,
+                        "pending repeated Send has no unique active ordinal");
+                    let prior = repetition_groups_on(tx, instance_id)?;
+                    let group = plan.repetition_groups.iter().chain(prior.iter()).find(|group|
+                        group.group_id == occurrence[0].group_id
+                            && group.scope_id == source.scope_id
+                            && group.node_id == source.node_id
+                            && !group.terminal_capacity
+                            && matches!(group.status,
+                                ProcessRepetitionGroupStatus::Open
+                                    | ProcessRepetitionGroupStatus::Incident))
+                        .context("pending repeated Send has no factual coordinator")?;
+                    let parent = termination_token_on(tx, instance_id, plan,
+                        &group.parent_token_id)?;
+                    ensure!(parent.status == "waiting"
+                        && parent.scope_id == source.scope_id
+                        && parent.node_id == source.node_id
+                        && plan.create_timers.iter().all(|timer|
+                            timer.token_id.as_deref() != Some(waiting_id.as_str()))
+                        && plan.create_subscriptions.iter().all(|subscription|
+                            subscription.token_id != *waiting_id),
+                        "pending repeated Send cloned its coordinator arm onto an ordinal");
+                    Some(group.parent_token_id.clone())
+                } else { None };
+                let arm_token_id = repeated_group.as_deref().unwrap_or(waiting_id);
+                let exact_arms = attached.iter().try_fold(true, |all, boundary| -> Result<bool> {
+                    let exact = match &boundary.kind {
+                        ProcessNodeKind::BoundaryTimer { .. } => {
+                            let stored: i64 = tx.query_row(
+                                "SELECT COUNT(*) FROM bpmn_timers WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND kind='boundary' AND status IN ('pending','blocked')",
+                                params![instance_id,source.scope_id,arm_token_id,boundary.id],
+                                |row| row.get(0),
+                            )?;
+                            usize::try_from(stored).ok().is_some_and(|count|
+                                count + plan.create_timers.iter().filter(|timer|
+                                    timer.token_id.as_deref() == Some(arm_token_id)
+                                        && timer.node_id == boundary.id
+                                        && timer.kind == ProcessTimerKind::Boundary).count() == 1)
+                        }
+                        ProcessNodeKind::BoundaryMessage { .. } => {
+                            let stored: i64 = tx.query_row(
+                                "SELECT COUNT(*) FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND kind='boundary_message' AND status='open'",
+                                params![instance_id,source.scope_id,arm_token_id,boundary.id],
+                                |row| row.get(0),
+                            )?;
+                            usize::try_from(stored).ok().is_some_and(|count|
+                                count + plan.create_subscriptions.iter().filter(|subscription|
+                                    subscription.token_id == arm_token_id
+                                        && subscription.node_id == boundary.id
+                                        && subscription.kind == ProcessSubscriptionKind::BoundaryMessage)
+                                    .count() == 1)
+                        }
                         _ => false,
-                    })
+                    };
+                    Ok(all && exact)
+                })?;
+                ensure!(!attached.is_empty() && exact_arms
                     && plan.create_timers.iter().filter(|timer|
-                        timer.token_id.as_deref() == Some(waiting_id.as_str())).count()
-                        == attached.iter().filter(|boundary|
+                        timer.token_id.as_deref() == Some(arm_token_id)).count()
+                        <= attached.iter().filter(|boundary|
                             matches!(&boundary.kind, ProcessNodeKind::BoundaryTimer { .. })).count()
                     && plan.create_subscriptions.iter().filter(|subscription|
-                        subscription.token_id == *waiting_id).count()
-                        == attached.iter().filter(|boundary|
+                        subscription.token_id == arm_token_id).count()
+                        <= attached.iter().filter(|boundary|
                             matches!(&boundary.kind, ProcessNodeKind::BoundaryMessage { .. })).count(),
                     "pending Send did not arm its exact pinned boundary set");
                 continue;
@@ -9990,16 +13604,101 @@ fn validate_script_actions_on(
                     "pending Send failure incident has an extra action source");
                 continue;
             }
+            if event.kind == "incident" && !plan.event_sources.contains_key(&index)
+                && (plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                    ActivityIoInputFact::Failed { incident_event_index, .. }
+                        if *incident_event_index == index))
+                    || plan.activity_io_results.iter().any(|fact| matches!(
+                        &fact.disposition, ActivityIoResultDisposition::Blocked {
+                            incident_event_index, .. } if *incident_event_index == index))) {
+                continue;
+            }
+            if event.kind == "incident" && node.activity_io.is_some()
+                && event.data["code"] == "MESSAGE_EXPRESSION_ERROR"
+                && !plan.event_sources.contains_key(&index) {
+                let captured = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+                    ActivityIoInputFact::Captured { scope_id, node_id,
+                        source_token_id, activation_token_id, event_index, .. }
+                        if scope_id == &event.scope_id && node_id == &node.id
+                            && *event_index < index
+                            && event.data["activation_token_id"]
+                                == *activation_token_id =>
+                        Some((source_token_id, activation_token_id)),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                ensure!(captured.len() == 1,
+                    "Send preparation failure lost its exact captured input");
+                let source = termination_token_on(tx, instance_id, plan, captured[0].0)?;
+                let waiting = termination_token_on(tx, instance_id, plan, captured[0].1)?;
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. }
+                    | VariableEffect::RepetitionAggregate { event_index, .. }
+                    | VariableEffect::RepetitionEntry { event_index, .. } =>
+                        *event_index < index,
+                }).count();
+                let states = variable_states.get(effect_count)
+                    .context("Send preparation failure lost source-time variables")?;
+                let effective = effective_scope_variables(scopes, states, instance_id,
+                    states.get(instance_id).context("Send root variables are missing")?,
+                    &event.scope_id)?;
+                let body_extra = planned_activity_io_extra_for_activation(
+                    plan, &event.scope_id, &node.id,
+                    captured[0].1,
+                )?;
+                let error = super::messages::prepare_throw(model, node, &effective, &body_extra)
+                    .err().context("Send preparation succeeded but a failure was claimed")?;
+                ensure!(error.downcast_ref::<super::messages::MessageExpressionFailed>()
+                    .is_some(), "Send infrastructure failure cannot become an incident");
+                let message = bounded_failure_message(&error.to_string());
+                let incident_id = event.data["incident_id"].as_str()
+                    .context("Send preparation failure lost its incident identity")?;
+                ensure!(source.status == "ready" && waiting.status == "waiting"
+                    && waiting.scope_id == source.scope_id
+                    && waiting.node_id == source.node_id
+                    && waiting.arrival_edge_id == source.arrival_edge_id
+                    && waiting.fork_stack == source.fork_stack
+                    && plan.token_sources.get(captured[0].1) == Some(captured[0].0)
+                    && !plan.consume_token_ids.contains(captured[0].1)
+                    && !plan.cancel_token_ids.contains(captured[0].1)
+                    && plan.event_ids.get(&index).is_some_and(|id|
+                        Uuid::parse_str(id).is_ok())
+                    && event.data == serde_json::json!({
+                        "code":"MESSAGE_EXPRESSION_ERROR","message":message,
+                        "incident_id":incident_id,
+                        "activation_token_id":captured[0].1,
+                    })
+                    && plan.add_incidents.iter().filter(|incident|
+                        incident.incident_id == incident_id
+                            && incident.scope_id == event.scope_id
+                            && incident.node_id.as_deref() == Some(node.id.as_str())
+                            && incident.code == "MESSAGE_EXPRESSION_ERROR"
+                            && incident.message == message && !incident.can_retry
+                            && incident.job_id.is_none()).count() == 1
+                    && plan.create_messages.iter().all(|message|
+                        message.source_activation_id != *captured[0].1)
+                    && plan.activity_io_results.iter().all(|result|
+                        result.token_id != *captured[0].1),
+                    "Send preparation failure changed its exact captured wait or incident");
+                continue;
+            }
             let source_id = plan.event_sources.get(&index)
                 .context("Send action has no exact activation source")?;
-            ensure!(sources.insert(source_id.clone())
-                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count()
-                    == usize::from(event.kind != "send_admission_failed"),
-                "Send action did not consume one unique ready activation");
-            let source = termination_token_on(tx, instance_id, plan, source_id)?;
             let pending = matches!(entry, EntryAuthority::Accepted(
                 AcceptedInputRef::SendAdmission { pending_token_id, .. })
                     if pending_token_id == source_id);
+            let send_io_action = send_io_admission_handoff_on(
+                plan, source_id, index, pending);
+            let send_io_blocked = send_io_action && plan.activity_io_results.iter().any(|fact|
+                fact.token_id == *source_id && fact.result_event_index == index
+                    && matches!(&fact.disposition,
+                        ActivityIoResultDisposition::Blocked { .. }));
+            ensure!(sources.insert(source_id.clone())
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count()
+                    == usize::from(event.kind != "send_admission_failed"
+                        && !send_io_blocked),
+                "Send action did not consume one unique ready activation");
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
             if pending {
                 let EntryAuthority::Accepted(AcceptedInputRef::SendAdmission {
                     instance_id: selected_instance, scope_id: selected_scope,
@@ -10032,12 +13731,20 @@ fn validate_script_actions_on(
                     && prior_status == "consumed" && !prior_failure,
                     "pending Send admission lacks its authenticated prior event and live wait");
             }
-            ensure!((source.status == "ready" && !pending
-                    || source.status == "waiting" && pending)
-                && source.scope_id == event.scope_id
-                && source.node_id == node.id
-                && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
-                    plan, source_id, expected_revision, entry, false)?,
+            ensure!((source.status == "ready" && !pending && !send_io_action
+                    || source.status == "waiting" && (pending || send_io_action))
+                && source.scope_id == event.scope_id && source.node_id == node.id,
+                "Send action differs from its selected activation status, scope, or node");
+            if !send_io_action {
+                if let EntryAuthority::Accepted(input @ AcceptedInputRef::Start { .. }) = entry {
+                    trace_termination_source_on(tx, instance_id, model, scopes, plan,
+                        source_id, None, input, &mut HashSet::new())
+                        .context("Send action has no factual path from its accepted Start")?;
+                }
+            }
+            ensure!(send_io_action || ordinary_action_source_matches_entry_on(tx,
+                instance_id, model, scopes, plan, source_id, expected_revision,
+                entry, false)?,
                 "Send action is outside its authenticated entry lineage");
             let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
                 VariableEffect::Mapped { event_index, .. }
@@ -10049,8 +13756,23 @@ fn validate_script_actions_on(
                 .context("Send source-time variables are missing")?;
             let effective = effective_scope_variables(scopes, locals, instance_id,
                 locals.get(instance_id).context("Send root variables are missing")?, &source.scope_id)?;
+            let repeated = plan.repetition_occurrences.iter().find(|row|
+                row.token_id == *source_id && matches!(row.status,
+                    ProcessRepetitionOccurrenceStatus::Completed
+                        | ProcessRepetitionOccurrenceStatus::AcceptedBlocked));
+            let effective = repeated.map_or(effective, |row| row.input_variables.clone());
+            let repeat_extra = repeated.map(|row| vec![("repeat".to_owned(),
+                serde_json::json!({"group_id":row.group_id,"index":row.ordinal,
+                    "item":row.item}))]).unwrap_or_default();
+            let mut body_extra = planned_activity_io_extra_for_activation(
+                plan, &source.scope_id, &node.id, source_id,
+            )?;
+            if body_extra.is_empty() {
+                body_extra = repeat_extra.clone();
+            }
             let path = scope_path(scopes, instance_id, &source.scope_id)?;
-            let (_, flows, _) = super::model::scope_body(model, &path)?;
+            let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let flows = selected.sequence_flows;
             let outgoing = flows.iter().filter(|flow| flow.source_id == node.id).collect::<Vec<_>>();
             let children = plan.create_tokens.iter().filter(|token|
                 plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
@@ -10059,9 +13781,11 @@ fn validate_script_actions_on(
                 let (org_id, initiator): (String, String) = tx.query_row(
                     "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
                     [instance_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+                let (variables, extra) = send_repetition_context_on(tx, instance_id,
+                    &source.scope_id, node, source_id, &effective)?;
                 Some(send_admission_evaluation_on(tx,
                     &ProcessActor { org_id, user_id: initiator }, instance_id,
-                    model, node, &effective)?)
+                    model, node, &variables, &extra)?)
             } else { None };
             if event.kind == "send_task_admitted" {
                 let expected = if let Some(result) = prepared {
@@ -10071,7 +13795,7 @@ fn validate_script_actions_on(
                             bail!("Send admission has a factual finite failure"),
                     }
                 } else {
-                    super::messages::prepare_throw(model, node, &effective)
+                    super::messages::prepare_throw(model, node, &effective, &body_extra)
                         .context("Send admission has no valid pinned message")?
                 };
                 let rows = plan.create_messages.iter().filter(|message|
@@ -10079,28 +13803,71 @@ fn validate_script_actions_on(
                         && message.source_scope_id == event.scope_id
                         && message.source_node_id == node.id
                         && message.source_activation_id == *source_id).collect::<Vec<_>>();
-                ensure!(rows.len() == 1
-                    && rows[0].message.target == expected.target
+                let repeated_completion = repeated.is_some_and(|row| {
+                    plan.repetition_groups.iter().any(|group|
+                        group.group_id == row.group_id && group.scope_id == source.scope_id
+                            && group.node_id == node.id)
+                        && plan.event_ids.get(&index).is_some_and(|id|
+                            row.accepted_source_event_id.as_deref() == Some(id))
+                        && (row.status == ProcessRepetitionOccurrenceStatus::Completed
+                            && plan.events.iter().enumerate().filter(|(completion_index, completion)|
+                                *completion_index > index
+                                    && completion.kind == "repetition_occurrence_completed"
+                                    && completion.scope_id == source.scope_id
+                                    && completion.node_id.as_deref() == Some(node_id)
+                                    && completion.data == serde_json::json!({
+                                        "group_id":row.group_id,
+                                        "occurrence_id":row.occurrence_id,
+                                        "ordinal":row.ordinal,
+                                        "source_event_id":row.accepted_source_event_id,
+                                    })).count() == 1
+                            || row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                                && plan.repetition_capacity.as_ref().is_some_and(|capacity|
+                                    capacity.group_id == row.group_id
+                                        && capacity.scope_id == row.scope_id
+                                        && capacity.reason == "repetition_bytes"
+                                        && capacity.event_index > index
+                                        && plan.repetition_groups.iter().any(|group|
+                                            group.group_id == row.group_id
+                                                && group.terminal_capacity)))
+                });
+                ensure!(rows.len() == 1,
+                    "Send admission lacks one source-linked outbox row");
+                ensure!(rows[0].message.target == expected.target
                     && rows[0].message.message_name == expected.message_name
                     && rows[0].message.correlation_key == expected.correlation_key
                     && rows[0].message.payload == expected.payload
-                    && rows[0].message.ttl_seconds == expected.ttl_seconds
-                    && event.data == serde_json::json!({
+                    && rows[0].message.ttl_seconds == expected.ttl_seconds,
+                    "Send admission differs from its pinned message");
+                ensure!(event.data == serde_json::json!({
                         "message_id":rows[0].message.message_id,
                         "source_activation_id":source_id,
                         "target":rows[0].message.target,
                         "message_name":rows[0].message.message_name,
-                        "correlation_key":rows[0].message.correlation_key})
-                    && (!pending || plan.event_ids.get(&index).is_some_and(|id|
-                        Uuid::parse_str(id).is_ok()))
-                    && children.len() == 1 && children[0].status == "ready"
-                    && children[0].scope_id == source.scope_id
-                    && children[0].node_id == outgoing[0].target_id
-                    && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
-                    && children[0].fork_stack == source.fork_stack
-                    && plan.event_sources.iter().all(|(child_index, child_source)|
-                        child_source != &children[0].token_id || *child_index > index),
-                    "Send admission differs from its pinned message or single successor");
+                        "correlation_key":rows[0].message.correlation_key}),
+                    "Send admission event differs from its source-linked outbox row");
+                ensure!((!pending && !send_io_action)
+                    || plan.event_ids.get(&index).is_some_and(|id|
+                    Uuid::parse_str(id).is_ok()),
+                    "pending Send admission lacks its exact event identity");
+                if send_io_blocked {
+                    ensure!(children.is_empty()
+                        && plan.create_messages.iter().filter(|message|
+                            message.source_activation_id == *source_id).count() == 1,
+                        "blocked Send IO fabricated a successor or duplicate outbox row");
+                } else if repeated_completion {
+                    ensure!(children.is_empty(),
+                        "repeated Send admission created a direct successor instead of its ordinal completion");
+                } else {
+                    ensure!(children.len() == 1 && children[0].status == "ready"
+                        && children[0].scope_id == source.scope_id
+                        && children[0].node_id == outgoing[0].target_id
+                        && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
+                        && children[0].fork_stack == source.fork_stack
+                        && plan.event_sources.iter().all(|(child_index, child_source)|
+                            child_source != &children[0].token_id || *child_index > index),
+                        "Send admission lacks its single pinned successor or factual ordinal completion");
+                }
             } else if event.kind == "send_admission_failed" && pending {
                 let SendAdmissionEvaluation::Fail(failure) = prepared
                     .context("pending Send lacks its source-time decision")? else {
@@ -10144,7 +13911,7 @@ fn validate_script_actions_on(
                     && children.is_empty(),
                     "pending Send failure differs from its factual expression and parked wait");
             } else {
-                let error = super::messages::prepare_throw(model, node, &effective)
+                let error = super::messages::prepare_throw(model, node, &effective, &body_extra)
                     .err().context("Send incident has a valid pinned message")?;
                 let message = bounded_failure_message(&error.to_string());
                 ensure!(event.kind == "incident"
@@ -10170,52 +13937,240 @@ fn validate_script_actions_on(
                 "immediate completion named another pinned node");
             continue;
         };
+        if event.kind == "incident" && !plan.event_sources.contains_key(&index) {
+            if plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                ActivityIoInputFact::Failed { incident_event_index, .. }
+                    if *incident_event_index == index))
+                || plan.activity_io_results.iter().any(|fact| matches!(
+                    &fact.disposition, ActivityIoResultDisposition::Blocked {
+                        incident_event_index, .. } if *incident_event_index == index)) {
+                continue;
+            }
+            if event.data["code"] == "REPETITION_INPUT_ERROR"
+                && plan.repetition_groups.iter().any(|group|
+                    group.scope_id == event.scope_id && group.node_id == node.id
+                        && group.created_count == 0 && group.total_count.is_none()
+                        && group.status == ProcessRepetitionGroupStatus::Incident) {
+                continue;
+            }
+            if event.data["code"] == "REPETITION_LIMIT"
+                && plan.repetition_capacity.as_ref().is_some_and(|capacity|
+                    plan.repetition_groups.iter().any(|group|
+                        group.group_id == capacity.group_id
+                            && group.scope_id == event.scope_id
+                            && group.node_id == node.id)) {
+                continue;
+            }
+            if plan.repetition_occurrences.iter().any(|row|
+                    row.scope_id == event.scope_id
+                        && row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                        && row.accepted_source_event_id.is_some()
+                        && plan.repetition_groups.iter().any(|group|
+                            group.group_id == row.group_id && group.node_id == node.id
+                                && group.terminal_incident_id.as_ref().is_some_and(|id|
+                                    plan.add_incidents.iter().any(|incident|
+                                        incident.incident_id == id.as_str()
+                                            && event.data["code"] == incident.code)))) {
+                continue;
+            }
+            let candidates = plan.repetition_occurrences.iter().filter_map(|current| {
+                let source_id = plan.token_sources.get(&current.token_id)?;
+                (current.scope_id == event.scope_id
+                    && current.status == ProcessRepetitionOccurrenceStatus::Active
+                    && plan.consume_token_ids.contains(source_id)
+                    && plan.repetition_groups.iter().any(|group|
+                        group.group_id == current.group_id && group.node_id == node.id
+                            && group.scope_id == current.scope_id))
+                    .then_some((current, source_id))
+            }).collect::<Vec<_>>();
+            ensure!(candidates.len() == 1,
+                "failed repeated Script has no unique active ordinal and consumed ready source");
+            let (current, source_id) = candidates[0];
+            let failed_group = plan.repetition_groups.iter().find(|group|
+                group.group_id == current.group_id)
+                .context("failed repeated Script did not retain its group")?;
+            let prior = prior_occurrences.iter().find(|row|
+                row.occurrence_id == current.occurrence_id);
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            let waiting = plan.create_tokens.iter().filter(|token|
+                token.token_id == current.token_id && token.status == "waiting"
+                    && token.scope_id == current.scope_id && token.node_id == node.id
+                    && token.arrival_edge_id == source.arrival_edge_id
+                    && token.fork_stack == source.fork_stack).collect::<Vec<_>>();
+            let new_ordinal = prior.is_none() && plan.events.iter().filter(|started|
+                started.kind == "repetition_occurrence_started"
+                    && started.scope_id == current.scope_id
+                    && started.data["group_id"] == current.group_id
+                    && started.data["occurrence_id"] == current.occurrence_id
+                    && started.data["token_id"] == *source_id).count() == 1;
+            let extra = vec![("repeat".to_owned(), serde_json::json!({
+                "group_id":current.group_id,"index":current.ordinal,"item":current.item,
+            }))];
+            let failure = super::runtime::script_evaluate(script,
+                &current.input_variables, &Value::Null, &extra)
+                .err().context("failed repeated Script has a successful pinned body")?;
+            ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>().is_none(),
+                "repeated Script infrastructure failure cannot become an incident");
+            let incidents = plan.add_incidents.iter().filter(|incident|
+                incident.scope_id == event.scope_id
+                    && incident.node_id.as_deref() == Some(node_id)
+                    && incident.code == "SCRIPT_EVALUATION_FAILED"
+                    && incident.message == failure.to_string() && !incident.can_retry)
+                .collect::<Vec<_>>();
+            ensure!(source.status == "ready" && source.scope_id == event.scope_id
+                && source.node_id == node.id && sources.insert(source_id.clone())
+                && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                    plan, source_id, expected_revision, entry, false)?
+                && waiting.len() == 1 && (new_ordinal || prior.is_some_and(|row|
+                    row.status == ProcessRepetitionOccurrenceStatus::Active
+                        && row.token_id == *source_id))
+                && current.status == ProcessRepetitionOccurrenceStatus::Active
+                && current.accepted_source_event_id.is_none()
+                && current.aggregate_item.is_none() && current.state_patch.is_none()
+                && current.state_after.is_none() && incidents.len() == 1
+                && event.data == serde_json::json!({
+                    "code":"SCRIPT_EVALUATION_FAILED","message":failure.to_string(),
+                })
+                && plan.events.iter().filter(|candidate|
+                    candidate.kind == "incident" && candidate.scope_id == event.scope_id
+                        && candidate.node_id == event.node_id).count() == 1
+                && failed_group.status == ProcessRepetitionGroupStatus::Incident
+                && failed_group.terminal_incident_id.as_deref()
+                    == Some(incidents[0].incident_id.as_str())
+                && failed_group.terminal_event_id.is_none()
+                && failed_group.completed_count == u32::try_from(
+                    plan.repetition_occurrences.iter().filter(|row|
+                        row.group_id == failed_group.group_id
+                            && row.status == ProcessRepetitionOccurrenceStatus::Completed).count()
+                    + prior_occurrences.iter().filter(|row|
+                        row.group_id == failed_group.group_id
+                            && row.status == ProcessRepetitionOccurrenceStatus::Completed
+                            && !plan.repetition_occurrences.iter().any(|changed|
+                                changed.occurrence_id == row.occurrence_id)).count())?
+                && !plan.events.iter().any(|candidate|
+                    candidate.kind == "repetition_group_blocked"
+                        && candidate.data["group_id"] == failed_group.group_id),
+                "failed repeated Script changed its exact body, incident, or parked ordinal");
+            continue;
+        }
         let source_id = plan.event_sources.get(&index)
             .context("Script action has no exact token source")?;
+        let script_io_action = node.activity_io.is_some()
+            && script_io_action_handoff_on(plan, source_id, index);
+        let io_result = if script_io_action
+            && !(event.kind == "incident"
+                && event.data["code"] == "SCRIPT_EVALUATION_FAILED") {
+            Some(plan.activity_io_results.iter().find(|fact|
+                fact.token_id == *source_id && fact.scope_id == event.scope_id
+                    && fact.node_id == node.id
+                    && (matches!(&fact.disposition,
+                        ActivityIoResultDisposition::Applied { output_event_index, .. }
+                            if *output_event_index < index)
+                        || matches!(&fact.disposition,
+                            ActivityIoResultDisposition::Retained {
+                                fate: ActivityIoRetainedFate::ScriptMappingFailure,
+                                route_event_index,
+                            } if *route_event_index == index)))
+                .context("Script IO action lost its accepted evaluated result")?)
+        } else { None };
+        ensure!(event.kind != "incident" || !plan.repetition_occurrences.iter().any(|row|
+            row.scope_id == event.scope_id
+                && row.status == ProcessRepetitionOccurrenceStatus::Active
+                && row.accepted_source_event_id.is_none()
+                && plan.token_sources.get(&row.token_id) == Some(source_id)
+                && plan.repetition_groups.iter().any(|group|
+                    group.group_id == row.group_id && group.node_id == node.id
+                        && group.status == ProcessRepetitionGroupStatus::Incident)),
+            "failed repeated Script cannot claim an accepted body source");
         ensure!(sources.insert(source_id.clone())
             && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
             "Script action did not consume one unique ready activation");
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
-        ensure!(source.status == "ready" && source.scope_id == event.scope_id
+        ensure!((source.status == "ready" && node.activity_io.is_none()
+                && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
+                    plan, source_id, expected_revision, entry, false)?
+                || source.status == "waiting" && script_io_action)
+            && source.scope_id == event.scope_id
             && source.node_id == node.id
-            && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
-                plan, source_id, expected_revision, entry, false)?,
+            ,
             "Script action is outside its authenticated entry lineage");
+        let source_event_index = io_result.map_or(index, |fact| fact.result_event_index);
         let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
             VariableEffect::Mapped { event_index, .. }
             | VariableEffect::ScopeEntry { event_index, .. }
             | VariableEffect::RepetitionAggregate { event_index, .. }
-            | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < index,
+            | VariableEffect::RepetitionEntry { event_index, .. } =>
+                *event_index < source_event_index,
         }).count();
         let locals = variable_states.get(effect_count)
             .context("Script source-time variables are missing")?;
         let effective = effective_scope_variables(scopes, locals, instance_id,
             locals.get(instance_id).context("Script root variables are missing")?, &source.scope_id)?;
+        let repeated = plan.repetition_occurrences.iter().find(|row|
+            row.token_id == *source_id && plan.repetition_groups.iter().any(|group|
+                group.group_id == row.group_id && group.scope_id == source.scope_id
+                    && group.node_id == node.id));
+        let effective = repeated.map_or(effective, |row| row.input_variables.clone());
+        let mut extra = if let Some(fact) = io_result {
+            activity_io_replay_extra_on(
+                tx, instance_id, plan, &fact.witness_id,
+                &fact.scope_id, &fact.node_id, &fact.token_id,
+            )?
+        } else {
+            repeated.map(|row| vec![("repeat".to_owned(), serde_json::json!({
+                "group_id":row.group_id,"index":row.ordinal,"item":row.item,
+            }))]).unwrap_or_default()
+        };
+        if node.activity_io.is_some() && io_result.is_none() {
+            let inputs = persisted_activity_io_inputs_for_activation_on(
+                tx, instance_id, plan, &event.scope_id, &node.id, source_id,
+            )?.context("Script IO action lost its captured input witness")?;
+            extra.extend(super::runtime::activity_inputs_extra(&inputs)?);
+        }
+        let mapped_event_index = io_result.and_then(|fact| match &fact.disposition {
+            ActivityIoResultDisposition::Applied { output_event_index, .. } =>
+                Some(*output_event_index),
+            _ => None,
+        }).unwrap_or(index);
         let effects = plan.variable_effects.iter().filter_map(|effect| match effect {
             VariableEffect::Mapped { event_index, scope_id, node_id, source_token_id,
-                outputs, extra, .. }
-                if *event_index == index && scope_id == &event.scope_id
+                outputs, extra: effect_extra, .. }
+                if *event_index == mapped_event_index && scope_id == &event.scope_id
                     && node_id == &node.id && source_token_id == source_id
-                    && extra.is_empty() => Some(outputs),
+                    && effect_extra == &extra => Some(outputs),
             _ => None,
         }).collect::<Vec<_>>();
         let path = scope_path(scopes, instance_id, &source.scope_id)?;
-        let (_, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+            let flows = selected.sequence_flows;
         let outgoing = flows.iter().filter(|flow| flow.source_id == node.id)
             .collect::<Vec<_>>();
         let children = plan.create_tokens.iter().filter(|token|
             plan.token_sources.get(&token.token_id) == Some(source_id)).collect::<Vec<_>>();
         ensure!(outgoing.len() == 1, "Script has no pinned single successor");
         if event.kind == "script_completed" {
-            ensure!(effects.len() == usize::from(!output_mapping.is_empty()),
+            ensure!(effects.len() == usize::from(script_io_action
+                || repeated.is_none() && !output_mapping.is_empty()),
                 "Script completion has an extra or missing mapped effect");
-            let outputs = if let Some(output) = effects.first() {
-                (*output).clone()
-            } else {
-                super::runtime::script_evaluate(script, &effective, &Value::Null)?
-            };
+            let outputs = super::runtime::script_evaluate(script, &effective, &Value::Null, &extra)?;
+            ensure!(effects.first().is_none_or(|effect| *effect == &outputs),
+                "Script mapped effect changed its independently replayed body");
+            if let Some(row) = repeated {
+                ensure!(plan.event_ids.get(&index).is_some_and(|id|
+                    row.accepted_source_event_id.as_deref() == Some(id.as_str()))
+                    && matches!(row.status, ProcessRepetitionOccurrenceStatus::Completed
+                        | ProcessRepetitionOccurrenceStatus::AcceptedBlocked)
+                    && children.is_empty(),
+                    "repeated Script body lacks its exact accepted source and ordinal");
+                ensure!(event.data == serde_json::json!({"outputs":outputs}),
+                    "repeated Script body differs from its source-time evaluation");
+                continue;
+            }
             ensure!(event.data == serde_json::json!({"outputs":outputs})
-                && children.len() == 1 && children[0].status == "ready"
+                && children.len() == 1
+                && (children[0].status == "ready"
+                    || children[0].status == "waiting"
+                        && limited_token_ids.contains(&children[0].token_id))
                 && children[0].scope_id == source.scope_id
                 && children[0].node_id == outgoing[0].target_id
                 && children[0].arrival_edge_id.as_deref() == Some(outgoing[0].id.as_str())
@@ -10223,24 +14178,43 @@ fn validate_script_actions_on(
                 "Script completion changed its result or single pinned continuation");
         } else {
             ensure!(effects.is_empty(), "failed Script wrote a mapped variable effect");
-            let body = super::runtime::script_evaluate(script, &effective, &Value::Null);
+            let body = super::runtime::script_evaluate(script, &effective, &Value::Null, &extra);
             let (code, failure) = match body {
                 Err(error) => ("SCRIPT_EVALUATION_FAILED", error),
                 Ok(outputs) => {
                     let local = locals.get(&source.scope_id)
                         .context("Script failure local variables are missing")?;
                     let failure = super::runtime::patch_script_variables(
-                        output_mapping, local, &effective, &outputs)
+                        output_mapping, local, &effective, &outputs, &extra)
                         .err().context("Script mapping succeeded but an incident was claimed")?;
                     ("SCRIPT_MAPPING_FAILED", failure)
                 }
             };
             ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>().is_none(),
                 "Script infrastructure failure cannot be recorded as a deterministic incident");
-            ensure!(event.data == serde_json::json!({"code":code,"message":failure.to_string()})
+            let expected_message = if script_io_action {
+                bounded_failure_message(&failure.to_string())
+            } else { failure.to_string() };
+            let expected_data = if script_io_action {
+                let incident = plan.add_incidents.iter().find(|incident|
+                    incident.scope_id == event.scope_id
+                        && incident.node_id.as_deref() == Some(node_id)
+                        && incident.code == code
+                        && incident.message == expected_message)
+                    .context("Script IO mapping action lost its exact incident")?;
+                serde_json::json!({
+                    "code":code,"message":expected_message,
+                    "incident_id":incident.incident_id,
+                    "activation_token_id":source_id,
+                    "parked_token_id":children.first().map(|child| child.token_id.as_str()),
+                })
+            } else {
+                serde_json::json!({"code":code,"message":expected_message})
+            };
+            ensure!(event.data == expected_data
                 && plan.add_incidents.iter().any(|incident|
                     incident.scope_id == event.scope_id && incident.node_id.as_deref() == Some(node_id)
-                        && incident.code == code && incident.message == failure.to_string()
+                        && incident.code == code && incident.message == expected_message
                         && !incident.can_retry)
                 && children.len() == 1 && children[0].status == "waiting"
                 && children[0].scope_id == source.scope_id
@@ -10252,7 +14226,7 @@ fn validate_script_actions_on(
     }
     for source_id in plan.consume_token_ids.iter().chain(plan.token_sources.values()) {
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
-        let node = scope_node(model, scopes, instance_id, &source.scope_id, &source.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &source.scope_id, &source.node_id)?;
         if source.status == "ready" {
             if let ProcessNodeKind::ReceiveTask { correlation_expression, .. } = &node.kind {
                 let waits = plan.create_tokens.iter().filter(|token|
@@ -10261,11 +14235,45 @@ fn validate_script_actions_on(
                         && token.node_id == source.node_id
                         && token.arrival_edge_id == source.arrival_edge_id
                         && token.fork_stack == source.fork_stack).collect::<Vec<_>>();
+                let coordinator = waits.len() == 1 && plan.repetition_groups.iter().any(|group|
+                    group.scope_id == source.scope_id && group.node_id == source.node_id
+                        && group.source_token_id == *source_id
+                        && group.parent_token_id == waits[0].token_id
+                        && plan.events.iter().filter(|event|
+                            event.kind == "repetition_group_started"
+                                && event.scope_id == group.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "group_id":group.group_id,
+                                    "source_token_id":group.source_token_id,
+                                    "parent_token_id":group.parent_token_id,
+                                    "mode":group.mode,"total":if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+                                        None
+                                    } else { group.total_count }
+                                })).count() == 1);
+                if coordinator {
+                    ensure!(plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
+                        && ordinary_action_source_matches_entry_on(tx, instance_id, model,
+                            scopes, plan, source_id, expected_revision, entry, false)?,
+                        "ReceiveTask repetition coordinator changed its accepted activation");
+                    continue;
+                }
                 ensure!(waits.len() == 1
                     && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
                     && ordinary_action_source_matches_entry_on(tx, instance_id, model, scopes,
                         plan, source_id, expected_revision, entry, false)?,
                     "ReceiveTask lacks one authenticated ready-to-waiting activation");
+                if plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                    ActivityIoInputFact::Failed { scope_id, node_id, source_token_id,
+                        waiting_token_id, .. }
+                        if scope_id == &source.scope_id && node_id == &source.node_id
+                            && source_token_id == source_id
+                            && waiting_token_id == &waits[0].token_id)) {
+                    ensure!(!plan.create_subscriptions.iter().any(|subscription|
+                        subscription.token_id == waits[0].token_id),
+                        "ReceiveTask failed input created a subscription");
+                    continue;
+                }
                 let subscriptions = plan.create_subscriptions.iter().filter(|subscription|
                     subscription.kind == ProcessSubscriptionKind::ReceiveTask
                         && subscription.scope_id == source.scope_id
@@ -10301,10 +14309,30 @@ fn validate_script_actions_on(
                 }).count();
                 let locals = variable_states.get(effect_count)
                     .context("ReceiveTask source-time variables are missing")?;
-                let effective = effective_scope_variables(scopes, locals, instance_id,
-                    locals.get(instance_id).context("ReceiveTask root variables are missing")?,
-                    &source.scope_id)?;
-                let expected = super::messages::evaluate_key(correlation_expression, &effective);
+                let repeated = plan.repetition_occurrences.iter().find(|row|
+                    row.scope_id == source.scope_id && row.token_id == waits[0].token_id);
+                let effective = if let Some(occurrence) = repeated {
+                    ensure!(plan.repetition_groups.iter().any(|group|
+                        group.group_id == occurrence.group_id
+                            && group.scope_id == source.scope_id
+                            && group.node_id == node.id),
+                        "ReceiveTask arm lacks its pinned repetition group");
+                    occurrence.input_variables.clone()
+                } else {
+                    effective_scope_variables(scopes, locals, instance_id,
+                        locals.get(instance_id).context("ReceiveTask root variables are missing")?,
+                        &source.scope_id)?
+                };
+                let mut receive_extra = planned_activity_io_extra_for_activation(
+                    plan, &source.scope_id, &node.id, &waits[0].token_id,
+                )?;
+                if receive_extra.is_empty() {
+                    receive_extra = repeated.map(|row| vec![("repeat".to_owned(),
+                        serde_json::json!({"group_id":row.group_id,"index":row.ordinal,
+                            "item":row.item}))]).unwrap_or_default();
+                }
+                let expected = super::messages::evaluate_key(correlation_expression,
+                    &effective, &receive_extra);
                 match expected {
                     Ok(key) => ensure!(arm.len() == 1
                         && subscriptions[0].status == ProcessSubscriptionStatus::Open
@@ -10372,22 +14400,56 @@ fn validate_script_actions_on(
         if source.status == "ready" && matches!(&node.kind,
             ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
             | ProcessNodeKind::SignalThrow { .. }) {
-            ensure!(sources.contains(source_id)
+            let repeated_entry = node.repeat.is_some()
+                && plan.repetition_groups.iter().filter(|group|
+                    group.scope_id == source.scope_id && group.node_id == source.node_id
+                        && group.source_token_id == *source_id
+                        && plan.create_tokens.iter().any(|token|
+                            token.token_id == group.parent_token_id
+                                && token.status == "waiting"
+                                && plan.token_sources.get(&token.token_id) == Some(source_id))
+                        && plan.events.iter().filter(|event|
+                            event.kind == "repetition_group_started"
+                                && event.scope_id == group.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "group_id":group.group_id,
+                                    "source_token_id":group.source_token_id,
+                                    "parent_token_id":group.parent_token_id,
+                                    "mode":group.mode,"total":if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
+                                        None
+                                    } else { group.total_count },
+                                })).count() == 1)
+                    .count() == 1;
+            // A configured activity parks its ready source when it captures the
+            // authored inputs; that capture is validated against the same source.
+            let captured_io_entry = node.activity_io.is_some()
+                && plan.activity_io_inputs.iter().any(|fact| match fact {
+                    ActivityIoInputFact::Captured { scope_id, node_id,
+                        source_token_id, .. }
+                    | ActivityIoInputFact::Failed { scope_id, node_id,
+                        source_token_id, .. } =>
+                        source_token_id == source_id && scope_id == &source.scope_id
+                            && node_id == &source.node_id,
+                });
+            ensure!((sources.contains(source_id) || repeated_entry || captured_io_entry)
                 && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1,
                 "Script consumed or continued without one authenticated action fact");
         }
     }
     for incident in &plan.add_incidents {
         let Some(node_id) = incident.node_id.as_deref() else { continue; };
-        let node = scope_node(model, scopes, instance_id, &incident.scope_id, node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &incident.scope_id, node_id)?;
         if matches!(&node.kind,
             ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
             | ProcessNodeKind::SignalThrow { .. }) {
+            // Configured activities add incident, activation, and parked-wait
+            // identities to the event; each is pinned by its own validator.
             let events = plan.events.iter().filter(|event|
                 event.kind == "incident" && event.scope_id == incident.scope_id
                     && event.node_id.as_deref() == Some(node_id)
-                    && event.data == serde_json::json!({"code":incident.code,
-                        "message":incident.message})).count();
+                    && event.data["code"] == incident.code
+                    && event.data["message"] == incident.message).count();
             let rows = plan.add_incidents.iter().filter(|row|
                 row.scope_id == incident.scope_id && row.node_id == incident.node_id
                     && row.code == incident.code && row.message == incident.message
@@ -10404,6 +14466,7 @@ fn validate_signal_failure_on(
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     variable_states: &[BTreeMap<String, Value>], input: &AcceptedInputRef,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let AcceptedInputRef::Signal { signal_id, receipt_id,
         target_subscription_id, .. } = input else { return Ok(()) };
     let incidents = plan.add_incidents.iter().filter(|incident|
@@ -10418,7 +14481,7 @@ fn validate_signal_failure_on(
         "failed Signal receipt changed unrelated activity facts");
     let incident = incidents[0];
     let subscription = subscription_on(tx, target_subscription_id)?;
-    let node = scope_node(model, scopes, instance_id,
+    let node = scope_node(model, &selected_process_id, scopes, instance_id,
         &subscription.scope_id, &subscription.node_id)?;
     let ProcessNodeKind::SignalCatch { output_mapping, .. } = &node.kind else {
         bail!("failed Signal receipt targets another pinned node")
@@ -10479,6 +14542,2700 @@ fn validate_signal_failure_on(
     Ok(())
 }
 
+fn validate_activity_io_results_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    let mut witnesses = HashSet::new();
+    let mut result_events = HashSet::new();
+    let mut output_events = HashSet::new();
+    let mut route_events = HashSet::new();
+    for fact in &plan.activity_io_results {
+        ensure!(Uuid::parse_str(&fact.witness_id).is_ok()
+            && witnesses.insert(&fact.witness_id)
+            && result_events.insert(fact.result_event_index),
+            "activity IO result reused a witness or accepted event");
+        let path = scope_path(scopes, instance_id, &fact.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == fact.node_id)
+            .context("activity IO result node left its selected body")?;
+        let planned_inputs = plan.activity_io_inputs.iter().filter_map(|input| match input {
+            ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                activation_token_id, event_index, group_id, occurrence_id, .. }
+                if witness_id == &fact.witness_id =>
+                    Some((scope_id, node_id, activation_token_id, event_index,
+                        group_id, occurrence_id)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let (phase, token_id, node_id, scope_id, phase_owner):
+            (String, String, String, String, String) =
+            if !planned_inputs.is_empty() {
+                ensure!(planned_inputs.len() == 1,
+                    "immediate activity IO result lacks one planned input capture");
+                let (scope_id, node_id, token_id, input_index, group_id, occurrence_id) = planned_inputs[0];
+                ensure!(plan.events.get(*input_index).is_some_and(|event|
+                        event.kind == "activity_io_input_captured"
+                            && event.scope_id == *scope_id
+                            && event.node_id.as_deref() == Some(node_id.as_str())
+                            && event.data["activation_token_id"].as_str()
+                                == Some(token_id.as_str()))
+                    && plan.event_ids.get(input_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && !plan.event_sources.contains_key(input_index)
+                    && *input_index < fact.result_event_index,
+                    "immediate activity IO result changed its captured input source");
+                ("input_captured".to_owned(), token_id.clone(), node_id.clone(),
+                    scope_id.clone(), match (group_id, occurrence_id) {
+                        (Some(_), Some(_)) => "ordinal",
+                        (Some(_), None) => "coordinator",
+                        (None, None) => "ordinary",
+                        _ => bail!("activity IO input has an incomplete owner"),
+                    }.to_owned())
+            } else {
+                ensure!(planned_inputs.is_empty(),
+                    "persisted activity IO result reused a planned input capture");
+                tx.query_row(
+                    "SELECT phase,token_id,node_id,scope_id,phase_owner FROM bpmn_activity_io_witnesses \
+                     WHERE witness_id=?1 AND instance_id=?2",
+                    params![fact.witness_id, instance_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                        row.get(3)?, row.get(4)?)),
+                ).context("activity IO result lacks its persisted input witness")?
+            };
+        ensure!(phase == "input_captured" && token_id == fact.token_id
+            && node_id == fact.node_id && scope_id == fact.scope_id,
+            "activity IO result changed its captured activation");
+        ensure!(node.activity_io.is_some(),
+            "activity IO result has no authored selected-body IO");
+        let event = plan.events.get(fact.result_event_index)
+            .context("activity IO result event is missing")?;
+        let accepted_event_id = plan.event_ids.get(&fact.result_event_index)
+            .context("activity IO result accepted event has no UUID")?;
+        ensure!(event.scope_id == fact.scope_id
+            && event.node_id.as_deref() == Some(fact.node_id.as_str())
+            && (matches!(&node.kind, ProcessNodeKind::CallActivity(_))
+                || accepted_event_id == &fact.source_event_id)
+            && Uuid::parse_str(accepted_event_id).is_ok()
+            && Uuid::parse_str(&fact.source_event_id).is_ok(),
+            "activity IO result changed its accepted event identity");
+        if phase_owner == "ordinal" {
+            validate_repetition_ordinal_activity_io_result_on(
+                tx, instance_id, plan, fact)?;
+        }
+        if phase_owner == "coordinator" {
+            validate_repetition_coordinator_activity_io_result_on(
+                tx, instance_id, model, &selected_process_id, scopes, plan,
+                variable_states, fact, node, event)?;
+        } else {
+        match &node.kind {
+            ProcessNodeKind::ServiceTask { input_mapping, .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated Service IO needs its frozen ordinal result proof");
+                let EntryAuthority::Accepted(AcceptedInputRef::Service {
+                    job_id, attempt, fence, result_event_id,
+                }) = entry else {
+                    bail!("Service IO result lacks its accepted fenced command")
+                };
+                let (invocation_id, invocation_phase, observed_json,
+                    reserved_event_id, job_scope, job_node, job_token,
+                    actual_attempt, actual_fence, job_input_json):
+                    (String, String, String, String, String, String, String, u32, u64, String) =
+                    tx.query_row(
+                        "SELECT v.invocation_id,v.phase,v.observed_result_json, \
+                         v.reserved_result_event_id,j.scope_id,j.node_id,j.token_id, \
+                         j.attempt,j.fence,j.input_json FROM bpmn_service_invocations v \
+                         JOIN bpmn_jobs j ON j.job_id=v.job_id \
+                         WHERE v.job_id=?1 AND v.instance_id=?2",
+                        params![job_id, instance_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                            row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+                            row.get(7)?, row_u64(row, 8)?, row.get(9)?)),
+                    )?;
+                let replay_extra = activity_io_replay_extra_on(
+                    tx, instance_id, plan, &fact.witness_id,
+                    &fact.scope_id, &fact.node_id, &fact.token_id,
+                )?;
+                let expected_variables = if phase_owner == "ordinal" {
+                    let source = activity_io_input_source_on(
+                        tx, instance_id, plan, &fact.witness_id,
+                        &fact.scope_id, &fact.node_id, &fact.token_id,
+                    )?;
+                    let occurrence_id = source.occurrence_id.as_deref()
+                        .context("repeated Service result has no occurrence")?;
+                    let occurrence = if let Some(row) = plan.repetition_occurrences.iter()
+                        .find(|occurrence| occurrence.occurrence_id == occurrence_id).cloned() {
+                        row
+                    } else {
+                        repetition_occurrences_on(tx, instance_id)?.into_iter()
+                            .find(|occurrence| occurrence.occurrence_id == occurrence_id)
+                            .context("repeated Service result has no source variables")?
+                    };
+                    occurrence.input_variables
+                } else {
+                    let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                        VariableEffect::Mapped { event_index, .. }
+                        | VariableEffect::ScopeEntry { event_index, .. }
+                        | VariableEffect::RepetitionAggregate { event_index, .. }
+                        | VariableEffect::RepetitionEntry { event_index, .. } =>
+                            *event_index < fact.result_event_index,
+                    }).count();
+                    let states = variable_states.get(effect_count)
+                        .context("Service result has no source-time variables")?;
+                    let root = states.get(instance_id)
+                        .context("Service result has no source root variables")?;
+                    effective_scope_variables(scopes, states, instance_id, root,
+                        &fact.scope_id)?
+                };
+                ensure!(parse::<Value>(job_input_json.clone())?
+                    == super::runtime::prepare_service_input(
+                        input_mapping, &expected_variables, &replay_extra)?,
+                    "Service job input differs from its authenticated activity inputs");
+                let observed: ObservedActivityResult = parse(observed_json)?;
+                let mut expected_event = serde_json::to_value(&observed.result)?;
+                expected_event["result_origin"] = serde_json::json!(
+                    result_origin_text(&observed.origin));
+                ensure!(invocation_phase == "observed"
+                    && fact.service_invocation_id.as_deref() == Some(invocation_id.as_str())
+                    && fact.resource_id.as_deref() == Some(job_id.as_str())
+                    && fact.resource_revision == Some(*fence)
+                    && actual_attempt == *attempt && actual_fence == *fence
+                    && job_scope == fact.scope_id && job_node == fact.node_id
+                    && job_token == fact.token_id
+                    && reserved_event_id == *result_event_id
+                    && fact.source_instance_id == instance_id
+                    && fact.source_event_id == *result_event_id
+                    && fact.result_sources == vec![result_event_id.clone()]
+                    && fact.accepted_origin.as_ref() == Some(&observed.origin)
+                    && fact.observed == IoObservedValue::Present {
+                        value: observed.result.outputs.clone() }
+                    && event.kind == "service_result" && event.data == expected_event
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && plan.complete_job_ids.iter().filter(|id| *id == job_id).count() == 1,
+                    "Service IO result differs from its original fenced observation");
+            }
+            ProcessNodeKind::UserTask { .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated User IO needs its frozen ordinal result proof");
+                let EntryAuthority::Accepted(AcceptedInputRef::Human {
+                    task_id, expected_task_revision,
+                    ..
+                }) = entry else {
+                    bail!("User IO result lacks its accepted Human command")
+                };
+                let (task_scope, task_node, task_token, kind, status,
+                    revision, outputs_json):
+                    (String, String, String, String, String, u64, String) =
+                    tx.query_row(
+                        "SELECT scope_id,node_id,token_id,kind,status,revision,outputs_json \
+                         FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+                        params![instance_id, task_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
+                            row.get(3)?, row.get(4)?, row_u64(row, 5)?, row.get(6)?)),
+                    )?;
+                let outputs: Value = parse(outputs_json)?;
+                let waiting = termination_token_on(tx, instance_id, plan,
+                    &fact.token_id)?;
+                ensure!(revision == *expected_task_revision
+                    && task_scope == fact.scope_id && task_node == fact.node_id
+                    && task_token == fact.token_id && kind == "work"
+                    && status == "open" && waiting.status == "waiting"
+                    && waiting.scope_id == fact.scope_id
+                    && waiting.node_id == fact.node_id
+                    && fact.resource_id.as_deref() == Some(task_id.as_str())
+                    && fact.resource_revision == Some(*expected_task_revision)
+                    && fact.service_invocation_id.is_none()
+                    && fact.source_instance_id == instance_id
+                    && plan.event_ids.get(&fact.result_event_index)
+                        == Some(&fact.source_event_id)
+                    && fact.result_sources == vec![fact.source_event_id.clone()]
+                    && fact.observed == IoObservedValue::Present {
+                        value: outputs.clone() }
+                    && fact.accepted_origin.is_none()
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && event.kind == "user_result_accepted"
+                    && event.data == serde_json::json!({
+                        "user_task_id":task_id,
+                        "task_revision":revision,
+                        "activation_token_id":fact.token_id,
+                        "outputs":outputs,
+                    }),
+                    "User IO result differs from its staged accepted Work response");
+                match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } => {
+                        let completed = plan.events.iter().enumerate().filter(|(index, event)|
+                            *index > *output_event_index
+                                && event.kind == "user_task_completed"
+                                && event.scope_id == fact.scope_id
+                                && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "user_task_id":task_id,"outputs":outputs,
+                                })).count();
+                        ensure!(completed == 1
+                            && plan.complete_user_task_ids.iter().filter(|id|
+                                *id == task_id).count() == 1
+                            && plan.consume_token_ids.iter().filter(|id|
+                                *id == &fact.token_id).count() == 1,
+                            "User IO applied result lacks its one factual task completion");
+                    }
+                    ActivityIoResultDisposition::Blocked { .. } => {
+                        ensure!(!plan.complete_user_task_ids.contains(task_id)
+                            && !plan.cancel_user_task_ids.contains(task_id)
+                            && !plan.consume_token_ids.contains(&fact.token_id)
+                            && !plan.cancel_token_ids.contains(&fact.token_id)
+                            && !plan.events.iter().any(|event|
+                                event.kind == "user_task_completed"
+                                    && event.data["user_task_id"] == *task_id),
+                            "User IO blocked result changed its open task or activation");
+                    }
+                    ActivityIoResultDisposition::Retained { .. } =>
+                        bail!("User Work IO cannot retain an alternate result route"),
+                }
+            }
+            ProcessNodeKind::ManualTask { .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated Manual IO needs its frozen ordinal result proof");
+                let EntryAuthority::Accepted(AcceptedInputRef::ManualAcknowledgment {
+                    task_id, expected_task_revision, ..
+                }) = entry else {
+                    bail!("Manual IO result lacks its accepted acknowledgment")
+                };
+                let (task_scope, task_node, task_token, kind, status, revision,
+                    assignee, outputs_json):
+                    (String, String, String, String, String, u64, String, String) =
+                    tx.query_row(
+                        "SELECT scope_id,node_id,token_id,kind,status,revision, \
+                         assignee_user_id,outputs_json FROM bpmn_user_tasks \
+                         WHERE instance_id=?1 AND user_task_id=?2",
+                        params![instance_id,task_id],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                            row.get(3)?,row.get(4)?,row_u64(row,5)?,
+                            row.get(6)?,row.get(7)?)),
+                    )?;
+                let waiting = termination_token_on(tx, instance_id, plan,
+                    &fact.token_id)?;
+                ensure!(revision == *expected_task_revision
+                    && task_scope == fact.scope_id && task_node == fact.node_id
+                    && task_token == fact.token_id && kind == "manual"
+                    && status == "open" && parse::<Value>(outputs_json)?.is_null()
+                    && waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+                    && waiting.node_id == fact.node_id
+                    && fact.resource_id.as_deref() == Some(task_id.as_str())
+                    && fact.resource_revision == Some(revision)
+                    && fact.service_invocation_id.is_none()
+                    && fact.source_instance_id == instance_id
+                    && fact.result_sources == vec![fact.source_event_id.clone()]
+                    && fact.observed == IoObservedValue::Present { value: Value::Null }
+                    && fact.accepted_origin.is_none()
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && event.kind == "manual_result_accepted"
+                    && event.data == serde_json::json!({
+                        "user_task_id":task_id,
+                        "task_revision":revision,
+                        "activation_token_id":fact.token_id,
+                        "acknowledged_by_user_id":assignee,
+                        "result_presence":"present",
+                        "result":null,
+                    }),
+                    "Manual IO result differs from its factual null acknowledgment");
+                match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } => {
+                        ensure!(plan.events.iter().enumerate().filter(|(index,event)|
+                            *index > *output_event_index
+                                && event.kind == "manual_task_acknowledged"
+                                && event.scope_id == fact.scope_id
+                                && event.node_id.as_deref() == Some(fact.node_id.as_str())
+                                && event.data == serde_json::json!({
+                                    "user_task_id":task_id,
+                                    "acknowledged_by_user_id":assignee,
+                                })).count() == 1
+                            && plan.complete_user_task_ids.iter().filter(|id|
+                                *id == task_id).count() == 1
+                            && plan.consume_token_ids.iter().filter(|id|
+                                *id == &fact.token_id).count() == 1,
+                            "Manual IO applied result lacks its one factual acknowledgment");
+                    }
+                    ActivityIoResultDisposition::Blocked { .. } => {
+                        ensure!(!plan.complete_user_task_ids.contains(task_id)
+                            && !plan.cancel_user_task_ids.contains(task_id)
+                            && !plan.consume_token_ids.contains(&fact.token_id)
+                            && !plan.cancel_token_ids.contains(&fact.token_id)
+                            && !plan.events.iter().any(|event|
+                                event.kind == "manual_task_acknowledged"
+                                    && event.data["user_task_id"] == *task_id),
+                            "Manual IO blocked result changed its open task or activation");
+                    }
+                    ActivityIoResultDisposition::Retained { .. } =>
+                        bail!("Manual IO cannot retain an alternate result route"),
+                }
+            }
+            ProcessNodeKind::ReceiveTask { .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated Receive IO needs its frozen ordinal result proof");
+                let EntryAuthority::Accepted(AcceptedInputRef::Message {
+                    org_id, sender_user_id, message_id, expected_message_revision,
+                    target_subscription_id: Some(subscription_id),
+                    expected_subscription_revision: Some(subscription_revision),
+                }) = entry else {
+                    bail!("Receive IO result lacks its accepted message receipt")
+                };
+                let subscription = subscription_on(tx, subscription_id)?;
+                let message = message_on(tx, &MessageKey {
+                    org_id: org_id.clone(), sender_user_id: sender_user_id.clone(),
+                    message_id: message_id.clone(),
+                }, true)?;
+                let payload = message.payload.as_ref()
+                    .context("Receive IO result lost its immutable message payload")?;
+                let metadata = serde_json::json!({
+                    "message_id":message.key.message_id,
+                    "sender_user_id":message.key.sender_user_id,
+                    "message_name":message.message_name,
+                    "correlation_key":message.correlation_key,
+                    "received_at_ms":message.received_at_ms,
+                    "expires_at_ms":message.expires_at_ms,
+                    "payload_sha256":message.payload_sha256,
+                });
+                let waiting = termination_token_on(tx, instance_id, plan,
+                    &fact.token_id)?;
+                ensure!(subscription.instance_id == instance_id
+                    && subscription.scope_id == fact.scope_id
+                    && subscription.node_id == fact.node_id
+                    && subscription.token_id == fact.token_id
+                    && subscription.kind == ProcessSubscriptionKind::ReceiveTask
+                    && subscription.status == ProcessSubscriptionStatus::Open
+                    && subscription.revision == *subscription_revision
+                    && message.revision == *expected_message_revision
+                    && matches!(message.status,
+                        ProcessMessageStatus::Pending | ProcessMessageStatus::Blocked)
+                    && fact.resource_id.as_deref() == Some(subscription_id.as_str())
+                    && fact.resource_revision == Some(*subscription_revision)
+                    && fact.service_invocation_id.is_none()
+                    && fact.source_instance_id == instance_id
+                    && fact.result_sources == vec![fact.source_event_id.clone()]
+                    && fact.observed == IoObservedValue::Present { value: payload.clone() }
+                    && fact.accepted_origin.is_none()
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && event.kind == "message_delivered"
+                    && event.data == serde_json::json!({
+                        "subscription_id":subscription_id,
+                        "attached_token_id":subscription.token_id,
+                        "message_id":message_id,
+                        "message":metadata,
+                        "payload":payload,
+                    })
+                    && waiting.status == "waiting"
+                    && waiting.scope_id == fact.scope_id
+                    && waiting.node_id == fact.node_id
+                    && plan.subscription_updates.iter().filter(|update|
+                        update.subscription_id == *subscription_id
+                            && update.expected_revision == *subscription_revision
+                            && update.status == ProcessSubscriptionStatus::Consumed).count() == 1,
+                    "Receive IO result differs from its accepted message and subscription");
+                match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } => {
+                        ensure!(plan.consume_token_ids.iter().filter(|id|
+                            *id == &fact.token_id).count() == 1
+                            && plan.events.iter().enumerate().filter(|(index,completion)|
+                                *index > *output_event_index
+                                    && completion.kind == "receive_task_completed"
+                                    && completion.scope_id == fact.scope_id
+                                    && completion.node_id.as_deref()
+                                        == Some(fact.node_id.as_str())
+                                    && completion.data == serde_json::json!({
+                                        "subscription_id":subscription_id,
+                                        "attached_token_id":fact.token_id,
+                                        "message_id":message_id,
+                                    })).count() == 1,
+                            "Receive IO applied result lacks its one factual completion");
+                    }
+                    ActivityIoResultDisposition::Blocked { .. } => {
+                        ensure!(!plan.consume_token_ids.contains(&fact.token_id)
+                            && !plan.cancel_token_ids.contains(&fact.token_id)
+                            && !plan.events.iter().any(|event|
+                                event.kind == "receive_task_completed"
+                                    && event.scope_id == fact.scope_id
+                                    && event.node_id.as_deref()
+                                        == Some(fact.node_id.as_str())),
+                            "Receive IO blocked result changed its live activation");
+                    }
+                    ActivityIoResultDisposition::Retained { .. } =>
+                        bail!("Receive IO cannot retain an alternate result route"),
+                }
+            }
+            ProcessNodeKind::ScriptTask { script, .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated Script IO needs its frozen ordinal result proof");
+                let captured = plan.activity_io_inputs.iter().filter_map(|input| match input {
+                    ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                        source_token_id, activation_token_id, event_index, .. }
+                        if witness_id == &fact.witness_id && scope_id == &fact.scope_id
+                            && node_id == &fact.node_id
+                            && activation_token_id == &fact.token_id =>
+                            Some((source_token_id, event_index)),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                ensure!(captured.len() == 1 && *captured[0].1 < fact.result_event_index,
+                    "Script IO result lost its one factual same-plan input capture");
+                let source = termination_token_on(tx, instance_id, plan, captured[0].0)?;
+                let activation = termination_token_on(tx, instance_id, plan,
+                    &fact.token_id)?;
+                let state_index = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. }
+                    | VariableEffect::RepetitionAggregate { event_index, .. }
+                    | VariableEffect::RepetitionEntry { event_index, .. } =>
+                        *event_index < fact.result_event_index,
+                }).count();
+                let states = variable_states.get(state_index)
+                    .context("Script IO result lacks its source-time variables")?;
+                let root = states.get(instance_id)
+                    .context("Script IO result lacks its root variables")?;
+                let effective = effective_scope_variables(scopes, states,
+                    instance_id, root, &fact.scope_id)?;
+                let replay_extra = activity_io_replay_extra_on(
+                    tx, instance_id, plan, &fact.witness_id,
+                    &fact.scope_id, &fact.node_id, &fact.token_id,
+                )?;
+                let effective = if phase_owner == "ordinal" {
+                    let source = activity_io_input_source_on(
+                        tx, instance_id, plan, &fact.witness_id,
+                        &fact.scope_id, &fact.node_id, &fact.token_id,
+                    )?;
+                    let occurrence_id = source.occurrence_id.as_deref()
+                        .context("repeated Script result has no occurrence")?;
+                    let occurrence = if let Some(row) = plan.repetition_occurrences.iter()
+                        .find(|occurrence| occurrence.occurrence_id == occurrence_id).cloned() {
+                        row
+                    } else {
+                        repetition_occurrences_on(tx, instance_id)?.into_iter()
+                            .find(|occurrence| occurrence.occurrence_id == occurrence_id)
+                            .context("repeated Script result has no source variables")?
+                    };
+                    occurrence.input_variables
+                } else {
+                    effective
+                };
+                let outputs = super::runtime::script_evaluate(script,
+                    &effective, &Value::Null, &replay_extra)?;
+                let observed = IoObservedValue::Present { value: outputs.clone() };
+                ensure!(source.status == "ready" && source.scope_id == fact.scope_id
+                    && source.node_id == fact.node_id
+                    && activation.status == "waiting"
+                    && activation.scope_id == fact.scope_id
+                    && activation.node_id == fact.node_id
+                    && plan.token_sources.get(&fact.token_id) == Some(captured[0].0)
+                    && fact.source_instance_id == instance_id
+                    && fact.result_sources == vec![fact.source_event_id.clone()]
+                    && fact.observed == observed
+                    && fact.accepted_origin.is_none()
+                    && fact.resource_id.is_none() && fact.resource_revision.is_none()
+                    && fact.service_invocation_id.is_none()
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && event.kind == "script_result_evaluated"
+                    && !plan.event_sources.contains_key(&fact.result_event_index)
+                    && event.data == serde_json::json!({
+                        "source_activation_id":fact.token_id,
+                        "outputs":outputs,
+                        "result_sha256":activity_io_result_sha256(&observed)?,
+                    }),
+                    "Script IO result differs from its independently evaluated body");
+                match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } => {
+                        ensure!(plan.consume_token_ids.iter().filter(|id|
+                                *id == &fact.token_id).count() == 1
+                            && plan.events.iter().enumerate().filter(|(index, completion)|
+                                *index > *output_event_index
+                                    && completion.kind == "script_completed"
+                                    && completion.scope_id == fact.scope_id
+                                    && completion.node_id.as_deref()
+                                        == Some(fact.node_id.as_str())
+                                    && completion.data == serde_json::json!({"outputs":outputs})
+                                    && plan.event_sources.get(index)
+                                        == Some(&fact.token_id)).count() == 1,
+                            "Script IO applied result lacks its one factual completion");
+                    }
+                    ActivityIoResultDisposition::Blocked { .. } => {
+                        ensure!(!plan.consume_token_ids.contains(&fact.token_id)
+                            && !plan.cancel_token_ids.contains(&fact.token_id)
+                            && !plan.events.iter().enumerate().any(|(index, completion)|
+                                completion.kind == "script_completed"
+                                    && plan.event_sources.get(&index)
+                                        == Some(&fact.token_id)),
+                            "Script IO blocked result falsely completed its body");
+                    }
+                    ActivityIoResultDisposition::Retained {
+                        fate: ActivityIoRetainedFate::ScriptMappingFailure, .. } => {}
+                    ActivityIoResultDisposition::Retained { .. } =>
+                        bail!("Script IO has no other accepted-result route"),
+                }
+            }
+            ProcessNodeKind::SendTask { .. } => {
+                ensure!(matches!(phase_owner.as_str(), "ordinary" | "ordinal"),
+                    "repeated Send IO needs its frozen ordinal admission proof");
+                let source = termination_token_on(tx, instance_id, plan,
+                    &fact.token_id)?;
+                let queued = plan.create_messages.iter().filter(|message|
+                    message.source_event_index == fact.result_event_index
+                        && message.source_scope_id == fact.scope_id
+                        && message.source_node_id == fact.node_id
+                        && message.source_activation_id == fact.token_id)
+                    .collect::<Vec<_>>();
+                ensure!(queued.len() == 1,
+                    "Send IO result lacks one factual admitted outbox row");
+                let message = &queued[0].message;
+                let replay_extra = activity_io_replay_extra_on(
+                    tx, instance_id, plan, &fact.witness_id,
+                    &fact.scope_id, &fact.node_id, &fact.token_id,
+                )?;
+                let expected_variables = if phase_owner == "ordinal" {
+                    let source = activity_io_input_source_on(
+                        tx, instance_id, plan, &fact.witness_id,
+                        &fact.scope_id, &fact.node_id, &fact.token_id,
+                    )?;
+                    let occurrence_id = source.occurrence_id.as_deref()
+                        .context("repeated Send result has no occurrence")?;
+                    let occurrence = if let Some(row) = plan.repetition_occurrences.iter()
+                        .find(|occurrence| occurrence.occurrence_id == occurrence_id).cloned() {
+                        row
+                    } else {
+                        repetition_occurrences_on(tx, instance_id)?.into_iter()
+                            .find(|occurrence| occurrence.occurrence_id == occurrence_id)
+                            .context("repeated Send result has no source variables")?
+                    };
+                    occurrence.input_variables
+                } else {
+                    let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                        VariableEffect::Mapped { event_index, .. }
+                        | VariableEffect::ScopeEntry { event_index, .. }
+                        | VariableEffect::RepetitionAggregate { event_index, .. }
+                        | VariableEffect::RepetitionEntry { event_index, .. } =>
+                            *event_index < fact.result_event_index,
+                    }).count();
+                    let states = variable_states.get(effect_count)
+                        .context("Send result has no source-time variables")?;
+                    let root = states.get(instance_id)
+                        .context("Send result has no source root variables")?;
+                    effective_scope_variables(scopes, states, instance_id, root,
+                        &fact.scope_id)?
+                };
+                let mut expected_message = super::messages::prepare_throw(
+                    model, node, &expected_variables, &replay_extra,
+                )?;
+                expected_message.message_id = message.message_id.clone();
+                ensure!(serde_json::to_value(expected_message)?
+                    == serde_json::to_value(message)?,
+                    "Send IO result differs from its replayed message body");
+                ensure!(source.status == "waiting"
+                    && source.scope_id == fact.scope_id
+                    && source.node_id == fact.node_id
+                    && fact.source_instance_id == instance_id
+                    && fact.result_sources == vec![fact.source_event_id.clone()]
+                    && fact.observed == IoObservedValue::Present {
+                        value: message.payload.clone() }
+                    && fact.resource_id.as_deref()
+                        == Some(message.message_id.as_str())
+                    && fact.resource_revision.is_none()
+                    && fact.accepted_origin.is_none()
+                    && fact.service_invocation_id.is_none()
+                    && fact.child_scope_id.is_none() && fact.call_id.is_none()
+                    && fact.child_instance_id.is_none()
+                    && fact.child_expected_revision.is_none()
+                    && fact.child_status.is_none()
+                    && fact.parent_wait_token_id.is_none()
+                    && event.kind == "send_task_admitted"
+                    && plan.event_sources.get(&fact.result_event_index)
+                        == Some(&fact.token_id)
+                    && event.data == serde_json::json!({
+                        "message_id":message.message_id,
+                        "source_activation_id":fact.token_id,
+                        "target":message.target,
+                        "message_name":message.message_name,
+                        "correlation_key":message.correlation_key,
+                    }),
+                    "Send IO result differs from its admitted payload and outbox identity");
+                match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { .. } => {
+                        ensure!(plan.consume_token_ids.iter().filter(|id|
+                            *id == &fact.token_id).count() == 1,
+                            "applied Send IO did not consume its admitted activation");
+                    }
+                    ActivityIoResultDisposition::Blocked { .. } => {
+                        ensure!(!plan.consume_token_ids.contains(&fact.token_id)
+                            && !plan.cancel_token_ids.contains(&fact.token_id),
+                            "blocked Send IO changed its accepted waiting activation");
+                    }
+                    ActivityIoResultDisposition::Retained { .. } =>
+                        bail!("Send IO has no alternate result route"),
+                }
+            }
+            ProcessNodeKind::SubProcess { .. } => {
+                validate_subprocess_activity_io_result_on(tx, instance_id, model,
+                    &selected_process_id, scopes, plan, variable_states, fact, node,
+                    event, &phase_owner)?;
+            }
+            ProcessNodeKind::CallActivity(_) => {
+                validate_call_activity_io_result_on(tx, instance_id, model,
+                    &selected_process_id, scopes, plan, fact, node, event,
+                    &phase_owner)?;
+            }
+            _ => bail!("activity IO result kind lacks its independent accepted-source proof"),
+        }
+        }
+        match &fact.disposition {
+            ActivityIoResultDisposition::Applied { output_event_index,
+                ordered_outputs, local_patch } => {
+                ensure!(output_events.insert(*output_event_index)
+                    && *output_event_index > fact.result_event_index,
+                    "activity IO applied output is out of order or duplicated");
+                let output = plan.events.get(*output_event_index)
+                    .context("activity IO applied output event is missing")?;
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, scope_id, node_id,
+                        source_token_id, activity_io_outputs: Some(actual), result, .. }
+                        if event_index == output_event_index && scope_id == &fact.scope_id
+                            && node_id == &fact.node_id && source_token_id == &fact.token_id
+                            && actual == ordered_outputs && result == local_patch => true,
+                    VariableEffect::RepetitionAggregate { output_event_index: Some(event_index),
+                        scope_id, group_id, parent_token_id, activity_io_outputs: Some(actual),
+                        result, .. }
+                        if event_index == output_event_index && scope_id == &fact.scope_id
+                            && group_id.is_empty() == false && parent_token_id == &fact.token_id
+                            && actual == ordered_outputs && result == local_patch => true,
+                    _ => false,
+                }).count();
+                ensure!(output.kind == "activity_io_output_applied"
+                    && output.scope_id == fact.scope_id
+                    && output.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && output.data == serde_json::json!({
+                        "source_token_id":fact.token_id,
+                        "ordered_outputs":ordered_outputs,
+                        "local_patch":local_patch,
+                    }) && plan.event_ids.get(output_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && !plan.event_sources.contains_key(output_event_index)
+                    && effect_count == 1,
+                    "activity IO applied output lacks its exact accepted effect");
+            }
+            ActivityIoResultDisposition::Blocked { incident_event_index,
+                incident_id, association_id, position } => {
+                ensure!(plan.activity_io_results.iter().filter(|candidate|
+                    candidate.scope_id == fact.scope_id
+                        && candidate.node_id == fact.node_id
+                        && candidate.token_id == fact.token_id
+                        && matches!(&candidate.disposition,
+                            ActivityIoResultDisposition::Blocked { .. })).count() == 1,
+                    "activity IO blockage has more than one reverse result writer");
+                let empty_mapping = BTreeMap::new();
+                let output_mapping = match &node.kind {
+                    ProcessNodeKind::ServiceTask { output_mapping, .. }
+                    | ProcessNodeKind::UserTask { output_mapping, .. }
+                    | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+                    | ProcessNodeKind::ScriptTask { output_mapping, .. }
+                    | ProcessNodeKind::SubProcess { output_mapping, .. }
+                    | ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. }) =>
+                        output_mapping,
+                    ProcessNodeKind::ManualTask { .. }
+                    | ProcessNodeKind::SendTask { .. } => &empty_mapping,
+                    _ => bail!("blocked activity IO kind lacks its independent output proof"),
+                };
+                let io = node.activity_io.as_ref()
+                    .context("blocked activity IO lost its authored associations")?;
+                let modeling = super::model::io_modeling(body.modeling);
+                let effect_count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. }
+                    | VariableEffect::RepetitionAggregate { event_index, .. }
+                    | VariableEffect::RepetitionEntry { event_index, .. } =>
+                        *event_index < *incident_event_index,
+                }).count();
+                let states = variable_states.get(effect_count)
+                    .context("blocked activity IO has no source-time variables")?;
+                let local = states.get(&fact.scope_id)
+                    .context("blocked activity IO has no source local variables")?;
+                let root = states.get(instance_id)
+                    .context("blocked activity IO has no source root variables")?;
+                let effective = effective_scope_variables(scopes, states,
+                    instance_id, root, &fact.scope_id)?;
+                let IoObservedValue::Present { value: outputs } = &fact.observed else {
+                    bail!("blocked Service result lost its present observation")
+                };
+                let mut extra = if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }) {
+                    vec![("message".to_owned(), event.data["message"].clone())]
+                } else { Vec::new() };
+                extra.extend(activity_io_replay_extra_on(
+                    tx, instance_id, plan, &fact.witness_id,
+                    &fact.scope_id, &fact.node_id, &fact.token_id,
+                )?);
+                let legacy = if phase_owner == "coordinator" {
+                    local.clone()
+                } else if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                    super::runtime::patch_script_variables(output_mapping,
+                        local, &effective, outputs, &extra)?
+                } else {
+                    super::runtime::patch_variables(output_mapping,
+                        local, &effective, outputs, &extra)?
+                };
+                let owner = if phase_owner == "coordinator" {
+                    super::runtime::ActivityIoOutputOwner::Coordinator
+                } else {
+                    super::runtime::ActivityIoOutputOwner::Ordinal
+                };
+                let failure = super::runtime::evaluate_activity_outputs(io, modeling,
+                    &legacy, &effective, &fact.observed, &extra,
+                    owner)
+                    .err().context("blocked activity IO mapping succeeds from factual inputs")?;
+                let failure = failure.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
+                    .context("blocked activity IO has no authored failing association")?;
+                ensure!(failure.source.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                    .is_none(), "infrastructure expression failure cannot be retained as IO blockage");
+                let expected_message = bounded_failure_message(&failure.to_string());
+                let blocked = plan.events.get(*incident_event_index)
+                    .context("activity IO blocked incident event is missing")?;
+                let incidents = plan.add_incidents.iter().filter(|incident|
+                    incident.incident_id == *incident_id
+                        && incident.scope_id == fact.scope_id
+                        && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                        && incident.code == "ACTIVITY_IO_OUTPUT_FAILED"
+                        && !incident.can_retry).collect::<Vec<_>>();
+                let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+                ensure!(*incident_event_index > fact.result_event_index
+                    && blocked.kind == "incident" && blocked.scope_id == fact.scope_id
+                    && blocked.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && blocked.data["incident_id"] == *incident_id
+                    && blocked.data["activation_token_id"] == fact.token_id
+                    && blocked.data["code"] == "ACTIVITY_IO_OUTPUT_FAILED"
+                    && blocked.data["message"] == expected_message
+                    && plan.event_ids.get(incident_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && incidents.len() == 1 && incidents[0].message == expected_message
+                    && association_id.as_deref() == Some(failure.association_id.as_str())
+                    && *position == Some(failure.position)
+                    && waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+                    && !plan.consume_token_ids.contains(&fact.token_id)
+                    && !plan.cancel_token_ids.contains(&fact.token_id)
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && source_token_id == &fact.token_id)),
+                    "activity IO blocked result changed its live activation or incident");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::ScriptMappingFailure,
+                route_event_index,
+            } => {
+                let ProcessNodeKind::ScriptTask { output_mapping, .. } = &node.kind else {
+                    bail!("Script mapping failure route changed its activity kind")
+                };
+                let IoObservedValue::Present { value: outputs } = &fact.observed else {
+                    bail!("Script mapping failure lost its evaluated output")
+                };
+                let count = plan.variable_effects.iter().filter(|effect| match effect {
+                    VariableEffect::Mapped { event_index, .. }
+                    | VariableEffect::ScopeEntry { event_index, .. }
+                    | VariableEffect::RepetitionAggregate { event_index, .. }
+                    | VariableEffect::RepetitionEntry { event_index, .. } =>
+                        *event_index < fact.result_event_index,
+                }).count();
+                let states = variable_states.get(count)
+                    .context("Script mapping failure lost its source-time variables")?;
+                let local = states.get(&fact.scope_id)
+                    .context("Script mapping failure lost its local variables")?;
+                let root = states.get(instance_id)
+                    .context("Script mapping failure lost its root variables")?;
+                let effective = effective_scope_variables(scopes, states,
+                    instance_id, root, &fact.scope_id)?;
+                let replay_extra = activity_io_replay_extra_on(
+                    tx, instance_id, plan, &fact.witness_id,
+                    &fact.scope_id, &fact.node_id, &fact.token_id,
+                )?;
+                let failure = super::runtime::patch_script_variables(output_mapping,
+                    local, &effective, outputs, &replay_extra).err()
+                    .context("Script legacy mapping succeeded but a failure route was claimed")?;
+                ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                    .is_none(), "Script infrastructure failure cannot become a retained route");
+                let message = bounded_failure_message(&failure.to_string());
+                let route = plan.events.get(*route_event_index)
+                    .context("Script mapping failure has no factual incident event")?;
+                let incident_id = route.data["incident_id"].as_str()
+                    .context("Script mapping failure lost its incident row identity")?;
+                let parked_id = route.data["parked_token_id"].as_str()
+                    .context("Script mapping failure lost its parked successor")?;
+                let source = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+                let parked = termination_token_on(tx, instance_id, plan, parked_id)?;
+                ensure!(*route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index)
+                    && route.kind == "incident" && route.scope_id == fact.scope_id
+                    && route.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && route.data == serde_json::json!({
+                        "code":"SCRIPT_MAPPING_FAILED","message":message,
+                        "incident_id":incident_id,
+                        "activation_token_id":fact.token_id,
+                        "parked_token_id":parked_id,
+                    })
+                    && plan.event_ids.get(route_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && plan.event_sources.get(route_event_index) == Some(&fact.token_id)
+                    && plan.add_incidents.iter().filter(|incident|
+                        incident.incident_id == incident_id
+                            && incident.scope_id == fact.scope_id
+                            && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                            && incident.code == "SCRIPT_MAPPING_FAILED"
+                            && incident.message == message
+                            && incident.job_id.is_none() && !incident.can_retry).count() == 1
+                    && source.status == "waiting"
+                    && parked.status == "waiting"
+                    && parked.scope_id == source.scope_id
+                    && parked.node_id == source.node_id
+                    && parked.arrival_edge_id == source.arrival_edge_id
+                    && parked.fork_stack == source.fork_stack
+                    && plan.token_sources.get(parked_id) == Some(&fact.token_id)
+                    && plan.consume_token_ids.iter().filter(|id|
+                        *id == &fact.token_id).count() == 1
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, node_id,
+                            source_token_id, .. }
+                            if scope_id == &fact.scope_id && node_id == &fact.node_id
+                                && source_token_id == &fact.token_id))
+                    && !plan.events.iter().enumerate().any(|(index, candidate)|
+                        candidate.kind == "script_completed"
+                            && plan.event_sources.get(&index) == Some(&fact.token_id)),
+                    "Script legacy mapping failure changed its accepted body or parked route");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::AwaitingVerification { user_task_id },
+                route_event_index,
+            } => {
+                let route = plan.events.get(*route_event_index)
+                    .context("retained Service IO has no verification opening event")?;
+                let tasks = plan.create_user_tasks.iter().filter(|task|
+                    task.user_task_id == *user_task_id
+                        && task.scope_id == fact.scope_id
+                        && task.node_id == fact.node_id
+                        && task.token_id.as_deref() == Some(fact.token_id.as_str())
+                        && task.kind == ProcessUserTaskKind::Verification
+                        && task.status == ProcessUserTaskStatus::Open)
+                    .collect::<Vec<_>>();
+                let mut expected_task_result = event.data.as_object()
+                    .context("retained Service IO result is not an object")?.clone();
+                expected_task_result.remove("result_origin");
+                let accepted_result: ActivityResult = serde_json::from_value(
+                    Value::Object(expected_task_result.clone()))?;
+                let ProcessNodeKind::ServiceTask { verification, .. } = &node.kind else {
+                    bail!("only Service IO may retain pending verification")
+                };
+                let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+                ensure!(*route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index)
+                    && (accepted_result.outcome == ActivityOutcome::NeedsHuman
+                        || matches!(verification,
+                            tentaflow_protocol::processes::ActivityVerification::Human))
+                    && route.kind == "user_task_opened"
+                    && route.scope_id == fact.scope_id
+                    && route.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && route.data == serde_json::json!({
+                        "user_task_id":user_task_id,
+                        "assignee_user_id":tasks.first().map(|task| task.assignee_user_id.as_str()),
+                        "kind":ProcessUserTaskKind::Verification,
+                    })
+                    && plan.event_ids.get(route_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && tasks.len() == 1
+                    && tasks[0].outputs == Value::Object(expected_task_result)
+                    && waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+                    && waiting.node_id == fact.node_id
+                    && !plan.complete_user_task_ids.contains(user_task_id)
+                    && !plan.cancel_user_task_ids.contains(user_task_id)
+                    && !plan.consume_token_ids.contains(&fact.token_id)
+                    && !plan.cancel_token_ids.contains(&fact.token_id)
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, node_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && node_id == &fact.node_id
+                                && source_token_id == &fact.token_id)),
+                    "retained Service IO changed its live verification route");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::UnhandledError
+                    | ActivityIoRetainedFate::Cancelled,
+                route_event_index,
+            } => {
+                let route = plan.events.get(*route_event_index)
+                    .context("retained Service IO has no final incident event")?;
+                let mut result_data = event.data.as_object()
+                    .context("retained Service IO result is not an object")?.clone();
+                result_data.remove("result_origin");
+                let accepted_result: ActivityResult =
+                    serde_json::from_value(Value::Object(result_data))?;
+                let expected_fate = if accepted_result.outcome == ActivityOutcome::Error {
+                    ActivityIoRetainedFate::UnhandledError
+                } else if accepted_result.outcome == ActivityOutcome::Cancelled {
+                    ActivityIoRetainedFate::Cancelled
+                } else {
+                    bail!("final Service IO incident has no final activity outcome")
+                };
+                let expected_code = accepted_result.code.as_deref()
+                    .unwrap_or("SERVICE_ERROR");
+                let route_incident_id = route.data["incident_id"].as_str()
+                    .context("retained Service IO incident lacks its row identity")?;
+                let incidents = plan.add_incidents.iter().filter(|incident|
+                    incident.incident_id == route_incident_id
+                        && incident.scope_id == fact.scope_id
+                        && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                        && incident.job_id.as_deref() == fact.resource_id.as_deref()
+                        && incident.code == expected_code
+                        && incident.message == accepted_result.summary
+                        && !incident.can_retry).count();
+                let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+                ensure!(matches!(&fact.disposition,
+                        ActivityIoResultDisposition::Retained { fate, .. }
+                            if *fate == expected_fate)
+                    && Uuid::parse_str(route_incident_id).is_ok()
+                    && *route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index)
+                    && route.kind == "incident" && route.scope_id == fact.scope_id
+                    && route.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && route.data == serde_json::json!({
+                        "incident_id":route_incident_id,
+                        "activation_token_id":fact.token_id,
+                        "code":expected_code, "message":accepted_result.summary,
+                    })
+                    && plan.event_ids.get(route_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && incidents == 1
+                    && waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+                    && waiting.node_id == fact.node_id
+                    && !plan.consume_token_ids.contains(&fact.token_id)
+                    && !plan.cancel_token_ids.contains(&fact.token_id)
+                    && !plan.create_user_tasks.iter().any(|task|
+                        task.token_id.as_deref() == Some(fact.token_id.as_str()))
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && source_token_id == &fact.token_id)),
+                    "retained Service IO changed its final incident route");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::BoundaryError { subscription_id },
+                route_event_index,
+            } => {
+                let route = plan.events.get(*route_event_index)
+                    .context("retained Service IO has no boundary error event")?;
+                let (handler_scope, handler_node, attached_token, kind, status, error_code):
+                    (String, String, String, String, String, Option<String>) = tx.query_row(
+                    "SELECT scope_id,node_id,token_id,kind,status,error_code \
+                     FROM bpmn_event_subscriptions WHERE instance_id=?1 AND subscription_id=?2",
+                    params![instance_id, subscription_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                        row.get(3)?,row.get(4)?,row.get(5)?)),
+                ).context("retained Service IO selected no factual boundary subscription")?;
+                let mut result_data = event.data.as_object()
+                    .context("retained Service IO result is not an object")?.clone();
+                result_data.remove("result_origin");
+                let accepted_result: ActivityResult =
+                    serde_json::from_value(Value::Object(result_data))?;
+                ensure!(accepted_result.outcome == ActivityOutcome::Error
+                    && fact.accepted_origin == Some(ActivityResultOrigin::Contract)
+                    && kind == "boundary_error" && status == "open"
+                    && error_code.as_deref().is_none_or(|code|
+                        Some(code) == accepted_result.code.as_deref())
+                    && *route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index)
+                    && route.kind == "business_error_caught"
+                    && route.scope_id == handler_scope
+                    && route.node_id.as_deref() == Some(handler_node.as_str())
+                    && route.data == serde_json::json!({
+                        "subscription_id":subscription_id,
+                        "attached_token_id":attached_token,
+                        "job_id":fact.resource_id,
+                        "error_code":accepted_result.code,
+                        "result_origin":"contract",
+                    })
+                    && plan.event_ids.get(route_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && plan.subscription_updates.iter().filter(|update|
+                        update.subscription_id == *subscription_id
+                            && update.status == ProcessSubscriptionStatus::Consumed).count() == 1
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, node_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && node_id == &fact.node_id
+                                && source_token_id == &fact.token_id)),
+                    "retained Service IO changed its selected boundary error route");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::BoundaryEscalation { subscription_id },
+                route_event_index,
+            } => {
+                let route = plan.events.get(*route_event_index)
+                    .context("retained Service IO has no boundary escalation event")?;
+                let (handler_scope, handler_node, attached_token, kind, status,
+                    escalation_code): (String, String, String, String, String, Option<String>) =
+                    tx.query_row(
+                        "SELECT scope_id,node_id,token_id,kind,status,escalation_code \
+                         FROM bpmn_event_subscriptions \
+                         WHERE instance_id=?1 AND subscription_id=?2",
+                        params![instance_id, subscription_id],
+                        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                            row.get(3)?,row.get(4)?,row.get(5)?)),
+                    ).context("retained Service IO selected no factual escalation subscription")?;
+                let mut result_data = event.data.as_object()
+                    .context("retained Service IO result is not an object")?.clone();
+                result_data.remove("result_origin");
+                let accepted_result: ActivityResult =
+                    serde_json::from_value(Value::Object(result_data))?;
+                ensure!(accepted_result.outcome == ActivityOutcome::NeedsHuman
+                    && fact.accepted_origin == Some(ActivityResultOrigin::Contract)
+                    && kind == "boundary_escalation" && status == "open"
+                    && escalation_code.as_deref().is_none_or(|code|
+                        Some(code) == accepted_result.code.as_deref())
+                    && *route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index)
+                    && route.kind == "escalation_caught"
+                    && route.scope_id == handler_scope
+                    && route.node_id.as_deref() == Some(handler_node.as_str())
+                    && route.data["subscription_id"].as_str() == Some(subscription_id.as_str())
+                    && route.data["attached_token_id"].as_str() == Some(attached_token.as_str())
+                    && route.data["source_token_id"].as_str() == Some(fact.token_id.as_str())
+                    && route.data["source_scope_id"].as_str() == Some(fact.scope_id.as_str())
+                    && route.data["job_id"].as_str() == fact.resource_id.as_deref()
+                    && route.data["result_event_id"].as_str() == Some(fact.source_event_id.as_str())
+                    && route.data["code"].as_str() == accepted_result.code.as_deref()
+                    && route.data["result_origin"].as_str() == Some("contract")
+                    && route.data["cancel_activity"].as_bool() == Some(true)
+                    && plan.event_ids.get(route_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && plan.subscription_updates.iter().filter(|update|
+                        update.subscription_id == *subscription_id
+                            && update.status == ProcessSubscriptionStatus::Consumed).count() == 1
+                    && !plan.create_user_tasks.iter().any(|task|
+                        task.token_id.as_deref() == Some(fact.token_id.as_str()))
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, node_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && node_id == &fact.node_id
+                                && source_token_id == &fact.token_id)),
+                    "retained Service IO changed its interrupting escalation route");
+            }
+            ActivityIoResultDisposition::Retained {
+                fate: ActivityIoRetainedFate::ScopeReturnFailure { .. },
+                route_event_index,
+            } => {
+                // The SubProcess validator above proved the return incident and its
+                // child-scope state; this only keeps the route event single-use.
+                ensure!(matches!(&node.kind, ProcessNodeKind::SubProcess { .. })
+                    && *route_event_index > fact.result_event_index
+                    && route_events.insert(*route_event_index),
+                    "retained scope-return route is out of order or reused");
+            }
+            ActivityIoResultDisposition::Retained { .. } =>
+                bail!("retained activity IO result lacks its kind-specific route proof"),
+        }
+    }
+    ensure!(plan.events.iter().enumerate().filter(|(_, event)|
+        event.kind == "activity_io_output_applied")
+        .all(|(index, _)| output_events.contains(&index)
+            || plan.activity_io_continuations.iter().any(|fact|
+                matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index, .. }
+                    if *output_event_index == index))),
+        "activity IO applied history lacks its accepted result witness");
+    for (index, event) in plan.events.iter().enumerate()
+        .filter(|(_, event)| matches!(event.kind.as_str(),
+            "service_result" | "user_result_accepted" | "manual_result_accepted"
+                | "script_result_evaluated"
+                | "message_delivered" | "scope_result_accepted"
+                | "call_result_accepted")) {
+        let node_id = event.node_id.as_deref()
+            .context("Service result has no selected node")?;
+        let path = scope_path(scopes, instance_id, &event.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Service result left its selected body")?;
+        if node.activity_io.is_some()
+            && (event.kind != "message_delivered"
+                || matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })) {
+            ensure!(result_events.contains(&index),
+                "configured activity result lacks its typed IO witness");
+        }
+    }
+    for (completion_index, completion) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "repetition_completed") {
+        let node_id = completion.node_id.as_deref()
+            .context("Repetition completion has no selected node")?;
+        let path = scope_path(scopes, instance_id, &completion.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Repetition completion left its selected body")?;
+        if node.activity_io.as_ref().and_then(|io|
+            io.coordinator_output.as_ref()).is_none() {
+            continue;
+        }
+        let parent_token_id = completion.data["parent_token_id"].as_str()
+            .context("configured Repetition completion has no parent activation")?;
+        let coordinator_facts = plan.activity_io_results.iter().filter(|fact|
+            fact.result_event_index == completion_index
+                && fact.scope_id == completion.scope_id
+                && fact.node_id == node_id
+                && fact.token_id == parent_token_id)
+            .collect::<Vec<_>>();
+        ensure!(coordinator_facts.len() == 1,
+            "configured Repetition completion lacks exactly one coordinator result fact");
+    }
+    for (completion_index, completion) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "user_task_completed") {
+        let node_id = completion.node_id.as_deref()
+            .context("User completion has no selected node")?;
+        let path = scope_path(scopes, instance_id, &completion.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("User completion left its selected body")?;
+        if node.activity_io.is_none() { continue; }
+        let task_id = completion.data["user_task_id"].as_str()
+            .context("configured User completion has no factual task")?;
+        let token_id: String = tx.query_row(
+            "SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 \
+             AND scope_id=?3 AND node_id=?4 AND kind='work' AND status='open'",
+            params![instance_id,task_id,completion.scope_id,node_id],
+            |row| row.get(0),
+        ).context("configured User completion changed its open Work activation")?;
+        ensure!(plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == completion.scope_id && fact.node_id == node_id
+                && fact.token_id == token_id
+                && fact.resource_id.as_deref() == Some(task_id)
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index, .. }
+                        if fact.result_event_index < *output_event_index
+                            && *output_event_index < completion_index)).count() == 1,
+            "configured User completion lacks its one pre-map accepted result witness");
+    }
+    for (completion_index, completion) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "manual_task_acknowledged") {
+        let node_id = completion.node_id.as_deref()
+            .context("Manual acknowledgment has no selected node")?;
+        let path = scope_path(scopes, instance_id, &completion.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Manual acknowledgment left its selected body")?;
+        if node.activity_io.is_none() { continue; }
+        let task_id = completion.data["user_task_id"].as_str()
+            .context("configured Manual acknowledgment has no factual task")?;
+        let token_id: String = tx.query_row(
+            "SELECT token_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 \
+             AND scope_id=?3 AND node_id=?4 AND kind='manual' AND status='open'",
+            params![instance_id,task_id,completion.scope_id,node_id],
+            |row| row.get(0),
+        ).context("configured Manual acknowledgment changed its open activation")?;
+        ensure!(plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == completion.scope_id && fact.node_id == node_id
+                && fact.token_id == token_id
+                && fact.resource_id.as_deref() == Some(task_id)
+                && fact.observed == IoObservedValue::Present { value: Value::Null }
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index, .. }
+                        if fact.result_event_index < *output_event_index
+                            && *output_event_index < completion_index)).count() == 1,
+            "configured Manual acknowledgment lacks its one pre-map null result witness");
+    }
+    for (completion_index, completion) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "receive_task_completed") {
+        let node_id = completion.node_id.as_deref()
+            .context("Receive completion has no selected node")?;
+        let path = scope_path(scopes, instance_id, &completion.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Receive completion left its selected body")?;
+        if node.activity_io.is_none() { continue; }
+        let subscription_id = completion.data["subscription_id"].as_str()
+            .context("configured Receive completion has no factual subscription")?;
+        let token_id = completion.data["attached_token_id"].as_str()
+            .context("configured Receive completion has no factual activation")?;
+        ensure!(plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == completion.scope_id && fact.node_id == node_id
+                && fact.token_id == token_id
+                && fact.resource_id.as_deref() == Some(subscription_id)
+                && plan.events.get(fact.result_event_index).is_some_and(|result|
+                    result.kind == "message_delivered"
+                        && result.data["subscription_id"] == subscription_id)
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index, .. }
+                        if fact.result_event_index < *output_event_index
+                            && *output_event_index < completion_index)).count() == 1,
+            "configured Receive completion lacks its one pre-map message result witness");
+    }
+    for (completion_index, completion) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "script_completed") {
+        let node_id = completion.node_id.as_deref()
+            .context("Script completion has no selected node")?;
+        let path = scope_path(scopes, instance_id, &completion.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Script completion left its selected body")?;
+        if node.activity_io.is_none() { continue; }
+        let source_id = plan.event_sources.get(&completion_index)
+            .context("configured Script completion has no factual action source")?;
+        ensure!(plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == completion.scope_id && fact.node_id == node_id
+                && fact.token_id == *source_id
+                && plan.events.get(fact.result_event_index).is_some_and(|result|
+                    result.kind == "script_result_evaluated")
+                && matches!(&fact.disposition,
+                    ActivityIoResultDisposition::Applied { output_event_index, .. }
+                        if fact.result_event_index < *output_event_index
+                            && *output_event_index < completion_index)).count() == 1,
+            "configured Script completion lacks its one pre-map evaluated result witness");
+    }
+    for (admitted_index, admitted) in plan.events.iter().enumerate()
+        .filter(|(_, event)| event.kind == "send_task_admitted") {
+        let node_id = admitted.node_id.as_deref()
+            .context("Send admission has no selected node")?;
+        let path = scope_path(scopes, instance_id, &admitted.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == node_id)
+            .context("Send admission left its selected body")?;
+        if node.activity_io.is_none() { continue; }
+        let token_id = admitted.data["source_activation_id"].as_str()
+            .context("configured Send admission lost its waiting activation")?;
+        let message_id = admitted.data["message_id"].as_str()
+            .context("configured Send admission lost its outbox identity")?;
+        ensure!(plan.activity_io_results.iter().filter(|fact|
+            fact.scope_id == admitted.scope_id && fact.node_id == node_id
+                && fact.token_id == token_id
+                && fact.result_event_index == admitted_index
+                && fact.resource_id.as_deref() == Some(message_id)
+                && match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { output_event_index, .. } =>
+                        *output_event_index > admitted_index,
+                    ActivityIoResultDisposition::Blocked { incident_event_index, .. } =>
+                        *incident_event_index > admitted_index,
+                    _ => false,
+                }).count() == 1,
+            "configured Send admission lacks its one accepted payload witness");
+    }
+    Ok(())
+}
+
+fn validate_repetition_ordinal_activity_io_result_on(
+    tx: &Transaction<'_>, instance_id: &str, plan: &RuntimePlan,
+    fact: &ActivityIoResultFact,
+) -> Result<()> {
+    let planned = plan.activity_io_inputs.iter().filter_map(|input| match input {
+        ActivityIoInputFact::Captured { witness_id, group_id: Some(group_id),
+            occurrence_id: Some(occurrence_id), ordinal: Some(ordinal), .. }
+            if witness_id == &fact.witness_id =>
+                Some((group_id.clone(), occurrence_id.clone(), *ordinal)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    let persisted: Option<(String, String, u32)> = tx.query_row(
+        "SELECT group_id,occurrence_id,ordinal FROM bpmn_activity_io_witnesses \
+         WHERE instance_id=?1 AND witness_id=?2 AND phase_owner='ordinal'",
+        params![instance_id, fact.witness_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row_u32(row, 2)?)),
+    ).optional()?;
+    let identity = planned.into_iter().next().or(persisted)
+        .context("ordinal activity IO result has no group and occurrence identity")?;
+    let groups = repetition_groups_on(tx, instance_id)?;
+    let group = plan.repetition_groups.iter().find(|group|
+        group.group_id == identity.0)
+        .or_else(|| groups.iter().find(|group| group.group_id == identity.0))
+        .context("ordinal activity IO result has no factual group")?;
+    let occurrences = repetition_occurrences_on(tx, instance_id)?;
+    let occurrence = plan.repetition_occurrences.iter().find(|occurrence|
+        occurrence.occurrence_id == identity.1)
+        .or_else(|| occurrences.iter().find(|occurrence|
+            occurrence.occurrence_id == identity.1))
+        .context("ordinal activity IO result has no factual occurrence")?;
+    ensure!(group.scope_id == fact.scope_id && group.node_id == fact.node_id
+        && occurrence.group_id == group.group_id
+        && occurrence.scope_id == fact.scope_id
+        && occurrence.ordinal == identity.2
+        && occurrence.token_id == fact.token_id,
+        "ordinal activity IO result changed its group, ordinal, or activation");
+    match &fact.disposition {
+        ActivityIoResultDisposition::Applied { .. } => ensure!(
+            occurrence.status == ProcessRepetitionOccurrenceStatus::Completed,
+            "applied ordinal activity IO result has no completed occurrence"),
+        ActivityIoResultDisposition::Blocked { .. } => ensure!(
+            occurrence.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked,
+            "blocked ordinal activity IO result changed its retained occurrence"),
+        ActivityIoResultDisposition::Retained { .. } => ensure!(
+            matches!(occurrence.status,
+                ProcessRepetitionOccurrenceStatus::AwaitingVerification
+                | ProcessRepetitionOccurrenceStatus::AcceptedBlocked),
+            "retained ordinal activity IO result changed its pending occurrence"),
+    }
+    Ok(())
+}
+
+fn validate_repetition_coordinator_activity_io_result_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    selected_process_id: &str, scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], fact: &ActivityIoResultFact,
+    node: &ProcessNode, event: &PlannedEvent,
+) -> Result<()> {
+    ensure!(node.repeat.is_some(),
+        "coordinator activity IO result has no repeated activity");
+    let io = node.activity_io.as_ref()
+        .context("coordinator activity IO result has no authored IO")?;
+    ensure!(io.coordinator_output.is_some()
+        && fact.source_instance_id == instance_id
+        && fact.call_id.is_none() && fact.child_scope_id.is_none()
+        && fact.child_instance_id.is_none() && fact.child_expected_revision.is_none()
+        && fact.child_status.is_none() && fact.parent_wait_token_id.is_none()
+        && fact.resource_id.is_none() && fact.resource_revision.is_none()
+        && fact.service_invocation_id.is_none() && fact.accepted_origin.is_none()
+        && fact.result_sources.len() == 1
+        && fact.result_sources[0] == fact.source_event_id,
+        "coordinator activity IO result carried an ordinal or resource identity");
+    let persisted_group_id: Option<String> = tx.query_row(
+        "SELECT group_id FROM bpmn_activity_io_witnesses WHERE instance_id=?1 AND witness_id=?2",
+        params![instance_id, fact.witness_id], |row| row.get(0)).optional()?;
+    let group_id = plan.activity_io_inputs.iter().find_map(|input| match input {
+        ActivityIoInputFact::Captured { witness_id, group_id: Some(group_id),
+            occurrence_id: None, .. } if witness_id == &fact.witness_id =>
+            Some(group_id.clone()),
+        _ => None,
+    }).or(persisted_group_id)
+        .context("coordinator activity IO result has no group identity")?;
+    let prior_groups = repetition_groups_on(tx, instance_id)?;
+    let group = plan.repetition_groups.iter().find(|group|
+        group.group_id == group_id)
+        .or_else(|| prior_groups.iter().find(|group| group.group_id == group_id))
+        .context("coordinator activity IO result has no factual group")?;
+    ensure!(group.scope_id == fact.scope_id && group.node_id == fact.node_id
+        && group.parent_token_id == fact.token_id
+        && group.status == ProcessRepetitionGroupStatus::Completed,
+        "coordinator activity IO result changed its completed group identity");
+    let prior_occurrences = repetition_occurrences_on(tx, instance_id)?;
+    let mut occurrences = prior_occurrences.into_iter()
+        .filter(|row| row.group_id == group_id
+            && !plan.repetition_occurrences.iter().any(|changed|
+                changed.occurrence_id == row.occurrence_id))
+        .collect::<Vec<_>>();
+    occurrences.extend(plan.repetition_occurrences.iter().filter(|row|
+        row.group_id == group_id).cloned());
+    occurrences.sort_by_key(|row| row.ordinal);
+    ensure!(occurrences.len() == usize::try_from(group.completed_count)?
+        && occurrences.iter().enumerate().all(|(ordinal, row)|
+            row.ordinal == ordinal as u32
+                && row.status == ProcessRepetitionOccurrenceStatus::Completed),
+        "coordinator activity IO result does not cover its completed ordinal ledger");
+    let aggregate = Value::Array(occurrences.iter().map(|row|
+        row.aggregate_item.clone().context("coordinator aggregate item is missing"))
+        .collect::<Result<Vec<_>>>()?);
+    let event_id = plan.event_ids.get(&fact.result_event_index)
+        .context("coordinator activity IO result has no accepted event UUID")?;
+    ensure!(Uuid::parse_str(event_id).is_ok()
+        && event.scope_id == fact.scope_id
+        && event.node_id.as_deref() == Some(fact.node_id.as_str())
+        && event.kind == "repetition_completed"
+        && event.data == serde_json::json!({
+            "group_id":group_id,
+            "completed":group.completed_count,
+            "parent_token_id":fact.token_id,
+        })
+        && fact.source_event_id == *event_id
+        && fact.observed == IoObservedValue::Present { value: aggregate.clone() },
+        "coordinator activity IO result changed its factual aggregate source");
+    let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+    ensure!(waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+        && waiting.node_id == fact.node_id,
+        "coordinator activity IO result lost its parent waiting activation");
+    let path = scope_path(scopes, instance_id, &fact.scope_id)?;
+    let body = super::model::selected_body(model, selected_process_id, &path)?;
+    let modeling = super::model::io_modeling(body.modeling);
+    let effect = plan.variable_effects.iter().filter_map(|effect| match effect {
+        VariableEffect::RepetitionAggregate { event_index, scope_id,
+            group_id: effect_group, parent_token_id, aggregate: effect_aggregate,
+            activity_io_outputs, output_event_index, result, .. }
+            if *event_index == fact.result_event_index
+                && scope_id == &fact.scope_id && effect_group == &group_id
+                && parent_token_id == &fact.token_id
+                && effect_aggregate == &aggregate =>
+            Some((activity_io_outputs, output_event_index, result)),
+        _ => None,
+    }).collect::<Vec<_>>();
+    ensure!(effect.len() == 1,
+        "coordinator activity IO result lacks its unique aggregate effect");
+    let (activity_io_outputs, output_event_index, effect_result) = effect[0];
+    let pre_aggregate_effect_count = plan.variable_effects.iter().filter(|candidate| match candidate {
+        VariableEffect::Mapped { event_index, .. }
+        | VariableEffect::ScopeEntry { event_index, .. }
+        | VariableEffect::RepetitionAggregate { event_index, .. }
+        | VariableEffect::RepetitionEntry { event_index, .. } =>
+            *event_index < fact.result_event_index,
+    }).count();
+    let pre_aggregate_states = variable_states.get(pre_aggregate_effect_count)
+        .context("coordinator activity IO result has no pre-aggregate variables")?;
+    let pre_aggregate_local = pre_aggregate_states.get(&fact.scope_id)
+        .context("coordinator activity IO result has no pre-aggregate parent locals")?;
+    let mut post_aggregate_states = pre_aggregate_states.clone();
+    let mut aggregate_local = pre_aggregate_local.as_object()
+        .context("coordinator activity IO parent locals are not an object")?.clone();
+    aggregate_local.insert(group.output_collection_variable.clone(), aggregate.clone());
+    let aggregate_local = Value::Object(aggregate_local);
+    post_aggregate_states.insert(fact.scope_id.clone(), aggregate_local.clone());
+    let aggregate_root = post_aggregate_states.get(instance_id)
+        .context("coordinator activity IO result has no aggregate root variables")?;
+    let aggregate_effective = effective_scope_variables(scopes, &post_aggregate_states,
+        instance_id, aggregate_root, &fact.scope_id)?;
+    let final_effect_count = plan.variable_effects.iter().filter(|candidate| match candidate {
+        VariableEffect::Mapped { event_index, .. }
+        | VariableEffect::ScopeEntry { event_index, .. }
+        | VariableEffect::RepetitionAggregate { event_index, .. }
+        | VariableEffect::RepetitionEntry { event_index, .. } =>
+            *event_index <= fact.result_event_index,
+    }).count();
+    let final_states = variable_states.get(final_effect_count)
+        .context("coordinator activity IO result has no final variables")?;
+    let final_local = final_states.get(&fact.scope_id)
+        .context("coordinator activity IO result has no final parent locals")?;
+    let replay_extra = activity_io_replay_extra_on(
+        tx, instance_id, plan, &fact.witness_id,
+        &fact.scope_id, &fact.node_id, &fact.token_id,
+    )?;
+    let expected = super::runtime::evaluate_activity_outputs(io, modeling,
+        &aggregate_local, &aggregate_effective,
+        &fact.observed, &replay_extra,
+        super::runtime::ActivityIoOutputOwner::Coordinator);
+    match &fact.disposition {
+        ActivityIoResultDisposition::Applied { output_event_index: applied_index,
+            ordered_outputs, local_patch } => {
+            let (expected_outputs, expected_patch) = expected
+                .context("coordinator activity IO applied mapping failed during replay")?;
+            let output = plan.events.get(*applied_index)
+                .context("coordinator activity IO applied event is missing")?;
+            ensure!(*output_event_index == Some(*applied_index)
+                && activity_io_outputs.as_ref() == Some(ordered_outputs)
+                && *effect_result == *local_patch
+                && expected_outputs == *ordered_outputs
+                && expected_patch == *local_patch
+                && *applied_index > fact.result_event_index
+                && output.kind == "activity_io_output_applied"
+                && output.scope_id == fact.scope_id
+                && output.node_id.as_deref() == Some(fact.node_id.as_str())
+                && output.data == serde_json::json!({
+                    "source_token_id":fact.token_id,
+                    "ordered_outputs":ordered_outputs,
+                    "local_patch":local_patch,
+                })
+                && plan.event_ids.get(applied_index)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                && plan.consume_token_ids.iter().filter(|id| *id == &fact.token_id).count() == 1,
+                "applied coordinator activity IO result changed its aggregate effect");
+        }
+        ActivityIoResultDisposition::Blocked { incident_event_index,
+            incident_id, association_id, position } => {
+            let failure = expected.err()
+                .context("blocked coordinator activity IO mapping succeeds during replay")?;
+            let failure = failure.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
+                .context("blocked coordinator activity IO has no authored failing association")?;
+            ensure!(activity_io_outputs.is_none() && output_event_index.is_none()
+                && *effect_result == *final_local
+                && failure.source.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                    .is_none(),
+                "blocked coordinator activity IO changed its aggregate effect");
+            let incident = plan.events.get(*incident_event_index)
+                .context("blocked coordinator activity IO incident is missing")?;
+            let message = bounded_failure_message(&failure.to_string());
+            ensure!(*incident_event_index > fact.result_event_index
+                && incident.kind == "incident"
+                && incident.scope_id == fact.scope_id
+                && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                && incident.data == serde_json::json!({
+                    "code":"ACTIVITY_IO_OUTPUT_FAILED",
+                    "message":message,
+                    "incident_id":incident_id,
+                    "activation_token_id":fact.token_id,
+                })
+                && association_id.as_deref() == Some(failure.association_id.as_str())
+                && *position == Some(failure.position)
+                && plan.event_ids.get(incident_event_index)
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                && plan.add_incidents.iter().filter(|incident| {
+                    incident.incident_id == *incident_id
+                        && incident.scope_id == fact.scope_id
+                        && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                        && incident.code == "ACTIVITY_IO_OUTPUT_FAILED"
+                        && incident.message == message && !incident.can_retry
+                }).count() == 1
+                && !plan.consume_token_ids.contains(&fact.token_id)
+                && !plan.cancel_token_ids.contains(&fact.token_id),
+                "blocked coordinator activity IO result changed its incident or wait");
+        }
+        ActivityIoResultDisposition::Retained { .. } =>
+            bail!("coordinator activity IO result has an unsupported retained route"),
+    }
+    Ok(())
+}
+
+fn validate_subprocess_activity_io_result_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    selected_process_id: &str, scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], fact: &ActivityIoResultFact,
+    node: &ProcessNode, event: &PlannedEvent, phase_owner: &str,
+) -> Result<()> {
+    ensure!(matches!(&node.kind, ProcessNodeKind::SubProcess { .. })
+        && matches!(phase_owner, "ordinary" | "ordinal"),
+        "SubProcess IO result changed its authored activity owner");
+    let child_scope_id = fact.child_scope_id.as_deref()
+        .context("SubProcess IO result has no child scope")?;
+    ensure!(fact.call_id.is_none()
+        && fact.child_instance_id.is_none()
+        && fact.parent_wait_token_id.as_deref() == Some(fact.token_id.as_str())
+        && fact.source_instance_id == instance_id
+        && fact.resource_id.is_none()
+        && fact.resource_revision.is_none()
+        && fact.service_invocation_id.is_none()
+        && fact.accepted_origin.is_none(),
+        "SubProcess IO result carried Call or external-resource identity");
+    let child = scopes.iter().find(|scope| scope.scope_id == child_scope_id)
+        .context("SubProcess IO result selected no child scope")?;
+    let planned_child = plan.create_scopes.iter()
+        .filter(|created| created.scope_id == child_scope_id)
+        .collect::<Vec<_>>();
+    ensure!(planned_child.len() <= 1,
+        "SubProcess IO result duplicated its planned child scope");
+    let (actual_child_revision, actual_child_status, actual_parent_scope_id,
+        actual_parent_token_id): (u64, String, Option<String>, Option<String>) =
+        if let Some(created) = planned_child.first() {
+            ensure!(created.parent_scope_id == fact.scope_id
+                && created.parent_token_id == fact.token_id,
+                "same-plan SubProcess IO result changed its child lineage");
+            (1, "running".to_owned(), Some(created.parent_scope_id.clone()),
+                Some(created.parent_token_id.clone()))
+        } else {
+            tx.query_row(
+                "SELECT revision,status,parent_scope_id,parent_token_id FROM bpmn_scopes \
+                 WHERE instance_id=?1 AND scope_id=?2",
+                params![instance_id, child_scope_id],
+                |row| Ok((row_u64(row, 0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).context("SubProcess IO result selected no persisted child scope")?
+        };
+    ensure!(child.parent_scope_id.as_deref() == Some(fact.scope_id.as_str())
+        && child.parent_token_id.as_deref() == Some(fact.token_id.as_str())
+        && actual_parent_scope_id.as_deref() == Some(fact.scope_id.as_str())
+        && actual_parent_token_id.as_deref() == Some(fact.token_id.as_str())
+        && fact.child_expected_revision == Some(actual_child_revision)
+        && child.revision == actual_child_revision,
+        "SubProcess IO result changed its child lineage or revision");
+    let pre_status = fact.child_status.as_deref()
+        .context("SubProcess IO result has no pre-return child status")?;
+    ensure!(matches!(pre_status, "running" | "waiting")
+        && pre_status == actual_child_status
+        && matches!(actual_child_status.as_str(), "running" | "waiting"),
+        "SubProcess IO result selected a terminal or invalid child status");
+    let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+    ensure!(waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+        && waiting.node_id == fact.node_id,
+        "SubProcess IO result lost its parent waiting activation");
+
+    let persisted_end_ids = tx.prepare(
+        "SELECT event_id FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 \
+         AND kind='end_reached' AND json_type(data_json,'$.source_token_id')='text' \
+         ORDER BY seq",
+    )?.query_map(params![instance_id, child_scope_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let planned_end_ids = plan.events.iter().enumerate().filter_map(|(index, candidate)| {
+        if candidate.kind != "end_reached" || candidate.scope_id != child_scope_id
+            || candidate.data["source_token_id"].as_str().is_none() {
+            return None;
+        }
+        plan.event_ids.get(&index).cloned()
+    }).collect::<Vec<_>>();
+    let mut expected_sources = persisted_end_ids;
+    expected_sources.extend(planned_end_ids);
+    ensure!(!expected_sources.is_empty() && fact.result_sources == expected_sources,
+        "SubProcess IO result changed the ordered child End source ledger");
+    ensure!(fact.result_sources.iter().all(|id| Uuid::parse_str(id).is_ok()),
+        "SubProcess IO result has a non-UUID End source");
+    let final_source = fact.result_sources.last()
+        .context("SubProcess IO result has no final End source")?;
+    ensure!(event.kind == "scope_result_accepted"
+        && event.data == serde_json::json!({
+            "child_scope_id":child_scope_id,
+            "parent_scope_id":fact.scope_id,
+            "parent_token_id":fact.token_id,
+            "child_revision":fact.child_expected_revision,
+            "child_status":fact.child_status,
+            "end_source_event_ids":fact.result_sources,
+            "final_end_source_event_id":final_source,
+            "result_presence":"present",
+            "result":match &fact.observed {
+                IoObservedValue::Present { value } => value,
+                IoObservedValue::Missing => &Value::Null,
+            },
+            "result_sha256":activity_io_result_sha256(&fact.observed)?,
+        }),
+        "SubProcess IO result differs from its factual scope-return event");
+    let IoObservedValue::Present { value: child_locals } = &fact.observed else {
+        bail!("SubProcess IO result cannot be missing");
+    };
+    let effects_before = plan.variable_effects.iter().filter(|effect| match effect {
+        VariableEffect::Mapped { event_index, .. }
+        | VariableEffect::ScopeEntry { event_index, .. }
+        | VariableEffect::RepetitionAggregate { event_index, .. }
+        | VariableEffect::RepetitionEntry { event_index, .. } =>
+            *event_index < fact.result_event_index,
+    }).count();
+    let states = variable_states.get(effects_before)
+        .context("SubProcess IO result has no pre-return variable state")?;
+    ensure!(states.get(child_scope_id) == Some(child_locals),
+        "SubProcess IO result differs from the child local variables at End");
+
+    for source_id in &fact.result_sources {
+        if let Some((index, _)) = plan.event_ids.iter()
+            .find(|(_, id)| id.as_str() == source_id.as_str()) {
+            let source = plan.events.get(*index)
+                .context("planned SubProcess End source event is missing")?;
+            let source_token_id = source.data["source_token_id"].as_str()
+                .context("planned SubProcess End source has no token")?;
+            let source_token = termination_token_on(tx, instance_id, plan, source_token_id)?;
+            ensure!(source.kind == "end_reached" && source.scope_id == child_scope_id
+                && scope_node(model, selected_process_id, scopes, instance_id,
+                    child_scope_id, source.node_id.as_deref().unwrap_or_default())?
+                    .kind == ProcessNodeKind::End
+                && source_token.status == "ready"
+                && source_token.scope_id == child_scope_id
+                && source_token.node_id == source.node_id.as_deref().unwrap_or_default()
+                && plan.event_sources.get(index)
+                    .is_some_and(|id| id == source_token_id)
+                && plan.consume_token_ids.iter().filter(|id| *id == source_token_id).count() == 1,
+                "planned SubProcess End source is not the consumed selected End token");
+        } else {
+            let (scope_id, node_id, data_json): (String, String, String) = tx.query_row(
+                "SELECT scope_id,node_id,data_json FROM bpmn_events \
+                 WHERE instance_id=?1 AND event_id=?2 AND kind='end_reached'",
+                params![instance_id, source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).context("persisted SubProcess End source is missing")?;
+            let data: Value = parse(data_json)?;
+            let source_token_id = data["source_token_id"]
+                .as_str()
+                .context("persisted SubProcess End source has no source token")?;
+            let source_token = termination_token_on(tx, instance_id, plan, source_token_id)?;
+            ensure!(scope_id == child_scope_id
+                && source_token.status == "consumed"
+                && source_token.scope_id == child_scope_id
+                && source_token.node_id == node_id
+                && scope_node(model, selected_process_id, scopes, instance_id,
+                    child_scope_id, &node_id)?.kind == ProcessNodeKind::End,
+                "persisted SubProcess End source changed its selected node");
+        }
+    }
+
+    match &fact.disposition {
+        ActivityIoResultDisposition::Applied { .. } => {
+            let update = plan.scope_updates.iter().filter(|update|
+                update.scope_id == child_scope_id
+                    && update.status == ProcessInstanceStatus::Completed
+                    && update.variables.as_ref() == Some(child_locals)).collect::<Vec<_>>();
+            ensure!(update.len() == 1
+                && plan.consume_token_ids.iter().filter(|id| *id == &fact.token_id).count() == 1
+                && plan.events.iter().filter(|candidate|
+                    candidate.kind == "scope_completed"
+                        && candidate.scope_id == child_scope_id
+                        && candidate.node_id.is_none()
+                        && candidate.data == serde_json::json!({
+                            "scope_id":child_scope_id,
+                            "parent_scope_id":fact.scope_id,
+                            "parent_token_id":fact.token_id,
+                            "subprocess_node_id":fact.node_id,
+                        })).count() == 1,
+                "applied SubProcess IO result did not complete its child exactly once");
+        }
+        ActivityIoResultDisposition::Blocked { .. } => {
+            let updates = plan.scope_updates.iter().filter(|update|
+                update.scope_id == child_scope_id).collect::<Vec<_>>();
+            ensure!(updates.len() <= 1
+                && updates.iter().all(|update|
+                    update.status == ProcessInstanceStatus::Waiting
+                        && update.variables.is_none())
+                && !plan.consume_token_ids.contains(&fact.token_id)
+                && !plan.cancel_token_ids.contains(&fact.token_id)
+                && !plan.events.iter().any(|candidate|
+                    candidate.kind == "scope_completed"
+                        && candidate.scope_id == child_scope_id),
+                "blocked SubProcess IO result advanced its child or parent");
+        }
+        ActivityIoResultDisposition::Retained {
+            fate: ActivityIoRetainedFate::ScopeReturnFailure { incident_id },
+            route_event_index,
+        } => {
+            let child_mapped_before_return = plan.variable_effects.iter().any(|effect| matches!(
+                effect,
+                VariableEffect::Mapped { event_index, scope_id, .. }
+                    if scope_id == child_scope_id && *event_index < fact.result_event_index
+            ));
+            let failures = plan.scope_return_failures.iter().filter(|failure|
+                failure.child_scope_id == child_scope_id
+                    && failure.parent_scope_id == fact.scope_id
+                    && failure.parent_token_id == fact.token_id
+                    && failure.incident_id == *incident_id
+                    && failure.end_event_indices.iter().filter_map(|index|
+                        plan.event_ids.get(index)).cloned().collect::<Vec<_>>() == fact.result_sources
+                    && failure.child_locals == *child_locals).collect::<Vec<_>>();
+            let route = plan.events.get(*route_event_index)
+                .context("retained SubProcess IO result has no return incident")?;
+            ensure!(failures.len() == 1
+                && route.kind == "incident" && route.scope_id == child_scope_id
+                && route.node_id.is_none()
+                && route.data["incident_id"].as_str() == Some(incident_id.as_str())
+                && route.data["code"] == "SCOPE_RETURN_ERROR"
+                && plan.scope_updates.iter().filter(|update|
+                    update.scope_id == child_scope_id
+                        && update.status == ProcessInstanceStatus::Incident
+                        && update.variables.as_ref()
+                            == child_mapped_before_return.then_some(child_locals)).count() == 1
+                && !plan.consume_token_ids.contains(&fact.token_id)
+                && !plan.cancel_token_ids.contains(&fact.token_id),
+                "retained SubProcess IO result changed its exact mapping-failure route");
+        }
+        ActivityIoResultDisposition::Retained { .. } => {
+            bail!("SubProcess IO result has an unsupported retained route");
+        }
+    }
+    Ok(())
+}
+
+fn validate_call_activity_io_result_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    selected_process_id: &str, scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    fact: &ActivityIoResultFact, node: &ProcessNode, event: &PlannedEvent,
+    phase_owner: &str,
+) -> Result<()> {
+    ensure!(matches!(&node.kind, ProcessNodeKind::CallActivity(_))
+        && matches!(phase_owner, "ordinary" | "ordinal"),
+        "Call IO result changed its authored activity owner");
+    let path = scope_path(scopes, instance_id, &fact.scope_id)?;
+    let body = super::model::selected_body(model, selected_process_id, &path)?;
+    ensure!(body.nodes.iter().any(|candidate|
+        candidate.id == fact.node_id && candidate.activity_io.is_some()
+            && matches!(&candidate.kind, ProcessNodeKind::CallActivity(_))),
+        "Call IO result left its selected body");
+    let call_id = fact.call_id.as_deref().context("Call IO result has no call ID")?;
+    let child_instance_id = fact.child_instance_id.as_deref()
+        .context("Call IO result has no child instance")?;
+    ensure!(fact.child_scope_id.is_none()
+        && fact.parent_wait_token_id.as_deref() == Some(fact.token_id.as_str())
+        && fact.source_instance_id == child_instance_id
+        && fact.child_status.as_deref() == Some("completed")
+        && fact.child_expected_revision.is_some()
+        && fact.resource_id.is_none() && fact.resource_revision.is_none()
+        && fact.service_invocation_id.is_none() && fact.accepted_origin.is_none()
+        && fact.result_sources.len() == 1
+        && Uuid::parse_str(&fact.result_sources[0]).is_ok(),
+        "Call IO result changed its child completion identity");
+    let call = calls_on(tx, instance_id)?.into_iter().find(|call| {
+        call.call_id == call_id && call.parent_instance_id == instance_id
+            && call.parent_scope_id == fact.scope_id
+            && call.parent_token_id == fact.token_id
+            && call.call_node_id == fact.node_id
+            && call.child_instance_id == child_instance_id
+    }).context("Call IO result selected no exact persisted Call activation")?;
+    let (child_revision, child_status, child_definition_id, child_version,
+        child_process_id, child_variables_json): (u64, String, String, u32, String, String) =
+        tx.query_row(
+            "SELECT revision,status,definition_id,version,selected_process_id,variables_json \
+             FROM bpmn_instances WHERE instance_id=?1",
+            [child_instance_id],
+            |row| Ok((row_u64(row, 0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row.get(5)?)),
+        ).context("Call IO result child instance is missing")?;
+    ensure!(child_revision == fact.child_expected_revision.unwrap()
+        && child_status == "completed"
+        && child_definition_id == call.called_definition_id
+        && child_version == call.called_version
+        && child_process_id == call.called_process_id,
+        "Call IO result changed its pinned completed child");
+    let child_variables: Value = parse(child_variables_json)?;
+    validate_variables(&child_variables)?;
+    let (completed_count, completed_event_id): (u32, Option<String>) = tx.query_row(
+        "SELECT COUNT(*),MIN(event_id) FROM bpmn_events \
+         WHERE instance_id=?1 AND scope_id=?1 AND node_id IS NULL \
+           AND kind='instance_completed'",
+        [child_instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(completed_count == 1
+        && completed_event_id.as_deref() == Some(fact.result_sources[0].as_str()),
+        "Call IO result lacks the one immutable child instance_completed source");
+    ensure!(event.kind == "call_result_accepted"
+        && event.data == serde_json::json!({
+            "call_id":call_id,
+            "child_instance_id":child_instance_id,
+            "child_completed_event_id":fact.result_sources[0],
+            "parent_token_id":fact.token_id,
+            "child_revision":fact.child_expected_revision,
+            "child_status":"completed",
+            "result_presence":"present",
+            "result":child_variables,
+            "result_sha256":activity_io_result_sha256(&fact.observed)?,
+        })
+        && fact.observed == IoObservedValue::Present { value: child_variables.clone() },
+        "Call IO result differs from its factual child completion event");
+    let waiting = termination_token_on(tx, instance_id, plan, &fact.token_id)?;
+    ensure!(waiting.status == "waiting" && waiting.scope_id == fact.scope_id
+        && waiting.node_id == fact.node_id,
+        "Call IO result lost its parent waiting activation");
+    match &fact.disposition {
+        ActivityIoResultDisposition::Applied { .. } => {
+            ensure!(call.status == ProcessCallStatus::Returned
+                && plan.consume_token_ids.iter().filter(|id| *id == &fact.token_id).count() == 1
+                && plan.events.iter().filter(|candidate|
+                    candidate.kind == "call_returned"
+                        && candidate.scope_id == fact.scope_id
+                        && candidate.node_id.as_deref() == Some(fact.node_id.as_str())
+                        && candidate.data == serde_json::json!({
+                            "call_id":call_id,
+                            "child_instance_id":child_instance_id,
+                            "parent_token_id":fact.token_id,
+                        })).count() == 1,
+                "applied Call IO result did not return its completed child exactly once");
+        }
+        ActivityIoResultDisposition::Blocked {
+            incident_event_index, incident_id, ..
+        } => {
+            let incident = plan.events.get(*incident_event_index)
+                .context("blocked Call IO result has no output incident")?;
+            ensure!(call.status == ProcessCallStatus::ReturnIncident
+                && incident.kind == "incident" && incident.scope_id == fact.scope_id
+                && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                && incident.data["incident_id"].as_str() == Some(incident_id.as_str())
+                && incident.data["activation_token_id"].as_str() == Some(fact.token_id.as_str())
+                && incident.data["code"] == "ACTIVITY_IO_OUTPUT_FAILED"
+                && !plan.consume_token_ids.contains(&fact.token_id)
+                && !plan.cancel_token_ids.contains(&fact.token_id)
+                && !plan.events.iter().any(|candidate|
+                    candidate.kind == "call_returned"
+                        && candidate.data["call_id"].as_str() == Some(call_id)),
+                "blocked Call IO result advanced its parent return");
+        }
+        ActivityIoResultDisposition::Retained { .. } => {
+            bail!("Call IO result has an unsupported retained route");
+        }
+    }
+    Ok(())
+}
+
+fn validate_activity_io_continuations_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    let mut seen = HashSet::new();
+    for fact in &plan.activity_io_continuations {
+        ensure!(Uuid::parse_str(&fact.witness_id).is_ok()
+            && seen.insert(&fact.witness_id)
+            && !plan.activity_io_results.iter().any(|result|
+                result.witness_id == fact.witness_id),
+            "activity IO continuation repeated an accepted witness");
+        let EntryAuthority::Accepted(AcceptedInputRef::Human {
+            task_id, expected_task_revision, ..
+        }) = entry else {
+            bail!("activity IO continuation lacks its authenticated Human command")
+        };
+        ensure!(task_id == &fact.user_task_id,
+            "activity IO continuation selected another approval task");
+        let witnesses = activity_io_witnesses_on(tx, instance_id)?;
+        let witness = witnesses.iter().find(|row| row.witness_id == fact.witness_id)
+            .context("activity IO continuation lost its accepted witness")?;
+        ensure!(witness.phase == "result_accepted"
+            && matches!(witness.phase_owner.as_str(), "ordinary" | "ordinal")
+            && witness.revision == fact.expected_witness_revision
+            && witness.retained_route_kind.as_deref() == Some("awaiting_verification")
+            && witness.retained_route_resource_id.as_deref() == Some(task_id)
+            && witness.scope_id == fact.scope_id && witness.node_id == fact.node_id
+            && witness.token_id == fact.token_id
+            && witness.result_presence.as_deref() == Some("present")
+            && witness.result.as_ref() == match &fact.observed {
+                IoObservedValue::Present { value } => Some(value),
+                IoObservedValue::Missing => None,
+            }
+            && witness.result_sha256.as_deref()
+                == Some(activity_io_result_sha256(&fact.observed)?.as_str()),
+            "activity IO continuation changed its original accepted result");
+        if witness.phase_owner == "ordinal" {
+            let group_id = witness.group_id.as_deref()
+                .context("ordinal activity IO continuation has no group")?;
+            let occurrence_id = witness.occurrence_id.as_deref()
+                .context("ordinal activity IO continuation has no occurrence")?;
+            let prior_groups = repetition_groups_on(tx, instance_id)?;
+            let prior_occurrences = repetition_occurrences_on(tx, instance_id)?;
+            let group = plan.repetition_groups.iter().find(|group|
+                group.group_id == group_id)
+                .or_else(|| prior_groups.iter().find(|group| group.group_id == group_id))
+                .context("ordinal activity IO continuation has no factual group")?;
+            let occurrence = plan.repetition_occurrences.iter().find(|occurrence|
+                occurrence.occurrence_id == occurrence_id)
+                .or_else(|| prior_occurrences.iter().find(|occurrence|
+                    occurrence.occurrence_id == occurrence_id))
+                .context("ordinal activity IO continuation has no factual occurrence")?;
+            ensure!(group.scope_id == fact.scope_id && group.node_id == fact.node_id
+                && occurrence.group_id == group_id && occurrence.scope_id == fact.scope_id
+                && occurrence.token_id == fact.token_id
+                && match &fact.disposition {
+                    ActivityIoResultDisposition::Applied { .. } =>
+                        occurrence.status == ProcessRepetitionOccurrenceStatus::Completed,
+                    ActivityIoResultDisposition::Blocked { .. } =>
+                        occurrence.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked,
+                    ActivityIoResultDisposition::Retained { .. } => false,
+                },
+                "ordinal activity IO continuation changed its repeated activation");
+        }
+        let (task_scope, task_node, task_token, task_kind, task_status, task_revision,
+            stored): (String, String, String, String, String, u64, String) = tx.query_row(
+            "SELECT scope_id,node_id,token_id,kind,status,revision,outputs_json \
+             FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2",
+            params![instance_id,task_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
+                row.get(4)?,row_u64(row, 5)?,row.get(6)?)),
+        )?;
+        let accepted_result: ActivityResult = parse(stored)?;
+        ensure!(task_scope == fact.scope_id && task_node == fact.node_id
+            && task_token == fact.token_id && task_kind == "verification"
+            && task_status == "open" && task_revision == *expected_task_revision
+            && fact.observed == IoObservedValue::Present {
+                value: accepted_result.outputs.clone() }
+            && plan.complete_user_task_ids.iter().filter(|id| *id == task_id).count() == 1
+            && !plan.cancel_user_task_ids.contains(task_id),
+            "activity IO continuation lacks its one factual open Verification task");
+        let approval = plan.events.get(fact.approval_event_index)
+            .context("activity IO continuation has no approval event")?;
+        ensure!(approval.kind == "verification_approved"
+            && approval.scope_id == fact.scope_id
+            && approval.node_id.as_deref() == Some(fact.node_id.as_str())
+            && approval.data["user_task_id"].as_str() == Some(task_id)
+            && approval.data.get("outputs").is_some()
+            && plan.event_ids.get(&fact.approval_event_index)
+                .is_some_and(|id| Uuid::parse_str(id).is_ok()
+                    && witness.result_event_id.as_deref() != Some(id.as_str()))
+            && plan.events.iter().filter(|event|
+                event.kind == "verification_approved"
+                    && event.data["user_task_id"].as_str() == Some(task_id)).count() == 1,
+            "activity IO continuation changed its authenticated approval");
+        let path = scope_path(scopes, instance_id, &fact.scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == fact.node_id)
+            .context("activity IO continuation node left its selected body")?;
+        let (ProcessNodeKind::ServiceTask { output_mapping, .. }, Some(io)) =
+            (&node.kind, node.activity_io.as_ref()) else {
+            bail!("activity IO continuation lost its selected Service mapping")
+        };
+        let modeling = super::model::io_modeling(body.modeling);
+        let source_index = match &fact.disposition {
+            ActivityIoResultDisposition::Applied { output_event_index, .. } => *output_event_index,
+            ActivityIoResultDisposition::Blocked { incident_event_index, .. } => *incident_event_index,
+            ActivityIoResultDisposition::Retained { .. } =>
+                bail!("approval continuation cannot retain its result again"),
+        };
+        let effects_before = plan.variable_effects.iter().filter(|effect| match effect {
+            VariableEffect::Mapped { event_index, .. }
+            | VariableEffect::ScopeEntry { event_index, .. }
+            | VariableEffect::RepetitionAggregate { event_index, .. }
+            | VariableEffect::RepetitionEntry { event_index, .. } => *event_index < source_index,
+        }).count();
+        let states = variable_states.get(effects_before)
+            .context("approval-time IO has no replayed variable state")?;
+        let local = states.get(&fact.scope_id)
+            .context("approval-time IO has no selected local variables")?;
+        let root = states.get(instance_id)
+            .context("approval-time IO has no root variables")?;
+        let effective = effective_scope_variables(scopes, states,
+            instance_id, root, &fact.scope_id)?;
+        let replay_extra = activity_io_replay_extra_on(
+            tx, instance_id, plan, &fact.witness_id,
+            &fact.scope_id, &fact.node_id, &fact.token_id,
+        )?;
+        let legacy = super::runtime::patch_variables(output_mapping, local, &effective,
+            &accepted_result.outputs, &replay_extra)?;
+        let mapped = super::runtime::evaluate_activity_outputs(io, modeling,
+            &legacy, &effective, &fact.observed, &replay_extra,
+            super::runtime::ActivityIoOutputOwner::Ordinal);
+        match (&fact.disposition, mapped) {
+            (ActivityIoResultDisposition::Applied { output_event_index,
+                ordered_outputs, local_patch }, Ok((expected_outputs, expected_patch))) => {
+                let output = plan.events.get(*output_event_index)
+                    .context("approval IO output event is missing")?;
+                ensure!(*output_event_index < fact.approval_event_index
+                    && expected_outputs == *ordered_outputs
+                    && expected_patch == *local_patch
+                    && output.kind == "activity_io_output_applied"
+                    && output.scope_id == fact.scope_id
+                    && output.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && output.data == serde_json::json!({
+                        "source_token_id":fact.token_id,
+                        "ordered_outputs":ordered_outputs,"local_patch":local_patch})
+                    && plan.event_ids.get(output_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && plan.variable_effects.iter().filter(|effect| matches!(effect,
+                        VariableEffect::Mapped { event_index, scope_id, node_id,
+                            source_token_id, activity_io_outputs: Some(actual), result, .. }
+                            if event_index == output_event_index
+                                && scope_id == &fact.scope_id && node_id == &fact.node_id
+                                && source_token_id == &fact.token_id
+                                && actual == ordered_outputs && result == local_patch)).count() == 1
+                    && plan.consume_token_ids.iter().filter(|id|
+                        *id == &fact.token_id).count() == 1,
+                    "approval IO output changed its original result or one mapped effect");
+            }
+            (ActivityIoResultDisposition::Blocked { incident_event_index,
+                incident_id, association_id, position }, Err(error)) => {
+                let failure = error.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
+                    .context("approval IO blockage has no deterministic association")?;
+                ensure!(failure.source.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                    .is_none(), "infrastructure failure cannot become output blockage");
+                let incident = plan.events.get(*incident_event_index)
+                    .context("approval IO blockage has no incident event")?;
+                let message = bounded_failure_message(&failure.to_string());
+                ensure!(fact.approval_event_index < *incident_event_index
+                    && association_id.as_deref() == Some(failure.association_id.as_str())
+                    && *position == Some(failure.position)
+                    && incident.kind == "incident" && incident.scope_id == fact.scope_id
+                    && incident.node_id.as_deref() == Some(fact.node_id.as_str())
+                    && incident.data == serde_json::json!({
+                        "code":"ACTIVITY_IO_OUTPUT_FAILED","message":message,
+                        "incident_id":incident_id,
+                        "activation_token_id":fact.token_id})
+                    && plan.event_ids.get(incident_event_index)
+                        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                    && plan.add_incidents.iter().filter(|row|
+                        row.incident_id == *incident_id && row.scope_id == fact.scope_id
+                            && row.node_id.as_deref() == Some(fact.node_id.as_str())
+                            && row.code == "ACTIVITY_IO_OUTPUT_FAILED"
+                            && row.message == message && !row.can_retry).count() == 1
+                    && !plan.consume_token_ids.contains(&fact.token_id)
+                    && !plan.cancel_token_ids.contains(&fact.token_id)
+                    && termination_token_on(tx, instance_id, plan, &fact.token_id)?
+                        .status == "waiting"
+                    && !plan.variable_effects.iter().any(|effect| matches!(effect,
+                        VariableEffect::Mapped { scope_id, source_token_id, .. }
+                            if scope_id == &fact.scope_id
+                                && source_token_id == &fact.token_id)),
+                    "approval IO blockage changed its factual waiting activation");
+            }
+            _ => bail!("approval IO disposition differs from its pure mapping"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_activity_io_inputs_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>],
+    expected_revision: u64, entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    let prior_occurrences = repetition_occurrences_on(tx, instance_id)?;
+    let prior_groups = repetition_groups_on(tx, instance_id)?;
+    let mut witnesses = HashSet::new();
+    let mut activations = HashSet::new();
+    let mut event_ids = HashSet::new();
+    let mut captured = HashSet::new();
+    let mut failed = HashSet::new();
+    for fact in &plan.activity_io_inputs {
+        let (witness_id, scope_id, node_id, source_token_id, activation_token_id,
+            event_index, group_id, occurrence_id, ordinal) = match fact {
+            ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                source_token_id, activation_token_id, event_index, group_id,
+                occurrence_id, ordinal, .. } =>
+                    (witness_id, scope_id, node_id, source_token_id,
+                        activation_token_id, *event_index, group_id, occurrence_id, ordinal),
+            ActivityIoInputFact::Failed { witness_id, scope_id, node_id,
+                source_token_id, waiting_token_id, incident_event_index,
+                group_id, occurrence_id, ordinal, .. } =>
+                    (witness_id, scope_id, node_id, source_token_id,
+                        waiting_token_id, *incident_event_index, group_id, occurrence_id, ordinal),
+        };
+        ensure!(Uuid::parse_str(witness_id).is_ok() && witnesses.insert(witness_id)
+            && activations.insert(activation_token_id)
+            && source_token_id != activation_token_id
+            && plan.token_sources.get(activation_token_id) == Some(source_token_id)
+            && plan.consume_token_ids.iter().filter(|id| *id == source_token_id).count() == 1
+            && !plan.cancel_token_ids.contains(source_token_id),
+            "activity IO input changed its unique ready-to-waiting lineage");
+        let source = termination_token_on(tx, instance_id, plan, source_token_id)?;
+        let activation = termination_token_on(tx, instance_id, plan, activation_token_id)?;
+        let path = scope_path(scopes, instance_id, scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == *node_id)
+            .context("activity IO input node is outside its selected body")?;
+        // An event-based gateway parks no ready token at its Receive branches, so
+        // the consumed gateway activation is their input-capture source.
+        let race_branch = source.node_id != *node_id
+            && matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })
+            && body.nodes.iter().any(|gateway| gateway.id == source.node_id
+                && matches!(&gateway.kind, ProcessNodeKind::EventBasedGateway))
+            && body.sequence_flows.iter().any(|flow|
+                activation.arrival_edge_id.as_deref() == Some(flow.id.as_str())
+                    && flow.source_id == source.node_id && flow.target_id == *node_id);
+        ensure!(source.status == "ready" && activation.status == "waiting"
+            && source.scope_id == *scope_id && activation.scope_id == *scope_id
+            && activation.node_id == *node_id
+            && (source.node_id == *node_id
+                && source.arrival_edge_id == activation.arrival_edge_id || race_branch)
+            && source.fork_stack == activation.fork_stack
+            && plan.create_tokens.iter().filter(|token|
+                token.token_id == *activation_token_id).count() == 1
+            && ordinary_action_source_matches_entry_on(tx, instance_id, model,
+                scopes, plan, source_token_id, expected_revision, entry, false)?,
+            "activity IO input lacks its authenticated activation");
+        let io = node.activity_io.as_ref()
+            .context("activity IO input node has no authored IO")?;
+        let modeling = super::model::io_modeling(body.modeling);
+        let count = plan.variable_effects.iter().filter(|effect| match effect {
+            VariableEffect::Mapped { event_index: index, .. }
+            | VariableEffect::ScopeEntry { event_index: index, .. }
+            | VariableEffect::RepetitionAggregate { event_index: index, .. }
+            | VariableEffect::RepetitionEntry { event_index: index, .. } => *index < event_index,
+        }).count();
+        let locals = variable_states.get(count)
+            .context("activity IO input has no replayed source-time variables")?;
+        let root = locals.get(instance_id)
+            .context("activity IO input has no replayed root variables")?;
+        let (local, effective, extra) = match (group_id, occurrence_id, ordinal) {
+            (None, None, None) => {
+                let local = locals.get(scope_id)
+                    .context("activity IO input has no selected-scope variables")?;
+                (local.clone(), effective_scope_variables(scopes, locals,
+                    instance_id, root, scope_id)?, Vec::new())
+            }
+            (Some(group_id), Some(occurrence_id), Some(ordinal)) => {
+                let occurrence = plan.repetition_occurrences.iter().find(|row|
+                    row.occurrence_id == *occurrence_id)
+                    .or_else(|| prior_occurrences.iter().find(|row|
+                        row.occurrence_id == *occurrence_id))
+                    .context("activity IO input has no factual repeated ordinal")?;
+                let group = plan.repetition_groups.iter().find(|row|
+                    row.group_id == *group_id)
+                    .or_else(|| prior_groups.iter().find(|row| row.group_id == *group_id))
+                    .context("activity IO input has no factual repeated group")?;
+                ensure!(occurrence.group_id == *group_id
+                    && occurrence.ordinal == *ordinal && occurrence.scope_id == *scope_id
+                    && occurrence.token_id == *activation_token_id
+                    && group.scope_id == *scope_id && group.node_id == *node_id,
+                    "activity IO input changed its group, ordinal, or waiting token");
+                let values = occurrence.input_variables.clone();
+                let extra = vec![("repeat".to_owned(), serde_json::json!({
+                    "group_id": group_id, "index": ordinal, "item": occurrence.item,
+                }))];
+                (values.clone(), values, extra)
+            }
+            (Some(group_id), None, None) => {
+                let group = plan.repetition_groups.iter().find(|row|
+                    row.group_id == *group_id)
+                    .or_else(|| prior_groups.iter().find(|row| row.group_id == *group_id))
+                    .context("activity IO input has no factual coordinator group")?;
+                ensure!(group.scope_id == *scope_id && group.node_id == *node_id
+                    && group.parent_token_id == *activation_token_id
+                    && group.source_token_id == *source_token_id
+                    && node.repeat.is_some()
+                    && io.coordinator_output.is_some(),
+                    "activity IO coordinator input changed its group or activation");
+                (group.entry_variables.clone(), group.entry_variables.clone(), Vec::new())
+            }
+            _ => bail!("activity IO input has an incomplete repeated owner"),
+        };
+        let event = plan.events.get(event_index)
+            .context("activity IO input event is missing")?;
+        ensure!(event.scope_id == *scope_id
+            && event.node_id.as_deref() == Some(node_id.as_str())
+            && plan.event_ids.get(&event_index).is_some_and(|id|
+                Uuid::parse_str(id).is_ok() && event_ids.insert(id))
+            && !plan.event_sources.contains_key(&event_index),
+            "activity IO input changed its event identity or action classification");
+        let evaluated = super::runtime::evaluate_activity_inputs(
+            io, modeling, &local, &effective, &extra);
+        match fact {
+            ActivityIoInputFact::Captured { inputs, .. } => {
+                ensure!(evaluated.as_ref().is_ok_and(|expected| expected == inputs)
+                    && event.kind == "activity_io_input_captured"
+                    && event.data == serde_json::json!({
+                        "source_token_id": source_token_id,
+                        "activation_token_id": activation_token_id,
+                        "inputs": inputs,
+                    }) && captured.insert(event_index),
+                    "activity IO captured inputs differ from their authored source-time values");
+                let mut body_extra = extra.clone();
+                body_extra.extend(super::runtime::activity_inputs_extra(inputs)?);
+                if let ProcessNodeKind::ServiceTask { input_mapping, .. } = &node.kind {
+                    let jobs = plan.create_jobs.iter().filter(|job|
+                        job.scope_id == *scope_id && job.node_id == *node_id
+                            && job.token_id == *activation_token_id).collect::<Vec<_>>();
+                    ensure!(jobs.len() == 1,
+                        "captured Service IO input lacks one planned service job");
+                    ensure!(jobs[0].input == super::runtime::prepare_service_input(
+                        input_mapping, &effective, &body_extra)?,
+                        "planned Service job ignored its authenticated activity inputs");
+                }
+                if let ProcessNodeKind::SendTask { .. } = &node.kind {
+                    let messages = plan.create_messages.iter().filter(|message|
+                        message.source_scope_id == *scope_id
+                            && message.source_node_id == *node_id
+                            && message.source_activation_id == *activation_token_id
+                            && message.source_event_index > event_index)
+                        .collect::<Vec<_>>();
+                    if messages.len() == 1 {
+                        let mut expected = super::messages::prepare_throw(
+                            model, node, &effective, &body_extra)?;
+                        expected.message_id = messages[0].message.message_id.clone();
+                        ensure!(serde_json::to_value(expected)?
+                            == serde_json::to_value(&messages[0].message)?,
+                            "planned Send message ignored its authenticated activity inputs");
+                    } else {
+                        ensure!(messages.is_empty(),
+                            "captured Send IO input has duplicate planned messages");
+                        // A pending Send admits its message in a later transition;
+                        // only a missing message without a pending wait is a failure.
+                        let pending = plan.events.iter().any(|candidate|
+                            candidate.kind == "send_task_pending"
+                                && candidate.scope_id == *scope_id
+                                && candidate.node_id.as_deref() == Some(node_id.as_str())
+                                && candidate.data["pending_token_id"]
+                                    == *activation_token_id);
+                        if !pending {
+                            let error = super::messages::prepare_throw(
+                                model, node, &effective, &body_extra)
+                                .err().context("Send IO failure has a prepared message")?;
+                            ensure!(error.downcast_ref::<super::messages::MessageExpressionFailed>()
+                                .is_some(),
+                                "Send infrastructure failure cannot become an input incident");
+                            let message = bounded_failure_message(&error.to_string());
+                            ensure!(plan.add_incidents.iter().filter(|incident|
+                                incident.scope_id == *scope_id
+                                    && incident.node_id.as_deref() == Some(node_id)
+                                    && incident.code == "MESSAGE_EXPRESSION_ERROR"
+                                    && incident.message == message && !incident.can_retry)
+                                .count() == 1,
+                                "Send IO input failure lacks its replayed expression incident");
+                        }
+                    }
+                }
+                if let ProcessNodeKind::ReceiveTask { correlation_expression, .. } = &node.kind {
+                    let subscriptions = plan.create_subscriptions.iter().filter(|subscription|
+                        subscription.scope_id == *scope_id
+                            && subscription.node_id == *node_id
+                            && subscription.token_id == *activation_token_id
+                            && subscription.kind == ProcessSubscriptionKind::ReceiveTask)
+                        .collect::<Vec<_>>();
+                    ensure!(subscriptions.len() == 1,
+                        "captured Receive IO input lacks one planned subscription");
+                    match super::messages::evaluate_key(
+                        correlation_expression, &effective, &body_extra,
+                    ) {
+                        Ok(key) => ensure!(subscriptions[0].status
+                            == ProcessSubscriptionStatus::Open
+                            && subscriptions[0].correlation_key.as_deref() == Some(key.as_str()),
+                            "planned Receive subscription ignored its authenticated activity inputs"),
+                        Err(error) => ensure!(subscriptions[0].status
+                            == ProcessSubscriptionStatus::Error
+                            && subscriptions[0].correlation_key.is_none()
+                            && subscriptions[0].last_reason.as_deref()
+                                == Some(timer_reason(&format!("{error:#}"))?.as_str()),
+                            "Receive correlation failure ignored its authenticated activity inputs"),
+                    }
+                }
+                let resource = plan.events.iter().enumerate().filter(|(index, candidate)| {
+                    // `scope_entered` is recorded inside the child scope and has no node.
+                    let entered_scope = matches!(&node.kind, ProcessNodeKind::SubProcess { .. });
+                    if *index <= event_index || !entered_scope
+                        && (candidate.scope_id != *scope_id
+                            || candidate.node_id.as_deref() != Some(node_id)) {
+                        return false;
+                    }
+                    match &node.kind {
+                        ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ManualTask { .. } =>
+                            plan.create_user_tasks.iter().any(|task|
+                                task.scope_id == *scope_id && task.node_id == *node_id
+                                && task.token_id.as_deref() == Some(activation_token_id)
+                                && candidate.kind == if matches!(&node.kind,
+                                    ProcessNodeKind::ManualTask { .. }) {
+                                    "manual_task_opened" } else { "user_task_opened" }
+                                && candidate.data["user_task_id"] == task.user_task_id),
+                        ProcessNodeKind::ServiceTask { .. } =>
+                            plan.create_jobs.iter().any(|job|
+                                job.scope_id == *scope_id && job.node_id == *node_id
+                                && job.token_id == *activation_token_id
+                                && candidate.kind == "service_queued"
+                                && candidate.data["job_id"] == job.job_id),
+                        ProcessNodeKind::ReceiveTask { .. } =>
+                            plan.create_subscriptions.iter().any(|subscription|
+                                subscription.scope_id == *scope_id
+                                && subscription.node_id == *node_id
+                                && subscription.token_id == *activation_token_id
+                                && matches!(candidate.kind.as_str(),
+                                    "receive_task_opened" | "message_error")
+                                && candidate.data["subscription_id"] == subscription.subscription_id),
+                        ProcessNodeKind::SubProcess { .. } =>
+                            candidate.kind == "scope_entered"
+                                && candidate.data["parent_scope_id"] == *scope_id
+                                && candidate.data["parent_token_id"] == *activation_token_id
+                                && candidate.data["subprocess_node_id"] == *node_id
+                                && plan.create_scopes.iter().any(|scope|
+                                    scope.parent_token_id == *activation_token_id
+                                        && candidate.scope_id == scope.scope_id),
+                        ProcessNodeKind::CallActivity(call) =>
+                            candidate.kind == "call_requested"
+                                && candidate.data["parent_token_id"] == *activation_token_id
+                                && plan.call_requests.iter().any(|request|
+                                    request.parent_token_id == *activation_token_id)
+                            || candidate.kind == "incident"
+                                && plan.call_requests.iter().all(|request|
+                                    request.parent_token_id != *activation_token_id)
+                                && super::runtime::patch_variables(&call.input_mapping,
+                                    &serde_json::json!({}), &effective, &Value::Null,
+                                    &body_extra)
+                                    .err().is_some_and(|error| {
+                                        let message = bounded_failure_message(
+                                            &format!("{error:#}"));
+                                        plan.add_incidents.iter().filter(|incident|
+                                            incident.scope_id == *scope_id
+                                                && incident.node_id.as_deref() == Some(node_id)
+                                                && incident.code == "CALL_ADMISSION_ERROR"
+                                                && incident.message == message
+                                                && incident.job_id.is_none()
+                                                && !incident.can_retry
+                                                && candidate.data == serde_json::json!({
+                                                    "code":"CALL_ADMISSION_ERROR",
+                                                    "message":message,
+                                                    "incident_id":incident.incident_id,
+                                                    "activation_token_id":activation_token_id,
+                                                })).count() == 1
+                                    }),
+                        ProcessNodeKind::ScriptTask { .. } =>
+                            candidate.kind == "script_result_evaluated"
+                                && !plan.event_sources.contains_key(index)
+                                && plan.activity_io_results.iter().any(|fact|
+                                    fact.witness_id.as_str() == witness_id.as_str()
+                                        && fact.token_id.as_str() == activation_token_id.as_str()
+                                        && fact.result_event_index == *index)
+                            || candidate.kind == "incident"
+                                && candidate.data["code"] == "SCRIPT_EVALUATION_FAILED"
+                                && plan.event_sources.get(index)
+                                    == Some(activation_token_id)
+                                && script_io_action_handoff_on(plan,
+                                    activation_token_id, *index),
+                        ProcessNodeKind::SendTask { .. } =>
+                            candidate.kind == "send_task_pending"
+                                && candidate.data["pending_token_id"] == *activation_token_id
+                            || candidate.kind == "send_task_admitted"
+                                && candidate.data["source_activation_id"] == *activation_token_id
+                            || candidate.kind == "incident"
+                                && candidate.data["code"] == "MESSAGE_EXPRESSION_ERROR"
+                                && candidate.data["activation_token_id"]
+                                    == *activation_token_id
+                                && !plan.event_sources.contains_key(index)
+                                && plan.create_messages.iter().all(|message|
+                                    message.source_activation_id != *activation_token_id),
+                        _ => false,
+                    }
+                }).count();
+                if !(group_id.is_some() && occurrence_id.is_none()) {
+                    ensure!(resource == 1,
+                        "activity IO input capture lacks one later resource or accepted body fact");
+                }
+            }
+            ActivityIoInputFact::Failed { incident_id, association_id, position, .. } => {
+                let failure = evaluated.err()
+                    .context("activity IO input failure is not reproducible")?;
+                let failure = failure.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
+                    .context("activity IO input failure has no authored association")?;
+                let message = bounded_failure_message(&failure.to_string());
+                ensure!(failure.association_id == *association_id
+                    && failure.position == *position
+                    && event.kind == "incident"
+                    && event.data == serde_json::json!({
+                        "incident_id":incident_id,
+                        "activation_token_id":activation_token_id,
+                        "code":"ACTIVITY_IO_INPUT_FAILED", "message":message,
+                    }) && plan.add_incidents.iter().filter(|incident|
+                        incident.incident_id == *incident_id
+                            && incident.scope_id == *scope_id
+                            && incident.node_id.as_deref() == Some(node_id.as_str())
+                            && incident.code == "ACTIVITY_IO_INPUT_FAILED"
+                            && incident.message == message
+                            && !incident.can_retry).count() == 1
+                    && !plan.consume_token_ids.contains(activation_token_id)
+                    && !plan.create_jobs.iter().any(|job|
+                        job.token_id == *activation_token_id)
+                    && !plan.create_user_tasks.iter().any(|task|
+                        task.token_id.as_deref() == Some(activation_token_id))
+                    && !plan.create_subscriptions.iter().any(|subscription|
+                        subscription.token_id == *activation_token_id)
+                    && !plan.create_scopes.iter().any(|scope|
+                        scope.parent_token_id == *activation_token_id)
+                    && !plan.call_requests.iter().any(|request|
+                        request.parent_token_id == *activation_token_id)
+                    && !plan.create_messages.iter().any(|message|
+                        message.source_activation_id == *activation_token_id)
+                    && !plan.create_timers.iter().any(|timer|
+                        timer.token_id.as_deref() == Some(activation_token_id))
+                    && !plan.create_signals.iter().any(|signal|
+                        signal.source_activation_id == *activation_token_id)
+                    && failed.insert(event_index),
+                    "activity IO input failure changed its first association or parked incident");
+            }
+        }
+    }
+    ensure!(plan.events.iter().enumerate().filter(|(_, event)|
+        event.kind == "activity_io_input_captured").all(|(index, _)| captured.contains(&index))
+        && plan.events.iter().enumerate().filter(|(_, event)|
+            event.kind == "incident"
+                && event.data["code"] == "ACTIVITY_IO_INPUT_FAILED")
+            .all(|(index, _)| failed.contains(&index)),
+        "activity IO input history lacks its unique typed witness");
+    Ok(())
+}
+
+fn insert_activity_io_inputs_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan, at_ms: i64,
+) -> Result<()> {
+    if plan.activity_io_inputs.is_empty() { return Ok(()); }
+    let (definition_id, version, model_sha256): (String, u32, String) = tx.query_row(
+        "SELECT i.definition_id,i.version,v.model_sha256 FROM bpmn_instances i \
+         JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+         WHERE i.instance_id=?1", [instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    for fact in &plan.activity_io_inputs {
+        let (witness_id, scope_id, node_id, token_id, event_index,
+            group_id, occurrence_id, ordinal, inputs, incident_id,
+            failed_association_id, failed_position) = match fact {
+            ActivityIoInputFact::Captured { witness_id, scope_id, node_id,
+                activation_token_id, event_index, inputs, group_id,
+                occurrence_id, ordinal, .. } =>
+                    (witness_id, scope_id, node_id, activation_token_id,
+                        *event_index, group_id, occurrence_id, ordinal,
+                        Some(inputs), None, None, None),
+            ActivityIoInputFact::Failed { witness_id, scope_id, node_id,
+                waiting_token_id, incident_event_index, incident_id,
+                association_id, position, group_id, occurrence_id, ordinal, .. } =>
+                    (witness_id, scope_id, node_id, waiting_token_id,
+                        *incident_event_index, group_id, occurrence_id, ordinal,
+                        None, Some(incident_id), Some(association_id), Some(*position)),
+        };
+        let path = scope_path(scopes, instance_id, scope_id)?;
+        let body = super::model::selected_body(model, &selected_process_id, &path)?;
+        let node = body.nodes.iter().find(|node| node.id == *node_id)
+            .context("activity IO witness node left its selected body")?;
+        let io = node.activity_io.as_ref()
+            .context("activity IO witness has no authored IO")?;
+        let activity_kind = match &node.kind {
+            ProcessNodeKind::UserTask { .. } => "user",
+            ProcessNodeKind::ScriptTask { .. } => "script",
+            ProcessNodeKind::ServiceTask { .. } => "service",
+            ProcessNodeKind::ManualTask { .. } => "manual",
+            ProcessNodeKind::SendTask { .. } => "send",
+            ProcessNodeKind::ReceiveTask { .. } => "receive",
+            ProcessNodeKind::SubProcess { .. } => "subprocess",
+            ProcessNodeKind::CallActivity(_) => "call",
+            _ => bail!("activity IO witness is not one of the eight accepted kinds"),
+        };
+        let phase_owner = match (group_id, occurrence_id) {
+            (Some(_), Some(_)) => "ordinal",
+            (Some(_), None) => "coordinator",
+            (None, None) => "ordinary",
+            _ => bail!("activity IO input has an incomplete owner"),
+        };
+        let io_spec_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(io)?));
+        let input_values_json = inputs.map(json).transpose()?;
+        let input_sha256 = input_values_json.as_ref()
+            .map(|value| hex::encode(Sha256::digest(value.as_bytes())));
+        let event_id = plan.event_ids.get(&event_index)
+            .context("activity IO witness lost its authenticated event UUID")?;
+        let (input_event_id, incident_event_id, phase) = if inputs.is_some() {
+            (Some(event_id.as_str()), None, "input_captured")
+        } else {
+            (None, Some(event_id.as_str()), "input_failed")
+        };
+        tx.execute(
+            "INSERT INTO bpmn_activity_io_witnesses \
+             (witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner, \
+              group_id,occurrence_id,ordinal,definition_id,version,selected_process_id, \
+              body_path_json,model_sha256,io_spec_sha256,phase,revision,input_event_id, \
+              input_values_json,input_sha256,incident_event_id,incident_id, \
+              failed_association_id,failed_position,created_at_ms,updated_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1, \
+                     ?18,?19,?20,?21,?22,?23,?24,?25,?25)",
+            params![witness_id,instance_id,scope_id,token_id,node_id,activity_kind,
+                phase_owner,group_id,occurrence_id,
+                ordinal.map(|value| sql_integer(u64::from(value))).transpose()?,
+                definition_id,version,selected_process_id,json(&path)?,
+                model_sha256,io_spec_sha256,phase,input_event_id,
+                input_values_json,input_sha256,incident_event_id,incident_id,
+                failed_association_id,
+                failed_position.map(|value| sql_integer(u64::try_from(value)?)).transpose()?,
+                at_ms],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_activity_io_results_on(
+    tx: &Transaction<'_>, instance_id: &str, plan: &RuntimePlan, at_ms: i64,
+) -> Result<()> {
+    for fact in &plan.activity_io_results {
+        let result_event_id = plan.event_ids.get(&fact.result_event_index)
+            .context("activity IO result lacks its accepted event UUID")?;
+        let result_sha256 = activity_io_result_sha256(&fact.observed)?;
+        let (presence, result_json) = match &fact.observed {
+            IoObservedValue::Missing => ("missing", None),
+            IoObservedValue::Present { value } => ("present", Some(json(value)?)),
+        };
+        let result_sources_json = json(&fact.result_sources)?;
+        let resource_revision = fact.resource_revision.map(sql_integer).transpose()?;
+        let child_revision = fact.child_expected_revision.map(sql_integer).transpose()?;
+        let (route_kind, route_event_id, route_resource_id) = match &fact.disposition {
+            ActivityIoResultDisposition::Applied { .. }
+            | ActivityIoResultDisposition::Blocked { .. } => ("mapping", None, None),
+            ActivityIoResultDisposition::Retained { fate, route_event_index } => {
+                let event_id = plan.event_ids.get(route_event_index)
+                    .context("retained activity IO route lacks its event UUID")?;
+                let (kind, resource) = match fate {
+                    ActivityIoRetainedFate::ScriptMappingFailure =>
+                        ("final_script_mapping_failure", None),
+                    ActivityIoRetainedFate::ScopeReturnFailure { .. } =>
+                        ("final_scope_return_failure", None),
+                    ActivityIoRetainedFate::AwaitingVerification { user_task_id } =>
+                        ("awaiting_verification", Some(user_task_id.as_str())),
+                    ActivityIoRetainedFate::BoundaryError { subscription_id } =>
+                        ("final_boundary_error", Some(subscription_id.as_str())),
+                    ActivityIoRetainedFate::BoundaryEscalation { subscription_id } =>
+                        ("final_boundary_escalation", Some(subscription_id.as_str())),
+                    ActivityIoRetainedFate::UnhandledError =>
+                        ("final_unhandled_error", None),
+                    ActivityIoRetainedFate::UnhandledEscalation =>
+                        ("final_unhandled_escalation", None),
+                    ActivityIoRetainedFate::VerificationRejected { user_task_id } =>
+                        ("final_verification_rejected", Some(user_task_id.as_str())),
+                    ActivityIoRetainedFate::Cancelled => ("final_cancelled", None),
+                };
+                (kind, Some(event_id.as_str()), resource)
+            }
+        };
+        let updated = tx.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='result_accepted', \
+             revision=revision+1,result_event_id=?1,source_instance_id=?2, \
+             source_event_id=?3,result_sources_json=?4,result_presence=?5, \
+             result_json=?6,result_sha256=?7,retained_route_kind=?8, \
+             retained_route_event_id=?9,retained_route_resource_id=?10, \
+             accepted_origin=?11,resource_id=?12,resource_revision=?13, \
+             service_invocation_id=?14,child_scope_id=?15,call_id=?16, \
+             child_instance_id=?17,child_expected_revision=?18,child_status=?19, \
+             parent_wait_token_id=?20,updated_at_ms=?21 \
+             WHERE instance_id=?22 AND witness_id=?23 AND scope_id=?24 \
+             AND token_id=?25 AND phase='input_captured'",
+            params![result_event_id,fact.source_instance_id,fact.source_event_id,
+                result_sources_json,presence,result_json,result_sha256,
+                route_kind,route_event_id,route_resource_id,
+                fact.accepted_origin.as_ref().map(result_origin_text),
+                fact.resource_id,resource_revision,fact.service_invocation_id,
+                fact.child_scope_id,fact.call_id,fact.child_instance_id,
+                child_revision,fact.child_status,fact.parent_wait_token_id,
+                at_ms,instance_id,fact.witness_id,fact.scope_id,fact.token_id],
+        )?;
+        ensure!(updated == 1,
+            "activity IO result lost its unique captured witness CAS");
+        let (phase, output_event_id, output_values_json, local_patch_json,
+            incident_event_id, incident_id, failed_association_id, failed_position) =
+            match &fact.disposition {
+                ActivityIoResultDisposition::Applied { output_event_index,
+                    ordered_outputs, local_patch } => (
+                    "output_applied", Some(plan.event_ids.get(output_event_index)
+                        .context("activity IO output lacks its event UUID")?.as_str()),
+                    Some(json(ordered_outputs)?),Some(json(local_patch)?),
+                    None,None,None,None),
+                ActivityIoResultDisposition::Blocked { incident_event_index,
+                    incident_id, association_id, position } => (
+                    "output_blocked",None,None,None,
+                    Some(plan.event_ids.get(incident_event_index)
+                        .context("activity IO blockage lacks its event UUID")?.as_str()),
+                    Some(incident_id.as_str()),association_id.as_deref(),
+                    position.map(|index| i64::try_from(index)).transpose()?),
+                ActivityIoResultDisposition::Retained { .. } => continue,
+            };
+        let updated = tx.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase=?1,revision=revision+1, \
+             output_event_id=?2,output_values_json=?3,local_patch_json=?4, \
+             incident_event_id=?5,incident_id=?6,failed_association_id=?7, \
+             failed_position=?8,updated_at_ms=?9 WHERE instance_id=?10 \
+             AND witness_id=?11 AND phase='result_accepted'",
+            params![phase,output_event_id,output_values_json,local_patch_json,
+                incident_event_id,incident_id,failed_association_id,failed_position,
+                at_ms,instance_id,fact.witness_id],
+        )?;
+        ensure!(updated == 1,
+            "activity IO output lost its accepted-result CAS");
+    }
+    Ok(())
+}
+
+fn insert_activity_io_continuations_on(
+    tx: &Transaction<'_>, instance_id: &str, plan: &RuntimePlan, at_ms: i64,
+) -> Result<()> {
+    for fact in &plan.activity_io_continuations {
+        let (phase, output_event_id, output_values_json, local_patch_json,
+            incident_event_id, incident_id, association_id, position) =
+            match &fact.disposition {
+                ActivityIoResultDisposition::Applied { output_event_index,
+                    ordered_outputs, local_patch } => (
+                    "output_applied",
+                    Some(plan.event_ids.get(output_event_index)
+                        .context("approval output lacks its factual event UUID")?.as_str()),
+                    Some(json(ordered_outputs)?), Some(json(local_patch)?),
+                    None, None, None, None),
+                ActivityIoResultDisposition::Blocked { incident_event_index,
+                    incident_id, association_id, position } => (
+                    "output_blocked", None, None, None,
+                    Some(plan.event_ids.get(incident_event_index)
+                        .context("approval blockage lacks its factual event UUID")?.as_str()),
+                    Some(incident_id.as_str()), association_id.as_deref(),
+                    position.map(i64::try_from).transpose()?),
+                ActivityIoResultDisposition::Retained { .. } =>
+                    bail!("approval cannot retain the same accepted result again"),
+            };
+        let changed = tx.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase=?1,revision=revision+1, \
+             output_event_id=?2,output_values_json=?3,local_patch_json=?4, \
+             incident_event_id=?5,incident_id=?6,failed_association_id=?7, \
+             failed_position=?8,updated_at_ms=?9 WHERE instance_id=?10 \
+             AND witness_id=?11 AND scope_id=?12 AND node_id=?13 AND token_id=?14 \
+             AND phase='result_accepted' AND retained_route_kind='awaiting_verification' \
+             AND retained_route_resource_id=?15 AND revision=?16",
+            params![phase,output_event_id,output_values_json,local_patch_json,
+                incident_event_id,incident_id,association_id,position,at_ms,instance_id,
+                fact.witness_id,fact.scope_id,fact.node_id,fact.token_id,
+                fact.user_task_id,sql_integer(fact.expected_witness_revision)?],
+        )?;
+        ensure!(changed == 1,
+            "approval lost its original accepted result witness CAS");
+    }
+    Ok(())
+}
+
 fn validate_termination_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -10490,11 +17247,13 @@ fn validate_termination_plan_on(
     entry: EntryAuthority<'_>,
     actor_id: &str,
 ) -> Result<(HashSet<String>, Vec<BTreeMap<String, Value>>)> {
-    let mut mapping_scopes = Vec::new();
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    // The IO validators read scopes even when no variable replay is needed.
+    let mut mapping_scopes = scopes.to_vec();
     let mut has_script = false;
     for source_id in plan.consume_token_ids.iter().chain(plan.token_sources.values()) {
         let source = termination_token_on(tx, instance_id, plan, source_id)?;
-        if source.status == "ready" && scope_node(model, scopes, instance_id,
+        if source.status == "ready" && scope_node(model, &selected_process_id, scopes, instance_id,
             &source.scope_id, &source.node_id)
             .is_ok_and(|node| matches!(&node.kind,
                 ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
@@ -10508,19 +17267,19 @@ fn validate_termination_plan_on(
             "script_completed" | "send_task_pending" | "send_task_admitted"
             | "send_admission_failed" | "signal_admitted")
         || event.kind == "incident" && event.node_id.as_deref().is_some_and(|node_id|
-            scope_node(model, scopes, instance_id, &event.scope_id, node_id)
+            scope_node(model, &selected_process_id, scopes, instance_id, &event.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
                     ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
                     | ProcessNodeKind::SignalThrow { .. }))));
     has_script |= plan.add_incidents.iter().any(|incident|
         incident.node_id.as_deref().is_some_and(|node_id|
-            scope_node(model, scopes, instance_id, &incident.scope_id, node_id)
+            scope_node(model, &selected_process_id, scopes, instance_id, &incident.scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind,
                     ProcessNodeKind::ScriptTask { .. } | ProcessNodeKind::SendTask { .. }
                     | ProcessNodeKind::SignalThrow { .. }))));
     has_script |= plan.variable_effects.iter().any(|effect| matches!(effect,
         VariableEffect::Mapped { scope_id, node_id, .. }
-            if scope_node(model, scopes, instance_id, scope_id, node_id)
+            if scope_node(model, &selected_process_id, scopes, instance_id, scope_id, node_id)
                 .is_ok_and(|node| matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }))));
     let has_manual = matches!(entry,
         EntryAuthority::Accepted(AcceptedInputRef::ManualAcknowledgment { .. }))
@@ -10542,15 +17301,25 @@ fn validate_termination_plan_on(
     let has_receive = has_receive || plan.consume_token_ids.iter()
         .chain(plan.token_sources.values()).any(|source_id|
             termination_token_on(tx, instance_id, plan, source_id).is_ok_and(|source|
-                source.status == "ready" && scope_node(model, scopes, instance_id,
+                source.status == "ready" && scope_node(model, &selected_process_id, scopes, instance_id,
                     &source.scope_id, &source.node_id).is_ok_and(|node|
                         matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. }
                             | ProcessNodeKind::SignalCatch { .. }))));
+    let has_link = plan.events.iter().any(|event|
+        matches!(event.kind.as_str(), "link_thrown" | "link_caught"));
+    let has_retry = matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Retry { .. }));
     let replay_variables = !plan.termination_attempts.is_empty()
+        || !plan.scope_return_failures.is_empty()
         || !plan.event_sources.is_empty()
+        || plan.variable_effects.iter().any(|effect|
+            matches!(effect, VariableEffect::Mapped { .. }))
         || has_script
         || has_manual
         || has_receive
+        || has_retry
+        || !plan.activity_io_inputs.is_empty()
+        || !plan.activity_io_results.is_empty()
+        || !plan.activity_io_continuations.is_empty()
         || plan.variable_effects.iter().any(|effect|
             matches!(effect, VariableEffect::RepetitionEntry { .. }
                 | VariableEffect::RepetitionAggregate { .. }))
@@ -10583,22 +17352,38 @@ fn validate_termination_plan_on(
         validate_signal_failure_on(tx, instance_id, model, &mapping_scopes,
             plan, &variable_states, input)?;
     }
+    validate_activity_io_inputs_on(tx, instance_id, model, &mapping_scopes,
+        plan, &variable_states, expected_revision, entry)?;
+    validate_activity_io_results_on(tx, instance_id, model, &mapping_scopes,
+        plan, &variable_states, entry)?;
+    validate_activity_io_continuations_on(tx, instance_id, model, &mapping_scopes,
+        plan, &variable_states, entry)?;
     if has_script || has_manual || has_receive {
         validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
             expected_revision, plan, &variable_states, entry)?;
         if plan.termination_attempts.is_empty() {
             for source_id in plan.event_sources.values() {
+                // A configured activity continues from the waiting activation that
+                // its captured input witness already ties to the accepted input.
+                if plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                    ActivityIoInputFact::Captured { activation_token_id, .. }
+                        if activation_token_id == source_id)) {
+                    continue;
+                }
                 ensure!(ordinary_action_source_matches_entry_on(tx, instance_id, model,
                     &mapping_scopes, plan, source_id, expected_revision, entry, false)?,
                     "Script reduction advanced an action outside its accepted input");
             }
         }
     }
+    let limited_token_ids = validate_immediate_lineage_limit_on(plan)?;
     validate_action_sources_on(tx, instance_id, model, &mapping_scopes,
         plan, &variable_states, entry)?;
-    if !plan.termination_attempts.is_empty() || has_script || has_manual || has_receive {
+    if !plan.termination_attempts.is_empty() || has_script || has_manual || has_receive
+        || has_link || has_retry || !limited_token_ids.is_empty() {
         validate_termination_action_provenance_on(tx, instance_id, model,
-            &mapping_scopes, plan, &variable_states, call_source, entry, actor_id)?;
+            &mapping_scopes, plan, &variable_states, call_source, entry, actor_id,
+            expected_revision, &limited_token_ids)?;
     }
     let mut sources = HashSet::new();
     let mut successful_scopes = HashSet::new();
@@ -10673,7 +17458,8 @@ fn validate_termination_plan_on(
             && !plan.cancel_token_ids.contains(source_token_id),
             "termination source is not one factual consumed ready token");
         let path = scope_path(scopes, instance_id, source_scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         let node = nodes.iter().find(|node| node.id == *source_node_id)
             .context("termination source node is outside its pinned body")?;
         ensure!(matches!(node.kind, ProcessNodeKind::TerminateEnd),
@@ -10719,7 +17505,7 @@ fn validate_termination_plan_on(
                     .context("failed return has no enclosing scope")?;
                 let parent_node_id = scope.subprocess_node_id.as_deref()
                     .context("failed return has no enclosing subprocess")?;
-                let parent_node = scope_node(model, scopes, instance_id, parent_scope_id, parent_node_id)?;
+                let parent_node = scope_node(model, &selected_process_id, scopes, instance_id, parent_scope_id, parent_node_id)?;
                 let ProcessNodeKind::SubProcess { output_mapping, .. } = &parent_node.kind else {
                     bail!("failed return parent is not its pinned subprocess")
                 };
@@ -10782,6 +17568,17 @@ fn validate_termination_plan_on(
                     "persisted termination input changed its ready source or revision");
                 Some(token_id.clone())
             }
+            AcceptedInputRef::Retry { old_job_id, old_invocation_id, old_token_id,
+                expected_instance_revision, .. } => {
+                ensure!(*expected_instance_revision == expected_revision
+                    && job_direct_retryable_on(tx, old_job_id, instance_id)?
+                    && tx.query_row(
+                        "SELECT token_id FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2 AND instance_id=?3 AND phase='proved_no_effect'",
+                        params![old_invocation_id,old_job_id,instance_id],
+                        |row| row.get::<_, String>(0))? == *old_token_id,
+                    "terminating Retry input differs from its immutable old activation");
+                Some(old_token_id.clone())
+            }
             AcceptedInputRef::SendAdmission { instance_id: selected_instance, scope_id,
                 node_id, pending_token_id, pending_event_id, expected_instance_revision } => {
                 let pending = termination_token_on(tx, instance_id, plan, pending_token_id)?;
@@ -10804,6 +17601,8 @@ fn validate_termination_plan_on(
                      AND scope_id=?2 AND node_id=?3 AND kind='send_admission_failed' \
                      AND json_extract(data_json,'$.pending_token_id')=?4)",
                     params![instance_id,scope_id,node_id,pending_token_id], |row| row.get(0))?;
+                let admitted = pending_send_already_admitted_on(tx, instance_id, scope_id,
+                    node_id, pending_token_id)?;
                 ensure!(selected_instance == instance_id
                     && *expected_instance_revision == expected_revision
                     && pending.status == "waiting" && pending.scope_id == *scope_id
@@ -10814,7 +17613,7 @@ fn validate_termination_plan_on(
                         "source_activation_id":predecessor,
                         "pending_token_id":pending_token_id,
                     }) && prior_scope == *scope_id && prior_node == *node_id
-                    && prior_status == "consumed" && !failed
+                    && prior_status == "consumed" && !failed && !admitted
                     && plan.consume_token_ids.iter().filter(|id| *id == pending_token_id).count() == 1
                     && plan.events.iter().enumerate().filter(|(index,event)|
                         event.kind == "send_task_admitted" && event.scope_id == *scope_id
@@ -11055,7 +17854,7 @@ fn validate_termination_plan_on(
                 && group.source_token_id == source.source_token_id
                 && group.parent_token_id == source.parent_token_id)
             .context("capacity closure has no exact triggering group")?;
-        let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
         ensure!(source.instance_id == instance_id && node.repeat.is_some() && group.terminal_capacity
             && group.status == ProcessRepetitionGroupStatus::Incident
             && group.terminal_incident_id.as_deref() == Some(source.incident_id.as_str())
@@ -11065,8 +17864,12 @@ fn validate_termination_plan_on(
             && plan.cancel_scope_roots.iter().filter(|root| *root == instance_id).count() == 1
             && !plan.resolve_incident_ids.contains(&source.incident_id),
             "capacity closure changed its group, incident, or instance root");
+        let occurrences_before = repetition_occurrences_on(tx, instance_id)?;
+        let projected_occurrences = occurrences_before.iter().filter(|prior|
+            !plan.repetition_occurrences.iter().any(|row| row.occurrence_id == prior.occurrence_id))
+            .chain(plan.repetition_occurrences.iter()).collect::<Vec<_>>();
         let event = &plan.events[source.event_index];
-        let last_source = plan.repetition_occurrences.iter().filter(|row|
+        let last_source = projected_occurrences.iter().filter(|row|
             row.group_id == group.group_id).max_by_key(|row| row.ordinal)
             .and_then(|row| row.accepted_source_event_id.as_deref());
         ensure!(event.kind == "repetition_group_blocked"
@@ -11131,14 +17934,10 @@ fn validate_termination_plan_on(
             accepted => ensure!(matches!(entry, EntryAuthority::Accepted(actual) if actual == accepted),
                 "capacity closure changed its independently authenticated input"),
         }
-        let occurrences_before = repetition_occurrences_on(tx, instance_id)?;
         let groups_created = plan.repetition_groups.iter().filter(|row|
             !groups_before.iter().any(|prior| prior.group_id == row.group_id)).count();
         let occurrences_created = plan.repetition_occurrences.iter().filter(|row|
             !occurrences_before.iter().any(|prior| prior.occurrence_id == row.occurrence_id)).count();
-        let projected_occurrences = occurrences_before.iter().filter(|prior|
-            !plan.repetition_occurrences.iter().any(|row| row.occurrence_id == prior.occurrence_id))
-            .chain(plan.repetition_occurrences.iter()).collect::<Vec<_>>();
         let before_bytes = groups_before.iter().try_fold(0_u64, |sum, row|
             sum.checked_add(row.retained_bytes).context("repetition byte counter overflow"))?;
         let reserved_before_candidate_bytes = repetition_admission_reservation_on(
@@ -11211,6 +18010,8 @@ fn validate_termination_plan_on(
         ensure!(factual_limit, "capacity closure has no independently measured limit");
         authorized_roots.insert(instance_id.to_owned());
     }
+    let prior_closure_groups = repetition_groups_on(tx, instance_id)?;
+    let prior_closure_occurrences = repetition_occurrences_on(tx, instance_id)?;
     for root in &plan.cancel_scope_roots {
         if authorized_roots.contains(root) { continue; }
         if root == instance_id {
@@ -11238,6 +18039,38 @@ fn validate_termination_plan_on(
         let attached = termination_token_on(tx, instance_id, plan, attached_id)?;
         ensure!(attached.scope_id == parent_scope && attached.status == "waiting",
             "ordinary scope closure changed its attached waiting token");
+        let outer_groups = prior_closure_groups.iter().filter(|group|
+            group.scope_id == parent_scope && group.node_id == attached.node_id
+                && child.subprocess_node_id.as_deref() == Some(group.node_id.as_str())
+                && matches!(group.status,
+                    ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
+                && prior_closure_occurrences.iter().any(|occurrence|
+                    occurrence.group_id == group.group_id
+                        && occurrence.scope_id == *parent_scope
+                        && occurrence.token_id == attached_id
+                        && matches!(occurrence.status,
+                            ProcessRepetitionOccurrenceStatus::Pending
+                                | ProcessRepetitionOccurrenceStatus::Active
+                                | ProcessRepetitionOccurrenceStatus::AwaitingVerification
+                                | ProcessRepetitionOccurrenceStatus::RetryableError))
+                && plan.repetition_groups.iter().any(|update|
+                    update.group_id == group.group_id
+                        && update.status == ProcessRepetitionGroupStatus::Cancelled
+                        && update.revision == group.revision + 1)
+                && plan.cancel_token_ids.contains(&group.parent_token_id))
+            .collect::<Vec<_>>();
+        ensure!(outer_groups.len() <= 1,
+            "ordinary scope closure has ambiguous repetition coordinators");
+        if let Some(group) = outer_groups.first() {
+            let coordinator = termination_token_on(tx, instance_id, plan,
+                &group.parent_token_id)?;
+            ensure!(coordinator.status == "waiting"
+                && coordinator.scope_id == *parent_scope
+                && coordinator.node_id == group.node_id,
+                "ordinary scope closure lost its live outer repetition arm");
+        }
+        let boundary_wait_id = outer_groups.first().map_or(attached_id,
+            |group| group.parent_token_id.as_str());
         let accepted_error_service = |caught: &PlannedEvent| -> Result<bool> {
             let EntryAuthority::Accepted(AcceptedInputRef::Service {
                 job_id, attempt, fence, result_event_id,
@@ -11280,11 +18113,11 @@ fn validate_termination_plan_on(
         };
         let valid_boundary = plan.events.iter().any(|event| {
             if event.scope_id != parent_scope
-                || event.data["attached_token_id"].as_str() != Some(attached_id) {
+                || event.data["attached_token_id"].as_str() != Some(boundary_wait_id) {
                 return false;
             }
             let Some(boundary_id) = event.node_id.as_deref() else { return false; };
-            let Ok(boundary) = scope_node(model, scopes, instance_id,
+            let Ok(boundary) = scope_node(model, &selected_process_id, scopes, instance_id,
                 parent_scope, boundary_id) else { return false; };
             let matching_attachment = match &boundary.kind {
                 ProcessNodeKind::BoundaryTimer { attached_to_id, cancel_activity, .. }
@@ -11307,7 +18140,7 @@ fn validate_termination_plan_on(
                                 && update.fired_occurrence == Some(*fired_occurrence)))
                         && timer.instance_id.as_deref() == Some(instance_id)
                         && timer.scope_id.as_deref() == Some(parent_scope)
-                        && timer.token_id.as_deref() == Some(attached_id)
+                        && timer.token_id.as_deref() == Some(boundary_wait_id)
                         && timer.node_id == boundary_id
                         && timer.kind == ProcessTimerKind::Boundary
                         && plan.timer_updates.iter().any(|update|
@@ -11326,13 +18159,13 @@ fn validate_termination_plan_on(
                         && *accepted_revision == subscription.revision)
                         && subscription.instance_id == instance_id
                         && subscription.scope_id == parent_scope
-                        && subscription.token_id == attached_id
+                        && subscription.token_id == boundary_wait_id
                         && subscription.node_id == boundary_id
                         && subscription.status == ProcessSubscriptionStatus::Open
                         && plan.subscription_updates.iter().any(|update|
                             update.subscription_id == subscription_id
                                 && update.status == ProcessSubscriptionStatus::Consumed)
-                        && event.data["attached_token_id"].as_str() == Some(attached_id)
+                        && event.data["attached_token_id"].as_str() == Some(boundary_wait_id)
                 }
                 (ProcessNodeKind::BoundaryError { .. }, "business_error_caught") => {
                     let valid_error_end = event.data["source_event_id"].as_str().is_some_and(|id|
@@ -11411,10 +18244,28 @@ fn validate_termination_plan_on(
                 .context("terminating child lost its source-time variables")?;
             let child_local = source_state.get(&source.source_scope_id)
                 .context("terminating child lacks source-time locals")?;
+            let repeated_child = plan.repetition_occurrences.iter().any(|occurrence|
+                occurrence.scope_id == parent_scope_id
+                    && occurrence.token_id == parent_token_id
+                    && occurrence.status == ProcessRepetitionOccurrenceStatus::Completed
+                    && occurrence.accepted_source_event_id.as_deref()
+                        == Some(source.source_event_id.as_str())
+                    && occurrence.aggregate_item.as_ref() == Some(child_local)
+                    && plan.repetition_groups.iter().any(|group|
+                        group.group_id == occurrence.group_id
+                            && group.scope_id == occurrence.scope_id
+                            && scope.subprocess_node_id.as_deref()
+                                == Some(group.node_id.as_str()))
+                    && plan.events.iter().filter(|event|
+                        event.kind == "terminate_end_reached"
+                            && event.scope_id == source.source_scope_id
+                            && event.data["source_event_id"].as_str()
+                                == Some(source.source_event_id.as_str()))
+                        .count() == 1);
             ensure!(matches!(plan.variable_effects.get(source.variable_effect_count),
                 Some(VariableEffect::Mapped { scope_id, source_token_id, outputs, .. })
                     if scope_id == parent_scope_id && source_token_id == parent_token_id
-                        && outputs == child_local),
+                        && outputs == child_local) || repeated_child,
                 "terminating child did not map its actual source-time locals to the parent");
             let expected = serde_json::json!({"scope_id":scope.scope_id,
                 "parent_scope_id":scope.parent_scope_id,"parent_token_id":scope.parent_token_id,
@@ -11468,6 +18319,7 @@ fn ordinary_action_source_matches_entry_on(
                     params![instance_id, job_id], |row| row.get::<_, String>(0))?),
                 AcceptedInputRef::CallReturn { parent_token_id, .. } => Some(parent_token_id.clone()),
                 AcceptedInputRef::SendAdmission { pending_token_id, .. } => Some(pending_token_id.clone()),
+                AcceptedInputRef::Retry { old_token_id, .. } => Some(old_token_id.clone()),
                 AcceptedInputRef::PersistedReady { .. } => return Ok(false),
             };
             if trace_termination_source_on(tx, instance_id, model, scopes, plan,
@@ -11498,11 +18350,9 @@ fn ordinary_action_source_matches_entry_on(
     Ok(false)
 }
 
-fn refresh_repetition_retained_bytes_on(
-    tx: &Transaction<'_>, instance_id: &str, group_id: &str,
-) -> Result<u64> {
-    let actual: u64 = tx.query_row(
-            "SELECT length(CAST(g.entry_variables_json AS BLOB))
+/// Retained-byte measure of a repetition group, split so the Service invocation
+/// migration can measure before the activity IO witness table exists.
+const RETAINED_BYTES_BEFORE_WITNESSES_SQL: &str = "SELECT length(CAST(g.entry_variables_json AS BLOB))
                 +COALESCE(length(CAST(g.frozen_collection_json AS BLOB)),0)
                 +COALESCE(length(CAST(g.loop_state_json AS BLOB)),0)
                 +COALESCE((SELECT SUM(length(CAST(o.item_json AS BLOB))
@@ -11515,10 +18365,32 @@ fn refresh_repetition_retained_bytes_on(
                     +COALESCE(length(CAST(j.result_json AS BLOB)),0)) FROM bpmn_jobs j
                     WHERE j.instance_id=g.instance_id AND j.job_id IN
                     (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
+                +COALESCE((SELECT SUM(length(CAST(v.observed_result_json AS BLOB)))
+                    FROM bpmn_service_invocations v
+                    WHERE v.instance_id=g.instance_id AND v.job_id IN
+                    (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
                 +COALESCE((SELECT SUM(length(CAST(t.outputs_json AS BLOB))) FROM bpmn_user_tasks t
                     WHERE t.instance_id=g.instance_id AND t.user_task_id IN
                     (SELECT o.user_task_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id
                      UNION SELECT o.verification_user_task_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id)),0)
+                +COALESCE((SELECT SUM(COALESCE(length(CAST(m.payload_json AS BLOB)),0))
+                    FROM bpmn_messages m WHERE m.source_instance_id=g.instance_id
+                    AND m.source_activation_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                        WHERE o.group_id=g.group_id)),0)
+                +COALESCE((SELECT SUM(COALESCE(length(CAST(s.message_name AS BLOB)),0)
+                    +COALESCE(length(CAST(s.correlation_key AS BLOB)),0))
+                    FROM bpmn_event_subscriptions s WHERE s.instance_id=g.instance_id
+                    AND s.token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                        WHERE o.group_id=g.group_id)),0)
+                +COALESCE((SELECT SUM(length(CAST(s.local_variables_json AS BLOB)))
+                    FROM bpmn_scopes s WHERE s.instance_id=g.instance_id
+                    AND s.parent_token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                        WHERE o.group_id=g.group_id)),0)
+                +COALESCE((SELECT SUM(length(CAST(i.variables_json AS BLOB)))
+                    FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id
+                    WHERE c.parent_instance_id=g.instance_id
+                    AND c.parent_token_id IN (SELECT o.token_id FROM bpmn_repetition_occurrences o
+                        WHERE o.group_id=g.group_id)),0)
                 +COALESCE((SELECT SUM(length(CAST(e.data_json AS BLOB))) FROM bpmn_events e
                     WHERE e.instance_id=g.instance_id AND (
                         json_extract(e.data_json,'$.group_id')=g.group_id
@@ -11529,13 +18401,94 @@ fn refresh_repetition_retained_bytes_on(
                     )),0)
                 +COALESCE((SELECT SUM(length(CAST(i.message AS BLOB))) FROM bpmn_incidents i
                     WHERE i.instance_id=g.instance_id AND (i.incident_id=g.terminal_incident_id
-                        OR i.job_id IN (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id))),0)
-                FROM bpmn_repetition_groups g WHERE g.instance_id=?1 AND g.group_id=?2",
-            params![instance_id,group_id], |row| row_u64(row,0),
-    )?;
+                        OR i.job_id IN (SELECT o.job_id FROM bpmn_repetition_occurrences o WHERE o.group_id=g.group_id))),0)";
+const RETAINED_BYTES_WITNESSES_SQL: &str = "+COALESCE((SELECT SUM(
+                    COALESCE(length(CAST(w.input_values_json AS BLOB)),0)
+                    +COALESCE(length(CAST(w.result_sources_json AS BLOB)),0)
+                    +COALESCE(length(CAST(w.result_json AS BLOB)),0)
+                    +COALESCE(length(CAST(w.output_values_json AS BLOB)),0)
+                    +COALESCE(length(CAST(w.local_patch_json AS BLOB)),0))
+                    FROM bpmn_activity_io_witnesses w
+                    WHERE w.instance_id=g.instance_id AND w.group_id=g.group_id),0)";
+const RETAINED_BYTES_TAIL_SQL: &str = " FROM bpmn_repetition_groups g WHERE g.instance_id=?1 AND g.group_id=?2";
+
+fn retained_bytes_on(conn: &Connection, instance_id: &str, group_id: &str, sql: &str) -> Result<u64> {
+    conn.query_row(sql, params![instance_id, group_id], |row| row_u64(row, 0))
+        .map_err(Into::into)
+}
+
+/// Measure for the Service invocation migration, which runs before the activity
+/// IO witness table exists.
+pub(crate) fn measured_repetition_retained_bytes_before_witnesses_on(
+    conn: &Connection, instance_id: &str, group_id: &str,
+) -> Result<u64> {
+    retained_bytes_on(conn, instance_id, group_id, &format!(
+        "{RETAINED_BYTES_BEFORE_WITNESSES_SQL}{RETAINED_BYTES_TAIL_SQL}"))
+}
+
+pub(crate) fn measured_repetition_retained_bytes_on(
+    conn: &Connection, instance_id: &str, group_id: &str,
+) -> Result<u64> {
+    retained_bytes_on(conn, instance_id, group_id, &format!(
+        "{RETAINED_BYTES_BEFORE_WITNESSES_SQL}{RETAINED_BYTES_WITNESSES_SQL}{RETAINED_BYTES_TAIL_SQL}"))
+}
+
+fn refresh_repetition_retained_bytes_on(
+    tx: &Transaction<'_>, instance_id: &str, group_id: &str,
+) -> Result<u64> {
+    let actual = measured_repetition_retained_bytes_on(tx, instance_id, group_id)?;
     tx.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE instance_id=?2 AND group_id=?3",
         params![sql_integer(actual)?,instance_id,group_id])?;
     Ok(actual)
+}
+
+fn repetition_activity_inputs_on(
+    model: &ProcessModel,
+    selected_process_id: &str,
+    scopes: &[ProcessScopeSummary],
+    instance_id: &str,
+    group: &RepetitionGroup,
+    occurrence: &RepetitionOccurrence,
+    node: &ProcessNode,
+) -> Result<Option<Vec<IoObservedInput>>> {
+    let Some(io) = &node.activity_io else { return Ok(None); };
+    let path = scope_path(scopes, instance_id, &group.scope_id)?;
+    let body = super::model::selected_body(model, selected_process_id, &path)?;
+    let modeling = super::model::io_modeling(body.modeling);
+    let extra = vec![("repeat".to_owned(), serde_json::json!({
+        "group_id": group.group_id.clone(),
+        "index": occurrence.ordinal,
+        "item": occurrence.item.clone(),
+    }))];
+    super::runtime::evaluate_activity_inputs(
+        io,
+        modeling,
+        &occurrence.input_variables,
+        &occurrence.input_variables,
+        &extra,
+    )
+    .map(Some)
+}
+
+/// Authored inputs of one ordinal, or none when an authored association fails. The
+/// failing ordinal is proved by its own parked-input fact; callers that size
+/// reservations or replay bodies see no inputs for it.
+fn repetition_inputs_unless_failed_on(
+    model: &ProcessModel,
+    selected_process_id: &str,
+    scopes: &[ProcessScopeSummary],
+    instance_id: &str,
+    group: &RepetitionGroup,
+    occurrence: &RepetitionOccurrence,
+    node: &ProcessNode,
+) -> Result<Option<Vec<IoObservedInput>>> {
+    match repetition_activity_inputs_on(
+        model, selected_process_id, scopes, instance_id, group, occurrence, node,
+    ) {
+        Err(error) if error.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
+            .is_some() => Ok(None),
+        other => other,
+    }
 }
 
 fn repetition_admission_reservation_on(
@@ -11543,6 +18496,7 @@ fn repetition_admission_reservation_on(
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
     prior_groups: &[RepetitionGroup], prior_occurrences: &[RepetitionOccurrence],
 ) -> Result<u64> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let mut reserved = 0_u64;
     for occurrence in prior_occurrences.iter().filter(|prior|
         !plan.repetition_occurrences.iter().any(|row| row.occurrence_id == prior.occurrence_id))
@@ -11560,23 +18514,44 @@ fn repetition_admission_reservation_on(
                     && prior_status.is_none_or(|status|
                         status == ProcessRepetitionOccurrenceStatus::Pending));
         if pending {
-            let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+            let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
+            let activity_inputs = repetition_inputs_unless_failed_on(
+                model, &selected_process_id, scopes, instance_id, group, occurrence, node)?;
             reserved = reserved.checked_add(super::runtime::repetition_immediate_reservation(
                 node, &group.group_id, occurrence.ordinal, &occurrence.item,
-                &occurrence.input_variables)?)
+                &occurrence.input_variables, activity_inputs.as_deref())?)
                 .context("pending repetition reservation overflow")?;
         } else if let Some(job_id) = &occurrence.job_id {
-            let prior_status: Option<String> = tx.query_row(
-                "SELECT status FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2",
-                params![instance_id,job_id], |row| row.get(0),
+            let prior_job: Option<(String, String, String, Option<String>)> = tx.query_row(
+                "SELECT j.status,v.phase,v.dispatch_evidence,v.reserved_result_event_id FROM bpmn_jobs j
+                    JOIN bpmn_service_invocations v ON v.job_id=j.job_id
+                        AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id
+                    WHERE j.instance_id=?1 AND j.job_id=?2",
+                params![instance_id,job_id], |row| Ok((row.get(0)?, row.get(1)?,
+                    row.get(2)?, row.get(3)?)),
             ).optional()?;
             let newly_queued = plan.create_jobs.iter().any(|job|
                 job.job_id == *job_id && job.status == "queued");
-            if !plan.complete_job_ids.contains(job_id)
-                && (matches!(prior_status.as_deref(), Some("queued" | "error"))
-                    || newly_queued) {
+            let (claim, observation, incident) =
+                super::runtime::repetition_service_reservation_flags(
+                    if newly_queued { "queued" }
+                    else { prior_job.as_ref().map_or("", |job| job.0.as_str()) },
+                    prior_job.as_ref().map(|job| job.1.as_str()),
+                    prior_job.as_ref().map_or("no_boundary", |job| job.2.as_str()),
+                    prior_job.as_ref().is_some_and(|job| job.3.is_some()));
+            if claim && !plan.complete_job_ids.contains(job_id) {
                 reserved = reserved.checked_add(super::runtime::repetition_claim_reservation()?)
                     .context("queued repetition claim reservation overflow")?;
+            }
+            if observation && !plan.complete_job_ids.contains(job_id) {
+                reserved = reserved.checked_add(
+                    super::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES)
+                    .context("repeated Service observation reservation overflow")?;
+            }
+            if incident && !plan.complete_job_ids.contains(job_id) {
+                reserved = reserved.checked_add(
+                    super::runtime::MAX_REPEATED_SERVICE_INCIDENT_MESSAGE_BYTES)
+                    .context("repeated Service incident reservation overflow")?;
             }
         }
     }
@@ -11594,7 +18569,9 @@ fn apply_repetition_plan_on(
     variable_states: &[BTreeMap<String, Value>],
     entry: EntryAuthority<'_>,
     at_ms: i64,
+    staged_requests: &[CallRequest],
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let prior_groups = repetition_groups_on(tx, instance_id)?;
     let prior_occurrences = repetition_occurrences_on(tx, instance_id)?;
     let mut planned_group_ids = HashSet::new();
@@ -11604,7 +18581,7 @@ fn apply_repetition_plan_on(
         ensure!(planned_group_ids.insert(group.group_id.as_str())
             && group.instance_id == instance_id && group.updated_at_ms == at_ms,
             "repetition group identity or update timestamp differs from its transaction");
-        let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
         let repeat = node.repeat.as_ref().context("repetition group has no pinned activity repeat")?;
         let (mode, output_target, max_iterations) = match repeat {
             tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance { mode, output_collection_variable, .. } => {
@@ -11630,6 +18607,41 @@ fn apply_repetition_plan_on(
         let lifetime_limit = prior.is_none() && group.terminal_capacity
             && plan.repetition_capacity.as_ref().is_some_and(|source|
                 source.group_id == group.group_id && source.reason == "group_lifetime");
+        let path = scope_path(scopes, instance_id, &group.scope_id)?;
+        let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let body_nodes = selected.nodes;
+        for boundary in body_nodes.iter().filter(|boundary| match &boundary.kind {
+            ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryMessage { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryError { attached_to_id, .. }
+            | ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } =>
+                attached_to_id == &group.node_id,
+            _ => false,
+        }) {
+            let created = if matches!(&boundary.kind, ProcessNodeKind::BoundaryTimer { .. }) {
+                plan.create_timers.iter().filter(|timer|
+                    timer.node_id == boundary.id
+                        && timer.scope_id.as_deref() == Some(group.scope_id.as_str())
+                        && timer.token_id.as_deref() == Some(group.parent_token_id.as_str())).count()
+            } else {
+                plan.create_subscriptions.iter().filter(|sub|
+                    sub.node_id == boundary.id && sub.scope_id == group.scope_id
+                        && sub.token_id == group.parent_token_id).count()
+            };
+            ensure!(created == usize::from(prior.is_none() && !entry_failed),
+                "repeated activity boundary must arm once on its outer coordinator");
+            if prior.is_none() && !entry_failed {
+                let all = if matches!(&boundary.kind, ProcessNodeKind::BoundaryTimer { .. }) {
+                    plan.create_timers.iter().filter(|timer|
+                        timer.node_id == boundary.id
+                            && timer.scope_id.as_deref() == Some(group.scope_id.as_str())).count()
+                } else {
+                    plan.create_subscriptions.iter().filter(|sub|
+                        sub.node_id == boundary.id && sub.scope_id == group.scope_id).count()
+                };
+                ensure!(all == 1, "repeated boundary was cloned onto an ordinal");
+            }
+        }
         if let Some(prior) = prior {
             ensure!(group.revision == prior.revision.checked_add(1).context("repetition group revision overflow")?
                 && group.instance_id == prior.instance_id && group.scope_id == prior.scope_id
@@ -11936,7 +18948,7 @@ fn apply_repetition_plan_on(
     }
     let actual_occurrences = repetition_occurrences_on(tx, instance_id)?;
     for group in &plan.repetition_groups {
-        let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
         let mut members = actual_occurrences.iter().filter(|row| row.group_id == group.group_id)
             .collect::<Vec<_>>();
         members.sort_by_key(|row| row.ordinal);
@@ -12059,7 +19071,12 @@ fn apply_repetition_plan_on(
         let mut loop_state = group.entry_variables.clone();
         let mapping = match &node.kind {
             ProcessNodeKind::UserTask { output_mapping, .. }
-            | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
+            | ProcessNodeKind::ServiceTask { output_mapping, .. }
+            | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+            | ProcessNodeKind::SubProcess { output_mapping, .. }
+            | ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. })
+            | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping.clone(),
+            ProcessNodeKind::ManualTask { .. } | ProcessNodeKind::SendTask { .. } => BTreeMap::new(),
             _ => bail!("repetition group pinned a non-activity node"),
         };
         for row in members {
@@ -12080,6 +19097,81 @@ fn apply_repetition_plan_on(
             };
             ensure!(&row.input_variables == expected_variables,
                 "repetition ordinal variables differ from their source-time snapshot");
+            let row_activity_inputs = repetition_inputs_unless_failed_on(
+                model, &selected_process_id, scopes, instance_id, &group, &row, node)?;
+            let mut row_body_extra = vec![("repeat".to_owned(), serde_json::json!({
+                "group_id":group.group_id.clone(),
+                "index":row.ordinal,
+                "item":row.item.clone(),
+            }))];
+            if let Some(inputs) = row_activity_inputs.as_deref() {
+                row_body_extra.extend(super::runtime::activity_inputs_extra(inputs)?);
+            }
+            if matches!(&node.kind, ProcessNodeKind::ReceiveTask { .. })
+                && row.status != ProcessRepetitionOccurrenceStatus::Pending {
+                let matches: u32 = tx.query_row(
+                    "SELECT COUNT(*) FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 AND kind='receive_task'",
+                    params![instance_id,row.scope_id,group.node_id,row.token_id],
+                    |sql| sql.get(0),
+                )?;
+                ensure!(matches == 1,
+                    "repeated Receive ordinal lacks its unique factual subscription");
+            }
+            if matches!(&node.kind, ProcessNodeKind::SubProcess { .. })
+                && row.status != ProcessRepetitionOccurrenceStatus::Pending {
+                let matches: u32 = tx.query_row(
+                    "SELECT COUNT(*) FROM bpmn_scopes WHERE instance_id=?1 AND parent_scope_id=?2 AND parent_token_id=?3 AND subprocess_node_id=?4",
+                    params![instance_id,row.scope_id,row.token_id,group.node_id],
+                    |sql| sql.get(0),
+                )?;
+                ensure!(matches == 1,
+                    "repeated subprocess ordinal lacks its unique child scope");
+            }
+            if matches!(&node.kind, ProcessNodeKind::CallActivity(_))
+                && row.status != ProcessRepetitionOccurrenceStatus::Pending {
+                let staged = staged_requests.iter().filter(|request|
+                    request.parent_scope_id == row.scope_id
+                        && request.parent_token_id == row.token_id
+                        && request.call_node_id == group.node_id).collect::<Vec<_>>();
+                if let ProcessNodeKind::CallActivity(ProcessCallActivity { input_mapping, .. }) = &node.kind {
+                    let expected = super::runtime::patch_variables(input_mapping,
+                        &serde_json::json!({}), &row.input_variables, &Value::Null,
+                        &row_body_extra)?;
+                    ensure!(plan.call_requests.iter().filter(|request|
+                        request.parent_scope_id == row.scope_id
+                            && request.parent_token_id == row.token_id
+                            && request.call_node_id == group.node_id)
+                        .all(|request| request.variables == expected)
+                        && staged.iter().all(|request| request.variables == expected),
+                        "repeated Call input differs from its frozen ordinal variables");
+                }
+                let matches: u32 = tx.query_row(
+                    "SELECT COUNT(*) FROM bpmn_calls WHERE parent_instance_id=?1 AND parent_scope_id=?2 AND parent_token_id=?3 AND call_node_id=?4",
+                    params![instance_id,row.scope_id,row.token_id,group.node_id],
+                    |sql| sql.get(0),
+                )?;
+                let requested = plan.call_requests.iter().filter(|request|
+                    request.parent_scope_id == row.scope_id
+                        && request.parent_token_id == row.token_id
+                        && request.call_node_id == group.node_id).count();
+                ensure!(matches == 1 || matches == 0 && requested == 1
+                    && !prior_occurrences.iter().any(|prior|
+                        prior.occurrence_id == row.occurrence_id)
+                    || matches == 0 && requested == 0 && staged.len() == 1
+                    && row.status == ProcessRepetitionOccurrenceStatus::Active
+                    && prior_occurrences.iter().any(|prior|
+                        prior.occurrence_id == row.occurrence_id
+                            && prior.group_id == group.group_id
+                            && prior.ordinal == row.ordinal
+                            && prior.scope_id == row.scope_id
+                            && prior.token_id == row.token_id
+                            && prior.status == ProcessRepetitionOccurrenceStatus::Active)
+                    && staged[0].child_instance_id != instance_id
+                    && plan.events.iter().all(|event|
+                        event.kind != "call_request_cancelled"
+                            || event.data["call_id"].as_str() != Some(staged[0].call_id.as_str())),
+                    "repeated Call ordinal lacks its unique pinned child");
+            }
             if let Some(job_id) = &row.job_id {
                 ensure!(linked_jobs.insert(job_id),
                     "repetition ordinals share one fenced Service job");
@@ -12093,9 +19185,7 @@ fn apply_repetition_plan_on(
                 };
                 ensure!(token_id == row.token_id && parse::<Value>(input_json)? ==
                     super::runtime::prepare_service_input(input_mapping, expected_variables,
-                        &[("repeat".to_owned(), serde_json::json!({
-                            "group_id":group.group_id,"index":row.ordinal,"item":row.item
-                        }))])?,
+                        &row_body_extra)?,
                     "repetition Service input differs from its pinned ordinal mapping");
             }
             if let Some(task_id) = &row.user_task_id {
@@ -12110,18 +19200,20 @@ fn apply_repetition_plan_on(
                 let accepted = if status == "completed" {
                     row.accepted_source_event_id.as_deref().is_some_and(|source_id|
                         tx.query_row(
-                            "SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND event_id=?3 AND kind='user_task_completed'",
+                            "SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND event_id=?3 AND kind IN ('user_task_completed','manual_task_acknowledged')",
                             params![instance_id,row.scope_id,source_id],
                             |sql| sql.get::<_, String>(0),
                         ).ok().and_then(|raw| parse::<Value>(raw).ok()).is_some_and(|source|
                             source["user_task_id"] == *task_id
-                                && source["outputs"] == outputs))
+                                && (kind == "manual" && outputs.is_null()
+                                    || kind == "work" && source["outputs"] == outputs)))
                 } else {
                     matches!(status.as_str(), "open" | "cancelled")
                         && outputs.is_null() && row.accepted_source_event_id.is_none()
                 };
-                ensure!(matches!(&node.kind, ProcessNodeKind::UserTask { .. })
-                    && token_id == row.token_id && kind == "work" && accepted,
+                ensure!((matches!(&node.kind, ProcessNodeKind::UserTask { .. }) && kind == "work"
+                    || matches!(&node.kind, ProcessNodeKind::ManualTask { .. }) && kind == "manual")
+                    && token_id == row.token_id && accepted,
                     "repetition Work task differs from its pinned ordinal wait");
             }
             if let Some(task_id) = &row.verification_user_task_id {
@@ -12168,13 +19260,7 @@ fn apply_repetition_plan_on(
                         && decision["user_task_id"] == *task_id
                         && decision.get("outputs").is_some(),
                         "completed repeated Verification changed its decision payload");
-                    if matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Human {
-                        task_id: accepted_task_id, ..
-                    }) if accepted_task_id == task_id) {
-                        task_outputs == expected
-                    } else {
-                        decision["outputs"] == task_outputs
-                    }
+                    task_outputs == expected
                 } else {
                     matches!(status.as_str(), "open" | "cancelled")
                         && row.approval_event_id.is_none()
@@ -12220,6 +19306,16 @@ fn apply_repetition_plan_on(
                         .map(|(index, _)| index).collect::<Vec<_>>();
                     ensure!(completed.len() == 1,
                         "accepted repetition ordinal lacks one ordered completion fact");
+                    if matches!(&node.kind, ProcessNodeKind::ManualTask { .. }
+                        | ProcessNodeKind::SendTask { .. }
+                        | ProcessNodeKind::ReceiveTask { .. }
+                        | ProcessNodeKind::SubProcess { .. }
+                        | ProcessNodeKind::CallActivity(_)
+                        | ProcessNodeKind::ScriptTask { .. }) {
+                        ensure!(plan.event_ids.iter().any(|(source_index, id)|
+                            id == source_id && *source_index < completed[0]),
+                            "new repeated activity completion lacks its current factual source");
+                    }
                     for causal_id in std::iter::once(source_id)
                         .chain(row.approval_event_id.as_deref()) {
                         if let Some((source_index, _)) = plan.event_ids.iter()
@@ -12229,15 +19325,204 @@ fn apply_repetition_plan_on(
                         }
                     }
                 }
-                let (kind, data_json): (String,String) = tx.query_row(
-                    "SELECT kind,data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND event_id=?3",
-                    params![instance_id,row.scope_id,source_id],
-                    |sql| Ok((sql.get(0)?,sql.get(1)?)),
+                let (kind, source_scope_id, data_json): (String,String,String) = tx.query_row(
+                    "SELECT kind,scope_id,data_json FROM bpmn_events WHERE instance_id=?1 AND event_id=?2",
+                    params![instance_id,source_id],
+                    |sql| Ok((sql.get(0)?,sql.get(1)?,sql.get(2)?)),
                 )?;
                 let data: Value = parse(data_json)?;
-                ensure!(matches!(kind.as_str(), "user_task_completed" | "service_result")
-                    && (row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
-                        || row.aggregate_item.as_ref() == data.get("outputs")),
+                let expected_output = match (&node.kind, kind.as_str()) {
+                    (ProcessNodeKind::UserTask { .. }, "user_task_completed")
+                    | (ProcessNodeKind::ServiceTask { .. }, "service_result") => {
+                        ensure!(source_scope_id == row.scope_id,
+                            "repetition source changed its ordinal scope");
+                        data.get("outputs").cloned().context("repetition source has no outputs")?
+                    }
+                    (ProcessNodeKind::ScriptTask { script, .. }, "script_completed") => {
+                        let expected = super::runtime::script_evaluate(script,
+                            &row.input_variables, &Value::Null, &row_body_extra)?;
+                        ensure!(source_scope_id == row.scope_id
+                            && data == serde_json::json!({"outputs":expected})
+                            && plan.event_ids.iter().filter(|(index, id)|
+                                id.as_str() == source_id
+                                    && plan.events.get(**index).is_some_and(|event|
+                                        event.kind == "script_completed"
+                                            && event.scope_id == row.scope_id
+                                            && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                            && plan.event_sources.get(index) == Some(&row.token_id)))
+                                .count() == 1,
+                            "repeated Script source differs from its joined body and ordinal");
+                        expected
+                    }
+                    (ProcessNodeKind::ManualTask { .. }, "manual_task_acknowledged") => {
+                        let task_id = row.user_task_id.as_deref()
+                            .context("repeated Manual source has no task")?;
+                        let (task_token, assignee, status): (String,String,String) = tx.query_row(
+                            "SELECT token_id,assignee_user_id,status FROM bpmn_user_tasks WHERE instance_id=?1 AND scope_id=?2 AND user_task_id=?3 AND kind='manual'",
+                            params![instance_id,row.scope_id,task_id],
+                            |sql| Ok((sql.get(0)?,sql.get(1)?,sql.get(2)?)),
+                        )?;
+                        ensure!(source_scope_id == row.scope_id && task_token == row.token_id
+                            && status == "completed" && data["user_task_id"] == task_id
+                            && data["acknowledged_by_user_id"] == assignee,
+                            "repeated Manual source differs from its factual acknowledgment");
+                        Value::Null
+                    }
+                    (ProcessNodeKind::SendTask { .. }, "send_task_admitted") => {
+                        let message_id = data["message_id"].as_str()
+                            .context("repeated Send source has no message ID")?;
+                        let count: u32 = tx.query_row(
+                            "SELECT COUNT(*) FROM bpmn_messages WHERE source_instance_id=?1 AND source_scope_id=?2 AND source_node_id=?3 AND source_activation_id=?4 AND source_event_id=?5 AND message_id=?6",
+                            params![instance_id,row.scope_id,group.node_id,row.token_id,source_id,message_id],
+                            |sql| sql.get(0),
+                        )?;
+                        let total: u32 = tx.query_row(
+                            "SELECT COUNT(*) FROM bpmn_messages WHERE source_instance_id=?1 AND source_scope_id=?2 AND source_node_id=?3 AND source_activation_id=?4",
+                            params![instance_id,row.scope_id,group.node_id,row.token_id],
+                            |sql| sql.get(0),
+                        )?;
+                        ensure!(source_scope_id == row.scope_id && count == 1 && total == 1
+                            && data["source_activation_id"] == row.token_id,
+                            "repeated Send source lacks one durable outbox admission");
+                        Value::Null
+                    }
+                    (ProcessNodeKind::ReceiveTask { .. }, "message_delivered") => {
+                        let subscription_id = data["subscription_id"].as_str()
+                            .context("repeated Receive source has no subscription")?;
+                        let count: u32 = tx.query_row(
+                            "SELECT COUNT(*) FROM bpmn_event_subscriptions WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 AND subscription_id=?5 AND kind='receive_task' AND status='consumed'",
+                            params![instance_id,row.scope_id,group.node_id,row.token_id,subscription_id],
+                            |sql| sql.get(0),
+                        )?;
+                        let sender = data["message"]["sender_user_id"].as_str()
+                            .context("repeated Receive source has no sender identity")?;
+                        let message_id = data["message_id"].as_str()
+                            .context("repeated Receive source has no message identity")?;
+                        let (hash, message_name, correlation, status, matched_subscription):
+                            (String,String,String,String,Option<String>) = tx.query_row(
+                            "SELECT m.payload_sha256,m.message_name,m.correlation_key,m.status,m.matched_subscription_id FROM bpmn_messages m JOIN bpmn_instances i ON i.instance_id=?1 AND i.org_id=m.org_id WHERE m.sender_user_id=?2 AND m.message_id=?3",
+                            params![instance_id,sender,message_id],
+                            |sql| Ok((sql.get(0)?,sql.get(1)?,sql.get(2)?,sql.get(3)?,sql.get(4)?)),
+                        )?;
+                        let source_is_current = matches!(entry,
+                            EntryAuthority::Accepted(AcceptedInputRef::Message {
+                                sender_user_id, message_id: accepted_message,
+                                target_subscription_id: Some(accepted_subscription), ..
+                            }) if sender_user_id == sender && accepted_message == message_id
+                                && accepted_subscription == subscription_id);
+                        ensure!(source_scope_id == row.scope_id && count == 1
+                            && data["attached_token_id"] == row.token_id
+                            && data.get("payload").is_some()
+                            && hash == data["message"]["payload_sha256"]
+                            && hash == hex::encode(Sha256::digest(json(&data["payload"])?.as_bytes()))
+                            && message_name == data["message"]["message_name"]
+                            && correlation == data["message"]["correlation_key"]
+                            && (source_is_current && matches!(status.as_str(), "pending" | "blocked")
+                                || status == "delivered"
+                                    && matched_subscription.as_deref() == Some(subscription_id)),
+                            "repeated Receive source differs from its consumed subscription");
+                        data.get("payload").cloned().context("repeated Receive source has no payload")?
+                    }
+                    (ProcessNodeKind::SubProcess { .. }, "scope_completed") => {
+                        let child_scope_id = data["scope_id"].as_str()
+                            .context("repeated subprocess return has no child scope")?;
+                        let (status, variables): (String,String) = tx.query_row(
+                            "SELECT status,local_variables_json FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2 AND parent_scope_id=?3 AND parent_token_id=?4 AND subprocess_node_id=?5",
+                            params![instance_id,child_scope_id,row.scope_id,row.token_id,group.node_id],
+                            |sql| Ok((sql.get(0)?,sql.get(1)?)),
+                        )?;
+                        ensure!(source_scope_id == child_scope_id && status == "completed"
+                            && data["parent_token_id"] == row.token_id,
+                            "repeated subprocess source differs from its completed child scope");
+                        parse(variables)?
+                    }
+                    (ProcessNodeKind::SubProcess { .. }, "terminate_end_reached") => {
+                        let children = scopes.iter().filter(|scope|
+                            scope.scope_id == source_scope_id
+                                && scope.parent_scope_id.as_deref()
+                                    == Some(row.scope_id.as_str())
+                                && scope.parent_token_id.as_deref()
+                                    == Some(row.token_id.as_str())
+                                && scope.subprocess_node_id.as_deref()
+                                    == Some(group.node_id.as_str()))
+                            .collect::<Vec<_>>();
+                        ensure!(children.len() == 1
+                            && data["source_event_id"].as_str() == Some(source_id)
+                            && data["source_scope_id"].as_str()
+                                == Some(source_scope_id.as_str()),
+                            "repeated child Terminate source differs from its exact child scope");
+                        let expected_return = serde_json::json!({
+                            "scope_id":source_scope_id,
+                            "parent_scope_id":row.scope_id,
+                            "parent_token_id":row.token_id,
+                            "subprocess_node_id":group.node_id,
+                            "reason":"terminate_end",
+                            "source_instance_id":instance_id,
+                            "source_event_id":source_id,
+                        });
+                        let retained = prior_occurrences.iter().any(|prior|
+                            prior.occurrence_id == row.occurrence_id
+                                && prior.status == ProcessRepetitionOccurrenceStatus::Completed
+                                && prior.token_id == row.token_id
+                                && prior.accepted_source_event_id == row.accepted_source_event_id);
+                        let return_count = if retained {
+                            tx.query_row(
+                                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='scope_completed' AND node_id IS NULL AND data_json=?3",
+                                params![instance_id,source_scope_id,json(&expected_return)?],
+                                |sql| sql.get::<_, u32>(0),
+                            )?
+                        } else {
+                            u32::try_from(plan.events.iter().filter(|event|
+                                event.kind == "scope_completed"
+                                    && event.scope_id == source_scope_id
+                                    && event.node_id.is_none()
+                                    && event.data == expected_return).count())?
+                        };
+                        ensure!(return_count == 1,
+                            "repeated child Terminate source differs from its exact scope return");
+                        let (status, variables): (String, String) = tx.query_row(
+                            "SELECT status,local_variables_json FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2 AND parent_scope_id=?3 AND parent_token_id=?4 AND subprocess_node_id=?5",
+                            params![instance_id,source_scope_id,row.scope_id,row.token_id,group.node_id],
+                            |sql| Ok((sql.get(0)?,sql.get(1)?)),
+                        )?;
+                        ensure!(status == "completed",
+                            "repeated child Terminate left its factual scope active");
+                        parse(variables)?
+                    }
+                    (ProcessNodeKind::CallActivity(_), "call_returned") => {
+                        let call_id = data["call_id"].as_str()
+                            .context("repeated Call return has no call ID")?;
+                        let (child_id, status, child_variables, called_definition,
+                            called_version, called_process_id):
+                            (String,String,String,String,u32,String) = tx.query_row(
+                            "SELECT c.child_instance_id,c.status,i.variables_json,c.called_definition_id,c.called_version,c.called_process_id FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id WHERE c.call_id=?1 AND c.parent_instance_id=?2 AND c.parent_scope_id=?3 AND c.parent_token_id=?4 AND c.call_node_id=?5",
+                            params![call_id,instance_id,row.scope_id,row.token_id,group.node_id],
+                            |sql| Ok((sql.get(0)?,sql.get(1)?,sql.get(2)?,sql.get(3)?,sql.get(4)?,sql.get(5)?)),
+                        )?;
+                        let ProcessNodeKind::CallActivity(call) = &node.kind else {
+                            bail!("repeated Call source lost its pinned node")
+                        };
+                        let (called_definition_id, pinned_version, called_element) =
+                            match &call.target {
+                                ProcessCallTarget::PublishedBody { definition_id, version,
+                                    called_element } =>
+                                    (definition_id.as_str(), *version, called_element),
+                                ProcessCallTarget::LocalBody { called_element } =>
+                                    (definition_id, version, called_element),
+                            };
+                        ensure!(source_scope_id == row.scope_id && status == "returned"
+                            && data["parent_token_id"] == row.token_id
+                            && data["child_instance_id"] == child_id
+                            && called_definition == called_definition_id
+                            && called_version == pinned_version
+                            && called_process_id == called_element.process_id,
+                            "repeated Call source differs from its pinned returned child");
+                        parse(child_variables)?
+                    }
+                    _ => bail!("repetition accepted source kind differs from its pinned activity"),
+                };
+                ensure!(row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                    || row.aggregate_item.as_ref() == Some(&expected_output),
                     "repetition aggregate item differs from its accepted source output");
                 if kind == "service_result" {
                     let job_id = row.job_id.as_deref()
@@ -12265,7 +19550,7 @@ fn apply_repetition_plan_on(
                     ensure!(data == expected
                         && row.accepted_origin.as_ref().is_some_and(|actual| result_origin_text(actual) == origin),
                         "repeated Service aggregate differs from its fenced full result");
-                } else {
+                } else if kind == "user_task_completed" {
                     ensure!(row.user_task_id.as_deref().is_some_and(|task_id|
                         data["user_task_id"].as_str() == Some(task_id)),
                         "repeated Work aggregate differs from its completed task");
@@ -12285,6 +19570,29 @@ fn apply_repetition_plan_on(
                     }
                     let byte_denied = plan.repetition_capacity.as_ref().is_some_and(|source|
                         source.group_id == group.group_id && source.reason == "repetition_bytes");
+                    let mapping_failure = if byte_denied
+                        && matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                        Ok(loop_state.clone())
+                    } else if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                        super::runtime::patch_script_variables(&mapping, &loop_state,
+                            &loop_state, &expected_output,
+                            &row_body_extra)
+                    } else {
+                        super::runtime::patch_variables(&mapping, &loop_state, &loop_state,
+                            &expected_output,
+                            &row_body_extra)
+                    };
+                    let mapping_error = mapping_failure.err();
+                    if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })
+                        && mapping_error.as_ref().is_some_and(|error|
+                        error.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                            .is_some()) {
+                        return Err(mapping_error.context("Script mapping infrastructure failed")?);
+                    }
+                    let deterministic_failure = mapping_error.as_ref().is_some_and(|error|
+                        !matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })
+                            || error.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>()
+                                .is_none());
                     ensure!(group.status == ProcessRepetitionGroupStatus::Incident
                         && row.aggregate_item.is_none() && row.state_patch.is_none()
                         && row.state_after.is_none()
@@ -12293,11 +19601,7 @@ fn apply_repetition_plan_on(
                         && (byte_denied && group.terminal_capacity
                             || !byte_denied && !group.terminal_capacity
                                 && group.mode == ProcessRepetitionGroupMode::StructuredLoop
-                                && super::runtime::patch_variables(mapping, &loop_state, &loop_state,
-                                    data.get("outputs").context("accepted source has no outputs")?,
-                                    &[("repeat".to_owned(), serde_json::json!({
-                                        "group_id":group.group_id,"index":row.ordinal,"item":Value::Null
-                                    }))]).is_err())
+                                && deterministic_failure)
                         && plan.events.iter().filter(|event| event.kind == "repetition_group_blocked"
                             && event.scope_id == group.scope_id
                             && event.data["group_id"] == group.group_id
@@ -12305,14 +19609,49 @@ fn apply_repetition_plan_on(
                                 "REPETITION_LIMIT" } else { "REPETITION_MAPPING_FAILED" }
                             && event.data["last_source_event_id"] == source_id).count() == 1,
                         "accepted repetition mapping failure differs from pinned source and state");
+                    if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) && !byte_denied {
+                        let source_index = plan.event_ids.iter().find_map(|(index, id)|
+                            (id == source_id).then_some(*index))
+                            .context("blocked Script lost its body source index")?;
+                        let incident_index = plan.events.iter().position(|event|
+                            event.kind == "incident" && event.scope_id == row.scope_id
+                                && event.node_id.as_deref() == Some(group.node_id.as_str())
+                                && event.data["code"] == "REPETITION_MAPPING_FAILED")
+                            .context("blocked Script lost its mapping incident")?;
+                        let block_index = plan.events.iter().position(|event|
+                            event.kind == "repetition_group_blocked"
+                                && event.data["group_id"] == group.group_id)
+                            .context("blocked Script lost its group fact")?;
+                        let failure = mapping_error.as_ref()
+                            .context("blocked Script has no deterministic mapping failure")?;
+                        let incident_id = group.terminal_incident_id.as_deref()
+                            .context("blocked Script has no terminal incident")?;
+                        ensure!(source_index < incident_index && incident_index < block_index
+                            && plan.events[incident_index].data == serde_json::json!({
+                                "code":"REPETITION_MAPPING_FAILED",
+                                "message":bounded_failure_message(&failure.to_string()),
+                            })
+                            && plan.add_incidents.iter().filter(|incident|
+                                incident.incident_id == incident_id
+                                    && incident.message == bounded_failure_message(
+                                        &failure.to_string())
+                                    && !incident.can_retry).count() == 1
+                            && plan.events.iter().filter(|event|
+                                event.kind == "repetition_occurrence_completed"
+                                    && event.data["occurrence_id"] == row.occurrence_id).count() == 0,
+                            "blocked Script changed the accepted body, incident, or completion order");
+                    }
                     continue;
                 }
                 if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
-                    let next = super::runtime::patch_variables(mapping, &loop_state, &loop_state,
-                        row.aggregate_item.as_ref().context("completed loop output missing")?,
-                        &[("repeat".to_owned(), serde_json::json!({
-                            "group_id":group.group_id,"index":row.ordinal,"item":Value::Null
-                        }))])?;
+                    let outputs = row.aggregate_item.as_ref().context("completed loop output missing")?;
+                    let next = if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                        super::runtime::patch_script_variables(&mapping, &loop_state, &loop_state,
+                            outputs, &row_body_extra)?
+                    } else {
+                        super::runtime::patch_variables(&mapping, &loop_state, &loop_state,
+                            outputs, &row_body_extra)?
+                    };
                     let patch = Value::Object(mapping.keys().map(|key| (key.clone(), next[key].clone())).collect());
                     ensure!(row.state_patch.as_ref() == Some(&patch)
                         && row.state_after.as_ref() == Some(&next),
@@ -12432,6 +19771,7 @@ fn apply_repetition_plan_on(
         "SELECT COALESCE(SUM(retained_bytes),0) FROM bpmn_repetition_groups WHERE instance_id=?1",
         [instance_id], |row| row_u64(row,0),
     )?;
+    let current_occurrences = repetition_occurrences_on(tx, instance_id)?;
     if let Some(source) = &plan.repetition_capacity {
         let blocked = plan.events.get(source.event_index)
             .context("capacity latch lost its blocked event")?;
@@ -12467,7 +19807,7 @@ fn apply_repetition_plan_on(
                             && event.data["group_id"] == group.group_id
                             && event.data["ordinal"] == u64::from(*ordinal)),
                     "denied repetition ordinal created an occurrence or start fact");
-                let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
                 let item = match &node.repeat {
                     Some(tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance {
                         input: tentaflow_protocol::processes::ProcessMultiInstanceInput::CollectionExpression { .. }, ..
@@ -12479,9 +19819,23 @@ fn apply_repetition_plan_on(
                 let input_variables = if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
                     group.loop_state.as_ref().context("denied loop ordinal has no local state")?
                 } else { &group.entry_variables };
-                let reserve = super::runtime::repetition_immediate_reservation(node,
-                    &group.group_id, *ordinal, &item, input_variables)?;
                 let uuid = "00000000-0000-0000-0000-000000000000";
+                let candidate = RepetitionOccurrence {
+                    occurrence_id: uuid.to_owned(), group_id: group.group_id.clone(),
+                    instance_id: group.instance_id.clone(), scope_id: group.scope_id.clone(),
+                    token_id: uuid.to_owned(),
+                    ordinal: *ordinal, item: item.clone(), input_variables: input_variables.clone(),
+                    status: ProcessRepetitionOccurrenceStatus::Pending, revision: 1,
+                    created_at_ms: 0, updated_at_ms: 0, job_id: None, user_task_id: None,
+                    verification_user_task_id: None, accepted_source_event_id: None,
+                    approval_event_id: None, aggregate_item: None, state_patch: None,
+                    state_after: None, accepted_origin: None,
+                };
+                let activity_inputs = repetition_inputs_unless_failed_on(
+                    model, &selected_process_id, scopes, instance_id, group, &candidate, node)?;
+                let reserve = super::runtime::repetition_immediate_reservation(node,
+                    &group.group_id, *ordinal, &item, input_variables,
+                    activity_inputs.as_deref())?;
                 let start = serde_json::json!({
                     "group_id":group.group_id,"occurrence_id":uuid,
                     "ordinal":ordinal,"token_id":uuid
@@ -12518,35 +19872,79 @@ fn apply_repetition_plan_on(
                 "denied repetition candidate changed its accepted ordinal");
             let source_event_id = occurrence.accepted_source_event_id.as_deref()
                 .context("denied repetition candidate has no accepted source")?;
-            let source_data: String = tx.query_row(
-                "SELECT data_json FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND event_id=?3 AND kind IN ('user_task_completed','service_result')",
-                params![instance_id,occurrence.scope_id,source_event_id], |row| row.get(0),
+            let (source_kind, source_data): (String,String) = tx.query_row(
+                "SELECT kind,data_json FROM bpmn_events WHERE instance_id=?1 AND event_id=?2",
+                params![instance_id,source_event_id],
+                |row| Ok((row.get(0)?,row.get(1)?)),
             )?;
             let source_data: Value = parse(source_data)?;
-            let outputs = source_data.get("outputs")
-                .context("denied repetition candidate has no accepted outputs")?;
+            let outputs = match source_kind.as_str() {
+                "user_task_completed" | "service_result" => source_data.get("outputs")
+                    .cloned().context("denied repetition candidate has no accepted outputs")?,
+                "manual_task_acknowledged" | "send_task_admitted" => Value::Null,
+                "message_delivered" => source_data.get("payload")
+                    .cloned().context("denied Receive candidate has no factual payload")?,
+                "scope_completed" => {
+                    let scope_id = source_data["scope_id"].as_str()
+                        .context("denied subprocess candidate has no child scope")?;
+                    let raw: String = tx.query_row(
+                        "SELECT local_variables_json FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2 AND parent_token_id=?3 AND status='completed'",
+                        params![instance_id,scope_id,occurrence.token_id], |row| row.get(0),
+                    )?;
+                    parse(raw)?
+                }
+                "call_returned" => {
+                    let call_id = source_data["call_id"].as_str()
+                        .context("denied Call candidate has no call ID")?;
+                    let raw: String = tx.query_row(
+                        "SELECT i.variables_json FROM bpmn_calls c JOIN bpmn_instances i ON i.instance_id=c.child_instance_id WHERE c.call_id=?1 AND c.parent_instance_id=?2 AND c.parent_token_id=?3 AND c.status='returned'",
+                        params![call_id,instance_id,occurrence.token_id], |row| row.get(0),
+                    )?;
+                    parse(raw)?
+                }
+                _ => bail!("denied repetition candidate changed its accepted source kind"),
+            };
             let mut candidate = source.retained_before_closure_bytes
                 .checked_add(source.reserved_before_candidate_bytes)
                 .context("accepted repetition reserve overflow")?;
-            candidate = candidate.checked_add(size(outputs)?)
+            candidate = candidate.checked_add(size(&outputs)?)
                 .context("denied repetition candidate byte count overflow")?;
             candidate = candidate.checked_add(size(&serde_json::json!({
                 "group_id":group.group_id,"occurrence_id":occurrence.occurrence_id,
                 "ordinal":occurrence.ordinal,"source_event_id":source_event_id
             }))?).context("denied repetition candidate event byte count overflow")?;
             if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
-                let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+                let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
                 let mapping = match &node.kind {
                     ProcessNodeKind::UserTask { output_mapping, .. }
-                    | ProcessNodeKind::ServiceTask { output_mapping, .. } => output_mapping,
+                    | ProcessNodeKind::ServiceTask { output_mapping, .. }
+                    | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+                    | ProcessNodeKind::SubProcess { output_mapping, .. }
+                    | ProcessNodeKind::CallActivity(ProcessCallActivity { output_mapping, .. })
+                    | ProcessNodeKind::ScriptTask { output_mapping, .. } => output_mapping.clone(),
+                    ProcessNodeKind::ManualTask { .. } | ProcessNodeKind::SendTask { .. } => BTreeMap::new(),
                     _ => bail!("denied repetition candidate is not an activity"),
                 };
                 let prior = group.loop_state.as_ref()
                     .context("denied loop candidate has no prior state")?;
-                let next = super::runtime::patch_variables(mapping, prior, prior, outputs,
-                    &[("repeat".to_owned(), serde_json::json!({
-                        "group_id":group.group_id,"index":occurrence.ordinal,"item":Value::Null
-                    }))])?;
+                let activity_inputs = repetition_activity_inputs_on(
+                    model, &selected_process_id, scopes, instance_id,
+                    group, &occurrence, node,
+                )?;
+                let mut body_extra = vec![("repeat".to_owned(), serde_json::json!({
+                    "group_id":group.group_id,"index":occurrence.ordinal,
+                    "item":occurrence.item.clone(),
+                }))];
+                if let Some(inputs) = activity_inputs.as_deref() {
+                    body_extra.extend(super::runtime::activity_inputs_extra(inputs)?);
+                }
+                let next = if matches!(&node.kind, ProcessNodeKind::ScriptTask { .. }) {
+                    super::runtime::patch_script_variables(&mapping, prior, prior,
+                        &outputs, &body_extra)?
+                } else {
+                    super::runtime::patch_variables(&mapping, prior, prior,
+                        &outputs, &body_extra)?
+                };
                 let patch = Value::Object(mapping.keys().map(|key|
                     (key.clone(), next[key].clone())).collect());
                 let next_bytes = size(&next)?;
@@ -12562,7 +19960,7 @@ fn apply_repetition_plan_on(
             }
             RepetitionDeniedBytes::ParentAggregate { final_ordinal, source_event_id } => {
                 ensure!(*final_ordinal == group.completed_count.checked_sub(1)
-                    && source_event_id.as_deref() == plan.repetition_occurrences.iter()
+                    && source_event_id.as_deref() == current_occurrences.iter()
                         .filter(|row| row.group_id == group.group_id)
                         .max_by_key(|row| row.ordinal)
                         .and_then(|row| row.accepted_source_event_id.as_deref())
@@ -12590,15 +19988,19 @@ fn apply_repetition_plan_on(
         }
     }
     let current_groups = repetition_groups_on(tx, instance_id)?;
-    let current_occurrences = repetition_occurrences_on(tx, instance_id)?;
     let reserved = repetition_admission_reservation_on(tx, instance_id, model, scopes,
         &RuntimePlan::initial(Value::Null), &current_groups, &current_occurrences)?;
     ensure!(retained.checked_add(reserved)
             .is_some_and(|bytes| bytes <= 64 * 1024 * 1024)
             || plan.repetition_groups.iter().any(|group| group.terminal_capacity),
         "repetition retained evidence exceeded admission without a terminal capacity latch");
+    ensure!(plan.service_invocation_ids.len() == plan.create_jobs.len()
+        && plan.service_invocation_ids.values().all(|id| Uuid::parse_str(id).is_ok())
+        && plan.service_invocation_ids.values().collect::<HashSet<_>>().len()
+            == plan.create_jobs.len(),
+        "Service invocation identities differ from new planned jobs");
     for job in &plan.create_jobs {
-        let node = scope_node(model, scopes, instance_id, &job.scope_id, &job.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &job.scope_id, &job.node_id)?;
         if node.repeat.is_none() {
             continue;
         }
@@ -12617,7 +20019,7 @@ fn apply_repetition_plan_on(
             "repeated Service job has no unique pinned ordinal and queue fact");
     }
     for task in &plan.create_user_tasks {
-        let node = scope_node(model, scopes, instance_id, &task.scope_id, &task.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &task.scope_id, &task.node_id)?;
         if node.repeat.is_none() {
             continue;
         }
@@ -12628,25 +20030,35 @@ fn apply_repetition_plan_on(
                     ProcessUserTaskKind::Work => occurrence.user_task_id.as_ref() == Some(&task.user_task_id),
                     ProcessUserTaskKind::Verification => occurrence.verification_user_task_id.as_ref()
                         == Some(&task.user_task_id),
-                    ProcessUserTaskKind::Manual => false,
+                    ProcessUserTaskKind::Manual => occurrence.user_task_id.as_ref()
+                        == Some(&task.user_task_id),
                 }
                 && plan.repetition_groups.iter().chain(prior_groups.iter()).any(|group|
                     group.group_id == occurrence.group_id
                         && group.scope_id == task.scope_id
                         && group.node_id == task.node_id)).count() == 1
             && plan.events.iter().filter(|event|
-                event.kind == "user_task_opened" && event.scope_id == task.scope_id
+                event.kind == if task.kind == ProcessUserTaskKind::Manual {
+                    "manual_task_opened"
+                } else { "user_task_opened" } && event.scope_id == task.scope_id
                     && event.node_id.as_deref() == Some(task.node_id.as_str())
-                    && event.data == serde_json::json!({
-                        "user_task_id":task.user_task_id,
-                        "assignee_user_id":task.assignee_user_id,"kind":task.kind
-                    })).count() == 1,
+                    && event.data == if task.kind == ProcessUserTaskKind::Manual {
+                        serde_json::json!({
+                            "user_task_id":task.user_task_id,
+                            "assignee_user_id":task.assignee_user_id,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "user_task_id":task.user_task_id,
+                            "assignee_user_id":task.assignee_user_id,"kind":task.kind,
+                        })
+                    }).count() == 1,
             "repeated Human task has no unique pinned ordinal and open fact");
     }
     let mut expected_events = Vec::<(&str, &str, &str, Value)>::new();
     for group in &plan.repetition_groups {
         let prior = prior_groups.iter().find(|row| row.group_id == group.group_id);
-        let node = scope_node(model, scopes, instance_id, &group.scope_id, &group.node_id)?;
+        let node = scope_node(model, &selected_process_id, scopes, instance_id, &group.scope_id, &group.node_id)?;
         if prior.is_none() {
             let direct_input_failure = group.mode != ProcessRepetitionGroupMode::StructuredLoop
                 && group.status == ProcessRepetitionGroupStatus::Incident
@@ -12700,27 +20112,57 @@ fn apply_repetition_plan_on(
                 && !group.terminal_capacity) {
             let incident_id = group.terminal_incident_id.as_deref()
                 .context("blocked repetition group has no incident")?;
-            let last_source = current_occurrences.iter()
-                .filter(|row| row.group_id == group.group_id)
-                .max_by_key(|row| row.ordinal)
-                .and_then(|row| row.accepted_source_event_id.as_deref());
-            let (phase, code, reason) = if let Some(source) = plan.repetition_capacity.as_ref()
-                .filter(|source| source.group_id == group.group_id) {
-                ("capacity", "REPETITION_LIMIT", Some(source.reason.as_str()))
+            let pre_body_script_failure = matches!(&node.kind, ProcessNodeKind::ScriptTask { .. })
+                && plan.add_incidents.iter().any(|incident|
+                    incident.incident_id == incident_id
+                        && incident.code == "SCRIPT_EVALUATION_FAILED"
+                        && incident.scope_id == group.scope_id
+                        && incident.node_id.as_deref() == Some(group.node_id.as_str())
+                        && !incident.can_retry)
+                && current_occurrences.iter().any(|row|
+                    row.group_id == group.group_id
+                        && row.status == ProcessRepetitionOccurrenceStatus::Active
+                        && row.accepted_source_event_id.is_none());
+            // A failing authored input parks its ordinal under a typed parked-input
+            // fact; no aggregate was attempted, so there is no blocked-group event.
+            let input_failure = plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                ActivityIoInputFact::Failed { group_id: Some(failed_group), incident_id: failed, .. }
+                    if failed_group == &group.group_id && failed == incident_id));
+            if input_failure {
+                ensure!(group.terminal_event_id.is_none()
+                    && plan.events.iter().all(|event|
+                        event.kind != "repetition_group_blocked"
+                            || event.data["group_id"] != group.group_id),
+                    "failed IO input cannot claim an accepted aggregate source");
+            } else if pre_body_script_failure {
+                ensure!(group.terminal_event_id.is_none()
+                    && plan.events.iter().all(|event|
+                        event.kind != "repetition_group_blocked"
+                            || event.data["group_id"] != group.group_id),
+                    "failed Script body cannot claim an accepted aggregate source");
             } else {
-                let incident = plan.add_incidents.iter().find(|incident|
-                    incident.incident_id == incident_id)
-                    .context("blocked repetition group has no factual incident")?;
-                ensure!(matches!(incident.code.as_str(),
-                    "REPETITION_MAPPING_FAILED" | "REPETITION_AGGREGATE_LIMIT"),
-                    "blocked repetition group has an unsupported aggregate incident");
-                ("aggregate", incident.code.as_str(), None)
-            };
-            expected_events.push(("repetition_group_blocked", &group.scope_id, &group.node_id,
-                serde_json::json!({"group_id":group.group_id,
-                    "last_completed_ordinal":group.completed_count.checked_sub(1),
-                    "last_source_event_id":last_source,"incident_id":incident_id,
-                    "phase":phase,"code":code,"reason":reason})));
+                let last_source = current_occurrences.iter()
+                    .filter(|row| row.group_id == group.group_id)
+                    .max_by_key(|row| row.ordinal)
+                    .and_then(|row| row.accepted_source_event_id.as_deref());
+                let (phase, code, reason) = if let Some(source) = plan.repetition_capacity.as_ref()
+                    .filter(|source| source.group_id == group.group_id) {
+                    ("capacity", "REPETITION_LIMIT", Some(source.reason.as_str()))
+                } else {
+                    let incident = plan.add_incidents.iter().find(|incident|
+                        incident.incident_id == incident_id)
+                        .context("blocked repetition group has no factual incident")?;
+                    ensure!(matches!(incident.code.as_str(),
+                        "REPETITION_MAPPING_FAILED" | "REPETITION_AGGREGATE_LIMIT"),
+                        "blocked repetition group has an unsupported aggregate incident");
+                    ("aggregate", incident.code.as_str(), None)
+                };
+                expected_events.push(("repetition_group_blocked", &group.scope_id, &group.node_id,
+                    serde_json::json!({"group_id":group.group_id,
+                        "last_completed_ordinal":group.completed_count.checked_sub(1),
+                        "last_source_event_id":last_source,"incident_id":incident_id,
+                        "phase":phase,"code":code,"reason":reason})));
+            }
         }
         for occurrence in current_occurrences.iter().filter(|row| row.group_id == group.group_id) {
             let prior_occurrence = prior_occurrences.iter().find(|row|
@@ -12786,6 +20228,475 @@ fn apply_repetition_plan_on(
     Ok(())
 }
 
+fn script_infrastructure_incident_on(
+    tx: &Transaction<'_>, instance_id: &str, source: &ServiceDispatchFact,
+) -> Result<Option<String>> {
+    let open_count: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND job_id=?2 AND code='SCRIPT_INFRASTRUCTURE_FAILED' AND resolved_at_ms IS NULL",
+        params![instance_id,source.job_id],
+        |row| row_u64(row, 0),
+    )?;
+    ensure!(open_count <= 1,
+        "cancelled observed Service has duplicate infrastructure incidents");
+    if source.phase != "observed" {
+        ensure!(open_count == 0,
+            "nonobserved Service retained an infrastructure incident");
+        return Ok(None);
+    }
+    let (observed_bytes, observed_hash, observed_at):
+        (Option<String>, Option<String>, Option<i64>) = tx.query_row(
+        "SELECT v.observed_result_json,v.observed_result_sha256,v.observed_at_ms FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id WHERE v.invocation_id=?1 AND v.job_id=?2 AND v.instance_id=?3 AND v.scope_id=?4 AND v.phase='observed' AND v.dispatch_evidence='committed_boundary'",
+        params![source.invocation_id,source.job_id,instance_id,source.scope_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    )?;
+    let observed_bytes = observed_bytes.context("cancelled observed Service lost its result bytes")?;
+    let observed: ObservedActivityResult = serde_json::from_str(&observed_bytes)?;
+    let actual_hash = hex::encode(Sha256::digest(observed_bytes.as_bytes()));
+    ensure!(observed_hash.as_deref() == Some(actual_hash.as_str())
+        && observed_at.is_some()
+        && source.reserved_result_event_id.is_some(),
+        "cancelled observed Service changed its original result evidence");
+    validate_output(&observed.result.outputs)?;
+    let mut statement = tx.prepare(
+        r#"SELECT i.incident_id,i.message FROM bpmn_incidents i
+            JOIN bpmn_service_invocations v ON v.job_id=i.job_id
+                AND v.instance_id=i.instance_id AND v.scope_id=i.scope_id
+            JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id
+                AND j.scope_id=v.scope_id
+            WHERE i.instance_id=?1 AND i.scope_id=?2 AND i.node_id=?3
+                AND i.job_id=?4 AND i.code='SCRIPT_INFRASTRUCTURE_FAILED'
+                AND i.resolved_at_ms IS NULL AND v.invocation_id=?5
+                AND v.phase='observed' AND v.dispatch_evidence='committed_boundary'
+                AND v.token_id=?6 AND v.dispatch_attempt=?7 AND v.dispatch_fence=?8
+                AND v.dispatch_worker_id=?9 AND v.reserved_result_event_id=?10"#,
+    )?;
+    let rows = statement.query_map(params![instance_id,source.scope_id,source.node_id,
+        source.job_id,source.invocation_id,source.token_id,source.attempt,
+        sql_integer(source.fence)?,source.worker_id,source.reserved_result_event_id],
+        |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(rows.len() as u64 == open_count,
+        "cancelled observed Service infrastructure incident changed its dispatch source");
+    let Some((incident_id, message)) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let event_count: u64 = tx.query_row(
+        r#"SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2
+            AND node_id=?3 AND kind='incident'
+            AND json_extract(data_json,'$.incident_id')=?4
+            AND json_extract(data_json,'$.code')='SCRIPT_INFRASTRUCTURE_FAILED'
+            AND json_extract(data_json,'$.message')=?5
+            AND json_extract(data_json,'$.invocation_id')=?6
+            AND json_extract(data_json,'$.job_id')=?7
+            AND json_extract(data_json,'$.source_token_id')=?8
+            AND json_extract(data_json,'$.dispatch_attempt')=?9
+            AND json_extract(data_json,'$.dispatch_fence')=?10
+            AND json_extract(data_json,'$.reserved_result_event_id')=?11"#,
+        params![instance_id,source.scope_id,source.node_id,incident_id,message,
+            source.invocation_id,source.job_id,source.token_id,source.attempt,
+            sql_integer(source.fence)?,source.reserved_result_event_id],
+        |row| row_u64(row, 0),
+    )?;
+    ensure!(event_count == 1,
+        "cancelled observed Service lacks its original infrastructure incident event");
+    Ok(Some(incident_id))
+}
+
+fn close_cancelled_instance_dispatches_on(
+    tx: &Transaction<'_>, instance_id: &str, at_ms: i64,
+) -> Result<()> {
+    let mut statement = tx.prepare("SELECT v.invocation_id,v.job_id,v.scope_id,v.node_id,v.token_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.reserved_result_event_id,v.uncertainty_incident_id,j.attempt,j.fence FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id WHERE v.instance_id=?1 AND v.dispatch_evidence='committed_boundary' AND v.phase IN ('may_have_executed','uncertain','observed') AND j.status='cancelled' AND t.status='cancelled' ORDER BY v.job_id")?;
+    let rows = statement.query_map([instance_id], |row| Ok((ServiceDispatchFact {
+        invocation_id: row.get(0)?, job_id: row.get(1)?, scope_id: row.get(2)?,
+        node_id: row.get(3)?, token_id: row.get(4)?, phase: row.get(5)?,
+        attempt: row.get(6)?, fence: row_u64(row, 7)?, worker_id: row.get(8)?,
+        reserved_result_event_id: row.get(9)?,
+        uncertainty_incident_id: row.get(10)?,
+    }, row.get::<_, u32>(11)?, row_u64(row, 12)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (source, job_attempt, job_fence) in rows {
+        ensure!(job_attempt == source.attempt
+            && job_fence == source.fence.checked_add(1)
+                .context("cancelled Service fence overflow")?,
+            "owner cancellation differs from the original Service dispatch generation");
+        let infrastructure_incident_id =
+            script_infrastructure_incident_on(tx, instance_id, &source)?;
+        let (code, message) = if source.phase == "observed" {
+            ("EXTERNAL_RESULT_NOT_APPLIED",
+                "The original result was observed after its activity closed")
+        } else {
+            ("EXTERNAL_OUTCOME_UNCERTAIN",
+                "The external effect may have occurred; direct retry is unavailable")
+        };
+        let incident_id = if source.phase == "uncertain" {
+            source.uncertainty_incident_id.clone()
+                .context("cancelled uncertain Service lost its original incident")?
+        } else { Uuid::new_v4().to_string() };
+        if source.phase == "uncertain" {
+            let original: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_incidents i JOIN bpmn_events e ON e.instance_id=i.instance_id AND e.scope_id=i.scope_id AND e.node_id=i.node_id WHERE i.incident_id=?1 AND i.instance_id=?2 AND i.scope_id=?3 AND i.node_id=?4 AND i.job_id=?5 AND i.code='EXTERNAL_OUTCOME_UNCERTAIN' AND i.message=?6 AND i.resolved_at_ms IS NULL AND e.kind='incident' AND json_extract(e.data_json,'$.incident_id')=i.incident_id AND json_extract(e.data_json,'$.invocation_id')=?7 AND json_extract(e.data_json,'$.dispatch_attempt')=?8 AND json_extract(e.data_json,'$.dispatch_fence')=?9",
+                params![incident_id,instance_id,source.scope_id,source.node_id,
+                    source.job_id,message,source.invocation_id,source.attempt,
+                    sql_integer(source.fence)?], |row| row.get(0))?;
+            ensure!(original == 1,
+                "cancelled uncertain Service lost its exact original incident history");
+        }
+        if source.phase != "uncertain" {
+            tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![incident_id,instance_id,source.scope_id,source.node_id,
+                    source.job_id,code,message,at_ms])?;
+        }
+        let seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [instance_id], |row| row_u64(row, 0))?;
+        insert_event_on(tx, instance_id, seq, None, &PlannedEvent {
+            scope_id: source.scope_id.clone(), kind: if source.phase == "uncertain" {
+                "incident_resolved".into()
+            } else { "incident".into() },
+            node_id: Some(source.node_id.clone()),
+            data: serde_json::json!({"incident_id":incident_id,
+                "invocation_id":source.invocation_id,"job_id":source.job_id,
+                "code":code,"message":message,
+                "reason":"activity_cancelled_after_dispatch",
+                "resolution_reason":"activity_cancelled_after_dispatch",
+                "dispatch_attempt":source.attempt,"dispatch_fence":source.fence,
+                "source_token_id":source.token_id,
+                "reserved_result_event_id":source.reserved_result_event_id}),
+        }, at_ms, None)?;
+        close_cancelled_service_dispatch_on(tx, instance_id, &source, &incident_id, at_ms)?;
+        if let Some(diagnostic_id) = infrastructure_incident_id {
+            let resolved = tx.execute(
+                "UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND node_id=?5 AND job_id=?6 AND code='SCRIPT_INFRASTRUCTURE_FAILED' AND resolved_at_ms IS NULL",
+                params![at_ms,diagnostic_id,instance_id,source.scope_id,
+                    source.node_id,source.job_id])?;
+            ensure!(resolved == 1,
+                "owner cancellation changed the original infrastructure incident");
+            let seq: u64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+                [instance_id], |row| row_u64(row, 0))?;
+            insert_event_on(tx, instance_id, seq, None, &PlannedEvent {
+                scope_id: source.scope_id.clone(), kind: "incident_resolved".into(),
+                node_id: Some(source.node_id.clone()),
+                data: serde_json::json!({"incident_id":diagnostic_id,
+                    "invocation_id":source.invocation_id,"job_id":source.job_id,
+                    "source_token_id":source.token_id,
+                    "reserved_result_event_id":source.reserved_result_event_id,
+                    "dispatch_attempt":source.attempt,"dispatch_fence":source.fence,
+                    "reason":"activity_cancelled_after_dispatch"}),
+            }, at_ms, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn close_cancelled_service_dispatch_on(
+    tx: &Transaction<'_>, instance_id: &str, source: &ServiceDispatchFact,
+    incident_id: &str, at_ms: i64,
+) -> Result<()> {
+    let expected_code = if source.phase == "observed" {
+        "EXTERNAL_RESULT_NOT_APPLIED"
+    } else {
+        ensure!(matches!(source.phase.as_str(), "may_have_executed" | "uncertain"),
+            "cancelled Service dispatch has no closable original phase");
+        "EXTERNAL_OUTCOME_UNCERTAIN"
+    };
+    let resolved = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code=?6 AND resolved_at_ms IS NULL",
+        params![at_ms,incident_id,instance_id,source.scope_id,source.job_id,expected_code])?;
+    ensure!(resolved == 1, "cancelled Service history incident changed before resolution");
+    let changed = if source.phase == "uncertain" {
+        1
+    } else if source.phase == "observed" {
+        tx.execute("UPDATE bpmn_service_invocations SET phase='observed_blocked',blocked_incident_id=?1,blocked_reason='activation_closed',acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+CASE WHEN acceptance_owner_id IS NULL THEN 0 ELSE 1 END,phase_revision=phase_revision+1,updated_at_ms=?2 WHERE invocation_id=?3 AND job_id=?4 AND instance_id=?5 AND phase='observed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?6 AND dispatch_fence=?7 AND dispatch_worker_id=?8 AND reserved_result_event_id=?9",
+            params![incident_id,at_ms,source.invocation_id,source.job_id,
+                instance_id,source.attempt,sql_integer(source.fence)?,
+                source.worker_id,source.reserved_result_event_id])?
+    } else {
+        tx.execute("UPDATE bpmn_service_invocations SET phase='uncertain',uncertainty_incident_id=?1,phase_revision=phase_revision+1,updated_at_ms=?2 WHERE invocation_id=?3 AND job_id=?4 AND instance_id=?5 AND phase='may_have_executed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?6 AND dispatch_fence=?7 AND dispatch_worker_id=?8",
+            params![incident_id,at_ms,source.invocation_id,source.job_id,
+                instance_id,source.attempt,sql_integer(source.fence)?,source.worker_id])?
+    };
+    ensure!(changed == 1, "cancelled Service dispatch changed before historical closure");
+    Ok(())
+}
+
+fn validate_closed_service_dispatches_on(
+    tx: &Transaction<'_>, instance_id: &str, plan: &RuntimePlan, at_ms: i64,
+) -> Result<()> {
+    let mut expected = HashSet::new();
+    for job_id in &plan.cancel_job_ids {
+        let created = plan.create_jobs.iter().filter(|job| job.job_id == *job_id)
+            .collect::<Vec<_>>();
+        ensure!(created.len() <= 1, "cancelled Service job has duplicate planned creation");
+        if let Some(job) = created.first() {
+            let waiting = plan.create_tokens.iter().filter(|token|
+                token.token_id == job.token_id && token.scope_id == job.scope_id
+                    && token.node_id == job.node_id && token.status == "waiting")
+                .collect::<Vec<_>>();
+            let source_id = plan.token_sources.get(&job.token_id)
+                .context("same-command Service wait lacks its source token")?;
+            let source = termination_token_on(tx, instance_id, plan, source_id)?;
+            let persisted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1)",
+                [job_id], |row| row.get(0))?;
+            ensure!(job.instance_id == instance_id && job.status == "queued"
+                && job.attempt == 0 && job.fence == 0
+                && job.worker_id.is_none() && job.lease_until_ms.is_none()
+                && job.result.is_none() && job.result_origin.is_none()
+                && job.observed_result_event_id.is_none()
+                && waiting.len() == 1 && !persisted
+                && plan.cancel_token_ids.iter().filter(|id| *id == &job.token_id).count() == 1
+                && plan.consume_token_ids.iter().filter(|id| *id == source_id).count() == 1
+                && source.status == "ready" && source.scope_id == job.scope_id
+                && source.node_id == job.node_id
+                && source.arrival_edge_id == waiting[0].arrival_edge_id
+                && source.fork_stack == waiting[0].fork_stack
+                && !plan.closed_service_dispatches.iter().any(|closed|
+                    closed.source.job_id == *job_id),
+                "same-command cancelled Service job lacks its unclaimed waiting activation");
+            continue;
+        }
+        let row: (String, String, String, String, String, String, Option<u32>, Option<u64>,
+            Option<String>, Option<String>, Option<String>, String, String) = tx.query_row(
+            "SELECT v.invocation_id,v.job_id,v.scope_id,v.node_id,v.token_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.reserved_result_event_id,v.uncertainty_incident_id,j.status,t.status FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id WHERE v.job_id=?1 AND v.instance_id=?2",
+            params![job_id,instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row_optional_u64(row, 7)?,
+                row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)))?;
+        let (invocation_id, _, scope_id, node_id, token_id, phase, attempt, fence,
+            worker_id, result_id, uncertainty_incident_id, job_status, token_status) = row;
+        if !matches!(phase.as_str(), "may_have_executed" | "uncertain" | "observed") { continue }
+        let attempt = attempt.context("cancelled dispatch lacks its original attempt")?;
+        let fence = fence.context("cancelled dispatch lacks its original fence")?;
+        let worker_id = worker_id.context("cancelled dispatch lacks its original worker")?;
+        ensure!((job_status == "running"
+                || phase == "uncertain" && job_status == "error")
+            && token_status == "waiting"
+            && plan.cancel_token_ids.contains(&token_id)
+            && expected.insert(invocation_id.clone()),
+            "cancelled dispatched Service lacks one live original activation");
+        let closed = plan.closed_service_dispatches.iter().filter(|closed|
+            closed.source.invocation_id == invocation_id).collect::<Vec<_>>();
+        ensure!(closed.len() == 1,
+            "cancelled dispatched Service lacks one planned historical outcome");
+        let closed = closed[0];
+        let source = &closed.source;
+        ensure!(source.job_id == *job_id && source.scope_id == scope_id
+            && source.node_id == node_id && source.token_id == token_id
+            && source.phase == phase && source.attempt == attempt
+            && source.fence == fence && source.worker_id == worker_id
+            && source.reserved_result_event_id == result_id
+            && source.uncertainty_incident_id == uncertainty_incident_id
+            && Uuid::parse_str(&closed.incident_id).is_ok(),
+            "cancelled Service history differs from its original dispatch fence");
+        if phase == "observed" {
+            let observation: (Option<String>, Option<String>, Option<i64>) = tx.query_row(
+                "SELECT observed_result_json,observed_result_sha256,observed_at_ms FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2 AND phase='observed' AND dispatch_evidence='committed_boundary'",
+                params![invocation_id,job_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let bytes = observation.0.context("cancelled observed Service lost its original bytes")?;
+            let observed: ObservedActivityResult = serde_json::from_str(&bytes)?;
+            let observed_hash = hex::encode(Sha256::digest(bytes.as_bytes()));
+            ensure!(observation.1.as_deref() == Some(observed_hash.as_str())
+                && observation.2.is_some() && result_id.is_some(),
+                "cancelled observed Service lacks its immutable result and reserved event");
+            validate_output(&observed.result.outputs)?;
+        }
+        let (code, message) = if phase == "observed" {
+            ("EXTERNAL_RESULT_NOT_APPLIED",
+                "The original result was observed after its activity closed")
+        } else {
+            ("EXTERNAL_OUTCOME_UNCERTAIN",
+                "The external effect may have occurred; direct retry is unavailable")
+        };
+        if phase == "uncertain" {
+            let prior_incident: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2 AND scope_id=?3 AND node_id=?4 AND job_id=?5 AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND message=?6 AND resolved_at_ms IS NULL",
+                params![closed.incident_id,instance_id,scope_id,node_id,job_id,message],
+                |row| row.get(0))?;
+            let original_event: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND kind='incident' AND json_extract(data_json,'$.incident_id')=?4 AND json_extract(data_json,'$.invocation_id')=?5 AND json_extract(data_json,'$.job_id')=?6 AND json_extract(data_json,'$.code')='EXTERNAL_OUTCOME_UNCERTAIN' AND json_extract(data_json,'$.dispatch_attempt')=?7 AND json_extract(data_json,'$.dispatch_fence')=?8",
+                params![instance_id,scope_id,node_id,closed.incident_id,invocation_id,job_id,
+                    attempt,sql_integer(fence)?], |row| row.get(0))?;
+            ensure!(uncertainty_incident_id.as_deref() == Some(closed.incident_id.as_str())
+                && prior_incident == 1 && original_event == 1
+                && !plan.add_incidents.iter().any(|incident|
+                    incident.incident_id == closed.incident_id),
+                "cancelled uncertain Service changed its factual incident identity");
+        } else {
+            ensure!(plan.add_incidents.iter().filter(|incident|
+                incident.incident_id == closed.incident_id
+                    && incident.scope_id == scope_id
+                    && incident.node_id.as_deref() == Some(node_id.as_str())
+                    && incident.job_id.as_deref() == Some(job_id.as_str())
+                    && incident.code == code && incident.message == message
+                    && incident.at_ms == at_ms && !incident.can_retry).count() == 1,
+                "cancelled Service history lacks its exact resolved incident");
+        }
+        let event = plan.events.get(closed.event_index)
+            .context("cancelled Service history has no planned incident event")?;
+        let event_kind = if phase == "uncertain" { "incident_resolved" } else { "incident" };
+        ensure!(event.kind == event_kind && event.scope_id == scope_id
+            && event.node_id.as_deref() == Some(node_id.as_str())
+            && event.data == serde_json::json!({
+                "incident_id":closed.incident_id,"invocation_id":invocation_id,
+                "job_id":job_id,"code":code,"message":message,
+                "reason":"activity_cancelled_after_dispatch",
+                "resolution_reason":"activity_cancelled_after_dispatch",
+                "dispatch_attempt":attempt,"dispatch_fence":fence,
+                "source_token_id":token_id,"reserved_result_event_id":result_id,
+            }) && plan.events.iter().filter(|event| event.kind == event_kind
+                && event.data["incident_id"] == closed.incident_id).count() == 1,
+            "cancelled Service history differs from its exact dispatch incident fact");
+        let original_infrastructure = script_infrastructure_incident_on(tx, instance_id, source)?;
+        ensure!(closed.infrastructure_incident_id == original_infrastructure,
+            "cancelled Service changed its original infrastructure incident");
+        if let Some(diagnostic_id) = &closed.infrastructure_incident_id {
+            let matches = plan.events.iter().enumerate().filter(|(_, event)|
+                event.kind == "incident_resolved" && event.scope_id == scope_id
+                    && event.node_id.as_deref() == Some(node_id.as_str())
+                    && event.data == serde_json::json!({
+                        "incident_id":diagnostic_id,"invocation_id":invocation_id,
+                        "job_id":job_id,"source_token_id":token_id,
+                        "reserved_result_event_id":result_id,
+                        "dispatch_attempt":attempt,"dispatch_fence":fence,
+                        "reason":"activity_cancelled_after_dispatch",
+                    })).map(|(index, _)| index).collect::<Vec<_>>();
+            ensure!(matches.len() == 1 && matches[0] > closed.event_index
+                && plan.resolve_incident_ids.iter().filter(|id|
+                    *id == diagnostic_id).count() == 1,
+                "cancelled Service lacks one later infrastructure resolution");
+        }
+    }
+    ensure!(expected.len() == plan.closed_service_dispatches.len()
+        && plan.closed_service_dispatches.iter().all(|closed|
+            expected.contains(&closed.source.invocation_id)),
+        "cancelled Service history includes an unselected dispatch");
+    Ok(())
+}
+
+pub(crate) fn start_simulation_plan_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    instance_id: &str,
+    definition_id: &str,
+    version: u32,
+    process_id: &str,
+    start_node_id: &str,
+    plan: &RuntimePlan,
+    at_ms: i64,
+    accepted: &AcceptedInputRef,
+) -> Result<ProcessInstance> {
+    ensure!(
+        matches!(accepted, AcceptedInputRef::Start { instance_id: started, .. }
+            if started == instance_id),
+        "simulation start entry does not match its instance"
+    );
+    start_instance_on(
+        tx,
+        actor,
+        instance_id,
+        definition_id,
+        version,
+        plan.start_variables
+            .as_ref()
+            .context("simulation start plan has no variables")?,
+        Some(process_id),
+        Some(start_node_id),
+        plan,
+        at_ms,
+        None,
+        None,
+        accepted,
+        ExecutionMode::Simulation,
+    )
+}
+
+pub(crate) fn apply_simulation_plan_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    instance_id: &str,
+    expected_revision: u64,
+    plan: &RuntimePlan,
+    at_ms: i64,
+    accepted: Option<&AcceptedInputRef>,
+    human_outputs: Option<&Value>,
+) -> Result<ProcessInstance> {
+    require_actor(tx, actor)?;
+    let initiator = require_instance_reader(tx, actor, instance_id)?;
+    if !initiator {
+        ensure!(
+            matches!(
+                accepted,
+                Some(
+                    AcceptedInputRef::Human { .. } | AcceptedInputRef::ManualAcknowledgment { .. }
+                )
+            ),
+            "simulation actor is not the process initiator"
+        );
+    }
+    let entry = accepted.map_or(EntryAuthority::PersistedReady, EntryAuthority::Accepted);
+    if human_outputs.is_some() {
+        persist_simulation_human_task_outputs_on(tx, instance_id, plan, entry, human_outputs)?;
+    }
+    apply_plan_on(
+        tx,
+        instance_id,
+        &actor.user_id,
+        expected_revision,
+        plan,
+        at_ms,
+        None,
+        entry,
+        &[],
+    )?;
+    instance_on(tx, actor, instance_id, None)
+}
+
+fn persist_simulation_human_task_outputs_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+    entry: EntryAuthority<'_>,
+    supplied_outputs: Option<&Value>,
+) -> Result<()> {
+    let EntryAuthority::Accepted(AcceptedInputRef::Human { task_id, .. }) = entry else {
+        return Ok(());
+    };
+    let (kind, task_scope_id): (String, String) = tx.query_row(
+        "SELECT kind,scope_id FROM bpmn_user_tasks WHERE instance_id=?1 AND user_task_id=?2 AND status='open'",
+        params![instance_id, task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if kind != "work" {
+        return Ok(());
+    }
+    let events = plan
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == "user_task_completed"
+                && event.scope_id == task_scope_id
+                && event.data["user_task_id"].as_str() == Some(task_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let outputs = match supplied_outputs {
+        Some(outputs) => outputs,
+        None if events.len() == 1 => &events[0].data["outputs"],
+        None => return Ok(()),
+    };
+    validate_output(outputs)?;
+    let changed = tx.execute(
+        "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE instance_id=?2 AND user_task_id=?3 AND status='open'",
+        params![json(outputs)?, instance_id, task_id],
+    )?;
+    ensure!(
+        changed == 1,
+        "completed Work task changed before its output was persisted"
+    );
+    Ok(())
+}
+
 fn apply_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -12795,7 +20706,12 @@ fn apply_plan_on(
     at_ms: i64,
     call_source: Option<&BusinessErrorSource>,
     entry: EntryAuthority<'_>,
+    staged_requests: &[CallRequest],
 ) -> Result<Vec<CancelledJobClaim>> {
+    ensure!(plan.recovered_service_incidents.is_empty()
+        || matches!(&entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. })),
+        "infrastructure incident resolution has no accepted Service source");
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let (current_revision, current_status): (u64, String) = tx.query_row(
         "SELECT revision,status FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
@@ -12807,6 +20723,12 @@ fn apply_plan_on(
         "process instance revision conflict or closed instance"
     );
     sql_incrementable(expected_revision)?;
+    // A supplied plan bypasses the runtime planner, so the writer admits every
+    // new task's full-detail encoding before any event row can be written.
+    for task in &plan.create_user_tasks {
+        super::runtime::ensure_user_task_wire_budget(task)?;
+    }
+    validate_closed_service_dispatches_on(tx, instance_id, plan, at_ms)?;
     let proposed_scopes = validate_scope_plan_on(tx, instance_id, plan, at_ms)?;
     let (definition_id,version,org_id,initiator):(String,u32,String,String)=tx.query_row("SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",[instance_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
     let model = current_version_model_on(tx, &definition_id, version)?;
@@ -12845,12 +20767,18 @@ fn apply_plan_on(
             ensure!(
                 plan.timer_updates.iter().any(|update| update.timer_id == id
                     && update.status == ProcessTimerStatus::Cancelled
-                    && update.last_reason.as_deref() == Some("activity_completed")),
-                "completed activity must disarm its boundary timers"
+                    && (update.last_reason.as_deref() == Some("activity_completed")
+                        || update.last_reason.as_deref() == Some("activity_retried")
+                            && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Retry {
+                                old_token_id, .. }) if old_token_id == token_id))),
+                "completed or authentically retried activity must disarm its boundary timers"
             );
         }
     }
     apply_event_plan_on(tx, instance_id, &proposed_scopes, &successful_terminations, plan, entry, at_ms)?;
+    insert_activity_io_inputs_on(tx, instance_id, &model, &proposed_scopes, plan, at_ms)?;
+    insert_activity_io_results_on(tx, instance_id, plan, at_ms)?;
+    insert_activity_io_continuations_on(tx, instance_id, plan, at_ms)?;
     for update in &plan.timer_updates {
         let actual = timer_on(tx, &update.timer_id)?;
         ensure!(
@@ -12873,7 +20801,10 @@ fn apply_plan_on(
                 .as_deref()
                 .context("boundary cancellation lacks its reason")?;
             ensure!(
-                (reason == "activity_completed" && plan.consume_token_ids.iter().any(|id|id == token_id))
+                ((reason == "activity_completed" || reason == "activity_retried"
+                    && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Retry {
+                        old_token_id, .. }) if old_token_id == token_id))
+                    && plan.consume_token_ids.iter().any(|id|id == token_id))
                     || (matches!(reason,"sibling_interrupted"|"scope_cancelled"|"terminate_end"|"repetition_limit") && plan.cancel_token_ids.iter().any(|id|id == token_id)),
                 "boundary cancellation does not follow its exact activity completion or interruption"
             );
@@ -12986,8 +20917,7 @@ fn apply_plan_on(
             waiting,
             "new user task does not match its waiting activation"
         );
-        let node = scope_node(
-            &model,
+        let node = scope_node(&model, &selected_process_id,
             &proposed_scopes,
             instance_id,
             &task.scope_id,
@@ -13012,6 +20942,39 @@ fn apply_plan_on(
             task.assignee_user_id == expected_assignee && task.name == node.name,
             "new work identity differs from its pinned scoped activity"
         );
+        let expected_instructions = match (&node.kind, &task.kind) {
+            (ProcessNodeKind::ManualTask { instructions, .. },
+                ProcessUserTaskKind::Manual) => Some(instructions.as_str()),
+            (_, ProcessUserTaskKind::Work | ProcessUserTaskKind::Verification) => None,
+            _ => bail!("new user task instructions differ from its exact scoped activity"),
+        };
+        ensure!(task.instructions.as_deref() == expected_instructions,
+            "new user task instructions differ from its pinned scoped activity");
+        if task.kind == ProcessUserTaskKind::Work {
+            ensure!(task.outputs.is_null(),
+                "new Work task cannot carry fabricated activity output");
+        }
+        let canonical_inputs = if node.activity_io.is_some() {
+            let captures = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+                ActivityIoInputFact::Captured {
+                    scope_id, node_id, activation_token_id, inputs, ..
+                } if scope_id == &task.scope_id && node_id == &task.node_id
+                    && activation_token_id == token_id => Some(inputs),
+                _ => None,
+            }).collect::<Vec<_>>();
+            ensure!(captures.len() == 1,
+                "new user task lacks its unique authenticated activity IO capture");
+            super::runtime::activity_inputs_for_task(node, captures[0])?
+        } else {
+            ensure!(task.activity_inputs.is_empty(),
+                "user task carries activity inputs without authored IO");
+            Vec::new()
+        };
+        ensure!(task.activity_inputs == canonical_inputs,
+            "new user task activity inputs differ from its authenticated capture");
+        // A supplied plan bypasses the runtime planner, so the durable writer
+        // repeats the exact full-detail encoding admission before INSERT.
+        super::runtime::ensure_user_task_wire_budget(task)?;
         tx.execute("INSERT INTO bpmn_user_tasks(user_task_id,instance_id,node_id,name,assignee_user_id,kind,status,outputs_json,revision,created_at_ms,updated_at_ms,token_id,scope_id) VALUES(?1,?2,?3,?4,?5,?6,'open',?7,1,?8,?8,?9,?10)",params![task.user_task_id,instance_id,task.node_id,task.name,task.assignee_user_id,task_kind_text(&task.kind),json(&task.outputs)?,at_ms,token_id,task.scope_id])?;
     }
     for job in &plan.create_jobs {
@@ -13022,8 +20985,7 @@ fn apply_plan_on(
                 && job.fence == 0,
             "invalid queued service job"
         );
-        let node = scope_node(
-            &model,
+        let node = scope_node(&model, &selected_process_id,
             &proposed_scopes,
             instance_id,
             &job.scope_id,
@@ -13047,7 +21009,27 @@ fn apply_plan_on(
             waiting,
             "new job differs from its actual scoped service wait"
         );
-        tx.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,'queued',?6,?6,?7)",params![job.job_id,instance_id,job.node_id,job.token_id,json(&job.input)?,at_ms,job.scope_id])?;
+        let input_json = json(&job.input)?;
+        tx.execute("INSERT INTO bpmn_jobs(job_id,instance_id,node_id,token_id,input_json,status,created_at_ms,updated_at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,'queued',?6,?6,?7)",params![job.job_id,instance_id,job.node_id,job.token_id,input_json,at_ms,job.scope_id])?;
+        let (definition_id, version, model_sha256, snapshots_json):
+            (String, u32, String, String) = tx.query_row(
+            "SELECT i.definition_id,i.version,v.model_sha256,v.service_snapshots_json FROM bpmn_instances i JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version WHERE i.instance_id=?1",
+            [instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
+        let pins = snapshots.iter().filter(|snapshot| snapshot.info.node_id == job.node_id
+            && snapshot.info.flow_id == *flow_id).collect::<Vec<_>>();
+        ensure!(pins.len() == 1
+            && pins[0].info.graph_sha256 == hex::encode(Sha256::digest(pins[0].graph_json.as_bytes())),
+            "new Service job has no unique immutable flow snapshot");
+        let invocation_id = plan.service_invocation_ids.get(&job.job_id)
+            .context("queued Service job has no reserved invocation identity")?;
+        ensure!(invocation_id != &job.job_id,
+            "Service invocation identity must differ from its job identity");
+        tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14)",
+            params![invocation_id,job.job_id,instance_id,job.scope_id,
+                job.node_id,job.token_id,definition_id,version,selected_process_id,
+                model_sha256,flow_id,pins[0].info.graph_sha256,
+                hex::encode(Sha256::digest(input_json.as_bytes())),at_ms])?;
     }
     for token_id in &plan.consume_token_ids {
         let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
@@ -13120,6 +21102,7 @@ fn apply_plan_on(
             changed == 1,
             "service job generation changed before interruption"
         );
+        tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='prepared' AND dispatch_evidence='no_boundary'", params![at_ms,job_id,instance_id])?;
     }
     for incident in &plan.add_incidents {
         ensure!(
@@ -13129,8 +21112,23 @@ fn apply_plan_on(
         tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident.incident_id,instance_id,incident.node_id,incident.job_id,incident.code,incident_message(&incident.message),at_ms,incident.scope_id])?;
     }
     for incident_id in &plan.resolve_incident_ids {
+        let closed = plan.closed_service_dispatches.iter().filter(|closed|
+            closed.source.phase == "uncertain"
+                && closed.incident_id.as_str() == incident_id.as_str()
+                && closed.source.uncertainty_incident_id.as_deref()
+                    == Some(incident_id.as_str())).count();
+        if closed != 0 {
+            ensure!(closed == 1 && plan.resolve_incident_ids.iter().filter(|id|
+                id.as_str() == incident_id.as_str()).count() == 1,
+                "cancelled Service incident has ambiguous resolution ownership");
+            continue;
+        }
         let affected = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL",params![at_ms,incident_id,instance_id])?;
         ensure!(affected == 1, "process incident changed before transition");
+    }
+    for closed in &plan.closed_service_dispatches {
+        close_cancelled_service_dispatch_on(tx, instance_id, &closed.source,
+            &closed.incident_id, at_ms)?;
     }
     check_active_incident_budget_on(tx, instance_id)?;
     let next_seq: u64 = tx.query_row(
@@ -13376,7 +21374,7 @@ fn apply_plan_on(
     validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
     let unresolved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL) OR EXISTS(SELECT 1 FROM bpmn_timers x JOIN bpmn_tokens t ON t.token_id=x.token_id AND t.instance_id=x.instance_id AND t.scope_id=x.scope_id WHERE x.instance_id=?1 AND x.kind='catch' AND x.status='error' AND t.status='waiting')",[instance_id],|row|row.get(0))?;
     apply_repetition_plan_on(tx, instance_id, &definition_id, version, &model, &proposed_scopes,
-        plan, &repetition_variable_states, entry, at_ms)?;
+        plan, &repetition_variable_states, entry, at_ms, staged_requests)?;
     let status = if plan.repetition_capacity.is_some() {
         ensure!(unresolved && plan.status == ProcessInstanceStatus::Cancelled,
             "validated capacity closure requires one retained incident and a cancelled instance");
@@ -13413,8 +21411,30 @@ fn apply_plan_on(
         affected == 1,
         "process instance revision conflict or closed instance"
     );
+    let mut staged_call_requests = BTreeMap::new();
+    staged_call_requests.insert(instance_id.to_owned(), plan.call_requests.clone());
+    let mut failed_call_requests = HashMap::new();
     cancelled_claims.extend(apply_call_steps_on(tx, instance_id, actor_id,
-        &plan.call_steps, at_ms, 0, &mut HashSet::new())?);
+        &plan.call_steps, at_ms, 0, &mut HashSet::new(),
+        &mut staged_call_requests, &mut failed_call_requests)?);
+    if !plan.call_steps.is_empty() {
+        validate_staged_call_requests_on(tx, &staged_call_requests, &failed_call_requests)?;
+    }
+    let parent_call: Option<(String,String,String)> = tx.query_row(
+        "SELECT parent_instance_id,parent_scope_id,parent_token_id FROM bpmn_calls WHERE child_instance_id=?1",
+        [instance_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).optional()?;
+    if let Some((parent_instance_id, parent_scope_id, parent_token_id)) = parent_call {
+        let group_id: Option<String> = tx.query_row(
+            "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3",
+            params![parent_instance_id,parent_scope_id,parent_token_id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(group_id) = group_id {
+            refresh_repetition_retained_bytes_on(tx, &parent_instance_id, &group_id)?;
+        }
+    }
     Ok(cancelled_claims)
 }
 
@@ -13603,11 +21623,19 @@ fn initial_call_snapshot(
     actor: &ProcessActor,
     instance_id: &str,
     version: &PinnedCallVersion,
+    selected_process_id: &str,
+    selected_start_node_id: &str,
     variables: &Value,
     all_versions: &[PinnedCallVersion],
     at_ms: i64,
 ) -> Result<RuntimeSnapshot> {
-    let mut vars = serde_json::to_value(&version.version.model.variables)?;
+    let body = super::model::selected_body(&version.version.model,
+        selected_process_id, &[])?;
+    ensure!(body.nodes.iter().any(|node| node.id == selected_start_node_id
+        && matches!(node.kind, ProcessNodeKind::Start
+            | ProcessNodeKind::TimerStart { .. } | ProcessNodeKind::MessageStart { .. })),
+        "selected Start is outside its pinned body");
+    let mut vars = serde_json::to_value(body.variables)?;
     for (key, value) in variables
         .as_object()
         .context(CallTransitionRejected("called inputs are not an object"))?
@@ -13649,6 +21677,8 @@ fn initial_call_snapshot(
         repetition_groups: Vec::new(),
         repetition_occurrences: Vec::new(),
         selected_repetition_occurrence: None,
+        process_id: selected_process_id.to_owned(),
+        start_node_id: selected_start_node_id.to_owned(),
     };
     let root = ProcessScopeSummary {
         scope_id: instance_id.to_owned(),
@@ -13670,6 +21700,7 @@ fn initial_call_snapshot(
         user_tasks: Vec::new(),
         tokens: Vec::new(),
         jobs: Vec::new(),
+        service_dispatches: Vec::new(),
         receipts: Vec::new(),
         service_snapshots: version.services.clone(),
         timers: Vec::new(),
@@ -13684,6 +21715,8 @@ fn initial_call_snapshot(
         retained_scope_count: 1,
         repetition_groups: Vec::new(),
         repetition_occurrences: Vec::new(),
+        activity_io_witnesses: Vec::new(),
+        end_sources: Vec::new(),
     })
 }
 
@@ -13762,19 +21795,31 @@ fn append_call_plan(
 fn record_call_step(
     snapshots: &mut BTreeMap<String, RuntimeSnapshot>,
     steps: &mut Vec<CallStep>,
-    step: CallStep,
+    mut step: CallStep,
     projection_instance_id: &str,
     projection_plan: &RuntimePlan,
     at_ms: i64,
     execution: Option<(&Transaction<'_>, &str, &str)>,
     cancelled_claims: &mut Vec<CancelledJobClaim>,
     skipped: &mut HashSet<String>,
+    staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
+    failed_requests: &mut HashMap<(String, String), String>,
 ) -> Result<()> {
+    if let CallStep::Advance { plan, .. } = &mut step {
+        let indices = plan.events.iter().enumerate().filter_map(|(index, event)|
+            (event.kind == "incident"
+                && event.data["code"].as_str() == Some("CALL_ADMISSION_ERROR"))
+                .then_some(index)).collect::<Vec<_>>();
+        ensure!(indices.len() == 1,
+            "Call admission producer must identify one incident event");
+        ensure!(plan.event_ids.insert(indices[0], Uuid::new_v4().to_string()).is_none(),
+            "Call admission incident event identity was already assigned");
+    }
     let index = steps.len();
     steps.push(step);
     if let Some((tx, root_instance_id, actor_id)) = execution {
         cancelled_claims.extend(apply_call_steps_on(tx, root_instance_id, actor_id,
-            &steps[index..], at_ms, index, skipped)?);
+            &steps[index..], at_ms, index, skipped, staged_requests, failed_requests)?);
         let mut persisted = BTreeMap::new();
         for instance_id in call_tree_ids_on(tx, root_instance_id)? {
             let initiator = call_initiator_on(tx, &instance_id)?;
@@ -13783,6 +21828,10 @@ fn record_call_step(
         }
         *snapshots = persisted;
     } else {
+        let projection_plan = match &steps[index] {
+            CallStep::Advance { plan, .. } => plan.as_ref(),
+            _ => projection_plan,
+        };
         append_call_plan(snapshots, projection_instance_id, projection_plan, at_ms)?;
     }
     Ok(())
@@ -13797,11 +21846,29 @@ fn prepare_call_steps(
     at_ms: i64,
     execution: Option<(&Transaction<'_>, &str, &str)>,
     cancelled_claims: &mut Vec<CancelledJobClaim>,
+    staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
+    failed_requests: &mut HashMap<(String, String), String>,
 ) -> Result<()> {
     let mut pending = vec![(instance_id.to_owned(), Box::new(local_plan.clone()), 0usize)];
     let mut skipped = HashSet::new();
     'pending: while let Some((instance_id, local_plan, next_request)) = pending.pop() {
         if skipped.contains(&instance_id) { continue }
+        if next_request == 0 {
+            let staged = staged_requests.entry(instance_id.clone()).or_default();
+            for request in &local_plan.call_requests {
+                if let Some(prior) = staged.iter().find(|prior| prior.call_id == request.call_id) {
+                    ensure!(prior.parent_scope_id == request.parent_scope_id
+                        && prior.parent_token_id == request.parent_token_id
+                        && prior.parent_arrival_edge_id == request.parent_arrival_edge_id
+                        && prior.call_node_id == request.call_node_id
+                        && prior.child_instance_id == request.child_instance_id
+                        && prior.variables == request.variables,
+                        "composite Call request identity changed between steps");
+                } else {
+                    staged.push(request.clone());
+                }
+            }
+        }
         if let Some(request) = local_plan.call_requests.get(next_request).cloned() {
             pending.push((instance_id.clone(), local_plan, next_request + 1));
             let parent = snapshots
@@ -13811,34 +21878,67 @@ fn prepare_call_steps(
             if !parent
                 .tokens
                 .iter()
-                .any(|t| t.token_id == request.parent_token_id && t.status == "waiting")
+                .any(|t| t.token_id == request.parent_token_id
+                    && t.scope_id == request.parent_scope_id
+                    && t.arrival_edge_id.as_deref() ==
+                        Some(request.parent_arrival_edge_id.as_str())
+                    && t.status == "waiting")
             {
                 continue;
             }
             let node = scope_node(
                 &parent.model,
+                &parent.instance.process_id,
                 &parent.scopes,
                 &instance_id,
                 &request.parent_scope_id,
                 &request.call_node_id,
             )?;
-            let ProcessNodeKind::CallActivity {
-                called_definition_id,
-                called_version,
-                ..
-            } = &node.kind
+            let ProcessNodeKind::CallActivity(call) = &node.kind
             else {
                 bail!("planned call node is not CallActivity")
+            };
+            let (called_definition_id, called_version, called_element) = match &call.target {
+                ProcessCallTarget::PublishedBody { definition_id, version, called_element } =>
+                    (definition_id.as_str(), *version, called_element),
+                ProcessCallTarget::LocalBody { called_element } =>
+                    (parent.instance.definition_id.as_str(), parent.instance.version,
+                        called_element),
             };
             let target = parent
                 .call_versions
                 .iter()
                 .find(|v| {
-                    v.version.definition_id == *called_definition_id
-                        && v.version.version == *called_version
+                    v.version.definition_id == called_definition_id
+                        && v.version.version == called_version
                 })
                 .context("immutable called process version missing")?
                 .clone();
+            ensure!(target.version.model.target_namespace.as_deref()
+                .unwrap_or("https://tentaflow.app/bpmn/1")
+                == called_element.namespace_uri,
+                "Call QName namespace differs from its pinned target document");
+            let parent_path = scope_path(&parent.scopes, &instance_id,
+                &request.parent_scope_id)?;
+            let parent_body = super::model::selected_body(&parent.model,
+                &parent.instance.process_id, &parent_path)?;
+            let arrival = parent_body.sequence_flows.iter().find(|flow|
+                flow.id == request.parent_arrival_edge_id
+                    && flow.target_id == request.call_node_id)
+                .context("Call request has no factual incoming parent flow")?;
+            let child_body = super::model::selected_body(&target.version.model,
+                &called_element.process_id, &[])?;
+            let eligible_starts = child_body.nodes.iter()
+                .filter(|node| node.kind == ProcessNodeKind::Start).collect::<Vec<_>>();
+            let child_start_node_id = if let Some(start_id) = &arrival.call_start_node_id {
+                ensure!(eligible_starts.iter().any(|node| node.id == *start_id),
+                    "Call incoming flow selects no ordinary Start in its pinned child body");
+                start_id.clone()
+            } else {
+                ensure!(eligible_starts.len() == 1,
+                    "Call without an incoming Start selector requires one eligible child Start");
+                eligible_starts[0].id.clone()
+            };
             let mut depth = 1;
             let mut current = instance_id.to_owned();
             while let Some(call) = snapshots
@@ -13857,6 +21957,8 @@ fn prepare_call_steps(
                     &actor,
                     &request.child_instance_id,
                     &target,
+                    &called_element.process_id,
+                    &child_start_node_id,
                     &request.variables,
                     &parent.call_versions,
                     at_ms,
@@ -13869,10 +21971,12 @@ fn prepare_call_steps(
                 };
                 let plan = super::runtime::plan_start(
                     &target.version.model,
+                    &called_element.process_id,
+                    &child_start_node_id,
                     &request.child_instance_id,
                     &actor,
                     called_definition_id,
-                    *called_version,
+                    called_version,
                     child.instance.variables.clone(),
                     super::runtime::StartCause::Manual,
                     at_ms,
@@ -13881,12 +21985,15 @@ fn prepare_call_steps(
                         parent_instance_id: instance_id.clone(),
                         parent_scope_id: request.parent_scope_id.clone(),
                         parent_token_id: request.parent_token_id.clone(),
+                        parent_arrival_edge_id: request.parent_arrival_edge_id.clone(),
                         call_node_id: request.call_node_id.clone(),
                         parent_instance_revision_at_step: parent.instance.revision,
                         call_step_index: steps.len(),
                         child_instance_id: request.child_instance_id.clone(),
-                        child_definition_id: called_definition_id.clone(),
-                        child_version: *called_version,
+                        child_definition_id: called_definition_id.to_owned(),
+                        child_version: called_version,
+                        child_process_id: called_element.process_id.clone(),
+                        child_start_node_id: child_start_node_id.clone(),
                         child_model_sha256: target.version.model_sha256.clone(),
                     },
                     execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>))?;
@@ -13906,8 +22013,9 @@ fn prepare_call_steps(
                     record_call_step(snapshots, steps, CallStep::Advance {
                         instance_id: instance_id.to_owned(),
                         expected_revision: parent.instance.revision,
+                        request: request.clone(),
                         plan: Box::new(incident.clone()),
-                    }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped)?;
+                    }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -13942,8 +22050,9 @@ fn prepare_call_steps(
                 record_call_step(snapshots, steps, CallStep::Advance {
                     instance_id: instance_id.to_owned(),
                     expected_revision: parent.instance.revision,
+                    request: request.clone(),
                     plan: Box::new(incident.clone()),
-                }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped)?;
+                }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
                 continue;
             }
             let call = CallActivation {
@@ -13951,12 +22060,15 @@ fn prepare_call_steps(
                 parent_instance_id: instance_id.to_owned(),
                 parent_scope_id: request.parent_scope_id.clone(),
                 parent_token_id: request.parent_token_id.clone(),
+                parent_arrival_edge_id: request.parent_arrival_edge_id.clone(),
                 call_node_id: node.id.clone(),
                 child_instance_id: request.child_instance_id.clone(),
                 definition_id: parent.instance.definition_id.clone(),
                 version: parent.instance.version,
-                called_definition_id: called_definition_id.clone(),
-                called_version: *called_version,
+                called_definition_id: called_definition_id.to_owned(),
+                called_version,
+                called_process_id: called_element.process_id.clone(),
+                child_start_node_id,
                 model_sha256: target.version.model_sha256.clone(),
                 revision: 1,
                 status: ProcessCallStatus::Waiting,
@@ -13978,7 +22090,7 @@ fn prepare_call_steps(
                 },
                 plan: Box::new(plan.clone()),
             }, &request.child_instance_id, &plan, at_ms, execution, cancelled_claims,
-                &mut skipped)?;
+                &mut skipped, staged_requests, failed_requests)?;
             if snapshots.contains_key(&request.child_instance_id) {
                 pending.push((request.child_instance_id.clone(), Box::new(plan), 0));
             }
@@ -14035,7 +22147,7 @@ fn prepare_call_steps(
                         source: Some(source.clone()),
                         plan: Box::new(plan.clone()),
                     }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
-                        &mut skipped)?;
+                        &mut skipped, staged_requests, failed_requests)?;
                     pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
                     continue 'pending;
                 }
@@ -14061,7 +22173,7 @@ fn prepare_call_steps(
                     source: Some(source.clone()),
                     plan: Box::new(plan.clone()),
                 }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
-                    &mut skipped)?;
+                    &mut skipped, staged_requests, failed_requests)?;
             }
             continue 'pending;
         }
@@ -14097,12 +22209,36 @@ fn prepare_call_steps(
                         &parent, &call.call_node_id, &call.parent_scope_id,
                         "CALL_RETURN_ERROR", reason, at_ms)?, ProcessCallStatus::ReturnIncident)
                 } else {
+                    let child_completed_event_id = if let Some((tx, _, _)) = execution {
+                        let completed_events = tx.query_row(
+                            "SELECT COUNT(*),MIN(event_id) FROM bpmn_events \
+                             WHERE instance_id=?1 AND scope_id=?1 AND node_id IS NULL \
+                               AND kind='instance_completed'",
+                            [&child.instance.instance_id],
+                            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?)),
+                        )?;
+                        ensure!(completed_events.0 == 1,
+                            "completed Call child lacks one canonical instance_completed source");
+                        completed_events.1
+                            .context("completed Call child source UUID is missing")?
+                    } else {
+                        let completed_events = local_plan.events.iter().enumerate()
+                            .filter(|(_, event)| event.kind == "instance_completed"
+                                && event.scope_id == child.instance.instance_id
+                                && event.node_id.is_none())
+                            .filter_map(|(index, _)| local_plan.event_ids.get(&index).cloned())
+                            .collect::<Vec<_>>();
+                        ensure!(completed_events.len() == 1,
+                            "preflight Call child lacks one planned instance_completed source");
+                        completed_events[0].clone()
+                    };
                     let candidate = super::runtime::plan_call_return(
                         &parent,
                         &call,
                         &child.instance.variables,
                         at_ms,
                         child.instance.revision,
+                        &child_completed_event_id,
                         execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>));
                     match candidate {
                         Ok(plan) => {
@@ -14113,7 +22249,16 @@ fn prepare_call_steps(
                                     projected_call_budget(&proposed)
                                 });
                             match checked {
-                                Ok(()) => (plan, ProcessCallStatus::Returned),
+                                Ok(()) => {
+                                    let status = if plan.activity_io_results.iter().any(|fact|
+                                        matches!(&fact.disposition,
+                                            ActivityIoResultDisposition::Blocked { .. })) {
+                                        ProcessCallStatus::ReturnIncident
+                                    } else {
+                                        ProcessCallStatus::Returned
+                                    };
+                                    (plan, status)
+                                }
                                 Err(error) if error.downcast_ref::<CallTransitionRejected>().is_some() => (
                                     super::runtime::plan_call_incident(
                                         &parent,
@@ -14158,9 +22303,79 @@ fn prepare_call_steps(
                     }
                 }
                 record_call_step(snapshots, steps, step, &call.parent_instance_id,
-                    &plan, at_ms, execution, cancelled_claims, &mut skipped)?;
+                    &plan, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
                 pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_call_requests_on(
+    tx: &Transaction<'_>,
+    staged_requests: &BTreeMap<String, Vec<CallRequest>>,
+    failed_requests: &HashMap<(String, String), String>,
+) -> Result<()> {
+    ensure!(failed_requests.values().collect::<HashSet<_>>().len() == failed_requests.len(),
+        "distinct failed Call requests share one incident event");
+    for (parent_instance_id, requests) in staged_requests {
+        for request in requests {
+            let started: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_calls WHERE call_id=?1 AND parent_instance_id=?2 AND parent_scope_id=?3 AND parent_token_id=?4 AND parent_arrival_edge_id=?5 AND call_node_id=?6 AND child_instance_id=?7",
+                params![request.call_id,parent_instance_id,request.parent_scope_id,
+                    request.parent_token_id,request.parent_arrival_edge_id,
+                    request.call_node_id,request.child_instance_id],
+                |row| row.get(0),
+            )?;
+            let entered: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='call_entered' AND node_id=?3 AND json_extract(data_json,'$.call_id')=?4 AND json_extract(data_json,'$.parent_token_id')=?5 AND json_extract(data_json,'$.child_instance_id')=?6 AND json_extract(data_json,'$.parent_arrival_edge_id')=?7",
+                params![parent_instance_id,request.parent_scope_id,request.call_node_id,
+                    request.call_id,request.parent_token_id,request.child_instance_id,
+                    request.parent_arrival_edge_id],
+                |row| row.get(0),
+            )?;
+            let cancelled: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='call_request_cancelled' AND node_id=?3 AND json_extract(data_json,'$.call_id')=?4 AND json_extract(data_json,'$.parent_token_id')=?5",
+                params![parent_instance_id,request.parent_scope_id,request.call_node_id,
+                    request.call_id,request.parent_token_id],
+                |row| row.get(0),
+            )?;
+            let blocked: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND kind='incident' AND node_id=?3 AND json_extract(data_json,'$.code')='CALL_ADMISSION_ERROR' AND json_extract(data_json,'$.call_id')=?4 AND json_extract(data_json,'$.parent_token_id')=?5",
+                params![parent_instance_id,request.parent_scope_id,request.call_node_id,
+                    request.call_id,request.parent_token_id],
+                |row| row.get(0),
+            )?;
+            let failure_event_id = failed_requests.get(&(
+                parent_instance_id.clone(), request.call_id.clone()));
+            if started == 1 && entered == 1 {
+                ensure!(cancelled == 0 && blocked == 0 && failure_event_id.is_none(),
+                    "staged Call request has conflicting child and closure facts");
+                continue;
+            }
+            let failed_fact: u32 = if let Some(event_id) = failure_event_id {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM bpmn_events WHERE event_id=?1 AND instance_id=?2 AND scope_id=?3 AND kind='incident' AND node_id=?4 AND json_extract(data_json,'$.code')='CALL_ADMISSION_ERROR' AND (json_extract(data_json,'$.call_id') IS NULL OR json_extract(data_json,'$.call_id')=?5) AND (json_extract(data_json,'$.parent_token_id') IS NULL OR json_extract(data_json,'$.parent_token_id')=?6)",
+                    params![event_id,parent_instance_id,request.parent_scope_id,
+                        request.call_node_id,request.call_id,request.parent_token_id],
+                    |row| row.get(0),
+                )?
+            } else { 0 };
+            let waiting: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
+                params![parent_instance_id,request.parent_scope_id,
+                    request.parent_token_id,request.call_node_id],
+                |row| row.get(0),
+            )?;
+            let incident: bool = tx.query_row(
+                "SELECT status='incident' FROM bpmn_instances WHERE instance_id=?1",
+                [parent_instance_id], |row| row.get(0),
+            )?;
+            ensure!(started == 0 && entered == 0 && (
+                cancelled == 1 && blocked == 0 && failure_event_id.is_none()
+                || cancelled == 0 && failure_event_id.is_some()
+                    && failed_fact == 1 && waiting && incident),
+                "staged Call request lacks one factual child or closure");
         }
     }
     Ok(())
@@ -14194,9 +22409,12 @@ fn apply_canonical_call_steps_on(
         "canonical Call source instance is missing");
     let mut steps = Vec::new();
     let mut cancelled_claims = Vec::new();
+    let mut staged_requests = BTreeMap::new();
+    let mut failed_requests = HashMap::new();
     prepare_call_steps(instance_id, plan, &mut snapshots, &authority,
         &mut steps, at_ms, Some((tx, instance_id, actor_id)),
-        &mut cancelled_claims)?;
+        &mut cancelled_claims, &mut staged_requests, &mut failed_requests)?;
+    validate_staged_call_requests_on(tx, &staged_requests, &failed_requests)?;
     Ok(cancelled_claims)
 }
 
@@ -14204,7 +22422,7 @@ fn prepare_call_plan<'pool>(
     pool: &'pool DbPool,
     actor: &ProcessActor,
     instance_id: &str,
-    initial: Option<(&str, u32, &Value)>,
+    initial: Option<(&str, u32, &Value, Option<&str>, Option<&str>)>,
     plan: &RuntimePlan,
     at_ms: i64,
 ) -> Result<(RuntimePlan, parking_lot::MutexGuard<'pool, Connection>)> {
@@ -14216,12 +22434,12 @@ fn prepare_call_plan<'pool>(
         let (mut snapshots, authority) = read_snapshot(pool, |conn| {
             let mut snapshots = BTreeMap::new();
             let mut authority = BTreeMap::new();
-            if let Some((definition_id, version, variables)) = initial {
+            if let Some((definition_id, version, variables, process_id, start_node_id)) = initial {
                 require_actor(conn, actor)?;
                 require_owner(conn, actor, definition_id)?;
                 let ver = version_on(conn, definition_id, version)?;
                 let services=parse(conn.query_row("SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",params![definition_id,version],|r|r.get::<_,String>(0))?)?;
-                let versions =
+                let mut versions =
                     pinned_call_versions_on(conn, actor, definition_id, version, &ver.model)?;
                 let pin = PinnedCallVersion {
                     version: ver,
@@ -14229,9 +22447,28 @@ fn prepare_call_plan<'pool>(
                     name: definition_on(conn, definition_id)?.name,
                     admission_error: None,
                 };
+                let selected_process_id = match process_id {
+                    Some(id) => id,
+                    None if pin.version.model.additional_processes.is_empty() =>
+                        pin.version.model.process_id.as_str(),
+                    None => bail!("multi-process start requires an exact process ID"),
+                };
+                let body = super::model::selected_body(&pin.version.model,
+                    selected_process_id, &[])?;
+                let eligible_starts = body.nodes.iter().filter(|node|
+                    matches!(node.kind, ProcessNodeKind::Start | ProcessNodeKind::TimerStart { .. }
+                        | ProcessNodeKind::MessageStart { .. })).collect::<Vec<_>>();
+                let selected_start_node_id = match start_node_id {
+                    Some(id) if eligible_starts.iter().any(|node| node.id == id) => id,
+                    Some(_) => bail!("selected Start is outside its pinned body"),
+                    None if eligible_starts.len() == 1 => eligible_starts[0].id.as_str(),
+                    None => bail!("start requires one exact eligible Start node"),
+                };
+                versions.push(pin.clone());
                 snapshots.insert(
                     instance_id.to_owned(),
-                    initial_call_snapshot(actor, instance_id, &pin, variables, &versions, at_ms)?,
+                    initial_call_snapshot(actor, instance_id, &pin, selected_process_id,
+                        selected_start_node_id, variables, &versions, at_ms)?,
                 );
             } else {
                 require_actor(conn, actor)?;
@@ -14292,6 +22529,8 @@ fn prepare_call_plan<'pool>(
             at_ms,
             None,
             &mut Vec::new(),
+            &mut BTreeMap::new(),
+            &mut HashMap::new(),
         )?;
         composite.call_steps = steps;
         #[cfg(test)]
@@ -14338,6 +22577,8 @@ pub fn start_instance(
     definition_id: &str,
     version: u32,
     initial_variables: &Value,
+    process_id: Option<&str>,
+    start_node_id: Option<&str>,
     plan_input: ProcessPlanInput<'_>,
     at_ms: i64,
 ) -> Result<ProcessInstance> {
@@ -14351,7 +22592,8 @@ pub fn start_instance(
     let (composite, mut conn) = match plan_input {
         ProcessPlanInput::Supplied(plan) => {
             let (composite, conn) = prepare_call_plan(pool, actor, instance_id,
-                Some((definition_id, version, initial_variables)), plan, at_ms)?;
+                Some((definition_id, version, initial_variables, process_id,
+                    start_node_id)), plan, at_ms)?;
             (Some(composite), conn)
         }
         ProcessPlanInput::Canonical => (None, pool.write()?),
@@ -14369,7 +22611,26 @@ pub fn start_instance(
     } else {
         validate_variables(initial_variables)?;
         let model = current_version_model_on(&tx, definition_id, version)?;
-        let mut variables = serde_json::to_value(&model.variables)?;
+        let selected_process_id = match process_id {
+            Some(id) => id,
+            None if model.additional_processes.is_empty() => model.process_id.as_str(),
+            None => bail!("multi-process start requires an exact process ID"),
+        };
+        let body = super::model::selected_body(&model, selected_process_id, &[])?;
+        let eligible_starts = body.nodes.iter().filter(|node|
+            matches!(node.kind, ProcessNodeKind::Start)).collect::<Vec<_>>();
+        let selected_start = match start_node_id {
+            Some(id) => {
+                let selected = body.nodes.iter().find(|node| node.id == id)
+                    .context("selected manual Start is outside its pinned body")?;
+                ensure!(matches!(selected.kind, ProcessNodeKind::Start),
+                    "selected process start cannot be started manually");
+                selected
+            }
+            None if eligible_starts.len() == 1 => eligible_starts[0],
+            None => bail!("manual start requires one exact eligible Start node"),
+        };
+        let mut variables = serde_json::to_value(body.variables)?;
         for (key, value) in initial_variables.as_object()
             .context("process variables must be an object")? {
             variables.as_object_mut().expect("model variables are object")
@@ -14384,8 +22645,9 @@ pub fn start_instance(
             accepted: Option<&AcceptedInputRef>| {
             signal_admission_on(&tx, actor, instance_id, prefix, signal, accepted)
         };
-        canonical = super::runtime::plan_start(&model, instance_id, actor,
-            definition_id, version, variables, super::runtime::StartCause::Manual,
+        canonical = super::runtime::plan_start(&model, selected_process_id,
+            &selected_start.id, instance_id, actor, definition_id, version, variables,
+            super::runtime::StartCause::Manual,
             at_ms, start_input, Some(&resolve))?;
         &canonical
     };
@@ -14410,11 +22672,14 @@ pub fn start_instance(
         definition_id,
         version,
         initial_variables,
+        process_id,
+        start_node_id,
         plan,
         at_ms,
         None,
         None,
         &entry,
+        ExecutionMode::Durable,
     )?;
     if composite.is_none() {
         apply_canonical_call_steps_on(&tx, instance_id, &actor.user_id,
@@ -14426,6 +22691,16 @@ pub fn start_instance(
     Ok(result)
 }
 
+/// A durable transition is authorized by definition ownership and begins from the
+/// pinned body defaults overlaid with the caller's inputs. A simulation actor
+/// is authorized by the ACL captured with its source pin, and the scenario
+/// supplies the complete initial scope, so an omitted variable stays missing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionMode {
+    Durable,
+    Simulation,
+}
+
 fn start_instance_on(
     tx: &Transaction<'_>,
     actor: &ProcessActor,
@@ -14433,11 +22708,14 @@ fn start_instance_on(
     definition_id: &str,
     version: u32,
     initial_variables: &Value,
+    process_id: Option<&str>,
+    start_node_id: Option<&str>,
     plan: &RuntimePlan,
     at_ms: i64,
     start_identity: Option<(&str, u64)>,
     message_identity: Option<&MessageKey>,
     entry: &AcceptedInputRef,
+    mode: ExecutionMode,
 ) -> Result<ProcessInstance> {
     validate_variables(initial_variables)?;
     ensure!(Uuid::parse_str(instance_id).is_ok(), "instance_id must be a UUID");
@@ -14446,7 +22724,9 @@ fn start_instance_on(
         "start transition identity differs from the persisted instance"
     );
     require_actor(tx, actor)?;
-    require_owner(tx, actor, definition_id)?;
+    if mode == ExecutionMode::Durable {
+        require_owner(tx, actor, definition_id)?;
+    }
     let definition = definition_on(tx, definition_id)?;
     ensure!(
         !definition.archived,
@@ -14462,18 +22742,29 @@ fn start_instance_on(
         "instance start cannot interrupt existing work"
     );
     let model = current_version_model_on(tx, definition_id, version)?;
-    let start = model
-        .nodes
-        .iter()
-        .find(|n| {
-            matches!(
-                n.kind,
-                ProcessNodeKind::Start
-                    | ProcessNodeKind::TimerStart { .. }
-                    | ProcessNodeKind::MessageStart { .. }
-            )
-        })
-        .context("process start missing")?;
+    let selected_process_id = match process_id {
+        Some(id) => id,
+        None if model.additional_processes.is_empty() => model.process_id.as_str(),
+        None => bail!("multi-process start requires an exact process ID"),
+    };
+    let body = super::model::selected_body(&model, selected_process_id, &[])?;
+    let eligible_starts = body.nodes.iter().filter(|node| match start_identity {
+        Some(_) => matches!(node.kind, ProcessNodeKind::TimerStart { .. }),
+        None if message_identity.is_some() => matches!(node.kind, ProcessNodeKind::MessageStart { .. }),
+        None => matches!(node.kind, ProcessNodeKind::Start),
+    }).collect::<Vec<_>>();
+    let start = match start_node_id {
+        Some(id) => eligible_starts.iter().find(|node| node.id == id)
+            .copied().context("selected Start is outside its pinned body")?,
+        None if eligible_starts.len() == 1 => eligible_starts[0],
+        None => bail!("process start requires one exact eligible Start node"),
+    };
+    ensure!(plan.events.iter().filter(|event| event.kind == "instance_started"
+        && event.scope_id == instance_id
+        && event.data["process_id"].as_str() == Some(selected_process_id)
+        && event.data["start_node_id"].as_str() == Some(start.id.as_str()))
+        .count() == 1,
+        "start history differs from its selected body and Start node");
     ensure!(
         matches!(start.kind, ProcessNodeKind::TimerStart { .. }) == start_identity.is_some()
             && matches!(start.kind, ProcessNodeKind::MessageStart { .. })
@@ -14485,7 +22776,7 @@ fn start_instance_on(
         ensure!(
             key.org_id == actor.org_id
                 && key.sender_user_id == actor.user_id
-                && matches!(&message.target,ProcessMessageTarget::Start{definition_id:target}if target==definition_id)
+                && matches!(&message.target,ProcessMessageTarget::Start{definition_id:target,..}if target==definition_id)
                 && definition.published_version == Some(version)
                 && matches!(
                     message.status,
@@ -14507,7 +22798,10 @@ fn start_instance_on(
             "start identity does not match the current process timer"
         );
     }
-    let mut vars = serde_json::to_value(&model.variables)?;
+    let mut vars = match mode {
+        ExecutionMode::Durable => serde_json::to_value(body.variables)?,
+        ExecutionMode::Simulation => Value::Object(Default::default()),
+    };
     for (key, value) in initial_variables
         .as_object()
         .context("process variables must be an object")?
@@ -14530,13 +22824,13 @@ fn start_instance_on(
     for snapshot in &snapshots {
         require_flow_current(tx, actor, &snapshot.info.flow_id, None)?;
     }
-    tx.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence) VALUES(?1,?2,?3,?4,?5,1,'running',?6,?7,?7,?8,?9)",params![instance_id,definition_id,version,actor.org_id,actor.user_id,json(&vars)?,at_ms,start_identity.map(|(id,_)|id),start_identity.map(|(_,slot)|sql_integer(slot)).transpose()?])?;
+    tx.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence,selected_process_id,start_node_id) VALUES(?1,?2,?3,?4,?5,1,'running',?6,?7,?7,?8,?9,?10,?11)",params![instance_id,definition_id,version,actor.org_id,actor.user_id,json(&vars)?,at_ms,start_identity.map(|(id,_)|id),start_identity.map(|(_,slot)|sql_integer(slot)).transpose()?,selected_process_id,start.id])?;
     tx.execute(
         "INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES(?1,?1)",
         [instance_id],
     )?;
     apply_plan_on(tx, instance_id, &actor.user_id, 1, plan, at_ms, None,
-        EntryAuthority::Accepted(entry))?;
+        EntryAuthority::Accepted(entry), &[])?;
     instance_on(tx, actor, instance_id, None)
 }
 
@@ -14611,7 +22905,7 @@ pub fn apply_transition(
         at_ms,
         None,
         EntryAuthority::PersistedReady,
-    )?;
+    &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
             &actor.user_id, plan, at_ms)?);
@@ -14642,6 +22936,38 @@ pub(super) fn pending_send_page(
     })
 }
 
+fn pending_send_already_admitted_on(
+    conn: &Connection, instance_id: &str, scope_id: &str, node_id: &str,
+    pending_token_id: &str,
+) -> Result<bool> {
+    let mut events = conn.prepare(
+        "SELECT event_id,json_extract(data_json,'$.message_id') FROM bpmn_events \
+         WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 \
+         AND kind='send_task_admitted' \
+         AND json_extract(data_json,'$.source_activation_id')=?4")?;
+    let admitted = events.query_map(
+        params![instance_id,scope_id,node_id,pending_token_id],
+        |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?)),
+    )?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if admitted.is_empty() { return Ok(false); }
+    ensure!(admitted.len() == 1 && Uuid::parse_str(&admitted[0].0).is_ok()
+        && Uuid::parse_str(&admitted[0].1).is_ok(),
+        "pending Send has ambiguous historical admission");
+    let bound: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM bpmn_activity_io_witnesses w \
+         JOIN bpmn_messages m ON m.message_id=w.resource_id \
+         WHERE w.instance_id=?1 AND w.scope_id=?2 AND w.node_id=?3 \
+         AND w.token_id=?4 AND w.phase='output_blocked' \
+         AND w.result_event_id=?5 AND w.resource_id=?6 \
+         AND m.source_instance_id=?1 AND m.source_scope_id=?2 \
+         AND m.source_node_id=?3 AND m.source_activation_id=?4 \
+         AND m.source_event_id=?5",
+        params![instance_id,scope_id,node_id,pending_token_id,admitted[0].0,admitted[0].1],
+        |row| row.get(0))?;
+    ensure!(bound == 1, "pending Send historical admission lacks its blocked result and outbox");
+    Ok(true)
+}
+
 pub(super) fn admit_pending_send(
     pool: &DbPool, pending_token_id: &str, at_ms: i64,
     plan_input: ProcessPlanInput<'_>,
@@ -14666,11 +22992,13 @@ pub(super) fn admit_pending_send(
         [&instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
     let model = current_version_model_on(&tx, &definition_id, version)?;
     let scopes = scopes_on(&tx, &instance_id, &model)?;
+    let selected_process_id = selected_process_id_on(&tx, &instance_id)?;
     let scope = scopes.iter().find(|scope| scope.scope_id == scope_id)
         .context("pending Send scope is absent from its pinned instance")?;
-    let node = scope_node(&model, &scopes, &instance_id, &scope_id, &node_id)?;
+    let node = scope_node(&model, &selected_process_id, &scopes, &instance_id, &scope_id, &node_id)?;
     let path = scope_path(&scopes, &instance_id, &scope_id)?;
-    let (body_nodes, _, _) = super::model::scope_body(&model, &path)?;
+    let selected = super::model::selected_body(&model, &selected_process_id, &path)?;
+    let body_nodes = selected.nodes;
     if !matches!(&node.kind, ProcessNodeKind::SendTask { .. })
         || !body_nodes.iter().any(|candidate| match &candidate.kind {
             ProcessNodeKind::BoundaryTimer { attached_to_id, .. }
@@ -14742,6 +23070,8 @@ pub(super) fn admit_pending_send(
          AND json_extract(data_json,'$.pending_token_id')=?4)",
         params![instance_id,scope_id,node_id,pending_token_id], |row| row.get(0))?;
     if failed { return Ok(None); }
+    if pending_send_already_admitted_on(&tx, &instance_id, &scope_id,
+        &node_id, pending_token_id)? { return Ok(None); }
     drop(events);
     let actor = ProcessActor { org_id, user_id: initiator };
     let snapshot = runtime_snapshot_on(&tx, &actor, &instance_id)?;
@@ -14758,8 +23088,10 @@ pub(super) fn admit_pending_send(
         ProcessPlanInput::Canonical => {
             let effective = effective_scope_variables(&snapshot.scopes,
                 &snapshot.scope_variables, &instance_id, &snapshot.instance.variables, &scope_id)?;
+            let (variables, extra) = send_repetition_context_on(&tx, &instance_id,
+                &scope_id, node, pending_token_id, &effective)?;
             let decision = send_admission_evaluation_on(&tx, &actor, &instance_id,
-                &model, node, &effective)?;
+                &model, node, &variables, &extra)?;
             let finite = match decision {
                 SendAdmissionEvaluation::Admit(_) => None,
                 SendAdmissionEvaluation::Fail(failure) => Some(failure),
@@ -14775,7 +23107,7 @@ pub(super) fn admit_pending_send(
         }
     };
     let mut cancelled_claims = apply_plan_on(&tx, &instance_id, &actor.user_id,
-        snapshot.instance.revision, plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
+        snapshot.instance.revision, plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
     if canonical_mode {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
             &actor.user_id, plan, at_ms)?);
@@ -14826,6 +23158,9 @@ pub fn acknowledge_manual_task(
     ensure!(kind == "manual" && status == "open" && assignee == actor.user_id
         && parse::<Value>(outputs)?.is_null(),
         "manual task is not currently acknowledgeable by this actor");
+    ensure!(!task_output_blocked_on(&tx, instance_id, user_task_id,
+        Some(&token_id))?,
+        "manual result was accepted and its output is blocked");
     let live: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM bpmn_tokens t JOIN bpmn_instances i ON i.instance_id=t.instance_id JOIN bpmn_scopes s ON s.instance_id=t.instance_id AND s.scope_id=t.scope_id WHERE t.token_id=?1 AND t.instance_id=?2 AND t.node_id=?3 AND t.scope_id=?4 AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND i.status NOT IN ('completed','cancelled','error'))",
         params![token_id,instance_id,node_id,scope_id], |row| row.get(0))?;
@@ -14838,7 +23173,8 @@ pub fn acknowledge_manual_task(
         "process instance revision conflict or closed instance");
     let model = current_version_model_on(&tx, &definition_id, version)?;
     let scopes = scopes_on(&tx, instance_id, &model)?;
-    ensure!(matches!(&scope_node(&model, &scopes, instance_id, &scope_id, &node_id)?.kind,
+    let selected_process_id = selected_process_id_on(&tx, instance_id)?;
+    ensure!(matches!(&scope_node(&model, &selected_process_id, &scopes, instance_id, &scope_id, &node_id)?.kind,
         ProcessNodeKind::ManualTask { .. }),
         "manual acknowledgment differs from its pinned activity");
     let entry = AcceptedInputRef::ManualAcknowledgment {
@@ -14867,7 +23203,7 @@ pub fn acknowledge_manual_task(
             && plan.cancel_job_ids.is_empty()
             && plan.cancel_user_task_ids.is_empty()),
         "ordinary advancement cannot authorize interruption");
-    ensure!(plan.complete_user_task_ids.len() == 1
+    let acknowledged = plan.complete_user_task_ids.len() == 1
         && plan.complete_user_task_ids[0] == user_task_id
         && plan.consume_token_ids.iter().filter(|id| *id == &token_id).count() == 1
         && plan.events.iter().enumerate().filter(|(_,event)|
@@ -14876,7 +23212,19 @@ pub fn acknowledge_manual_task(
                 && event.node_id.as_deref() == Some(node_id.as_str())
                 && event.data == serde_json::json!({
                     "user_task_id":user_task_id,"acknowledged_by_user_id":actor.user_id
-                })).count() == 1,
+                })).count() == 1;
+    let blocked = plan.activity_io_results.iter().filter(|fact|
+        fact.scope_id == scope_id && fact.node_id == node_id
+            && fact.token_id == token_id
+            && fact.resource_id.as_deref() == Some(user_task_id)
+            && fact.resource_revision == Some(task_revision)
+            && matches!(&fact.disposition, ActivityIoResultDisposition::Blocked { .. }))
+        .count() == 1
+        && plan.complete_user_task_ids.is_empty()
+        && !plan.consume_token_ids.contains(&token_id)
+        && !plan.cancel_token_ids.contains(&token_id)
+        && plan.events.iter().all(|event| event.kind != "manual_task_acknowledged");
+    ensure!(acknowledged || blocked,
         "manual acknowledgment differs from its authenticated task and actor");
     for attempt in &plan.termination_attempts {
         let accepted = match attempt {
@@ -14888,7 +23236,7 @@ pub fn acknowledge_manual_task(
             "manual acknowledgment cannot invent another terminating entry");
     }
     let mut cancelled_claims = apply_plan_on(&tx, instance_id, &actor.user_id,
-        expected_revision, plan, at_ms, None, EntryAuthority::Accepted(&entry))?;
+        expected_revision, plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
             &actor.user_id, plan, at_ms)?);
@@ -14943,6 +23291,9 @@ pub fn complete_user_task(
         assignee == actor.user_id && status == "open",
         "user task is not currently completable"
     );
+    ensure!(!task_output_blocked_on(&tx, instance_id, user_task_id,
+        Some(&token_id))?,
+        "user task result was accepted and its output is blocked");
     ensure!(
         (kind == "verification") == approved.is_some(),
         "verification decision must match user task kind"
@@ -15017,12 +23368,19 @@ pub fn complete_user_task(
                 "human completion cannot invent another terminating entry");
         }
     }
-    ensure!(
-        plan.complete_user_task_ids
-            .iter()
-            .any(|id| id == user_task_id),
-        "completion plan does not consume the requested user task"
-    );
+    let blocked_user_output = kind == "work" && plan.activity_io_results.iter().filter(|fact|
+        fact.scope_id == scope_id && fact.node_id == node_id
+            && fact.token_id == token_id
+            && fact.resource_id.as_deref() == Some(user_task_id)
+            && fact.resource_revision == Some(task_revision)
+            && matches!(&fact.disposition, ActivityIoResultDisposition::Blocked { .. }))
+        .count() == 1;
+    ensure!(plan.complete_user_task_ids.iter().any(|id| id == user_task_id)
+        || blocked_user_output && plan.complete_user_task_ids.is_empty()
+            && !plan.consume_token_ids.contains(&token_id)
+            && !plan.cancel_token_ids.contains(&token_id)
+            && plan.events.iter().all(|event| event.kind != "user_task_completed"),
+        "human result has neither its completed task nor one accepted blocked output");
     if kind == "verification" && !plan.termination_attempts.is_empty() {
         ensure!(approved == Some(true)
             && plan.events.iter().filter(|event|
@@ -15049,13 +23407,7 @@ pub fn complete_user_task(
         at_ms,
         None,
         EntryAuthority::Accepted(&entry),
-    )?;
-    if kind == "verification" {
-        tx.execute(
-            "UPDATE bpmn_user_tasks SET outputs_json=?1 WHERE user_task_id=?2",
-            params![json(outputs)?, user_task_id],
-        )?;
-    }
+    &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
             &actor.user_id, plan, at_ms)?);
@@ -15272,7 +23624,9 @@ fn cancel_instance_on(
     )?;
     tx.execute("UPDATE bpmn_tokens SET status='cancelled' WHERE instance_id=?1 AND status IN ('ready','waiting','joining')",[instance_id])?;
     tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND status='open'",params![instance_id,at_ms])?;
+    tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND phase='prepared' AND dispatch_evidence='no_boundary' AND EXISTS(SELECT 1 FROM bpmn_jobs j WHERE j.job_id=bpmn_service_invocations.job_id AND j.instance_id=?1 AND j.status IN ('queued','running','error'))",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_jobs SET status='cancelled',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE instance_id=?1 AND status IN ('queued','running','error')",params![instance_id,at_ms])?;
+    close_cancelled_instance_dispatches_on(tx, instance_id, at_ms)?;
     tx.execute("UPDATE bpmn_repetition_occurrences SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND status IN ('pending','active','awaiting_verification','retryable_error')",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_repetition_groups SET status='cancelled',revision=revision+1,updated_at_ms=?2 WHERE instance_id=?1 AND terminal_capacity=0 AND status IN ('open','incident')",params![instance_id,at_ms])?;
     tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE instance_id=?2 AND resolved_at_ms IS NULL AND incident_id NOT IN (SELECT terminal_incident_id FROM bpmn_repetition_groups WHERE instance_id=?2 AND terminal_capacity=1)",params![at_ms,instance_id])?;
@@ -15354,6 +23708,9 @@ fn cancel_instance_on(
         termination,
         capacity,
     )?);
+    for group in repetition_groups_on(tx, instance_id)? {
+        refresh_repetition_retained_bytes_on(tx, instance_id, &group.group_id)?;
+    }
     Ok(cancelled_claims)
 }
 
@@ -15398,12 +23755,13 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     let queued:Option<(String,String,String,String,String,String)>=tx.query_row(
-        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 1",
+        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 1",
         [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
     ).optional()?;
     let Some((job_id, instance_id, scope_id, node_id, org_id, user_id)) = queued else {
         return Ok(None);
     };
+    selected_process_id_on(&tx, &instance_id)?;
     let actor = ProcessActor { org_id, user_id };
     let flow_id = job_flow_id_on(&tx, &job_id)?;
     if let Err(error) = require_actor(&tx, &actor)
@@ -15411,6 +23769,8 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
         .and_then(|_| require_flow_current(&tx, &actor, &flow_id, None))
     {
         let reason = bounded_failure_message(&error.to_string());
+        let closed = tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='prepared' AND dispatch_evidence='no_boundary'", params![now_ms,job_id,instance_id])?;
+        ensure!(closed == 1, "pre-dispatch Service denial changed its invocation boundary");
         tx.execute("UPDATE bpmn_jobs SET status='error',updated_at_ms=?1 WHERE job_id=?2 AND status='queued'",params![now_ms,job_id])?;
         tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2",params![now_ms,instance_id])?;
         tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id,scope_id])?;
@@ -15454,6 +23814,7 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     let claimed_before_event = runtime_snapshot_on(&tx, &actor, &instance_id)?;
     let claimed_node = scope_node(
         &claimed_before_event.model,
+        &claimed_before_event.instance.process_id,
         &claimed_before_event.scopes,
         &instance_id,
         &scope_id,
@@ -15467,7 +23828,7 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
         }
     );
     let body_path = scope_path(&claimed_before_event.scopes, &instance_id, &scope_id)?;
-    let has_escalation = super::model::scope_body(&claimed_before_event.model, &body_path)?.0
+    let has_escalation = super::model::selected_body(&claimed_before_event.model, &claimed_before_event.instance.process_id, &body_path)?.nodes
         .iter().any(|node| matches!(&node.kind,
             ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } if attached_to_id == &node_id));
     let expression_variables_sha256 = if has_expression && has_escalation {
@@ -15547,12 +23908,265 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
             "claimed process variables changed before claim commit"
         );
     }
+    let (invocation_id, request_id): (String, String) = tx.query_row(
+        "SELECT invocation_id,stable_request_id FROM bpmn_service_invocations WHERE job_id=?1 AND instance_id=?2 AND scope_id=?3 AND phase='prepared' AND dispatch_evidence='no_boundary'",
+        params![job_id,instance_id,scope_id],
+        |row| Ok((row.get(0)?,row.get(1)?)))?;
     tx.commit()?;
     Ok(Some(ClaimedProcessJob {
         actor,
         job,
         snapshot,
+        invocation_id,
+        request_id,
+        result_event_id: Uuid::new_v4().to_string(),
     }))
+}
+
+pub fn commit_job_dispatch_boundary(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    at_ms: i64,
+) -> Result<bool> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    require_actor(&tx, &claimed.actor)?;
+    require_call_control_authority_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
+    let flow_id = job_flow_id_on(&tx, &claimed.job.job_id)?;
+    require_flow_current(&tx, &claimed.actor, &flow_id, None)?;
+    if !job_activation_live_on(&tx, &claimed.job.job_id)? {
+        return Ok(false);
+    }
+    let (input_json, pinned_flow_id, pinned_input_hash, pinned_request):
+        (String, String, String, String) = tx.query_row(
+        "SELECT j.input_json,v.flow_id,v.input_sha256,v.stable_request_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id WHERE j.job_id=?1 AND v.invocation_id=?2 AND v.phase='prepared' AND v.dispatch_evidence='no_boundary'",
+        params![claimed.job.job_id,claimed.invocation_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+    ensure!(pinned_flow_id == flow_id
+        && pinned_request == claimed.request_id
+        && pinned_input_hash == hex::encode(Sha256::digest(input_json.as_bytes())),
+        "Service dispatch differs from its immutable invocation input");
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2)",
+        params![claimed.job.instance_id,claimed.job.job_id], |row| row.get::<_, bool>(0))? {
+        let snapshot = runtime_snapshot_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
+        let retained = snapshot.repetition_groups.iter().try_fold(0_u64, |sum, group|
+            sum.checked_add(group.retained_bytes)
+                .context("repetition retained byte count overflow"))?;
+        let reserved = repetition_admission_reservation_on(&tx,
+            &claimed.job.instance_id, &snapshot.model, &snapshot.scopes,
+            &RuntimePlan::initial(Value::Null), &snapshot.repetition_groups,
+            &snapshot.repetition_occurrences)?;
+        ensure!(retained.checked_add(reserved)
+            .is_some_and(|bytes| bytes <= 64 * 1024 * 1024),
+            "repeated Service dispatch has no retained observation capacity");
+    }
+    let changed = tx.execute(
+        "UPDATE bpmn_service_invocations SET phase='may_have_executed',dispatch_evidence='committed_boundary',dispatch_attempt=?1,dispatch_fence=?2,dispatch_worker_id=?3,dispatch_committed_at_ms=?4,phase_revision=phase_revision+1,updated_at_ms=?4 WHERE invocation_id=?5 AND job_id=?6 AND phase='prepared' AND dispatch_evidence='no_boundary' AND stable_request_id=?7 AND EXISTS(SELECT 1 FROM bpmn_jobs j WHERE j.job_id=bpmn_service_invocations.job_id AND j.status='running' AND j.worker_id=?3 AND j.attempt=?1 AND j.fence=?2 AND j.lease_until_ms>=?4)",
+        params![claimed.job.attempt,sql_integer(claimed.job.fence)?,worker_id,
+            at_ms,claimed.invocation_id,claimed.job.job_id,claimed.request_id])?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+fn block_observed_invocation_on(
+    tx: &Transaction<'_>, invocation_id: &str, job_id: &str,
+    instance_id: &str, scope_id: &str, node_id: &str,
+    dispatch_attempt: u32, dispatch_fence: u64,
+    reserved_result_event_id: &str, reason: &str, at_ms: i64,
+) -> Result<()> {
+    ensure!(matches!(reason, "activation_closed" | "execution_authority_revoked"),
+        "observed Service blockage has no finite reason");
+    let incident_id = Uuid::new_v4().to_string();
+    let code = "EXTERNAL_RESULT_NOT_APPLIED";
+    let message = match reason {
+        "activation_closed" => "The original result was observed after its activity closed",
+        "execution_authority_revoked" =>
+            "The original result was observed after execution authority was revoked",
+        _ => "The original result was observed but its process continuation was rejected",
+    };
+    let resolved_at_ms = (reason == "activation_closed").then_some(at_ms);
+    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms])?;
+    let seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [instance_id], |row| row_u64(row, 0))?;
+    insert_event_on(tx, instance_id, seq, None, &PlannedEvent {
+        scope_id: scope_id.to_owned(), kind: "incident".into(),
+        node_id: Some(node_id.to_owned()),
+        data: serde_json::json!({"incident_id":incident_id,"invocation_id":invocation_id,
+            "job_id":job_id,"code":code,"message":message,"reason":reason,
+            "resolution_reason":(reason == "activation_closed").then_some("activity_cancelled_after_dispatch"),
+            "dispatch_attempt":dispatch_attempt,"dispatch_fence":dispatch_fence,
+            "reserved_result_event_id":reserved_result_event_id}),
+    }, at_ms, None)?;
+    let changed = tx.execute("UPDATE bpmn_service_invocations SET phase='observed_blocked',blocked_incident_id=?1,blocked_reason=?2,acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+CASE WHEN acceptance_owner_id IS NULL THEN 0 ELSE 1 END,phase_revision=phase_revision+1,updated_at_ms=?3 WHERE invocation_id=?4 AND job_id=?5 AND phase='observed' AND dispatch_evidence='committed_boundary' AND reserved_result_event_id=?6",
+        params![incident_id,reason,at_ms,invocation_id,job_id,reserved_result_event_id])?;
+    ensure!(changed == 1, "observed Service result changed before blocked closure");
+    let job_changed = tx.execute("UPDATE bpmn_jobs SET status='error',worker_id=NULL,lease_until_ms=NULL,fence=fence+1,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",
+        params![at_ms,job_id])?;
+    if reason != "activation_closed" {
+        ensure!(job_changed == 1, "observed Service job changed before blocked closure");
+    }
+    if reason != "activation_closed" {
+        mark_service_incident_status_on(tx, instance_id, scope_id, job_id, at_ms)?;
+    }
+    Ok(())
+}
+
+fn block_closed_observed_job(pool: &DbPool, job_id: &str, at_ms: i64) -> Result<bool> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let row: Option<(String, String, String, String, u32, u64, String, String, String)> =
+        tx.query_row(
+            "SELECT v.invocation_id,v.instance_id,v.scope_id,v.node_id,v.dispatch_attempt,v.dispatch_fence,v.reserved_result_event_id,i.org_id,i.initiator_user_id FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_instances i ON i.instance_id=v.instance_id WHERE v.job_id=?1 AND v.phase='observed' AND v.dispatch_evidence='committed_boundary'",
+            [job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                row.get(4)?, row_u64(row, 5)?, row.get(6)?, row.get(7)?, row.get(8)?))
+        ).optional()?;
+    let Some((invocation_id, instance_id, scope_id, node_id, attempt, fence,
+        reserved_result_event_id, org_id, user_id)) = row else {
+        return Ok(false);
+    };
+    let live = job_activation_live_on(&tx, job_id)?;
+    let actor = ProcessActor { org_id, user_id };
+    let authority = if live {
+        require_call_control_authority_on(&tx, &actor, &instance_id)
+            .and_then(|_| job_flow_id_on(&tx, job_id))
+            .and_then(|flow| require_flow_current(&tx, &actor, &flow, None))
+    } else { Ok(()) };
+    let reason = if !live { Some("activation_closed") }
+        else if authority.is_err() { Some("execution_authority_revoked") }
+        else { None };
+    let Some(reason) = reason else { return Ok(false) };
+    block_observed_invocation_on(&tx, &invocation_id, job_id, &instance_id,
+        &scope_id, &node_id, attempt, fence, &reserved_result_event_id, reason, at_ms)?;
+    if let Some(group_id) = tx.query_row(
+        "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2",
+        params![instance_id,job_id], |row| row.get::<_, String>(0)).optional()? {
+        refresh_repetition_retained_bytes_on(&tx, &instance_id, &group_id)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn mark_service_incident_status_on(
+    tx: &Transaction<'_>, instance_id: &str, scope_id: &str,
+    job_id: &str, at_ms: i64,
+) -> Result<()> {
+    tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled','error')",
+        params![at_ms,instance_id])?;
+    tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",
+        params![at_ms,instance_id,scope_id])?;
+    if let Some(group_id) = tx.query_row(
+        "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2",
+        params![instance_id,job_id], |row| row.get::<_, String>(0)).optional()? {
+        refresh_repetition_retained_bytes_on(tx, instance_id, &group_id)?;
+    }
+    Ok(())
+}
+
+pub fn record_job_observation(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    at_ms: i64,
+) -> Result<JobObservationState> {
+    validate_output(&observed.result.outputs)?;
+    let bytes = json(observed)?;
+    ensure!(u64::try_from(bytes.len())? <= super::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES,
+        "observed Service result exceeds its history budget");
+    let result_hash = hex::encode(Sha256::digest(bytes.as_bytes()));
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let (phase, evidence, attempt, fence, original_worker, request_id,
+        stored_result, stored_hash, incident_id, instance_id, scope_id, node_id,
+        reserved_event_id):
+        (String,String,Option<u32>,Option<u64>,Option<String>,Option<String>,
+            Option<String>,Option<String>,Option<String>,String,String,String,Option<String>) =
+        tx.query_row(
+            "SELECT phase,dispatch_evidence,dispatch_attempt,dispatch_fence,dispatch_worker_id,stable_request_id,observed_result_json,observed_result_sha256,uncertainty_incident_id,instance_id,scope_id,node_id,reserved_result_event_id FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2",
+            params![claimed.invocation_id,claimed.job.job_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_optional_u64(row, 3)?,row.get(4)?,
+                row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
+                row.get(10)?,row.get(11)?,row.get(12)?)))?;
+    ensure!(evidence == "committed_boundary"
+        && attempt == Some(claimed.job.attempt)
+        && fence == Some(claimed.job.fence)
+        && original_worker.as_deref() == Some(worker_id)
+        && request_id.as_deref() == Some(claimed.request_id.as_str())
+        && instance_id == claimed.job.instance_id
+        && scope_id == claimed.job.scope_id && node_id == claimed.job.node_id,
+        "observed Service result lacks its original dispatch identity");
+    if matches!(phase.as_str(), "observed" | "observed_blocked" | "accepted") {
+        ensure!(stored_result.as_deref() == Some(bytes.as_str())
+            && stored_hash.as_deref() == Some(result_hash.as_str())
+            && reserved_event_id.is_some(),
+            "late Service result conflicts with its original observation");
+        return Ok(match phase.as_str() {
+            "observed" => JobObservationState::Observed,
+            "observed_blocked" => JobObservationState::Blocked,
+            _ => JobObservationState::Accepted,
+        });
+    }
+    ensure!(matches!(phase.as_str(), "may_have_executed" | "uncertain"),
+        "Service observation arrived before its dispatch boundary");
+    let live = job_activation_live_on(&tx, &claimed.job.job_id)?;
+    let authority = if live {
+        require_call_control_authority_on(&tx, &claimed.actor, &instance_id)
+            .and_then(|_| job_flow_id_on(&tx, &claimed.job.job_id))
+            .and_then(|flow| require_flow_current(&tx, &claimed.actor, &flow, None))
+    } else { Ok(()) };
+    let blocked_reason = if !live { Some("activation_closed") }
+        else if authority.is_err() { Some("execution_authority_revoked") }
+        else { None };
+    let reserved = claimed.result_event_id.clone();
+    let changed = tx.execute(
+        "UPDATE bpmn_service_invocations SET phase='observed',observed_result_json=?1,observed_result_origin=?2,observed_result_sha256=?3,reserved_result_event_id=?4,observed_at_ms=?5,phase_revision=phase_revision+1,updated_at_ms=?5 WHERE invocation_id=?6 AND phase=?7 AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?8 AND dispatch_fence=?9 AND dispatch_worker_id=?10",
+        params![bytes,result_origin_text(&observed.origin),result_hash,reserved,
+            at_ms,claimed.invocation_id,phase,claimed.job.attempt,
+            sql_integer(claimed.job.fence)?,worker_id])?;
+    ensure!(changed == 1, "Service observation changed before durable capture");
+    if let Some(incident_id) = incident_id {
+        let resolved_at_ms: Option<i64> = tx.query_row(
+            "SELECT resolved_at_ms FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2 AND scope_id=?3 AND job_id=?4 AND code='EXTERNAL_OUTCOME_UNCERTAIN'",
+            params![incident_id,instance_id,scope_id,claimed.job.job_id],
+            |row| row.get(0))?;
+        if resolved_at_ms.is_some() {
+            let matching_event: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND kind IN ('incident','incident_resolved') AND json_extract(data_json,'$.incident_id')=?4 AND json_extract(data_json,'$.invocation_id')=?5 AND json_extract(data_json,'$.job_id')=?6 AND json_extract(data_json,'$.reason')='activity_cancelled_after_dispatch' AND json_extract(data_json,'$.resolution_reason')='activity_cancelled_after_dispatch' AND json_extract(data_json,'$.dispatch_attempt')=?7 AND json_extract(data_json,'$.dispatch_fence')=?8",
+                params![instance_id,scope_id,node_id,incident_id,claimed.invocation_id,
+                    claimed.job.job_id,claimed.job.attempt,sql_integer(claimed.job.fence)?],
+                |row| row.get(0))?;
+            ensure!(blocked_reason == Some("activation_closed") && matching_event == 1,
+                "resolved Service uncertainty lacks its exact cancelled activation history");
+        } else {
+            let changed = tx.execute(
+                "UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND resolved_at_ms IS NULL",
+                params![at_ms,incident_id,instance_id,scope_id,claimed.job.job_id])?;
+            ensure!(changed == 1, "original uncertainty incident was not open");
+        }
+        if blocked_reason.is_none() {
+            tx.execute("UPDATE bpmn_scopes SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND scope_id=?3 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND status='incident'",
+                params![at_ms,instance_id,scope_id])?;
+            tx.execute("UPDATE bpmn_instances SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status='incident'",
+                params![at_ms,instance_id])?;
+        }
+    }
+    if let Some(reason) = blocked_reason {
+        block_observed_invocation_on(&tx, &claimed.invocation_id, &claimed.job.job_id,
+            &instance_id, &scope_id, &node_id, claimed.job.attempt,
+            claimed.job.fence, &reserved, reason, at_ms)?;
+    }
+    if let Some(group_id) = tx.query_row(
+        "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2",
+        params![instance_id,claimed.job.job_id], |row| row.get::<_, String>(0)).optional()? {
+        refresh_repetition_retained_bytes_on(&tx, &instance_id, &group_id)?;
+    }
+    tx.commit()?;
+    Ok(if blocked_reason.is_some() { JobObservationState::Blocked }
+        else { JobObservationState::Observed })
 }
 
 pub fn renew_job_lease(
@@ -15693,8 +24307,10 @@ fn validate_escalation_choices_on(
     mapped_effective: &Value,
     plan: &RuntimePlan,
 ) -> Result<()> {
+    let selected_process_id = &instance.process_id;
     let path = scope_path(scopes, &instance.instance_id, source_scope)?;
-    let (nodes, flows, _) = super::model::scope_body(model, &path)?;
+    let selected = super::model::selected_body(model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
     let pairs = super::model::gateway_pairs(nodes, flows)?;
     let choices = plan
         .events
@@ -15958,6 +24574,7 @@ fn validate_escalation_provenance_on(
     accepted_result: &Value,
     scope_id: &str,
     source_token_id: &str,
+    attached_token_id: &str,
     source_node_id: &str,
     boundary_id: &str,
     boundary_edge_id: &str,
@@ -15992,6 +24609,9 @@ fn validate_escalation_provenance_on(
             "escalation prefix revisited a ready activation");
         let node = nodes.iter().find(|node| node.id == token.node_id)
             .context("escalation prefix token node is outside its pinned body")?;
+        let node_activity_extra = planned_activity_io_extra_for_activation(
+            plan, scope_id, &node.id, &token.token_id,
+        )?;
         let outgoing = flows.iter().filter(|edge| edge.source_id == node.id).collect::<Vec<_>>();
         match &node.kind {
             ProcessNodeKind::UserTask { .. } | ProcessNodeKind::ServiceTask { .. }
@@ -16098,7 +24718,8 @@ fn validate_escalation_provenance_on(
                         && message.source_activation_id == token.token_id).collect::<Vec<_>>();
                 ensure!(messages.len() == 1,
                     "escalation MessageThrow lacks its traced queued message");
-                let mut expected = super::messages::prepare_throw(model, node, mapped_effective)?;
+                let mut expected = super::messages::prepare_throw(
+                    model, node, mapped_effective, &node_activity_extra)?;
                 expected.message_id = messages[0].message.message_id.clone();
                 ensure!(serde_json::to_value(expected)? == serde_json::to_value(&messages[0].message)?,
                     "escalation queued message differs from its pinned expression inputs");
@@ -16161,8 +24782,14 @@ fn validate_escalation_provenance_on(
             && plan.create_tokens.iter().any(|token| token.token_id.as_str() == id.as_str()
                 && matches!(token.status.as_str(), "ready" | "joining"))),
         "escalation plan consumed an untraced or persisted token");
-    ensure!(if cancel_activity { plan.cancel_token_ids == [source_token_id.to_owned()] }
-        else { plan.cancel_token_ids.is_empty() },
+    ensure!(if cancel_activity {
+            if attached_token_id == source_token_id {
+                plan.cancel_token_ids == [source_token_id.to_owned()]
+            } else {
+                plan.cancel_token_ids.contains(&source_token_id.to_owned())
+                    && plan.cancel_token_ids.contains(&attached_token_id.to_owned())
+            }
+        } else { plan.cancel_token_ids.is_empty() },
         "escalation plan cancelled a token outside its source activity");
     let waiting = plan.create_tokens.iter().filter(|token|
         traced.contains(&token.token_id) && token.status == "waiting")
@@ -16207,7 +24834,11 @@ fn validate_escalation_provenance_on(
         let ProcessNodeKind::ServiceTask { input_mapping, .. } = &node.kind else {
             bail!("escalation queued job node is not a pinned service task");
         };
-        ensure!(job.input == super::runtime::prepare_service_input(input_mapping, mapped_effective, &[])?,
+        let activity_extra = planned_activity_io_extra_for_activation(
+            plan, scope_id, &job.node_id, &job.token_id,
+        )?;
+        ensure!(job.input == super::runtime::prepare_service_input(
+            input_mapping, mapped_effective, &activity_extra)?,
             "escalation queued service input differs from its pinned mapping");
         expected_events.push(PlannedEvent { scope_id: scope_id.to_owned(),
             kind: "service_queued".into(), node_id: Some(job.node_id.clone()),
@@ -16289,7 +24920,12 @@ fn validate_escalation_provenance_on(
             _ => None,
         };
         if let Some(expression) = correlation {
-            let expected_key = super::messages::evaluate_key(expression, mapped_effective)?;
+            let activity_extra = planned_activity_io_extra_for_activation(
+                plan, scope_id, &subscription.node_id,
+                subscription.token_id.as_str(),
+            )?;
+            let expected_key = super::messages::evaluate_key(
+                expression, mapped_effective, &activity_extra)?;
             ensure!(subscription.correlation_key.as_deref() == Some(expected_key.as_str()),
                 "escalation subscription correlation differs from its pinned expression");
         }
@@ -16361,17 +24997,46 @@ fn validate_escalation_provenance_on(
     Ok(expected_events)
 }
 
+fn repeated_service_boundary_parent_on(
+    conn: &Connection, instance_id: &str, scope_id: &str,
+    node_id: &str, token_id: &str, job_id: &str,
+) -> Result<Option<String>> {
+    let Some(occurrence) = repetition_occurrences_on(conn, instance_id)?.into_iter()
+        .find(|row| row.job_id.as_deref() == Some(job_id)) else {
+        return Ok(None);
+    };
+    ensure!(occurrence.scope_id == scope_id && occurrence.token_id == token_id
+        && occurrence.status == ProcessRepetitionOccurrenceStatus::Active,
+        "service result differs from its live repetition ordinal");
+    let group = repetition_groups_on(conn, instance_id)?.into_iter()
+        .find(|row| row.group_id == occurrence.group_id)
+        .context("repeated service result has no factual coordinator")?;
+    ensure!(group.scope_id == scope_id && group.node_id == node_id
+        && !group.terminal_capacity
+        && matches!(group.status,
+            ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident),
+        "service result differs from its live boundary coordinator");
+    let waiting: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
+        params![instance_id, scope_id, group.parent_token_id, node_id], |row| row.get(0))?;
+    ensure!(waiting, "repeated service boundary coordinator lost its factual wait");
+    Ok(Some(group.parent_token_id))
+}
+
 fn selected_escalation_subscription_on(
     conn: &Connection, instance_id: &str, source_scope: &str,
-    source_token_id: &str, code: Option<&str>,
+    source_node_id: &str, source_token_id: &str, job_id: &str, code: Option<&str>,
 ) -> Result<Option<EventSubscription>> {
+    let attached = repeated_service_boundary_parent_on(conn, instance_id, source_scope,
+        source_node_id, source_token_id, job_id)?
+        .unwrap_or_else(|| source_token_id.to_owned());
     let open = subscriptions_on(conn, instance_id)?
         .into_iter()
         .filter(|sub| {
             sub.kind == ProcessSubscriptionKind::BoundaryEscalation
                 && sub.status == ProcessSubscriptionStatus::Open
                 && sub.scope_id == source_scope
-                && sub.token_id == source_token_id
+                && sub.token_id == attached
         })
         .collect::<Vec<_>>();
     Ok(open.iter()
@@ -16404,7 +25069,8 @@ fn validate_escalation_result_plan_on(
         && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
     {
         selected_escalation_subscription_on(tx, &instance.instance_id,
-            source_scope, source_token_id, observed.result.code.as_deref())?
+            source_scope, source_node_id, source_token_id, job_id,
+            observed.result.code.as_deref())?
     } else {
         None
     };
@@ -16465,7 +25131,7 @@ fn validate_escalation_result_plan_on(
         if observed.origin == ActivityResultOrigin::Contract
             && observed.result.outcome
                 == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman {
-            let node = scope_node(model, scopes, &instance.instance_id,
+            let node = scope_node(model, &instance.process_id, scopes, &instance.instance_id,
                 source_scope, source_node_id)?;
             let waiting: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
@@ -16495,7 +25161,20 @@ fn validate_escalation_result_plan_on(
                     "user_task_id":task.user_task_id,
                     "assignee_user_id":instance.initiator_user_id.as_str(),
                     "kind":ProcessUserTaskKind::Verification})
-                && plan.event_ids.len() == 1 && plan.event_ids.contains_key(&0)
+                && if node.activity_io.is_some() {
+                    plan.event_ids.len() == 2
+                        && plan.event_ids.contains_key(&0)
+                        && plan.event_ids.contains_key(&1)
+                        && plan.activity_io_results.iter().any(|fact|
+                            fact.result_event_index == 0
+                                && matches!(&fact.disposition,
+                                    ActivityIoResultDisposition::Retained {
+                                        fate: ActivityIoRetainedFate::AwaitingVerification {
+                                            user_task_id }, route_event_index: 1,
+                                    } if user_task_id == &task.user_task_id))
+                } else {
+                    plan.event_ids.len() == 1 && plan.event_ids.contains_key(&0)
+                }
                 && plan.termination_attempts.is_empty()
                 && plan.variable_effects.is_empty()
                 && plan.event_sources.is_empty() && plan.token_sources.is_empty()
@@ -16533,6 +25212,7 @@ fn validate_escalation_result_plan_on(
     };
     let handler = scope_node(
         model,
+        &instance.process_id,
         scopes,
         &instance.instance_id,
         source_scope,
@@ -16615,13 +25295,24 @@ fn validate_escalation_result_plan_on(
         caught.len() == 1 && result_event_id.is_some(),
         "escalation catch requires one factual result event ID"
     );
-    ensure!(plan.event_ids.len() == 1,
-        "escalation catch assigned an unrelated event identity");
+    let source_node = scope_node(model, &instance.process_id, scopes,
+        &instance.instance_id, source_scope, source_node_id)?;
+    ensure!(if source_node.activity_io.is_some() {
+            plan.event_ids.len() == 2
+                && plan.activity_io_results.len() == 1
+                && plan.activity_io_results[0].result_event_index == result_index
+                && matches!(&plan.activity_io_results[0].disposition,
+                    ActivityIoResultDisposition::Retained {
+                        fate: ActivityIoRetainedFate::AwaitingVerification { .. }
+                            | ActivityIoRetainedFate::BoundaryEscalation { .. }, .. })
+        } else {
+            plan.event_ids.len() == 1
+        }, "escalation catch assigned an unrelated event identity");
     let event = caught[0];
     let expected = serde_json::json!({
         "subscription_id": subscription.subscription_id,
         "boundary_id": subscription.node_id,
-        "attached_token_id": source_token_id,
+        "attached_token_id": subscription.token_id,
         "source_token_id": source_token_id,
         "source_scope_id": source_scope,
         "job_id": job_id,
@@ -16666,7 +25357,8 @@ fn validate_escalation_result_plan_on(
         plan,
     )?;
     let path = scope_path(scopes, &instance.instance_id, source_scope)?;
-    let (body_nodes, body_flows, _) = super::model::scope_body(model, &path)?;
+    let selected = super::model::selected_body(model, &instance.process_id, &path)?;
+    let (body_nodes, body_flows) = (selected.nodes, selected.sequence_flows);
     let boundary_flows = body_flows
         .iter()
         .filter(|flow| flow.source_id == subscription.node_id)
@@ -16703,15 +25395,24 @@ fn validate_escalation_result_plan_on(
         &instance.variables,
         source_scope,
     )?;
+    let source_activity_extra = plan.activity_io_results.iter()
+        .find(|fact| fact.result_event_index == result_index
+            && fact.scope_id == source_scope
+            && fact.node_id == source_node_id)
+        .map(|fact| activity_io_replay_extra_on(
+            tx, &instance.instance_id, plan, &fact.witness_id,
+            source_scope, source_node_id, &fact.token_id,
+        )).transpose()?.unwrap_or_default();
+    let mut source_mapping_extra = vec![
+        ("activity_result".into(), serde_json::to_value(&observed.result)?),
+    ];
+    source_mapping_extra.extend(source_activity_extra);
     let canonical_source = super::runtime::patch_variables(
         output_mapping,
         &source_local,
         &effective,
         &observed.result.outputs,
-        &[(
-            "activity_result".into(),
-            serde_json::to_value(&observed.result)?,
-        )],
+        &source_mapping_extra,
     )?;
     let canonical_root = if source_scope == instance.instance_id {
         ensure!(
@@ -16784,7 +25485,7 @@ fn validate_escalation_result_plan_on(
     )?;
     let mut expected_events = validate_escalation_provenance_on(plan, model, &mapped_effective,
         &serde_json::to_value(&observed.result)?,
-        source_scope, source_token_id, source_node_id,
+        source_scope, source_token_id, &subscription.token_id, source_node_id,
         &subscription.node_id, &boundary_flows[0].id, *cancel_activity,
         body_nodes, body_flows)?;
     expected_events.push(plan.events[result_index].clone());
@@ -16793,7 +25494,7 @@ fn validate_escalation_result_plan_on(
         .filter(|update| update.status == ProcessSubscriptionStatus::Cancelled) {
         let actual = subscription_on(tx, &update.subscription_id)?;
         ensure!(*cancel_activity && actual.scope_id == source_scope
-            && actual.token_id == source_token_id
+            && actual.token_id == subscription.token_id
             && update.last_reason.as_deref() == Some("sibling_interrupted"),
             "escalation cancelled a subscription outside its source activity");
         expected_events.push(PlannedEvent { scope_id: source_scope.to_owned(),
@@ -16805,7 +25506,7 @@ fn validate_escalation_result_plan_on(
         .filter(|update| update.status == ProcessTimerStatus::Cancelled) {
         let actual = timer_on(tx, &update.timer_id)?;
         ensure!(*cancel_activity && actual.scope_id.as_deref() == Some(source_scope)
-            && actual.token_id.as_deref() == Some(source_token_id)
+            && actual.token_id.as_deref() == Some(subscription.token_id.as_str())
             && update.last_reason.as_deref() == Some("sibling_interrupted"),
             "escalation cancelled a timer outside its source activity");
         let node = body_nodes.iter().find(|node| node.id == actual.node_id)
@@ -16844,6 +25545,7 @@ fn validate_job_result_plan_on(
     instance: &ProcessInstance,
     node_id: &str,
     job_id: &str,
+    acceptance_owner_id: &str,
     observed: &ObservedActivityResult,
     plan: &RuntimePlan,
 ) -> Result<()> {
@@ -16853,9 +25555,79 @@ fn validate_job_result_plan_on(
         params![job_id, instance.instance_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let mut recovery_incident_query = tx.prepare(
+        r#"SELECT x.incident_id,x.message,v.invocation_id,v.reserved_result_event_id,
+            v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.acceptance_owner_id
+            FROM bpmn_incidents x JOIN bpmn_service_invocations v
+            ON v.job_id=x.job_id AND v.instance_id=x.instance_id AND v.scope_id=x.scope_id
+            WHERE x.instance_id=?1 AND x.scope_id=?2 AND x.job_id=?3
+            AND x.code='SCRIPT_INFRASTRUCTURE_FAILED' AND x.resolved_at_ms IS NULL"#)?;
+    let recovery_incidents = recovery_incident_query
+        .query_map(params![instance.instance_id,source_scope,job_id], |row| Ok((
+            row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,row.get::<_, u32>(4)?,row_u64(row,5)?,
+            row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(recovery_incident_query);
+    ensure!(recovery_incidents.len() <= 1,
+        "observed Service has duplicate open infrastructure incidents");
+    if let Some((incident_id, message, invocation_id, reserved_event_id,
+        attempt, fence, dispatch_worker, recovery_owner)) = recovery_incidents.first() {
+        let expected = RecoveredServiceIncident {
+            incident_id: incident_id.clone(), invocation_id: invocation_id.clone(),
+            job_id: job_id.to_owned(), source_token_id: token_id.clone(),
+            reserved_result_event_id: reserved_event_id.clone(),
+            attempt: *attempt, fence: *fence,
+        };
+        let event_count: u64 = tx.query_row(
+            r#"SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2
+                AND node_id=?3 AND kind='incident'
+                AND json_extract(data_json,'$.incident_id')=?4
+                AND json_extract(data_json,'$.code')='SCRIPT_INFRASTRUCTURE_FAILED'
+                AND json_extract(data_json,'$.message')=?5
+                AND json_extract(data_json,'$.invocation_id')=?6
+                AND json_extract(data_json,'$.job_id')=?7
+                AND json_extract(data_json,'$.source_token_id')=?8
+                AND json_extract(data_json,'$.dispatch_attempt')=?9
+                AND json_extract(data_json,'$.dispatch_fence')=?10
+                AND json_extract(data_json,'$.reserved_result_event_id')=?11"#,
+            params![instance.instance_id,source_scope,node_id,incident_id,message,
+                invocation_id,job_id,token_id,attempt,sql_integer(*fence)?,reserved_event_id],
+            |row| row_u64(row,0))?;
+        let resolution_events = plan.events.iter().filter(|event|
+            event.kind == "incident_resolved"
+                && event.scope_id == source_scope
+                && event.node_id.as_deref() == Some(node_id)
+                && event.data == serde_json::json!({
+                    "incident_id":incident_id,"invocation_id":invocation_id,
+                    "job_id":job_id,"source_token_id":token_id,
+                    "reserved_result_event_id":reserved_event_id,
+                    "dispatch_attempt":attempt,"dispatch_fence":fence,
+                    "reason":"script_infrastructure_recovered",
+                })).count();
+        let result_index = plan.events.iter().position(|event|
+            event.kind == "service_result"
+                && event.scope_id == source_scope
+                && event.node_id.as_deref() == Some(node_id));
+        let resolution_index = plan.events.iter().position(|event|
+            event.kind == "incident_resolved"
+                && event.data["incident_id"] == incident_id.as_str());
+        ensure!(plan.recovered_service_incidents == [expected]
+            && plan.resolve_incident_ids.iter().filter(|id| *id == incident_id).count() == 1
+            && event_count == 1 && resolution_events == 1
+            && result_index.zip(resolution_index).is_some_and(|(result, resolution)|
+                result < resolution)
+            && recovery_owner.as_deref() == Some(acceptance_owner_id)
+            && !dispatch_worker.is_empty(),
+            "Service recovery changed its original infrastructure source or resolution");
+    } else {
+        ensure!(plan.recovered_service_incidents.is_empty(),
+            "Service result fabricated an infrastructure incident resolution");
+    }
     let scopes = scopes_on(tx, &instance.instance_id, &model)?;
     let node = scope_node(
         &model,
+        &instance.process_id,
         &scopes,
         &instance.instance_id,
         &source_scope,
@@ -16918,8 +25690,8 @@ fn validate_job_result_plan_on(
                 "repeated Contract result differs from its pinned expression and source observation");
         }
     }
-    let has_escalation = super::model::scope_body(&model, &body_path)?
-        .0
+    let has_escalation = super::model::selected_body(&model, &instance.process_id, &body_path)?
+        .nodes
         .iter()
         .any(|candidate| {
             matches!(&candidate.kind,
@@ -16948,11 +25720,24 @@ fn validate_job_result_plan_on(
         let expression = result_expression
             .as_deref()
             .context("accepted escalation has no pinned result expression")?;
+        let repeat_extra = if let Some(occurrence) =
+            repetition_occurrences_on(tx, &instance.instance_id)?
+                .into_iter()
+                .find(|row| row.job_id.as_deref() == Some(job_id))
+        {
+            vec![("repeat".to_owned(), serde_json::json!({
+                "group_id": occurrence.group_id,
+                "index": occurrence.ordinal,
+                "item": occurrence.item,
+            }))]
+        } else {
+            Vec::new()
+        };
         let actual = super::jobs::parse_contract_result(super::runtime::evaluate(
             expression,
             &observation.evaluation_variables,
             &observation.normalized_outputs,
-            &[],
+            &repeat_extra,
         )?)?;
         ensure!(
             actual == observed.result,
@@ -17002,6 +25787,13 @@ fn validate_job_result_plan_on(
             {
                 handler = Some(*sub);
                 break;
+            }
+            if attached_token == token_id {
+                if let Some(parent) = repeated_service_boundary_parent_on(tx,
+                    &instance.instance_id, &scope_id, node_id, &token_id, job_id)? {
+                    attached_token = parent;
+                    continue;
+                }
             }
             let scope = scopes
                 .iter()
@@ -17133,6 +25925,7 @@ fn validate_job_result_plan_on(
 fn prepare_service_result_plan(
     plan: &RuntimePlan, observed: &ObservedActivityResult, job_id: &str,
     attempt: u32, fence: u64, selected_escalation: bool, repeated_source: bool,
+    reserved_result_event_id: &str,
 ) -> Result<(RuntimePlan, bool, usize)> {
     let result = &observed.result;
     let result_indices = plan.events.iter().enumerate()
@@ -17155,8 +25948,19 @@ fn prepare_service_result_plan(
     if observed.origin == ActivityResultOrigin::Contract
         && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
         && !selected_escalation && !repeated_source {
-        ensure!(plan.event_ids.is_empty(),
-            "unselected NeedsHuman result cannot supply an event identity");
+        if plan.activity_io_results.is_empty() {
+            ensure!(plan.event_ids.is_empty(),
+                "unselected NeedsHuman result cannot supply an event identity");
+        } else {
+            ensure!(plan.activity_io_results.len() == 1
+                && plan.activity_io_results[0].result_event_index == result_index
+                && plan.activity_io_results[0].source_event_id == reserved_result_event_id
+                && matches!(&plan.activity_io_results[0].disposition,
+                    ActivityIoResultDisposition::Retained {
+                        fate: ActivityIoRetainedFate::AwaitingVerification { .. }, .. })
+                && plan.event_ids.len() == 2,
+                "unselected NeedsHuman IO has no exact retained verification source");
+        }
     }
     let source_bearing = repeated_source || !plan.termination_attempts.is_empty()
         || plan.business_error.is_some()
@@ -17168,9 +25972,12 @@ fn prepare_service_result_plan(
                     && selected_escalation && !retained_failure);
     ensure!(plan.event_ids.contains_key(&result_index) || !source_bearing,
         "accepted service result lacks its required source identity");
+    ensure!(plan.event_ids.get(&result_index).is_none_or(|id|
+        id == reserved_result_event_id),
+        "Service result event differs from its durable reservation");
     let mut prepared = plan.clone();
     if !retained_failure && !prepared.event_ids.contains_key(&result_index) {
-        let result_event_id = Uuid::new_v4().to_string();
+        let result_event_id = reserved_result_event_id.to_owned();
         prepared.event_ids.insert(result_index, result_event_id.clone());
         let mut planned_source_id: Option<String> = None;
         for effect in &mut prepared.variable_effects {
@@ -17217,30 +26024,48 @@ pub fn accept_job_result(
         json(result)?.len() <= 384 * 1024 - 4096,
         "activity result exceeds the process history budget"
     );
+    let observed_bytes = json(observed)?;
+    let (invocation_phase, dispatch_evidence, dispatched_attempt, dispatched_fence,
+        reserved_result_event_id, stored_observation):
+        (String,String,Option<u32>,Option<u64>,Option<String>,Option<String>) = {
+        let conn = pool.read()?;
+        conn.query_row("SELECT phase,dispatch_evidence,dispatch_attempt,dispatch_fence,reserved_result_event_id,observed_result_json FROM bpmn_service_invocations WHERE job_id=?1",
+            [job_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
+                row_optional_u64(row, 3)?,row.get(4)?,row.get(5)?)))?
+    };
+    ensure!(dispatch_evidence == "committed_boundary"
+        && dispatched_attempt == Some(attempt) && dispatched_fence == Some(fence)
+        && stored_observation.as_deref() == Some(observed_bytes.as_str()),
+        "Service acceptance lacks its immutable original observation");
+    let reserved_result_event_id = reserved_result_event_id
+        .context("Service acceptance has no reserved result event")?;
+    ensure!(matches!(invocation_phase.as_str(), "observed" | "accepted"),
+        "Service result is not available for canonical acceptance");
     let (source_id, initial_status, initial_attempt, initial_fence,
-        initial_worker, initial_lease, initial_activation, selected_escalation,
+        _initial_worker, _initial_lease, initial_activation, selected_escalation,
         repeated_source):
         (String,String,u32,u64,Option<String>,Option<i64>,bool,bool,bool) = {
         let conn = pool.read()?;
-        let (source_id,source_scope,source_token_id,status,attempt,fence,worker,lease):
-            (String,String,String,String,u32,u64,Option<String>,Option<i64>) = conn.query_row(
-            "SELECT instance_id,scope_id,token_id,status,attempt,fence,worker_id,lease_until_ms FROM bpmn_jobs WHERE job_id=?1",
+        let (source_id,source_scope,source_node_id,source_token_id,status,attempt,fence,worker,lease):
+            (String,String,String,String,String,u32,u64,Option<String>,Option<i64>) = conn.query_row(
+            "SELECT instance_id,scope_id,node_id,token_id,status,attempt,fence,worker_id,lease_until_ms FROM bpmn_jobs WHERE job_id=?1",
             [job_id],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
-                row.get(4)?,row_u64(row,5)?,row.get(6)?,row.get(7)?)),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+                row.get(5)?,row_u64(row,6)?,row.get(7)?,row.get(8)?)),
         )?;
         let activation = status != "running" || job_activation_live_on(&conn, job_id)?;
-        let selected_escalation = observed.origin == ActivityResultOrigin::Contract
+        let selected_escalation = status == "running"
+            && observed.origin == ActivityResultOrigin::Contract
             && result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
             && selected_escalation_subscription_on(&conn, &source_id, &source_scope,
-                &source_token_id, result.code.as_deref())?.is_some();
+                &source_node_id, &source_token_id, job_id, result.code.as_deref())?.is_some();
         let repeated_source: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences o JOIN bpmn_repetition_groups g ON g.group_id=o.group_id AND g.instance_id=o.instance_id JOIN bpmn_jobs j ON j.job_id=o.job_id AND j.instance_id=o.instance_id WHERE o.instance_id=?1 AND o.job_id=?2 AND o.scope_id=?3 AND o.token_id=?4 AND o.status='active' AND g.status='open' AND g.scope_id=o.scope_id AND g.node_id=j.node_id AND j.token_id=o.token_id AND j.scope_id=o.scope_id)",
             params![source_id,job_id,source_scope,source_token_id], |row| row.get(0))?;
         (source_id,status,attempt,fence,worker,lease,activation,selected_escalation,
             repeated_source)
     };
-    if matches!(initial_status.as_str(), "completed" | "error" | "cancelled") {
+    if invocation_phase == "accepted" {
         let mut conn = pool.write()?;
         let tx = conn.transaction()?;
         require_actor(&tx, actor)?;
@@ -17260,17 +26085,12 @@ pub fn accept_job_result(
             "service job result conflicts with accepted result");
         return Ok(ProcessTransitionOutcome { instance, cancelled_claims: Vec::new() });
     }
-    if initial_status == "running" {
-        let preflight_now_ms = now_ms()?;
-        ensure!(initial_attempt == attempt && initial_fence == fence
-            && initial_worker.as_deref() == Some(worker_id)
-            && initial_lease.is_some_and(|lease| lease >= preflight_now_ms)
-            && initial_activation,
-            "service job fence is stale");
-    }
+    ensure!(initial_status == "running" && initial_attempt == attempt
+        && initial_fence == fence && initial_activation,
+        "Service acceptance lost its factual waiting activation");
     let (precomposed, mut conn) = if let Some(plan) = supplied_plan {
         let (prepared, retained_failure, result_index) = prepare_service_result_plan(plan, observed, job_id,
-            attempt, fence, selected_escalation, repeated_source)?;
+            attempt, fence, selected_escalation, repeated_source, &reserved_result_event_id)?;
         let (composite, conn) = prepare_call_plan(pool, actor, &source_id, None,
             &prepared, at_ms)?;
         (Some((composite, retained_failure, result_index)), conn)
@@ -17286,7 +26106,7 @@ pub fn accept_job_result(
     };
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
-    let (instance_id,node_id,status,current_attempt,current_fence,current_worker,lease_until_ms,stored_result):(String,String,String,u32,u64,Option<String>,Option<i64>,Option<String>)=tx.query_row("SELECT instance_id,node_id,status,attempt,fence,worker_id,lease_until_ms,result_json FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,row.get(7)?))).context("process job not found")?;
+    let (instance_id,node_id,status,current_attempt,current_fence,_current_worker,_lease_until_ms,stored_result):(String,String,String,u32,u64,Option<String>,Option<i64>,Option<String>)=tx.query_row("SELECT instance_id,node_id,status,attempt,fence,worker_id,lease_until_ms,result_json FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,row.get(7)?))).context("process job not found")?;
     let instance = instance_on(&tx, actor, &instance_id, None)?;
     ensure!(
         instance.initiator_user_id == actor.user_id,
@@ -17321,15 +26141,15 @@ pub fn accept_job_result(
                 | ProcessInstanceStatus::Error),
         "process instance revision conflict or closed instance");
     let commit_now_ms = now_ms()?;
-    ensure!(
-        status == "running"
-            && current_attempt == attempt
-            && current_fence == fence
-            && current_worker.as_deref() == Some(worker_id)
-            && lease_until_ms.is_some_and(|lease| lease >= commit_now_ms)
-            && job_activation_live_on(&tx, job_id)?,
-        "service job fence is stale"
-    );
+    ensure!(status == "running" && current_attempt == attempt
+        && current_fence == fence && job_activation_live_on(&tx, job_id)?,
+        "Service acceptance lost its waiting job generation");
+    let acquired = tx.execute(
+        "UPDATE bpmn_service_invocations SET acceptance_owner_id=?1,acceptance_lease_until_ms=?2,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?3 WHERE job_id=?4 AND instance_id=?5 AND phase='observed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?6 AND dispatch_fence=?7 AND observed_result_json=?8 AND reserved_result_event_id=?9 AND (acceptance_owner_id IS NULL OR acceptance_owner_id=?1 OR acceptance_lease_until_ms<?3)",
+        params![worker_id,commit_now_ms+30_000,commit_now_ms,job_id,instance_id,
+            attempt,sql_integer(fence)?,observed_bytes,reserved_result_event_id])?;
+    ensure!(acquired == 1,
+        "Service acceptance owner or durable observation changed");
     let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
         prepared
     } else {
@@ -17343,7 +26163,7 @@ pub fn accept_job_result(
         let planned = super::runtime::plan_job_result(&snapshot, job, observed, at_ms,
             Some(&resolve))?;
         prepare_service_result_plan(&planned, observed, job_id, attempt, fence,
-            selected_escalation, repeated_source)?
+            selected_escalation, repeated_source, &reserved_result_event_id)?
     };
     for attempt_fact in &composite.termination_attempts {
         let accepted = match attempt_fact {
@@ -17363,13 +26183,13 @@ pub fn accept_job_result(
         composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
     );
-    validate_job_result_plan_on(&tx, &instance, &node_id, job_id, observed,
+    validate_job_result_plan_on(&tx, &instance, &node_id, job_id, worker_id, observed,
         &composite)?;
     if retained_failure {
         ensure!(composite.call_steps.is_empty()
             && composite.termination_attempts.is_empty(),
             "retained service failure cannot add a call or termination");
-        composite.event_ids.insert(result_index, Uuid::new_v4().to_string());
+        composite.event_ids.insert(result_index, reserved_result_event_id.clone());
     }
     let plan = &composite;
     tx.execute(
@@ -17378,6 +26198,8 @@ pub fn accept_job_result(
     )?;
     let result_event_id = plan.event_ids.get(&result_index)
         .context("accepted service result has no event identity")?;
+    ensure!(result_event_id == &reserved_result_event_id,
+        "accepted Service result differs from its reserved event UUID");
     let entry = AcceptedInputRef::Service { job_id: job_id.to_owned(), attempt, fence,
         result_event_id: result_event_id.clone() };
     let mut cancelled_claims = apply_plan_on(
@@ -17389,7 +26211,7 @@ pub fn accept_job_result(
         at_ms,
         None,
         EntryAuthority::Accepted(&entry),
-    )?;
+    &[])?;
     let terminal = match result.outcome {
         tentaflow_protocol::processes::ActivityOutcome::Completed
         | tentaflow_protocol::processes::ActivityOutcome::NeedsHuman => "completed",
@@ -17397,6 +26219,10 @@ pub fn accept_job_result(
         tentaflow_protocol::processes::ActivityOutcome::Cancelled => "cancelled",
     };
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
+    let accepted = tx.execute(
+        "UPDATE bpmn_service_invocations SET phase='accepted',acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='observed' AND acceptance_owner_id=?4 AND reserved_result_event_id=?5 AND observed_result_json=?6",
+        params![at_ms.max(commit_now_ms),job_id,instance_id,worker_id,reserved_result_event_id,observed_bytes])?;
+    ensure!(accepted == 1, "Service acceptance lost its independent CAS owner");
     if supplied_plan.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
             &actor.user_id, plan, at_ms)?);
@@ -17422,88 +26248,56 @@ pub fn retry_job(
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
     let instance = instance_on(&tx, actor, instance_id, None)?;
-    ensure!(
-        instance.initiator_user_id == actor.user_id,
-        "only process initiator may retry"
-    );
+    ensure!(instance.initiator_user_id == actor.user_id,
+        "only process initiator may retry");
     if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
         return reproject_instance_on(&tx, actor, &prior.instance_id);
     }
-    ensure!(
-        instance.revision == expected_revision
-            && instance.status == ProcessInstanceStatus::Incident,
-        "process instance revision conflict or not incident"
-    );
+    ensure!(instance.revision == expected_revision
+        && instance.status == ProcessInstanceStatus::Incident,
+        "process instance revision conflict or not incident");
     sql_incrementable(expected_revision)?;
-    ensure!(
-        job_activation_live_on(&tx, job_id)?,
-        "service activity is no longer retryable"
-    );
-    let accepted_needs_human: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status='completed' AND result_origin='contract' AND json_extract(result_json,'$.outcome')='NeedsHuman')",
-        params![job_id,instance_id], |row| row.get(0),
-    )?;
-    ensure!(
-        !accepted_needs_human,
-        "accepted Contract NeedsHuman service job cannot be retried"
-    );
-    let retained_script_failure: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id WHERE x.instance_id=?1 AND x.job_id=?2 AND x.resolved_at_ms IS NULL AND x.code='SCRIPT_INFRASTRUCTURE_FAILED' AND j.result_json IS NOT NULL)",
-        params![instance_id,job_id], |row| row.get(0),
-    )?;
-    ensure!(!retained_script_failure,
-        "observed Service result retained after Script infrastructure failure cannot be retried");
-    let (node_id,scope_id):(String,String)=tx.query_row("SELECT j.node_id,j.scope_id FROM bpmn_jobs j JOIN bpmn_incidents x ON x.job_id=j.job_id AND x.instance_id=j.instance_id AND x.resolved_at_ms IS NULL WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status IN ('error','completed')",params![job_id,instance_id],|row|Ok((row.get(0)?,row.get(1)?))).context("retryable job not found")?;
+    ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,
+        "Service direct retry requires one proved-no-effect invocation before dispatch");
     require_call_control_authority_on(&tx, actor, instance_id)?;
     let flow_id = job_flow_id_on(&tx, job_id)?;
     require_flow_current(&tx, actor, &flow_id, None)?;
-    let affected=tx.execute("UPDATE bpmn_jobs SET status='queued',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,result_json=NULL,result_origin=NULL,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND status IN ('error','completed')",params![at_ms,job_id,instance_id])?;
-    ensure!(affected == 1, "retryable job changed");
-    let repeated: Option<(String,String,String)> = tx.query_row(
-        "SELECT o.occurrence_id,o.group_id,o.status FROM bpmn_repetition_occurrences o WHERE o.instance_id=?1 AND o.job_id=?2",
-        params![instance_id,job_id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).optional()?;
-    if let Some((occurrence_id, group_id, status)) = &repeated {
-        ensure!(matches!(status.as_str(), "retryable_error" | "active"),
-            "repeated occurrence is not retryable at its current ordinal");
-        let changed = tx.execute(
-            "UPDATE bpmn_repetition_occurrences SET status='active',accepted_source_event_id=NULL,accepted_origin=NULL,aggregate_item_json=NULL,state_patch_json=NULL,state_after_json=NULL,revision=revision+1,updated_at_ms=?1 WHERE occurrence_id=?2 AND instance_id=?3 AND status=?4",
-            params![at_ms,occurrence_id,instance_id,status],
-        )?;
-        ensure!(changed == 1, "repeated occurrence changed before retry");
-        let changed = tx.execute(
-            "UPDATE bpmn_repetition_groups SET status='open',revision=revision+1,updated_at_ms=?1 WHERE group_id=?2 AND instance_id=?3 AND status='incident' AND terminal_capacity=0",
-            params![at_ms,group_id,instance_id],
-        )?;
-        ensure!(changed == 1, "repeated group cannot resume its fenced ordinal");
-    }
-    tx.execute("UPDATE bpmn_user_tasks SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND token_id=(SELECT token_id FROM bpmn_jobs WHERE job_id=?3) AND kind='verification' AND status='open'",params![at_ms,instance_id,job_id])?;
-    tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE instance_id=?2 AND job_id=?3 AND resolved_at_ms IS NULL",params![at_ms,instance_id,job_id])?;
-    tx.execute("UPDATE bpmn_scopes SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND scope_id=?3 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",params![at_ms,instance_id,scope_id])?;
-    tx.execute("UPDATE bpmn_instances SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2",params![at_ms,instance_id])?;
-    let next_seq: u64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-        [instance_id],
-        |row| row_u64(row, 0),
-    )?;
-    insert_event_on(
-        &tx,
-        instance_id,
-        next_seq,
-        Some(&actor.user_id),
-        &PlannedEvent {
-            scope_id: scope_id.clone(),
-            kind: "job_retried".into(),
-            node_id: Some(node_id),
-            data: serde_json::json!({"job_id":job_id}),
-        },
-        at_ms,
-        None,
-    )?;
-    if let Some((_, group_id, _)) = &repeated {
-        refresh_repetition_retained_bytes_on(&tx, instance_id, group_id)?;
-    }
+    let mut selected_stmt = tx.prepare(
+        "SELECT v.invocation_id,j.token_id,j.scope_id,x.incident_id \
+         FROM bpmn_jobs j \
+         JOIN bpmn_service_invocations v ON v.job_id=j.job_id \
+             AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id \
+         JOIN bpmn_incidents x ON x.job_id=j.job_id \
+             AND x.instance_id=j.instance_id AND x.scope_id=j.scope_id \
+         WHERE j.job_id=?1 AND j.instance_id=?2 AND j.status='error' \
+             AND v.phase='proved_no_effect' AND v.dispatch_evidence='no_boundary' \
+             AND x.resolved_at_ms IS NULL")?;
+    let selected: Vec<(String, String, String, String)> = selected_stmt
+        .query_map(params![job_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?,
+            row.get(2)?, row.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(selected_stmt);
+    ensure!(selected.len() == 1,
+        "Service direct retry requires one exact unresolved invocation incident");
+    let (invocation_id, token_id, scope_id, incident_id) = &selected[0];
+    let snapshot = runtime_snapshot_on(&tx, actor, instance_id)?;
+    // Retry must not silently advance another persisted ready activation under this command.
+    ensure!(snapshot.tokens.iter().all(|token| token.status != "ready")
+        && snapshot.tokens.iter().any(|token| token.token_id == *token_id
+            && token.scope_id == *scope_id && token.status == "waiting"),
+        "Service retry has another ready activation or lost its old wait");
+    let entry = AcceptedInputRef::Retry {
+        old_job_id: job_id.to_owned(),
+        old_invocation_id: invocation_id.clone(),
+        old_token_id: token_id.clone(),
+        expected_instance_revision: expected_revision,
+        command_id: stamp.command_id.clone(),
+        request_hash: stamp.request_hash.clone(),
+    };
+    let plan = super::runtime::plan_service_retry(&snapshot, job_id, invocation_id,
+        incident_id, at_ms, entry.clone())?;
+    apply_plan_on(&tx, instance_id, &actor.user_id, expected_revision, &plan,
+        at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -17511,52 +26305,153 @@ pub fn retry_job(
 }
 
 pub fn recover_jobs(pool: &DbPool, worker_id: Option<&str>, now_ms: i64) -> Result<u32> {
+    let conn = pool.read()?;
+    let mut statement = conn.prepare(
+        "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),v.phase,j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE ((j.status='running' AND v.phase IN ('prepared','may_have_executed')) OR v.phase='observed') AND (?1 IS NULL OR v.dispatch_worker_id=?1 OR v.phase='prepared' AND j.worker_id=?1) ORDER BY j.created_at_ms,j.job_id")?;
+    let jobs = statement.query_map([worker_id], |row| {
+        Ok((row.get::<_, String>(0)?,row.get::<_, u32>(1)?,row_u64(row,2)?,
+            row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    drop(conn);
+    let mut recovered = 0u32;
+    for (job_id, attempt, fence, original_worker, phase, instance_id,
+        org_id, user_id, observed_json) in jobs {
+        if phase == "observed" {
+            if block_closed_observed_job(pool, &job_id, now_ms)? {
+                recovered += 1;
+                continue;
+            }
+            let observed: ObservedActivityResult = parse(observed_json
+                .context("observed invocation lost its immutable result bytes")?)?;
+            let actor = ProcessActor { org_id, user_id };
+            let controller_id = Uuid::new_v4().to_string();
+            for _ in 0..8 {
+                let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
+                match accept_job_result(pool, &actor, &job_id, attempt, fence,
+                    &controller_id, &observed, snapshot.instance.revision,
+                    ProcessPlanInput::Canonical, now_ms) {
+                    Ok(_) => { recovered += 1; break; }
+                    Err(error) if error.to_string().contains("revision conflict") => continue,
+                    Err(_) if block_closed_observed_job(pool, &job_id, now_ms)? => {
+                        recovered += 1;
+                        break;
+                    }
+                    Err(error) => return Err(error.context(
+                        "durably observed Service result could not resume canonical acceptance")),
+                }
+            }
+        } else if fail_job(pool, &job_id, attempt, fence, &original_worker,
+            "INTERRUPTED", "the worker stopped before its Service result was observed",
+            now_ms, None)? {
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
+}
+
+pub(super) fn record_observed_script_infrastructure_failure(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    error: &anyhow::Error,
+    at_ms: i64,
+) -> Result<bool> {
+    ensure!(error.chain().any(|cause|
+        cause.is::<crate::flow_engine::expr::InfrastructureExprError>()),
+        "Service continuation failure has no typed Script infrastructure source");
+    if fail_job(pool, &claimed.job.job_id, claimed.job.attempt,
+        claimed.job.fence, worker_id, "SCRIPT_INFRASTRUCTURE_FAILED",
+        &format!("{error:#}"), at_ms, Some(observed))? {
+        return Ok(true);
+    }
+    let observed_bytes = json(observed)?;
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let mut stmt=tx.prepare("SELECT j.job_id,j.instance_id,j.node_id,j.scope_id FROM bpmn_jobs j WHERE j.status='running' AND (?1 IS NULL OR j.worker_id=?1) ORDER BY j.created_at_ms,j.job_id")?;
-    let rows = stmt
-        .query_map([worker_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    for (job_id, instance_id, node_id, scope_id) in &rows {
-        ensure!(
-            job_activation_live_on(&tx, job_id)?,
-            "running service job no longer has a waiting activation"
-        );
-        tx.execute("UPDATE bpmn_jobs SET status='error',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",params![now_ms,job_id])?;
-        tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id])?;
-        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id,scope_id])?;
-        let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,'INTERRUPTED','The worker stopped before the external effect was confirmed',?5,?6)",params![incident_id,instance_id,node_id,job_id,now_ms,scope_id])?;
-        let next_seq: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-            [instance_id],
-            |row| row_u64(row, 0),
-        )?;
-        insert_event_on(
-            &tx,
-            instance_id,
-            next_seq,
-            None,
-            &PlannedEvent {
-                scope_id: scope_id.clone(),
-                kind: "job_interrupted".into(),
-                node_id: Some(node_id.clone()),
-                data: serde_json::json!({"job_id":job_id,"incident_id":incident_id}),
-            },
-            now_ms,
-            None,
-        )?;
+    let (instance_id, scope_id, node_id, token_id, status,
+        phase, evidence, dispatch_attempt, dispatch_fence, dispatch_worker,
+        stored_observation, reserved_result_event_id, updated_at_ms):
+        (String,String,String,String,String,String,String,Option<u32>,Option<u64>,
+            Option<String>,Option<String>,Option<String>,i64) = tx.query_row(
+        r#"SELECT j.instance_id,j.scope_id,j.node_id,j.token_id,j.status,
+            v.phase,v.dispatch_evidence,v.dispatch_attempt,v.dispatch_fence,
+            v.dispatch_worker_id,v.observed_result_json,v.reserved_result_event_id,
+            v.updated_at_ms
+            FROM bpmn_jobs j JOIN bpmn_service_invocations v
+            ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id
+            WHERE j.job_id=?1 AND v.invocation_id=?2 AND j.attempt=?3 AND j.fence=?4"#,
+        params![claimed.job.job_id,claimed.invocation_id,claimed.job.attempt,
+            sql_integer(claimed.job.fence)?],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,
+            row.get(5)?,row.get(6)?,row.get(7)?,row_optional_u64(row,8)?,
+            row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+    )?;
+    ensure!(status == "running" && phase == "observed"
+        && evidence == "committed_boundary"
+        && dispatch_attempt == Some(claimed.job.attempt)
+        && dispatch_fence == Some(claimed.job.fence)
+        && dispatch_worker.as_deref() == Some(worker_id)
+        && stored_observation.as_deref() == Some(observed_bytes.as_str())
+        && reserved_result_event_id.is_some()
+        && job_activation_live_on(&tx, &claimed.job.job_id)?,
+        "Script infrastructure failure lost its observed Service source");
+    let (org_id, user_id): (String, String) = tx.query_row(
+        "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+        [&instance_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+    let actor = ProcessActor { org_id, user_id };
+    require_actor(&tx, &actor)?;
+    require_call_control_authority_on(&tx, &actor, &instance_id)?;
+    let flow_id = job_flow_id_on(&tx, &claimed.job.job_id)?;
+    require_flow_current(&tx, &actor, &flow_id, None)?;
+    let existing = tx.query_row(
+        r#"SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2
+            AND job_id=?3 AND code='SCRIPT_INFRASTRUCTURE_FAILED'
+            AND resolved_at_ms IS NULL"#,
+        params![instance_id,scope_id,claimed.job.job_id],
+        |row| row.get::<_, String>(0)).optional()?;
+    if existing.is_some() {
+        return Ok(false);
     }
+    let incident_id = Uuid::new_v4().to_string();
+    let message = bounded_failure_message(&format!("{error:#}"));
+    let at_ms = at_ms.max(updated_at_ms);
+    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,'SCRIPT_INFRASTRUCTURE_FAILED',?6,?7)",
+        params![incident_id,instance_id,scope_id,node_id,claimed.job.job_id,message,at_ms])?;
+    let seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [&instance_id], |row| row_u64(row,0))?;
+    insert_event_on(&tx, &instance_id, seq, None, &PlannedEvent {
+        scope_id: scope_id.clone(), kind: "incident".into(), node_id: Some(node_id),
+        data: serde_json::json!({"incident_id":incident_id,
+            "code":"SCRIPT_INFRASTRUCTURE_FAILED","message":message,
+            "invocation_id":claimed.invocation_id,"job_id":claimed.job.job_id,
+            "source_token_id":token_id,"dispatch_attempt":claimed.job.attempt,
+            "dispatch_fence":claimed.job.fence,
+            "reserved_result_event_id":reserved_result_event_id}),
+    }, at_ms, None)?;
+    let changed = tx.execute(
+        r#"UPDATE bpmn_service_invocations SET acceptance_owner_id=NULL,
+            acceptance_lease_until_ms=NULL,
+            phase_revision=phase_revision+1,updated_at_ms=?1
+            WHERE invocation_id=?2 AND job_id=?3 AND phase='observed'
+            AND dispatch_evidence='committed_boundary' AND observed_result_json=?4
+            AND acceptance_owner_id IS NULL"#,
+        params![at_ms,claimed.invocation_id,claimed.job.job_id,observed_bytes])?;
+    ensure!(changed == 1, "Script continuation ownership changed before recovery");
+    let released = tx.execute(
+        "UPDATE bpmn_jobs SET lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running' AND attempt=?3 AND fence=?4 AND worker_id=?5",
+        params![at_ms,claimed.job.job_id,claimed.job.attempt,
+            sql_integer(claimed.job.fence)?,worker_id])?;
+    ensure!(released == 1,
+        "Script continuation released a different job generation");
+    mark_service_incident_status_on(&tx, &instance_id, &scope_id,
+        &claimed.job.job_id, at_ms)?;
+    check_active_incident_budget_on(&tx, &instance_id)?;
     tx.commit()?;
-    Ok(u32::try_from(rows.len())?)
+    Ok(true)
 }
 
 pub fn fail_job(
@@ -17570,108 +26465,109 @@ pub fn fail_job(
     now_ms: i64,
     observed: Option<&ObservedActivityResult>,
 ) -> Result<bool> {
-    ensure!(
-        !code.is_empty() && code.len() <= 128,
-        "invalid process job failure"
-    );
+    ensure!(!code.is_empty() && code.len() <= 128,
+        "invalid process job failure");
     let message = bounded_failure_message(message);
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let row:Option<(String,String,String)>=tx.query_row("SELECT instance_id,node_id,scope_id FROM bpmn_jobs WHERE job_id=?1 AND status='running' AND attempt=?2 AND fence=?3 AND worker_id=?4",params![job_id,attempt,sql_integer(fence)?,worker_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
-    let Some((instance_id, node_id, scope_id)) = row else {
+    let row: Option<(String,String,String,String,String,Option<u32>,Option<u64>,Option<String>,Option<String>,Option<String>)> = tx.query_row(
+        "SELECT j.instance_id,j.scope_id,j.node_id,v.invocation_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.observed_result_json,v.reserved_result_event_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id WHERE j.job_id=?1 AND j.status='running' AND j.attempt=?2 AND j.fence=?3 AND j.worker_id=?4",
+        params![job_id,attempt,sql_integer(fence)?,worker_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,
+            row.get(4)?,row.get(5)?,row_optional_u64(row, 6)?,row.get(7)?,row.get(8)?,row.get(9)?)),
+    ).optional()?;
+    let Some((instance_id, scope_id, node_id, invocation_id, phase,
+        dispatch_attempt, dispatch_fence, dispatch_worker, stored_observation,
+        reserved_result_event_id)) = row else {
         return Ok(false);
     };
-    if !job_activation_live_on(&tx, job_id)? {
+    if phase == "accepted" || phase == "observed_blocked" || phase == "proved_no_effect" {
         return Ok(false);
+    }
+    if phase != "prepared" {
+        ensure!(dispatch_attempt == Some(attempt) && dispatch_fence == Some(fence)
+            && dispatch_worker.as_deref() == Some(worker_id),
+            "Service failure differs from original dispatch identity");
     }
     if let Some(observed) = observed {
-        validate_output(&observed.result.outputs)?;
-        ensure!(
-            json(&observed.result)?.len() <= 384 * 1024 - 4096,
-            "observed result exceeds history budget"
-        );
-        if observed.origin == ActivityResultOrigin::Contract {
-            super::jobs::parse_contract_result(serde_json::to_value(&observed.result)?)?;
-            let (definition, version): (String, u32) = tx.query_row(
-                "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
-                [&instance_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let model = current_version_model_on(&tx, &definition, version)?;
-            ensure!(
-                matches!(
-                    &scoped_node_on(&tx, &instance_id, &scope_id, &model, &node_id)?.kind,
-                    ProcessNodeKind::ServiceTask {
-                        result_expression: Some(_),
-                        ..
-                    }
-                ),
-                "contract provenance has no pinned result expression"
-            );
-        }
-        tx.execute(
-            "UPDATE bpmn_jobs SET result_json=?1,result_origin=?2 WHERE job_id=?3",
-            params![
-                json(&observed.result)?,
-                result_origin_text(&observed.origin),
-                job_id
-            ],
-        )?;
-        let seq: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-            [&instance_id],
-            |row| row_u64(row, 0),
-        )?;
-        let mut data = serde_json::to_value(&observed.result)?;
-        data["result_origin"] = serde_json::json!(result_origin_text(&observed.origin));
-        insert_event_on(
-            &tx,
-            &instance_id,
-            seq,
-            None,
-            &PlannedEvent {
-                scope_id: scope_id.clone(),
-                kind: "service_result".into(),
-                node_id: Some(node_id.clone()),
-                data,
-            },
-            now_ms,
-            None,
-        )?;
+        ensure!(phase == "observed" && stored_observation.as_deref() == Some(json(observed)?.as_str()),
+            "Service failure cannot fabricate an unrecorded result");
     }
-    let changed=tx.execute("UPDATE bpmn_jobs SET status='error',fence=fence+1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running' AND attempt=?3 AND fence=?4 AND worker_id=?5",params![now_ms,job_id,attempt,sql_integer(fence)?,worker_id])?;
-    if changed == 0 {
+    if phase == "uncertain" {
         return Ok(false);
     }
-    let active=tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id])?;
-    if active == 1 {
-        tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id,scope_id])?;
+    if phase == "may_have_executed" {
+        ensure!(observed.is_none(),
+            "observed Service result must be persisted before failure handling");
         let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident_id,instance_id,node_id,job_id,code,incident_message(&message),now_ms,scope_id])?;
+        let uncertain_code = "EXTERNAL_OUTCOME_UNCERTAIN";
+        let uncertain_message = "The external effect may have occurred; direct retry is unavailable";
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![incident_id,instance_id,scope_id,node_id,job_id,
+                uncertain_code,uncertain_message,now_ms])?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-            [&instance_id],
-            |row| row_u64(row, 0),
-        )?;
-        insert_event_on(
-            &tx,
-            &instance_id,
-            next_seq,
-            None,
-            &PlannedEvent {
-                scope_id: scope_id.clone(),
-                kind: "job_failed".into(),
-                node_id: Some(node_id),
-                data: serde_json::json!({"job_id":job_id,"incident_id":incident_id,"code":code,"message":message}),
-            },
-            now_ms,
-            None,
-        )?;
+            [&instance_id], |row| row_u64(row, 0))?;
+        insert_event_on(&tx, &instance_id, next_seq, None, &PlannedEvent {
+            scope_id: scope_id.clone(), kind: "incident".into(), node_id: Some(node_id.clone()),
+            data: serde_json::json!({"incident_id":incident_id,"invocation_id":invocation_id,
+                "job_id":job_id,"code":uncertain_code,"message":uncertain_message,
+                "dispatch_attempt":attempt,"dispatch_fence":fence,"reason":code}),
+        }, now_ms, None)?;
+        let changed = tx.execute("UPDATE bpmn_service_invocations SET phase='uncertain',uncertainty_incident_id=?1,phase_revision=phase_revision+1,updated_at_ms=?2 WHERE invocation_id=?3 AND phase='may_have_executed' AND dispatch_attempt=?4 AND dispatch_fence=?5 AND dispatch_worker_id=?6",
+            params![incident_id,now_ms,invocation_id,attempt,sql_integer(fence)?,worker_id])?;
+        ensure!(changed == 1, "Service dispatch changed before uncertainty was recorded");
+        tx.execute("UPDATE bpmn_jobs SET lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",
+            params![now_ms,job_id])?;
+    } else if phase == "prepared" {
+        ensure!(observed.is_none(),
+            "pre-dispatch Service failure cannot contain an external result");
+        let changed = tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?1 WHERE invocation_id=?2 AND phase='prepared' AND dispatch_evidence='no_boundary'",
+            params![now_ms,invocation_id])?;
+        ensure!(changed == 1, "pre-dispatch Service boundary changed");
+        tx.execute("UPDATE bpmn_jobs SET status='error',worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",
+            params![now_ms,job_id])?;
+        let incident_id = Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![incident_id,instance_id,scope_id,node_id,job_id,code,incident_message(&message),now_ms])?;
+        let next_seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [&instance_id], |row| row_u64(row, 0))?;
+        insert_event_on(&tx, &instance_id, next_seq, None, &PlannedEvent {
+            scope_id: scope_id.clone(), kind: "job_failed".into(), node_id: Some(node_id.clone()),
+            data: serde_json::json!({"job_id":job_id,"incident_id":incident_id,
+                "code":code,"message":message}),
+        }, now_ms, None)?;
+    } else {
+        ensure!(phase == "observed", "Service failure has an invalid invocation phase");
+        let (org_id, user_id): (String, String) = tx.query_row(
+            "SELECT i.org_id,i.initiator_user_id FROM bpmn_instances i WHERE i.instance_id=?1",
+            [&instance_id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+        let actor = ProcessActor { org_id, user_id };
+        let live = job_activation_live_on(&tx, job_id)?;
+        let authority = if live {
+            require_call_control_authority_on(&tx, &actor, &instance_id)
+                .and_then(|_| job_flow_id_on(&tx, job_id))
+                .and_then(|flow| require_flow_current(&tx, &actor, &flow, None))
+        } else { Ok(()) };
+        let reason = if !live { Some("activation_closed") }
+            else if authority.is_err() { Some("execution_authority_revoked") }
+            else { None };
+        if let Some(reason) = reason {
+            block_observed_invocation_on(&tx, &invocation_id, job_id, &instance_id,
+                &scope_id, &node_id, attempt, fence,
+                reserved_result_event_id.as_deref()
+                    .context("observed Service result has no reserved event ID")?,
+                reason, now_ms)?;
+        } else {
+            return Ok(false);
+        }
     }
-    if let Some(group_id) = tx.query_row(
+    if phase != "observed" {
+        mark_service_incident_status_on(&tx, &instance_id, &scope_id, job_id, now_ms)?;
+    } else if let Some(group_id) = tx.query_row(
         "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2",
-        params![instance_id,job_id], |row| row.get::<_, String>(0),
-    ).optional()? {
+        params![instance_id,job_id], |row| row.get::<_, String>(0)).optional()? {
         refresh_repetition_retained_bytes_on(&tx, &instance_id, &group_id)?;
     }
     tx.commit()?;
@@ -17934,6 +26830,7 @@ fn subscription_live_on(conn: &Connection, s: &EventSubscription) -> Result<bool
     Ok(true)
 }
 fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, &s.instance_id)?;
     ensure!(
         s.revision == 1
             && matches!(
@@ -17967,7 +26864,8 @@ fn insert_subscription_on(tx: &Transaction<'_>, s: &EventSubscription) -> Result
         let model = current_version_model_on(tx, &s.definition_id, s.version)?;
         let scopes = scopes_on(tx, &s.instance_id, &model)?;
         let path = scope_path(&scopes, &s.instance_id, &s.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+        let selected = super::model::selected_body(&model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         ensure!(
             nodes.iter().any(|node| node.id == s.node_id
                 && matches!((&s.kind, &node.kind),
@@ -17995,6 +26893,7 @@ fn apply_event_plan_on(
     entry: EntryAuthority<'_>,
     at_ms: i64,
 ) -> Result<()> {
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
     let (definition_id, version, org_id): (String, u32, String) = tx.query_row(
         "SELECT definition_id,version,org_id FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
@@ -18004,7 +26903,8 @@ fn apply_event_plan_on(
     for race in &plan.create_event_races {
         let scopes = scopes_on(tx, instance_id, &model)?;
         let path = scope_path(&scopes, instance_id, &race.scope_id)?;
-        let (nodes, flows, _) = super::model::scope_body(&model, &path)?;
+        let selected = super::model::selected_body(&model, &selected_process_id, &path)?;
+        let (nodes, flows) = (selected.nodes, selected.sequence_flows);
         ensure!(
             race.instance_id == instance_id
                 && race.revision == 1
@@ -18286,7 +27186,15 @@ fn apply_event_plan_on(
             {
                 ensure!(
                     if Some(&s.subscription_id) == update.winner_subscription_id.as_ref() {
+                        // A winner whose output mapping is blocked stays parked on its
+                        // consumed subscription; its siblings still close.
                         plan.consume_token_ids.contains(&s.token_id)
+                            || plan.activity_io_results.iter().any(|fact|
+                                fact.token_id == s.token_id
+                                    && fact.resource_id.as_deref()
+                                        == Some(s.subscription_id.as_str())
+                                    && matches!(&fact.disposition,
+                                        ActivityIoResultDisposition::Blocked { .. }))
                     } else {
                         plan.cancel_token_ids.contains(&s.token_id)
                     },
@@ -18427,8 +27335,14 @@ fn apply_event_plan_on(
                     ..
                 }
             );
+            // A blocked output mapping keeps the activation waiting while the
+            // delivered message stays consumed by its accepted IO result.
+            let io_retained = plan.activity_io_results.iter().any(|fact|
+                fact.token_id == actual.token_id
+                    && fact.resource_id.as_deref() == Some(actual.subscription_id.as_str())
+                    && matches!(&fact.disposition, ActivityIoResultDisposition::Blocked { .. }));
             ensure!(
-                token_advanced || noninterrupt,
+                token_advanced || noninterrupt || io_retained,
                 "consumed subscription does not advance its activation"
             );
         }
@@ -18438,7 +27352,9 @@ fn apply_event_plan_on(
                 .as_deref()
                 .context("subscription cancellation lacks reason")?;
             ensure!(
-                (reason == "activity_completed"
+                ((reason == "activity_completed" || reason == "activity_retried"
+                    && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Retry {
+                        old_token_id, .. }) if old_token_id == &actual.token_id))
                     && plan.consume_token_ids.contains(&actual.token_id))
                     || (matches!(
                         reason,
@@ -18543,9 +27459,13 @@ fn message_status(value: &str) -> Result<ProcessMessageStatus> {
     }
 }
 fn message_on(conn: &Connection, key: &MessageKey, load_payload: bool) -> Result<MessageRecord> {
-    let r=conn.query_row("SELECT request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,CASE WHEN ?4 THEN payload_json ELSE NULL END,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,source_node_id,payload_json IS NOT NULL FROM bpmn_messages WHERE org_id=?1 AND sender_user_id=?2 AND message_id=?3",params![key.org_id,key.sender_user_id,key.message_id,load_payload],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,String>(9)?,r.get::<_,u32>(10)?,r.get::<_,u32>(11)?,r.get::<_,i64>(12)?,r.get::<_,i64>(13)?,row_u64(r,14)?,r.get::<_,String>(15)?,r.get::<_,Option<String>>(16)?,r.get::<_,i64>(17)?,r.get::<_,i64>(18)?,r.get::<_,Option<String>>(19)?,r.get::<_,Option<String>>(20)?,r.get::<_,Option<String>>(21)?,r.get::<_,Option<String>>(22)?,r.get::<_,Option<u32>>(23)?,r.get::<_,Option<String>>(24)?,r.get::<_,Option<String>>(25)?,r.get::<_,Option<i64>>(26)?,r.get::<_,Option<String>>(27)?,r.get::<_,Option<String>>(28)?,r.get::<_,bool>(29)?))).context("message not found")?;
+    let r=conn.query_row("SELECT request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,CASE WHEN ?4 THEN payload_json ELSE NULL END,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,last_reason,next_check_at_ms,updated_at_ms,resolved_instance_id,resolved_subscription_id,resolved_token_id,matched_instance_id,matched_version,matched_node_id,matched_subscription_id,delivered_at_ms,source_instance_id,source_node_id,payload_json IS NOT NULL,target_process_id,target_start_node_id FROM bpmn_messages WHERE org_id=?1 AND sender_user_id=?2 AND message_id=?3",params![key.org_id,key.sender_user_id,key.message_id,load_payload],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,String>(9)?,r.get::<_,u32>(10)?,r.get::<_,u32>(11)?,r.get::<_,i64>(12)?,r.get::<_,i64>(13)?,row_u64(r,14)?,r.get::<_,String>(15)?,r.get::<_,Option<String>>(16)?,r.get::<_,i64>(17)?,r.get::<_,i64>(18)?,r.get::<_,Option<String>>(19)?,r.get::<_,Option<String>>(20)?,r.get::<_,Option<String>>(21)?,r.get::<_,Option<String>>(22)?,r.get::<_,Option<u32>>(23)?,r.get::<_,Option<String>>(24)?,r.get::<_,Option<String>>(25)?,r.get::<_,Option<i64>>(26)?,r.get::<_,Option<String>>(27)?,r.get::<_,Option<String>>(28)?,r.get::<_,bool>(29)?,r.get::<_,Option<String>>(30)?,r.get::<_,Option<String>>(31)?))).context("message not found")?;
     let target = match r.2.as_str() {
-        "start" => ProcessMessageTarget::Start { definition_id: r.3 },
+        "start" => ProcessMessageTarget::Start {
+            definition_id: r.3,
+            process_id: r.30,
+            start_node_id: r.31,
+        },
         "catch" => ProcessMessageTarget::Catch {
             definition_id: r.3,
             instance_id: r.4,
@@ -18596,7 +27516,7 @@ fn require_message_target_on(
 ) -> Result<()> {
     require_actor(conn, actor)?;
     match target {
-        ProcessMessageTarget::Start { definition_id }
+        ProcessMessageTarget::Start { definition_id, .. }
         | ProcessMessageTarget::Catch {
             definition_id,
             instance_id: None,
@@ -18630,9 +27550,43 @@ enum SendAdmissionEvaluation {
     Fail(super::runtime::SendAdmissionFailure),
 }
 
+fn send_repetition_context_on(
+    tx: &Transaction<'_>, instance_id: &str, scope_id: &str,
+    node: &ProcessNode, token_id: &str, effective: &Value,
+) -> Result<(Value, Vec<(String, Value)>)> {
+    let occurrence = repetition_occurrences_on(tx, instance_id)?.into_iter()
+        .find(|row| row.token_id == token_id);
+    let Some(occurrence) = occurrence else {
+        ensure!(node.repeat.is_none(), "repeated Send wait lacks its factual occurrence");
+        return Ok((effective.clone(), Vec::new()));
+    };
+    ensure!(node.repeat.is_some() && occurrence.scope_id == scope_id
+        && occurrence.status == ProcessRepetitionOccurrenceStatus::Active,
+        "Send wait has a foreign or inactive ordinal");
+    let group = repetition_groups_on(tx, instance_id)?.into_iter()
+        .find(|row| row.group_id == occurrence.group_id)
+        .context("Send ordinal lacks its factual group")?;
+    ensure!(group.scope_id == scope_id && group.node_id == node.id
+        && !group.terminal_capacity
+        && matches!(group.status, ProcessRepetitionGroupStatus::Open
+            | ProcessRepetitionGroupStatus::Incident),
+        "Send ordinal differs from its live coordinator");
+    let extra = vec![("repeat".to_owned(), serde_json::json!({
+        "group_id":group.group_id,"index":occurrence.ordinal,"item":occurrence.item,
+    }))];
+    let mut extra = extra;
+    if let Some(inputs) = persisted_activity_io_inputs_on(
+        tx, instance_id, scope_id, &node.id, token_id,
+    )? {
+        extra.extend(super::runtime::activity_inputs_extra(&inputs)?);
+    }
+    Ok((occurrence.input_variables, extra))
+}
+
 fn send_admission_evaluation_on(
     tx: &Transaction<'_>, actor: &ProcessActor, instance_id: &str,
     model: &ProcessModel, node: &ProcessNode, variables: &Value,
+    extra: &[(String, Value)],
 ) -> Result<SendAdmissionEvaluation> {
     let (definition_id, version): (String, u32) = tx.query_row(
         "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
@@ -18656,7 +27610,7 @@ fn send_admission_evaluation_on(
     if let Some(denied) = authority(require_version_execution_on(tx, actor, &definition_id, version))? {
         return Ok(denied);
     }
-    let prepared = match super::messages::prepare_throw(model, node, variables) {
+    let prepared = match super::messages::prepare_throw(model, node, variables, extra) {
         Ok(prepared) => prepared,
         Err(error) if error.downcast_ref::<super::messages::MessageExpressionFailed>().is_some() =>
             return Ok(SendAdmissionEvaluation::Fail(super::runtime::SendAdmissionFailure {
@@ -18675,7 +27629,7 @@ fn send_admission_evaluation_on(
         return Err(error);
     }
     let unavailable = match &prepared.target {
-        ProcessMessageTarget::Start { definition_id } => {
+        ProcessMessageTarget::Start { definition_id, .. } => {
             let definition = definition_on(tx, definition_id)?;
             if definition.archived || definition.published_version.is_none() {
                 true
@@ -18873,29 +27827,46 @@ fn require_message_source_on(
         "message source declaration or logical activation changed"
     );
     let declared_definition = match declared_target {
-        tentaflow_protocol::processes::ProcessMessageTargetSpec::Start { definition_id }
+        tentaflow_protocol::processes::ProcessMessageTargetSpec::Start { definition_id, .. }
         | tentaflow_protocol::processes::ProcessMessageTargetSpec::Catch {
             definition_id, ..
         } => definition_id,
     };
     let actual_definition = match target {
-        ProcessMessageTarget::Start { definition_id }
+        ProcessMessageTarget::Start { definition_id, .. }
         | ProcessMessageTarget::Catch { definition_id, .. } => definition_id,
     };
-    ensure!(
-        declared_definition == actual_definition
-            && matches!(
-                (declared_target, target),
-                (
-                    tentaflow_protocol::processes::ProcessMessageTargetSpec::Start { .. },
-                    ProcessMessageTarget::Start { .. }
-                ) | (
-                    tentaflow_protocol::processes::ProcessMessageTargetSpec::Catch { .. },
-                    ProcessMessageTarget::Catch { .. }
-                )
-            ),
-        "message source target differs from its pinned Throw contract"
-    );
+    let target_matches = match (declared_target, target) {
+        (
+            tentaflow_protocol::processes::ProcessMessageTargetSpec::Start {
+                process_id: declared_process_id,
+                start_node_id: declared_start_node_id,
+                ..
+            },
+            ProcessMessageTarget::Start { process_id, start_node_id, .. },
+        ) => declared_process_id.as_ref().is_none_or(|id| process_id.as_ref() == Some(id))
+            && declared_start_node_id.as_ref().is_none_or(|id| start_node_id.as_ref() == Some(id))
+            && (phase == MessageSourceProofPhase::Admission
+                || process_id.is_some() && start_node_id.is_some()),
+        (
+            tentaflow_protocol::processes::ProcessMessageTargetSpec::Catch { .. },
+            ProcessMessageTarget::Catch { .. },
+        ) => true,
+        _ => false,
+    };
+    ensure!(declared_definition == actual_definition && target_matches,
+        "message source target differs from its pinned Throw contract");
+    let authored_target = match declared_target {
+        tentaflow_protocol::processes::ProcessMessageTargetSpec::Start {
+            definition_id, process_id, start_node_id,
+        } => serde_json::to_value(ProcessMessageTarget::Start {
+            definition_id: definition_id.clone(),
+            process_id: process_id.clone(),
+            start_node_id: start_node_id.clone(),
+        })?,
+        tentaflow_protocol::processes::ProcessMessageTargetSpec::Catch { .. } =>
+            serde_json::to_value(target)?,
+    };
     let (kind, event_node, data): (String, Option<String>, String) = conn
         .query_row(
             "SELECT kind,node_id,data_json FROM bpmn_events WHERE event_id=?1 AND instance_id=?2 AND scope_id=?3",
@@ -18911,7 +27882,7 @@ fn require_message_source_on(
             && data["source_activation_id"].as_str() == Some(activation_id)
             && data["message_name"].as_str() == Some(message_name)
             && data["correlation_key"].as_str() == Some(correlation_key)
-            && data["target"] == serde_json::to_value(target)?,
+            && data["target"] == authored_target,
         "message source differs from its actual queued event"
     );
     Ok((definition_id, version))
@@ -19393,7 +28364,7 @@ fn finalize_signal_delivery_failure_on(
     let plan = super::runtime::plan_signal_delivery_failure(&snapshot,
         &subscription, at_ms, input.clone())?;
     apply_plan_on(tx, &subscription.instance_id, &claim.actor.user_id,
-        snapshot.instance.revision, &plan, at_ms, None, EntryAuthority::Accepted(&input))?;
+        snapshot.instance.revision, &plan, at_ms, None, EntryAuthority::Accepted(&input), &[])?;
     let incident_id = plan.add_incidents.iter().find(|incident|
         incident.code == "SIGNAL_DELIVERY_FAILED"
             && incident.scope_id == subscription.scope_id
@@ -19525,7 +28496,7 @@ pub fn deliver_signal_receipt(
     let mut cancelled_claims = apply_plan_on(&tx, instance_id, &claim.actor.user_id,
         expected_revision,
         plan, at_ms, None,
-        EntryAuthority::Accepted(&expected))?;
+        EntryAuthority::Accepted(&expected), &[])?;
     settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
         claim.revision, if mapping_failed { "error" } else { "delivered" },
         if mapping_failed { Some("recipient_mapping_failed") } else { None },
@@ -19998,7 +28969,7 @@ fn insert_message_on(
     super::messages::validate_message(prepared)?;
     require_message_target_on(tx, actor, &prepared.target)?;
     let (kind, definition_id, instance_id, subscription_id) = match &prepared.target {
-        ProcessMessageTarget::Start { definition_id } => ("start", definition_id, None, None),
+        ProcessMessageTarget::Start { definition_id, .. } => ("start", definition_id, None, None),
         ProcessMessageTarget::Catch {
             definition_id,
             instance_id,
@@ -20033,7 +29004,9 @@ fn insert_message_on(
         )?;
         ensure!(!closed, "target instance is closed");
     }
-    if kind == "start" {
+    let (target_process_id, target_start_node_id) = if let ProcessMessageTarget::Start {
+        process_id, start_node_id, ..
+    } = &prepared.target {
         let definition = definition_on(tx, definition_id)?;
         ensure!(!definition.archived, "definition_archived");
         let version = version_on(
@@ -20043,8 +29016,28 @@ fn insert_message_on(
                 .published_version
                 .context("message start is not published")?,
         )?;
-        ensure!(version.model.nodes.iter().any(|n|matches!(&n.kind,ProcessNodeKind::MessageStart{message_ref,..}if version.model.messages.iter().any(|d|&d.message_id==message_ref&&d.name==prepared.message_name))),"message start name is not declared by the current published version");
-    }
+        let selected_process_id = match process_id.as_deref() {
+            Some(id) => id,
+            None if version.model.additional_processes.is_empty() => version.model.process_id.as_str(),
+            None => bail!("message Start requires an exact selected process"),
+        };
+        let body = super::model::selected_body(&version.model, selected_process_id, &[])?;
+        let matches = body.nodes.iter().filter(|node| match &node.kind {
+            ProcessNodeKind::MessageStart { message_ref, .. } => version.model.messages.iter()
+                .any(|declaration| declaration.message_id.as_str() == message_ref.as_str()
+                    && declaration.name.as_str() == prepared.message_name.as_str()),
+            _ => false,
+        }).collect::<Vec<_>>();
+        let selected_start = match start_node_id.as_deref() {
+            Some(id) => matches.iter().find(|node| node.id == id)
+                .copied().context("message Start selector differs from its selected body")?,
+            None if matches.len() == 1 => matches[0],
+            None => bail!("message Start has no unique selected Start event"),
+        };
+        (Some(selected_process_id.to_owned()), Some(selected_start.id.clone()))
+    } else {
+        (None, None)
+    };
     let payload = json(&prepared.payload)?;
     let (sender_count,sender_bytes,org_count,org_bytes) =
         apply_pending_entry_debit(pending_emission_budget_on(tx, &actor.org_id,
@@ -20082,7 +29075,7 @@ fn insert_message_on(
             )
         })
         .transpose()?;
-    tx.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,source_instance_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id,source_scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1,'pending',?16,?16,?18,?19,?20,?21,?22,?23,?24)",params![actor.org_id,actor.user_id,prepared.message_id,hash,if source.is_some(){"process"}else{"api"},kind,definition_id,instance_id,subscription_id,prepared.message_name,prepared.correlation_key,payload,hex::encode(Sha256::digest(payload.as_bytes())),u32::try_from(payload.len())?,prepared.ttl_seconds,at_ms,expires,source_instance,source_identity.as_ref().map(|r|r.0.as_str()),source_identity.as_ref().map(|r|r.1),source_node,source_activation,source_event,source_scope])?;
+    tx.execute("INSERT INTO bpmn_messages(org_id,sender_user_id,message_id,request_hash,origin,target_kind,definition_id,target_instance_id,target_subscription_id,message_name,correlation_key,payload_json,payload_sha256,payload_bytes,ttl_seconds,received_at_ms,expires_at_ms,revision,status,next_check_at_ms,updated_at_ms,source_instance_id,source_definition_id,source_version,source_node_id,source_activation_id,source_event_id,source_scope_id,target_process_id,target_start_node_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1,'pending',?16,?16,?18,?19,?20,?21,?22,?23,?24,?25,?26)",params![actor.org_id,actor.user_id,prepared.message_id,hash,if source.is_some(){"process"}else{"api"},kind,definition_id,instance_id,subscription_id,prepared.message_name,prepared.correlation_key,payload,hex::encode(Sha256::digest(payload.as_bytes())),u32::try_from(payload.len())?,prepared.ttl_seconds,at_ms,expires,source_instance,source_identity.as_ref().map(|r|r.0.as_str()),source_identity.as_ref().map(|r|r.1),source_node,source_activation,source_event,source_scope,target_process_id,target_start_node_id])?;
     message_on(tx, &key, true)
 }
 pub fn send_message(
@@ -20256,31 +29249,39 @@ fn message_selection_on(conn: &Connection, c: &MessageCandidate) -> Result<Messa
         );
     }
     let (definition_id, instance_id, subscription_id) = match &m.target {
-        ProcessMessageTarget::Start { definition_id } => {
+        ProcessMessageTarget::Start { definition_id, process_id, start_node_id } => {
             let d = definition_on(conn, definition_id)?;
             ensure!(!d.archived, "definition_archived");
-            let version = version_on(
-                conn,
-                definition_id,
-                d.published_version.context("start_definition_changed")?,
-            )?;
-            ensure!(
-                version.model.nodes.iter().any(|n| match &n.kind {
-                    ProcessNodeKind::MessageStart { message_ref, .. } => version
-                        .model
-                        .messages
-                        .iter()
-                        .any(|decl| &decl.message_id == message_ref && decl.name == m.message_name),
-                    _ => false,
-                }),
-                "start_definition_changed"
-            );
+            let version = version_on(conn, definition_id,
+                d.published_version.context("start_definition_changed")?)?;
+            let selected_process_id = match process_id.as_deref() {
+                Some(id) => id,
+                None if version.model.additional_processes.is_empty() => version.model.process_id.as_str(),
+                None => bail!("start_definition_changed"),
+            };
+            let body = super::model::selected_body(&version.model, selected_process_id, &[])
+                .context("start_definition_changed")?;
+            let matches = body.nodes.iter().filter(|node| match &node.kind {
+                ProcessNodeKind::MessageStart { message_ref, .. } => version.model.messages.iter()
+                    .any(|decl| &decl.message_id == message_ref && decl.name == m.message_name),
+                _ => false,
+            }).collect::<Vec<_>>();
+            let start = match start_node_id.as_deref() {
+                Some(id) => matches.iter().find(|node| node.id == id)
+                    .copied().context("start_definition_changed")?,
+                None if matches.len() == 1 => matches[0],
+                None => bail!("start_definition_changed"),
+            };
             require_version_execution_on(conn, &sender, definition_id, version.version)?;
+            let process_id = selected_process_id.to_owned();
+            let start_node_id = start.id.clone();
             return Ok(MessageSelection::Ready(MessageSnapshot {
                 candidate: c.clone(),
                 message: m,
                 target: MessageDeliveryTarget::Start {
                     actor: sender,
+                    process_id,
+                    start_node_id,
                     version,
                     instance_id: Uuid::new_v4().to_string(),
                 },
@@ -20793,7 +29794,7 @@ pub fn record_message_failed(
             at_ms,
             None,
             EntryAuthority::Accepted(&entry),
-        )?;
+        &[])?;
     }
     let result = update_message_state_on(
         &tx,
@@ -20824,10 +29825,12 @@ pub fn deliver_message(
     let (composite, mut conn) = match plan_input {
         ProcessPlanInput::Supplied(plan) => {
             let (actor, source_id, initial) = match &prepared.target {
-                MessageDeliveryTarget::Start { actor, version, instance_id } => (
+                MessageDeliveryTarget::Start { actor, version, instance_id,
+                    process_id, start_node_id } => (
                     actor, instance_id.as_str(), Some((version.definition_id.as_str(),
                         version.version, plan.start_variables.as_ref()
-                            .context("message start variables missing")?))),
+                            .context("message start variables missing")?,
+                        Some(process_id.as_str()), Some(start_node_id.as_str())))),
                 MessageDeliveryTarget::Catch { actor, snapshot, .. } =>
                     (actor, snapshot.instance.instance_id.as_str(), None),
             };
@@ -20915,18 +29918,27 @@ pub fn deliver_message(
             MessageDeliveryTarget::Start {
                 version: old,
                 instance_id,
+                process_id: old_process_id,
+                start_node_id: old_start_node_id,
                 ..
             },
-            MessageDeliveryTarget::Start { actor, version, .. },
+            MessageDeliveryTarget::Start { actor, version, process_id, start_node_id, .. },
         ) => {
-            if old.version != version.version || old.model_sha256 != version.model_sha256 {
+            if old.version != version.version || old.model_sha256 != version.model_sha256
+                || old_process_id != process_id || old_start_node_id != start_node_id {
                 return Ok(None);
             }
             ensure!(
                 plan.start_instance_id.as_deref() == Some(instance_id.as_str()),
                 "message start plan identity is wrong"
             );
-            let node=version.model.nodes.iter().find(|n|matches!(&n.kind,ProcessNodeKind::MessageStart{message_ref,..}if version.model.messages.iter().any(|d|&d.message_id==message_ref&&d.name==fresh.message.message_name))).context("message start node missing")?;
+            let body = super::model::selected_body(&version.model, process_id, &[])?;
+            let node = body.nodes.iter().find(|node| node.id == *start_node_id
+                && matches!(&node.kind,ProcessNodeKind::MessageStart { message_ref, .. }
+                    if version.model.messages.iter().any(|declaration|
+                        &declaration.message_id == message_ref
+                            && declaration.name == fresh.message.message_name)))
+                .context("message Start differs from its exact selected body")?;
             ensure!(
                 delivered[0].node_id.as_deref() == Some(node.id.as_str()),
                 "message start event uses another node"
@@ -20947,11 +29959,14 @@ pub fn deliver_message(
                 plan.start_variables
                     .as_ref()
                     .context("message start inputs missing")?,
+                Some(process_id),
+                Some(start_node_id),
                 plan,
                 at_ms,
                 None,
                 Some(&fresh.message.key),
                 &entry,
+                ExecutionMode::Durable,
             )?;
             (
                 actor.clone(),
@@ -21007,7 +30022,7 @@ pub fn deliver_message(
                         && event.data["subscription_id"].as_str()
                             == Some(subscription.subscription_id.as_str()))
                     .context("receive task has no exact delivered message")?;
-                ensure!(completion_facts.len() == 1
+                let completed = completion_facts.len() == 1
                     && completion_facts[0].0 > delivery_index
                     && completion_facts[0].1.scope_id == subscription.scope_id
                     && completion_facts[0].1.node_id.as_deref()
@@ -21015,12 +30030,28 @@ pub fn deliver_message(
                     && completion_facts[0].1.data == serde_json::json!({
                         "subscription_id":subscription.subscription_id,
                         "attached_token_id":subscription.token_id,
-                        "message_id":fresh.message.key.message_id}),
+                        "message_id":fresh.message.key.message_id});
+                let blocked = completion_facts.is_empty()
+                    && plan.activity_io_results.iter().filter(|fact|
+                        fact.scope_id == subscription.scope_id
+                            && fact.node_id == subscription.node_id
+                            && fact.token_id == subscription.token_id
+                            && fact.resource_id.as_deref()
+                                == Some(subscription.subscription_id.as_str())
+                            && fact.resource_revision == Some(subscription.revision)
+                            && fact.result_event_index == delivery_index
+                            && matches!(&fact.disposition,
+                                ActivityIoResultDisposition::Blocked { .. })).count() == 1
+                    && !plan.consume_token_ids.contains(&subscription.token_id)
+                    && !plan.cancel_token_ids.contains(&subscription.token_id);
+                ensure!(completed || blocked,
                     "receive task completion differs from its factual message delivery");
-                ensure!(plan.event_sources.iter().all(|(index, source)|
-                    *index > completion_facts[0].0 || !plan.token_sources.iter().any(|(child, parent)|
-                        child == source && parent == &subscription.token_id)),
-                    "receive task continuation precedes its factual completion");
+                if completed {
+                    ensure!(plan.event_sources.iter().all(|(index, source)|
+                        *index > completion_facts[0].0 || !plan.token_sources.iter().any(|(child, parent)|
+                            child == source && parent == &subscription.token_id)),
+                        "receive task continuation precedes its factual completion");
+                }
             } else {
                 ensure!(completion_facts.is_empty(),
                     "non-receive message created a receive task completion");
@@ -21082,7 +30113,7 @@ pub fn deliver_message(
                 at_ms,
                 None,
                 EntryAuthority::Accepted(&entry),
-            )?;
+            &[])?;
             (
                 actor.clone(),
                 instance_on(&tx, actor, &snapshot.instance.instance_id, None)?,
@@ -21196,6 +30227,14 @@ pub fn prune_message_payloads(pool: &DbPool, at_ms: i64, limit: u32) -> Result<u
 }
 
 #[cfg(test)]
+fn only_persisted_timer(catalog: Vec<ProcessStartCatalogEntry>) -> ProcessTimerSummary {
+    let [entry] = catalog.as_slice() else { panic!("one TimerStart expected") };
+    let ProcessStartTrigger::TimerStart { persisted_timer: Some(timer), .. } = &entry.trigger
+    else { panic!("persisted TimerStart expected") };
+    timer.clone()
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
 
@@ -21241,14 +30280,14 @@ mod tests {
         let candidate = due_timers(&fixture.db, due, 32).unwrap().into_iter()
             .find(|candidate| candidate.timer_id == timer.timer_id).unwrap();
         let timer_snapshot = timer_snapshot(&fixture.db, &candidate).unwrap();
-        let plan = super::super::timers::plan_timer_fire(&timer_snapshot, due, None).unwrap();
+        let plan = super::super::timers::plan_timer_fire(&timer_snapshot, due, None, None).unwrap();
         assert!(plan.cancel_scope_roots.iter().any(|scope| scope != &started.instance_id));
         let before_rows = super::super::call_tests::transition_rows(&fixture);
         let mut connection = fixture.db.write().unwrap();
         let transaction = connection.transaction().unwrap();
         let rejection = apply_plan_on(&transaction, &started.instance_id,
             &fixture.owner.user_id, before.instance.revision, &plan, due,
-            None, EntryAuthority::PersistedReady).unwrap_err();
+            None, EntryAuthority::PersistedReady, &[]).unwrap_err();
         assert!(format!("{rejection:#}").contains(
             "ordinary scope closure lacks an independently accepted boundary activation"),
             "{rejection:#}");
@@ -21537,14 +30576,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pinned.model, model);
-        let (_, timer, _) = get_definition(&db, &actor, &draft.definition_id).unwrap();
-        let timer = timer.unwrap();
+        let (_, catalog) = get_definition(&db, &actor, &draft.definition_id).unwrap();
+        let timer = only_persisted_timer(catalog);
         assert_eq!(timer.status, ProcessTimerStatus::Pending);
         let third_due = timer.due_at_ms.unwrap() + 600_000;
         let candidates = due_timers(&db, third_due, 32).unwrap();
         assert_eq!(candidates.len(), 1);
         let snapshot = timer_snapshot(&db, &candidates[0]).unwrap();
-        let plan = super::super::timers::plan_timer_fire(&snapshot, third_due, None).unwrap();
+        let plan = super::super::timers::plan_timer_fire(&snapshot, third_due, None, None).unwrap();
         let fired = fire_timer(&db, &candidates[0], &actor, None, ProcessPlanInput::Supplied(&plan), third_due)
             .unwrap().unwrap();
         assert!(fired.cancelled_claims.is_empty());
@@ -21598,8 +30637,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let (_, timer, _) = get_definition(&db, &actor, &draft.definition_id).unwrap();
-        let due_at = timer.unwrap().due_at_ms.unwrap();
+        let (_, catalog) = get_definition(&db, &actor, &draft.definition_id).unwrap();
+        let due_at = only_persisted_timer(catalog).due_at_ms.unwrap();
         let candidate = due_timers(&db, due_at, 32).unwrap().remove(0);
         db.write().unwrap().execute(
             "UPDATE user_accounts SET is_active=0 WHERE id=?1", [&actor.user_id],
@@ -21614,8 +30653,8 @@ mod tests {
                 [&actor.user_id],
             )
             .unwrap();
-        let (_, timer, _) = get_definition(&db, &actor, &draft.definition_id).unwrap();
-        assert_eq!(timer.unwrap().last_reason.as_deref(), Some(reason.as_str()));
+        let (_, catalog) = get_definition(&db, &actor, &draft.definition_id).unwrap();
+        assert_eq!(only_persisted_timer(catalog).last_reason.as_deref(), Some(reason.as_str()));
         let details: String = db.read().unwrap().query_row(
             "SELECT details FROM audit_log WHERE action='process.timer_blocked' AND resource_id=?1 ORDER BY id DESC LIMIT 1",
             [&candidate.timer_id], |row| row.get(0),
@@ -21632,11 +30671,12 @@ mod tests {
             id: "Wait_1".into(), name: "Wait".into(),
             kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 1 } },
             repeat: None,
+            activity_io: None,
         });
         model.sequence_flows[0].target_id = "Wait_1".into();
         model.sequence_flows.push(ProcessSequenceFlow {
             id: "Flow_2".into(), source_id: "Wait_1".into(),
-            target_id: "End_1".into(), condition: None,
+            target_id: "End_1".into(), condition: None, call_start_node_id: None,
         });
         let draft = save_definition(
             &db,
@@ -21661,11 +30701,11 @@ mod tests {
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
         let command = stamp("start catch");
-        let plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
+        let plan = super::super::runtime::plan_start(&model, &model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&model), &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command), None).unwrap();
         let waiting = start_instance(&db, &actor, &command, &instance_id,
-            &draft.definition_id, 1, &json!({}), ProcessPlanInput::Supplied(&plan), 1_000).unwrap();
+            &draft.definition_id, 1, &json!({}), None, None, ProcessPlanInput::Supplied(&plan), 1_000).unwrap();
         assert_eq!(waiting.status, ProcessInstanceStatus::Waiting);
         assert_eq!(waiting.timers.len(), 1);
         let due = due_timers(&db, 2_000, 32).unwrap();
@@ -21711,11 +30751,12 @@ mod tests {
             id: "Wait_1".into(), name: "Wait".into(),
             kind: ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 1 } },
             repeat: None,
+            activity_io: None,
         });
         model.sequence_flows[1].target_id = "Wait_1".into();
         model.sequence_flows.push(ProcessSequenceFlow {
             id: "Flow_3".into(), source_id: "Wait_1".into(),
-            target_id: "End_1".into(), condition: None,
+            target_id: "End_1".into(), condition: None, call_start_node_id: None,
         });
         let draft = save_definition(
             &db,
@@ -21740,11 +30781,11 @@ mod tests {
         .unwrap();
         let instance_id = Uuid::new_v4().to_string();
         let command = stamp("start revocation");
-        let start_plan = super::super::runtime::plan_start(&model, &instance_id, &actor,
+        let start_plan = super::super::runtime::plan_start(&model, &model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&model), &instance_id, &actor,
             &draft.definition_id, 1, json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command), None).unwrap();
         let started = start_instance(&db, &actor, &command, &instance_id,
-            &draft.definition_id, 1, &json!({}), ProcessPlanInput::Supplied(&start_plan), 1_000).unwrap();
+            &draft.definition_id, 1, &json!({}), None, None, ProcessPlanInput::Supplied(&start_plan), 1_000).unwrap();
         let task_id = started.user_tasks[0].user_task_id.clone();
         let task_snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
         let completion_command = stamp("complete before timer");
@@ -21775,7 +30816,7 @@ mod tests {
         let due = due_timers(&db, 2_500, 32).unwrap();
         assert_eq!(due.len(), 1);
         let snapshot = timer_snapshot(&db, &due[0]).unwrap();
-        let fire_plan = super::super::timers::plan_timer_fire(&snapshot, 2_500, None).unwrap();
+        let fire_plan = super::super::timers::plan_timer_fire(&snapshot, 2_500, None, None).unwrap();
         let before: (i64, i64, i64) = db.read().unwrap().query_row(
             "SELECT (SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1),
                     (SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1),
@@ -21885,6 +30926,7 @@ mod tests {
                     output_mapping: Default::default(),
                 },
                 repeat: None,
+                activity_io: None,
             },
         );
         model.sequence_flows = vec![
@@ -21893,12 +30935,14 @@ mod tests {
                 source_id: "Start_1".into(),
                 target_id: "User_1".into(),
                 condition: None,
+                call_start_node_id: None,
             },
             ProcessSequenceFlow {
                 id: "Flow_2".into(),
                 source_id: "User_1".into(),
                 target_id: "End_1".into(),
                 condition: None,
+                call_start_node_id: None,
             },
         ];
         model
@@ -21983,7 +31027,7 @@ mod tests {
         let instance_id = Uuid::new_v4().to_string();
         let command = stamp("start");
         let start_plan = super::super::runtime::plan_start(
-            &model, &instance_id, &actor, &definition.definition_id, 1,
+            &model, &model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&model), &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command),
         None).unwrap();
@@ -21994,7 +31038,7 @@ mod tests {
             &instance_id,
             &definition.definition_id,
             1,
-            &json!({}),
+            &json!({}), None, None,
             ProcessPlanInput::Supplied(&start_plan),
             1_000,
         )
@@ -22164,7 +31208,7 @@ mod tests {
         let instance_id = Uuid::new_v4().to_string();
         let command = stamp("start inactive");
         let plan = super::super::runtime::plan_start(
-            &model, &instance_id, &actor, &definition.definition_id, 1,
+            &model, &model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&model), &instance_id, &actor, &definition.definition_id, 1,
             json!({}), super::super::runtime::StartCause::Manual, 1_000,
             super::super::runtime::test_support::manual_input(&command),
         None).unwrap();
@@ -22175,7 +31219,7 @@ mod tests {
             &instance_id,
             &definition.definition_id,
             1,
-            &json!({}),
+            &json!({}), None, None,
             ProcessPlanInput::Supplied(&plan),
             1_000,
         )
@@ -22602,7 +31646,7 @@ mod calendar_tests {
         assert_eq!(refreshed.0.draft_revision, stale.draft_revision + 1);
         assert_ne!(refreshed.1.model.calendar_pin, first.1.model.calendar_pin);
         assert_eq!(
-            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap(),
+            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap().0,
             first.1
         );
         let (list, total, _) = list_definitions(&fixture.db, &fixture.owner, 0, 10).unwrap();
@@ -22667,10 +31711,10 @@ mod calendar_tests {
             outcomes.iter().filter(|outcome| outcome.is_err()).count(),
             1
         );
-        let (definition, timer, _) =
+        let (definition, catalog) =
             get_definition(&fixture.db, &fixture.owner, &draft.definition_id).unwrap();
-        let version = get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap();
-        let timer = timer.unwrap();
+        let version = get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap().0;
+        let timer = only_persisted_timer(catalog);
         assert_eq!(timer.status, ProcessTimerStatus::Pending);
         assert_eq!(timer.due_at_ms, Some(version.published_at_ms + 1000));
         assert_eq!(timer.working_time.unwrap().due_offset_seconds, Some(0));
@@ -22804,10 +31848,10 @@ mod calendar_tests {
         .contains("128 KiB"));
         assert_eq!(
             get_definition(&fixture.db, &fixture.owner, &draft.definition_id).unwrap(),
-            (stale, old_timer, None)
+            (stale, old_timer)
         );
         assert_eq!(
-            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap(),
+            get_version(&fixture.db, &fixture.owner, &draft.definition_id, 1).unwrap().0,
             version
         );
         let conn = fixture.db.read().unwrap();
@@ -22972,10 +32016,10 @@ mod calendar_tests {
             }
             assert_eq!(
                 get_definition(&fixture.db, &fixture.owner, &version.definition_id).unwrap(),
-                (expected, original.1, original.2)
+                (expected, original.1)
             );
             assert_eq!(
-                get_version(&fixture.db, &fixture.owner, &version.definition_id, 1).unwrap(),
+                get_version(&fixture.db, &fixture.owner, &version.definition_id, 1).unwrap().0,
                 version
             );
             let conn = fixture.db.read().unwrap();

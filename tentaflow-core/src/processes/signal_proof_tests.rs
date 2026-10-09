@@ -140,6 +140,7 @@ fn mixed_message_signal_model(
                 ttl_seconds: 120,
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = if message_first {
@@ -187,7 +188,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
     let command = stamp("admit message before denied Signal");
     let variables = serde_json::to_value(&source.model.variables).unwrap();
     let unbounded = runtime::plan_start(
-        &source.model,
+        &source.model, &source.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&source.model),
         &instance_id,
         &fixture.owner,
         &source.definition_id,
@@ -214,7 +215,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&unbounded),
         at_ms,
     )
@@ -230,7 +231,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
         Ok(runtime::SignalAdmissionDecision::DenyPending)
     };
     let denied_plan = runtime::plan_start(
-        &source.model,
+        &source.model, &source.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&source.model),
         &instance_id,
         &fixture.owner,
         &source.definition_id,
@@ -275,7 +276,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
             &instance_id,
             &source.definition_id,
             source.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Supplied(&changed),
             at_ms,
         )
@@ -293,7 +294,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -320,7 +321,7 @@ fn same_plan_message_then_signal_commits_only_the_prior_admission_at_the_shared_
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -375,7 +376,7 @@ fn same_plan_signal_then_message_rolls_back_the_tentative_signal_at_the_shared_l
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -390,7 +391,7 @@ fn same_plan_signal_then_message_rolls_back_the_tentative_signal_at_the_shared_l
         &instance_id,
         &source.definition_id,
         source.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -416,7 +417,7 @@ fn both_same_plan_admission_orders_commit_exact_sources_below_the_shared_limit()
         let variables = serde_json::to_value(&source.model.variables).unwrap();
         let at_ms = chrono::Utc::now().timestamp_millis();
         let plan = runtime::plan_start(
-            &source.model,
+            &source.model, &source.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&source.model),
             &instance_id,
             &fixture.owner,
             &source.definition_id,
@@ -442,7 +443,7 @@ fn both_same_plan_admission_orders_commit_exact_sources_below_the_shared_limit()
             &instance_id,
             &source.definition_id,
             source.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Supplied(&forged),
             at_ms,
         )
@@ -459,7 +460,7 @@ fn both_same_plan_admission_orders_commit_exact_sources_below_the_shared_limit()
             &instance_id,
             &source.definition_id,
             source.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Canonical,
             at_ms,
         )
@@ -499,7 +500,7 @@ fn both_same_plan_admission_orders_commit_exact_sources_below_the_shared_limit()
             &instance_id,
             &source.definition_id,
             source.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Canonical,
             at_ms,
         )
@@ -521,12 +522,14 @@ fn parent_arm_then_call_model(
             name: "Open work".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
         ProcessNode {
             id: "Join".into(),
             name: "Join work".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
         ProcessNode {
             id: "Catch_1".into(),
@@ -536,6 +539,7 @@ fn parent_arm_then_call_model(
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         },
     ]);
     parent.sequence_flows = vec![
@@ -560,7 +564,7 @@ fn canonical_call_child_signal_sees_the_parent_arm_in_the_same_transaction() {
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &instance_id,
         &fixture.owner,
         &version.definition_id,
@@ -587,7 +591,7 @@ fn canonical_call_child_signal_sees_the_parent_arm_in_the_same_transaction() {
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&forged),
         at_ms,
     )
@@ -598,6 +602,17 @@ fn canonical_call_child_signal_sees_the_parent_arm_in_the_same_transaction() {
         "forged parent arm changed durable rows: {error:#}"
     );
 
+    let mut wrong_arrival = plan.clone();
+    wrong_arrival.events.iter_mut()
+        .find(|event| event.kind == "call_requested").unwrap()
+        .data["parent_arrival_edge_id"] = json!(Uuid::new_v4().to_string());
+    assert!(repository::start_instance(
+        &fixture.db, &fixture.owner, &command, &instance_id,
+        &version.definition_id, version.version, &variables, None, None,
+        repository::ProcessPlanInput::Supplied(&wrong_arrival), at_ms,
+    ).is_err());
+    assert_eq!(all_transition_rows(&fixture), before);
+
     let actual = repository::start_instance(
         &fixture.db,
         &fixture.owner,
@@ -605,7 +620,7 @@ fn canonical_call_child_signal_sees_the_parent_arm_in_the_same_transaction() {
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -638,7 +653,7 @@ fn canonical_call_child_signal_sees_the_parent_arm_in_the_same_transaction() {
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -669,7 +684,7 @@ fn canonical_called_child_signal_denies_the_factual_sixty_fifth_recipient() {
     let variables = serde_json::to_value(&parent.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(
-        &parent.model,
+        &parent.model, &parent.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&parent.model),
         &instance_id,
         &fixture.owner,
         &parent.definition_id,
@@ -696,7 +711,7 @@ fn canonical_called_child_signal_denies_the_factual_sixty_fifth_recipient() {
         &instance_id,
         &parent.definition_id,
         parent.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&forged),
         at_ms,
     )
@@ -714,7 +729,7 @@ fn canonical_called_child_signal_denies_the_factual_sixty_fifth_recipient() {
         &instance_id,
         &parent.definition_id,
         parent.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -757,7 +772,7 @@ fn canonical_called_child_signal_denies_the_factual_sixty_fifth_recipient() {
         &instance_id,
         &parent.definition_id,
         parent.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -780,12 +795,14 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
             name: "Open and emit".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
         ProcessNode {
             id: "Join".into(),
             name: "Join signal branches".into(),
             kind: ProcessNodeKind::ParallelGateway,
             repeat: None,
+            activity_io: None,
         },
         ProcessNode {
             id: "Catch_1".into(),
@@ -795,6 +812,7 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
                 output_mapping: BTreeMap::new(),
             },
             repeat: None,
+            activity_io: None,
         },
     ]);
     model.sequence_flows = vec![
@@ -811,7 +829,7 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &instance_id,
         &fixture.owner,
         &version.definition_id,
@@ -884,7 +902,7 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&forged),
         at_ms,
     )
@@ -902,7 +920,7 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -918,7 +936,7 @@ fn forged_earlier_signal_catch_close_cannot_reduce_a_sixty_five_recipient_cohort
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -1168,6 +1186,8 @@ fn accepted_message_start_frees_its_pending_slot_before_signal_admission() {
         &envelope(
             tentaflow_protocol::processes::ProcessMessageTarget::Start {
                 definition_id: version.definition_id.clone(),
+                process_id: None,
+                start_node_id: None,
             },
             json!({"source":"start"}),
         ),
@@ -1745,6 +1765,7 @@ fn accepted_message_catch_frees_its_slot_for_a_same_plan_directed_send() {
                 ttl_seconds: 120,
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.sequence_flows = vec![
@@ -1988,6 +2009,7 @@ fn incoming_other_sender_does_not_free_the_outgoing_senders_full_budget() {
                 instructions: "Acknowledge external preparation before receipt.".into(),
             },
             repeat: None,
+            activity_io: None,
         },
     );
     model.nodes.insert(
@@ -2118,7 +2140,7 @@ fn signal_admission_rejects_forged_source_payload_and_successors_before_real_com
     let variables = serde_json::to_value(&version.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(
-        &version.model,
+        &version.model, &version.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&version.model),
         &instance_id,
         &fixture.owner,
         &version.definition_id,
@@ -2200,7 +2222,7 @@ fn signal_admission_rejects_forged_source_payload_and_successors_before_real_com
             &instance_id,
             &version.definition_id,
             version.version,
-            &variables,
+            &variables, None, None,
             repository::ProcessPlanInput::Supplied(&mutant),
             at_ms,
         )
@@ -2218,7 +2240,7 @@ fn signal_admission_rejects_forged_source_payload_and_successors_before_real_com
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at_ms,
     )
@@ -2243,7 +2265,7 @@ fn signal_admission_rejects_forged_source_payload_and_successors_before_real_com
         &instance_id,
         &version.definition_id,
         version.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&plan),
         at_ms,
     )
@@ -2794,7 +2816,7 @@ fn canonical_call_start_retains_an_archived_target_incident_without_a_phantom_ch
     let variables = serde_json::to_value(&caller.model.variables).unwrap();
     let at_ms = chrono::Utc::now().timestamp_millis();
     let plan = runtime::plan_start(
-        &caller.model,
+        &caller.model, &caller.model.process_id, crate::processes::runtime::test_support::ordinary_start_id(&caller.model),
         &instance_id,
         &fixture.owner,
         &caller.definition_id,
@@ -2821,7 +2843,7 @@ fn canonical_call_start_retains_an_archived_target_incident_without_a_phantom_ch
         &instance_id,
         &caller.definition_id,
         caller.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Supplied(&forged),
         at_ms,
     )
@@ -2839,7 +2861,7 @@ fn canonical_call_start_retains_an_archived_target_incident_without_a_phantom_ch
         &instance_id,
         &caller.definition_id,
         caller.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
@@ -2866,7 +2888,7 @@ fn canonical_call_start_retains_an_archived_target_incident_without_a_phantom_ch
         &instance_id,
         &caller.definition_id,
         caller.version,
-        &variables,
+        &variables, None, None,
         repository::ProcessPlanInput::Canonical,
         at_ms,
     )
