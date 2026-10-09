@@ -126,7 +126,9 @@ export function shortPath(path) {
   const parts = String(path).split('/').filter(Boolean);
   const kept = parts.length > 5 && !parts.includes('…') ? [...parts.slice(0, 2), '…', ...parts.slice(-2)] : parts;
   const text = `/${kept.join('/')}`;
-  return text.length > PATH_MAX ? `${text.slice(0, PATH_MAX)}…` : text;
+  // Cut by code points: slicing UTF-16 units could split a surrogate pair.
+  const points = Array.from(text);
+  return points.length > PATH_MAX ? `${points.slice(0, PATH_MAX).join('')}…` : text;
 }
 
 const upperFirst = (text) => (text ? text.charAt(0).toLocaleUpperCase(I18n.getLanguage()) + text.slice(1) : text);

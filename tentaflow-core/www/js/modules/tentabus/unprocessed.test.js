@@ -445,6 +445,9 @@ test('a very deep path is shown as its first and last elements, the full text st
   assert.equal(shortPath(`/drzewo${'/dziecko'.repeat(128)}`), '/drzewo/dziecko/…/dziecko/dziecko');
   assert.equal(shortPath('/drzewo/dziecko/…/dziecko/dziecko'), '/drzewo/dziecko/…/dziecko/dziecko', 'a path the server already shortened is kept');
   assert.ok(shortPath(`/${'n'.repeat(500)}`).length <= 121);
+  const emoji = shortPath(`/${'😀'.repeat(200)}`);
+  assert.equal(emoji, `/${'😀'.repeat(119)}…`, 'the cut counts code points, not UTF-16 units');
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(emoji), 'no surrogate pair is split');
   const deep = `/drzewo${'/dziecko'.repeat(128)}: element is not allowed here`;
   assert.equal(plainCheckError(deep), '/drzewo/dziecko/…/dziecko/dziecko: ten element nie może tu wystąpić.');
   const rec = unprocessedRecord('drzewa', {

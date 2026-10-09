@@ -88,6 +88,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -376,6 +377,11 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
     let mut out = String::from("\\A(?:");
     let mut i = 0;
     let mut in_class = false;
+    // Items seen in the current class, and whether the last one expands to
+    // several characters (`\s`, `\d`, `\p{..}`), which cannot bound a range.
+    let mut class_items = 0usize;
+    let mut prev_multi = false;
+    let mut range_open = false;
     let mut prev_quantifier = false;
     // Without this, `a)|(b` would close the anchoring group opened above and
     // leave the two halves of the alternation unanchored.
@@ -388,6 +394,15 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
                     return Err("pattern ends with a lone backslash".to_string());
                 };
                 i += 2;
+                let multi = matches!(n, 'd' | 'D' | 's' | 'S' | 'p' | 'P');
+                if in_class {
+                    if multi && range_open {
+                        return Err(format!("\\{n} cannot be the end of a character range"));
+                    }
+                    class_items += 1;
+                    prev_multi = multi;
+                    range_open = false;
+                }
                 match n {
                     'n' | 'r' | 't' | '\\' | '|' | '.' | '-' | '^' | '?' | '*' | '+' | '{'
                     | '}' | '(' | ')' | '[' | ']' => {
@@ -446,6 +461,9 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
             }
             '[' => {
                 in_class = true;
+                class_items = 0;
+                prev_multi = false;
+                range_open = false;
                 out.push('[');
                 if chars.get(i + 1) == Some(&'^') {
                     out.push('^');
@@ -469,9 +487,25 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
             '-' if in_class && chars.get(i + 1) == Some(&'-') => {
                 return Err("'--' inside a character class is not supported".to_string());
             }
+            '-' if in_class => {
+                let literal = class_items == 0 || chars.get(i + 1) == Some(&']');
+                if prev_multi && !literal {
+                    return Err(
+                        "a multi-character escape cannot be the start of a character range"
+                            .to_string(),
+                    );
+                }
+                out.push('-');
+                range_open = !literal;
+                prev_multi = false;
+                class_items += 1;
+            }
             '&' | '~' if in_class => {
                 out.push('\\');
                 out.push(c);
+                class_items += 1;
+                prev_multi = false;
+                range_open = false;
             }
             '^' | '$' if !in_class => {
                 out.push('\\');
@@ -510,7 +544,11 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
             }
             _ => {
                 out.push(c);
-                if !in_class {
+                if in_class {
+                    class_items += 1;
+                    prev_multi = false;
+                    range_open = false;
+                } else {
                     prev_quantifier = false;
                 }
             }
@@ -1407,7 +1445,7 @@ impl Facets {
 struct SimpleType {
     builtin: Builtin,
     /// One entry per restriction step, base-most first; all must hold.
-    steps: Vec<Facets>,
+    steps: Vec<Arc<Facets>>,
 }
 
 impl SimpleType {
@@ -2003,10 +2041,10 @@ impl<'d> Compiler<'d> {
             enumeration,
         };
         if !step.is_unconstrained() {
-            st.steps.push(step);
+            st.steps.push(Arc::new(step));
         }
-        // Each derived type copies the steps of its base, so an unbounded
-        // chain would cost quadratic memory.
+        // Steps are shared with the base, so a derived type costs one pointer
+        // per step; the depth cap still bounds the chain a lookup walks.
         if st.steps.len() > MAX_SCHEMA_DEPTH {
             return Err(invalid(format!(
                 "type '{what}': restrictions are stacked through more than \
@@ -2214,6 +2252,17 @@ fn shorten_path(path: &str) -> String {
     cut
 }
 
+/// A payload-supplied name, cut to `MAX_NAME_CHARS` characters so a hostile
+/// document cannot inflate violation text (audit rows, logs).
+fn shorten_name(name: &str) -> String {
+    if name.chars().count() <= MAX_NAME_CHARS {
+        return name.to_string();
+    }
+    let mut cut: String = name.chars().take(MAX_NAME_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 fn violation(path: &str, msg: &str) -> SchemaError {
     SchemaError::Violation(format!("{}: {msg}", shorten_path(path)))
 }
@@ -2293,21 +2342,25 @@ fn check_attributes(
             return Err(violation(
                 &path(),
                 &format!(
-                    "attribute '{key}' is not supported (xsi:type and xsi:nil are not honoured)"
+                    "attribute '{}' is not supported (xsi:type and xsi:nil are not honoured)",
+                    shorten_name(key)
                 ),
             ));
         }
         let Some(decl) = declared.iter().find(|a| a.name == key) else {
             return Err(violation(
                 &path(),
-                &format!("attribute '{key}' is not declared"),
+                &format!("attribute '{}' is not declared", shorten_name(key)),
             ));
         };
         let value = attr
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
             .map_err(|_| violation(&path(), "malformed attribute value"))?;
         if let Err(why) = c.simple(decl.ty).check(&value) {
-            return Err(violation(&path(), &format!("attribute '{key}' {why}")));
+            return Err(violation(
+                &path(),
+                &format!("attribute '{}' {why}", shorten_name(key)),
+            ));
         }
         if decl.required {
             required_seen += 1;
@@ -2347,11 +2400,12 @@ fn enter_child(
     steps: &mut u64,
 ) -> Result<usize, SchemaError> {
     let Some(parent_idx) = stack.len().checked_sub(1) else {
-        return c
-            .roots
-            .get(name)
-            .copied()
-            .ok_or_else(|| violation("<root>", &format!("root element '{name}' is not declared")));
+        return c.roots.get(name).copied().ok_or_else(|| {
+            violation(
+                "<root>",
+                &format!("root element '{}' is not declared", shorten_name(name)),
+            )
+        });
     };
     let parent = &mut stack[parent_idx];
     let outcome = match &c.types[parent.ty] {
@@ -2984,6 +3038,13 @@ impl<'a> Inclusion<'a> {
         format!("/{}: {msg}", path.join("/"))
     }
 
+    fn work_limit(&self) -> Result<(), String> {
+        if self.work > MAX_COMPAT_WORK {
+            return Err(TOO_COMPLEX.to_string());
+        }
+        Ok(())
+    }
+
     fn budget(&mut self) -> Result<(), String> {
         self.pairs += 1;
         if self.pairs > self.max_pairs {
@@ -3040,8 +3101,14 @@ impl<'a> Inclusion<'a> {
         self.budget()?;
         let (sup_attrs, sup_content) = view(self.sup, sup_ty);
         let (sub_attrs, sub_content) = view(self.sub, sub_ty);
+        self.work += (sup_attrs.len() + sub_attrs.len()) as u64;
+        self.work_limit()?;
+        let sup_by_name: HashMap<&str, &AttrDecl> =
+            sup_attrs.iter().map(|a| (a.name.as_str(), a)).collect();
+        let sub_names: HashSet<&str> = sub_attrs.iter().map(|b| b.name.as_str()).collect();
+        let (sup_c, sub_c) = (self.sup, self.sub);
         for b in sub_attrs {
-            let Some(a) = sup_attrs.iter().find(|a| a.name == b.name) else {
+            let Some(a) = sup_by_name.get(b.name.as_str()) else {
                 return Err(self.fail(
                     path,
                     &format!(
@@ -3050,8 +3117,14 @@ impl<'a> Inclusion<'a> {
                     ),
                 ));
             };
-            self.simple(self.sup.simple(a.ty), self.sub.simple(b.ty))
-                .map_err(|m| self.fail(path, &format!("attribute '{}': {m}", b.name)))?;
+            self.simple(sup_c.simple(a.ty), sub_c.simple(b.ty))
+                .map_err(|m| {
+                    if m == TOO_COMPLEX {
+                        m
+                    } else {
+                        self.fail(path, &format!("attribute '{}': {m}", b.name))
+                    }
+                })?;
             if a.required && !b.required {
                 return Err(self.fail(
                     path,
@@ -3063,7 +3136,7 @@ impl<'a> Inclusion<'a> {
             }
         }
         for a in sup_attrs.iter().filter(|a| a.required) {
-            if !sub_attrs.iter().any(|b| b.name == a.name) {
+            if !sub_names.contains(a.name.as_str()) {
                 return Err(self.fail(
                     path,
                     &format!(
@@ -3075,9 +3148,13 @@ impl<'a> Inclusion<'a> {
         }
         match (sup_content, sub_content) {
             (ContentView::Empty, ContentView::Empty) => Ok(()),
-            (ContentView::Text(a), ContentView::Text(b)) => {
-                self.simple(a, b).map_err(|m| self.fail(path, &m))
-            }
+            (ContentView::Text(a), ContentView::Text(b)) => self.simple(a, b).map_err(|m| {
+                if m == TOO_COMPLEX {
+                    m
+                } else {
+                    self.fail(path, &m)
+                }
+            }),
             (ContentView::Empty, ContentView::Model(m)) => {
                 let no_children = match m {
                     Model::Nfa(n) => n.children.is_empty(),
@@ -3120,7 +3197,10 @@ impl<'a> Inclusion<'a> {
         }
     }
 
-    fn simple(&self, sup: &SimpleType, sub: &SimpleType) -> Result<(), String> {
+    fn simple(&mut self, sup: &SimpleType, sub: &SimpleType) -> Result<(), String> {
+        let patterns = |t: &SimpleType| t.steps.iter().map(|s| s.patterns.len()).sum::<usize>();
+        self.work += (1 + patterns(sup) + patterns(sub)) as u64;
+        self.work_limit()?;
         if !sub.builtin.widens_to(sup.builtin) {
             return Err(format!(
                 "type xs:{} ({}) is not contained in xs:{} ({})",
@@ -3151,6 +3231,18 @@ impl<'a> Inclusion<'a> {
                         .to_string(),
                 );
             }
+            // Each member runs every step of `sup`, which tries up to all of
+            // its patterns; the intersection above is quadratic in the sizes.
+            let widest = sub
+                .steps
+                .iter()
+                .map(|s| s.enumeration.len())
+                .max()
+                .unwrap_or(0);
+            let total: usize = sub.steps.iter().map(|s| s.enumeration.len()).sum();
+            let per_member = (1 + sup.steps.len() + patterns(sup)) as u64;
+            self.work += (widest * total) as u64 + members.len() as u64 * per_member;
+            self.work_limit()?;
             for member in members {
                 if sup.check(member).is_err() {
                     return Err(format!(
@@ -5202,5 +5294,118 @@ mod tests {
             XSD_OPS.validate(&other, b"<a/>"),
             Err(SchemaError::Invalid(_))
         ));
+    }
+
+    // ---- compatibility cost, shared facets, class ranges, payload names -----
+
+    /// Same attributes in both schemas; the first schema's shared type
+    /// enumerates `members`, the second's accepts them through `patterns`
+    /// decoys followed by the one pattern that matches.
+    fn attribute_pair(count: usize, members: usize, patterns: usize) -> (String, String) {
+        let attrs: String = (0..count)
+            .map(|i| format!(r#"<xs:attribute name="a{i}" type="T"/>"#))
+            .collect();
+        let enumeration: String = (0..members)
+            .map(|i| format!(r#"<xs:enumeration value="v{i}"/>"#))
+            .collect();
+        let decoys: String = (0..patterns)
+            .map(|i| format!(r#"<xs:pattern value="q{i}x"/>"#))
+            .chain(std::iter::once(
+                r#"<xs:pattern value="v[0-9]+"/>"#.to_string(),
+            ))
+            .collect();
+        let doc = |facets: &str| {
+            schema(&format!(
+                r#"<xs:simpleType name="T"><xs:restriction base="xs:string">{facets}</xs:restriction></xs:simpleType>
+                <xs:element name="r"><xs:complexType>{attrs}</xs:complexType></xs:element>"#
+            ))
+        };
+        (doc(&enumeration), doc(&decoys))
+    }
+
+    #[test]
+    fn simple_type_comparison_is_charged_to_the_compatibility_budget() {
+        let (members, patterns) = attribute_pair(500, 2048, 255);
+        // Backward compares the new schema (accepting) against the old one.
+        assert!(members.len() < MAX_SCHEMA_TEXT_BYTES && patterns.len() < MAX_SCHEMA_TEXT_BYTES);
+        let started = std::time::Instant::now();
+        let result = XSD_OPS.check_compatibility(&members, &patterns, Compatibility::Backward);
+        assert!(
+            matches!(&result, Err(SchemaError::LimitExceeded(m)) if m.contains("too complex")),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let (small_members, small_patterns) = attribute_pair(3, 4, 2);
+        XSD_OPS
+            .check_compatibility(&small_members, &small_patterns, Compatibility::Backward)
+            .unwrap();
+    }
+
+    #[test]
+    fn derived_types_share_the_facets_of_their_base() {
+        let enumeration: String = (0..100)
+            .map(|i| format!(r#"<xs:enumeration value="v{i}"/>"#))
+            .collect();
+        let derived: String = (0..300)
+            .map(|i| {
+                format!(
+                    r#"<xs:simpleType name="D{i}"><xs:restriction base="B"><xs:maxLength value="{}"/></xs:restriction></xs:simpleType>"#,
+                    10 + i
+                )
+            })
+            .collect();
+        let elements: String = (0..300)
+            .map(|i| el(&format!("e{i}"), &format!("D{i}"), ""))
+            .collect();
+        let text = schema(&format!(
+            r#"<xs:simpleType name="B"><xs:restriction base="xs:string">{enumeration}</xs:restriction></xs:simpleType>
+            {derived}<xs:element name="r"><xs:complexType><xs:sequence>{elements}</xs:sequence></xs:complexType></xs:element>"#
+        ));
+        let CompiledSchema::Xsd(c) = compiled(&text) else {
+            panic!("expected an xsd schema");
+        };
+        let bases: Vec<&Arc<Facets>> = c
+            .types
+            .iter()
+            .filter_map(|t| match t {
+                TypeDef::Simple(s) if s.steps.len() == 2 => Some(&s.steps[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bases.len(), 300);
+        assert!(bases.iter().all(|b| Arc::ptr_eq(b, bases[0])));
+        assert_eq!(bases[0].enumeration.len(), 100);
+    }
+
+    #[test]
+    fn multi_character_escapes_cannot_bound_a_class_range() {
+        for bad in [r"[\s-~]", r"[\t-\s]", r"[\d-z]", r"[a-\d]", r"[\p{L}-z]"] {
+            assert!(build_pattern(bad).is_err(), "{bad} must be refused");
+        }
+        for good in [
+            r"[\s]", r"[-\s]", r"[\s-]", r"[a-z\s]", r"[\sa-z]", r"[\d\s]",
+        ] {
+            assert!(build_pattern(good).is_ok(), "{good} must be accepted");
+        }
+    }
+
+    #[test]
+    fn payload_names_are_shortened_in_violations() {
+        let text = seq(&el("a", "xs:string", ""));
+        let long = "n".repeat(1_000_000);
+        let wide = "é".repeat(1_000_000);
+        for name in [&long, &wide] {
+            for doc in [
+                format!(r#"<r {name}="1"><a/></r>"#),
+                format!(r#"<r xsi:{name}="1"><a/></r>"#),
+                format!(r#"<{name}/>"#),
+            ] {
+                let msg = violation_of(&text, &doc);
+                assert!(msg.chars().count() < 600, "{}", msg.chars().count());
+            }
+        }
+        let typed = element_with(r#"<xs:sequence/><xs:attribute name="x" type="xs:int"/>"#);
+        let msg = violation_of(&typed, &format!(r#"<r {long}="1"/>"#));
+        assert!(msg.chars().count() < 600);
     }
 }
