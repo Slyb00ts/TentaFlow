@@ -149,7 +149,6 @@ fn collection_null_object_and_list_items_stay_frozen_after_a_real_sibling_change
                 .find(|row| row.occurrence_id == next.occurrence_id).unwrap()
                 .item = json!({"changed":"after repetition entry"});
             let before_rows = super::call_tests::transition_rows(&fixture);
-            assert_eq!(before_rows.len(), super::call_tests::TRANSITION_TABLES.len());
             let error = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
                 &started.instance_id, &task.user_task_id, snapshot.instance.revision,
                 &outputs, None, repository::ProcessPlanInput::Supplied(&forged), at).unwrap_err();
@@ -274,7 +273,6 @@ fn nonboolean_posttest_preserves_accepted_source_and_blocks_parent_continuation(
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id,
         &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let before = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     let mut forged = plan.clone();
     forged.repetition_groups[0].status = ProcessRepetitionGroupStatus::Completed;
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,
@@ -321,7 +319,6 @@ fn loop_mapping_error_keeps_accepted_work_fact_and_no_next_ordinal() {
     let plan = runtime::plan_user_completion(&snapshot, &task.user_task_id,
         &outputs, None, at, human_input(&snapshot, &task.user_task_id, &command), None).unwrap();
     let before = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     let mut forged = plan.clone();
     forged.repetition_occurrences[0].item = json!("foreign loop item");
     assert!(repository::complete_user_task(&fixture.db, &fixture.owner, &command,

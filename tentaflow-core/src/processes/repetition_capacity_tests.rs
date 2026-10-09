@@ -334,7 +334,6 @@ fn assert_capacity_forgeries(fixture: &Fixture, instance_id: &str,
     snapshot: &repository::RuntimeSnapshot, task_id: &str,
     command: &repository::CommandStamp, outputs: &Value, canonical: &RuntimePlan, at_ms: i64) {
     let before = super::call_tests::transition_rows(fixture);
-    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     let capacity = canonical.repetition_capacity.as_ref().expect("canonical capacity latch");
     assert_eq!(capacity.reason, "repetition_bytes");
     assert!(canonical.events.iter().any(|event| event.kind == "user_task_completed"));
@@ -895,7 +894,6 @@ fn aggregate_limit_retains_two_accepted_sources_and_rejects_forged_finite_codes(
             &command, &outputs, at_ms);
         if ordinal == 1 {
             let before = super::call_tests::transition_rows(&fixture);
-            assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
             for both_codes in [false, true] {
                 let mut forged = canonical.clone();
                 let blocked = forged.events.iter_mut().find(|event|
@@ -1018,7 +1016,6 @@ async fn capacity_latch_preserves_real_completed_service_evidence_and_cancels_op
         assert!(matches!(&capacity.accepted_input,
             repository::AcceptedInputRef::Human { .. }));
         let before = super::call_tests::transition_rows(&fixture);
-        assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
         let mut unrelated_verification = canonical.clone();
         unrelated_verification.complete_user_task_ids.push(verification_id.clone());
         assert_rejected_unchanged(&fixture, &started.instance_id, &waiting,
@@ -1604,7 +1601,6 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
         event.kind == "repetition_occurrence_started").unwrap();
     let occurrence_token_id = occurrence_event.data["token_id"].as_str().unwrap().to_owned();
     let before_start = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before_start.len(), super::call_tests::TRANSITION_TABLES.len());
     let mut wrong_start_source = start_plan.clone();
     wrong_start_source.events.iter_mut().find(|event|
         event.kind == "repetition_occurrence_started").unwrap().data["token_id"] =
@@ -1675,7 +1671,6 @@ fn capacity_latch_cancels_an_unrelated_manual_wait_without_acknowledgment() {
     assert_eq!((opened, acknowledged), (1,0));
     drop(conn);
     let before = super::call_tests::transition_rows(&fixture);
-    assert_eq!(before.len(), super::call_tests::TRANSITION_TABLES.len());
     assert!(repository::acknowledge_manual_task(&reopened, &fixture.owner,
         &manual_command, &started.instance_id, &manual_id, snapshot.instance.revision,
         repository::ProcessPlanInput::Supplied(&manual_plan), at_ms).is_err());

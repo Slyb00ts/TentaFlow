@@ -325,6 +325,41 @@ pub(super) const TRANSITION_TABLES: [&str; 18] = [
     "bpmn_repetition_occurrences",
 ];
 
+/// Process tables that a transition snapshot deliberately leaves out, with the reason.
+/// A table in neither list means a transition test would silently miss its rows.
+const NON_TRANSITION_TABLES: [&str; 6] = [
+    // Authoring tables: a transition reads the pinned version but never writes them.
+    "bpmn_definitions",
+    "bpmn_versions",
+    // Publication-time call pins, snapshotted by `call_pin_tests`.
+    "bpmn_call_dependencies",
+    "bpmn_call_pins",
+    // Signal rows are appended to the snapshot by the signal tests that observe them.
+    "bpmn_signal_emissions",
+    "bpmn_signal_receipts",
+];
+
+#[test]
+fn transition_snapshots_cover_every_process_table() {
+    let fixture = Fixture::new();
+    let conn = fixture.db.read().unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'bpmn\\_%' ESCAPE '\\' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let uncovered = tables
+        .iter()
+        .filter(|table| !TRANSITION_TABLES.contains(&table.as_str())
+            && !NON_TRANSITION_TABLES.contains(&table.as_str()))
+        .collect::<Vec<_>>();
+    assert!(uncovered.is_empty(), "unclassified process tables: {uncovered:?}");
+    assert!(TRANSITION_TABLES.iter().all(|table| tables.iter().any(|name| name == table)),
+        "a snapshotted table no longer exists");
+}
+
 pub(super) fn transition_rows(f: &Fixture) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     let conn = f.db.read().unwrap();
     TRANSITION_TABLES
