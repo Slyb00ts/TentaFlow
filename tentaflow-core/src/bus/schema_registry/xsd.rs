@@ -101,7 +101,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -111,7 +112,6 @@ use regex_automata::hybrid::dfa::{
 };
 use regex_automata::nfa::thompson::pikevm::PikeVM;
 use regex_automata::nfa::thompson::{self, WhichCaptures};
-use regex_automata::util::pool::Pool;
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 
@@ -153,11 +153,13 @@ const PATTERN_NFA_LIMIT: usize = 256 * 1024;
 /// `PATTERN_CACHE_FLOOR` and refused above `PATTERN_CACHE_MAX`.
 const PATTERN_CACHE_FLOOR: usize = 16 * 1024;
 const PATTERN_CACHE_MAX: usize = 1024 * 1024;
-/// Lazy-DFA caches a pattern is budgeted for: one per concurrent validator.
-/// The pool hands every concurrently running match its own cache and keeps
-/// it, so a pattern holds as many caches as it has seen simultaneous matches;
-/// `pattern_memory` accounts for this many, each further concurrent match
-/// adds at most `cache_capacity + fresh_cache_bytes`.
+/// Lazy-DFA caches a pattern is budgeted for, and the number of schema
+/// validations the process runs at once (`ValidationGate`). A validation
+/// holds at most one cache of a pattern at a time, so no pattern ever has
+/// more than this many caches alive, retained or transient; `CachePool`
+/// keeps at most this many. `pattern_memory` accounts for exactly this many.
+/// Effect: a node validates at most `POOLED_CACHES` documents concurrently
+/// (others wait on a blocking thread), however large the blocking pool grows.
 const POOLED_CACHES: usize = 4;
 /// Memory proxy per schema, charged per pattern as
 /// `nfa.memory_usage() + POOLED_CACHES x (cache_capacity + fresh_cache_bytes)`:
@@ -674,14 +676,144 @@ struct Matcher {
     /// Pike VM work per input byte: NFA states plus every sparse transition
     /// range and union alternate a step may have to scan.
     width: u64,
-    /// One lazy-DFA cache per concurrently running match, reused across
-    /// matches (a fresh cache zeroes NFA-sized sets and recomputes every
+    /// One lazy-DFA cache per concurrently running match (at most
+    /// `POOLED_CACHES`, see `ValidationGate`), reused across matches (a fresh cache zeroes NFA-sized sets and recomputes every
     /// transition, so it is charged when built).
-    caches: DfaCachePool,
+    caches: CachePool,
     memory: usize,
 }
 
-type DfaCachePool = Pool<MatchCache, Box<dyn Fn() -> MatchCache + Send + Sync>>;
+/// Process-wide counting gate: at most `POOLED_CACHES` validations run at
+/// once. Validation of one record never re-enters validation, so a permit
+/// is never requested while one is held and the gate cannot deadlock.
+struct ValidationGate {
+    running: Mutex<usize>,
+    freed: Condvar,
+}
+
+struct ValidationPermit(&'static ValidationGate);
+
+static VALIDATION_GATE: ValidationGate = ValidationGate {
+    running: Mutex::new(0),
+    freed: Condvar::new(),
+};
+
+impl ValidationGate {
+    /// Blocks the calling (blocking-pool) thread until a slot is free.
+    fn enter(&'static self) -> ValidationPermit {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        while *running >= POOLED_CACHES {
+            running = self
+                .freed
+                .wait(running)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *running += 1;
+        ValidationPermit(self)
+    }
+}
+
+impl Drop for ValidationPermit {
+    fn drop(&mut self) {
+        let mut running = self
+            .0
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *running -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl std::fmt::Debug for CachePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachePool").finish_non_exhaustive()
+    }
+}
+
+/// Fixed-capacity cache pool: a lease takes a free cache or builds one, and
+/// on release the cache is kept only while fewer than `POOLED_CACHES` are
+/// free, so retained memory is bounded by the pool itself.
+struct CachePool {
+    free: Mutex<Vec<MatchCache>>,
+    make: Box<dyn Fn() -> MatchCache + Send + Sync>,
+    #[cfg(test)]
+    leased: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    peak_leased: std::sync::atomic::AtomicUsize,
+}
+
+struct CacheLease<'a> {
+    pool: &'a CachePool,
+    slot: Option<MatchCache>,
+}
+
+impl CachePool {
+    fn new(make: Box<dyn Fn() -> MatchCache + Send + Sync>) -> Self {
+        CachePool {
+            free: Mutex::new(Vec::new()),
+            make,
+            #[cfg(test)]
+            leased: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_leased: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self) -> CacheLease<'_> {
+        let reused = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.leased.fetch_add(1, SeqCst) + 1;
+            self.peak_leased.fetch_max(now, SeqCst);
+        }
+        CacheLease {
+            pool: self,
+            slot: Some(reused.unwrap_or_else(|| (self.make)())),
+        }
+    }
+}
+
+impl Deref for CacheLease<'_> {
+    type Target = MatchCache;
+    fn deref(&self) -> &MatchCache {
+        self.slot
+            .as_ref()
+            .expect("lease holds a cache until dropped")
+    }
+}
+
+impl DerefMut for CacheLease<'_> {
+    fn deref_mut(&mut self) -> &mut MatchCache {
+        self.slot
+            .as_mut()
+            .expect("lease holds a cache until dropped")
+    }
+}
+
+impl Drop for CacheLease<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.pool
+            .leased
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(cache) = self.slot.take() {
+            let mut free = self
+                .pool
+                .free
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if free.len() < POOLED_CACHES {
+                free.push(cache);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct MatchCache {
@@ -785,7 +917,7 @@ fn build_pattern(source: &str) -> Result<Matcher, String> {
         dfa,
         pike,
         cache_capacity,
-        caches: Pool::new(Box::new(move || MatchCache {
+        caches: CachePool::new(Box::new(move || MatchCache {
             cache: pool_dfa.create_cache(),
             fresh: true,
         })),
@@ -4031,6 +4163,7 @@ impl SchemaKindOps for XsdOps {
         let CompiledSchema::Xsd(c) = compiled else {
             return Err(invalid("validate called with a non-xsd compiled schema"));
         };
+        let _permit = VALIDATION_GATE.enter();
         let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_STEPS));
         let verdict = validate_with(c, payload, &mut budget);
         shared.spend(budget.used);
@@ -6610,6 +6743,54 @@ mod tests {
         XSD_OPS.validate(&c, doc.as_bytes()).unwrap();
         eprintln!("20k IBANs: {:?}", started.elapsed());
         within(started, 30);
+    }
+
+    /// 32 threads validate against one hot schema. The gate keeps at most
+    /// `POOLED_CACHES` caches of the pattern alive at once and nothing
+    /// deadlocks; without the gate the peak reaches the thread count.
+    #[test]
+    fn concurrent_validations_never_hold_more_caches_than_the_pool_bound() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let text = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(r#"<xs:pattern value="[a-z]+\d{3}"/>"#)
+        ));
+        let shared = Arc::new(compiled(&text));
+        let CompiledSchema::Xsd(inner) = &*shared else {
+            panic!("expected an xsd schema");
+        };
+        let matcher = inner
+            .types
+            .iter()
+            .find_map(|t| match t {
+                TypeDef::Simple(s) => s.steps.iter().find_map(|f| f.patterns.first()),
+                TypeDef::Complex(_) => None,
+            })
+            .map(|p| Arc::clone(&p.matcher))
+            .expect("the schema has one pattern");
+        let doc = format!("<r>{}123</r>", "abcdefgh".repeat(2000));
+        let start = Arc::new(std::sync::Barrier::new(32));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let (shared, doc, start) = (Arc::clone(&shared), doc.clone(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..20 {
+                        XSD_OPS.validate(&shared, doc.as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let peak = matcher.caches.peak_leased.load(SeqCst);
+        assert!(peak >= 1, "the pattern was never matched");
+        assert!(
+            peak <= POOLED_CACHES,
+            "{peak} caches were alive at once, the bound is {POOLED_CACHES}"
+        );
+        assert!(matcher.caches.free.lock().unwrap().len() <= POOLED_CACHES);
     }
 
     #[test]

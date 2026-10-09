@@ -200,6 +200,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   budowy wzorca podaje powód (zły zakres powtórzeń, zbyt głębokie
   zagnieżdżenie, zakres znaków od końca) i dashboard opisuje go po polsku. Wybór efektywnej wersji tematu z
   wycofaniami czyta tylko numery i skróty wersji, a tekst wybranej jednej.
+  **Węzeł waliduje XSD najwyżej czterema dokumentami naraz** (`POOLED_CACHES`,
+  wspólna bramka dla publikacji, REST, podglądu i synchronizacji): dalsze
+  walidacje czekają na wątku blokującym. Dzięki temu wzorzec ma w pamięci co
+  najwyżej cztery cache'e leniwego DFA (zachowane i chwilowe), tyle ile liczy
+  `pattern_memory`, niezależnie od rozmiaru puli wątków; pula cache'y ma stałą
+  pojemność i nadmiarowe cache'e są zwalniane.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo
