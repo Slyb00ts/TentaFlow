@@ -170,12 +170,72 @@ impl ProjectDirectory {
         Ok(out)
     }
 
+    /// What Project Studio grants the ACTOR in a project, with no administrator
+    /// exception. An absence is handed over by the person's manager, who need
+    /// not belong to the person's projects and must not see or move their work.
+    pub fn actor_access(&self, project_id: &str, actor: &str) -> Result<Option<ProjectAccessWire>> {
+        let Some(record) = repository::get_project(&self.org_id, project_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(repository::project_access(&record, actor, false)?))
+    }
+
+    /// True when the actor may read `area` of the project.
+    pub fn actor_reads(&self, project_id: &str, actor: &str, areas: &[ProjectArea]) -> Result<bool> {
+        Ok(self.actor_access(project_id, actor)?.is_some_and(|access| {
+            areas
+                .iter()
+                .any(|area| access.allows(*area, ProjectPermissionLevel::Read))
+        }))
+    }
+
+    /// True when the actor may reassign `area` work: a writer there or a
+    /// project administrator.
+    fn actor_reassigns(&self, project_id: &str, actor: &str, area: ProjectArea) -> Result<bool> {
+        Ok(self.actor_access(project_id, actor)?.is_some_and(|access| {
+            access.has_access
+                && (access.can_manage_members
+                    || access.allows(area, ProjectPermissionLevel::Write))
+        }))
+    }
+
     fn sync_index(&self, project_id: &str, pool: &crate::db::DbPool) -> Result<()> {
         let record = repository::get_project(&self.org_id, project_id)?
             .ok_or_else(|| anyhow::anyhow!("project missing"))?;
-        while crate::project_studio::task_index::sync_project(&record, pool, 256)?.lag != 0 {}
-        Ok(())
+        settle(
+            || Ok(crate::project_studio::task_index::sync_project(&record, pool, 256)?.lag),
+            SYNC_INDEX_MAX_ROUNDS,
+            SYNC_INDEX_DEADLINE,
+        )
+        .map_err(|_| {
+            crate::services::org_structure::error::OrgStructureError::Db(format!(
+                "task index of project {project_id} did not settle"
+            ))
+        })
     }
+}
+
+/// Rounds of 256 entries one index sync may take, and the time it may spend:
+/// a project whose index never settles must not hold a worker forever.
+const SYNC_INDEX_MAX_ROUNDS: usize = 64;
+const SYNC_INDEX_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Runs `round` until it reports no lag, at most `max_rounds` times and until `deadline`.
+fn settle<L: PartialEq + Default>(
+    mut round: impl FnMut() -> Result<L>,
+    max_rounds: usize,
+    deadline: std::time::Duration,
+) -> std::result::Result<(), ()> {
+    let until = std::time::Instant::now() + deadline;
+    for _ in 0..max_rounds {
+        if round().map_err(|_| ())? == L::default() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= until {
+            break;
+        }
+    }
+    Err(())
 }
 
 /// `task:<project>:<task>` and friends: the project id has no colon.
@@ -254,6 +314,15 @@ impl HandoverProvider for TaskProvider<'_> {
     fn list(&self, cx: &ListCx<'_>) -> Result<Vec<Held>> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
+            if cx.reason == Reason::Absence
+                && !self.projects.actor_reads(
+                    &facts.id,
+                    cx.actor,
+                    &[ProjectArea::Tasks, ProjectArea::Board],
+                )?
+            {
+                continue;
+            }
             if cx.reason == Reason::ProjectRemoval {
                 if let Some(removed_project) = cx.project {
                     let record = repository::get_project(&self.projects.org_id, &facts.id)?
@@ -338,6 +407,13 @@ impl WorkProvider for TaskProvider<'_> {
         };
         if facts.archived {
             return Ok(Step::Refused("project_archived"));
+        }
+        if cx.reason == Reason::Absence
+            && !self
+                .projects
+                .actor_reassigns(project_id, cx.actor, ProjectArea::Tasks)?
+        {
+            return Ok(Step::Refused("not_permitted"));
         }
         let taker = match taker_of(
             item,
@@ -517,6 +593,13 @@ impl HandoverProvider for TestItemProvider<'_> {
     fn list(&self, cx: &ListCx<'_>) -> Result<Vec<Held>> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
+            if cx.reason == Reason::Absence
+                && !self
+                    .projects
+                    .actor_reads(&facts.id, cx.actor, &[ProjectArea::Tests])?
+            {
+                continue;
+            }
             if cx.reason == Reason::ProjectRemoval {
                 if let Some(removed_project) = cx.project {
                     let record = repository::get_project(&self.projects.org_id, &facts.id)?
@@ -577,6 +660,13 @@ impl WorkProvider for TestItemProvider<'_> {
         };
         if facts.archived {
             return Ok(Step::Refused("project_archived"));
+        }
+        if cx.reason == Reason::Absence
+            && !self
+                .projects
+                .actor_reassigns(project_id, cx.actor, ProjectArea::Tests)?
+        {
+            return Ok(Step::Refused("not_permitted"));
         }
         let taker = match taker_of(
             item,
@@ -903,6 +993,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_index_sync_stops_after_its_round_budget_and_after_its_deadline() {
+        let mut rounds = 0;
+        let never = settle(
+            || {
+                rounds += 1;
+                Ok(1u64)
+            },
+            5,
+            std::time::Duration::from_secs(60),
+        );
+        assert!(never.is_err());
+        assert_eq!(rounds, 5);
+
+        let mut slow_rounds = 0;
+        let slow = settle(
+            || {
+                slow_rounds += 1;
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                Ok(1u64)
+            },
+            1000,
+            std::time::Duration::from_millis(50),
+        );
+        assert!(slow.is_err());
+        assert!(slow_rounds < 10, "{slow_rounds}");
+
+        let mut left = 3u64;
+        assert!(settle(
+            || {
+                left -= 1;
+                Ok(left)
+            },
+            10,
+            std::time::Duration::from_secs(1)
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn keys_split_into_project_and_item() {
         assert_eq!(parse_key("task:p-1:t-9", "task"), Some(("p-1", "t-9")));
         assert_eq!(parse_key("test:p-1:i-2", "test"), Some(("p-1", "i-2")));
@@ -910,6 +1039,160 @@ mod tests {
         assert_eq!(parse_key("member:p-1", "task"), None);
         // A prefix must be a whole word: "tasks:..." is not a task key.
         assert_eq!(parse_key("tasks:p-1:t-9", "task"), None);
+    }
+
+    #[tokio::test]
+    async fn an_absence_is_moved_only_by_an_asker_who_may_write_the_work() {
+        use crate::project_studio::models::MemberInput;
+        let root = tempfile::tempdir().expect("actual project storage");
+        let _ = ps_db::init(&root.path().join("projects.db"));
+        let state = crate::dispatch::AppState::for_test();
+        let org = crate::services::org::DEFAULT_ORG_ID;
+        let mut users = Vec::new();
+        for name in ["abs-owner", "abs-giver", "abs-taker", "abs-stranger"] {
+            let id = crate::db::repository::create_user_account(
+                &state.db,
+                name,
+                "hash",
+                name,
+                &format!("{name}@example.test"),
+            )
+            .expect("actual account");
+            crate::services::org::add_membership(&state.db, org, &id, "role-org-viewer", "test")
+                .expect("actual organization member");
+            users.push(id);
+        }
+        let (owner, giver, taker, stranger) = (&users[0], &users[1], &users[2], &users[3]);
+        let grant = |user: &str| MemberInput {
+            user_id: user.into(),
+            functions: vec!["developer".into(), "tester".into()],
+            project_admin: false,
+            expires_at: None,
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = root.path().join(&id);
+        std::fs::create_dir_all(dir.join("files")).expect("actual project directory");
+        repository::create_project(
+            &id,
+            org,
+            &format!("Absence {id}"),
+            "",
+            "custom",
+            "[\"tasks\",\"tests\"]",
+            owner,
+            &dir.to_string_lossy(),
+            "",
+            None,
+            false,
+            false,
+            false,
+            &[grant(giver), grant(taker)],
+        )
+        .expect("actual project");
+        let pool = project_db::open(&id).expect("content");
+        let task = tasks::create_task(
+            &pool,
+            &tasks::TaskInput {
+                task_type: "technical",
+                title: "Held while away",
+                description_md: "",
+                severity: "",
+                priority: "medium",
+                status: "todo",
+                assigned_to: giver,
+                due_date: "",
+                parent_task_id: None,
+                links_json: "[]",
+                attachments_json: "[]",
+            },
+            owner,
+        )
+        .expect("actual held task");
+        let item_id = uuid::Uuid::new_v4().to_string();
+        {
+            let conn = pool.write().expect("content writer");
+            conn.execute(
+                "INSERT INTO test_runs (run_id, run_no, name, assignment_mode, status, created_by) \
+                 VALUES ('abs-run', 1, 'Regression', 'single', 'running', ?1)",
+                [owner],
+            )
+            .expect("actual run");
+            conn.execute(
+                "INSERT INTO test_run_items (item_id, run_id, case_id, case_title, case_version, \
+                    position, assigned_to, status) VALUES (?1, 'abs-run', 'c-1', 'Login', 1, 0, ?2, 'pending')",
+                [&item_id, giver],
+            )
+            .expect("actual run item");
+        }
+        let directory = ProjectDirectory::new(org, &state.db);
+        directory.sync_index(&id, &pool).expect("current location");
+        let day = chrono::Utc::now().date_naive();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let cx = |actor| ApplyCx {
+            org_id: org,
+            actor,
+            actor_is_admin: false,
+            handover_id: &operation,
+            from_user: giver,
+            reason: Reason::Absence,
+            date: day,
+            today: day,
+            note: "Away",
+            note_digest: "",
+        };
+        let task_plan = Planned {
+            key: task_key(&id, &task.task_id),
+            category: Category::Task,
+            title: "Held while away".into(),
+            project_id: Some(id.clone()),
+            taker: Some(taker.clone()),
+        };
+        let item_plan = Planned {
+            key: test_key(&id, &item_id),
+            category: Category::TestItem,
+            title: "Login".into(),
+            project_id: Some(id.clone()),
+            taker: Some(taker.clone()),
+        };
+        let tasks_of = TaskProvider {
+            projects: &directory,
+        };
+        let items_of = TestItemProvider {
+            projects: &directory,
+        };
+
+        // Somebody who is not in the project is refused, however the key was learned.
+        assert!(matches!(
+            tasks_of.apply(&cx(stranger), &task_plan).expect("answered"),
+            Step::Refused("not_permitted")
+        ));
+        assert!(matches!(
+            items_of.apply(&cx(stranger), &item_plan).expect("answered"),
+            Step::Refused("not_permitted")
+        ));
+        assert_eq!(
+            tasks::get_task(&pool, &task.task_id).unwrap().unwrap().assigned_to,
+            *giver
+        );
+        assert_eq!(
+            runs::get_run_item(&pool, &item_id).unwrap().unwrap().assigned_to,
+            *giver
+        );
+
+        // The project's own owner may.
+        assert!(matches!(
+            tasks_of.apply(&cx(owner), &task_plan).expect("answered"),
+            Step::Done(_)
+        ));
+        assert!(matches!(
+            items_of.apply(&cx(owner), &item_plan).expect("answered"),
+            Step::Done(_)
+        ));
+        assert_eq!(
+            tasks::get_task(&pool, &task.task_id).unwrap().unwrap().assigned_to,
+            *taker
+        );
+        std::mem::forget(root);
     }
 
     #[tokio::test]
@@ -1022,6 +1305,7 @@ mod tests {
                     conn: &conn,
                     org_id: org,
                     user_id: giver,
+                    actor: owner,
                     reason,
                     date: day,
                     project,

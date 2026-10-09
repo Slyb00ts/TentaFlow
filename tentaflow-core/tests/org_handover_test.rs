@@ -1760,3 +1760,208 @@ async fn temporary_task_handover_and_return_record_actual_actor_and_atomic_notes
         events.len()
     );
 }
+
+// =============================================================================
+// An absence handover is limited to what the asker may see in Project Studio
+// =============================================================================
+
+fn add_to_project(project: &str, owner: &str, user: &str) {
+    repository::add_members(
+        project,
+        &[tentaflow_core::project_studio::models::MemberInput {
+            user_id: user.to_string(),
+            functions: vec!["developer".to_string(), "tester".to_string()],
+            project_admin: false,
+            expires_at: None,
+        }],
+        owner,
+    )
+    .expect("add member");
+}
+
+#[tokio::test]
+async fn a_manager_outside_the_project_neither_sees_nor_moves_the_work_of_an_absence() {
+    let w = world();
+    // The leaver's manager (boss) is NOT a member of this project.
+    let p = project(
+        &w,
+        "closed",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let me = ctx(&w, &w.leaver, false);
+    let boss = ctx(&w, &w.boss, false);
+    let admin = ctx(&w, &w.admin, true);
+    let back = plus(w.today, 7);
+
+    let own = list(&me, &w.leaver, Reason::Absence, None, None)
+        .await
+        .unwrap();
+    assert_eq!(own.items(Cat::Task).len(), 2);
+    assert_eq!(own.items(Cat::TestItem).len(), 1);
+    for asker in [&boss, &admin] {
+        let seen = list(asker, &w.leaver, Reason::Absence, None, None).await;
+        match seen {
+            Ok(listing) => assert!(
+                listing.groups.is_empty(),
+                "work of a project the asker cannot see was listed: {:?}",
+                listing.groups
+            ),
+            // An administrator hands over an absence on the same footing as a manager.
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+        }
+    }
+
+    // Knowing the keys does not help: they are not held as far as the asker is concerned.
+    let all_keys: Vec<OrgHandoverChoice> = own
+        .items(Cat::Task)
+        .iter()
+        .chain(own.items(Cat::TestItem))
+        .map(|item| choice(item, Some(&w.peer)))
+        .collect();
+    let attempt = apply(
+        &boss,
+        &w.leaver,
+        Reason::Absence,
+        None,
+        None,
+        Some(s(back)),
+        "takeover",
+        all_keys,
+    )
+    .await
+    .unwrap();
+    assert!(!attempt.ok, "{attempt:?}");
+    assert!(attempt.handover_id.is_none());
+    assert_eq!(assignee_of(&p.id, &p.task_a), w.leaver);
+    assert_eq!(item_assignee(&p.id, &p.item), w.leaver);
+
+    // As a member of the project the manager sees the work.
+    add_to_project(&p.id, &w.peer, &w.boss);
+    let seen = list(&boss, &w.leaver, Reason::Absence, None, None)
+        .await
+        .unwrap();
+    assert_eq!(seen.items(Cat::Task).len(), 2);
+
+    // The person hands over their own work; who may read the record follows the same rule.
+    let done = apply(
+        &me,
+        &w.leaver,
+        Reason::Absence,
+        None,
+        None,
+        Some(s(back)),
+        "vacation",
+        own.items(Cat::Task)
+            .iter()
+            .map(|item| choice(item, Some(&w.peer)))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert!(done.ok, "{:?}", done.items);
+    let records_for = |user: &str, is_admin: bool| {
+        handover::records(
+            &w.state.db,
+            DEFAULT_ORG_ID,
+            &handover::Actor { user_id: user, is_admin },
+            &w.leaver,
+        )
+        .unwrap()
+    };
+    assert_eq!(records_for(&w.leaver, false).len(), 1);
+    assert_eq!(records_for(&w.boss, false)[0].items.len(), 2);
+    repository::remove_member(&p.id, &w.boss).expect("remove member");
+    assert!(
+        records_for(&w.boss, false).is_empty(),
+        "a manager who cannot see the project does not read the record of its work"
+    );
+    assert!(records_for(&w.admin, true).is_empty());
+}
+
+#[tokio::test]
+async fn a_departure_record_stays_whole_for_the_administrator() {
+    let w = world();
+    let p = project(
+        &w,
+        "dep",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let admin = ctx(&w, &w.admin, true);
+    let listing = list(&admin, &w.leaver, Reason::Departure, None, None)
+        .await
+        .unwrap();
+    let done = apply(
+        &admin,
+        &w.leaver,
+        Reason::Departure,
+        None,
+        None,
+        None,
+        "leaving",
+        listing
+            .items(Cat::Task)
+            .iter()
+            .map(|item| choice(item, Some(&w.peer)))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert!(done.ok, "{:?}", done.items);
+    assert_eq!(assignee_of(&p.id, &p.task_a), w.peer);
+    let records = handover::records(
+        &w.state.db,
+        DEFAULT_ORG_ID,
+        &handover::Actor {
+            user_id: &w.admin,
+            is_admin: true,
+        },
+        &w.leaver,
+    )
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].items.len(), 2);
+}
+
+#[tokio::test]
+async fn handover_requests_are_limited_per_person_and_one_apply_takes_a_bounded_number_of_items() {
+    let w = world();
+    let me = ctx(&w, &w.leaver, false);
+    // One apply names at most `MAX_CHOICES` items.
+    let too_many: Vec<OrgHandoverChoice> = (0..=handover::MAX_CHOICES)
+        .map(|n| OrgHandoverChoice {
+            key: format!("task:p:{n}"),
+            taker_user_id: Some(w.peer.clone()),
+        })
+        .collect();
+    let refused = apply(
+        &me,
+        &w.leaver,
+        Reason::Absence,
+        None,
+        None,
+        Some(s(plus(w.today, 7))),
+        "x",
+        too_many,
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.error_code.as_deref(), Some("invalid_value"));
+
+    // The window of requests is shared by every handover request of a person.
+    let mut limited = None;
+    for _ in 0..40 {
+        if let Err(e) = list(&me, &w.leaver, Reason::Absence, None, None).await {
+            limited = Some(e);
+            break;
+        }
+    }
+    let limited = limited.expect("the 31st request within a minute is refused");
+    assert_eq!(limited.code, ProtocolErrorCode::RateLimited);
+    // Another person is not affected.
+    let boss = ctx(&w, &w.boss, false);
+    assert!(list(&boss, &w.leaver, Reason::Absence, None, None).await.is_ok());
+}

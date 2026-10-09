@@ -6,6 +6,8 @@
 //! `PolicyDenied` what the service refuses as not permitted, and turns rule
 //! failures of an apply into a normal answer the screen can show.
 
+use std::sync::LazyLock;
+
 use serde_json::json;
 use tentaflow_protocol::org_structure::OrgStructurePayload as P;
 use tentaflow_protocol::org_structure_cover::OrgPersonRef;
@@ -16,13 +18,17 @@ use super::{
     db_error, fmt, op_error, opt_day_write, publish, read_error, require_admin, require_member,
     PERM_ADMIN,
 };
+use crate::auth::rate_limit::LoginRateLimiter;
 use crate::dispatch::HandlerContext;
 use crate::services::org_structure::availability;
 use crate::services::org_structure::handover as service;
 use crate::services::org_structure::OrgStructureError as E;
 use crate::services::rbac::OrgContext;
 
-pub(super) fn dispatch(ctx: &HandlerContext, payload: &P) -> Result<MessageBody, ProtocolError> {
+pub(super) async fn dispatch(
+    ctx: &HandlerContext,
+    payload: &P,
+) -> Result<MessageBody, ProtocolError> {
     let body = match payload {
         P::HandoverListRequest {
             user_id,
@@ -37,7 +43,7 @@ pub(super) fn dispatch(ctx: &HandlerContext, payload: &P) -> Result<MessageBody,
             project_id.as_deref(),
             date,
             return_date,
-        )?,
+        ).await?,
         P::HandoverApplyRequest {
             user_id,
             reason,
@@ -55,10 +61,10 @@ pub(super) fn dispatch(ctx: &HandlerContext, payload: &P) -> Result<MessageBody,
             return_date,
             note,
             items,
-        )?,
-        P::HandoverRetryRequest { handover_id, keys } => retry(ctx, handover_id, keys)?,
-        P::HandoverPendingRequest {} => pending(ctx)?,
-        P::HandoverRecordsRequest { user_id } => records(ctx, user_id.as_deref())?,
+        ).await?,
+        P::HandoverRetryRequest { handover_id, keys } => retry(ctx, handover_id, keys).await?,
+        P::HandoverPendingRequest {} => pending(ctx).await?,
+        P::HandoverRecordsRequest { user_id } => records(ctx, user_id.as_deref()).await?,
         _ => return Err(ProtocolError::bad_request("not a handover request")),
     };
     Ok(MessageBody::OrgStructureBody(body))
@@ -131,10 +137,58 @@ fn result_to_wire(result: service::ItemResult) -> h::OrgHandoverItemResult {
     }
 }
 
-fn actor(org: &OrgContext) -> service::Actor<'_> {
-    service::Actor {
-        user_id: &org.user_id,
-        is_admin: org.has(PERM_ADMIN),
+/// Handover requests a person may make in a minute. Each one reads every
+/// project the person works in, so an unbounded stream of them would starve
+/// the workers that serve everybody else.
+const MAX_REQUESTS_PER_MINUTE: usize = 30;
+
+static REQUESTS: LazyLock<LoginRateLimiter> = LazyLock::new(LoginRateLimiter::new);
+
+fn throttle(org: &OrgContext) -> Result<(), ProtocolError> {
+    let key = format!("org-handover:{}:{}", org.org_id, org.user_id);
+    if REQUESTS.check_and_record(&key, MAX_REQUESTS_PER_MINUTE) {
+        Ok(())
+    } else {
+        Err(ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            "too many handover requests, try again in a minute",
+        ))
+    }
+}
+
+/// The service reads Project Studio databases one by one and may take long:
+/// it runs on the blocking pool, never on an async worker.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| E::Db(format!("handover task: {e}")))?
+}
+
+/// What a blocking call needs of the caller, owned.
+struct Caller {
+    pool: crate::db::DbPool,
+    org_id: String,
+    user_id: String,
+    is_admin: bool,
+}
+
+impl Caller {
+    fn of(ctx: &HandlerContext, org: &OrgContext) -> Self {
+        Self {
+            pool: ctx.state.db.clone(),
+            org_id: org.org_id.clone(),
+            user_id: org.user_id.clone(),
+            is_admin: org.has(PERM_ADMIN),
+        }
+    }
+
+    fn actor(&self) -> service::Actor<'_> {
+        service::Actor {
+            user_id: &self.user_id,
+            is_admin: self.is_admin,
+        }
     }
 }
 
@@ -150,7 +204,7 @@ fn refuse(e: E) -> ProtocolError {
     }
 }
 
-fn list(
+async fn list(
     ctx: &HandlerContext,
     user_id: &str,
     reason: h::OrgHandoverReason,
@@ -159,15 +213,28 @@ fn list(
     return_date: &Option<String>,
 ) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let target = service::Target {
-        user_id,
-        reason: reason_of(reason),
-        project_id: project_id.filter(|p| !p.is_empty()),
-        date: opt_day_write(date).map_err(read_error)?,
-        return_date: opt_day_write(return_date).map_err(read_error)?,
-    };
-    let listing =
-        service::list(&ctx.state.db, &org.org_id, &actor(org), &target).map_err(refuse)?;
+    throttle(org)?;
+    let (date, return_date) = (
+        opt_day_write(date).map_err(read_error)?,
+        opt_day_write(return_date).map_err(read_error)?,
+    );
+    let caller = Caller::of(ctx, org);
+    let (subject, project) = (
+        user_id.to_string(),
+        project_id.filter(|p| !p.is_empty()).map(str::to_string),
+    );
+    let listing = blocking(move || {
+        let target = service::Target {
+            user_id: &subject,
+            reason: reason_of(reason),
+            project_id: project.as_deref(),
+            date,
+            return_date,
+        };
+        service::list(&caller.pool, &caller.org_id, &caller.actor(), &target)
+    })
+    .await
+    .map_err(refuse)?;
     Ok(P::HandoverListResponse {
         user: OrgPersonRef {
             user_id: user_id.to_string(),
@@ -219,7 +286,7 @@ fn applied_to_wire(applied: service::Applied) -> P {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply(
+async fn apply(
     ctx: &HandlerContext,
     user_id: &str,
     reason: h::OrgHandoverReason,
@@ -230,30 +297,41 @@ fn apply(
     items: &[h::OrgHandoverChoice],
 ) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let parsed = (|| -> Result<_, E> {
-        Ok(service::Target {
-            user_id,
-            reason: reason_of(reason),
-            project_id: project_id.filter(|p| !p.is_empty()),
-            date: opt_day_write(date)?,
-            return_date: opt_day_write(return_date)?,
-        })
-    })();
-    let request = match parsed {
-        Ok(subject) => service::ApplyRequest {
-            subject,
-            note,
-            choices: items
-                .iter()
-                .map(|c| service::Choice {
-                    key: c.key.clone(),
-                    taker_user_id: c.taker_user_id.clone(),
-                })
-                .collect(),
-        },
+    throttle(org)?;
+    let parsed = (|| -> Result<_, E> { Ok((opt_day_write(date)?, opt_day_write(return_date)?)) })();
+    let (date, return_date) = match parsed {
+        Ok(days) => days,
         Err(e) => return Ok(rejected(&e)),
     };
-    match service::apply(&ctx.state.db, &org.org_id, &actor(org), &request) {
+    let caller = Caller::of(ctx, org);
+    let (subject, project, note) = (
+        user_id.to_string(),
+        project_id.filter(|p| !p.is_empty()).map(str::to_string),
+        note.to_string(),
+    );
+    let choices: Vec<service::Choice> = items
+        .iter()
+        .map(|c| service::Choice {
+            key: c.key.clone(),
+            taker_user_id: c.taker_user_id.clone(),
+        })
+        .collect();
+    let outcome = blocking(move || {
+        let request = service::ApplyRequest {
+            subject: service::Target {
+                user_id: &subject,
+                reason: reason_of(reason),
+                project_id: project.as_deref(),
+                date,
+                return_date,
+            },
+            note: &note,
+            choices,
+        };
+        service::apply(&caller.pool, &caller.org_id, &caller.actor(), &request)
+    })
+    .await;
+    match outcome {
         Ok(applied) => {
             publish_applied(ctx, org, user_id, reason, &applied);
             Ok(applied_to_wire(applied))
@@ -311,9 +389,26 @@ fn publish_applied(
     );
 }
 
-fn retry(ctx: &HandlerContext, handover_id: &str, keys: &[String]) -> Result<P, ProtocolError> {
+async fn retry(
+    ctx: &HandlerContext,
+    handover_id: &str,
+    keys: &[String],
+) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    match service::retry(&ctx.state.db, &org.org_id, &actor(org), handover_id, keys) {
+    throttle(org)?;
+    let caller = Caller::of(ctx, org);
+    let (handover_id, keys) = (handover_id.to_string(), keys.to_vec());
+    let outcome = blocking(move || {
+        service::retry(
+            &caller.pool,
+            &caller.org_id,
+            &caller.actor(),
+            &handover_id,
+            &keys,
+        )
+    })
+    .await;
+    match outcome {
         Ok(applied) => {
             if let Some(id) = &applied.handover_id {
                 publish(
@@ -333,10 +428,17 @@ fn retry(ctx: &HandlerContext, handover_id: &str, keys: &[String]) -> Result<P, 
     }
 }
 
-fn pending(ctx: &HandlerContext) -> Result<P, ProtocolError> {
+async fn pending(ctx: &HandlerContext) -> Result<P, ProtocolError> {
     let org = require_admin(ctx)?;
-    let people = service::pending_people(&ctx.state.db, &org.org_id).map_err(refuse)?;
-    let names = availability::display_names(&ctx.state.db, &org.org_id).map_err(read_error)?;
+    throttle(org)?;
+    let caller = Caller::of(ctx, org);
+    let (pool, org_id) = (caller.pool.clone(), caller.org_id.clone());
+    let people = blocking(move || {
+        service::pending_people(&caller.pool, &caller.org_id, &caller.user_id)
+    })
+    .await
+    .map_err(refuse)?;
+    let names = availability::display_names(&pool, &org_id).map_err(read_error)?;
     Ok(P::HandoverPendingResponse {
         people: people
             .into_iter()
@@ -350,12 +452,21 @@ fn pending(ctx: &HandlerContext) -> Result<P, ProtocolError> {
     })
 }
 
-fn records(ctx: &HandlerContext, user_id: Option<&str>) -> Result<P, ProtocolError> {
+async fn records(ctx: &HandlerContext, user_id: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let subject = user_id.filter(|u| !u.is_empty()).unwrap_or(&org.user_id);
-    let records =
-        service::records(&ctx.state.db, &org.org_id, &actor(org), subject).map_err(refuse)?;
-    let names = availability::display_names(&ctx.state.db, &org.org_id).map_err(read_error)?;
+    throttle(org)?;
+    let subject = user_id
+        .filter(|u| !u.is_empty())
+        .unwrap_or(&org.user_id)
+        .to_string();
+    let caller = Caller::of(ctx, org);
+    let (pool, org_id) = (caller.pool.clone(), caller.org_id.clone());
+    let records = blocking(move || {
+        service::records(&caller.pool, &caller.org_id, &caller.actor(), &subject)
+    })
+    .await
+    .map_err(refuse)?;
+    let names = availability::display_names(&pool, &org_id).map_err(read_error)?;
     Ok(P::HandoverRecordsResponse {
         records: records
             .into_iter()

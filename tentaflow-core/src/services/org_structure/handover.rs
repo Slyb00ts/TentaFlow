@@ -62,6 +62,10 @@ use project_work::{MembershipProvider, ProjectDirectory, TaskProvider, TestItemP
 /// every task as a comment.
 pub const MAX_NOTE_CHARS: usize = 4000;
 
+/// Most items one apply takes: every choice is looked up and written to the
+/// record, so an unbounded list is a way to pin a worker.
+pub const MAX_CHOICES: usize = 2000;
+
 /// Most people `pending_people` looks at: each one costs a read of their items.
 const MAX_PENDING_PEOPLE: usize = 200;
 
@@ -186,6 +190,8 @@ pub(super) struct ListCx<'a> {
     pub conn: &'a Connection,
     pub org_id: &'a str,
     pub user_id: &'a str,
+    /// Who asks: an absence lists only what the ACTOR may see in Project Studio.
+    pub actor: &'a str,
     pub reason: Reason,
     pub date: NaiveDate,
     /// The one project of a project removal.
@@ -464,7 +470,13 @@ struct Gathered {
     project_name: Option<String>,
 }
 
-fn gather(pool: &DbPool, org_id: &str, subject: &Target<'_>, today: NaiveDate) -> Result<Gathered> {
+fn gather(
+    pool: &DbPool,
+    org_id: &str,
+    actor: &str,
+    subject: &Target<'_>,
+    today: NaiveDate,
+) -> Result<Gathered> {
     let names = availability::display_names(pool, org_id)?;
     let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
     let ended = advice::last_end(&conn, org_id, subject.user_id, today)?;
@@ -483,6 +495,7 @@ fn gather(pool: &DbPool, org_id: &str, subject: &Target<'_>, today: NaiveDate) -
         conn: &conn,
         org_id,
         user_id: subject.user_id,
+        actor,
         reason: subject.reason,
         date,
         project,
@@ -554,7 +567,7 @@ pub fn list(
         authorize(&conn, org_id, actor, subject, today)?;
         today
     };
-    let gathered = gather(pool, org_id, subject, today)?;
+    let gathered = gather(pool, org_id, actor.user_id, subject, today)?;
     let mut groups: Vec<(Category, Vec<Held>)> = Vec::new();
     for category in Category::ALL {
         let items: Vec<Held> = gathered
@@ -693,6 +706,12 @@ pub fn apply(
             reason: format!("longer than {MAX_NOTE_CHARS} characters"),
         });
     }
+    if request.choices.len() > MAX_CHOICES {
+        return Err(E::InvalidValue {
+            field: "items",
+            reason: format!("more than {MAX_CHOICES} items in one handover"),
+        });
+    }
     let subject = &request.subject;
     let today = {
         let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
@@ -715,7 +734,7 @@ pub fn apply(
         }
         _ => None,
     };
-    let gathered = gather(pool, org_id, subject, today)?;
+    let gathered = gather(pool, org_id, actor.user_id, subject, today)?;
     let held: HashMap<&str, &Held> = gathered.held.iter().map(|h| (h.key.as_str(), h)).collect();
 
     let mut seen = HashSet::new();
@@ -1140,19 +1159,29 @@ fn notify_takers(header: &record::Header, results: &[ItemResult], names: &HashMa
     }
     let from = names.get(&header.user_id).cloned().unwrap_or_default();
     let note: String = header.note.chars().take(300).collect();
+    let return_on = header.return_on.map(format_date);
     for (taker, count) in per_taker {
-        let until = header
-            .return_on
-            .map(|d| format!(" (do {})", format_date(d)))
+        // The screen words it in the reader's language from `link_json`; title and body are the
+        // fallback of a client that does not know the kind.
+        let until = return_on
+            .as_deref()
+            .map(|d| format!(" (until {d})"))
             .unwrap_or_default();
         notifications::notify(
             &header.org_id,
             taker,
             header.project_id.as_deref().unwrap_or(""),
             "work_handed_over",
-            "Przekazano Ci pracę",
-            &format!("{from}: {count} poz.{until}. {note}"),
-            &json!({ "handover_id": header.id }).to_string(),
+            "Work handed over to you",
+            &format!("{from}: {count} item(s){until}. {note}"),
+            &json!({
+                "handover_id": header.id,
+                "from_name": from,
+                "count": count,
+                "return_on": return_on,
+                "note": note,
+            })
+            .to_string(),
         );
     }
 }
@@ -1164,7 +1193,7 @@ fn notify_takers(header: &record::Header, results: &[ItemResult], names: &HashMa
 /// People whose last assignment ended and who still hold something (an item
 /// that failed to move, or a membership waiting for its day, is still held).
 /// `org.admin` only (the caller checks).
-pub fn pending_people(pool: &DbPool, org_id: &str) -> Result<Vec<Pending>> {
+pub fn pending_people(pool: &DbPool, org_id: &str, admin_id: &str) -> Result<Vec<Pending>> {
     let (today, candidates) = {
         let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
         let today = today_of(&conn, org_id)?;
@@ -1197,7 +1226,7 @@ pub fn pending_people(pool: &DbPool, org_id: &str) -> Result<Vec<Pending>> {
             date: None,
             return_date: None,
         };
-        let count = gather(pool, org_id, &subject, today)?.held.len() as u32;
+        let count = gather(pool, org_id, admin_id, &subject, today)?.held.len() as u32;
         if count > 0 {
             out.push(Pending {
                 user_id: user,
@@ -1228,9 +1257,43 @@ pub fn records(
         return_date: None,
     };
     authorize(&conn, org_id, actor, &subject, today)?;
+    let projects = ProjectDirectory::new(org_id, pool);
+    let mut visible: HashMap<String, bool> = HashMap::new();
     let mut out = Vec::new();
     for header in record::headers_of(&conn, org_id, user_id)? {
-        let items = record::items(&conn, &header.id)?;
+        let mut items = record::items(&conn, &header.id)?;
+        // A departure is the administrator's decision and stays whole for them; every other record
+        // shows only the work of projects the asker may see, like the listing it came from.
+        if !(header.reason == Reason::Departure && actor.is_admin) {
+            let before = items.len();
+            let mut kept = Vec::with_capacity(before);
+            for item in items {
+                let may_see = match item.project_id.as_deref() {
+                    None => true,
+                    Some(project) => match visible.get(project) {
+                        Some(known) => *known,
+                        None => {
+                            let known = projects
+                                .actor_access(project, actor.user_id)?
+                                .is_some_and(|access| access.has_access);
+                            visible.insert(project.to_string(), known);
+                            known
+                        }
+                    },
+                };
+                if may_see {
+                    kept.push(item);
+                }
+            }
+            items = kept;
+            let hidden_project = header
+                .project_id
+                .as_deref()
+                .is_some_and(|project| visible.get(project) == Some(&false));
+            if hidden_project || (items.is_empty() && before > 0) {
+                continue;
+            }
+        }
         let project_names = project_names_of(org_id, &items);
         out.push(HandoverRecord {
             project_name: header
