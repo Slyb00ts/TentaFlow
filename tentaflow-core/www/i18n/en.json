@@ -11211,7 +11211,8 @@
         "button": "Add pattern",
         "refused": "Pattern {name} was not added.",
         "text_hint_hl7v2_profile": "A profile is JSON text with lists of required segments and fields, e.g. {example}. You can also load a file. The pattern is checked when it is added; this will be version 1.",
-        "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1."
+        "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1.",
+        "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version 1."
       },
       "version": {
         "title": "New version of pattern {name}",
@@ -11281,7 +11282,10 @@
         "fix_requires_new": "Remove {items} or change the pattern's compatibility.",
         "fix_requires_old": "Keep {items} or change the pattern's compatibility.",
         "fix_element_new": "Add minOccurs=\"0\" to the {n|element|elements} {list} or change the pattern's compatibility.",
-        "fix_element_old": "Keep {list} among the required elements or change the pattern's compatibility."
+        "fix_element_old": "Keep {list} among the required elements or change the pattern's compatibility.",
+        "avro_fix_required_new": "Give “{field}” a default value (\"default\") or change the pattern's compatibility.",
+        "avro_type": "the type of “{path}” changes: {from} cannot be read as {to}",
+        "avro_enum": "enum “{name}” loses symbol “{symbol}”, which messages may still contain"
       },
       "compat_window": {
         "title": "Change compatibility — {name}",
@@ -11378,7 +11382,12 @@
         "xsd_help_title": "Which XSD patterns will work",
         "xsd_help_works": "An ordinary pattern written in one file will work: which elements and attributes the document has, how many times they may occur, a choice of one of several possibilities and simple restrictions, e.g. the length of a text or a list of allowed values.",
         "xsd_help_fails": "A pattern that includes other files or uses more advanced parts of XSD will not — when you add it, you will see what is missing.",
-        "xsd_help_limits": "A pattern also has size limits: a value in a list of allowed values up to 1 KB (the lists together up to 128 KB and 4096 entries), a pattern restriction up to 512 characters, at most 1024 attributes in one type, and all patterns together must fit in 16 MB of memory."
+        "xsd_help_limits": "A pattern also has size limits: a value in a list of allowed values up to 1 KB (the lists together up to 128 KB and 4096 entries), a pattern restriction up to 512 characters, at most 1024 attributes in one type, and all patterns together must fit in 16 MB of memory.",
+        "avro_fields": "Record fields",
+        "avro_type": "Type",
+        "avro_presence": "Presence",
+        "avro_required": "required",
+        "avro_optional": "optional"
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
@@ -11430,7 +11439,17 @@
         "xsd_limit_pattern_operand": "One of the pattern restrictions has a repetition mark (*, + or ?) with nothing before it. Put the character or group it applies to in front of it.",
         "xsd_limit_pattern_syntax": "One of the pattern restrictions is not a valid regular expression. Check its brackets, groups and repetition counts.",
         "xsd_limit_attributes": "One of the types has too many attributes (at most {limit}). Split it into smaller ones.",
-        "xsd_limit_compile": "This schema is too complex to accept. Simplify it: fewer types, attributes and repetitions."
+        "xsd_limit_compile": "This schema is too complex to accept. Simplify it: fewer types, attributes and repetitions.",
+        "avro_invalid": "Avro did not accept this schema: check the names and types, and that every type you use is defined before it is used. Details are below.",
+        "avro_no_value": "This schema has no valid value: a record contains itself with no way to end. Allow an absent value (a union with null), an array or a map.",
+        "avro_fields_shape": "The fields of a record must be a list of objects, each with a name and a type.",
+        "avro_limit_types": "This schema has more than {limit} types. Simplify it.",
+        "avro_limit_fields": "A record has more than {limit} fields. Split it into smaller records.",
+        "avro_limit_union": "A union has more than {limit} branches.",
+        "avro_limit_symbols": "An enum has more than {limit} symbols.",
+        "avro_limit_fixed": "A fixed type is larger than {limit} bytes.",
+        "avro_limit_depth": "The types are nested deeper than {limit} levels.",
+        "avro_default": "A field's default value does not fit the first branch of its union. In an Avro union the default must be of the first branch's type (for example null when null comes first)."
       }
     },
     "topics": {
@@ -12205,7 +12224,20 @@
         "xsd_why_pattern": "does not match the pattern",
         "xsd_why_enum": "is not one of the allowed values",
         "xsd_value": "the value {why}.",
-        "xsd_attr_value": "the value of the attribute “{name}” {why}."
+        "xsd_attr_value": "the value of the attribute “{name}” {why}.",
+        "avro_truncated": "the message ends before the value is complete.",
+        "avro_trailing": "bytes remain after the value (this is not a single bare Avro message).",
+        "avro_int_long": "a number is encoded incorrectly (too long).",
+        "avro_int_range": "the number does not fit the int type.",
+        "avro_boolean": "a boolean must be 0 or 1.",
+        "avro_negative": "a length is negative.",
+        "avro_length": "the declared length is larger than the rest of the message.",
+        "avro_utf8": "the text is not valid UTF-8.",
+        "avro_enum": "the enum value number is outside the list.",
+        "avro_union": "the union branch number is outside the list.",
+        "avro_block_count": "an array or map declares more items than the rest of the message can hold.",
+        "avro_block_size": "the size of an array or map block does not match its items.",
+        "avro_too_deep": "the message is nested too deeply to check."
       }
     },
     "access": {

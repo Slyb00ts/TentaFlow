@@ -115,6 +115,23 @@ const XSD_PHRASES = [
   [/^document exceeds the validation work budget$/, 'xsd_budget'],
 ];
 
+// The Avro checks (avro.rs `Walker`), all of them "path: message" like the XSD ones.
+const AVRO_PHRASES = [
+  [/^payload ends before the value is complete$/, 'avro_truncated'],
+  [/^bytes remain after the value$/, 'avro_trailing'],
+  [/^integer encoding is longer than 10 bytes or overflows 64 bits$/, 'avro_int_long'],
+  [/^value does not fit the int type$/, 'avro_int_range'],
+  [/^boolean is neither 0 nor 1$/, 'avro_boolean'],
+  [/^length is negative$/, 'avro_negative'],
+  [/^declared length exceeds the remaining payload$/, 'avro_length'],
+  [/^string is not valid UTF-8$/, 'avro_utf8'],
+  [/^enum index is out of range$/, 'avro_enum'],
+  [/^union branch index is out of range$/, 'avro_union'],
+  [/^block declares more items than the remaining payload can hold$/, 'avro_block_count'],
+  [/^block byte size does not match its items$/, 'avro_block_size'],
+  [/^value is nested too deeply to check$/, 'avro_too_deep'],
+];
+
 const PATH_MAX = 120;
 
 /**
@@ -141,7 +158,7 @@ function valueWhy(why) {
   return '';
 }
 
-function xsdSentence(path, message) {
+function pathSentence(path, message) {
   const at = path === '<root>' ? '' : shortPath(path);
   const say = (key, params) => T(`unprocessed.plain.${key}`, params);
   const withPath = (sentence) => (at ? `${at}: ${sentence}` : upperFirst(sentence));
@@ -161,14 +178,15 @@ function xsdSentence(path, message) {
   if (m && valueWhy(m[2])) return withPath(say('xsd_attr_value', { name: m[1], why: valueWhy(m[2]) }));
   m = /^value (is .*|does .*)$/.exec(message);
   if (m && valueWhy(m[1])) return withPath(say('xsd_value', { why: valueWhy(m[1]) }));
-  const known = XSD_PHRASES.find(([re]) => re.test(message));
+  const known = [...XSD_PHRASES, ...AVRO_PHRASES].find(([re]) => re.test(message));
   return known ? withPath(say(known[1])) : '';
 }
 
 /**
  * The checker's sentence for one message in plain words — the HL7 profile's
  * and message parser's sentences (hl7v2_profile.rs, payload_format/hl7v2.rs)
- * and the XSD checker's (xsd.rs), the latter after its element path — or `''`
+ * and the XSD checker's (xsd.rs) and Avro checker's (avro.rs), the latter two
+ * after their element or field path — or `''`
  * for any other text, which the caller then shows as the server wrote it.
  */
 export function plainCheckError(text) {
@@ -179,8 +197,8 @@ export function plainCheckError(text) {
   if (segment) return T('unprocessed.plain.hl7_segment', { segment: segment[1] });
   const hl7 = HL7_PHRASES.find(([re]) => re.test(message));
   if (hl7) return T(`unprocessed.plain.${hl7[1]}`);
-  const xsd = /^(<root>|\/\S*): ([\s\S]+)$/.exec(message);
-  return xsd ? xsdSentence(xsd[1], xsd[2]) : '';
+  const pathed = /^(<root>|\/\S*): ([\s\S]+)$/.exec(message);
+  return pathed ? pathSentence(pathed[1], pathed[2]) : '';
 }
 
 /** "Program odbiorcy zgłosił błąd". */

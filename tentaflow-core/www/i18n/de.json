@@ -9976,7 +9976,8 @@
         "button": "Muster hinzufügen",
         "refused": "Muster {name} wurde nicht hinzugefügt.",
         "text_hint_hl7v2_profile": "Ein Profil ist JSON-Text mit Listen der verlangten Segmente und Felder, z. B. {example}. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
-        "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1."
+        "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
+        "text_hint_avro": "Ein Avro-Muster ist ein als JSON geschriebenes Schema, z. B. {example}. Es prüft eine einzelne Nachricht in der binären Avro-Kodierung – ohne Avro-Dateikopf und ohne Confluent-Kopf. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1."
       },
       "version": {
         "title": "Neue Version des Musters {name}",
@@ -10046,7 +10047,10 @@
         "fix_requires_new": "Entfernen Sie {items} oder ändern Sie die Kompatibilität des Musters.",
         "fix_requires_old": "Lassen Sie {items} stehen oder ändern Sie die Kompatibilität des Musters.",
         "fix_element_new": "Fügen Sie minOccurs=\"0\" {n|zum Element|zu den Elementen} {list} hinzu oder ändern Sie die Kompatibilität des Musters.",
-        "fix_element_old": "Lassen Sie {list} unter den verlangten Elementen oder ändern Sie die Kompatibilität des Musters."
+        "fix_element_old": "Lassen Sie {list} unter den verlangten Elementen oder ändern Sie die Kompatibilität des Musters.",
+        "avro_fix_required_new": "Geben Sie „{field}“ einen Standardwert (\"default\") oder ändern Sie die Kompatibilität des Musters.",
+        "avro_type": "der Typ von „{path}“ ändert sich: {from} lässt sich nicht als {to} lesen",
+        "avro_enum": "das Enum „{name}“ verliert das Symbol „{symbol}“, das Nachrichten noch enthalten können"
       },
       "compat_window": {
         "title": "Kompatibilität ändern — {name}",
@@ -10143,7 +10147,12 @@
         "xsd_help_title": "Welche XSD-Muster funktionieren",
         "xsd_help_works": "Ein gewöhnliches Muster in einer einzigen Datei funktioniert: welche Elemente und Attribute das Dokument hat, wie oft sie vorkommen dürfen, die Auswahl einer von mehreren Möglichkeiten und einfache Einschränkungen, z. B. die Länge eines Textes oder eine Liste erlaubter Werte.",
         "xsd_help_fails": "Ein Muster, das andere Dateien einbindet oder fortgeschrittenere Teile von XSD nutzt, funktioniert nicht – beim Hinzufügen sehen Sie, was fehlt.",
-        "xsd_help_limits": "Ein Muster hat auch Größengrenzen: ein Wert in einer Liste erlaubter Werte bis 1 KB (die Listen zusammen bis 128 KB und 4096 Einträge), eine pattern-Einschränkung bis 512 Zeichen, höchstens 1024 Attribute in einem Typ, und alle Muster zusammen müssen in 16 MB Speicher passen."
+        "xsd_help_limits": "Ein Muster hat auch Größengrenzen: ein Wert in einer Liste erlaubter Werte bis 1 KB (die Listen zusammen bis 128 KB und 4096 Einträge), eine pattern-Einschränkung bis 512 Zeichen, höchstens 1024 Attribute in einem Typ, und alle Muster zusammen müssen in 16 MB Speicher passen.",
+        "avro_fields": "Felder des Records",
+        "avro_type": "Typ",
+        "avro_presence": "Vorkommen",
+        "avro_required": "erforderlich",
+        "avro_optional": "optional"
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
@@ -10195,7 +10204,17 @@
         "xsd_limit_pattern_operand": "Eine der pattern-Einschränkungen hat ein Wiederholungszeichen (*, + oder ?) ohne Bezug davor. Setzen Sie das Zeichen oder die Gruppe davor, auf die es sich bezieht.",
         "xsd_limit_pattern_syntax": "Eine der pattern-Einschränkungen ist kein gültiger regulärer Ausdruck. Prüfen Sie Klammern, Gruppen und Wiederholungszahlen.",
         "xsd_limit_attributes": "Einer der Typen hat zu viele Attribute (höchstens {limit}). Teilen Sie ihn in kleinere auf.",
-        "xsd_limit_compile": "Dieses Muster ist zu komplex, um es anzunehmen. Vereinfachen Sie es: weniger Typen, Attribute und Wiederholungen."
+        "xsd_limit_compile": "Dieses Muster ist zu komplex, um es anzunehmen. Vereinfachen Sie es: weniger Typen, Attribute und Wiederholungen.",
+        "avro_invalid": "Avro hat dieses Schema nicht akzeptiert: Prüfen Sie Namen und Typen und ob jeder verwendete Typ vorher definiert ist. Einzelheiten stehen unten.",
+        "avro_no_value": "Dieses Schema hat keinen gültigen Wert: Ein Record enthält sich selbst ohne Ende. Erlauben Sie einen fehlenden Wert (Union mit null), ein Array oder eine Map.",
+        "avro_fields_shape": "Die Felder eines Records müssen eine Liste von Objekten sein, jedes mit Name und Typ.",
+        "avro_limit_types": "Dieses Schema hat mehr als {limit} Typen. Vereinfachen Sie es.",
+        "avro_limit_fields": "Ein Record hat mehr als {limit} Felder. Teilen Sie ihn in kleinere Records auf.",
+        "avro_limit_union": "Eine Union hat mehr als {limit} Zweige.",
+        "avro_limit_symbols": "Ein Enum hat mehr als {limit} Symbole.",
+        "avro_limit_fixed": "Ein fixed-Typ ist größer als {limit} Bytes.",
+        "avro_limit_depth": "Die Typen sind tiefer als {limit} Ebenen verschachtelt.",
+        "avro_default": "Der Standardwert eines Feldes passt nicht zum ersten Zweig seiner Union. In einer Avro-Union muss der Standardwert den Typ des ersten Zweigs haben (z. B. null, wenn null zuerst steht)."
       }
     },
     "topics": {
@@ -10970,7 +10989,20 @@
         "xsd_why_pattern": "passt nicht zum Muster (pattern)",
         "xsd_why_enum": "gehört nicht zu den erlaubten Werten",
         "xsd_value": "der Wert {why}.",
-        "xsd_attr_value": "der Wert des Attributs „{name}“ {why}."
+        "xsd_attr_value": "der Wert des Attributs „{name}“ {why}.",
+        "avro_truncated": "die Nachricht endet, bevor der Wert vollständig ist.",
+        "avro_trailing": "nach dem Wert bleiben Bytes übrig (das ist keine einzelne Avro-Nachricht ohne Kopf).",
+        "avro_int_long": "eine Zahl ist falsch kodiert (zu lang).",
+        "avro_int_range": "die Zahl passt nicht in den Typ int.",
+        "avro_boolean": "ein Boolean muss 0 oder 1 sein.",
+        "avro_negative": "eine Länge ist negativ.",
+        "avro_length": "die angegebene Länge ist größer als der Rest der Nachricht.",
+        "avro_utf8": "der Text ist kein gültiges UTF-8.",
+        "avro_enum": "die Enum-Nummer liegt außerhalb der Liste.",
+        "avro_union": "die Nummer des Union-Zweigs liegt außerhalb der Liste.",
+        "avro_block_count": "ein Array oder eine Map kündigt mehr Elemente an, als der Rest der Nachricht fassen kann.",
+        "avro_block_size": "die Größe eines Array- oder Map-Blocks passt nicht zu seinen Elementen.",
+        "avro_too_deep": "die Nachricht ist zu tief verschachtelt, um sie zu prüfen."
       }
     },
     "access": {

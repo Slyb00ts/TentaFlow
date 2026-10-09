@@ -60,6 +60,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
+  bez kodeków kompresji; tylko do czytania schematów i serializacji
+  podschematu). Temat `avro/binary`, `application/octet-stream` lub dowolny
+  inny wiąże się z wzorcem `avro` i może mieć `validation = warn | dlq`:
+  ładunek to **jedna surowa wartość Avro** zapisana schematem wzorca, bez
+  bajtów po niej. Nagłówek pliku Avro (`Obj\x01`), kodowanie single-object
+  (`C3 01`) i format Confluent (`00` + id) nie są obsługiwane i dają
+  naruszenie. Bez migracji i bez zmian w protokole.
+- Wartości Avro są sprawdzane własnym przejściem bez alokacji, a nie
+  `from_avro_datum` (ta alokuje to, co wartość deklaruje, ma globalny limit
+  512 MiB i uznaje urwany boolean lub numer gałęzi unii za null). Zadeklarowana
+  długość większa niż reszta ładunku, blok tablicy lub mapy większy niż
+  ładunek, ujemna długość, zły UTF-8, numer wyliczenia lub gałęzi poza listą i
+  rozmiar bloku niezgodny z jego elementami są naruszeniem od razu; elementy
+  zerowej szerokości (`null`, pusty rekord) są liczone jednym kosztem, a praca
+  na dokument (20 mln jednostek, wspólna dla paczki), zagnieżdżenie (256) i
+  schematy rekurencyjne kończą się `schema_check_too_complex`, nigdy
+  werdyktem „niepoprawne”.
+- Zgodność wersji Avro według rozwiązywania schematów Avro: backward =
+  nowy schemat czyta dane starego, forward = stary czyta dane nowego, full =
+  oba. Unia pisarza musi być w całości czytelna, enum bez domyślnego symbolu
+  nie może tracić symboli, nowe pole bez `default` łamie backward. Typ
+  nazwany jest porównywany po tożsamości, nie po miejscu definicji
+  (`SchemaCompatibility::can_read` uznaje przeniesienie definicji między
+  polami za niezgodność, a „częściową” zgodność za sukces). Porównanie, które
+  nie mieści się w limicie pracy, to `bus.schema_compare_too_complex`.
+- Limity wzorca Avro przy rejestracji: 256 KiB tekstu, 4096 typów, 1024 pola
+  w rekordzie, 64 gałęzie unii, 1024 symbole enuma, `fixed` do 16 MiB,
+  zagnieżdżenie 64; odrzucany jest też rekord, który zawiera sam siebie bez
+  wyjścia (nie ma skończonej wartości), pole rekordu niebędące obiektem
+  (parser Avro pomijał je po cichu), dwukrotna definicja tej samej nazwy
+  (parser brał pierwszą) i wartość domyślna pola unii niepasująca do
+  pierwszego wariantu.
+- Wzór pochodny (`derive_subschema`) zostawia dozwolone pola rekordu
+  najwyższego poziomu i przenosi definicję typu nazwanego do pierwszego
+  zachowanego miejsca, które go używa. Rzutowanie odczytu dla formatów
+  binarnych (polityki pól) to osobny pakiet B6.
+- Dashboard: kafel Avro w „Dodaj wzór” z podpowiedzią kształtu, odmowy po
+  polsku (typy, limity, rekord bez wartości), powód odmowy wersji nazywa pole,
+  typ lub symbol enuma, karta „Pola rekordu” na stronie wzoru (nazwa, typ,
+  wymagane/opcjonalne) i przetłumaczone powody w Nieprzetworzonych (pięć
+  języków).
+
 - Walidacja XSD przy publikacji jest uczciwa: kolejka do czterech miejsc
   walidacji węzła jest FIFO (wątek, który właśnie zwolnił miejsce, nie
   wyprzedza czekającego), jedna organizacja zajmuje najwyżej 2 z 4 miejsc, a

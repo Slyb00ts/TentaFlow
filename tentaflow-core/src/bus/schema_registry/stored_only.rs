@@ -1,7 +1,7 @@
 // =============================================================================
 // File: bus/schema_registry/stored_only.rs — kinds without a validator yet
 // =============================================================================
-// `avro` / `protobuf` / `thrift` subjects can be
+// `protobuf` / `thrift` subjects can be
 // registered and versioned so integrators can stage schemas ahead of F4, but
 // nothing in this build can evaluate a payload against them. `compile` is a
 // shape smoke-check only; every other operation returns
@@ -23,12 +23,6 @@ impl SchemaKindOps for StoredOnlyOps {
     fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         if schema_text.trim().is_empty() {
             return Err(SchemaError::Invalid("schema text is empty".to_string()));
-        }
-        if self.0 == SchemaType::Avro {
-            // An Avro schema is JSON by definition — the one structural
-            // check we can do without an Avro parser.
-            serde_json::from_str::<serde_json::Value>(schema_text)
-                .map_err(|e| SchemaError::Invalid(format!("avro schema is not valid JSON: {e}")))?;
         }
         Ok(CompiledSchema::StoredOnly(self.0))
     }
@@ -72,7 +66,6 @@ impl SchemaKindOps for StoredOnlyOps {
     }
 }
 
-pub(super) static AVRO_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Avro);
 pub(super) static PROTOBUF_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Protobuf);
 pub(super) static THRIFT_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Thrift);
 
@@ -81,11 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compile_smoke_checks_and_avro_must_be_json() {
-        assert!(AVRO_OPS
-            .compile("{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}")
-            .is_ok());
-        assert!(AVRO_OPS.compile("not json").is_err());
+    fn compile_is_a_shape_smoke_check() {
         assert!(PROTOBUF_OPS
             .compile("syntax = \"proto3\"; message X {}")
             .is_ok());

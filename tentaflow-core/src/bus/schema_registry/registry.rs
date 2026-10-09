@@ -511,7 +511,7 @@ mod test_hooks {
 ///     compatibility mode (skipped for a brand-new subject, which has
 ///     nothing to be compatible WITH yet);
 ///   - a NEW subject defaults to `Backward`; a non-`None` compatibility on a
-///     type with no validator (`avro`/`protobuf`/`thrift`) is rejected
+///     type with no validator (`protobuf`/`thrift`) is rejected
 ///     UNLESS the caller explicitly passes `Some(Compatibility::None)`.
 #[allow(clippy::too_many_arguments)]
 pub fn register(
@@ -1372,16 +1372,16 @@ mod tests {
     }
 
     #[test]
-    fn register_avro_requires_explicit_compatibility_none() {
+    fn register_protobuf_requires_explicit_compatibility_none() {
         let db = fresh_db();
-        let avro_text = r#"{"type":"record","name":"X","fields":[]}"#;
+        let proto_text = "syntax = \"proto3\"; message X {}";
         let err = register(
             &db,
             "tentabus-00000001",
             "org-1",
             "events",
-            SchemaType::Avro,
-            avro_text,
+            SchemaType::Protobuf,
+            proto_text,
             None,
             None,
         )
@@ -1393,13 +1393,47 @@ mod tests {
             "tentabus-00000001",
             "org-1",
             "events",
-            SchemaType::Avro,
-            avro_text,
+            SchemaType::Protobuf,
+            proto_text,
             Some(Compatibility::None),
             None,
         )
         .unwrap();
         assert_eq!(out.version, 1);
+    }
+
+    #[test]
+    fn register_avro_checks_compatibility_by_default_and_refuses_a_text_it_cannot_read() {
+        let db = fresh_db();
+        let v1 = r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"}]}"#;
+        let register_avro = |text: &str, compat: Option<Compatibility>| {
+            register(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "events",
+                SchemaType::Avro,
+                text,
+                compat,
+                None,
+            )
+        };
+        assert_eq!(register_avro(v1, None).unwrap().version, 1);
+        let v2 = r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}"#;
+        let err = register_avro(v2, None).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::SchemaIncompatible { mode: "backward", detail, .. }
+                if detail.contains("requires field 'b'")),
+            "{err:?}"
+        );
+        let v2_ok = r#"{"type":"record","name":"X","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":""}]}"#;
+        assert_eq!(register_avro(v2_ok, None).unwrap().version, 2);
+        // A text Avro cannot read is refused whatever the mode.
+        let err = register_avro(r#"{"type":"nonsense"}"#, Some(Compatibility::None)).unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
     }
 
     #[test]

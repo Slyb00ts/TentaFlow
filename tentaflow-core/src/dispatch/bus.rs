@@ -6116,7 +6116,7 @@ mod tests {
                 );
                 assert_eq!(
                     capabilities.schema_types,
-                    vec!["json_schema", "xsd", "hl7v2_profile"]
+                    vec!["json_schema", "avro", "xsd", "hl7v2_profile"]
                 );
                 assert_eq!(capabilities.field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
@@ -8382,7 +8382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_register_avro_with_non_none_compatibility_is_rejected() {
+    async fn schema_register_protobuf_with_non_none_compatibility_is_rejected() {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
@@ -8394,12 +8394,14 @@ mod tests {
             &ctx,
             fixture_instance_id().as_str(),
             subject,
-            "avro".to_string(),
-            r#"{"type":"record","name":"x","fields":[]}"#.to_string(),
+            "protobuf".to_string(),
+            "syntax = \"proto3\"; message X {}".to_string(),
             Some("backward".to_string()),
         )
         .await
-        .expect_err("avro with a non-none compatibility mode must be rejected in F3");
+        .expect_err(
+            "protobuf with a non-none compatibility mode must be rejected until it has a validator",
+        );
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     }
 

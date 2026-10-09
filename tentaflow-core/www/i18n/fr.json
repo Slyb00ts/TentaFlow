@@ -9976,7 +9976,8 @@
         "button": "Ajouter le modèle",
         "refused": "Le modèle {name} n’a pas été ajouté.",
         "text_hint_hl7v2_profile": "Un profil est un texte JSON avec des listes de segments et de champs obligatoires, par ex. {example}. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
-        "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
+        "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
+        "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
       },
       "version": {
         "title": "Nouvelle version du modèle {name}",
@@ -10046,7 +10047,10 @@
         "fix_requires_new": "Retirez {items} ou changez la compatibilité du modèle.",
         "fix_requires_old": "Laissez {items} ou changez la compatibilité du modèle.",
         "fix_element_new": "Ajoutez minOccurs=\"0\" {n|à l’élément|aux éléments} {list} ou changez la compatibilité du modèle.",
-        "fix_element_old": "Laissez {list} parmi les éléments obligatoires ou changez la compatibilité du modèle."
+        "fix_element_old": "Laissez {list} parmi les éléments obligatoires ou changez la compatibilité du modèle.",
+        "avro_fix_required_new": "Donnez à « {field} » une valeur par défaut (\"default\") ou changez la compatibilité du modèle.",
+        "avro_type": "le type de « {path} » change : {from} ne peut pas être lu comme {to}",
+        "avro_enum": "l’enum « {name} » perd le symbole « {symbol} », que les messages peuvent encore contenir"
       },
       "compat_window": {
         "title": "Changer la compatibilité — {name}",
@@ -10143,7 +10147,12 @@
         "xsd_help_title": "Quels modèles XSD fonctionnent",
         "xsd_help_works": "Un modèle ordinaire écrit dans un seul fichier fonctionne : quels éléments et attributs le document a, combien de fois ils peuvent apparaître, le choix d’une possibilité parmi plusieurs et des restrictions simples, par ex. la longueur d’un texte ou une liste de valeurs autorisées.",
         "xsd_help_fails": "Un modèle qui inclut d’autres fichiers ou utilise des parties plus avancées de XSD ne fonctionne pas : à l’ajout, vous verrez ce qui manque.",
-        "xsd_help_limits": "Un modèle a aussi des limites de taille : une valeur d’une liste de valeurs autorisées jusqu’à 1 Ko (les listes ensemble jusqu’à 128 Ko et 4096 entrées), une restriction pattern jusqu’à 512 caractères, au plus 1024 attributs dans un type, et tous les motifs ensemble doivent tenir dans 16 Mo de mémoire."
+        "xsd_help_limits": "Un modèle a aussi des limites de taille : une valeur d’une liste de valeurs autorisées jusqu’à 1 Ko (les listes ensemble jusqu’à 128 Ko et 4096 entrées), une restriction pattern jusqu’à 512 caractères, au plus 1024 attributs dans un type, et tous les motifs ensemble doivent tenir dans 16 Mo de mémoire.",
+        "avro_fields": "Champs de l’enregistrement",
+        "avro_type": "Type",
+        "avro_presence": "Présence",
+        "avro_required": "obligatoire",
+        "avro_optional": "facultatif"
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
@@ -10195,7 +10204,17 @@
         "xsd_limit_pattern_operand": "Une des restrictions pattern a un symbole de répétition (*, + ou ?) sans rien devant. Placez devant le caractère ou le groupe concerné.",
         "xsd_limit_pattern_syntax": "Une des restrictions pattern n’est pas une expression régulière valide. Vérifiez les parenthèses, les groupes et les nombres de répétitions.",
         "xsd_limit_attributes": "Un des types a trop d’attributs (au plus {limit}). Scindez-le en types plus petits.",
-        "xsd_limit_compile": "Ce modèle est trop complexe pour être accepté. Simplifiez-le : moins de types, d’attributs et de répétitions."
+        "xsd_limit_compile": "Ce modèle est trop complexe pour être accepté. Simplifiez-le : moins de types, d’attributs et de répétitions.",
+        "avro_invalid": "Avro n’a pas accepté ce schéma : vérifiez les noms et les types, et que chaque type utilisé est défini avant son utilisation. Les détails sont plus bas.",
+        "avro_no_value": "Ce schéma n’a aucune valeur valide : un enregistrement se contient lui-même sans issue. Autorisez une valeur absente (union avec null), un tableau ou une map.",
+        "avro_fields_shape": "Les champs d’un enregistrement doivent former une liste d’objets, chacun avec un nom et un type.",
+        "avro_limit_types": "Ce schéma a plus de {limit} types. Simplifiez-le.",
+        "avro_limit_fields": "Un enregistrement a plus de {limit} champs. Découpez-le en enregistrements plus petits.",
+        "avro_limit_union": "Une union a plus de {limit} branches.",
+        "avro_limit_symbols": "Un enum a plus de {limit} symboles.",
+        "avro_limit_fixed": "Un type fixed dépasse {limit} octets.",
+        "avro_limit_depth": "Les types sont imbriqués sur plus de {limit} niveaux.",
+        "avro_default": "La valeur par défaut d’un champ ne correspond pas à la première branche de son union. Dans une union Avro, la valeur par défaut doit être du type de la première branche (par exemple null si null vient en premier)."
       }
     },
     "topics": {
@@ -10970,7 +10989,20 @@
         "xsd_why_pattern": "ne correspond pas au motif (pattern)",
         "xsd_why_enum": "ne fait pas partie des valeurs autorisées",
         "xsd_value": "la valeur {why}.",
-        "xsd_attr_value": "la valeur de l’attribut « {name} » {why}."
+        "xsd_attr_value": "la valeur de l’attribut « {name} » {why}.",
+        "avro_truncated": "le message se termine avant que la valeur soit complète.",
+        "avro_trailing": "des octets restent après la valeur (ce n’est pas un message Avro unique sans en-tête).",
+        "avro_int_long": "un nombre est mal encodé (trop long).",
+        "avro_int_range": "le nombre ne tient pas dans le type int.",
+        "avro_boolean": "un booléen doit valoir 0 ou 1.",
+        "avro_negative": "une longueur est négative.",
+        "avro_length": "la longueur indiquée dépasse le reste du message.",
+        "avro_utf8": "le texte n’est pas de l’UTF-8 valide.",
+        "avro_enum": "le numéro de l’énumération est hors de la liste.",
+        "avro_union": "le numéro de la branche de l’union est hors de la liste.",
+        "avro_block_count": "un tableau ou une map déclare plus d’éléments que le reste du message ne peut en contenir.",
+        "avro_block_size": "la taille d’un bloc de tableau ou de map ne correspond pas à ses éléments.",
+        "avro_too_deep": "le message est imbriqué trop profondément pour être vérifié."
       }
     },
     "access": {

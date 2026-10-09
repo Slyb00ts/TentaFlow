@@ -9976,7 +9976,8 @@
         "button": "Añadir patrón",
         "refused": "No se añadió el patrón {name}.",
         "text_hint_hl7v2_profile": "Un perfil es texto JSON con listas de segmentos y campos obligatorios, p. ej. {example}. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1.",
-        "text_hint_xsd": "Funcionará un patrón XSD corriente escrito en un solo archivo, sin archivos incluidos y sin las partes más avanzadas de XSD. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1."
+        "text_hint_xsd": "Funcionará un patrón XSD corriente escrito en un solo archivo, sin archivos incluidos y sin las partes más avanzadas de XSD. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1.",
+        "text_hint_avro": "Un patrón Avro es un esquema escrito como JSON, p. ej. {example}. Comprueba un solo mensaje escrito en la codificación binaria de Avro, sin cabecera de archivo Avro ni cabecera de Confluent. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1."
       },
       "version": {
         "title": "Nueva versión del patrón {name}",
@@ -10046,7 +10047,10 @@
         "fix_requires_new": "Quita {items} o cambia la compatibilidad del patrón.",
         "fix_requires_old": "Deja {items} o cambia la compatibilidad del patrón.",
         "fix_element_new": "Añade minOccurs=\"0\" {n|al elemento|a los elementos} {list} o cambia la compatibilidad del patrón.",
-        "fix_element_old": "Deja {list} entre los elementos obligatorios o cambia la compatibilidad del patrón."
+        "fix_element_old": "Deja {list} entre los elementos obligatorios o cambia la compatibilidad del patrón.",
+        "avro_fix_required_new": "Da a «{field}» un valor por defecto (\"default\") o cambia la compatibilidad del patrón.",
+        "avro_type": "el tipo de «{path}» cambia: {from} no se puede leer como {to}",
+        "avro_enum": "el enum «{name}» pierde el símbolo «{symbol}», que los mensajes aún pueden contener"
       },
       "compat_window": {
         "title": "Cambiar compatibilidad — {name}",
@@ -10143,7 +10147,12 @@
         "xsd_help_title": "Qué patrones XSD funcionan",
         "xsd_help_works": "Funciona un patrón corriente escrito en un solo archivo: qué elementos y atributos tiene el documento, cuántas veces pueden aparecer, la elección de una entre varias posibilidades y restricciones sencillas, p. ej. la longitud de un texto o una lista de valores permitidos.",
         "xsd_help_fails": "No funciona un patrón que incluya otros archivos o use partes más avanzadas de XSD: al añadirlo verás qué falta.",
-        "xsd_help_limits": "Un patrón también tiene límites de tamaño: un valor de una lista de valores permitidos de hasta 1 KB (las listas juntas hasta 128 KB y 4096 entradas), una restricción pattern de hasta 512 caracteres, como máximo 1024 atributos en un tipo, y todos los patrones juntos deben caber en 16 MB de memoria."
+        "xsd_help_limits": "Un patrón también tiene límites de tamaño: un valor de una lista de valores permitidos de hasta 1 KB (las listas juntas hasta 128 KB y 4096 entradas), una restricción pattern de hasta 512 caracteres, como máximo 1024 atributos en un tipo, y todos los patrones juntos deben caber en 16 MB de memoria.",
+        "avro_fields": "Campos del registro",
+        "avro_type": "Tipo",
+        "avro_presence": "Presencia",
+        "avro_required": "obligatorio",
+        "avro_optional": "opcional"
       },
       "added_existing_title": "El patrón {name} ya existía",
       "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",
@@ -10195,7 +10204,17 @@
         "xsd_limit_pattern_operand": "Una de las restricciones pattern tiene un símbolo de repetición (*, + o ?) sin nada delante. Pon delante el carácter o grupo al que se aplica.",
         "xsd_limit_pattern_syntax": "Una de las restricciones pattern no es una expresión regular válida. Revisa los paréntesis, los grupos y los números de repeticiones.",
         "xsd_limit_attributes": "Uno de los tipos tiene demasiados atributos (máximo {limit}). Divídelo en otros más pequeños.",
-        "xsd_limit_compile": "Este patrón es demasiado complejo para aceptarlo. Simplifícalo: menos tipos, atributos y repeticiones."
+        "xsd_limit_compile": "Este patrón es demasiado complejo para aceptarlo. Simplifícalo: menos tipos, atributos y repeticiones.",
+        "avro_invalid": "Avro no aceptó este esquema: revisa los nombres y los tipos, y que cada tipo usado esté definido antes de usarlo. Los detalles están abajo.",
+        "avro_no_value": "Este esquema no tiene ningún valor válido: un registro se contiene a sí mismo sin forma de terminar. Permite un valor ausente (unión con null), un array o un mapa.",
+        "avro_fields_shape": "Los campos de un registro deben ser una lista de objetos, cada uno con nombre y tipo.",
+        "avro_limit_types": "Este esquema tiene más de {limit} tipos. Simplifícalo.",
+        "avro_limit_fields": "Un registro tiene más de {limit} campos. Divídelo en registros más pequeños.",
+        "avro_limit_union": "Una unión tiene más de {limit} ramas.",
+        "avro_limit_symbols": "Un enum tiene más de {limit} símbolos.",
+        "avro_limit_fixed": "Un tipo fixed es mayor que {limit} bytes.",
+        "avro_limit_depth": "Los tipos están anidados a más de {limit} niveles.",
+        "avro_default": "El valor por defecto de un campo no encaja con la primera rama de su unión. En una unión de Avro el valor por defecto debe ser del tipo de la primera rama (por ejemplo null si null va primero)."
       }
     },
     "topics": {
@@ -10970,7 +10989,20 @@
         "xsd_why_pattern": "no coincide con el patrón",
         "xsd_why_enum": "no es uno de los valores permitidos",
         "xsd_value": "el valor {why}.",
-        "xsd_attr_value": "el valor del atributo «{name}» {why}."
+        "xsd_attr_value": "el valor del atributo «{name}» {why}.",
+        "avro_truncated": "el mensaje termina antes de que el valor esté completo.",
+        "avro_trailing": "sobran bytes después del valor (no es un único mensaje Avro sin cabecera).",
+        "avro_int_long": "un número está codificado incorrectamente (demasiado largo).",
+        "avro_int_range": "el número no cabe en el tipo int.",
+        "avro_boolean": "un booleano debe ser 0 o 1.",
+        "avro_negative": "una longitud es negativa.",
+        "avro_length": "la longitud indicada es mayor que el resto del mensaje.",
+        "avro_utf8": "el texto no es UTF-8 válido.",
+        "avro_enum": "el número del enum está fuera de la lista.",
+        "avro_union": "el número de la rama de la unión está fuera de la lista.",
+        "avro_block_count": "un array o mapa declara más elementos de los que caben en el resto del mensaje.",
+        "avro_block_size": "el tamaño de un bloque de array o mapa no coincide con sus elementos.",
+        "avro_too_deep": "el mensaje está anidado a demasiada profundidad para comprobarlo."
       }
     },
     "access": {

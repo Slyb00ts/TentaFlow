@@ -116,8 +116,8 @@ use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 
 use super::{
-    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
-    MAX_SCHEMA_TEXT_BYTES,
+    shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
+    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
@@ -187,37 +187,6 @@ const MAX_COMPILE_WORK: u64 = 5_000_000;
 const COMPILE_WORK_REFUSAL: &str = "the schema exceeds the compile work limit; simplify it";
 
 const SUPPORTED_BUILTINS: &str = "string, int, integer, decimal, boolean, date, dateTime";
-
-/// The single meter every expensive primitive charges. An absurd charge
-/// (value length x pattern count) cannot wrap around: it simply does not fit.
-#[derive(Debug)]
-struct Budget {
-    used: u64,
-    limit: u64,
-}
-
-/// A [`Budget`] ran out: the check stopped before it could decide.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LimitExceeded;
-
-impl Budget {
-    fn new(limit: u64) -> Budget {
-        Budget { used: 0, limit }
-    }
-
-    /// Check before commit: a charge that does not fit is refused WITHOUT
-    /// being added, so `used` never exceeds `limit` and a shared batch is
-    /// debited only for work that was actually allowed to run.
-    fn charge(&mut self, units: u64) -> Result<(), LimitExceeded> {
-        match self.used.checked_add(units) {
-            Some(total) if total <= self.limit => {
-                self.used = total;
-                Ok(())
-            }
-            _ => Err(LimitExceeded),
-        }
-    }
-}
 
 fn invalid(msg: impl Into<String>) -> SchemaError {
     SchemaError::Invalid(msg.into())
@@ -2917,37 +2886,6 @@ fn compile_doc(doc: &Doc) -> Result<Compiled, SchemaError> {
 // Validation
 // =============================================================================
 
-/// Longest element path a violation message carries. A document nested up to
-/// `MAX_DOC_DEPTH` levels with long names would otherwise put kilobytes into
-/// audit rows and DLQ headers.
-const MAX_PATH_CHARS: usize = 256;
-
-/// `path` unchanged when short; otherwise its first two and last two
-/// segments around `…`, bounded in characters whatever the names are.
-fn shorten_path(path: &str) -> String {
-    if path.chars().count() <= MAX_PATH_CHARS {
-        return path.to_string();
-    }
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let joined = if segments.len() > 4 {
-        format!(
-            "/{}/{}/…/{}/{}",
-            segments[0],
-            segments[1],
-            segments[segments.len() - 2],
-            segments[segments.len() - 1]
-        )
-    } else {
-        path.to_string()
-    };
-    if joined.chars().count() <= MAX_PATH_CHARS {
-        return joined;
-    }
-    let mut cut: String = joined.chars().take(MAX_PATH_CHARS).collect();
-    cut.push('…');
-    cut
-}
-
 /// A payload-supplied name, cut to `MAX_NAME_CHARS` characters so a hostile
 /// document cannot inflate violation text (audit rows, logs).
 fn shorten_name(name: &str) -> String {
@@ -4330,7 +4268,7 @@ pub(super) static XSD_OPS: XsdOps = XsdOps;
 mod tests {
     use super::*;
     use crate::bus::payload_format::PayloadFormat;
-    use crate::bus::schema_registry::fixtures;
+    use crate::bus::schema_registry::{fixtures, MAX_PATH_CHARS};
 
     fn schema(body: &str) -> String {
         format!(r#"<xs:schema xmlns:xs="{XSD_NS}">{body}</xs:schema>"#)

@@ -11211,7 +11211,8 @@
         "button": "Dodaj wzór",
         "refused": "Nie dodano wzoru {name}.",
         "text_hint_hl7v2_profile": "Profil to tekst JSON z listami wymaganych segmentów i pól, np. {example}. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
-        "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
+        "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
+        "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
       },
       "version": {
         "title": "Nowa wersja wzoru {name}",
@@ -11281,7 +11282,10 @@
         "fix_requires_new": "Usuń {items} albo zmień zgodność wzoru.",
         "fix_requires_old": "Zostaw {items} albo zmień zgodność wzoru.",
         "fix_element_new": "Dodaj minOccurs=\"0\" do {n|elementu|elementów|elementów} {list} albo zmień zgodność wzoru.",
-        "fix_element_old": "Zostaw {list} wśród wymaganych elementów albo zmień zgodność wzoru."
+        "fix_element_old": "Zostaw {list} wśród wymaganych elementów albo zmień zgodność wzoru.",
+        "avro_fix_required_new": "Nadaj „{field}” wartość domyślną (\"default\") albo zmień zgodność wzoru.",
+        "avro_type": "typ „{path}” się zmienia: {from} nie da się odczytać jako {to}",
+        "avro_enum": "typ wyliczeniowy „{name}” traci symbol „{symbol}”, który wiadomości mogą jeszcze zawierać"
       },
       "compat_window": {
         "title": "Zmień zgodność — {name}",
@@ -11378,7 +11382,12 @@
         "xsd_help_title": "Jakie wzory XSD zadziałają",
         "xsd_help_works": "Zadziała zwykły wzór zapisany w jednym pliku: jakie elementy i atrybuty ma dokument, ile razy mogą wystąpić, wybór jednej z kilku możliwości i proste ograniczenia, np. długość tekstu albo lista dozwolonych wartości.",
         "xsd_help_fails": "Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje.",
-        "xsd_help_limits": "Wzór ma też granice rozmiaru: wartość na liście dozwolonych wartości do 1 KB (listy razem do 128 KB i 4096 pozycji), ograniczenie typu pattern do 512 znaków, najwyżej 1024 atrybuty w jednym typie, a wszystkie wzorce razem muszą zmieścić się w 16 MB pamięci."
+        "xsd_help_limits": "Wzór ma też granice rozmiaru: wartość na liście dozwolonych wartości do 1 KB (listy razem do 128 KB i 4096 pozycji), ograniczenie typu pattern do 512 znaków, najwyżej 1024 atrybuty w jednym typie, a wszystkie wzorce razem muszą zmieścić się w 16 MB pamięci.",
+        "avro_fields": "Pola rekordu",
+        "avro_type": "Typ",
+        "avro_presence": "Obecność",
+        "avro_required": "wymagane",
+        "avro_optional": "opcjonalne"
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
@@ -11430,7 +11439,17 @@
         "xsd_limit_pattern_operand": "Jeden ze wzorców pattern ma znak powtórzenia (*, + lub ?) bez niczego przed nim. Wstaw przed nim znak lub grupę, której dotyczy.",
         "xsd_limit_pattern_syntax": "Jeden ze wzorców pattern nie jest poprawnym wyrażeniem regularnym. Sprawdź nawiasy, grupy i liczby powtórzeń.",
         "xsd_limit_attributes": "Jeden z typów ma za dużo atrybutów (najwyżej {limit}). Podziel go na mniejsze.",
-        "xsd_limit_compile": "Ten wzór jest zbyt złożony, żeby go przyjąć. Uprość go: mniej typów, atrybutów i powtórzeń."
+        "xsd_limit_compile": "Ten wzór jest zbyt złożony, żeby go przyjąć. Uprość go: mniej typów, atrybutów i powtórzeń.",
+        "avro_invalid": "Avro nie przyjęło tego wzoru: sprawdź nazwy i typy oraz to, czy każdy użyty typ jest zdefiniowany wcześniej. Szczegóły są niżej.",
+        "avro_no_value": "Ten wzór nie ma żadnej poprawnej wartości: rekord zawiera sam siebie bez możliwości zakończenia. Dopuść brak wartości (unia z null), tablicę albo mapę.",
+        "avro_fields_shape": "Pola rekordu muszą być listą obiektów, a każde pole obiektem z nazwą i typem.",
+        "avro_limit_types": "Ten wzór ma więcej niż {limit} typów. Uprość go.",
+        "avro_limit_fields": "Rekord ma więcej niż {limit} pól. Podziel go na mniejsze rekordy.",
+        "avro_limit_union": "Unia ma więcej niż {limit} wariantów.",
+        "avro_limit_symbols": "Typ wyliczeniowy ma więcej niż {limit} symboli.",
+        "avro_limit_fixed": "Typ fixed jest większy niż {limit} bajtów.",
+        "avro_limit_depth": "Typy są zagnieżdżone głębiej niż {limit} poziomów.",
+        "avro_default": "Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii. W unii Avro wartość domyślna musi być typu pierwszego wariantu (np. null, gdy null jest pierwszy)."
       }
     },
     "topics": {
@@ -12205,7 +12224,20 @@
         "xsd_why_pattern": "nie pasuje do wzorca pattern",
         "xsd_why_enum": "nie jest jedną z dozwolonych wartości",
         "xsd_value": "wartość {why}.",
-        "xsd_attr_value": "wartość atrybutu „{name}” {why}."
+        "xsd_attr_value": "wartość atrybutu „{name}” {why}.",
+        "avro_truncated": "wiadomość kończy się przed końcem wartości.",
+        "avro_trailing": "po wartości zostały dodatkowe bajty (to nie jest pojedyncza wiadomość Avro bez nagłówka).",
+        "avro_int_long": "liczba jest zapisana niepoprawnie (za długo).",
+        "avro_int_range": "liczba nie mieści się w typie int.",
+        "avro_boolean": "wartość logiczna musi być równa 0 albo 1.",
+        "avro_negative": "długość jest ujemna.",
+        "avro_length": "zapisana długość jest większa niż reszta wiadomości.",
+        "avro_utf8": "tekst nie jest poprawnym UTF-8.",
+        "avro_enum": "numer wartości wyliczenia jest poza listą.",
+        "avro_union": "numer wariantu unii jest poza listą.",
+        "avro_block_count": "tablica lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.",
+        "avro_block_size": "rozmiar bloku tablicy lub mapy nie zgadza się z jego elementami.",
+        "avro_too_deep": "wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić."
       }
     },
     "access": {

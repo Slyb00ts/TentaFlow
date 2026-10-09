@@ -18,7 +18,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText, hl7ProfileView,
+  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -339,4 +339,53 @@ test('the description of an XSD is the documentation element\'s own text, like t
   assert.equal(schemaDescription('xsd', xsd('  Faktura  ')), 'Faktura');
   assert.equal(schemaDescription('xsd', xsd('Faktura <b>pogrubiona</b> koniec')), 'Faktura  koniec', 'text of nested elements is not part of it');
   assert.equal(schemaDescription('xsd', xsd('<b>tylko element</b>')), '');
+});
+
+const ORDER_AVRO = JSON.stringify({
+  type: 'record', name: 'Order', doc: 'Zamówienie sklepu.',
+  fields: [
+    { name: 'id', type: 'long' },
+    { name: 'note', type: ['null', 'string'], default: null },
+    { name: 'region', type: 'string', default: 'eu' },
+    { name: 'tag', type: ['null', 'string'] },
+    { name: 'lines', type: { type: 'array', items: { type: 'record', name: 'Line', fields: [] } } },
+    { name: 'attrs', type: { type: 'map', values: 'int' } },
+    { name: 'status', type: { type: 'enum', name: 'Status', symbols: ['NEW'] } },
+    { name: 'created', type: { type: 'long', logicalType: 'timestamp-millis' } },
+  ],
+});
+
+test('an Avro record spelled out: each field with its type, optional when it has a default or allows null', () => {
+  assert.deepEqual(avroFieldsView(ORDER_AVRO), [
+    { name: 'id', type: 'long', optional: false },
+    { name: 'note', type: 'null | string', optional: true },
+    { name: 'region', type: 'string', optional: true },
+    { name: 'tag', type: 'null | string', optional: true },
+    { name: 'lines', type: 'array<record Line>', optional: false },
+    { name: 'attrs', type: 'map<int>', optional: false },
+    { name: 'status', type: 'enum Status', optional: false },
+    { name: 'created', type: 'long (timestamp-millis)', optional: false },
+  ]);
+  assert.equal(avroFieldsView('not json'), null);
+  assert.equal(avroFieldsView('"string"'), null);
+  assert.equal(avroFieldsView('{"type":"enum","name":"E","symbols":[]}'), null);
+  assert.deepEqual(avroFieldsView('{"type":"record","name":"E","fields":[1,{"type":"int"}]}'), []);
+});
+
+test('an Avro pattern\'s page lists the fields of the record above the text; other formats do not show the table', () => {
+  const avro = { ...wizyta, subject: 'zamowienie', schemaType: 'avro' };
+  const { body } = mount({ name: 'zamowienie', info: avro, shown: { version: 3, text: ORDER_AVRO, error: null } });
+  assert.equal(body.querySelector('[data-role="about"]').textContent, 'Zamówienie sklepu.');
+  assert.equal(body.querySelector('[data-role="avro"]').hidden, false);
+  assert.equal(body.querySelector('[data-role="profile"]').hidden, true);
+  const table = body.querySelector('[data-role="avro-fields"]');
+  assert.equal(table.rows.length, 8);
+  assert.match(table.rows[0].field, />id</);
+  assert.equal(norm(table.rows[0].presence), 'wymagane');
+  assert.match(table.rows[1].type, /null \| string/);
+  assert.equal(norm(table.rows[1].presence), 'opcjonalne');
+  const json = mount({ shown: { version: 3, text: TEXT, error: null } });
+  assert.equal(json.body.querySelector('[data-role="avro"]').hidden, true);
+  const broken = mount({ info: avro, shown: { version: 3, text: 'not json', error: null } });
+  assert.equal(broken.body.querySelector('[data-role="avro"]').hidden, true);
 });
