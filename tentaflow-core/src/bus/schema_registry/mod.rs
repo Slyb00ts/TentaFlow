@@ -244,6 +244,9 @@ impl CompiledSchema {
 #[derive(Debug)]
 pub struct ValidationBudget {
     remaining: u64,
+    /// Tenant the batch is published for; the XSD validation gate caps how
+    /// many of its slots one org holds and how many of its checks may queue.
+    org: String,
 }
 
 impl ValidationBudget {
@@ -254,8 +257,9 @@ impl ValidationBudget {
     pub const BATCH_BASE_UNITS: u64 = 50_000_000;
     pub const BATCH_UNITS_PER_BYTE: u64 = 64;
 
-    pub fn for_batch(payload_bytes: usize) -> ValidationBudget {
+    pub fn for_batch(org: &str, payload_bytes: usize) -> ValidationBudget {
         ValidationBudget {
+            org: org.to_string(),
             remaining: Self::BATCH_BASE_UNITS
                 .saturating_add(Self::BATCH_UNITS_PER_BYTE.saturating_mul(payload_bytes as u64)),
         }
@@ -264,8 +268,13 @@ impl ValidationBudget {
     /// No shared limit: the kind's own per-document cap decides.
     pub fn unshared() -> ValidationBudget {
         ValidationBudget {
+            org: String::new(),
             remaining: u64::MAX,
         }
+    }
+
+    pub fn org(&self) -> &str {
+        &self.org
     }
 
     /// Units the next document may spend, at most `per_document_cap`.

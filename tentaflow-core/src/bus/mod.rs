@@ -5471,6 +5471,7 @@ impl BusService {
             // One allowance for the whole batch: per-record budgets would let
             // N hostile records cost N times the per-document cap.
             let mut work = schema_registry::ValidationBudget::for_batch(
+                &ctx.org_id,
                 batch.records.iter().map(|r| r.payload.len()).sum(),
             );
             for mut r in std::mem::take(&mut batch.records) {

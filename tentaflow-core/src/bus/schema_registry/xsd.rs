@@ -159,7 +159,7 @@ const PATTERN_CACHE_MAX: usize = 1024 * 1024;
 /// more than this many caches alive, retained or transient; `CachePool`
 /// keeps at most this many. `pattern_memory` accounts for exactly this many.
 /// Effect: a node validates at most `POOLED_CACHES` documents concurrently
-/// (others wait on a blocking thread), however large the blocking pool grows.
+/// (others wait on a blocking thread, at most `ORG_SHARE` per org), however large the blocking pool grows.
 const POOLED_CACHES: usize = 4;
 /// Memory proxy per schema, charged per pattern as
 /// `nfa.memory_usage() + POOLED_CACHES x (cache_capacity + fresh_cache_bytes)`:
@@ -683,45 +683,135 @@ struct Matcher {
     memory: usize,
 }
 
-/// Process-wide counting gate: at most `POOLED_CACHES` validations run at
-/// once. Validation of one record never re-enters validation, so a permit
-/// is never requested while one is held and the gate cannot deadlock.
+/// Concurrent validations one org may hold of the `POOLED_CACHES` slots.
+const ORG_SHARE: usize = 2;
+/// Checks of one org that may wait for a slot; the next is refused at once.
+const ORG_QUEUE_LIMIT: usize = 32;
+
+/// Process-wide gate: at most `POOLED_CACHES` validations run at once, one
+/// org holds at most `ORG_SHARE` of them, and waiters are served in arrival
+/// order. A waiter whose org is at its share is skipped (not blocking the
+/// ones behind it), but a thread that has just released queues at the tail,
+/// so it cannot retake a slot ahead of an existing eligible waiter. At most
+/// `ORG_QUEUE_LIMIT` checks per org wait; beyond that `enter` refuses, which
+/// the caller reports as `LimitExceeded` (DLQ reason `schema_check_too_complex`)
+/// instead of parking yet another blocking thread.
+/// Validation of one record never re-enters validation, so a permit is never
+/// requested while one is held and the gate cannot deadlock.
 struct ValidationGate {
-    running: Mutex<usize>,
-    freed: Condvar,
+    state: Mutex<GateState>,
+    changed: Condvar,
+    slots: usize,
+    org_share: usize,
+    queue_limit: usize,
 }
 
-struct ValidationPermit(&'static ValidationGate);
+#[derive(Default)]
+struct GateState {
+    running: usize,
+    next_ticket: u64,
+    /// Waiters in arrival order: (ticket, org).
+    queue: VecDeque<(u64, String)>,
+    /// Slots held per org; an org with none held is absent.
+    held: Vec<(String, usize)>,
+}
 
-static VALIDATION_GATE: ValidationGate = ValidationGate {
-    running: Mutex::new(0),
-    freed: Condvar::new(),
-};
+impl GateState {
+    fn held_by(&self, org: &str) -> usize {
+        self.held
+            .iter()
+            .find(|(o, _)| o == org)
+            .map_or(0, |(_, n)| *n)
+    }
 
-impl ValidationGate {
-    /// Blocks the calling (blocking-pool) thread until a slot is free.
-    fn enter(&'static self) -> ValidationPermit {
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        while *running >= POOLED_CACHES {
-            running = self
-                .freed
-                .wait(running)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *running += 1;
-        ValidationPermit(self)
+    fn queued_by(&self, org: &str) -> usize {
+        self.queue.iter().filter(|(_, o)| o == org).count()
     }
 }
 
-impl Drop for ValidationPermit {
+struct ValidationPermit<'a> {
+    gate: &'a ValidationGate,
+    org: String,
+}
+
+static VALIDATION_GATE: ValidationGate =
+    ValidationGate::new(POOLED_CACHES, ORG_SHARE, ORG_QUEUE_LIMIT);
+
+impl ValidationGate {
+    const fn new(slots: usize, org_share: usize, queue_limit: usize) -> Self {
+        ValidationGate {
+            state: Mutex::new(GateState {
+                running: 0,
+                next_ticket: 0,
+                queue: VecDeque::new(),
+                held: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            slots,
+            org_share,
+            queue_limit,
+        }
+    }
+
+    /// Blocks the calling (blocking-pool) thread until it is next in line
+    /// among the waiters its org may serve and a slot is free. `None` when
+    /// the org already has `queue_limit` checks waiting.
+    fn enter(&self, org: &str) -> Option<ValidationPermit<'_>> {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.queued_by(org) >= self.queue_limit {
+            return None;
+        }
+        let ticket = st.next_ticket;
+        st.next_ticket += 1;
+        st.queue.push_back((ticket, org.to_string()));
+        loop {
+            if st.running < self.slots && self.is_next(&st, ticket) {
+                let at = st.queue.iter().position(|(t, _)| *t == ticket)?;
+                st.queue.remove(at);
+                st.running += 1;
+                match st.held.iter_mut().find(|(o, _)| o == org) {
+                    Some((_, n)) => *n += 1,
+                    None => st.held.push((org.to_string(), 1)),
+                }
+                // Another eligible waiter may now be first in line.
+                self.changed.notify_all();
+                return Some(ValidationPermit {
+                    gate: self,
+                    org: org.to_string(),
+                });
+            }
+            st = self
+                .changed
+                .wait(st)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// `ticket` is the earliest waiter whose org is below its share.
+    fn is_next(&self, st: &GateState, ticket: u64) -> bool {
+        st.queue
+            .iter()
+            .find(|(_, o)| st.held_by(o) < self.org_share)
+            .is_some_and(|(t, _)| *t == ticket)
+    }
+}
+
+impl Drop for ValidationPermit<'_> {
     fn drop(&mut self) {
-        let mut running = self
-            .0
-            .running
+        let mut st = self
+            .gate
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *running -= 1;
-        self.0.freed.notify_one();
+        st.running -= 1;
+        if let Some(at) = st.held.iter().position(|(o, _)| *o == self.org) {
+            st.held[at].1 -= 1;
+            if st.held[at].1 == 0 {
+                st.held.swap_remove(at);
+            }
+        }
+        // Waiters wait for different conditions (slot, org share, turn).
+        self.gate.changed.notify_all();
     }
 }
 
@@ -4163,7 +4253,12 @@ impl SchemaKindOps for XsdOps {
         let CompiledSchema::Xsd(c) = compiled else {
             return Err(invalid("validate called with a non-xsd compiled schema"));
         };
-        let _permit = VALIDATION_GATE.enter();
+        let Some(_permit) = VALIDATION_GATE.enter(shared.org()) else {
+            return Err(SchemaError::LimitExceeded(format!(
+                "schema validation is saturated for this org ({ORG_QUEUE_LIMIT} checks already \
+                 waiting); retry later"
+            )));
+        };
         let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_STEPS));
         let verdict = validate_with(c, payload, &mut budget);
         shared.spend(budget.used);
@@ -6448,7 +6543,7 @@ mod tests {
         // the whole allowance; it must not be debited from the batch.
         let hostile = format!("<r>{}</r>", random_bits(300_000));
         let honest = format!("<r>1{}</r>", "0".repeat(200));
-        let mut shared = ValidationBudget::for_batch(hostile.len() + 2 * honest.len());
+        let mut shared = ValidationBudget::for_batch("o", hostile.len() + 2 * honest.len());
         let before = shared.remaining;
         let first = XSD_OPS.validate_metered(&c, hostile.as_bytes(), &mut shared);
         assert!(
@@ -6771,12 +6866,17 @@ mod tests {
         let doc = format!("<r>{}123</r>", "abcdefgh".repeat(2000));
         let start = Arc::new(std::sync::Barrier::new(32));
         let threads: Vec<_> = (0..32)
-            .map(|_| {
+            .map(|i| {
                 let (shared, doc, start) = (Arc::clone(&shared), doc.clone(), Arc::clone(&start));
                 std::thread::spawn(move || {
                     start.wait();
+                    // One org per thread: the per-org queue bound is not under test.
+                    let org = format!("pool-bound-{i}");
                     for _ in 0..20 {
-                        XSD_OPS.validate(&shared, doc.as_bytes()).unwrap();
+                        let mut budget = ValidationBudget::for_batch(&org, doc.len());
+                        XSD_OPS
+                            .validate_metered(&shared, doc.as_bytes(), &mut budget)
+                            .unwrap();
                     }
                 })
             })
@@ -6880,6 +6980,7 @@ mod tests {
         let doc = format!("<r>{}</r>", "<x/>".repeat(6_000));
         XSD_OPS.validate(&c, doc.as_bytes()).unwrap();
         let mut shared = ValidationBudget {
+            org: String::new(),
             remaining: 40_000_000,
         };
         XSD_OPS
@@ -7039,5 +7140,145 @@ mod tests {
             "{got:?}"
         );
         within(started, 5);
+    }
+
+    // ---- validation gate ----------------------------------------------------
+
+    mod gate {
+        use super::super::ValidationGate;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cond() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn queued(gate: &ValidationGate) -> usize {
+            gate.state.lock().unwrap().queue.len()
+        }
+
+        #[test]
+        fn a_releasing_thread_cannot_overtake_an_existing_waiter() {
+            let gate = Arc::new(ValidationGate::new(1, 1, 32));
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let first = gate.enter("a").expect("slot");
+            let waiter = {
+                let (gate, order) = (gate.clone(), order.clone());
+                std::thread::spawn(move || {
+                    let _p = gate.enter("a").expect("slot");
+                    order.lock().unwrap().push("waiter");
+                })
+            };
+            wait_until("the waiter to queue", || queued(&gate) == 1);
+            drop(first);
+            let again = gate.enter("a").expect("slot");
+            order.lock().unwrap().push("releaser");
+            drop(again);
+            waiter.join().unwrap();
+            assert_eq!(*order.lock().unwrap(), ["waiter", "releaser"]);
+        }
+
+        #[test]
+        fn one_org_holds_at_most_its_share_while_another_gets_in() {
+            let gate = Arc::new(ValidationGate::new(4, 2, 32));
+            let release = Arc::new(AtomicBool::new(false));
+            let hogs: Vec<_> = (0..4)
+                .map(|_| {
+                    let (gate, release) = (gate.clone(), release.clone());
+                    std::thread::spawn(move || {
+                        let _p = gate.enter("a").expect("slot");
+                        wait_until("release", || release.load(Ordering::SeqCst));
+                    })
+                })
+                .collect();
+            wait_until("org a to hold its share with the rest queued", || {
+                let st = gate.state.lock().unwrap();
+                st.held_by("a") == 2 && st.queue.len() == 2
+            });
+            let (tx, rx) = mpsc::channel();
+            let other = {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    let _p = gate.enter("b").expect("slot");
+                    tx.send(()).unwrap();
+                })
+            };
+            let got_in = rx.recv_timeout(Duration::from_secs(5));
+            assert_eq!(gate.state.lock().unwrap().held_by("a"), 2);
+            release.store(true, Ordering::SeqCst);
+            assert!(got_in.is_ok(), "org b was starved by org a");
+            other.join().unwrap();
+            for h in hogs {
+                h.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn an_org_past_its_queue_bound_is_refused_without_waiting() {
+            let gate = Arc::new(ValidationGate::new(1, 1, 2));
+            let held = gate.enter("a").expect("slot");
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    let gate = gate.clone();
+                    std::thread::spawn(move || drop(gate.enter("a").expect("queued")))
+                })
+                .collect();
+            wait_until("two waiters", || queued(&gate) == 2);
+            let (tx, rx) = mpsc::channel();
+            let third = {
+                let gate = gate.clone();
+                std::thread::spawn(move || tx.send(gate.enter("a").is_none()).unwrap())
+            };
+            let refused = rx.recv_timeout(Duration::from_secs(5));
+            assert_eq!(refused, Ok(true), "third waiter must be refused at once");
+            third.join().unwrap();
+            assert_eq!(queued(&gate), 2, "a refusal leaves no queue entry");
+            let other = {
+                let gate = gate.clone();
+                std::thread::spawn(move || drop(gate.enter("b").expect("other org queues")))
+            };
+            wait_until("the other org to queue", || queued(&gate) == 3);
+            drop(held);
+            for w in waiters {
+                w.join().unwrap();
+            }
+            other.join().unwrap();
+        }
+
+        #[test]
+        fn many_threads_of_mixed_orgs_finish_within_the_limits() {
+            let gate = Arc::new(ValidationGate::new(4, 2, 32));
+            let running = Arc::new(AtomicUsize::new(0));
+            let per_org: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..4).map(|_| AtomicUsize::new(0)).collect());
+            let (tx, rx) = mpsc::channel();
+            for t in 0..32usize {
+                let (gate, running, per_org, tx) =
+                    (gate.clone(), running.clone(), per_org.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    let org = t % 4;
+                    let name = format!("org{org}");
+                    for _ in 0..40 {
+                        let _p = gate.enter(&name).expect("within the queue bound");
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mine = per_org[org].fetch_add(1, Ordering::SeqCst) + 1;
+                        assert!(now <= 4 && mine <= 2, "limits exceeded: {now} / {mine}");
+                        std::thread::yield_now();
+                        per_org[org].fetch_sub(1, Ordering::SeqCst);
+                        running.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    tx.send(()).unwrap();
+                });
+            }
+            for _ in 0..32 {
+                rx.recv_timeout(Duration::from_secs(60))
+                    .expect("a worker deadlocked or panicked");
+            }
+        }
     }
 }

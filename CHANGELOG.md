@@ -60,6 +60,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Walidacja XSD przy publikacji jest uczciwa: kolejka do czterech miejsc
+  walidacji węzła jest FIFO (wątek, który właśnie zwolnił miejsce, nie
+  wyprzedza czekającego), jedna organizacja zajmuje najwyżej 2 z 4 miejsc, a
+  czekający z organizacji na limicie nie blokuje kolejki innych organizacji.
+  Organizacja z 32 czekającymi sprawdzeniami dostaje natychmiast odmowę
+  `schema_check_too_complex` (rekord trafia do DLQ albo jest oznaczony
+  ostrzeżeniem jak każdy porzucony dokument) zamiast kolejnego zablokowanego
+  wątku. Bez nowych kodów w protokole.
 - Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
   `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
   i znaczniki usunięcia bez zmian; pakiety walidatorów nie mają własnej
