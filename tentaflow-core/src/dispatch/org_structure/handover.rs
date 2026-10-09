@@ -36,14 +36,17 @@ pub(super) async fn dispatch(
             project_id,
             date,
             return_date,
-        } => list(
-            ctx,
-            user_id,
-            *reason,
-            project_id.as_deref(),
-            date,
-            return_date,
-        ).await?,
+        } => {
+            list(
+                ctx,
+                user_id,
+                *reason,
+                project_id.as_deref(),
+                date,
+                return_date,
+            )
+            .await?
+        }
         P::HandoverApplyRequest {
             user_id,
             reason,
@@ -52,16 +55,19 @@ pub(super) async fn dispatch(
             return_date,
             note,
             items,
-        } => apply(
-            ctx,
-            user_id,
-            *reason,
-            project_id.as_deref(),
-            date,
-            return_date,
-            note,
-            items,
-        ).await?,
+        } => {
+            apply(
+                ctx,
+                user_id,
+                *reason,
+                project_id.as_deref(),
+                date,
+                return_date,
+                note,
+                items,
+            )
+            .await?
+        }
         P::HandoverRetryRequest { handover_id, keys } => retry(ctx, handover_id, keys).await?,
         P::HandoverPendingRequest {} => pending(ctx).await?,
         P::HandoverRecordsRequest { user_id } => records(ctx, user_id.as_deref()).await?,
@@ -433,11 +439,10 @@ async fn pending(ctx: &HandlerContext) -> Result<P, ProtocolError> {
     throttle(org)?;
     let caller = Caller::of(ctx, org);
     let (pool, org_id) = (caller.pool.clone(), caller.org_id.clone());
-    let people = blocking(move || {
-        service::pending_people(&caller.pool, &caller.org_id, &caller.user_id)
-    })
-    .await
-    .map_err(refuse)?;
+    let people =
+        blocking(move || service::pending_people(&caller.pool, &caller.org_id, &caller.user_id))
+            .await
+            .map_err(refuse)?;
     let names = availability::display_names(&pool, &org_id).map_err(read_error)?;
     Ok(P::HandoverPendingResponse {
         people: people
@@ -461,11 +466,10 @@ async fn records(ctx: &HandlerContext, user_id: Option<&str>) -> Result<P, Proto
         .to_string();
     let caller = Caller::of(ctx, org);
     let (pool, org_id) = (caller.pool.clone(), caller.org_id.clone());
-    let records = blocking(move || {
-        service::records(&caller.pool, &caller.org_id, &caller.actor(), &subject)
-    })
-    .await
-    .map_err(refuse)?;
+    let records =
+        blocking(move || service::records(&caller.pool, &caller.org_id, &caller.actor(), &subject))
+            .await
+            .map_err(refuse)?;
     let names = availability::display_names(&pool, &org_id).map_err(read_error)?;
     Ok(P::HandoverRecordsResponse {
         records: records

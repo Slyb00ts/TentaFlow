@@ -546,7 +546,18 @@ mod tests {
 
     #[test]
     fn padding_and_full_width_signs_lead_into_a_formula_too() {
-        for text in ["= 1", " =1", "\u{a0}+1", "\u{200b}@x", "\u{ff1d}1", "\u{ff0b}1", "\u{ff0d}1", "\u{ff20}x", "\t=1", "' =1"] {
+        for text in [
+            "= 1",
+            " =1",
+            "\u{a0}+1",
+            "\u{200b}@x",
+            "\u{ff1d}1",
+            "\u{ff0b}1",
+            "\u{ff0d}1",
+            "\u{ff20}x",
+            "\t=1",
+            "' =1",
+        ] {
             assert!(leads_into_formula(text), "{text:?}");
         }
         for text in ["Kowalski", "'Kowalski", " Kowalski", "a=b", ""] {

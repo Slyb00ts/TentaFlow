@@ -6,9 +6,9 @@ use tempfile::TempDir;
 
 use super::availability::AbsenceKind;
 use super::replication as repl;
-use crate::services::org;
 use super::tests::{captures_of, operation_from, Fixture, ORG};
 use super::*;
+use crate::services::org;
 use crate::sync::core_registry::CoreSyncResourceKind as Kind;
 use crate::sync::ledger::{ActionType, FieldValue};
 

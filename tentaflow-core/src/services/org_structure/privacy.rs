@@ -378,7 +378,8 @@ pub fn visible_availability(
     viewer_is_admin: bool,
     at: Option<NaiveDate>,
 ) -> Result<VisibleAvailability> {
-    let (snap, avail, real_today) = limited_availability(pool, org_id, viewer, viewer_is_admin, at)?;
+    let (snap, avail, real_today) =
+        limited_availability(pool, org_id, viewer, viewer_is_admin, at)?;
     let may_see = dates_visible(&snap, viewer, viewer_is_admin);
     let mut deputies = avail.deputies.clone();
     for deputy in &mut deputies {
@@ -388,7 +389,11 @@ pub fn visible_availability(
     }
     Ok(VisibleAvailability {
         at: avail.at,
-        absent: avail.absent_users().into_iter().map(str::to_string).collect(),
+        absent: avail
+            .absent_users()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         deputies,
     })
 }
@@ -451,7 +456,8 @@ pub fn person_cover(
     } else {
         Vec::new()
     };
-    let (mut covered_by, mut covering) = availability::deputies_around(pool, org_id, subject, today)?;
+    let (mut covered_by, mut covering) =
+        availability::deputies_around(pool, org_id, subject, today)?;
     // A cover's dates are an absence's in disguise: of a person whose dates the viewer may not see,
     // only the cover in force today is listed, without its dates.
     let may_see = dates_visible(&snap, viewer, viewer_is_admin);

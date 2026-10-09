@@ -189,7 +189,11 @@ impl Availability {
     /// absence or a cover of a person whose dates are private must not be
     /// readable by asking about another day. `today` is the same organization
     /// loaded for the real today.
-    pub fn limited_to_today(mut self, today: &Availability, may_see: impl Fn(&str) -> bool) -> Self {
+    pub fn limited_to_today(
+        mut self,
+        today: &Availability,
+        may_see: impl Fn(&str) -> bool,
+    ) -> Self {
         let people: Vec<String> = self
             .absent
             .union(&today.absent)
@@ -322,19 +326,17 @@ pub(super) fn absences_where<P: rusqlite::Params>(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(
-            |(id, user_id, from, to, kind, source, created_by)| {
-                Ok(Absence {
-                    id,
-                    user_id,
-                    valid_from: validate::parse_date(&from)?,
-                    valid_to: to.as_deref().map(validate::parse_date).transpose()?,
-                    kind: AbsenceKind::parse(&kind)?,
-                    source,
-                    created_by,
-                })
-            },
-        )
+        .map(|(id, user_id, from, to, kind, source, created_by)| {
+            Ok(Absence {
+                id,
+                user_id,
+                valid_from: validate::parse_date(&from)?,
+                valid_to: to.as_deref().map(validate::parse_date).transpose()?,
+                kind: AbsenceKind::parse(&kind)?,
+                source,
+                created_by,
+            })
+        })
         .collect()
 }
 

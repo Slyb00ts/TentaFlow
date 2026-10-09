@@ -181,7 +181,12 @@ impl ProjectDirectory {
     }
 
     /// True when the actor may read `area` of the project.
-    pub fn actor_reads(&self, project_id: &str, actor: &str, areas: &[ProjectArea]) -> Result<bool> {
+    pub fn actor_reads(
+        &self,
+        project_id: &str,
+        actor: &str,
+        areas: &[ProjectArea],
+    ) -> Result<bool> {
         Ok(self.actor_access(project_id, actor)?.is_some_and(|access| {
             areas
                 .iter()
@@ -194,8 +199,7 @@ impl ProjectDirectory {
     fn actor_reassigns(&self, project_id: &str, actor: &str, area: ProjectArea) -> Result<bool> {
         Ok(self.actor_access(project_id, actor)?.is_some_and(|access| {
             access.has_access
-                && (access.can_manage_members
-                    || access.allows(area, ProjectPermissionLevel::Write))
+                && (access.can_manage_members || access.allows(area, ProjectPermissionLevel::Write))
         }))
     }
 
@@ -1171,11 +1175,17 @@ mod tests {
             Step::Refused("not_permitted")
         ));
         assert_eq!(
-            tasks::get_task(&pool, &task.task_id).unwrap().unwrap().assigned_to,
+            tasks::get_task(&pool, &task.task_id)
+                .unwrap()
+                .unwrap()
+                .assigned_to,
             *giver
         );
         assert_eq!(
-            runs::get_run_item(&pool, &item_id).unwrap().unwrap().assigned_to,
+            runs::get_run_item(&pool, &item_id)
+                .unwrap()
+                .unwrap()
+                .assigned_to,
             *giver
         );
 
@@ -1189,7 +1199,10 @@ mod tests {
             Step::Done(_)
         ));
         assert_eq!(
-            tasks::get_task(&pool, &task.task_id).unwrap().unwrap().assigned_to,
+            tasks::get_task(&pool, &task.task_id)
+                .unwrap()
+                .unwrap()
+                .assigned_to,
             *taker
         );
         std::mem::forget(root);

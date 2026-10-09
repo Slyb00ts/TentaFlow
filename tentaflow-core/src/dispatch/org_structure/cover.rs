@@ -635,13 +635,7 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
             let event = json!({
                 "id": id, "user_id": before.user_id, "deputy_user_id": before.deputy_user_id,
             });
-            notify_deputy(
-                org,
-                &before,
-                "deputy_ended",
-                "Your cover has ended",
-                &names,
-            );
+            notify_deputy(org, &before, "deputy_ended", "Your cover has ended", &names);
             Ok(done(w, |()| OrgWriteResult::Done).event("org.deputy_ended", event))
         }
         P::AbsenceAddRequest {

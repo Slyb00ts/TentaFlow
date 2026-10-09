@@ -2255,11 +2255,7 @@ async fn a_person_writes_only_their_own_absences_and_others_learn_nothing_of_the
     let t = team(&w).await;
     let member = member_ctx(&w);
 
-    let (added, _) = write_ok(
-        &member,
-        absence_add(None, day(1), Some(day(4)), None),
-    )
-    .await;
+    let (added, _) = write_ok(&member, absence_add(None, day(1), Some(day(4)), None)).await;
     let absence = match added {
         OrgWriteResult::Absence(a) => a,
         other => panic!("expected an absence, got {other:?}"),
@@ -2385,7 +2381,8 @@ async fn a_person_writes_only_their_own_absences_and_others_learn_nothing_of_the
 }
 
 #[tokio::test]
-async fn an_absence_has_no_reason_a_client_that_sends_one_is_told_and_nothing_is_stored_or_published() {
+async fn an_absence_has_no_reason_a_client_that_sends_one_is_told_and_nothing_is_stored_or_published(
+) {
     let w = world();
     team(&w).await;
     let member = member_ctx(&w);
@@ -2398,7 +2395,11 @@ async fn an_absence_has_no_reason_a_client_that_sends_one_is_told_and_nothing_is
         "invalid_value"
     );
     // A blank reason is the same as none; and an old client clearing a reason is told it is gone.
-    write_ok(&member, absence_add(None, day(20), Some(day(21)), Some("  "))).await;
+    write_ok(
+        &member,
+        absence_add(None, day(20), Some(day(21)), Some("  ")),
+    )
+    .await;
     let events = event_bus().recent_events(4096);
     assert!(
         events
@@ -2964,7 +2965,10 @@ async fn a_past_day_names_who_held_each_position_then_and_is_the_administrators(
                     at: at.clone(),
                 },
             ),
-            ("integrity report", P::IntegrityReportRequest { at: at.clone() }),
+            (
+                "integrity report",
+                P::IntegrityReportRequest { at: at.clone() },
+            ),
             (
                 "manager of somebody else",
                 P::ManagerRequest {

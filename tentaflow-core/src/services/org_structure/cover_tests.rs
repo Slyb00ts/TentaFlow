@@ -8,8 +8,8 @@ use super::escalation::{
     effective_manager, escalation_chain, Chain, Problem, SkipReason, Step, Via, MAX_LEVELS,
 };
 use super::privacy::{
-    self,
-    can_view_person_data, visibility_of, who_can_view, Area, PersonDataKind, Verdict, ViewRule,
+    self, can_view_person_data, visibility_of, who_can_view, Area, PersonDataKind, Verdict,
+    ViewRule,
 };
 use super::query::{ManagerSource, Snapshot};
 use super::tests::{add_user, captures_of, day, Fixture, ORG};
@@ -592,14 +592,14 @@ fn the_privacy_matrix_of_the_plan_for_a_person_in_the_middle_of_the_line() {
     let subject = &c.carol;
     // (viewer, is_admin, [dates, utilization, history])
     let cases: [(&str, bool, [bool; 3]); 8] = [
-        (&c.carol, false, [true, true, true]), // the person
-        (&c.bob, false, [true, true, false]),  // manager on the primary line
-        (&c.alice, false, [true, true, false]), // higher up the line
-        (&c.zed, false, [false, false, false]), // functional line only
-        (&c.tom, false, [false, false, false]), // deputy of the manager
-        (&c.ian, false, [false, false, false]), // a subordinate
+        (&c.carol, false, [true, true, true]),   // the person
+        (&c.bob, false, [true, true, false]),    // manager on the primary line
+        (&c.alice, false, [true, true, false]),  // higher up the line
+        (&c.zed, false, [false, false, false]),  // functional line only
+        (&c.tom, false, [false, false, false]),  // deputy of the manager
+        (&c.ian, false, [false, false, false]),  // a subordinate
         (&c.dora, false, [false, false, false]), // a stranger
-        (&c.dora, true, [true, false, true]),  // an administrator
+        (&c.dora, true, [true, false, true]),    // an administrator
     ];
     let kinds = [
         PersonDataKind::AbsenceDates,
@@ -1272,7 +1272,10 @@ fn the_chain_asked_about_another_day_does_not_reveal_an_absence_the_asker_may_no
     };
     // Alice sees Bob's dates: his level is skipped as unavailable.
     let alice = chain_for(&c.alice);
-    assert!(alice.skipped.iter().any(|s| s.reason == SkipReason::Unavailable));
+    assert!(alice
+        .skipped
+        .iter()
+        .any(|s| s.reason == SkipReason::Unavailable));
     assert!(!who(&alice).contains(&c.bob.as_str()));
     // Ian, under Carol, sees Bob as at his desk.
     let ian = chain_for(&c.ian);
@@ -1298,8 +1301,16 @@ fn a_cover_shows_no_dates_of_a_person_whose_absence_dates_are_private() {
     .unwrap();
 
     let cover = |viewer: &str, offset: i64| {
-        privacy::person_cover(&c.f.pool, ORG, viewer, false, &c.bob, Some(day(offset)), false)
-            .unwrap()
+        privacy::person_cover(
+            &c.f.pool,
+            ORG,
+            viewer,
+            false,
+            &c.bob,
+            Some(day(offset)),
+            false,
+        )
+        .unwrap()
     };
     // The manager sees both covers, with their dates.
     let boss = cover(&c.alice, 0);
@@ -1317,12 +1328,13 @@ fn a_cover_shows_no_dates_of_a_person_whose_absence_dates_are_private() {
     assert!(carol.absences.is_empty());
 
     // The deputy herself knows the dates she covers.
-    let own = privacy::person_cover(&c.f.pool, ORG, &c.erin, false, &c.bob, Some(day(0)), false)
-        .unwrap();
+    let own =
+        privacy::person_cover(&c.f.pool, ORG, &c.erin, false, &c.bob, Some(day(0)), false).unwrap();
     assert!(own.covered_by.iter().any(|d| d.valid_to == Some(day(8))));
 
     // Availability lists carry the same limits.
-    let seen = privacy::visible_availability(&c.f.pool, ORG, &c.carol, false, Some(day(6))).unwrap();
+    let seen =
+        privacy::visible_availability(&c.f.pool, ORG, &c.carol, false, Some(day(6))).unwrap();
     assert!(seen.deputies.iter().all(|d| d.valid_to.is_none()));
     assert!(!seen.deputies.iter().any(|d| d.deputy_user_id == c.erin));
 }
@@ -1342,9 +1354,11 @@ fn plain_carol_admin_actor(c: &Co) {
         )
         .unwrap();
     let admin: String = conn
-        .query_row("SELECT role_id FROM roles WHERE name = 'org_admin'", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT role_id FROM roles WHERE name = 'org_admin'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     conn.execute(
         "UPDATE org_memberships SET role_id = ?1 WHERE user_id = ?2",
@@ -1364,9 +1378,13 @@ fn only_an_administrator_dates_an_absence_before_today_and_confirming_does_not_h
     plain_carol_admin_actor(&c);
     let past = new_absence(&c.carol, -2, Some(3));
     for confirmed in [false, true] {
-        let refused = add_absence(&c.f.pool, &ctx_of(&c.carol, confirmed), PERSON, &past)
-            .unwrap_err();
-        assert_eq!(refused.code(), "backdating_admin_only", "confirmed={confirmed}");
+        let refused =
+            add_absence(&c.f.pool, &ctx_of(&c.carol, confirmed), PERSON, &past).unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "backdating_admin_only",
+            "confirmed={confirmed}"
+        );
     }
     // From today on a person enters their own.
     let own = add_absence(
@@ -1400,8 +1418,8 @@ fn only_an_administrator_dates_an_absence_before_today_and_confirming_does_not_h
     )
     .unwrap()
     .value;
-    let deleted = delete_absence(&c.f.pool, &ctx_of(&c.carol, true), PERSON, &started.id)
-        .unwrap_err();
+    let deleted =
+        delete_absence(&c.f.pool, &ctx_of(&c.carol, true), PERSON, &started.id).unwrap_err();
     assert_eq!(deleted.code(), "backdating_admin_only");
     // Ending it today is how a person comes back early.
     update_absence(
@@ -1438,7 +1456,11 @@ fn only_an_administrator_dates_a_deputy_before_today() {
     };
     for confirmed in [false, true] {
         let refused = set_deputy(&c.f.pool, &ctx_of(&c.carol, confirmed), &deputy(-2)).unwrap_err();
-        assert_eq!(refused.code(), "backdating_admin_only", "confirmed={confirmed}");
+        assert_eq!(
+            refused.code(),
+            "backdating_admin_only",
+            "confirmed={confirmed}"
+        );
     }
     let made = set_deputy(&c.f.pool, &ctx_of(&c.carol, false), &deputy(0))
         .unwrap()
@@ -1462,9 +1484,7 @@ fn only_an_administrator_dates_a_deputy_before_today() {
         ..deputy(-2)
     };
     assert_eq!(
-        set_deputy(&c.f.pool, &c.f.ctx(), &past)
-            .unwrap_err()
-            .code(),
+        set_deputy(&c.f.pool, &c.f.ctx(), &past).unwrap_err().code(),
         "backdated_confirmation_required"
     );
     set_deputy(&c.f.pool, &c.f.confirmed(), &past).unwrap();

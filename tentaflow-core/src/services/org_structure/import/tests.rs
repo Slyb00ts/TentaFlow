@@ -1788,7 +1788,10 @@ fn full_width_and_padded_formula_names_are_written_inert_and_read_back_as_typed(
         report.rows, report.errors
     );
     let names: Vec<String> = units(&f).into_iter().map(|u| u.name).collect();
-    assert!(names.contains(&"\u{ff1d}HYPERLINK(\"http://x\")".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"\u{ff1d}HYPERLINK(\"http://x\")".to_string()),
+        "{names:?}"
+    );
     assert!(names.contains(&"\u{ff20}SUM(A1)".to_string()), "{names:?}");
 }
 

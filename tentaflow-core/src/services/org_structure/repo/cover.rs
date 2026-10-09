@@ -260,7 +260,9 @@ pub fn end_deputy(
     from: NaiveDate,
 ) -> Result<Written<()>> {
     let admin = is_admin(pool, ctx);
-    run(pool, ctx, "org.deputy.end", |s| end_deputy_in(s, admin, id, from))
+    run(pool, ctx, "org.deputy.end", |s| {
+        end_deputy_in(s, admin, id, from)
+    })
 }
 
 pub(in crate::services::org_structure) fn end_deputy_in(
@@ -375,10 +377,7 @@ fn update_absence_in(
     s.require_in_org("org_absences", "absence", "id", id)?;
     let before = absence_by_id(s, id)?;
     ensure_may_write_absence(actor, who.is_admin, &before)?;
-    if patch.valid_from.is_none()
-        && patch.valid_to.is_none()
-        && patch.kind.is_none()
-    {
+    if patch.valid_from.is_none() && patch.valid_to.is_none() && patch.kind.is_none() {
         return Err(E::InvalidValue {
             field: "patch",
             reason: "nothing to change".into(),

@@ -616,7 +616,11 @@ fn rows_of(w: &World) -> cs::Snapshot {
 #[test]
 fn two_nodes_approving_the_same_plan_at_once_make_the_same_rows() {
     let (a, b) = (node_with_base(), node_with_base());
-    assert_eq!(rows_of(&a), rows_of(&b), "both nodes start from the same rows");
+    assert_eq!(
+        rows_of(&a),
+        rows_of(&b),
+        "both nodes start from the same rows"
+    );
     let (set_a, set_b) = (pending(&a, "Q4", 30), pending(&b, "Q4", 30));
     approve_plan(&a, &a.second, &set_a.id, Some("plan-7"));
     approve_plan(&b, &b.second, &set_b.id, Some("plan-7"));
@@ -674,5 +678,7 @@ fn withdrawing_an_applied_plan_still_takes_back_what_it_made() {
     let rows = rows_of(&w);
     assert_eq!(rows["org_units"].len(), 1);
     assert_eq!(rows["org_positions"].len(), 1);
-    assert!(rows.get("org_external_persons").is_none_or(|t| t.is_empty()));
+    assert!(rows
+        .get("org_external_persons")
+        .is_none_or(|t| t.is_empty()));
 }

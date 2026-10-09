@@ -210,7 +210,14 @@ pub fn run_due(pool: &DbPool, org_id: &str, today: NaiveDate) -> Result<DueRepor
                 }
                 Failure::GiveUp => {
                     tracing::warn!(key = %item.key, "handover return failed {MAX_ATTEMPTS} times, given up: {e}");
-                    record::mark(pool, &header.id, &item.key, "kept", Some("return_failed"), None)?;
+                    record::mark(
+                        pool,
+                        &header.id,
+                        &item.key,
+                        "kept",
+                        Some("return_failed"),
+                        None,
+                    )?;
                     report.kept += 1;
                 }
             },
@@ -258,12 +265,26 @@ pub fn run_due(pool: &DbPool, org_id: &str, today: NaiveDate) -> Result<DueRepor
             Err(e) => match after_failure(&item.detail, today) {
                 Failure::Later(detail) => {
                     tracing::warn!(key = %item.key, "scheduled handover step failed, tried again later: {e}");
-                    record::mark(pool, &header.id, &item.key, "scheduled", None, Some(&detail))?;
+                    record::mark(
+                        pool,
+                        &header.id,
+                        &item.key,
+                        "scheduled",
+                        None,
+                        Some(&detail),
+                    )?;
                     report.failed += 1;
                 }
                 Failure::GiveUp => {
                     tracing::warn!(key = %item.key, "scheduled handover step failed {MAX_ATTEMPTS} times, given up: {e}");
-                    record::mark(pool, &header.id, &item.key, "failed", Some("completion_failed"), None)?;
+                    record::mark(
+                        pool,
+                        &header.id,
+                        &item.key,
+                        "failed",
+                        Some("completion_failed"),
+                        None,
+                    )?;
                     report.failed += 1;
                 }
             },
@@ -290,7 +311,11 @@ mod tests {
             match after_failure(&detail, day(0)) {
                 Failure::Later(next) => {
                     assert_eq!(next[ATTEMPTS], json!(attempt));
-                    assert_eq!(next["status"], json!("in_progress"), "what the step recorded stays");
+                    assert_eq!(
+                        next["status"],
+                        json!("in_progress"),
+                        "what the step recorded stays"
+                    );
                     let retry = validate::parse_date(next[RETRY_AFTER].as_str().unwrap()).unwrap();
                     waits.push((retry - day(0)).num_days());
                     assert!(is_waiting(&next, day(0)));
@@ -306,7 +331,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_return_that_keeps_failing_is_tried_a_bounded_number_of_times_and_then_left_with_the_taker() {
+    async fn a_return_that_keeps_failing_is_tried_a_bounded_number_of_times_and_then_left_with_the_taker(
+    ) {
         let root = tempfile::tempdir().expect("project storage");
         let _ = ps_db::init(&root.path().join("projects.db"));
         let state = crate::dispatch::AppState::for_test();
@@ -379,8 +405,15 @@ mod tests {
             )
             .expect("record");
         }
-        record::mark(&state.db, &handover, &key, "done", None, Some(&json!({ "status": "pending" })))
-            .expect("moved");
+        record::mark(
+            &state.db,
+            &handover,
+            &key,
+            "done",
+            None,
+            Some(&json!({ "status": "pending" })),
+        )
+        .expect("moved");
 
         let mut failures = 0;
         let mut kept = 0;

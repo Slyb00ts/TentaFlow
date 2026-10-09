@@ -665,7 +665,9 @@ fn is_taken_back(current: &Snapshot, undo: &Undo) -> bool {
         let Some(t) = undo.tables.get(spec.table) else {
             return true;
         };
-        t.inserted.iter().all(|row| !now.contains_key(&pk_of(spec, row)))
+        t.inserted
+            .iter()
+            .all(|row| !now.contains_key(&pk_of(spec, row)))
             && t.updated
                 .iter()
                 .all(|u| now.get(&pk_of(spec, &u.before)) == Some(&u.before))

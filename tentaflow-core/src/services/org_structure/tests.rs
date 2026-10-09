@@ -1188,7 +1188,9 @@ fn unit_types_are_unique_per_organization_and_protected_while_used() {
     assert_eq!(last.action, SqlWriteAction::Delete);
 }
 
-pub(super) fn operation_from(capture: &crate::sync::core_capture::CoreWriteCapture) -> SyncOperation {
+pub(super) fn operation_from(
+    capture: &crate::sync::core_capture::CoreWriteCapture,
+) -> SyncOperation {
     SyncOperation {
         op_id: OperationId::from_hash([9; 32]),
         operation_hash: [9; 32],
