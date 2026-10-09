@@ -760,6 +760,274 @@ test('destroy makes further calls throw', () => {
   assertThrows(() => s.read(PATH('a')));
 });
 
+// ---- pending user edits (optimistic bound controls) ----
+
+function snap(s, rev, entries) {
+  s.applySnapshot({ entries, state_revision: rev, truncated: false, panel_epoch: 1n });
+}
+function patch(s, base, ops) {
+  return s.applyPatch({ base_revision: BigInt(base), new_revision: BigInt(base + 1), panel_epoch: 1n, ops });
+}
+const SET = (path, value) => ({ path, op: { kind: 'set', value } });
+
+test('setLocalEdit writes at once, notifies, and returns a token', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const seen = [];
+  s.subscribe(PATH('on'), () => seen.push(s.read(PATH('on'))));
+  const t = s.setLocalEdit(PATH('on'), true);
+  assert(typeof t === 'number', 'token');
+  assertEq(s.read(PATH('on')), true);
+  assertEq(seen, [true]);
+  s.destroy();
+});
+
+test('pending edit survives a stale snapshot, overlay and patch', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }, { path: PATH('other'), value: 1 }]);
+  s.setLocalEdit(PATH('on'), true);
+  const seen = [];
+  s.subscribe(PATH('on'), () => seen.push(s.read(PATH('on'))));
+  snap(s, 2, [{ path: PATH('on'), value: false }, { path: PATH('other'), value: 2 }]);
+  assertEq(s.read(PATH('on')), true, 'snapshot');
+  assertEq(s.read(PATH('other')), 2, 'unrelated snapshot value applied');
+  s.applyOverlay([{ path: PATH('on'), value: false }]);
+  assertEq(s.read(PATH('on')), true, 'overlay');
+  patch(s, 2, [SET(PATH('on'), false)]);
+  assertEq(s.read(PATH('on')), true, 'patch');
+  assert(seen.every((v) => v === true), `subscriber never saw the old value: ${seen}`);
+  s.destroy();
+});
+
+test('probe #1: an unrelated patch is not an echo; the next stale snapshot still cannot bounce', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }, { path: PATH('x'), value: 0 }]);
+  s.setLocalEdit(PATH('on'), true);
+  patch(s, 1, [SET(PATH('x'), 1)]);
+  assertEq(s._pending.size, 1, 'still pending after an unrelated patch');
+  snap(s, 3, [{ path: PATH('on'), value: false }, { path: PATH('x'), value: 1 }]);
+  assertEq(s.read(PATH('on')), true);
+  s.destroy();
+});
+
+test('probe #1: an unrelated overlay is not an echo either', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  s.setLocalEdit(PATH('on'), true);
+  s.applyOverlay([{ path: PATH('y'), value: 'z' }]);
+  assertEq(s._pending.size, 1);
+  s.destroy();
+});
+
+test('server echo settles the pending edit; later server values win', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  s.setLocalEdit(PATH('on'), true);
+  s.applyOverlay([{ path: PATH('on'), value: true }]);
+  assertEq(s._pending.size, 0, 'echo clears pending');
+  s.applyOverlay([{ path: PATH('on'), value: false }]);
+  assertEq(s.read(PATH('on')), false, 'server value applies after echo');
+  s.destroy();
+});
+
+test('echo equality treats BigInt and integral Number as equal', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('n'), value: 1n }]);
+  s.setLocalEdit(PATH('n'), 3);
+  s.applyOverlay([{ path: PATH('n'), value: 3n }]);
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
+test('probe #2: server removing the row/key drops the edit without ghost entries', () => {
+  const s = newStore();
+  snap(s, 1, [
+    { path: PATH('items'), value: [{ on: false }, { on: false }] },
+    { path: PATH('cfg', 'a'), value: false },
+  ]);
+  s.setLocalEdit(PATH('items', 1, 'on'), true);
+  s.setLocalEdit(PATH('cfg', 'a'), true);
+  snap(s, 2, [{ path: PATH('items'), value: [{ on: false }] }, { path: PATH('other'), value: 1 }]);
+  assertEq(s.read(PATH('items')).length, 1, 'no ghost row');
+  assertEq(s.read(PATH('cfg')), undefined, 'no ghost map');
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
+test('probe #2: delete op on the edited key drops the edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('cfg', 'a'), value: false }]);
+  s.setLocalEdit(PATH('cfg', 'a'), true);
+  patch(s, 1, [{ path: PATH('cfg', 'a'), op: { kind: 'delete' } }]);
+  assertEq(s.read(PATH('cfg', 'a')), undefined);
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
+test('probe #2: an edit under a missing parent is not recorded and creates nothing', () => {
+  const s = newStore();
+  snap(s, 1, []);
+  assertEq(s.setLocalEdit(PATH('a', 'b'), true), null);
+  assertEq(s.read(PATH('a')), undefined);
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
+test('reject of an edit on a key the server never had deletes only the key', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('cfg', 'x'), value: 1 }]);
+  const t = s.setLocalEdit(PATH('cfg', 'fresh'), true);
+  s.rejectLocalEdits([t]);
+  assertEq(s.read(PATH('cfg', 'fresh')), undefined);
+  assertEq(s.read(PATH('cfg', 'x')), 1);
+  s.destroy();
+});
+
+test('probe #3: a late failure of an older action keeps the newer edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const t1 = s.setLocalEdit(PATH('on'), true);
+  s.setLocalEdit(PATH('on'), false);
+  const t3 = s.setLocalEdit(PATH('on'), true);
+  s.rejectLocalEdits([t1]);
+  assertEq(s.read(PATH('on')), true, 'older failure ignored');
+  assertEq(s._pending.size, 1);
+  s.rejectLocalEdits([t3]);
+  assertEq(s.read(PATH('on')), false, 'own failure restores the server value');
+  s.destroy();
+});
+
+test('reject restores the latest server value, not the pre-edit one', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('a'), value: 'x' }]);
+  const t = s.setLocalEdit(PATH('a'), 'y');
+  snap(s, 2, [{ path: PATH('a'), value: 'z' }]);
+  const seen = [];
+  s.subscribe(PATH('a'), () => seen.push(s.read(PATH('a'))));
+  s.rejectLocalEdits([t]);
+  assertEq(s.read(PATH('a')), 'z');
+  assertEq(seen, ['z']);
+  s.destroy();
+});
+
+test('probe #5: an op on the array under an index edit drops the edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('rows'), value: [{ on: false }, { on: false }] }]);
+  s.setLocalEdit(PATH('rows', 0, 'on'), true);
+  patch(s, 1, [{ path: PATH('rows'), op: { kind: 'prepend_array', value: { on: false } } }]);
+  assertEq(s._pending.size, 0);
+  assertEq(s.read(PATH('rows', 0, 'on')), false, 'new row 0 is not the edited one');
+  assertEq(s.read(PATH('rows', 1, 'on')), false, 'server value of the old row');
+  s.destroy();
+});
+
+test('probe #5: a write inside another row keeps the index edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('rows'), value: [{ on: false }, { on: false }] }]);
+  s.setLocalEdit(PATH('rows', 0, 'on'), true);
+  patch(s, 1, [SET(PATH('rows', 1, 'on'), true)]);
+  assertEq(s._pending.size, 1);
+  assertEq(s.read(PATH('rows', 0, 'on')), true);
+  s.destroy();
+});
+
+test('probe #5: a snapshot with a different array length drops the index edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('rows'), value: [{ on: false }, { on: false }] }]);
+  s.setLocalEdit(PATH('rows', 1, 'on'), true);
+  snap(s, 2, [{ path: PATH('rows'), value: [{ on: false }, { on: false }, { on: false }] }]);
+  assertEq(s._pending.size, 0);
+  assertEq(s.read(PATH('rows', 1, 'on')), false);
+  s.destroy();
+});
+
+test('probe #6: after an ok ack a differing server value wins after a short grace', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('n'), value: 5 }]);
+  const t = s.setLocalEdit(PATH('n'), 500);
+  s.ackLocalEdits([t]);
+  s.applyOverlay([{ path: PATH('n'), value: 100 }]); // clamped by the addon
+  const entry = [...s._pending.values()][0];
+  assert(entry.postAckSeen, 'post-ack disagreement recorded');
+  assertEq(s.read(PATH('n')), 500, 'user value during the grace');
+  s._expirePending(pathKey(PATH('n')), t);
+  assertEq(s.read(PATH('n')), 100, 'server answer wins');
+  s.destroy();
+});
+
+test('a stale pre-ack value does not override an acked edit on expiry', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const t = s.setLocalEdit(PATH('on'), true);
+  snap(s, 2, [{ path: PATH('on'), value: false }]); // pushed before the addon handled it
+  s.ackLocalEdits([t]);
+  s._expirePending(pathKey(PATH('on')), t);
+  assertEq(s.read(PATH('on')), true);
+  s.destroy();
+});
+
+test('without an ack, expiry converges to a server value seen meanwhile', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const t = s.setLocalEdit(PATH('on'), true);
+  snap(s, 2, [{ path: PATH('on'), value: false }]);
+  s._expirePending(pathKey(PATH('on')), t);
+  assertEq(s.read(PATH('on')), false);
+  s.destroy();
+});
+
+test('expiry without any server value keeps the local edit', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const t = s.setLocalEdit(PATH('on'), true);
+  s._expirePending(pathKey(PATH('on')), t);
+  assertEq(s.read(PATH('on')), true);
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
+test('a stale expiry timer of a replaced edit does nothing', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }]);
+  const t1 = s.setLocalEdit(PATH('on'), true);
+  s.setLocalEdit(PATH('on'), false);
+  s._expirePending(pathKey(PATH('on')), t1);
+  assertEq(s._pending.size, 1);
+  s.destroy();
+});
+
+test('probe #7: an increment applies to the server value, not the user value', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('n'), value: 5 }]);
+  const t = s.setLocalEdit(PATH('n'), 9);
+  patch(s, 1, [{ path: PATH('n'), op: { kind: 'increment', delta: 1n } }]);
+  assertEq(s.read(PATH('n')), 9, 'user value shown');
+  s.rejectLocalEdits([t]);
+  assertEq(Number(s.read(PATH('n'))), 6, 'server counted from its own 5');
+  s.destroy();
+});
+
+test('a failing patch leaves pending edits and the root untouched', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('on'), value: false }, { path: PATH('s'), value: 'x' }]);
+  s.setLocalEdit(PATH('on'), true);
+  const ok = patch(s, 1, [SET(PATH('on'), false), { path: PATH('s'), op: { kind: 'append_array', value: 1 } }]);
+  assertEq(ok, false);
+  assertEq(s.read(PATH('on')), true);
+  assertEq(s._pending.size, 1);
+  s.destroy();
+});
+
+test('probe #12: StateReset drops pending edits', () => {
+  const s = newStore();
+  snap(s, 1, [{ path: PATH('mode'), value: 'a' }]);
+  s.setLocalEdit(PATH('mode'), 'b');
+  s.applyReset({ panel_epoch: 1n, new_revision: 5n });
+  assertEq(s.read(PATH('mode')), undefined);
+  assertEq(s._pending.size, 0);
+  s.destroy();
+});
+
 // ---- report ----
 
 function reportResults(target) {

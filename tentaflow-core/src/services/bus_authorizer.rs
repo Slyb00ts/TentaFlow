@@ -1092,7 +1092,12 @@ mod tests {
         let key = api_key(&pool, "general");
         key_rule(&pool, "org-1", &key, "read", "allow");
         assert!(key_may(&auth, &key_ctx("org-1", &key), BusAction::Consume));
-        repository::delete_api_key_by_uid(&pool, &key).unwrap();
+        // Only the key row goes: rows naming a key that no longer exists
+        // (older data) must still admit nothing.
+        pool.write()
+            .unwrap()
+            .execute("DELETE FROM api_keys WHERE uid = ?1", [&key])
+            .unwrap();
         assert!(!key_may(&auth, &key_ctx("org-1", &key), BusAction::Consume));
 
         let user_key = api_key(&pool, "user");

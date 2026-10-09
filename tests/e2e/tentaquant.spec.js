@@ -1,7 +1,8 @@
 // =============================================================================
 // File: tests/e2e/tentaquant.spec.js
-// Description: End-to-end suite for the TentaQuant screens Q01–Q08 plus the
-//              results pair Q15/Q16. Boots an
+// Description: End-to-end suite for the TentaQuant screens Q01–Q08, the
+//              devices (Q09), examples (Q10), course (Q11) and settings (Q12)
+//              tabs plus the results pair Q15/Q16. Boots an
 //              isolated tentaflow instance (own port, sqlite db and
 //              TENTAFLOW_HOME) and drives the UI the way an administrator
 //              would: the laboratory list with nothing installed, installing a
@@ -179,11 +180,12 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('.tf-detail-header .tier.t0')).toContainText('T0');
     await expect(page.locator('.tf-detail-header .tier.t1')).toContainText('T1');
 
-    // Only the tabs whose screens exist.
-    await expect(page.locator('#tq-tabs tf-tab')).toHaveCount(3);
-    await expect(page.locator('#tq-tabs tf-tab#dashboard')).toBeVisible();
-    await expect(page.locator('#tq-tabs tf-tab#projects')).toBeVisible();
-    await expect(page.locator('#tq-tabs tf-tab#runs')).toBeVisible();
+    // Only the tabs whose screens exist; the administrator who installed the
+    // laboratory also gets Ustawienia, which a plain user does not.
+    await expect(page.locator('#tq-tabs tf-tab')).toHaveCount(7);
+    for (const id of ['dashboard', 'projects', 'runs', 'devices', 'examples', 'course', 'settings']) {
+      await expect(page.locator(`#tq-tabs tf-tab#${id}`)).toBeVisible();
+    }
 
     // Four KPI cards, all of them numbers LabOverview returns.
     await expect(page.locator('.tq-kpi tf-stat-card')).toHaveCount(4);
@@ -786,6 +788,131 @@ test.describe.serial('TentaQuant', () => {
     await page.locator('#tq-run-table tbody tr').first().click();
     await expect(page.locator('#tq-run-detail .run-detail')).toBeVisible({ timeout: 30000 });
     await expectNoHorizontalOverflow(page);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q11 — the course: graded in Core, one group at a time
+  // -------------------------------------------------------------------------
+
+  test('Q11 grades an answer in Core, pays the kata once and opens the next one', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#course').click();
+
+    // The course as shipped: ten katas in two groups, the second one closed.
+    await expect(page.locator('.kata-row')).toHaveCount(10, { timeout: 30000 });
+    await expect(page.locator('.kata-group')).toHaveCount(2);
+    await expect(page.locator('.kata-row.locked')).toHaveCount(4);
+    await expect(page.locator('.kata-row.cur-row')).toHaveAttribute('data-kata', '01-superposition-h');
+
+    // An untouched skeleton is a verdict, not a pass.
+    await page.locator('[data-act="check"]').click();
+    await expect(page.locator('.check-result.warn')).toBeVisible({ timeout: 30000 });
+
+    // The reference answer pays the kata, and only once.
+    const solve = async () => {
+      await page.evaluate(() => {
+        document.querySelector('#tq-kata-source').value =
+          'OPENQASM 3.0;\ninclude "stdgates.inc";\nqubit[1] q;\nh q[0];\n';
+      });
+      await page.locator('[data-act="check"]').click();
+    };
+    await solve();
+    await expect(page.locator('.check-result.ok .cr-title')).toContainText('+60', { timeout: 30000 });
+    await expect(page.locator('.kata-row[data-kata="01-superposition-h"] .pts.got')).toHaveText('+60');
+    await solve();
+    await expect(page.locator('.check-result.ok .cr-title')).not.toContainText('+60', { timeout: 30000 });
+    await expect(page.locator('tf-stat-card').nth(1)).toHaveAttribute('value', '60');
+
+    // The ranking lists the caller by name.
+    await expect(page.locator('.leader-row.hl')).toHaveCount(1);
+
+    await expectNoHorizontalOverflow(page);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q09 — devices: only the tiers Core lists, and the `auto` rule asked live
+  // -------------------------------------------------------------------------
+
+  test('Q09 lists the browser and this node and asks the auto rule for a width', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#devices').click();
+
+    // The browser (T0) and Core on the one node of this laboratory (T1) — no
+    // row for a tier that cannot take a run.
+    await expect(page.locator('.dev-card')).toHaveCount(2, { timeout: 30000 });
+    await expect(page.locator('.dev-card .tier.t0')).toHaveCount(1);
+    await expect(page.locator('.dev-card .tier.t1')).toHaveCount(1);
+    await expect(page.locator('.dev-missing-row')).not.toHaveCount(0);
+
+    // Five qubits fit the browser, forty fit no tier at all.
+    await expect(page.locator('.dev-answer .cr-title')).toContainText('auto →', { timeout: 30000 });
+    await page.locator('#tq-probe-qubits input').fill('40');
+    await expect(page.locator('.dev-answer .check-result.warn')).toBeVisible({ timeout: 30000 });
+
+    await expectNoHorizontalOverflow(page);
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q10 — examples: shipped circuits, forked into a project
+  // -------------------------------------------------------------------------
+
+  test('Q10 shows the two shipped examples and forks one into a new project', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#examples').click();
+
+    await expect(page.locator('.ex-card')).toHaveCount(2, { timeout: 30000 });
+    await page.locator('.ex-card[data-example="bell-state"] .qc-name').click();
+    await expect(page).toHaveURL(/example=bell-state/);
+    await expect(page.locator('.kata-head h3')).toContainText('Stan Bella');
+    await expect(page.locator('.ex-outcome')).toHaveCount(2);
+
+    await page.locator('[data-act="fork"]').click();
+    await expect(page.locator('.tq-project-header')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('.tq-project-header .d-name')).toContainText('Stan Bella');
+    await expect(page.locator('.cell')).toHaveCount(2, { timeout: 30000 });
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q12 — settings: what Core stores and applies
+  // -------------------------------------------------------------------------
+
+  test('Q12 switches the ranking off and on and changes a limit Core applies', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#settings').click();
+
+    await expect(page.locator('#tq-set-ranking-toggle')).toHaveAttribute('checked', '', { timeout: 30000 });
+    await expect(page.locator('#tq-set-limits tf-input')).toHaveCount(3);
+    await expect(page.locator('#tq-set-access .set-people tbody tr')).not.toHaveCount(0);
+
+    await page.locator('#tq-set-ranking-toggle').click();
+    await page.locator('[data-act="save-ranking"]').click();
+    await expect(page.locator('#tq-set-ranking-toggle')).not.toHaveAttribute('checked', '', { timeout: 30000 });
+    await page.locator('#tq-tabs tf-tab#course').click();
+    await expect(page.locator('.leader-row')).toHaveCount(0, { timeout: 30000 });
+
+    await page.locator('#tq-tabs tf-tab#settings').click();
+    await page.locator('#tq-set-ranking-toggle').click();
+    await page.locator('[data-act="save-ranking"]').click();
+    await expect(page.locator('#tq-set-ranking-toggle')).toHaveAttribute('checked', '', { timeout: 30000 });
+
+    await page.locator('#tq-set-maxConcurrentCoreRuns input').fill('3');
+    await page.locator('[data-act="save-limits"]').click();
+    await expect(page.locator('#tq-set-maxConcurrentCoreRuns input')).toHaveValue('3', { timeout: 30000 });
+
+    await expectNoHorizontalOverflow(page);
+    expect(errors, errors.join('\n')).toEqual([]);
   });
 
   // -------------------------------------------------------------------------

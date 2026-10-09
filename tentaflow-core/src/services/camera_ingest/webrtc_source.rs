@@ -61,7 +61,7 @@ use super::stream_publisher::Mp4StreamPublisher;
 ///
 ///   appsrc → tee → queue → h264parse → h264timestamper → nvh264dec(CUDA NV12)
 ///       → queue(leaky) → [privacy probe, in place] → tee_cuda
-///           ├─ queue(leaky) → [≤ HOST_FRAME_FPS] → cudadownload → RGB → appsink    (always on)
+///           ├─ queue(leaky) → cudadownload → RGB → appsink                          (always on)
 ///           └─ queue → nvcudah264enc → h264parse → mp4mux(fMP4) → appsink          (Branch B, on demand)
 pub fn build_webrtc_pipeline(
     config: &CameraConfig,
@@ -244,18 +244,6 @@ fn link_cpu_decode_branch(
 
 }
 
-/// Rate of anonymized frames downloaded to host memory for the mailbox,
-/// snapshots and depth mapping. Their consumers run at a few fps (analysis 5,
-/// depth ≤ 2), so downloading every frame would only move ~35 MB/s of pixels to
-/// the CPU for nothing.
-#[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
-    feature = "inference-vision-gpu",
-    feature = "vision-ort",
-    feature = "vision-cuda-preprocess"
-))]
-const HOST_FRAME_FPS: u64 = 5;
-
 /// Branch A of a privacy-processed camera. The H.264 is decoded by NVDEC into
 /// device NV12; the privacy probe anonymizes each frame IN PLACE before the
 /// CUDA tee, so every consumer behind it — the host download for the mailbox and
@@ -324,6 +312,12 @@ fn link_privacy_branch(
     queue_host.set_property_from_str("leaky", "downstream");
     let download = make("cudadownload", "download_privacy")?;
     let convert = make("videoconvert", "convert_privacy")?;
+    // Every frame reaches the host: the gesture engine reads each one. The
+    // NV12 → RGB conversion is split over a few cores so it keeps up.
+    convert.set_property(
+        "n-threads",
+        std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) as u32,
+    );
     let rgb_filter = make("capsfilter", "caps_privacy_rgb")?;
     rgb_filter.set_property(
         "caps",
@@ -386,7 +380,6 @@ fn link_privacy_branch(
         counters,
     )
     .map_err(|e| CameraIngestError::PipelineBuild(format!("privacy probe: {e:#}")))?;
-    install_host_decimator(&queue_host_sink, HOST_FRAME_FPS);
 
     let appsink = appsink
         .downcast::<gst_app::AppSink>()
@@ -417,30 +410,6 @@ fn link_privacy_branch(
     Err(CameraIngestError::PipelineBuild(
         "privacy processing (face anonymization / person detection) is not available on this node: it needs the NVIDIA GPU path".into(),
     ))
-}
-
-/// Pass at most `fps` buffers per second (by PTS) into the host download: the
-/// mailbox consumers need a recent frame, not every frame.
-#[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
-    feature = "inference-vision-gpu",
-    feature = "vision-ort",
-    feature = "vision-cuda-preprocess"
-))]
-fn install_host_decimator(pad: &gst::Pad, fps: u64) {
-    let interval_ns = 1_000_000_000 / fps.max(1);
-    let last = std::sync::atomic::AtomicU64::new(u64::MAX);
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-        let Some(pts) = info.buffer().and_then(|b| b.pts()).map(|t| t.nseconds()) else {
-            return gst::PadProbeReturn::Drop;
-        };
-        let prev = last.load(std::sync::atomic::Ordering::Relaxed);
-        if prev != u64::MAX && pts < prev.saturating_add(interval_ns) && pts >= prev {
-            return gst::PadProbeReturn::Drop;
-        }
-        last.store(pts, std::sync::atomic::Ordering::Relaxed);
-        gst::PadProbeReturn::Ok
-    });
 }
 
 /// Where Branch B (the fMP4 publisher branch) attaches, and in which form.

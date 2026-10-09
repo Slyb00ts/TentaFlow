@@ -1,0 +1,11 @@
+id = "06-x-basis-measurement"
+points = 100
+tier = "T0"
+
+[title]
+pl = "Pomiar w bazie X"
+en = "Measuring in the X basis"
+
+[summary]
+pl = "H przed pomiarem"
+en = "H before the measurement"

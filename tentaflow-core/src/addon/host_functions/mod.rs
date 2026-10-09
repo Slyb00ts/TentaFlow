@@ -7,6 +7,7 @@
 
 pub mod abi_helpers;
 pub mod aliases;
+pub mod background;
 pub mod bus;
 #[cfg(feature = "camera")]
 pub mod camera;
@@ -207,6 +208,10 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "event_publish", events::event_publish)
         .map_err(|e| anyhow::anyhow!("Rejestracja event_publish: {e}"))?;
+
+    linker
+        .func_wrap("tentaflow", "tool_run_in_background_v1", background::tool_run_in_background_v1)
+        .map_err(|e| anyhow::anyhow!("register tool_run_in_background_v1: {e}"))?;
 
     // --- UI API ---
     linker
@@ -768,6 +773,9 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "lidar_publish_v1", lidar::lidar_publish_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja lidar_publish_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "robot_pose_publish_v1", sensors::robot_pose_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja robot_pose_publish_v1: {e}"))?;
     }
 
     // --- Positioning sensors (device addon → per-device fusion engine) ---

@@ -7292,7 +7292,7 @@ mod elastic_refusal_scan_tests {
             DISPATCH[from..to].to_string()
         };
         cut("// ----- Elastic Array (§5.3)", "// ----- dispatcher")
-            + &cut("// ----- Elastic Array -----", "P::NodesListResponse { .. }")
+            + cut("// ----- Elastic Array -----", "P::NodesListResponse { .. }").as_str()
     }
 
     #[test]

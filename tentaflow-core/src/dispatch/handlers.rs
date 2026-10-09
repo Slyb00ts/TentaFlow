@@ -856,19 +856,29 @@ pub fn api_key_revoke(
 
     // key_id z protocolu to stabilny uid klucza (NIE key_prefix — ten jest
     // wylacznie do wyswietlania i moze kolidowac miedzy kluczami).
-    let affected = repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
+    let (affected, rights) =
+        repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
     if affected == 0 {
         return Err(ProtocolError::not_found("api key not found"));
     }
+    // A consumer holding a handle re-checks its rights on the next fetch.
+    if rights.iter().any(|(resource_type, _, _)| resource_type == "topic") {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    let removed: Vec<String> = rights
+        .iter()
+        .map(|(resource_type, _, action)| format!("{resource_type}:{action}"))
+        .collect();
+    let details = serde_json::json!({ "rights_removed": removed }).to_string();
     repository::log_audit(
         &ctx.state.db,
         user_id.as_deref(),
         None,
         "apikey.delete",
         Some(&format!("apikey:{}", key_id)),
-        None,
+        Some(&details),
         None,
         Some(&ctx.state.local_node_id),
     )
@@ -6951,7 +6961,12 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         // wersja ma inny `bundle_hash` (zmiana tresci manifest/wasm/migracje bez
         // podbicia numeru — typowe dla addonow wbudowanych). Bez tego drugiego
         // warunku edycja addona pod tym samym numerem wersji bylaby niewidoczna.
-        let update_available = if a.package_id.is_empty() {
+        // A native app has no update of its own: its code is part of the core
+        // binary, so every core build moves the catalog entry and the instance
+        // already runs it — offering "Update" there only ends in a refusal.
+        let update_available = if a.package_id.is_empty()
+            || a.runtime == crate::addon::NATIVE_RUNTIME
+        {
             false
         } else {
             let newer_version = repository::list_package_versions(&ctx.state.db, &a.package_id)
@@ -9727,6 +9742,14 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             subject_type,
             subject_id,
         } => {
+            // Clearing a topic entry here would skip the topic-admin check,
+            // the organisation scope and the `bus.acl.set` audit row that
+            // TentaBus applies, so it is refused like the setter above.
+            if resource_type == "topic" {
+                return Err(ProtocolError::bad_request(
+                    "topic access entries are cleared in TentaBus (BusAclSetRequest)",
+                ));
+            }
             repository::resource_permissions::clear(
                 db,
                 resource_type,
@@ -9735,10 +9758,6 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 subject_id,
             )
             .map_err(db_err)?;
-            // Open TentaBus consumers re-check their topics on the next fetch.
-            if resource_type == "topic" {
-                crate::services::bus_authorizer::bump_acl_generation();
-            }
             P::ResOk
         }
         P::ReqListPermsForResource {

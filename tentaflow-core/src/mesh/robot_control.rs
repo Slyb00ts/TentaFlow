@@ -118,6 +118,12 @@ pub enum RobotAction {
     /// Read-only fetch of the latest decoded LiDAR frame (points + metadata) for an
     /// on-demand renderer. Reports state only, never moves hardware.
     LidarFrame,
+    /// Let the robot react to people's gestures seen by its camera (wave → hello,
+    /// heart → heart). Enabling it authorizes those motions on its own, so it is
+    /// an actuator toggle and needs `robot.command`.
+    GesturesOn,
+    /// Stop reacting to gestures.
+    GesturesOff,
 }
 
 /// Per-axis body-orientation clamp (radians). Go2 accepts roughly ±0.75 rad on
@@ -200,6 +206,8 @@ impl RobotAction {
             "obstacle_avoid_on" => RobotAction::ObstacleAvoidOn,
             "obstacle_avoid_off" => RobotAction::ObstacleAvoidOff,
             "lidar_frame" => RobotAction::LidarFrame,
+            "gestures_on" => RobotAction::GesturesOn,
+            "gestures_off" => RobotAction::GesturesOff,
             _ => return None,
         })
     }
@@ -222,6 +230,20 @@ impl RobotAction {
     /// Read-only (reports state, never moves hardware or changes a latch).
     pub fn is_read_only(&self) -> bool {
         matches!(self, RobotAction::Status | RobotAction::LidarFrame)
+    }
+
+    /// A persistent setting rather than a move: sensors, gesture reactions,
+    /// obstacle avoidance.
+    pub fn is_setting(&self) -> bool {
+        matches!(
+            self,
+            RobotAction::LidarOn
+                | RobotAction::LidarOff
+                | RobotAction::GesturesOn
+                | RobotAction::GesturesOff
+                | RobotAction::ObstacleAvoidOn
+                | RobotAction::ObstacleAvoidOff
+        )
     }
 
     /// Audit-safe label: the action NAME only — never the `Move` velocity values
@@ -258,6 +280,8 @@ impl RobotAction {
             RobotAction::ObstacleAvoidOn => "ObstacleAvoidOn",
             RobotAction::ObstacleAvoidOff => "ObstacleAvoidOff",
             RobotAction::LidarFrame => "LidarFrame",
+            RobotAction::GesturesOn => "GesturesOn",
+            RobotAction::GesturesOff => "GesturesOff",
         }
     }
 
@@ -423,6 +447,8 @@ impl RobotAction {
             RobotAction::ObstacleAvoidOn => tool("go2.obstacle_avoid_on"),
             RobotAction::ObstacleAvoidOff => tool("go2.obstacle_avoid_off"),
             RobotAction::LidarFrame => tool("go2.lidar_frame"),
+            RobotAction::GesturesOn => tool("go2.gestures_on"),
+            RobotAction::GesturesOff => tool("go2.gestures_off"),
         }
     }
 }
@@ -732,28 +758,60 @@ pub fn execute_robot_call(
     plan: &RobotExecutionPlan,
     read_only: bool,
 ) -> RobotControlResponse {
-    let exec: anyhow::Result<serde_json::Value> = match &plan.call {
-        Go2Call::Tool { tool, params } => {
-            addon_manager.call_tool(&plan.addon_id, tool, params.clone(), &plan.actor_user_id)
-        }
-        Go2Call::Block { block_type, params } => match serde_json::to_vec(params) {
-            Ok(bytes) => addon_manager
-                .invoke_block(
-                    &plan.addon_id,
-                    block_type,
-                    &bytes,
-                    Some(plan.actor_user_id.clone()),
-                    None,
-                    ROBOT_BLOCK_FUEL,
-                    None,
-                )
-                .and_then(|raw| {
-                    serde_json::from_slice::<serde_json::Value>(&raw)
-                        .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
-                }),
-            Err(e) => Err(anyhow::anyhow!("encode block params: {e}")),
+    let exec = run_go2_call(
+        addon_manager,
+        &plan.addon_id,
+        &plan.call,
+        Some(&plan.actor_user_id),
+    );
+    call_response(exec, read_only)
+}
+
+/// Run `action` on a local robot addon on behalf of the system rather than a
+/// user: the robot's own automation (gesture reactions) that the operator
+/// authorized by switching it on. Same mapping and in-band refusal handling as
+/// `execute_robot_call`, so the addon's own gates (e-stop, online) still apply.
+pub fn execute_system_action(
+    addon_manager: &crate::addon::AddonManager,
+    addon_id: &str,
+    action: &RobotAction,
+) -> RobotControlResponse {
+    let exec = run_go2_call(addon_manager, addon_id, &action.to_go2_call(), None);
+    call_response(exec, action.is_read_only())
+}
+
+/// Dispatch one `Go2Call` into the addon; `actor` `None` runs it as the system.
+fn run_go2_call(
+    addon_manager: &crate::addon::AddonManager,
+    addon_id: &str,
+    call: &Go2Call,
+    actor: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    match call {
+        Go2Call::Tool { tool, params } => match actor {
+            Some(user) => addon_manager.call_tool(addon_id, tool, params.clone(), user),
+            None => addon_manager.call_tool_system(addon_id, tool, params.clone()),
         },
-    };
+        Go2Call::Block { block_type, params } => {
+            let bytes = serde_json::to_vec(params)
+                .map_err(|e| anyhow::anyhow!("encode block params: {e}"))?;
+            let raw = addon_manager.invoke_block(
+                addon_id,
+                block_type,
+                &bytes,
+                actor.map(str::to_string),
+                None,
+                ROBOT_BLOCK_FUEL,
+                None,
+            )?;
+            serde_json::from_slice::<serde_json::Value>(&raw)
+                .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
+        }
+    }
+}
+
+/// Turn a raw addon result into a `RobotControlResponse`.
+fn call_response(exec: anyhow::Result<serde_json::Value>, read_only: bool) -> RobotControlResponse {
     match exec {
         Ok(json) => {
             // The wasm block/tool call SUCCEEDS (Ok) even when the addon REFUSES the
@@ -846,6 +904,8 @@ mod tests {
             ("status", RobotAction::Status),
             ("lidar_on", RobotAction::LidarOn),
             ("lidar_off", RobotAction::LidarOff),
+            ("gestures_on", RobotAction::GesturesOn),
+            ("gestures_off", RobotAction::GesturesOff),
             ("obstacle_avoid_on", RobotAction::ObstacleAvoidOn),
             ("obstacle_avoid_off", RobotAction::ObstacleAvoidOff),
             ("lidar_frame", RobotAction::LidarFrame),
@@ -1140,6 +1200,10 @@ mod tests {
             "robot.command"
         );
         assert!(!RobotAction::ObstacleAvoidOn.is_read_only());
+        // Gesture reactions move the robot on their own once enabled → robot.command.
+        assert_eq!(RobotAction::GesturesOn.required_permission(), "robot.command");
+        assert_eq!(RobotAction::GesturesOff.required_permission(), "robot.command");
+        assert!(!RobotAction::GesturesOn.is_read_only());
     }
 
     #[test]
@@ -1149,6 +1213,8 @@ mod tests {
             other => panic!("expected Tool, got {other:?}"),
         };
         assert_eq!(tool_of(RobotAction::LidarOn), "go2.lidar_on");
+        assert_eq!(tool_of(RobotAction::GesturesOn), "go2.gestures_on");
+        assert_eq!(tool_of(RobotAction::GesturesOff), "go2.gestures_off");
         assert_eq!(tool_of(RobotAction::LidarOff), "go2.lidar_off");
         assert_eq!(tool_of(RobotAction::LidarFrame), "go2.lidar_frame");
         assert_eq!(

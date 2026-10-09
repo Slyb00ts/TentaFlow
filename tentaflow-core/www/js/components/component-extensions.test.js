@@ -1427,3 +1427,26 @@ test('tf-table: a declared signature cannot keep a node for an unmigrated builde
   second.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   assert.deepEqual(fired, ['r2'], 'and the handler acts on the row now in that slot');
 });
+
+// A caller that judges the typed values (the data-hiding window checks field
+// addresses) marks the wrong ones; the component only paints them.
+test('tf-tag-input: invalid marks the chips of the wrong values and leaves the rest alone', async () => {
+  await import('./tf-tag-input.js');
+  const input = document.createElement('tf-tag-input');
+  document.body.appendChild(input);
+  input.tags = ['PID-5', 'pid5'];
+  const chips = () => [...input.querySelectorAll('tf-chip')];
+  assert.deepEqual(chips().map((c) => c.getAttribute('tone')), ['neutral', 'neutral'], 'unmarked by default');
+
+  input.invalid = ['pid5', 'gone'];
+  assert.deepEqual(chips().map((c) => c.getAttribute('tone')), ['neutral', 'critical']);
+  assert.equal(chips()[1].getAttribute('aria-invalid'), 'true');
+  assert.equal(chips()[0].hasAttribute('aria-invalid'), false);
+  assert.deepEqual(input.invalid, ['pid5', 'gone']);
+
+  input.tags = ['pid5'];
+  assert.equal(chips()[0].getAttribute('tone'), 'critical', 'the mark follows the value across a redraw');
+  input.invalid = [];
+  assert.equal(chips()[0].getAttribute('tone'), 'neutral');
+  input.remove();
+});

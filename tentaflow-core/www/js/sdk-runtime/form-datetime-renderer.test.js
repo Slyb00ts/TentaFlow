@@ -131,9 +131,12 @@ test('DatePicker picker change re-emits value + kind=tstr on wrapper', () => {
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
   const picker = el.querySelector('tf-datepicker');
+  let edits = null;
+  el.addEventListener('change', (e) => { edits = e.__tfBoundEdits; });
   picker.value = '2024-06-15';
   picker.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, { value: '2024-06-15', kind: 'tstr' });
+  assertEq(edits, [{ path: PATH('d'), value: '2024-06-15' }]);
 });
 
 test('DatePicker calendar day click emits SDK change with clicked ISO date', () => {
@@ -412,10 +415,16 @@ test('DateRangePicker preset emits range value', () => {
     [9, [preset]],
   ]));
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let edits = null;
+  el.addEventListener('change', (e) => { got = e.detail; edits = e.__tfBoundEdits; });
   const btn = el.querySelector('.tf-daterange__presets [data-preset-id=p7]');
   btn.click();
   assertEq(got.kind, 'range');
+  // Both bound paths are edited in one gesture.
+  assertEq(edits, [
+    { path: PATH('from'), value: got.value.from },
+    { path: PATH('to'), value: got.value.to },
+  ]);
   assertEq(got.preset_id, 'p7');
   assert(typeof got.value.from === 'string');
   assert(typeof got.value.to === 'string');

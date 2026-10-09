@@ -542,9 +542,9 @@ pub(super) fn table_rows(conn: &Connection, table: &str, ordering: &str) -> Vec<
 
 fn legacy_database() -> (tempfile::TempDir, Connection, String, String) {
     let directory = tempfile::tempdir().unwrap();
-    let conn = Connection::open(directory.path().join("process-v185.db")).unwrap();
+    let conn = Connection::open(directory.path().join("process-v187.db")).unwrap();
     let (model_json, model_sha256) = crate::db::migrations::bpmn_boundary_migration_fixture(&conn);
-    crate::db::migrations::run_ladder_up_to(&conn, 185);
+    crate::db::migrations::run_ladder_up_to(&conn, 187);
     let graph_json = test_support::graph("legacy call-free service", None);
     conn.execute(
         "INSERT INTO flows(id,name,flow_json,status) VALUES('flow-pinned','Pinned service',?1,'active')",

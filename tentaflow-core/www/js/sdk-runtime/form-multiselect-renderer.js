@@ -19,7 +19,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
@@ -370,7 +370,7 @@ function renderMultiSelect(component, ctx) {
       detail: { value: detailArr, kind: 'array' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, selectedPath));
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

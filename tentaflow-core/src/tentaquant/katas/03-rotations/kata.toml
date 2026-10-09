@@ -1,0 +1,11 @@
+id = "03-rotations"
+points = 80
+tier = "T0"
+
+[title]
+pl = "Obroty RX, RY, RZ"
+en = "Rotations RX, RY and RZ"
+
+[summary]
+pl = "stan pośredni 70/30"
+en = "an in-between state, 70/30"

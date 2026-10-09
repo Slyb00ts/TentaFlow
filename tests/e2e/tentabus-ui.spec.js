@@ -27,9 +27,21 @@
 //              version refused in plain words and added after the
 //              compatibility changed, withdrawing a version and the pattern,
 //              deleting from the page and from the list, a used pattern the
-//              server will not delete, the phone layout and a reader); and,
-//              last because it stops the node, the list kept under the
-//              connection notice (T12). Stateful: run the whole project, never `-g`.
+//              server will not delete, the phone layout and a reader); then
+//              U6: a topic's Dostęp (a group given reading, a person a write
+//              ban, a change, the ban removed with its warning, an addon;
+//              a key issued with reading and shown once, checked over the
+//              records REST — it reads and cannot write — its rights changed
+//              and the key revoked; the phone layout; no section without
+//              administration); then U7: a topic's Ukrywanie danych (the empty
+//              state, a group rule added and changed through its window, the
+//              preview as the group with the audit entry and the fields the rules
+//              hid, the preview narrowed by the administrator's own rule explained,
+//              a writing rule, a rule for everyone, every rule deleted; an HL7
+//              topic with the dictionary and a refused address; a binary topic
+//              that cannot get a rule; the phone layout; no section without
+//              administration); and, last because it stops the node, the
+//              list kept under the connection notice (T12). Stateful: run the whole project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
 //              rig under /tmp (a symlink to /private/tmp) is not reliable.
 // =============================================================================
@@ -40,6 +52,14 @@ const fs = require('fs');
 const path = require('path');
 const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+
+// "Anuluj" asks once before it drops a changed draft, like the close button
+// and Escape: a second click is the answer.
+async function cancelOut(win) {
+  await win.locator('[data-act="cancel"]').click();
+  const discard = win.locator('[data-role="discard"]');
+  if (await discard.count() && await discard.isVisible()) await win.locator('[data-act="cancel"]').click();
+}
 
 const PORT = 18323;
 const REPO_ROOT = path.join(__dirname, '../..');
@@ -643,6 +663,10 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await name.locator('input').fill('wyniki-z-pracowni');
   await expect(name.locator('.tf-error-text')).toBeHidden();
   await expect(creator(page).locator('[data-role="heading"]')).toHaveText('wyniki-z-pracowni');
+  // "Anuluj" with a name typed asks first, like the close button and Escape in the other windows.
+  await creator(page).locator('[data-act="cancel"]').click();
+  await expect(creator(page).locator('[data-role="discard"]')).toBeVisible();
+  await expect(creator(page)).toHaveCount(1);
   await expect(creator(page).locator('#tb-cr-kind tf-choice-card')).toHaveCount(3);
   await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/json"]').click();
   await creator(page).locator('#tb-cr-partitions .tf-input-step--inc').click();
@@ -833,7 +857,7 @@ test('T02/T04 at 390x844: cards, no horizontal scroll, the creator and the previ
   await nextButton(page).click();
   await fits('tf-window.tb-creator');
   await page.screenshot({ path: path.join(SHOTS, 't04-krok2-telefon.png') });
-  await creator(page).locator('[data-act="cancel"]').click();
+  await cancelOut(creator(page));
   await expect(creator(page)).toHaveCount(0);
   await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3);
 
@@ -866,7 +890,10 @@ test('T11 Szkolenia: the empty list leads to the creator with one copy and no pa
   await expect(creator(page).locator('.tb-explain-box')).toContainText('W instancji Szkolenia nie ma jeszcze wzorów wiadomości');
   await expect(creator(page).locator('.tb-kv-grid')).toContainText('bez wzoru');
   await page.screenshot({ path: path.join(SHOTS, 't11-szkolenia-nowy-krok3.png') });
-  // Closing leaves the instance as empty as it was.
+  // Closing leaves the instance as empty as it was — after asking once, because a name is typed.
+  await page.keyboard.press('Escape');
+  await expect(creator(page).locator('[data-role="discard"]')).toBeVisible();
+  await expect(creator(page)).toHaveCount(1);
   await page.keyboard.press('Escape');
   await expect(creator(page)).toHaveCount(0);
   await expect(empty).toBeVisible();
@@ -920,7 +947,7 @@ test('U2 topic page at 1440: the menu, Stan with this topic\'s figures, alerts a
   await expect(page.locator('#tb-crumbs .tf-breadcrumb-item')).toHaveText(['TentaBus', 'Produkcja', 'Topiki', 'wyniki-badan']);
   const menu = d.locator('[data-role="menu"]');
   await expect(menu).toHaveAttribute('orientation', 'vertical');
-  await expect(menu.locator('tf-tab')).toHaveText([/Stan/, /Ustawienia/, /Nieprzetworzone\s*14/, /Partycje i kopie\s*3/]);
+  await expect(menu.locator('tf-tab')).toHaveText([/Stan/, /Ustawienia/, /Dostęp/, /Ukrywanie danych/, /Nieprzetworzone\s*14/, /Partycje i kopie\s*3/]);
   await expect(d.locator('[data-role="pick"]')).toBeHidden();
 
   const s = section(page, 'state');
@@ -980,7 +1007,7 @@ test('U2 Ustawienia: values to read with locks; Przechowywanie saved through its
   await expect(win.locator('.tb-vr-lock')).toContainText('Innego sposobu sprzątania na razie nie ma.');
   await win.locator('#tb-set-retention select').selectOption({ label: '3 dni' });
   await expect(win.locator('[data-role="impact"]')).toContainText('Co się stanie po zapisaniu: Wiadomości');
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   await expect(retentionValue).toHaveText('7 dni');
 
@@ -1116,7 +1143,7 @@ test('U2 Ponowne próby and Wzór wiadomości saved; a refusal stays in the wind
   await expect(win.locator('[data-role="error"]')).toBeVisible({ timeout: 15000 });
   await expect(win.locator('[data-role="error"]')).toContainText(/e2e-ustawienia|topik/i);
   await expect(win).toHaveCount(1);
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect(errors.filter((e) => !/topic_not_found|NotFound/.test(e)), errors.join('\n')).toEqual([]);
 });
@@ -1211,7 +1238,7 @@ test('U2 at 390x844: the section list replaces the menu, cards fit, a window fil
   await expect(changeWindow(page)).toBeVisible();
   await windowFits(page, 'tf-window.tb-change-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 'tp-ustawienia-zmien-przechowywanie-telefon.png') });
-  await changeWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(changeWindow(page));
   await pick.locator('select').selectOption('partitions');
   await expect(section(page, 'partitions').locator('tf-table tbody tr')).toHaveCount(3, { timeout: 15000 });
   await assertNoOverflow(page);
@@ -1528,7 +1555,7 @@ test('U3 Przesuń: to a number, to the start, to the end and to a time — the w
   await win.locator('#tb-move-offset input').fill(String(after[1].hw));
   await expect(win.locator('#tb-move-offset')).toHaveAttribute('error', /^Podaj numer od /);
   await expect(win.locator('[data-act="move"]')).toHaveAttribute('disabled', '');
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect((await readingPlaces(page, instanceId, group, topic))[1].committed).toBe(after[1].committed);
 
@@ -1610,7 +1637,7 @@ test('U3 at 390x844: the list as cards, the section list, the move window fills 
   await expect(moveWindow(page).locator('.tf-window-title-text')).toBeVisible();
   await windowFits(page, 'tf-window.tb-move-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 'od-przesun-p0-telefon.png') });
-  await moveWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(moveWindow(page));
   await pick.locator('select').selectOption('settings');
   await expect(consumerSection(page, 'settings').locator('.section-card')).toHaveCount(2);
   await assertNoOverflow(page);
@@ -1957,7 +1984,7 @@ test('U4 Ponów one message: the window says where it goes and who gets it; it l
   expect(impact).toContain('Dostaną ją wszyscy odbiorcy tego topiku (aplikacja-lekarza i raporty-laboratorium) — także ci, którzy już ją przetworzyli.');
   expect(impact).toContain('po 5 próbach');
   await page.screenshot({ path: path.join(SHOTS, 'tp-nieprzetworzone-ponow.png') });
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect(await topicEnd(page, instanceId, 'wyniki-badan')).toBe(endBefore);
 
@@ -2232,7 +2259,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   await expect(win).toHaveCount(1);
   await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
   await page.screenshot({ path: path.join(SHOTS, 't08-wzor-nowa-wersja-odmowa.png') });
-  await win.locator('[data-act="cancel"]').click();
+  await cancelOut(win);
   await expect(win).toHaveCount(0);
   expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: REFERRAL })).versions).toHaveLength(1);
 
@@ -2246,7 +2273,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
 
   // "Nowa wersja" comes back with the refused text.
   await p.locator('[data-role="new-version"]').click();
-  await expect(win.locator('.tb-explain-box')).toContainText('z poprzedniej próby');
+  await expect(win.locator('.tb-explain-box')).toContainText('z poprzedniego otwarcia tego okna');
   await expect(win.locator('[data-role="text"] textarea')).toHaveValue(REFERRAL_V2);
   await win.locator('[data-act="save"]').click();
   await expect(win).toHaveCount(0, { timeout: 15000 });
@@ -2350,7 +2377,7 @@ test('U5 at 390x844: the list as cards, the pattern\'s page in one column, a win
   await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
   await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
   await page.screenshot({ path: path.join(SHOTS, 't08-dodaj-telefon.png') });
-  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(schemaWindow(page));
   await expect(schemaWindow(page)).toHaveCount(0);
   await schemaRow(page, 'wizyta').locator('td').first().click();
   const p = schemaSlot(page);
@@ -2363,7 +2390,7 @@ test('U5 at 390x844: the list as cards, the pattern\'s page in one column, a win
   await p.locator('[data-role="compat"]').click();
   await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
   await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
-  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  await cancelOut(schemaWindow(page));
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
@@ -2398,6 +2425,705 @@ test('U5 without administration: the patterns to read, no change buttons, who ch
     await expect(p.locator('[data-role="versions"] tf-button[data-act="withdraw-version"]')).toHaveCount(0);
     await expect.poll(() => p.locator('tf-code-editor').evaluate((el) => el.value), { timeout: 15000 }).toContain('"gabinet"');
     await rp.screenshot({ path: path.join(SHOTS, 't08-wzor-bez-uprawnien.png'), fullPage: true });
+    expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+// ----------------------------------------------------------------------------
+// U6 — a topic's Dostęp (T09): the entries of people, groups and addons, and
+// the keys of outside systems. What the screen writes is checked against the
+// server's own list of entries and, for a key, against the records REST the
+// key is for.
+// ----------------------------------------------------------------------------
+
+const accessSection = (page) => section(page, 'access');
+// Names made in these tests carry the run, so a rerun against the same node
+// never meets the previous run's group or key.
+const RUN = Date.now().toString(36).slice(-5);
+const accessWindow = (page) => page.locator('tf-window.tb-access-window');
+const subjectRow = (page, name) => accessSection(page).locator('[data-role="subjects"] tbody tr', { hasText: name });
+
+function sqliteWrite(sql) {
+  execFileSync('/usr/bin/sqlite3', ['-cmd', '.timeout 5000', DB, sql], { encoding: 'utf8' });
+}
+
+function iamCall(page, kind, payload) {
+  return page.evaluate(async ([k, p]) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    return k === 'iamListUsersRequest' ? ApiBinary.one(k, p) : ApiBinary.action(k, p);
+  }, [kind, payload]);
+}
+
+async function ensureUser(page, username, password, displayName) {
+  const users = (await iamCall(page, 'iamListUsersRequest', {}))?.users || [];
+  const found = users.find((u) => u.username === username);
+  if (found) return found.userId ?? found.user_id ?? found.id;
+  const created = await iamCall(page, 'iamCreateUserRequest', { username, password, displayName, email: '', role: 'user', groupIds: [] });
+  return created?.userId ?? created?.user_id;
+}
+
+async function serverEntries(page, instanceId, topic = 'wyniki-badan') {
+  const res = await busCall(page, 'busAclListRequest', { instanceId, topic });
+  return (res?.entries || []).map((e) => `${e.subjectType}:${e.subjectId}:${e.action}:${e.accessLevel}`).sort();
+}
+
+// A window's entry and exit are animated: the evidence is taken once they
+// end (a status dot pulses forever and is not waited for).
+async function settled(page) {
+  await page.waitForFunction(() => document.getAnimations({ subtree: true })
+    .every((a) => a.playState !== 'running' || a.effect?.getTiming().iterations === Infinity));
+}
+
+async function pickSegment(win, selector, label) {
+  await win.locator(`${selector} .tf-seg-opt`, { hasText: label }).click();
+}
+
+test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const tomaszId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const piotrId = await ensureUser(page, 'piotr', 'Piotr-zakaz-1', 'Piotr Zieliński');
+  const groupName = `Rejestracja ${RUN}`;
+  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name: groupName, description: '' }))?.groupId;
+  expect(groupId).toBeTruthy();
+  await iamCall(page, 'iamSetUserGroupsRequest', { userId: tomaszId, groupIds: [groupId] });
+  // An addon that declares the bus and holds bus.read in this instance: the
+  // directory offers exactly those.
+  sqliteWrite("INSERT OR IGNORE INTO addons (addon_id, name, version, display_name) VALUES ('e2e-asystent', 'e2e-asystent', '1.0.0', 'Asystent lekarza');"
+    + " INSERT OR IGNORE INTO addon_permission_catalog (addon_id, permission_id) VALUES ('e2e-asystent', 'bus.subscribe');");
+  await iamCall(page, 'addonPermissionSetRequest', { addonId: instanceId, subjectType: 'user', subjectId: 'e2e-asystent', permissionId: 'bus.read', grantMode: 'allow' });
+  const before = await serverEntries(page, instanceId);
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'access');
+    const s = accessSection(page);
+    await expect(s.locator('.section-card').first()).toContainText('Osoby, grupy i addony');
+    await expect(s.locator('[data-role="subjects-count"] tf-chip')).toBeVisible({ timeout: 15000 });
+
+    // Nadaj: the group Rejestracja reads.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    const win = accessWindow(page);
+    await expect(win).toHaveCount(1);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    // Nobody is chosen for the administrator: not the first group of the list.
+    await expect(win.locator('[data-role="subject"] select')).toHaveValue('');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(win.locator('[data-role="impact"]')).toContainText(`1 osoba z grupy ${groupName} będzie mogła czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.`);
+    await windowFits(page, 'tf-window.tb-access-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Nadano dostęp');
+    await expect(subjectRow(page, 'Rejestracja')).toContainText('Grupa · 1 osoba');
+    await expect(subjectRow(page, 'Rejestracja')).toContainText('pozwolono');
+    expect(await serverEntries(page, instanceId)).toContain(`group:${groupId}:read:allow`);
+
+    // Nadaj: Piotr may not write; reading is left to his role.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await pickSegment(win, '[data-role="kind"]', 'Użytkownik');
+    await expect(win.locator('[data-role="subject"]')).toHaveAttribute('label', 'Który użytkownik');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Piotr Zieliński' })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: 'Piotr Zieliński' });
+    await pickSegment(win, 'tf-segmented[data-right="read"]', 'Nie ustawiaj');
+    await pickSegment(win, 'tf-segmented[data-right="write"]', 'Zabroń');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Zakaz dla „Piotr Zieliński”: zapis — wygrywa z rolą w organizacji i z pozwoleniem z grupy.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Piotr Zieliński')).toContainText('zabroniono');
+    let server = await serverEntries(page, instanceId);
+    expect(server).toContain(`user:${piotrId}:write:deny`);
+    expect(server.filter((e) => e.startsWith(`user:${piotrId}:`))).toHaveLength(1);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep.png'), fullPage: true });
+
+    // Zmień: Rejestracja may also write — one change, said before saving.
+    await subjectRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await expect(win.locator('.tb-explain-box')).toContainText(groupName);
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await pickSegment(win, 'tf-segmented[data-right="write"]', 'Pozwól');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Zapis dla „${groupName}” zmieni się z „nie ustawiono” na „pozwolono”. Będzie można wysyłać wiadomości. Pozostałe prawa bez zmian.`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Zapisano');
+    expect(await serverEntries(page, instanceId)).toContain(`group:${groupId}:write:allow`);
+
+    // Usuń the ban: the window warns that it may give the right back.
+    await subjectRow(page, 'Piotr Zieliński').locator('tf-button[data-act="remove"]').click();
+    await expect(win.locator('[data-role="lifts-deny"]')).toHaveText(/Usunięcie „zabroniono” może dać te prawa, jeśli pozwala na nie rola w organizacji\./);
+    await expect(win).toContainText('Piotr Zieliński straci wpis w tym topiku: zapis (zabroniono).');
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-usun.png') });
+    await win.locator('[data-act="go"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Piotr Zieliński')).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Usunięto wpis');
+    server = await serverEntries(page, instanceId);
+    expect(server.filter((e) => e.startsWith(`user:${piotrId}:`))).toEqual([]);
+
+    // Nadaj to an addon: its own kind of entry, never a user with its id.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await pickSegment(win, '[data-role="kind"]', 'Addon');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Asystent lekarza' })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: 'Asystent lekarza' });
+    await expect(win.locator('[data-role="impact"]')).toContainText('Addon „Asystent lekarza” dostanie w topiku wyniki-badan: czytanie.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Asystent lekarza')).toContainText('Addon');
+    expect(await serverEntries(page, instanceId)).toContain('addon:e2e-asystent:read:allow');
+
+    const rows = await s.locator('[data-role="subjects"] tbody tr').count();
+    await expect(d.locator('[data-role="menu"] tf-tab#access')).toHaveAttribute('count', String(rows));
+    await assertNoBannedWords(page);
+    await assertNoOverflow(page);
+  } finally {
+    for (const [subjectType, subjectId] of [['group', groupId], ['addon', 'e2e-asystent'], ['user', piotrId]]) {
+      for (const action of ['read', 'write', 'admin']) {
+        await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType, subjectId, accessLevel: 'clear', action });
+      }
+    }
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(await serverEntries(page, instanceId)).toEqual(before);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 keys: issued with reading, shown once; the key reads over REST and cannot write; its rights change; revoked, its rights and its reading go with it', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const keyName = `Portal wyników ${RUN}`;
+  let keyId = null;
+  let revoked = false;
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji Produkcja', { timeout: 20000 });
+    await s.locator('tf-button[data-go="key-issue"]').click();
+    const win = accessWindow(page);
+    await expect(win.locator('[data-role="impact"]')).toContainText('Wpisz nazwę systemu.');
+    await win.locator('[data-role="name"] input').fill(keyName);
+    await expect(win.locator('[data-role="impact"]')).toContainText('Zaznacz co najmniej jedno prawo.');
+    await win.locator('tf-checkbox[data-key-right="readMessages"] .tf-checkbox-label').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`${keyName} dostanie klucz z prawami: czyta wiadomości (topik wyniki-badan). Klucz zobaczysz tylko raz.`);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-wydaj-klucz.png') });
+    await win.locator('[data-act="save"]').click();
+
+    const issued = page.locator('tf-window.tb-key-issued');
+    await expect(issued).toHaveCount(1);
+    const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+    expect(token).toMatch(/^sk-[0-9a-f]{64}$/);
+    const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+    expect(url).toBe(`https://127.0.0.1:${PORT}/v1/bus/instances/${instanceId}/topics/wyniki-badan/records?org_id=org-default`);
+    const group = (await issued.locator('[data-role="group"]').textContent()).trim();
+    expect(group).toMatch(/^k:[0-9a-f-]{36}$/);
+    keyId = group.slice(2);
+    await expect(issued).toContainText('Produkcja ·');
+    await expect(issued).toContainText('czyta wiadomości · topik wyniki-badan');
+    // The technical hint is folded away; Escape before copying asks first.
+    await expect(issued.locator('details[data-role="developer"]')).not.toHaveAttribute('open', '');
+    await page.keyboard.press('Escape');
+    await expect(issued.locator('[data-role="discard"]')).toBeVisible();
+    await expect(issued).toHaveCount(1);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-klucz-wydany.png') });
+    await issued.locator('[data-act="done"]').click();
+    await expect(issued).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Wydano klucz');
+    const keyRow = s.locator('[data-role="keys"] tbody tr', { hasText: keyName });
+    await expect(keyRow).toContainText('Czyta wiadomości');
+    await expect(keyRow).toContainText('jeszcze nie');
+    await expect(keyRow).not.toContainText('Wysyła wiadomości');
+
+    // The key reads the topic under its own group, and nothing more.
+    const auth = { Authorization: `Bearer ${token}` };
+    const read = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+    expect(read.status(), await read.text()).toBe(200);
+    expect((await read.json()).records.length).toBeGreaterThan(0);
+    const line = JSON.stringify({ payload_b64: Buffer.from('MSH|^~\\&|LAB|X|||20260929||ORU^R01|1|P|2.5').toString('base64') });
+    const write = await request.post(url, { headers: { ...auth, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+    expect(write.status(), await write.text()).toBe(403);
+
+    // Prawa klucza: add sending; the key stays the same.
+    await keyRow.locator('tf-button[data-act="key-rights"]').click();
+    await win.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`${keyName} dostanie prawa: wysyła wiadomości. Pozostałe prawa bez zmian; klucz się nie zmienia.`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(keyRow).toContainText('Wysyła wiadomości');
+    const keyEntries = async () => (await busCall(page, 'busAclListRequest', { instanceId, topic: 'wyniki-badan' })).entries
+      .filter((e) => e.subjectType === 'api_key' && e.subjectId === keyId)
+      .map((e) => `${e.action}:${e.accessLevel}`).sort();
+    expect(await keyEntries()).toEqual(['read:allow', 'write:allow']);
+
+    // Its consumer is named after the key on the topic's Stan.
+    const d = detailSlot(page);
+    await d.locator('[data-role="menu"] tf-tab#state > button').click();
+    const consumerRow = section(page, 'state').locator('.tb-consumer-row', { hasText: `Klucz ${keyName}` });
+    await expect(consumerRow).toHaveCount(1, { timeout: 20000 });
+    await expect(section(page, 'state').locator('.tb-consumer-row', { hasText: group })).toHaveCount(0);
+    await d.locator('[data-role="menu"] tf-tab#access > button').click();
+
+    // Unieważnij: at once, for good, its rights with it.
+    await keyRow.locator('tf-button[data-act="key-revoke"]').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Klucz przestanie działać od razu. ${keyName} straci prawa: czyta wiadomości i wysyła wiadomości.`);
+    await win.locator('[data-act="go"]').click();
+    await expect(win).toHaveCount(0);
+    revoked = true;
+    await expect(keyRow).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Unieważniono klucz');
+    expect(await keyEntries()).toEqual([]);
+    await expect(s.locator('[data-role="keys"] tbody tr', { hasText: 'Klucz usunięty' })).toHaveCount(0);
+    const refused = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+    expect(refused.status()).toBe(401);
+
+    // Its consumer stays on Stan, said to be gone and counted nowhere.
+    await d.locator('[data-role="menu"] tf-tab#state > button').click();
+    const goneRow = section(page, 'state').locator('.tb-consumer-row', { hasText: 'Klucz usunięty' });
+    await expect(goneRow).toHaveCount(1, { timeout: 20000 });
+    await expect(goneRow).toContainText('klucza już nie ma — nikt tu nie czyta');
+  } finally {
+    if (keyId && !revoked) await page.evaluate(async (id) => {
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      await ApiBinary.action('apiKeyRevokeRequest', { keyId: id }).catch(() => {});
+    }, keyId);
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 at 390x844: Dostęp from the section list, the rows as cards, a window fills the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: 'e2e-telefon', accessLevel: 'deny', action: 'read' });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await d.locator('[data-role="pick"] select').selectOption('access');
+    await expect.poll(() => hashParams(page).section).toBe('access');
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="subjects"] tbody tr').first()).toBeVisible({ timeout: 15000 });
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-390.png'), fullPage: true });
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await expect(accessWindow(page).locator('[data-role="subject"] select option').first()).toBeAttached({ timeout: 15000 });
+    await windowFits(page, 'tf-window.tb-access-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj-390.png') });
+    await cancelOut(accessWindow(page));
+    await expect(accessWindow(page)).toHaveCount(0);
+  } finally {
+    await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: 'e2e-telefon', accessLevel: 'clear', action: 'read' });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 without administration: no Dostęp in the menu or the section list, and an address naming it opens Stan', async ({ page, browser }) => {
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
+  const rp = await context.newPage();
+  const readerErrors = trackErrors(rp);
+  try {
+    await rp.addInitScript(() => {
+      localStorage.setItem('tentaflow_lang', 'pl');
+      document.addEventListener('DOMContentLoaded', () => {
+        const st = document.createElement('style');
+        st.textContent = '.update-overlay{display:none!important}';
+        document.head.appendChild(st);
+      });
+    });
+    await loginAsAdmin(rp, { port: PORT, username: 'tomasz', password: 'Tomasz-czyta-1' });
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const d = rp.locator('#tb-panel > [data-tb-view-slot="detail"]');
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'state');
+    await expect(d.locator('[data-role="menu"] tf-tab#access')).toBeHidden();
+    await expect(d.locator('[data-role="menu"] tf-tab#settings')).toBeVisible();
+    await expect(d.locator('[data-section="access"]')).toBeHidden();
+    const options = await d.locator('[data-role="pick"] select option').allTextContents();
+    expect(options).not.toContain('Dostęp');
+    expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+// ----------------------------------------------------------------------------
+// U7 — a topic's Ukrywanie danych (T07): the rules of what each person, group
+// or addon sees or may write. What the screen writes is checked against the
+// server's own list of rules, and the preview against the record the server
+// really projects (and the audit entry it leaves).
+// ----------------------------------------------------------------------------
+
+const hidingSection = (page) => section(page, 'hiding');
+const hidingWindow = (page) => page.locator('tf-window.tb-hiding-window');
+const previewWindow = (page) => page.locator('tf-window.tb-hiding-preview');
+const ruleRow = (page, name) => hidingSection(page).locator('[data-role="rules"] tbody tr', { hasText: name });
+const fieldSeg = (win, field) => win.locator(`tf-segmented[data-field="${field}"]`);
+
+async function serverRules(page, instanceId, topic) {
+  const res = await busCall(page, 'busFieldPolicyListRequest', { instanceId, topic });
+  return Object.fromEntries((res?.policies || []).map((p) => [`${p.subjectType}:${p.subjectId}:${p.direction}`, { fields: [...p.fields].sort(), required: [...p.requiredFields].sort() }]));
+}
+
+async function clearRules(page, instanceId, topic) {
+  const res = await busCall(page, 'busFieldPolicyListRequest', { instanceId, topic });
+  for (const p of res?.policies || []) {
+    await busCall(page, 'busFieldPolicyDeleteRequest', { instanceId, topic, subjectType: p.subjectType, subjectId: p.subjectId, direction: p.direction });
+  }
+}
+
+test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the group; one for everyone narrows the preview; a writing rule; all deleted', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const tomaszId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const groupName = `Rejestracja U7 ${RUN}`;
+  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name: groupName, description: '' }))?.groupId;
+  expect(groupId).toBeTruthy();
+  await iamCall(page, 'iamSetUserGroupsRequest', { userId: tomaszId, groupIds: [groupId] });
+  await clearRules(page, instanceId, 'wizyty');
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wizyty', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'hiding');
+    const s = hidingSection(page);
+
+    // T11: a topic without rules says so, and its action opens the window.
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Ten topik nie ma zasad ukrywania danych', { timeout: 15000 });
+    await expect(d.locator('[data-role="menu"] tf-tab#hiding')).not.toHaveAttribute('count', /.+/);
+    await assertNoBannedWords(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-e-recepty.png'), fullPage: true });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win).toHaveCount(1);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(win.locator('tf-segmented[data-field]')).toHaveCount(4);
+    await expect(win.locator('[data-role="source-note"]')).toContainText('Pola pochodzą ze wzoru wiadomości wizyta, wersja 3.');
+    // The pattern does not close itself, so a rule that hides no listed field still hides the rest — and it is the first rule, which closes the topic to keys.
+    await expect(win.locator('[data-role="impact"]')).toContainText('znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Systemy zewnętrzne z kluczem API nie będą mogły czytać tego topiku, dopóki nie dodasz zasady dla wszystkich.');
+    await pickSegment(win, 'tf-segmented[data-field="lekarz"]', 'Ukryj');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Dla „${groupName}” znikną z wiadomości pola: lekarz. Pozostałe pola z listy bez zmian.`);
+    await windowFits(page, 'tf-window.tb-hiding-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-wizyty.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zasadę');
+    await expect(ruleRow(page, groupName)).toContainText('Grupa · 1 osoba');
+    await expect(ruleRow(page, groupName)).toContainText('lekarz');
+    await expect(ruleRow(page, groupName)).toContainText('Ukryj');
+    await expect(ruleRow(page, groupName)).toContainText('Odczyt');
+    await expect(s.locator('[data-role="count"] tf-chip')).toHaveAttribute('label', '1');
+    await expect(d.locator('[data-role="menu"] tf-tab#hiding')).toHaveAttribute('count', '1');
+    await expect(s.locator('[data-role="keys-note"]')).toContainText('zakresie odczytu');
+    expect(await serverRules(page, instanceId, 'wizyty')).toEqual({ [`group:${groupId}:read`]: { fields: ['gabinet', 'pacjent', 'termin'], required: [] } });
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodano-wizyty.png'), fullPage: true });
+
+    // Zmień: one more field hidden — said before saving, subject fixed.
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await expect(win.locator('.tb-explain-box').first()).toContainText(groupName);
+    await expect(fieldSeg(win, 'lekarz')).toHaveAttribute('value', 'hide');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await pickSegment(win, 'tf-segmented[data-field="termin"]', 'Ukryj');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Dla „${groupName}” znikną z wiadomości pola: termin. Pozostałe pola z listy bez zmian.`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zmianę zasady');
+    expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:read`].fields).toEqual(['gabinet', 'pacjent']);
+
+    // Zmień on a rule somebody else saved meanwhile: the server refuses the stale save, the window
+    // closes with a plain note, and what the other administrator stored stays.
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await expect(win).toHaveCount(1);
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Ukryj');
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: 'wizyty', subjectType: 'group', subjectId: groupId, direction: 'read', fields: ['gabinet', 'pacjent'], requiredFields: [] });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Nic nie zapisano — zasada zmieniła się w międzyczasie');
+    await expect(s.locator('[data-role="notice"] tf-alert')).not.toHaveAttribute('message', /spróbuj jeszcze raz/);
+    expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:read`].fields).toEqual(['gabinet', 'pacjent']);
+
+    // Podgląd, jak widzi…: the newest message as the group reads it, and the audit entry.
+    const audits = auditCount('bus.field_policy.preview');
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = previewWindow(page);
+    await expect(preview).toHaveCount(1);
+    await expect(preview.locator('.tb-audit-banner')).toContainText('Ten podgląd zapisuje się w dzienniku audytu.');
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await expect(preview.locator('[data-role="subject"] select option', { hasText: groupName })).toHaveCount(1, { timeout: 15000 });
+    await preview.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await preview.locator('[data-act="show"]').click();
+    await expect(preview.locator('[data-role="summary"]')).toHaveText('Zasady ukryły 2 pola: lekarz, termin.', { timeout: 15000 });
+    await expect(preview.locator('.tb-preview-record-head')).toContainText(`Tak widzi ją: grupa ${groupName}`);
+    const shown = await preview.locator('[data-role="payload"]').innerText();
+    expect(shown).toContain('"pacjent"');
+    expect(shown).not.toContain('"lekarz"');
+    expect(shown).not.toContain('"termin"');
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]')).toHaveCount(2);
+    await expect(preview.locator('[data-role="limited"]')).toHaveCount(0);
+    expect(auditCount('bus.field_policy.preview')).toBe(audits + 1);
+    await windowFits(page, 'tf-window.tb-hiding-preview', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-wizyty.png') });
+
+    // A rule for everyone covers the administrator too, so the group's preview
+    // is narrower than what the group sees — and the window says so.
+    await preview.locator('[data-act="close"]').click();
+    await expect(preview).toHaveCount(0);
+    await s.locator('tf-button[data-go="hiding-add"]').click();
+    await pickSegment(win, '[data-role="kind"]', 'Wszyscy');
+    await expect(win.locator('[data-role="pick-note"]')).toContainText('Systemy z kluczem API podlegają tylko tej zasadzie.');
+    await pickSegment(win, 'tf-segmented[data-field="gabinet"]', 'Ukryj');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(ruleRow(page, 'Wszyscy')).toContainText('gabinet');
+    await expect(s.locator('[data-role="keys-note"]')).toHaveText('');
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await expect(preview.locator('[data-role="subject"] select option', { hasText: groupName })).toHaveCount(1, { timeout: 15000 });
+    await preview.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await preview.locator('[data-act="show"]').click();
+    await expect(preview.locator('tf-alert[data-role="limited"]')).toHaveAttribute('title', 'Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu', { timeout: 15000 });
+    await expect(preview.locator('tf-alert[data-role="limited"]')).toHaveAttribute('message', /Podgląd nigdy nie pokazuje więcej, niż widzisz sam/);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-zawezony.png') });
+    await preview.locator('[data-act="close"]').click();
+
+    // Zapis: the group must send a patient and may not send a surgery.
+    await s.locator('tf-button[data-go="hiding-add"]').click();
+    await pickSegment(win, '[data-role="direction"]', 'Zapis');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(fieldSeg(win, 'pacjent').locator('.tf-seg-opt')).toHaveText(['Dozwolone', 'Wymagane', 'Niedozwolone']);
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Wymagane');
+    await pickSegment(win, 'tf-segmented[data-field="gabinet"]', 'Niedozwolone');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Wiadomość od „${groupName}”, w której jest którekolwiek z pól: gabinet, zostanie odrzucona i nie trafi do topiku.`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="rules"] tbody tr')).toHaveCount(3);
+    const written = ruleRow(page, groupName).filter({ hasText: 'Zapis' });
+    await expect(written).toContainText('Wymagane');
+    await expect(written).toContainText('Niedozwolone');
+    expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:write`]).toEqual({ fields: ['lekarz', 'pacjent', 'termin'], required: ['pacjent'] });
+    await expect(s.locator('[data-role="legend"]')).toContainText('Odrzuć wiadomość');
+    await expect(s.locator('[data-role="legend"]')).not.toContainText('Zahaszuj');
+    await assertNoBannedWords(page);
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-wizyty.png'), fullPage: true });
+
+    // Usuń on a rule somebody saved meanwhile: the server refuses the stale removal, the window
+    // closes with the same plain note, and the rule stays.
+    await ruleRow(page, 'Wszyscy').locator('tf-button[data-act="remove"]').click();
+    const stale = page.locator('tf-window.tb-access-window');
+    await expect(stale).toHaveCount(1);
+    const everyoneRead = (await serverRules(page, instanceId, 'wizyty'))['any:*:read'];
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: everyoneRead.fields, requiredFields: [] });
+    await stale.locator('[data-act="go"]').click();
+    await expect(stale).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Nic nie zapisano — zasada zmieniła się w międzyczasie');
+    expect((await serverRules(page, instanceId, 'wizyty'))['any:*:read']).toEqual(everyoneRead);
+
+    // Usuń: what the rule does now, then it is gone; the last one brings the empty state back.
+    await ruleRow(page, 'Wszyscy').locator('tf-button[data-act="remove"]').click();
+    await expect(win).toHaveCount(0);
+    const confirm = page.locator('tf-window.tb-access-window');
+    await expect(confirm.locator('.tb-explain-box')).toContainText('Zasada odczytu dla: Wszyscy. Ukrywa pola: gabinet.');
+    await expect(confirm.locator('[data-role="impact"]')).toContainText('Każdy, kto nie ma własnej zasady odczytu, zobaczy w topiku wizyty całe wiadomości.');
+    await expect(confirm.locator('[data-role="impact"]')).toContainText('nie będą mogły czytać tego topiku');
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-usun-wszyscy.png') });
+    await confirm.locator('[data-act="go"]').click();
+    await expect(confirm).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Usunięto zasadę');
+    await expect(s.locator('[data-role="rules"] tbody tr')).toHaveCount(2);
+    for (const direction of ['Zapis', 'Odczyt']) {
+      await ruleRow(page, groupName).filter({ hasText: direction }).locator('tf-button[data-act="remove"]').click();
+      await confirm.locator('[data-act="go"]').click();
+      await expect(confirm).toHaveCount(0);
+    }
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Ten topik nie ma zasad ukrywania danych', { timeout: 15000 });
+    expect(await serverRules(page, instanceId, 'wizyty')).toEqual({});
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(await serverRules(page, instanceId, 'wizyty')).toEqual({});
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U7 HL7 topic: the dictionary with plain names, a wrong address refused before the request, the typed field kept, the preview blanks the hidden fields', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await clearRules(page, instanceId, 'wyniki-badan');
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-button[data-go="hiding-add"]').first().click();
+    const win = hidingWindow(page);
+    await pickSegment(win, '[data-role="kind"]', 'Wszyscy');
+    await expect(win.locator('[data-role="source-note"]')).toContainText('najczęstsze pola HL7 v2');
+    expect(await win.locator('tf-segmented[data-field]').count()).toBeGreaterThanOrEqual(55);
+    await expect(fieldSeg(win, 'PID-5').locator('xpath=ancestor::div[contains(@class,"tb-right-row")]')).toContainText('Imię i nazwisko pacjenta');
+    await pickSegment(win, 'tf-segmented[data-field="PID-5"]', 'Ukryj');
+    await pickSegment(win, 'tf-segmented[data-field="PID-8"]', 'Ukryj');
+    const tags = win.locator('tf-tag-input[data-role="extra-shown"] input');
+    await tags.fill('PID-0');
+    await tags.press('Enter');
+    await expect(win.locator('[data-role="impact"]')).toContainText('„PID-0” nie jest adresem pola HL7. Adres ma postać SEGMENT-numer, np. PID-5.');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    // The wrong address is marked on its chip and explained under the field itself.
+    await expect(win.locator('tf-tag-input[data-role="extra-shown"] tf-chip').first()).toHaveAttribute('tone', 'critical');
+    await expect(win.locator('[data-role="extra-shown-problems"]')).toContainText('„PID-0” nie jest adresem pola HL7.');
+    await win.locator('tf-tag-input[data-role="extra-shown"] tf-chip').first().evaluate((chip) => chip.dispatchEvent(new CustomEvent('remove')));
+    await tags.fill('PID-31');
+    await tags.press('Enter');
+    await expect(win.locator('[data-role="impact"]')).toContainText('znikną z wiadomości pola: Imię i nazwisko pacjenta (PID-5), Płeć (PID-8).');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Pola spoza listy też znikną, chyba że je dopiszesz.');
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-hl7.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(ruleRow(page, 'Wszyscy')).toContainText('PID-5');
+    await expect(ruleRow(page, 'Wszyscy')).toContainText('Płeć');
+    const rules = await serverRules(page, instanceId, 'wyniki-badan');
+    const fields = rules['any:*:read'].fields;
+    expect(fields).toContain('PID-31');
+    expect(fields).toContain('PID-3');
+    expect(fields).not.toContain('PID-5');
+    expect(fields).not.toContain('PID-8');
+
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = previewWindow(page);
+    await pickSegment(preview, '[data-role="kind"]', 'Wszyscy');
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await preview.locator('[data-act="show"]').click();
+    // A reading rule hides what it does not list — the positions nobody named (PID-1, PID-4, …) too, as its window says.
+    await expect(preview.locator('[data-role="summary"]')).toContainText('Zasady ukryły', { timeout: 15000 });
+    const hiddenFields = await preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"] .mono').allInnerTexts();
+    expect(hiddenFields).toEqual(expect.arrayContaining(['PID-1', 'PID-4', 'PID-5', 'PID-8']));
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]')).not.toHaveCount(0);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]', { hasText: 'PID-5' })).toHaveCount(0);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]', { hasText: 'PID-5' })).toContainText('Imię i nazwisko pacjenta');
+    const message = await preview.locator('[data-role="payload"]').innerText();
+    expect(message).toContain('MSH|');
+    expect(message).not.toContain('Kowalski');
+    expect(message.split('\n').length).toBeGreaterThanOrEqual(4);
+    await preview.locator('[data-act="close"]').click();
+    expect(errors, errors.join('\n')).toEqual([]);
+  } finally {
+    await clearRules(page, instanceId, 'wyniki-badan');
+  }
+});
+
+test('U7 a topic with binary content cannot get a rule, and the section says why', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const name = `e2e-binarny-${RUN}`;
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name, options: { partitions: 1, contentType: 'application/octet-stream' } });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${name}&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Zasady tego topiku nie są tu edytowane', { timeout: 20000 });
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /nie edytuje się na tym ekranie/);
+    await expect(s.locator('[data-role="add"]')).toHaveAttribute('disabled', '');
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-powiadomienia.png'), fullPage: true });
+  } finally {
+    await busCall(page, 'busTopicDeleteRequest', { instanceId, name });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U7 at 390x844: Ukrywanie danych from the section list, the rules as cards, the windows fill the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await clearRules(page, instanceId, 'wizyty');
+  await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: ['pacjent', 'termin', 'gabinet'], requiredFields: [] });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wizyty', { timeout: 20000 });
+    await d.locator('[data-role="pick"] select').selectOption('hiding');
+    await expect.poll(() => hashParams(page).section).toBe('hiding');
+    const s = hidingSection(page);
+    await expect(s.locator('[data-role="rules"] tbody tr').first()).toBeVisible({ timeout: 15000 });
+    await expect(s.locator('[data-role="rules"] tbody tr').first()).toContainText('lekarz');
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-390.png'), fullPage: true });
+    await s.locator('tf-button[data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('tf-segmented[data-field]').first()).toBeVisible({ timeout: 15000 });
+    await windowFits(page, 'tf-window.tb-hiding-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-390.png') });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = previewWindow(page);
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await windowFits(page, 'tf-window.tb-hiding-preview', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-390.png') });
+    await preview.locator('[data-act="close"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U7 without administration: no Ukrywanie danych in the menu or the section list, and an address naming it opens Stan', async ({ page, browser }) => {
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  // A reader: bus.read on this instance, no administration of any topic.
+  const readerId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  await iamCall(page, 'addonPermissionSetRequest', { addonId: instanceId, subjectType: 'user', subjectId: readerId, permissionId: 'bus.read', grantMode: 'allow' });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
+  const rp = await context.newPage();
+  const readerErrors = trackErrors(rp);
+  try {
+    await rp.addInitScript(() => {
+      localStorage.setItem('tentaflow_lang', 'pl');
+      document.addEventListener('DOMContentLoaded', () => {
+        const st = document.createElement('style');
+        st.textContent = '.update-overlay{display:none!important}';
+        document.head.appendChild(st);
+      });
+    });
+    await loginAsAdmin(rp, { port: PORT, username: 'tomasz', password: 'Tomasz-czyta-1' });
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=hiding`);
+    const d = rp.locator('#tb-panel > [data-tb-view-slot="detail"]');
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'state');
+    await expect(d.locator('[data-role="menu"] tf-tab#hiding')).toBeHidden();
+    await expect(d.locator('[data-section="hiding"]')).toBeHidden();
+    expect(await d.locator('[data-section="hiding"]').evaluate((el) => el.children.length)).toBe(0);
+    const options = await d.locator('[data-role="pick"] select option').allTextContents();
+    expect(options).not.toContain('Ukrywanie danych');
     expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
   } finally {
     await context.close();

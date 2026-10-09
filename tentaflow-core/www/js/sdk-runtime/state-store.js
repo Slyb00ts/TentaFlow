@@ -68,6 +68,17 @@ const PATCH_REJECT_REASON = Object.freeze({
 
 const MAX_STATE_PATH_SEGMENTS = 32;
 
+// How long a user edit of a bound control outranks differing server values.
+// The addon applies the action and echoes the new value asynchronously (a
+// tick, a slot re-push); until then every server snapshot/overlay/patch still
+// carries the OLD value and would bounce the control back.
+const PENDING_EDIT_TTL_MS = 10_000;
+
+// Once the addon acknowledged the action, a server value that still differs
+// is its real answer (clamped, refused, normalised): it wins after this short
+// grace instead of the full TTL.
+const ACKED_DISAGREEMENT_TTL_MS = 1_500;
+
 // Limity strukturalne do obrony przed DoS przez addon. Każde naruszenie
 // emituje `StructuralLimit` w PatchRejected (lub w wypadku snapshotu —
 // odrzucenie z console.warn).
@@ -311,6 +322,13 @@ export class StateStore {
     // chunk z truncated=false, dopiero wtedy atomowo zamieniamy root.
     this._snapshotBuffer = null;
     this._patchRejectedListeners = new Set();
+    // User edits not yet confirmed by the server: Map<pathKey, PendingEdit>.
+    // PendingEdit = { path, value, token, server, serverSeen, acked,
+    //   postAckSeen, timer }. `server` is the server's own value at `path`
+    // (undefined = absent); `_root` holds the user's value instead, so echo
+    // detection and rollback never read the merged root.
+    this._pending = new Map();
+    this._editSeq = 0;
     this._destroyed = false;
   }
 
@@ -361,6 +379,53 @@ export class StateStore {
       e.callbacks.delete(callback);
       if (e.callbacks.size === 0) this._subscribers.delete(key);
     };
+  }
+
+  /// Records a user edit of a bound control: writes `value` at `path` at once
+  /// and keeps it there against differing server values until the server
+  /// echoes it, the action fails, or it expires. Returns the edit's token for
+  /// `ackLocalEdits` / `rejectLocalEdits`, or `null` when the path's parent
+  /// does not exist (the control is not backed by state the store can hold).
+  setLocalEdit(path, value) {
+    this._assertAlive();
+    assertPath(path, 'StateStore.setLocalEdit');
+    const safeValue = normalizeStateValue(value, 'StateStore.setLocalEdit.value');
+    const key = pathKey(path);
+    const prev = this._pending.get(key);
+    const server = prev ? prev.server : cloneStateValue(readAtPath(this._root, path));
+    if (!writeExisting(this._root, path, safeValue)) return null;
+    if (prev) clearTimeout(prev.timer);
+    const token = ++this._editSeq;
+    this._pending.set(key, {
+      path,
+      value: safeValue,
+      token,
+      server,
+      serverSeen: prev ? prev.serverSeen : false,
+      acked: false,
+      postAckSeen: false,
+      timer: setTimeout(() => this._expirePending(key, token), PENDING_EDIT_TTL_MS),
+    });
+    this._notifyOverlap(path);
+    return token;
+  }
+
+  /// The action carrying these edits succeeded. A server value that differs
+  /// from here on is the addon's answer and wins after a short grace.
+  ackLocalEdits(tokens) {
+    this._assertAlive();
+    for (const entry of this._pendingByTokens(tokens)) entry.acked = true;
+  }
+
+  /// The action carrying these edits failed: drop exactly those edits (a newer
+  /// edit of the same path has another token and stays) and show the server
+  /// value again.
+  rejectLocalEdits(tokens) {
+    this._assertAlive();
+    for (const entry of this._pendingByTokens(tokens)) {
+      this._dropPending(entry);
+      this._restoreServerValue(entry.path, entry.server);
+    }
   }
 
   /// Listener dla PatchRejected — addon dispatcher emituje to do backendu.
@@ -432,6 +497,12 @@ export class StateStore {
     this._root = newRoot;
     this._revision = rev;
     this._snapshotBuffer = null;
+    // The merged old root still has the server's array shapes (edits never
+    // add elements), so a changed length means the rows moved under the edit.
+    this._reconcilePending(
+      () => true,
+      (container) => arrayLength(readAtPath(oldRoot, container)) !== arrayLength(readAtPath(newRoot, container))
+    );
     // Po snapshotcie powiadamiamy wszystkich subskrybentów (cała ścieżka
     // mogła się zmienić) — dispatchujemy single root-level notify.
     this._notifyRoot(oldRoot);
@@ -465,6 +536,9 @@ export class StateStore {
     const snapshot = cloneStateValue(this._root);
     const changedPaths = [];
     try {
+      // Ops apply to the server's state (an increment must not count from the
+      // user's unconfirmed value), so pending edits step aside first.
+      this._showServerValues();
       for (const op of ops) {
         assertPath(op.path, 'applyPatch.op.path');
         applyOpInPlace(this._root, op);
@@ -488,6 +562,7 @@ export class StateStore {
       return false;
     }
     this._revision = next;
+    this._reconcileAfterWrites(changedPaths);
     for (const p of changedPaths) this._notifyOverlap(p);
     return true;
   }
@@ -506,6 +581,9 @@ export class StateStore {
     this._root = Object.create(null);
     this._revision = next;
     this._snapshotBuffer = null;
+    // A reset starts the panel state over: edits made against the old state
+    // have nothing left to stand on.
+    for (const entry of [...this._pending.values()]) this._dropPending(entry);
     this._notifyRoot(oldRoot);
     return true;
   }
@@ -521,6 +599,7 @@ export class StateStore {
     const snapshot = cloneStateValue(this._root);
     const changed = [];
     try {
+      this._showServerValues();
       for (const ent of entries) {
         assertPath(ent.path, 'applyOverlay.entry.path');
         const safeValue = normalizeStateValue(ent.value, 'applyOverlay.entry.value');
@@ -531,12 +610,15 @@ export class StateStore {
       this._root = snapshot;
       throw err;
     }
+    this._reconcileAfterWrites(changed);
     for (const p of changed) this._notifyOverlap(p);
     return true;
   }
 
   destroy() {
     this._destroyed = true;
+    for (const entry of this._pending.values()) clearTimeout(entry.timer);
+    this._pending.clear();
     this._subscribers.clear();
     this._patchRejectedListeners.clear();
     this._root = Object.create(null);
@@ -592,6 +674,100 @@ export class StateStore {
       return false;
     }
     return true;
+  }
+
+  _pendingByTokens(tokens) {
+    const wanted = new Set(tokens);
+    return [...this._pending.values()].filter((e) => wanted.has(e.token));
+  }
+
+  _dropPending(entry) {
+    clearTimeout(entry.timer);
+    this._pending.delete(pathKey(entry.path));
+  }
+
+  /// Puts the server's own values back under every pending edit, so a server
+  /// write lands on (and is read back from) pure server state.
+  _showServerValues() {
+    for (const entry of this._pending.values()) {
+      if (entry.server === undefined) deleteAtPath(this._root, entry.path);
+      else writeExisting(this._root, entry.path, cloneStateValue(entry.server));
+    }
+  }
+
+  /// After a patch / overlay: edits under a written path learn the server's
+  /// new value; an edit inside an array the write touched (the array itself
+  /// or an ancestor) is dropped — the index may now name another row.
+  _reconcileAfterWrites(changedPaths) {
+    const touches = (path) => changedPaths.some((c) => isPrefixOf(c, path) || isPrefixOf(path, c));
+    this._reconcilePending(
+      (entry) => touches(entry.path),
+      (container) => changedPaths.some((c) => isPrefixOf(c, container))
+    );
+  }
+
+  /// Runs on pure server state, before subscribers are notified. For each
+  /// edit: drop it when its rows moved (`arrayChanged(containerPath)`) or its
+  /// parent is gone; when `covers(entry)`, a server value equal to the edit is
+  /// its echo and settles it, a differing one becomes the edit's server copy.
+  /// Surviving edits are written back over the server value.
+  _reconcilePending(covers, arrayChanged) {
+    for (const entry of [...this._pending.values()]) {
+      const { path } = entry;
+      let moved = false;
+      for (let i = 0; i < path.length; i++) {
+        if (path[i].kind === 'index' && arrayChanged(path.slice(0, i))) {
+          moved = true;
+          break;
+        }
+      }
+      if (moved) {
+        this._dropPending(entry);
+        continue;
+      }
+      if (covers(entry)) {
+        const serverValue = readAtPath(this._root, path);
+        if (stateValuesEqual(serverValue, entry.value)) {
+          this._dropPending(entry);
+          continue;
+        }
+        if (serverValue === undefined && entry.server !== undefined) {
+          // The server removed the value: nothing for the edit to stand in for.
+          this._dropPending(entry);
+          continue;
+        }
+        entry.server = cloneStateValue(serverValue);
+        entry.serverSeen = true;
+        if (entry.acked) {
+          entry.postAckSeen = true;
+          clearTimeout(entry.timer);
+          entry.timer = setTimeout(
+            () => this._expirePending(pathKey(path), entry.token),
+            ACKED_DISAGREEMENT_TTL_MS
+          );
+        }
+      }
+      if (!writeExisting(this._root, path, entry.value)) this._dropPending(entry);
+    }
+  }
+
+  /// A pre-ack server value is presumed to predate the action, so after an ack
+  /// only a later value replaces the edit; without an ack any server value
+  /// seen since the edit does. With none, the user's value simply stays.
+  _expirePending(key, token) {
+    const entry = this._pending.get(key);
+    if (!entry || entry.token !== token || this._destroyed) return;
+    this._dropPending(entry);
+    if (entry.acked ? entry.postAckSeen : entry.serverSeen) {
+      this._restoreServerValue(entry.path, entry.server);
+    }
+  }
+
+  _restoreServerValue(path, value) {
+    if (stateValuesEqual(readAtPath(this._root, path), value)) return;
+    if (value === undefined) deleteAtPath(this._root, path);
+    else if (!writeExisting(this._root, path, cloneStateValue(value))) return;
+    this._notifyOverlap(path);
   }
 
   _notifyOverlap(changedPath) {
@@ -805,6 +981,53 @@ function incrementValue(current, delta) {
   return sum;
 }
 
+function arrayLength(v) {
+  return Array.isArray(v) ? v.length : -1;
+}
+
+/// Writes `value` at `path` only when the slot already has a home: the parent
+/// container exists with the right kind and an index names an existing
+/// element. Never creates intermediates or appends — a user edit must not
+/// invent rows or map entries the server does not have. Returns success.
+function writeExisting(root, path, value) {
+  if (path.length === 0) return false;
+  const parent = path.length === 1 ? root : readAtPath(root, path.slice(0, -1));
+  const last = path[path.length - 1];
+  if (last.kind === 'key') {
+    if (!isStateMap(parent)) return false;
+  } else if (!Array.isArray(parent) || last.value >= parent.length) {
+    return false;
+  }
+  writeAtPath(root, path, value, /*createIntermediates=*/ false);
+  return true;
+}
+
+/// Structural equality of two state values. BigInt and integral Number compare
+/// by value: the wire decodes i64 as BigInt while controls emit Numbers.
+function stateValuesEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a === 'bigint' && typeof b === 'number') return Number.isInteger(b) && a === BigInt(b);
+  if (typeof a === 'number' && typeof b === 'bigint') return Number.isInteger(a) && BigInt(a) === b;
+  if (a == null || b == null || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    if (!(a instanceof Uint8Array && b instanceof Uint8Array) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!stateValuesEqual(a[i], b[i])) return false;
+    return true;
+  }
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) {
+    if (!Object.prototype.hasOwnProperty.call(b, k) || !stateValuesEqual(a[k], b[k])) return false;
+  }
+  return true;
+}
+
 function readAtPath(root, path) {
   let node = root;
   for (const seg of path) {
@@ -976,6 +1199,8 @@ export {
   MAX_STATE_PATH_SEGMENTS,
   MAX_SNAPSHOT_ENTRIES,
   MAX_ARRAY_LEN,
+  PENDING_EDIT_TTL_MS,
+  ACKED_DISAGREEMENT_TTL_MS,
   pathKey,
   isPrefixOf,
 };

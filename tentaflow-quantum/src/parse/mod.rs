@@ -55,12 +55,15 @@ pub fn parse_qasm3(source: &str, inputs: &InputValues) -> Result<Circuit> {
     let (program, errors, symbols) = parsed.take_context().as_tuple();
     // Gate arity is re-checked while lowering, and it has to be: the upstream
     // analyser counts the operands of `ctrl @ x a, b` against the arity of `x`
-    // and rejects a perfectly valid modified call.
-    if let Some(error) = errors.iter().find(|error| {
-        !matches!(
-            error.kind(),
-            SemanticErrorKind::NumGateQubitsError | SemanticErrorKind::NumGateParamsError
-        )
+    // and rejects a perfectly valid modified call. The same holds for the size
+    // of a measurement: upstream types `measure q[0:3]` as a single bit, so
+    // writing a slice or a subset into a register is reported as a dimension
+    // mismatch, while lowering compares the real operand and register sizes.
+    if let Some(error) = errors.iter().find(|error| match error.kind() {
+        SemanticErrorKind::NumGateQubitsError | SemanticErrorKind::NumGateParamsError => false,
+        SemanticErrorKind::IncompatibleDimensionError => !is_measurement(source, error.range()),
+        SemanticErrorKind::IncompatibleTypesError => !is_measurement(source, error.range()),
+        _ => true,
     }) {
         return Err(Error::Semantic {
             pos: position(source, error.range()),
@@ -203,6 +206,20 @@ fn statement_positions(source: &str, tree: &SourceFile, expected: usize) -> Vec<
 
 fn position(source: &str, range: TextRange) -> SourcePos {
     SourcePos::from_offset(source, usize::from(range.start()))
+}
+
+/// Whether the statement at `range` assigns the result of a `measure`, i.e. its
+/// right-hand side starts with that keyword.
+fn is_measurement(source: &str, range: TextRange) -> bool {
+    let Some(text) = source.get(usize::from(range.start())..usize::from(range.end())) else {
+        return false;
+    };
+    let Some((_, rhs)) = text.split_once('=') else {
+        return false;
+    };
+    rhs.trim_start()
+        .strip_prefix("measure")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Walk the syntax tree and reject every construct outside the supported subset

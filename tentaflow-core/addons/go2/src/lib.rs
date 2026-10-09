@@ -48,7 +48,10 @@ const LATENCY_ALERT_MS: i64 = 500;
 const BATTERY_ALERT_PCT: i64 = 20;
 // Watchdogs (seconds). Validation must complete promptly; an online connection
 // that stops advancing telemetry (persistent drain/state errors) is declared dead.
-const CONNECT_TIMEOUT_SECS: i64 = 20;
+// Connecting runs on a worker while the tick keeps going, so its watchdog must
+// outlast the slowest legitimate connect: ICE gathering (8 s) plus two signaling
+// calls of up to 12 s connect + 15 s answer each — 62 s.
+const CONNECT_TIMEOUT_SECS: i64 = 75;
 const VALIDATION_TIMEOUT_SECS: i64 = 20;
 // Auto-connect backoff: when offline with connect-intent on, the tick retries a
 // connect with exponential backoff so an unreachable robot is not hammered every
@@ -132,6 +135,29 @@ extern "C" {
     fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn lidar_publish_v1(in_ptr: i32, in_len: i32) -> i32;
+    fn robot_pose_publish_v1(in_ptr: i32, in_len: i32) -> i32;
+    fn tool_run_in_background_v1(tool_ptr: i32, tool_len: i32, params_ptr: i32, params_len: i32) -> i32;
+}
+
+/// Hand the robot's latest odometry pose to the host scene, where it places the
+/// camera-depth cloud. Non-fatal: a failed publish only delays placement until the
+/// next pose.
+fn publish_robot_pose(position: [f64; 3], quat_xyzw: [f64; 4], timestamp_us: i64) {
+    let sample = tentaflow_sdk_spec::PoseSample {
+        version: tentaflow_sdk_spec::POSE_SAMPLE_VERSION,
+        flags: 0,
+        timestamp_us,
+        position: position.map(|v| v as f32),
+        quat_xyzw: quat_xyzw.map(|v| v as f32),
+    }
+    .encode();
+    let ret = unsafe { robot_pose_publish_v1(sample.as_ptr() as i32, sample.len() as i32) };
+    // Logged once per failure streak: this runs every tick, and a missing grant
+    // would otherwise repeat the same line several times a second.
+    let was_failing = POSE_PUBLISH_FAILING.with(|f| f.replace(ret != 0));
+    if ret != 0 && !was_failing {
+        log::warn(&alloc::format!("go2: pose publish abi error {ret}"));
+    }
 }
 
 /// Publish ONE canonical LiDAR frame (packed f32, sdk-spec layout) to the host
@@ -859,9 +885,9 @@ struct LidarState {
     // True once the host channel has been sent the subscribe message for this
     // online session, so the per-tick path does not re-subscribe every tick.
     subscribed: bool,
-    // Set when a disable transition's switch "off" send failed: local state is
-    // left as still-enabled so a later tick retries the off-send. Cleared only
-    // once an off-send actually succeeds (then enabled/subscribed flip to false).
+    // Set when a disable transition's unsubscribe send failed: local state is
+    // left as still-enabled so a later tick retries it. Cleared only once the
+    // unsubscribe actually succeeds (then enabled/subscribed flip to false).
     pending_disable: bool,
     // Last wall-clock second the small status was persisted to the shared DB.
     // Gates the per-frame status-write throttle (periodic ~1s refresh on top of
@@ -911,6 +937,11 @@ std::thread_local! {
     static VOXEL_FRAMING_LOGGED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     // Throttle counter for the robot_pose probe log.
     static POSE_LOG: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    // Newest complete robot_pose drained this tick with its host arrival time
+    // (Unix ms, the clock camera frames are stamped with), published once after
+    // the drain so the host can place a frame with the pose from its capture time.
+    static PENDING_POSE: core::cell::Cell<Option<([f64; 3], [f64; 4], u64)>> = const { core::cell::Cell::new(None) };
+    static POSE_PUBLISH_FAILING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     // DIAGNOSTIC (R2 / 0e-live probe): distinct WebRTC topics seen this session +
     // one-shot lowstate-shape dump. Tells us what data is actually available over
     // WebRTC (joints? position?) so we know whether option-B pose is possible here.
@@ -995,6 +1026,9 @@ fn lidar_reset_session() {
         *l = LidarState::default();
         l.enabled = enabled;
     });
+    // A pose drained before the link dropped must not be published as current
+    // once the next session comes up.
+    PENDING_POSE.with(|p| p.set(None));
     let _ = state::delete(state::KEY_TELEMETRY);
     let _ = state::delete(state::KEY_LIDAR_STATUS);
     // Reset the diagnostic probe so a reconnect re-enumerates topics + re-dumps the
@@ -1498,7 +1532,55 @@ fn set_lidar(enabled: bool) -> JsonValue {
     if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![u8::from(enabled)]) {
         return json!({ "error": alloc::format!("state: {e}") });
     }
+    echo_lidar_enabled(enabled);
     json!({ "status": "sent", "enabled": enabled })
+}
+
+/// Reflect a fresh toggle in the shared live status right away, so the next
+/// `go2.status` read reports the operator's choice instead of the previous state
+/// until the service tick gets to it. The tick overwrites it with measured values.
+fn echo_lidar_enabled(enabled: bool) {
+    let mut status = match lidar_status_from_store() {
+        Ok(JsonValue::Object(o)) => o,
+        _ => return,
+    };
+    status.insert("enabled".into(), json!(enabled));
+    if !enabled {
+        status.insert("available".into(), json!(false));
+    }
+    if let Err(e) = state::set_ephemeral(
+        state::KEY_LIDAR_STATUS,
+        JsonValue::Object(status).to_string().into_bytes(),
+    ) {
+        log::warn(&alloc::format!("go2: lidar status echo failed: {e}"));
+    }
+}
+
+/// Switch reactions to people's gestures on/off. Only the durable intent lives
+/// here; core's gesture engine reads it from `go2.status` and triggers the
+/// motions through this addon's own action tools (so e-stop and online gates
+/// still apply). Like the LiDAR toggle, a robot owned by another node gets the
+/// toggle over the mesh.
+fn set_gestures(enabled: bool) -> JsonValue {
+    if config_get(IP_CONFIG_KEY).filter(|ip| !ip.is_empty()).is_none() {
+        let kind = if enabled { "gestures_on" } else { "gestures_off" };
+        return match robot_dispatch(RobotActionWire::simple(kind)) {
+            Ok(resp) => dispatch_result_json(resp),
+            Err(e) => json!({ "error": alloc::format!("dispatch: {e}") }),
+        };
+    }
+    if let Err(e) = state::set_durable(state::KEY_GESTURES_ENABLED, alloc::vec![u8::from(enabled)]) {
+        return json!({ "error": alloc::format!("state: {e}") });
+    }
+    json!({ "status": "sent", "gestures_enabled": enabled })
+}
+
+/// The gesture-reaction intent; a never-written key means off.
+fn gestures_enabled() -> Result<bool, AbiError> {
+    match state::get(state::KEY_GESTURES_ENABLED)? {
+        Some(bytes) => Ok(bytes.first().is_some_and(|b| *b != 0)),
+        None => Ok(false),
+    }
 }
 
 /// Toggle on-board obstacle avoidance. Unlike the LiDAR intent (persisted and
@@ -1534,13 +1616,13 @@ fn lidar_frame() -> JsonValue {
 }
 
 /// Read the persistent LiDAR enable INTENT from the shared store. Propagates a
-/// read error rather than collapsing it to `false`: a transient ABI failure must
-/// NOT be interpreted as "operator wants LiDAR off" (that would silently command
-/// the robot's LiDAR off). `Ok(false)` only when nothing has ever been written.
+/// read error rather than collapsing it to a value: a transient ABI failure must
+/// NOT be interpreted as an operator decision (that would silently switch the
+/// robot's LiDAR). Nothing written yet means the default, which is ON.
 fn lidar_enabled_intent() -> Result<bool, AbiError> {
     match state::get(state::KEY_LIDAR_ENABLED)? {
         Some(bytes) => Ok(bytes.first().is_some_and(|b| *b != 0)),
-        None => Ok(false),
+        None => Ok(true),
     }
 }
 
@@ -1565,12 +1647,11 @@ fn json_f64_array(v: Option<&JsonValue>) -> Vec<f64> {
     out
 }
 
-/// Probe handler for `rt/utlidar/robot_pose`: parse the world pose
-/// (`data.pose.position` {x,y,z} + `data.pose.orientation` {x,y,z,w}) and log it
-/// throttled. Confirms whether the Go2 Air actually streams pose over WebRTC
-/// (go2_ros2_sdk sources /odom from this topic) and whether it tracks motion,
-/// before wiring odometry + map accumulation.
-fn ingest_robot_pose(raw: &[u8]) {
+/// Handler for `rt/utlidar/robot_pose`, the robot's lidar odometry: parse the world
+/// pose (`data.pose.position` {x,y,z} + `data.pose.orientation` {x,y,z,w}) into the
+/// telemetry snapshot and queue it for the host scene, stamped with `received_unix_ms`
+/// (host arrival time). Logs it throttled.
+fn ingest_robot_pose(raw: &[u8], received_unix_ms: u64) {
     let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
         return;
     };
@@ -1594,6 +1675,9 @@ fn ingest_robot_pose(raw: &[u8]) {
                 t.pose_orientation = alloc::vec![a, b, c, d];
             }
         });
+        if let (Some(a), Some(b), Some(c), Some(d)) = (ox, oy, oz, ow) {
+            PENDING_POSE.with(|p| p.set(Some(([x, y, z], [a, b, c, d], received_unix_ms))));
+        }
     }
     POSE_LOG.with(|c| {
         let n = c.get().wrapping_add(1);
@@ -1856,9 +1940,7 @@ fn telemetry_from_store() -> JsonValue {
 /// from the legitimate "absent = default disabled / no frame yet" case instead of
 /// fabricating a "disabled" object on any failure:
 ///   - `Ok(obj)` — a real persisted status, or (when none yet) the desired-enable
-///     INTENT with `available:false`. An absent key (`Ok(false)` intent) yields
-///     the same default shape `go2.status` rendered before, so callers render it
-///     identically.
+///     INTENT with `available:false` (enabled by default when never written).
 ///   - `Err` — a REAL host-fn read error: the caller MUST omit the lidar field
 ///     rather than emit a fabricated "disabled" object that misreports the robot.
 fn lidar_status_from_store() -> Result<JsonValue, AbiError> {
@@ -1873,8 +1955,7 @@ fn lidar_status_from_store() -> Result<JsonValue, AbiError> {
     }
     // No persisted status: fall back to the operator's persistent enable INTENT.
     // A READ ERROR here propagates (we must not paper a transient failure over as
-    // "disabled"); a genuinely absent intent (`Ok(false)`) yields the default
-    // shape the UI rendered before.
+    // "disabled"); a genuinely absent intent yields the default (enabled) shape.
     let enabled = lidar_enabled_intent()?;
     Ok(json!({
         "enabled": enabled,
@@ -1989,6 +2070,11 @@ fn do_connect() -> JsonValue {
         let _ = set_offline_mirrored("error", &alloc::format!("set_answer: {e}"));
         return json!({ "error": alloc::format!("set_answer: {e}") });
     }
+    // Signaling can take 10+ s (the robot answers con_ing slowly). The validation
+    // watchdog measures from this transition, so stamp it with the time now, not
+    // the tick start — otherwise ICE is left a few seconds before the watchdog
+    // closes a handshake that was about to finish.
+    db::resync_now_secs();
     // CAS connecting -> validating. If a disconnect raced (we lost), the fresh
     // channel is orphaned — close it so we don't leak a peer connection.
     match db::set_channel(&channel_id) {
@@ -2083,6 +2169,106 @@ std::thread_local! {
     // Consecutive failed auto-connect attempts — drives the exponential backoff
     // delay. Reset to 0 when the link reaches `online`.
     static RECONNECT_FAILS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    // Latest lowstate receipt `(unix secs, battery %)`, kept in memory: it arrives
+    // on nearly every tick and feeds the liveness watchdog here, so writing it to
+    // SQLite each time cost a write per tick. It is persisted once a second for
+    // the other workers (see the status block of the tick).
+    static LOWSTATE_SEEN: core::cell::Cell<(i64, i64)> = const { core::cell::Cell::new((0, -1)) };
+    // Receipt time of the telemetry last written to the database.
+    static TELEMETRY_PERSISTED: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    // Second of the last status publish: the status block runs once per second.
+    static STATUS_SECS: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    static TICK_PHASES: core::cell::RefCell<TickPhases> = core::cell::RefCell::new(TickPhases::default());
+}
+
+/// How often the per-phase tick timing is logged.
+const PHASE_LOG_SECS: u64 = 10;
+
+#[derive(Default, Clone, Copy)]
+struct PhaseStat {
+    sum_us: u64,
+    max_us: u64,
+}
+
+impl PhaseStat {
+    fn add(&mut self, took: std::time::Duration) {
+        let us = took.as_micros() as u64;
+        self.sum_us += us;
+        self.max_us = self.max_us.max(us);
+    }
+
+    fn describe(&self, ticks: u64) -> String {
+        alloc::format!(
+            "{:.2}/{:.1}ms",
+            self.sum_us as f64 / ticks.max(1) as f64 / 1000.0,
+            self.max_us as f64 / 1000.0
+        )
+    }
+}
+
+/// Where a tick's time goes, logged every `PHASE_LOG_SECS`: when the host's
+/// `addon.tick` rate shows slow ticks, this line names the phase. A tick that
+/// skips a phase counts as zero for it, so means are per tick.
+#[derive(Default)]
+struct TickPhases {
+    window_start: Option<std::time::Instant>,
+    ticks: u64,
+    drain: PhaseStat,
+    telemetry: PhaseStat,
+    lidar: PhaseStat,
+    status: PhaseStat,
+    total: PhaseStat,
+}
+
+/// Times `f` into one phase of the current tick.
+fn timed<T>(phase: fn(&mut TickPhases) -> &mut PhaseStat, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let took = started.elapsed();
+    TICK_PHASES.with(|p| phase(&mut p.borrow_mut()).add(took));
+    out
+}
+
+/// Closes one tick's timing and logs the window when it is due.
+fn finish_tick_timing(took: std::time::Duration) {
+    TICK_PHASES.with(|cell| {
+        let mut p = cell.borrow_mut();
+        let start = *p.window_start.get_or_insert_with(std::time::Instant::now);
+        p.ticks += 1;
+        p.total.add(took);
+        if start.elapsed().as_secs() < PHASE_LOG_SECS {
+            return;
+        }
+        let n = p.ticks;
+        log::info(&alloc::format!(
+            "go2 tick phases over {n} ticks (mean/max): total {}, drain {}, telemetry {}, lidar {}, status {}",
+            p.total.describe(n),
+            p.drain.describe(n),
+            p.telemetry.describe(n),
+            p.lidar.describe(n),
+            p.status.describe(n),
+        ));
+        *p = TickPhases::default();
+    });
+}
+
+/// Hands `go2.connect` to a host worker. Not started again while a previous
+/// connect is still running — the backoff above spaces the attempts anyway.
+fn start_background_connect() {
+    const TOOL: &str = "go2.connect";
+    let params = b"{}";
+    let code = unsafe {
+        tool_run_in_background_v1(
+            TOOL.as_ptr() as i32,
+            TOOL.len() as i32,
+            params.as_ptr() as i32,
+            params.len() as i32,
+        )
+    };
+    // -4: a connect from an earlier attempt is still in flight.
+    if code != 0 && code != -4 {
+        log::warn(&alloc::format!("go2: background connect not started: abi error {code}"));
+    }
 }
 
 /// Current backoff delay (seconds) for `fails` consecutive failures:
@@ -2158,6 +2344,11 @@ fn tick() {
                                 // DA-V2 metric depth over-estimates ~15% on this camera
                                 // (verified live against the Go2 lidar); 0.85 corrects it.
                                 camera_depth_scale: Some(0.85),
+                                // Front camera optical centre vs base_link, from the
+                                // Go2 URDF (Head_upper 0.285/0/0.01 + front_camera
+                                // 0.045/0/0.03): without it the depth cloud is cast
+                                // from the body centre and lands 0.33 m behind the lidar.
+                                camera_mount_offset_m: Some([0.33, 0.0, 0.04]),
                             };
                             let cam_id = match call_cbor_in_out::<_, WebRtcRegisterCameraOutput>(&reg, webrtc_register_camera_v1) {
                                 Ok(o) => o.camera_id,
@@ -2174,6 +2365,14 @@ fn tick() {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg(POSE_TOPIC));
+                                    // The LiDAR sensor stays powered for the whole session:
+                                    // robot_pose is its odometry and the camera-depth cloud
+                                    // is placed with it. The operator's LiDAR toggle only
+                                    // controls the voxel stream (see the tick).
+                                    let _ = wc_send_text(
+                                        &robot.channel_id,
+                                        &json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "on" }).to_string(),
+                                    );
                                     // Start with obstacle avoidance OFF on every connect so the
                                     // operator can drive/turn manually by default (active avoidance
                                     // can block manual turns). Matches go2_ros2_sdk's manual-driving
@@ -2222,15 +2421,14 @@ fn tick() {
             // continuously, so if no fresh lowstate has arrived within the window
             // the link is dead (a stalled-but-open data channel, or persistent
             // drain failure). last_telemetry advances ONLY on actual lowstate.
-            if db::now_secs() - robot.last_telemetry > ONLINE_STALE_SECS {
+            let (seen_secs, seen_battery) = LOWSTATE_SEEN.with(core::cell::Cell::get);
+            if db::now_secs() - robot.last_telemetry.max(seen_secs) > ONLINE_STALE_SECS {
                 wc_close(&robot.channel_id);
                 lidar_reset_session();
                 let _ = set_offline_mirrored("error", "telemetry stalled");
                 publish_event("go2.offline", json!({ "reason": "telemetry stalled" }));
                 return;
             }
-            db::bump_tick();
-            let tick_n = robot.tick_count + 1;
             // The operator enable INTENT lives in the shared DB (toggled from any
             // worker via go2.lidar_on/off). The service instance reads it each tick
             // and drives the actual switch + subscription against the live channel,
@@ -2263,15 +2461,13 @@ fn tick() {
                         });
                     }
                 } else if !desired_lidar && (enabled_local || pending_disable) {
-                    // Disable transition: send switch "off" + unsubscribe the voxel
-                    // topic. Only clear local enabled/subscribed AFTER a successful
-                    // off-send — a transient send failure must NOT leave the robot
-                    // streaming while we report disabled, so we keep a pending-disable
-                    // that a later tick retries (mirrors the enable path's robustness).
-                    let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "off" }).to_string();
-                    let off_ok = wc_send_text(&robot.channel_id, &switch).is_ok();
-                    let unsub_ok = wc_send_text(&robot.channel_id, &unsubscribe_msg(LIDAR_TOPIC)).is_ok();
-                    if off_ok && unsub_ok {
+                    // Disable transition: unsubscribe the voxel topic only. The sensor
+                    // keeps running because its odometry (robot_pose) places the
+                    // camera-depth cloud — switching it off would freeze the camera's
+                    // placement. Only clear local enabled/subscribed AFTER a successful
+                    // send; a transient failure keeps a pending-disable that a later
+                    // tick retries (mirrors the enable path's robustness).
+                    if wc_send_text(&robot.channel_id, &unsubscribe_msg(LIDAR_TOPIC)).is_ok() {
                         LIDAR.with(|cell| {
                             let mut l = cell.borrow_mut();
                             l.enabled = false;
@@ -2287,7 +2483,7 @@ fn tick() {
                     }
                 }
             }
-            let drained = match wc_drain(&robot.channel_id, 64) {
+            let drained = match timed(|p| &mut p.drain, || wc_drain(&robot.channel_id, 64)) {
                 Ok(d) => d,
                 Err(_) => return,
             };
@@ -2297,8 +2493,9 @@ fn tick() {
                 publish_event("go2.offline", json!({ "reason": "channel closed" }));
                 return;
             }
-            let mut battery = robot.battery_pct;
+            let mut battery = if seen_secs > 0 { seen_battery } else { robot.battery_pct };
             let mut got_telemetry = false;
+            let telemetry_started = std::time::Instant::now();
             // The single latest binary (voxel) frame is copied OUT of the scratch
             // here and ingested AFTER the DECODE_BUF borrow is released. This is the
             // connection-saving invariant: ingest_voxel_map -> decode can abort the
@@ -2360,16 +2557,15 @@ fn tick() {
                         // in memory; never advertise at this raw rate.
                         ingest_sportmodestate(raw);
                     } else if find_sub(raw, b"robot_pose", 0).is_some() {
-                        // Lidar-derived world pose (probe: confirm the Air streams it
-                        // and whether it tracks motion before wiring odometry/mapping).
-                        ingest_robot_pose(raw);
+                        // Lidar odometry: places the robot and the camera-depth cloud.
+                        ingest_robot_pose(raw, msg.received_unix_ms);
                     }
                 }
                 // Telemetry watchdog FIRST: record real lowstate receipt before any
                 // lidar work this drain, so the link's liveness is updated regardless
                 // of a (possibly malformed) voxel frame in the same drain.
                 if got_telemetry {
-                    let _ = db::record_lowstate(battery);
+                    LOWSTATE_SEEN.with(|t| t.set((db::now_secs(), battery)));
                 }
                 // Decode the single latest binary frame from base64 into the scratch
                 // and COPY the bytes into an owned Vec. ingest is intentionally NOT
@@ -2391,14 +2587,30 @@ fn tick() {
             // DECODE_BUF borrow is released. Ingest the latest voxel frame now: an
             // allocation/decode abort here can no longer leak the scratch borrow and
             // cascade into a permanent per-tick abort. Telemetry is already recorded.
+            // A frame still in flight after the operator turned the stream off is
+            // dropped, so nothing is published once the toggle reads off.
+            TICK_PHASES.with(|p| p.borrow_mut().telemetry.add(telemetry_started.elapsed()));
             if let Some(payload) = voxel_payload {
-                ingest_voxel_map(&payload);
+                if LIDAR.with(|cell| cell.borrow().enabled) {
+                    timed(|p| &mut p.lidar, || ingest_voxel_map(&payload));
+                }
             }
-            // Throttle RTT poll + publish + telemetry DB persist to ~1s (every 5
-            // ticks @200ms) so the high-rate stream never hammers SQLite. The
-            // shared-DB snapshot is the source of truth cross-worker go2.status
-            // reads; the thread_local is only the in-tick accumulator.
-            if tick_n % 5 == 0 {
+            if let Some((position, quat, received_ms)) = PENDING_POSE.with(core::cell::Cell::take) {
+                publish_robot_pose(position, quat, received_ms as i64 * 1000);
+            }
+            // Once per second: persist the telemetry, poll RTT, publish status —
+            // the high-rate stream never hammers SQLite. The shared-DB snapshot is
+            // the source of truth for cross-worker go2.status reads; the
+            // thread_locals are only the in-tick accumulators.
+            let now = db::now_secs();
+            if STATUS_SECS.with(|c| c.replace(now)) != now {
+                let status_started = std::time::Instant::now();
+                let (seen, latest_battery) = LOWSTATE_SEEN.with(core::cell::Cell::get);
+                if seen > TELEMETRY_PERSISTED.with(core::cell::Cell::get)
+                    && db::record_lowstate(latest_battery).is_ok()
+                {
+                    TELEMETRY_PERSISTED.with(|c| c.set(seen));
+                }
                 let snapshot = telemetry_json();
                 if !snapshot.is_null() {
                     let _ = state::set_ephemeral(
@@ -2439,6 +2651,7 @@ fn tick() {
                 if rtt > LATENCY_ALERT_MS {
                     publish_event("go2.latency_high", json!({ "rtt_ms": rtt }));
                 }
+                TICK_PHASES.with(|p| p.borrow_mut().status.add(status_started.elapsed()));
             }
         }
         // offline / error / unknown → AUTO-CONNECT. When the operator intent is
@@ -2457,7 +2670,12 @@ fn tick() {
                     // the robot actually answers, so a persistently-down robot
                     // keeps widening the gap instead of retrying every few seconds.
                     RECONNECT_FAILS.with(|c| c.set(fails.saturating_add(1)));
-                    let _ = do_connect();
+                    // The connect waits on the robot for up to a minute (ICE
+                    // gathering, two signaling calls with network timeouts); run
+                    // inside the tick it froze telemetry, LiDAR and every watchdog
+                    // for that long. A worker runs it; this tick and the next go on,
+                    // watching the `connecting` row it leaves.
+                    start_background_connect();
                 }
             }
         }
@@ -2500,6 +2718,8 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
         "go2.pose" => send_pose(params),
         "go2.lidar_on" => set_lidar(true),
         "go2.lidar_off" => set_lidar(false),
+        "go2.gestures_on" => set_gestures(true),
+        "go2.gestures_off" => set_gestures(false),
         "go2.obstacle_avoid_on" => set_obstacle_avoid(true),
         "go2.obstacle_avoid_off" => set_obstacle_avoid(false),
         // Combined toggle: `{enabled: bool}`; defaults to enabling when absent.
@@ -2551,6 +2771,16 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
                     }
                     Err(e) => log::warn(&alloc::format!("go2.status: lidar read failed, omitting: {e}")),
                 }
+                // A read error omits the field: core then keeps reactions off rather
+                // than act on a guess.
+                match gestures_enabled() {
+                    Ok(on) => {
+                        if let Some(o) = out.as_object_mut() {
+                            o.insert("gestures_enabled".into(), json!(on));
+                        }
+                    }
+                    Err(e) => log::warn(&alloc::format!("go2.status: gestures read failed, omitting: {e}")),
+                }
                 out
             }
             Err(e) => json!({ "error": alloc::format!("{e}") }),
@@ -2568,7 +2798,7 @@ fn capability_kinds() -> Vec<&'static str> {
         "body_height", "foot_raise_height", "speed_level", "pose", "wiggle_hips",
         "heart", "dance1", "dance2", "scrape", "front_flip", "front_jump",
         "front_pounce", "status", "camera", "lidar_on", "lidar_off", "lidar_frame",
-        "obstacle_avoid_on", "obstacle_avoid_off",
+        "obstacle_avoid_on", "obstacle_avoid_off", "gestures_on", "gestures_off",
     ]
 }
 
@@ -2620,6 +2850,8 @@ fn actions_meta() -> JsonValue {
         { "kind": "obstacle_avoid_on", "label": "Omijanie przeszkód: wł", "risk": "low", "params": [] },
         { "kind": "obstacle_avoid_off", "label": "Omijanie przeszkód: wył", "risk": "low", "params": [] },
         { "kind": "lidar_frame", "label": "LiDAR klatka", "risk": "low", "read_only": true, "params": [] },
+        { "kind": "gestures_on", "label": "Gesty włącz", "risk": "medium", "params": [] },
+        { "kind": "gestures_off", "label": "Gesty wyłącz", "risk": "low", "params": [] },
     ])
 }
 
@@ -2746,8 +2978,7 @@ pub extern "C" fn on_install() -> i32 {
 pub extern "C" fn on_start() -> i32 {
     install_panic_hook();
     ensure_robot_from_config();
-    bridge_legacy_lidar_intent();
-    seed_lidar_disabled_on_fresh_session();
+    apply_session_defaults();
     0
 }
 
@@ -2775,55 +3006,31 @@ fn install_panic_hook() {
     }));
 }
 
-/// Default the persistent LiDAR enable INTENT to OFF at the start of a FRESH
-/// session so a reconnect comes up with telemetry + camera only (no voxel
-/// stream). The voxel decoder runs on arbitrary real sensor data; defaulting the
-/// stream off isolates the connect + telemetry path from the decoder on bring-up,
-/// and a known-bad decoder can never auto-stream on reconnect — the operator must
-/// explicitly re-enable LiDAR via the GUI toggle after telemetry is confirmed.
-///
-/// This writes the durable intent UNCONDITIONALLY to OFF on every start. It runs
-/// AFTER `bridge_legacy_lidar_intent` (the one-time legacy upgrade) deliberately:
-/// a clean bring-up must win over a possibly-ON persisted/legacy value. To
-/// re-enable, toggle from the GUI (writes the durable intent back to ON), which
-/// then survives reconnects until the next process start. Reversible: removing
-/// this call restores "intent persists across starts".
-fn seed_lidar_disabled_on_fresh_session() {
-    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![0u8]) {
-        log::warn(&alloc::format!("go2: lidar default-off seed failed: {e}"));
-    }
-}
-
-/// One-time, idempotent upgrade bridge for the LiDAR enable INTENT. The intent
-/// used to live in `robot_live.lidar_enabled`; it now lives in the durable shared
-/// store under `lidar:enabled`. Migrations run before on_start, so the migration
-/// keeps the legacy table around and this seeds the store key FROM it exactly once:
-/// only when the durable key is ABSENT (a fresh upgrade) AND the legacy table
-/// still holds a value. A second start is a no-op — once the key exists (even if a
-/// newer toggle wrote a different value meanwhile) we never clobber it. A real
-/// read error on either side aborts the bridge for this start (retry next start)
-/// rather than fabricating intent.
-fn bridge_legacy_lidar_intent() {
-    // Already migrated (or already toggled this session): never clobber the store.
-    match state::get(state::KEY_LIDAR_ENABLED) {
-        Ok(Some(_)) => return,
+/// Session defaults, applied once per host process:
+///   * LiDAR ON — camera + 3D preview come up with the connection without the
+///     operator having to enable them;
+///   * gesture reactions OFF — they move the robot on their own, so a restart
+///     (nobody at the robot) must not leave them armed.
+/// The GUI toggles change both during the run, and those choices hold across
+/// reconnects. `on_start` runs for every pooled worker, so the defaults are
+/// applied once per process (ephemeral marker), never over a live operator choice.
+fn apply_session_defaults() {
+    match state::get(state::KEY_SESSION_DEFAULTS_APPLIED) {
         Ok(None) => {}
+        Ok(Some(_)) => return,
         Err(e) => {
-            log::warn(&alloc::format!("go2: lidar intent bridge skipped, store read failed: {e}"));
+            log::warn(&alloc::format!("go2: session defaults marker read failed: {e}"));
             return;
         }
     }
-    let legacy = match db::legacy_lidar_enabled() {
-        Ok(Some(v)) => v,
-        // No legacy table / no row: nothing to bridge (fresh install).
-        Ok(None) => return,
-        Err(e) => {
-            log::warn(&alloc::format!("go2: lidar intent bridge skipped, legacy read failed: {e}"));
+    for (key, value) in [(state::KEY_LIDAR_ENABLED, 1u8), (state::KEY_GESTURES_ENABLED, 0u8)] {
+        if let Err(e) = state::set_durable(key, alloc::vec![value]) {
+            log::warn(&alloc::format!("go2: session default {key} failed: {e}"));
             return;
         }
-    };
-    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![u8::from(legacy)]) {
-        log::warn(&alloc::format!("go2: lidar intent bridge write failed: {e}"));
+    }
+    if let Err(e) = state::set_ephemeral(state::KEY_SESSION_DEFAULTS_APPLIED, alloc::vec![1u8]) {
+        log::warn(&alloc::format!("go2: session defaults marker write failed: {e}"));
     }
 }
 
@@ -2854,7 +3061,9 @@ pub extern "C" fn on_tick(ts_ms: i64) -> i32 {
     // Seed the cached clock from the host timestamp so the tick never issues a
     // SQL roundtrip just to read wall-clock time.
     db::set_now_secs(ts_ms / 1000);
+    let started = std::time::Instant::now();
     tick();
+    finish_tick_timing(started.elapsed());
     0
 }
 
@@ -2907,9 +3116,13 @@ mod host_stubs {
     extern "C" fn robot_dispatch_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
     #[no_mangle]
     extern "C" fn lidar_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn robot_pose_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn tool_run_in_background_v1(_a: i32, _b: i32, _c: i32, _d: i32) -> i32 { 0 }
     // Native tests can't round-trip the host SQL ABI: it passes pointers as i32,
     // which truncates 64-bit stack addresses → SIGSEGV. Under `#[cfg(test)]` the
-    // `db` module routes SQL to its own in-memory `robot_live` store instead, so
+    // `db` module routes SQL to an inert in-process test backend instead, so
     // these stubs stay inert (the SQL path is never reached natively).
     #[no_mangle]
     extern "C" fn sql_exec_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { 5 }
@@ -3489,7 +3702,7 @@ mod tests {
         let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
         state::test_reset();
-        assert!(!lidar_enabled_intent().expect("read"), "default desire is disabled");
+        assert!(lidar_enabled_intent().expect("read"), "default desire is enabled");
         set_lidar_intent(true);
         assert!(lidar_enabled_intent().expect("read"), "enable desire persists");
         set_lidar_intent(false);
@@ -3525,10 +3738,9 @@ mod tests {
             l.subscribed = true;
         });
         // Mirror the tick disable branch with a failing send.
-        let off_ok = wc_send_text("chan", &json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "off" }).to_string()).is_ok();
         let unsub_ok = wc_send_text("chan", &unsubscribe_msg(LIDAR_TOPIC)).is_ok();
-        assert!(!off_ok || !unsub_ok, "native stub send fails — exercises the failure path");
-        if off_ok && unsub_ok {
+        assert!(!unsub_ok, "native stub send fails — exercises the failure path");
+        if unsub_ok {
             LIDAR.with(|cell| {
                 let mut l = cell.borrow_mut();
                 l.enabled = false;
@@ -3540,10 +3752,60 @@ mod tests {
         }
         LIDAR.with(|cell| {
             let l = cell.borrow();
-            assert!(l.enabled, "still enabled — off-send failed, no leak as disabled");
+            assert!(l.enabled, "still enabled — unsubscribe failed, no leak as disabled");
             assert!(l.pending_disable, "pending-disable armed for retry");
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn gestures_default_off_and_intent_persists() {
+        state::test_reset();
+        assert!(!gestures_enabled().expect("read"), "never switched on means off");
+        state::set_durable(state::KEY_GESTURES_ENABLED, alloc::vec![1u8]).expect("write");
+        assert!(gestures_enabled().expect("read"), "on persists");
+        state::set_durable(state::KEY_GESTURES_ENABLED, alloc::vec![0u8]).expect("write");
+        assert!(!gestures_enabled().expect("read"), "off persists");
+        state::test_reset();
+    }
+
+    #[test]
+    fn gesture_toggle_kinds_are_advertised() {
+        let kinds = capability_kinds();
+        assert!(kinds.contains(&"gestures_on") && kinds.contains(&"gestures_off"));
+        let meta = actions_meta();
+        let listed = |k: &str| {
+            meta.as_array()
+                .expect("array")
+                .iter()
+                .any(|a| a.get("kind").and_then(JsonValue::as_str) == Some(k))
+        };
+        assert!(listed("gestures_on") && listed("gestures_off"));
+    }
+
+    #[test]
+    fn session_defaults_apply_once_per_process_not_per_worker() {
+        state::test_reset();
+        // Gestures left on by a previous run must not stay armed after a restart.
+        state::set_durable(state::KEY_GESTURES_ENABLED, alloc::vec![1u8]).expect("write");
+        apply_session_defaults();
+        assert!(lidar_enabled_intent().expect("read"), "first start seeds LiDAR ON");
+        assert_eq!(
+            state::get(state::KEY_GESTURES_ENABLED).expect("read"),
+            Some(alloc::vec![0u8]),
+            "first start turns gestures OFF"
+        );
+        // Operator flips both; a later pooled worker's on_start must keep that.
+        set_lidar_intent(false);
+        state::set_durable(state::KEY_GESTURES_ENABLED, alloc::vec![1u8]).expect("write");
+        apply_session_defaults();
+        assert!(!lidar_enabled_intent().expect("read"), "a new worker keeps the operator's LiDAR OFF");
+        assert_eq!(
+            state::get(state::KEY_GESTURES_ENABLED).expect("read"),
+            Some(alloc::vec![1u8]),
+            "a new worker keeps the operator's gestures ON"
+        );
+        state::test_reset();
     }
 
     #[test]
@@ -3659,14 +3921,14 @@ mod tests {
     }
 
     #[test]
-    fn lidar_status_absent_renders_default_disabled_unchanged() {
+    fn lidar_status_absent_renders_default_enabled() {
         let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
         state::test_reset();
-        // Nothing persisted and no intent ever written: the byte-identical default
-        // disabled shape go2.status rendered before (absent != error).
+        // Nothing persisted and no intent ever written: the default enabled shape
+        // with no frame yet (absent != error).
         let s = lidar_status_from_store().expect("absent is Ok, not Err");
-        assert_eq!(s.get("enabled").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(s.get("enabled").and_then(JsonValue::as_bool), Some(true));
         assert_eq!(s.get("available").and_then(JsonValue::as_bool), Some(false));
         assert_eq!(s.get("point_count").and_then(JsonValue::as_u64), Some(0));
         assert_eq!(s.get("frame_seq").and_then(JsonValue::as_u64), Some(0));
@@ -3729,43 +3991,6 @@ mod tests {
         assert!(!would_mirror, "online-but-channel-less is not truly online");
         state::test_reset();
     }
-
-    #[test]
-    fn on_start_bridge_seeds_intent_from_legacy_when_absent() {
-        let _clock_guard = CLOCK_LOCK.lock().unwrap();
-        db::set_now_secs(1_700_000_000);
-        state::test_reset();
-        // Fresh upgrade: durable store key absent, legacy table holds ON intent.
-        db::test_set_legacy_lidar(Some(true));
-        assert!(state::get(state::KEY_LIDAR_ENABLED).expect("read").is_none(), "store key absent pre-bridge");
-        bridge_legacy_lidar_intent();
-        assert!(lidar_enabled_intent().expect("read"), "bridge seeds ON intent from legacy table");
-
-        // Idempotent: a second start with a DIFFERENT (newer) store value must NOT
-        // be clobbered by the stale legacy value.
-        set_lidar_intent(false);
-        db::test_set_legacy_lidar(Some(true));
-        bridge_legacy_lidar_intent();
-        assert!(!lidar_enabled_intent().expect("read"), "second start never clobbers a newer store value");
-        db::test_set_legacy_lidar(None);
-        state::test_reset();
-    }
-
-    #[test]
-    fn on_start_bridge_no_legacy_table_is_noop() {
-        let _clock_guard = CLOCK_LOCK.lock().unwrap();
-        db::set_now_secs(1_700_000_000);
-        state::test_reset();
-        // No legacy table (later drop migration shipped): the bridge leaves the
-        // store key absent (fresh-install default disabled), never fabricates one.
-        db::test_set_legacy_lidar(None);
-        bridge_legacy_lidar_intent();
-        assert!(
-            state::get(state::KEY_LIDAR_ENABLED).expect("read").is_none(),
-            "no legacy value → store key stays absent (no fabricated intent)"
-        );
-        state::test_reset();
-    }
 }
 
 #[no_mangle]
@@ -3776,6 +4001,9 @@ pub extern "C" fn on_request(
     out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
+    // Requests run on workers that never tick, so the cached clock there is
+    // whatever an earlier request left — read the real time first.
+    db::resync_now_secs();
     let input = read_string(input_ptr, input_len);
     let req: JsonValue = serde_json::from_str(&input).unwrap_or(JsonValue::Null);
     let raw_tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");

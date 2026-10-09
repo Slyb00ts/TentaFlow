@@ -26,10 +26,15 @@ enum Primitive {
 
 pub struct StabilizerSim {
     num_qubits: usize,
+    /// 64-bit words per tableau row.
+    words: usize,
     /// `x`, `z` and `r` hold 2n + 1 rows: n destabilizers, n stabilizers and one
-    /// scratch row used by deterministic measurements.
-    x: Vec<bool>,
-    z: Vec<bool>,
+    /// scratch row used by deterministic measurements. A row of `x`/`z` is
+    /// packed 64 qubits to a word, with the padding bits of the last word kept
+    /// at zero — `rowsum` is the hot path of every measurement and works a
+    /// word at a time, which is what keeps a thousand-qubit tableau usable.
+    x: Vec<u64>,
+    z: Vec<u64>,
     r: Vec<bool>,
     rng: StdRng,
 }
@@ -37,10 +42,12 @@ pub struct StabilizerSim {
 impl StabilizerSim {
     pub fn new(num_qubits: usize, seed: u64) -> StabilizerSim {
         let rows = 2 * num_qubits + 1;
+        let words = num_qubits.div_ceil(64).max(1);
         let mut sim = StabilizerSim {
             num_qubits,
-            x: vec![false; rows * num_qubits],
-            z: vec![false; rows * num_qubits],
+            words,
+            x: vec![0; rows * words],
+            z: vec![0; rows * words],
             r: vec![false; rows],
             rng: StdRng::seed_from_u64(seed),
         };
@@ -53,47 +60,60 @@ impl StabilizerSim {
     }
 
     pub fn reset_to_zero(&mut self) {
-        self.x.iter_mut().for_each(|b| *b = false);
-        self.z.iter_mut().for_each(|b| *b = false);
+        self.x.iter_mut().for_each(|w| *w = 0);
+        self.z.iter_mut().for_each(|w| *w = 0);
         self.r.iter_mut().for_each(|b| *b = false);
         let n = self.num_qubits;
         for i in 0..n {
-            self.x[i * n + i] = true;
-            self.z[(n + i) * n + i] = true;
+            self.set_bit(false, i, i, true);
+            self.set_bit(true, n + i, i, true);
+        }
+    }
+
+    fn bit(&self, z: bool, row: usize, qubit: usize) -> bool {
+        let words = if z { &self.z } else { &self.x };
+        words[row * self.words + qubit / 64] >> (qubit % 64) & 1 == 1
+    }
+
+    fn set_bit(&mut self, z: bool, row: usize, qubit: usize, value: bool) {
+        let words = if z { &mut self.z } else { &mut self.x };
+        let word = &mut words[row * self.words + qubit / 64];
+        let mask = 1u64 << (qubit % 64);
+        if value {
+            *word |= mask;
+        } else {
+            *word &= !mask;
         }
     }
 
     fn h(&mut self, a: usize) {
-        let n = self.num_qubits;
-        for i in 0..(2 * n) {
-            let xi = self.x[i * n + a];
-            let zi = self.z[i * n + a];
+        for i in 0..(2 * self.num_qubits) {
+            let xi = self.bit(false, i, a);
+            let zi = self.bit(true, i, a);
             self.r[i] ^= xi & zi;
-            self.x[i * n + a] = zi;
-            self.z[i * n + a] = xi;
+            self.set_bit(false, i, a, zi);
+            self.set_bit(true, i, a, xi);
         }
     }
 
     fn s(&mut self, a: usize) {
-        let n = self.num_qubits;
-        for i in 0..(2 * n) {
-            let xi = self.x[i * n + a];
-            let zi = self.z[i * n + a];
+        for i in 0..(2 * self.num_qubits) {
+            let xi = self.bit(false, i, a);
+            let zi = self.bit(true, i, a);
             self.r[i] ^= xi & zi;
-            self.z[i * n + a] = zi ^ xi;
+            self.set_bit(true, i, a, zi ^ xi);
         }
     }
 
     fn cx(&mut self, a: usize, b: usize) {
-        let n = self.num_qubits;
-        for i in 0..(2 * n) {
-            let xa = self.x[i * n + a];
-            let xb = self.x[i * n + b];
-            let za = self.z[i * n + a];
-            let zb = self.z[i * n + b];
+        for i in 0..(2 * self.num_qubits) {
+            let xa = self.bit(false, i, a);
+            let xb = self.bit(false, i, b);
+            let za = self.bit(true, i, a);
+            let zb = self.bit(true, i, b);
             self.r[i] ^= xa & zb & (xb ^ za ^ true);
-            self.x[i * n + b] = xb ^ xa;
-            self.z[i * n + a] = za ^ zb;
+            self.set_bit(false, i, b, xb ^ xa);
+            self.set_bit(true, i, a, za ^ zb);
         }
     }
 
@@ -106,57 +126,74 @@ impl StabilizerSim {
     }
 
     /// Accumulate row `i` onto row `h`, tracking the phase in Z4 as in the
-    /// original Aaronson-Gottesman paper.
+    /// original Aaronson-Gottesman paper. The per-qubit phase function g is
+    /// evaluated for 64 qubits at once: the qubits where it is +1 and where it
+    /// is -1 are counted with popcounts.
     fn rowsum(&mut self, h: usize, i: usize) {
-        let n = self.num_qubits;
-        let mut total: i32 = 2 * i32::from(self.r[h]) + 2 * i32::from(self.r[i]);
-        for j in 0..n {
-            total += g(
-                self.x[i * n + j],
-                self.z[i * n + j],
-                self.x[h * n + j],
-                self.z[h * n + j],
-            );
+        let words = self.words;
+        let (hs, is) = (h * words, i * words);
+        let mut plus: i64 = 0;
+        let mut minus: i64 = 0;
+        for w in 0..words {
+            let (x1, z1) = (self.x[is + w], self.z[is + w]);
+            let (x2, z2) = (self.x[hs + w], self.z[hs + w]);
+            let y = x1 & z1;
+            let px = x1 & !z1;
+            let pz = !x1 & z1;
+            plus += i64::from((y & !x2 & z2).count_ones())
+                + i64::from((px & x2 & z2).count_ones())
+                + i64::from((pz & x2 & !z2).count_ones());
+            minus += i64::from((y & x2 & !z2).count_ones())
+                + i64::from((px & !x2 & z2).count_ones())
+                + i64::from((pz & x2 & z2).count_ones());
         }
-        total = total.rem_euclid(4);
+        let total =
+            (2 * i64::from(self.r[h]) + 2 * i64::from(self.r[i]) + plus - minus).rem_euclid(4);
         self.r[h] = total == 2;
-        for j in 0..n {
-            self.x[h * n + j] ^= self.x[i * n + j];
-            self.z[h * n + j] ^= self.z[i * n + j];
+        for w in 0..words {
+            self.x[hs + w] ^= self.x[is + w];
+            self.z[hs + w] ^= self.z[is + w];
         }
+    }
+
+    fn copy_row(&mut self, to: usize, from: usize) {
+        let words = self.words;
+        self.x
+            .copy_within(from * words..(from + 1) * words, to * words);
+        self.z
+            .copy_within(from * words..(from + 1) * words, to * words);
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        let words = self.words;
+        self.x[row * words..(row + 1) * words].fill(0);
+        self.z[row * words..(row + 1) * words].fill(0);
     }
 
     pub fn measure(&mut self, a: usize) -> bool {
         let n = self.num_qubits;
-        let pivot = (n..(2 * n)).find(|i| self.x[i * n + a]);
+        let pivot = (n..(2 * n)).find(|i| self.bit(false, *i, a));
         match pivot {
             Some(p) => {
                 for i in 0..(2 * n) {
-                    if i != p && self.x[i * n + a] {
+                    if i != p && self.bit(false, i, a) {
                         self.rowsum(i, p);
                     }
                 }
-                for j in 0..n {
-                    self.x[(p - n) * n + j] = self.x[p * n + j];
-                    self.z[(p - n) * n + j] = self.z[p * n + j];
-                    self.x[p * n + j] = false;
-                    self.z[p * n + j] = false;
-                }
+                self.copy_row(p - n, p);
+                self.clear_row(p);
                 self.r[p - n] = self.r[p];
-                self.z[p * n + a] = true;
+                self.set_bit(true, p, a, true);
                 let outcome = self.rng.random::<bool>();
                 self.r[p] = outcome;
                 outcome
             }
             None => {
                 let scratch = 2 * n;
-                for j in 0..n {
-                    self.x[scratch * n + j] = false;
-                    self.z[scratch * n + j] = false;
-                }
+                self.clear_row(scratch);
                 self.r[scratch] = false;
                 for i in 0..n {
-                    if self.x[i * n + a] {
+                    if self.bit(false, i, a) {
                         self.rowsum(scratch, i + n);
                     }
                 }
@@ -181,16 +218,6 @@ impl StabilizerSim {
             self.apply_primitive(primitive);
         }
         Ok(())
-    }
-}
-
-fn g(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
-    let (x2, z2) = (i32::from(x2), i32::from(z2));
-    match (x1, z1) {
-        (false, false) => 0,
-        (true, true) => z2 - x2,
-        (true, false) => z2 * (2 * x2 - 1),
-        (false, true) => x2 * (1 - 2 * z2),
     }
 }
 

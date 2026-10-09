@@ -235,6 +235,7 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         let handle = match StreamHub::global().subscribe(&hub_key).await {
             Ok(h) => h,
             Err(StreamHubError::NotRegistered(_)) => {
+                tracing::warn!(stream_id = %stream_id, "stream: subscribe refused, not registered");
                 // Echo the PUBLIC stream id, never the internal (org/owner
                 // scoped) hub key, which would leak tenant/topology detail.
                 let _ = push_end_async(
@@ -248,6 +249,7 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
                 return;
             }
             Err(err) => {
+                tracing::warn!(stream_id = %stream_id, error = %err, "stream: subscribe failed");
                 let _ = push_end_async(
                     &sub,
                     Some(MessageBody::Error(ProtocolError::new(
@@ -1250,6 +1252,7 @@ mod tests {
             actions_meta: Vec::new(),
             telemetry: None,
             lidar: None,
+            gestures_enabled: false,
         };
         crate::mesh::robot_dispatch::global().replace_node(node_id, vec![robot]);
     }

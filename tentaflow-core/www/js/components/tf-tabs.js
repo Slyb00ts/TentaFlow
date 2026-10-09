@@ -25,7 +25,9 @@
 //   nothing),
 //   mono (monospace label), closable (trailing × emitting "tab-close"),
 //   pinned (sticks to the strip's left edge while the rest scrolls),
-//   nudge (amber "this is waiting for you" state), panel (id for aria-controls).
+//   nudge (amber "this is waiting for you" state), panel (id for aria-controls),
+//   hidden (the tab is out of the strip and of arrow-key moves — a section the
+//   reader may not see at all, as opposed to `disabled`, one shown with a reason).
 //   The leading slot holds exactly one marker, resolved dot > marker > icon.
 //
 // Events: "change" on <tf-tabs> (detail {value}), "tab-close" on <tf-tab>
@@ -572,7 +574,7 @@ class TfTabs extends HTMLElement {
     if (!current || !this._scroller.contains(current)) return;
 
     const buttons = this._getTabs()
-      .filter((t) => !t.hasAttribute('disabled'))
+      .filter((t) => !t.hasAttribute('disabled') && !t.hidden)
       .map((t) => t.querySelector('.tf-tab'))
       .filter(Boolean);
     if (buttons.length < 2) return;

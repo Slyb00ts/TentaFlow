@@ -24,6 +24,8 @@
 // Example: MessageBody::TentaQuantBody(TentaQuantPayload::LabListRequest {})
 // =============================================================================
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The six permission ids of `app-manifest.toml` (plan §10.2), in the order the
@@ -729,6 +731,139 @@ pub const RUN_EXPORT_PARTS: &[&str] = &[
     RUN_EXPORT_PART_CITATION_BIB,
 ];
 
+// ---- Course (Kurs, plan §12.3) ----
+
+/// Largest program one kata submission may carry. A kata is a handful of gates;
+/// the cap keeps an accidental paste of a notebook from reaching the parser.
+pub const KATA_SOURCE_MAX_BYTES: usize = 16 * 1024;
+
+/// How many places the ranking lists besides the caller's own (plan §18.20).
+pub const KATA_RANKING_TOP: usize = 5;
+
+/// One group of the course. A group opens when every kata of the group before
+/// it is passed; the first one is always open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KataGroupInfo {
+    pub group_id: String,
+    /// 1-based position in the fixed course order.
+    pub position: u32,
+    /// Language code → title. Every group carries at least "pl" and "en"; the
+    /// client picks its own language and falls back to "en".
+    pub titles: BTreeMap<String, String>,
+    pub kata_count: u32,
+    pub passed_count: u32,
+    pub unlocked: bool,
+}
+
+/// One kata with the caller's progress on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KataInfo {
+    pub kata_id: String,
+    pub group_id: String,
+    /// 1-based position in the whole course.
+    pub position: u32,
+    pub points: u32,
+    /// Tier that grades it: "T0" (the browser could) or "T1" (Core).
+    pub tier: String,
+    pub titles: BTreeMap<String, String>,
+    pub summaries: BTreeMap<String, String>,
+    /// "locked" (its group is not open yet) | "open" | "attempted" | "passed".
+    pub status: String,
+    pub attempts: u32,
+    /// Best score of any attempt, in [0, 1] — fidelity for state katas, one
+    /// minus the distance for distribution katas. Absent before the first one.
+    #[serde(default)]
+    pub best_score: Option<f64>,
+    /// Points actually earned: `points` once passed, `0` before. Never more
+    /// than once, however often the kata is passed again.
+    pub points_earned: u32,
+}
+
+/// The verdict on one submission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KataGrade {
+    /// "passed" | "failed" | "invalid" — invalid is a program the front end
+    /// rejected, which is not an attempt at the answer and is not counted as one.
+    pub outcome: String,
+    /// Why a failed attempt failed, as a code the client words: "mismatch" |
+    /// "above_threshold" | "unexpected_outcomes" | "qubit_count" |
+    /// "clbit_count" | "not_unitary" | "no_measurement". Empty when passed.
+    pub reason: String,
+    /// What `value` measures: "fidelity" | "process_fidelity" | "tvd".
+    pub metric: String,
+    /// The measured number, absent when grading stopped before measuring.
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// The bound `value` is held to: a lower bound for the fidelities, an upper
+    /// bound for the distance.
+    pub threshold: f64,
+    /// Qubits the kata asks for and the program declared.
+    pub expected_qubits: u32,
+    pub got_qubits: u32,
+    /// Shots and histogram of a distribution kata; empty for the others.
+    pub shots: u64,
+    pub counts: BTreeMap<String, u64>,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub diagnostic: Option<CircuitDiagnostic>,
+}
+
+/// One line of the course ranking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KataRankingEntry {
+    /// Competition ranking: equal scores share a place.
+    pub position: u32,
+    pub user_id: String,
+    pub display_name: String,
+    pub katas_passed: u32,
+    pub points: u32,
+    pub is_me: bool,
+}
+
+// ---- Examples (Przykłady, plan §12.1) ----
+
+/// One shipped example, as the gallery lists it. Counters that describe the
+/// circuit (`qubits`, `depth`) are measured from the parsed program, never
+/// typed into the example's manifest, so a card cannot disagree with what the
+/// fork will contain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExampleInfo {
+    pub example_id: String,
+    /// 1-based position in the shipped order.
+    pub position: u32,
+    /// Language code → title / one-paragraph description; every example
+    /// carries at least "pl" and "en".
+    pub titles: BTreeMap<String, String>,
+    pub descriptions: BTreeMap<String, String>,
+    /// "intro" | "core" | "advanced".
+    pub level: String,
+    pub tags: Vec<String>,
+    /// Register width the circuit below has. For a parametric example this is
+    /// the width that was asked for (or the default one in a listing).
+    pub qubits: u32,
+    /// Smallest and largest width the example can be built at; equal for a
+    /// fixed circuit.
+    pub qubits_min: u32,
+    pub qubits_max: u32,
+    pub qubits_default: u32,
+    /// Layers of the circuit when every gate is placed as early as its qubits
+    /// allow; measurements count as a layer.
+    pub depth: u32,
+}
+
+/// Shots, seed and tolerance an example's `expected.json` holds a run to, so
+/// the browser can say what "correct" looks like next to the histogram.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExampleExpected {
+    pub shots: u64,
+    pub seed: u64,
+    /// Largest total variation distance a correct run may have.
+    pub tolerance: f64,
+    /// Bitstring → ideal probability at the requested width. Any other
+    /// outcome is a wrong answer, not noise.
+    pub outcomes: BTreeMap<String, f64>,
+}
+
 /// TentaQuant message family (request + response). ciborium encodes variants
 /// external-tagged by variant NAME, so never rename a variant or a field
 /// without updating the frontend and the golden test (`tentaquant_wire_golden`).
@@ -1260,6 +1395,119 @@ pub enum TentaQuantPayload {
         pairs: Vec<KeyframePair>,
         probs_top: Vec<KeyframeProbability>,
     },
+
+    // ---- Course ----
+    /// The course in its fixed order with the caller's progress: groups, katas,
+    /// and the totals the progress card shows.
+    KataListRequest {
+        instance_id: String,
+    },
+    KataListResponse {
+        instance_id: String,
+        groups: Vec<KataGroupInfo>,
+        katas: Vec<KataInfo>,
+        passed_count: u32,
+        total_count: u32,
+        /// Points earned and the most the shipped katas can give.
+        points: u32,
+        max_points: u32,
+    },
+    /// One kata with its task text and the skeleton the editor starts from. A
+    /// kata of a group that is not open yet answers `NotFound`, so a locked kata
+    /// is not readable ahead of its turn.
+    KataGetRequest {
+        instance_id: String,
+        kata_id: String,
+    },
+    KataGetResponse {
+        instance_id: String,
+        kata: KataInfo,
+        /// Language code → task text (Markdown).
+        task: BTreeMap<String, String>,
+        starter_code: String,
+    },
+    /// Grades one OpenQASM 3 program in Core (`quant.run`). Deterministic: the
+    /// same program always gets the same verdict, counts included.
+    KataSubmitRequest {
+        instance_id: String,
+        kata_id: String,
+        qasm3: String,
+    },
+    KataSubmitResponse {
+        instance_id: String,
+        /// The kata after this attempt was recorded.
+        kata: KataInfo,
+        grade: KataGrade,
+        /// Points this attempt added: the kata's worth on its first pass, `0`
+        /// on every other submission.
+        points_awarded: u32,
+    },
+    /// Top [`KATA_RANKING_TOP`] of the laboratory plus the caller's own place.
+    /// Empty and `enabled = false` when a supervisor switched the ranking off.
+    KataRankingRequest {
+        instance_id: String,
+    },
+    KataRankingResponse {
+        instance_id: String,
+        enabled: bool,
+        /// People with at least one passed kata.
+        total: u32,
+        entries: Vec<KataRankingEntry>,
+        /// The caller's own line, whether or not it is among `entries`; absent
+        /// until they have passed a kata.
+        #[serde(default)]
+        me: Option<KataRankingEntry>,
+    },
+
+    // ---- Examples ----
+    /// The shipped examples in their fixed order. No per-person state: an
+    /// example is a document, so the list is the same for everyone who may read
+    /// the laboratory.
+    ExampleListRequest {
+        instance_id: String,
+    },
+    ExampleListResponse {
+        instance_id: String,
+        examples: Vec<ExampleInfo>,
+    },
+    /// One example with its README and circuit. `qubits` picks the width of a
+    /// parametric example (absent = its default); a width outside the
+    /// example's range is a `BadRequest`, and so is a width on a fixed one.
+    ExampleGetRequest {
+        instance_id: String,
+        example_id: String,
+        #[serde(default)]
+        qubits: Option<u32>,
+    },
+    ExampleGetResponse {
+        instance_id: String,
+        example: ExampleInfo,
+        /// Language code → README (Markdown).
+        readme: BTreeMap<String, String>,
+        /// The canonical OpenQASM 3 circuit at the requested width.
+        qasm3: String,
+        expected: ExampleExpected,
+    },
+    /// Copies an example into the caller's laboratory as a new private
+    /// project holding one notebook (the README as a markdown cell, the
+    /// circuit as a circuit cell). `quant.run`, like creating any project.
+    ExampleForkRequest {
+        instance_id: String,
+        example_id: String,
+        #[serde(default)]
+        qubits: Option<u32>,
+        /// Language the project name, description and README are taken in;
+        /// "en" when the example has no text in it.
+        language: String,
+    },
+    ExampleForkResponse {
+        instance_id: String,
+        project: ProjectInfo,
+        notebook: NotebookInfo,
+        /// The circuit cell of the new notebook, so the Studio can be opened
+        /// on exactly that cell.
+        circuit_cell_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -1574,6 +1822,179 @@ mod tests {
                 bitstring: "00".to_string(),
                 probability: 0.5,
             }],
+        });
+    }
+
+    fn kata_info() -> KataInfo {
+        KataInfo {
+            kata_id: "10-bell-state".to_string(),
+            group_id: "entanglement".to_string(),
+            position: 10,
+            points: 120,
+            tier: "T0".to_string(),
+            titles: BTreeMap::from([
+                ("pl".to_string(), "Stan Bella".to_string()),
+                ("en".to_string(), "Bell state".to_string()),
+            ]),
+            summaries: BTreeMap::from([("en".to_string(), "H then CNOT".to_string())]),
+            status: "attempted".to_string(),
+            attempts: 2,
+            best_score: Some(0.97),
+            points_earned: 0,
+        }
+    }
+
+    #[test]
+    fn course_family_round_trips() {
+        round_trip(TentaQuantPayload::KataListRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+        });
+        round_trip(TentaQuantPayload::KataListResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            groups: vec![KataGroupInfo {
+                group_id: "entanglement".to_string(),
+                position: 2,
+                titles: BTreeMap::from([("en".to_string(), "Entanglement".to_string())]),
+                kata_count: 4,
+                passed_count: 1,
+                unlocked: true,
+            }],
+            katas: vec![kata_info()],
+            passed_count: 7,
+            total_count: 10,
+            points: 500,
+            max_points: 860,
+        });
+        round_trip(TentaQuantPayload::KataGetRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            kata_id: "10-bell-state".to_string(),
+        });
+        round_trip(TentaQuantPayload::KataGetResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            kata: kata_info(),
+            task: BTreeMap::from([("en".to_string(), "Build a Bell pair.".to_string())]),
+            starter_code: "OPENQASM 3.0;\n".to_string(),
+        });
+        round_trip(TentaQuantPayload::KataSubmitRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            kata_id: "10-bell-state".to_string(),
+            qasm3: "OPENQASM 3.0;\n".to_string(),
+        });
+        round_trip(TentaQuantPayload::KataSubmitResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            kata: kata_info(),
+            grade: KataGrade {
+                outcome: "failed".to_string(),
+                reason: "above_threshold".to_string(),
+                metric: "tvd".to_string(),
+                value: Some(0.5),
+                threshold: 0.05,
+                expected_qubits: 2,
+                got_qubits: 2,
+                shots: 1024,
+                counts: BTreeMap::from([("00".to_string(), 1024)]),
+                duration_ms: 2,
+                diagnostic: None,
+            },
+            points_awarded: 0,
+        });
+        round_trip(TentaQuantPayload::KataRankingRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+        });
+        let entry = KataRankingEntry {
+            position: 1,
+            user_id: "u1".to_string(),
+            display_name: "Anna Kowalska".to_string(),
+            katas_passed: 10,
+            points: 860,
+            is_me: true,
+        };
+        round_trip(TentaQuantPayload::KataRankingResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            enabled: true,
+            total: 1,
+            entries: vec![entry.clone()],
+            me: Some(entry),
+        });
+    }
+
+    #[test]
+    fn example_family_round_trips() {
+        let info = ExampleInfo {
+            example_id: "ghz".to_string(),
+            position: 2,
+            titles: BTreeMap::from([
+                ("pl".to_string(), "Stan GHZ".to_string()),
+                ("en".to_string(), "GHZ state".to_string()),
+            ]),
+            descriptions: BTreeMap::from([("en".to_string(), "n entangled qubits".to_string())]),
+            level: "intro".to_string(),
+            tags: vec!["entanglement".to_string()],
+            qubits: 5,
+            qubits_min: 3,
+            qubits_max: 28,
+            qubits_default: 5,
+            depth: 6,
+        };
+        round_trip(TentaQuantPayload::ExampleListRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+        });
+        round_trip(TentaQuantPayload::ExampleListResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            examples: vec![info.clone()],
+        });
+        round_trip(TentaQuantPayload::ExampleGetRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: Some(12),
+        });
+        round_trip(TentaQuantPayload::ExampleGetResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example: info.clone(),
+            readme: BTreeMap::from([("en".to_string(), "# GHZ".to_string())]),
+            qasm3: "OPENQASM 3.0;\n".to_string(),
+            expected: ExampleExpected {
+                shots: 4096,
+                seed: 7,
+                tolerance: 0.05,
+                outcomes: BTreeMap::from([("00000".to_string(), 0.5), ("11111".to_string(), 0.5)]),
+            },
+        });
+        round_trip(TentaQuantPayload::ExampleForkRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: None,
+            language: "pl".to_string(),
+        });
+        round_trip(TentaQuantPayload::ExampleForkResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            project: ProjectInfo {
+                project_id: "p1".to_string(),
+                name: "Stan GHZ".to_string(),
+                description: String::new(),
+                owner_user_id: "u1".to_string(),
+                owner_name: "Anna".to_string(),
+                visibility: "private".to_string(),
+                my_role: "owner".to_string(),
+                share_count: 0,
+                file_count: 1,
+                notebook_count: 1,
+                run_count: 0,
+                linked_project_id: None,
+                created_at: "2026-09-03 10:00:00".to_string(),
+                updated_at: "2026-09-03 10:00:00".to_string(),
+                archived_at: None,
+            },
+            notebook: NotebookInfo {
+                notebook_id: "n1".to_string(),
+                project_id: "p1".to_string(),
+                file_id: "f1".to_string(),
+                name: "Stan GHZ".to_string(),
+                current_version: 1,
+                updated_by: "u1".to_string(),
+                updated_at: "2026-09-03 10:00:00".to_string(),
+            },
+            circuit_cell_id: "c1".to_string(),
         });
     }
 
@@ -1894,6 +2315,15 @@ mod tests {
             "RunStateQueryRequest wire drift"
         );
 
+        // The course submission, as the dashboard's encoder builds it.
+        let submit = TentaQuantPayload::KataSubmitRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            kata_id: "01-superposition-h".to_string(),
+            qasm3: "h q[0];".to_string(),
+        };
+        let bytes = crate::cbor::encode(&submit).expect("encode");
+        assert_eq!(bytes, hex_bytes("a1714b6174615375626d697452657175657374a36b696e7374616e63655f69647374656e74617175616e742d3061316232633364676b6174615f69647230312d7375706572706f736974696f6e2d68657161736d33676820715b305d3b"), "KataSubmitRequest wire drift");
+
         // The `device="auto"` question, as the UI asks it before a run starts.
         let resolve = TentaQuantPayload::TargetResolveRequest {
             instance_id: "tentaquant-0a1b2c3d".to_string(),
@@ -1909,5 +2339,16 @@ mod tests {
             ),
             "TargetResolveRequest wire drift"
         );
+
+        // A fork as the dashboard's encoder builds it; `qubits` omitted means
+        // the example's default width.
+        let fork = TentaQuantPayload::ExampleForkRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            example_id: "ghz".to_string(),
+            qubits: Some(5),
+            language: "pl".to_string(),
+        };
+        let bytes = crate::cbor::encode(&fork).expect("encode");
+        assert_eq!(bytes, hex_bytes("a1724578616d706c65466f726b52657175657374a46b696e7374616e63655f69647374656e74617175616e742d30613162326333646a6578616d706c655f69646367687a6671756269747305686c616e677561676562706c"), "ExampleForkRequest wire drift");
     }
 }

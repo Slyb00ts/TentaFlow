@@ -9386,6 +9386,51 @@ mod tests {
     }
 
     #[test]
+    fn bus_schema_subject_of_the_widened_types_materializes() {
+        let db = bus_db();
+        for kind in ["xsd", "hl7v2_profile"] {
+            let mut row = schema_subject_row_for_test("org-1", kind);
+            row.schema_type = kind.to_string();
+            let op = bus_schema_subject_op(&row, ActionType::Insert);
+            assert_eq!(apply_core_operation(&db, &op).unwrap(), 1, "{kind}");
+            let fetched =
+                repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", kind)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{kind} subject materialized"));
+            assert_eq!(fetched.schema_type, kind);
+        }
+    }
+
+    /// The path an old node (migration 179 not taken) hits for a widened
+    /// type is the same as for any unknown one: the CHECK refuses the row,
+    /// the op comes back as an error the inbox records as a conflict, and
+    /// nothing is left half-applied.
+    #[test]
+    fn bus_schema_subject_of_an_unknown_type_is_refused_without_a_trace() {
+        let db = bus_db();
+        let mut row = schema_subject_row_for_test("org-1", "weird");
+        row.schema_type = "yaml".to_string();
+        let op = bus_schema_subject_op(&row, ActionType::Insert);
+        assert!(apply_core_operation(&db, &op).is_err());
+        assert!(
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "weird")
+                .unwrap()
+                .is_none()
+        );
+        // A version op for the refused subject defers (retryable, later a
+        // conflict) instead of failing hard.
+        let version_op = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "weird", 1, "hash-w", 901),
+            ActionType::Insert,
+        );
+        let err = apply_core_operation(&db, &version_op).unwrap_err();
+        assert!(
+            matches!(err, SyncLedgerError::DeferredOrdering(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn bus_schema_subject_resource_id_mismatch_is_rejected() {
         let db = bus_db();
         let row = schema_subject_row_for_test("org-1", "orders.v1");

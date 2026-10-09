@@ -1,0 +1,31 @@
+id = "ghz"
+level = "intro"
+tags = ["entanglement", "scaling"]
+
+[title]
+pl = "Stan GHZ — n kubitów"
+en = "GHZ state — n qubits"
+
+[description]
+pl = "Splątanie n kubitów jednym łańcuchem CNOT. Pokazuje, jak korelacja rozciąga się na cały rejestr i jak szybko rośnie koszt symulacji (2ⁿ amplitud)."
+en = "Entangles n qubits with one fan of CNOT gates. Shows how the correlation spans the whole register and how fast the cost of simulation grows (2ⁿ amplitudes)."
+
+[qubits]
+min = 3
+max = 28
+default = 5
+
+# The OpenQASM 3 front end takes literal register sizes only, so the width is
+# not a parameter of the program: each line of circuit.qasm that carries it is
+# rewritten for another width. `{n}` is the requested width, `{last}` is n - 1.
+[[width_rewrite]]
+line = "qubit[5] q;"
+becomes = "qubit[{n}] q;"
+
+[[width_rewrite]]
+line = "bit[5] c;"
+becomes = "bit[{n}] c;"
+
+[[width_rewrite]]
+line = "for int i in [1:4] {"
+becomes = "for int i in [1:{last}] {"

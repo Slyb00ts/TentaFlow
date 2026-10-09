@@ -272,10 +272,12 @@ test('RangeSlider valid range emit change.range', () => {
   ]));
   const [minI, maxI] = el.querySelectorAll('input');
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let edits = null;
+  el.addEventListener('change', (e) => { got = e.detail; edits = e.__tfBoundEdits; });
   maxI.value = '60';
   maxI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, { value: { min: 10, max: 60 }, kind: 'range', changed: 'max' });
+  assertEq(edits, [{ path: PATH('lo'), value: 10 }, { path: PATH('hi'), value: 60 }]);
 });
 
 test('RangeSlider bubbled native events do not leak raw to wrapper', () => {
@@ -415,11 +417,13 @@ test('NumericInput change emituje rounded value na precision', () => {
     [8, 'md'], [9, false],
   ]));
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let bound = null;
+  el.addEventListener('change', (e) => { got = e.detail; bound = e.__tfBoundEdits[0].path; });
   const input = el.querySelector('input');
   input.value = '3.14159';
   input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, { value: 3.14, kind: 'f64' });
+  assertEq(bound, PATH('n'));
 });
 
 test('NumericInput bubbled native change emits exactly one SDK event', () => {

@@ -1,0 +1,11 @@
+id = "04-bloch-sphere"
+points = 80
+tier = "T0"
+
+[title]
+pl = "Sfera Blocha"
+en = "The Bloch sphere"
+
+[summary]
+pl = "gdzie leży |+⟩, a gdzie |−i⟩"
+en = "where |+⟩ sits, and where |−i⟩ does"

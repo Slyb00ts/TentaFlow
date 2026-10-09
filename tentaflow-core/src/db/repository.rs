@@ -688,14 +688,25 @@ pub fn create_api_key_with_scopes(
 
 /// Deletes a key by its stable `uid`. Revocation is keyed by `uid` because the
 /// 24-bit `key_prefix` is display-only and can collide across keys.
-pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
+/// Deletes the key and, in the same transaction, every right it held
+/// (`resource_permissions` rows with `subject_type = 'api_key'` of any
+/// resource type), each replicated as its own tombstone — a revoked key must
+/// not leave rights behind that a later key could never be told apart from.
+/// Returns the deleted key rows (0 or 1) and the `(resource_type,
+/// resource_id, action)` of each right removed.
+pub fn delete_api_key_by_uid(
+    pool: &DbPool,
+    uid: &str,
+) -> Result<(usize, Vec<(String, String, String)>)> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     let affected = tx.execute(
         "DELETE FROM api_keys WHERE uid = ?1",
         rusqlite::params![uid],
     )?;
+    let mut rights = Vec::new();
     if affected > 0 {
+        rights = resource_permissions::delete_subject_tx(&tx, "api_key", uid)?;
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
@@ -706,7 +717,7 @@ pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
         )?;
     }
     tx.commit()?;
-    Ok(affected)
+    Ok((affected, rights))
 }
 
 pub fn get_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<Option<DbApiKey>> {
@@ -22483,6 +22494,54 @@ pub mod resource_permissions {
         Ok(removed.len())
     }
 
+    /// Removes every row of one subject, of every resource type, inside the
+    /// caller's transaction, each replicated as its own Delete tombstone —
+    /// used when the subject itself is deleted (a revoked API key). Returns
+    /// the `(resource_type, resource_id, action)` of each removed row.
+    pub(crate) fn delete_subject_tx(
+        tx: &rusqlite::Transaction<'_>,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let removed: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "DELETE FROM resource_permissions
+                 WHERE subject_type = ?1 AND subject_id = ?2
+                 RETURNING resource_type, resource_id, action",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![subject_type, subject_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (resource_type, resource_id, action) in &removed {
+            super::record_core_capture_tx(
+                tx,
+                crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+                super::resource_permission_resource_id_for_action(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                ),
+                crate::sync::runtime::SqlWriteAction::Delete,
+                super::resource_permission_changed_fields(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                    None,
+                ),
+                None,
+            )?;
+        }
+        Ok(removed)
+    }
+
     /// Lista wszystkich wpisow dla konkretnego zasobu — dla UI
     /// "kto ma jaki dostep do gpt-4o".
     pub fn list_for_resource(
@@ -23877,6 +23936,8 @@ pub struct CameraPatch {
     pub depth_pose_robot_id: Option<Option<String>>,
     pub depth_camera_pitch_deg: Option<f64>,
     pub depth_scale: Option<f64>,
+    /// Camera optical centre vs the body origin (m, body frame x fwd / y left / z up).
+    pub depth_camera_offset_m: Option<[f64; 3]>,
 }
 
 #[cfg(feature = "camera")]
@@ -24600,6 +24661,8 @@ pub struct DepthMappingConfig {
     pub pitch_deg: f32,
     /// Metric scale correction for the (approximate) monocular depth.
     pub scale: f32,
+    /// Camera optical centre vs the pose's body origin (m, body frame FLU).
+    pub offset_m: [f32; 3],
 }
 
 /// Vertical FOV is optional: `0` (or non-positive) means "square pixels" (`fy = fx`);
@@ -24624,10 +24687,12 @@ pub fn camera_depth_mapping_config(
     camera_id: &str,
 ) -> Result<Option<DepthMappingConfig>> {
     let conn = acquire(pool)?;
-    let row: Option<(i64, Option<String>, f64, i64, Option<String>, f64, f64, f64)> = conn
+    type Row = (i64, Option<String>, f64, i64, Option<String>, f64, f64, f64, [f64; 3]);
+    let row: Option<Row> = conn
         .query_row(
             "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps, \
-             depth_pose_robot_id, depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg \
+             depth_pose_robot_id, depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg, \
+             depth_camera_offset_x_m, depth_camera_offset_y_m, depth_camera_offset_z_m \
              FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
             rusqlite::params![camera_id],
             |r| {
@@ -24640,11 +24705,13 @@ pub fn camera_depth_mapping_config(
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    [r.get(8)?, r.get(9)?, r.get(10)?],
                 ))
             },
         )
         .optional()?;
-    let Some((enabled, robot_id, fov, fps, pose_robot_id, pitch, scale, fov_v)) = row else {
+    let Some((enabled, robot_id, fov, fps, pose_robot_id, pitch, scale, fov_v, offset)) = row
+    else {
         return Ok(None);
     };
     if enabled == 0 {
@@ -24666,41 +24733,10 @@ pub fn camera_depth_mapping_config(
         fps: (fps.clamp(1, 10)) as u32,
         pitch_deg: (pitch as f32).clamp(-89.0, 89.0),
         scale: (scale as f32).clamp(0.1, 10.0),
+        // A mount is part of the robot body; anything beyond a couple of metres is a
+        // bad value, not a camera position.
+        offset_m: offset.map(|v| (v as f32).clamp(-2.0, 2.0)),
     }))
-}
-
-/// Lists every camera with depth mapping currently enabled (and a robot bound).
-/// The always-on depth loop calls this to discover which cameras to drive.
-#[cfg(feature = "camera")]
-pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfig>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps, depth_pose_robot_id, \
-         depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg \
-         FROM cameras \
-         WHERE depth_mapping_enabled = 1 AND depth_robot_id IS NOT NULL \
-           AND depth_robot_id <> '' AND removed_at IS NULL",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            let robot_id = r.get::<_, String>(1)?;
-            let pose_robot_id = r
-                .get::<_, Option<String>>(4)?
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| robot_id.clone());
-            Ok(DepthMappingConfig {
-                camera_id: r.get::<_, String>(0)?,
-                robot_id,
-                pose_robot_id,
-                fov_deg: (r.get::<_, f64>(2)? as f32).clamp(20.0, 150.0),
-                fov_v_deg: clamp_fov_v(r.get::<_, f64>(7)?),
-                fps: (r.get::<_, i64>(3)?.clamp(1, 10)) as u32,
-                pitch_deg: (r.get::<_, f64>(5)? as f32).clamp(-89.0, 89.0),
-                scale: (r.get::<_, f64>(6)? as f32).clamp(0.1, 10.0),
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
 }
 
 /// Per-camera analysis Flow id (the cold path runs it on a detection event).
@@ -25540,6 +25576,14 @@ pub fn update_camera(
     if let Some(v) = patch.depth_scale {
         sets.push("depth_scale = ?");
         params.push(Box::new(v));
+    }
+    if let Some([x, y, z]) = patch.depth_camera_offset_m {
+        sets.push("depth_camera_offset_x_m = ?");
+        params.push(Box::new(x));
+        sets.push("depth_camera_offset_y_m = ?");
+        params.push(Box::new(y));
+        sets.push("depth_camera_offset_z_m = ?");
+        params.push(Box::new(z));
     }
     sets.push("updated_at = ?");
     params.push(Box::new(now));
@@ -28829,7 +28873,7 @@ mod api_key_access_v2_tests {
         )
         .unwrap();
 
-        let affected = delete_api_key_by_uid(&db, &uid1).unwrap();
+        let (affected, _) = delete_api_key_by_uid(&db, &uid1).unwrap();
         assert_eq!(affected, 1, "exactly the targeted key is deleted");
         assert!(
             get_api_key_by_uid(&db, &uid1).unwrap().is_none(),
@@ -28845,7 +28889,67 @@ mod api_key_access_v2_tests {
         );
 
         // Revoking an unknown uid affects nothing.
-        assert_eq!(delete_api_key_by_uid(&db, "no-such-uid").unwrap(), 0);
+        assert_eq!(delete_api_key_by_uid(&db, "no-such-uid").unwrap().0, 0);
+    }
+
+    /// Revoking a key takes every right it held with it — a topic right,
+    /// a pattern right and a model scope alike — each as a replicated
+    /// tombstone, and leaves another key's rights alone.
+    #[test]
+    fn revoking_a_key_removes_all_its_rights_and_replicates_the_removal() {
+        let db = fresh_db();
+        let (_, uid) =
+            create_api_key(&db, "v-rights-1", "sk-...r1", "portal", "general", None, 60).unwrap();
+        let (_, other) =
+            create_api_key(&db, "v-rights-2", "sk-...r2", "lis", "general", None, 60).unwrap();
+        for (subject, resource_type, resource_id, action) in [
+            (&uid, "topic", "t-1", "read"),
+            (&uid, "topic", "t-1", "write"),
+            (&uid, "bus_schema_registry", "s-1", "read"),
+            (&uid, "model", "bielik", "*"),
+            (&other, "topic", "t-1", "read"),
+        ] {
+            resource_permissions::set_with_action(
+                &db,
+                resource_type,
+                resource_id,
+                "api_key",
+                subject,
+                action,
+                "allow",
+            )
+            .unwrap();
+        }
+        let (deleted, mut rights) = delete_api_key_by_uid(&db, &uid).unwrap();
+        assert_eq!(deleted, 1);
+        rights.sort();
+        assert_eq!(
+            rights,
+            vec![
+                (
+                    "bus_schema_registry".to_string(),
+                    "s-1".to_string(),
+                    "read".to_string()
+                ),
+                ("model".to_string(), "bielik".to_string(), "*".to_string()),
+                ("topic".to_string(), "t-1".to_string(), "read".to_string()),
+                ("topic".to_string(), "t-1".to_string(), "write".to_string()),
+            ]
+        );
+        assert!(resource_permissions::list_for_subject(&db, "api_key", &uid)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            resource_permissions::list_for_subject(&db, "api_key", &other)
+                .unwrap()
+                .len(),
+            1
+        );
+        let tombstone =
+            resource_permission_resource_id_for_action("topic", "t-1", "api_key", &uid, "write");
+        let (action, _) =
+            latest_capture(&db, "core.resource_permission", &tombstone).expect("right tombstone");
+        assert_eq!(action, "delete");
     }
 
     // =========================================================================
@@ -32225,18 +32329,46 @@ pub(crate) fn publish_bus_field_policy_capture(
     Ok(Some(recorded.op_id))
 }
 
+/// What a data-hiding rule write expects to find stored, checked in the same
+/// writer transaction as the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusFieldPolicyExpect {
+    /// Write whatever is stored (or nothing is).
+    Any,
+    /// No rule may exist for the key yet.
+    Absent,
+    /// A rule must exist and carry exactly this `updated_at_ms`.
+    UpdatedAt(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusFieldPolicyWrite {
+    Written,
+    /// The topic does not exist (nothing written).
+    TopicMissing,
+    /// The stored rule is not what `BusFieldPolicyExpect` named (nothing written).
+    Changed,
+}
+
 /// Upsert — one row per `(instance_id, org_id, topic, subject_type,
 /// subject_id, direction)`. Always captured as `SqlWriteAction::Update`:
 /// like `resource_permissions::set`, the materializer's own `INSERT ... ON
 /// CONFLICT DO UPDATE` treats Insert and Update identically, so the
 /// insert-vs-update distinction carries no information a replica needs.
 ///
-/// Written only while the topic exists, checked in the same writer
-/// transaction a topic delete takes (`bus_topic_delete`), so a delete cannot
-/// land between the check and the write and leave the rule behind.
-/// `Ok(false)` when the topic is missing (nothing written).
-pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<bool> {
-    let written = with_writer_tx(pool, |tx| {
+/// Written only while the topic exists and the stored rule is what `expect`
+/// names, both checked in the same writer transaction a topic delete takes
+/// (`bus_topic_delete`), so neither a delete nor a second administrator's
+/// write can land between the check and the write. A replacing write always
+/// gets an `updated_at_ms` above the stored one, so two writes within one
+/// millisecond cannot share the value `BusFieldPolicyExpect::UpdatedAt`
+/// compares.
+pub fn bus_field_policy_set(
+    pool: &DbPool,
+    row: &DbBusFieldPolicy,
+    expect: BusFieldPolicyExpect,
+) -> Result<BusFieldPolicyWrite> {
+    let (outcome, stored) = with_writer_tx(pool, |tx| {
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM bus_topics \
              WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3)",
@@ -32244,7 +32376,35 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<boo
             |r| r.get(0),
         )?;
         if !exists {
-            return Ok(false);
+            return Ok((BusFieldPolicyWrite::TopicMissing, row.clone()));
+        }
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT updated_at_ms FROM bus_field_policies \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+                   AND subject_id = ?5 AND direction = ?6",
+                rusqlite::params![
+                    row.instance_id,
+                    row.org_id,
+                    row.topic,
+                    row.subject_type,
+                    row.subject_id,
+                    row.direction
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let as_expected = match expect {
+            BusFieldPolicyExpect::Any => true,
+            BusFieldPolicyExpect::Absent => current.is_none(),
+            BusFieldPolicyExpect::UpdatedAt(ts) => current == Some(ts),
+        };
+        if !as_expected {
+            return Ok((BusFieldPolicyWrite::Changed, row.clone()));
+        }
+        let mut stored = row.clone();
+        if let Some(current) = current {
+            stored.updated_at_ms = stored.updated_at_ms.max(current + 1);
         }
         tx.execute(
             &format!(
@@ -32257,28 +32417,28 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<boo
                  updated_at_ms = excluded.updated_at_ms"
             ),
             rusqlite::params![
-                row.instance_id,
-                row.org_id,
-                row.topic,
-                row.subject_type,
-                row.subject_id,
-                row.direction,
-                row.fields_json,
-                row.required_fields_json,
-                row.created_at_ms,
-                row.updated_at_ms,
+                stored.instance_id,
+                stored.org_id,
+                stored.topic,
+                stored.subject_type,
+                stored.subject_id,
+                stored.direction,
+                stored.fields_json,
+                stored.required_fields_json,
+                stored.created_at_ms,
+                stored.updated_at_ms,
             ],
         )?;
-        Ok(true)
+        Ok((BusFieldPolicyWrite::Written, stored))
     })?;
-    if written {
+    if outcome == BusFieldPolicyWrite::Written {
         let _ = publish_bus_field_policy_capture(
             pool,
-            row,
+            &stored,
             crate::sync::runtime::SqlWriteAction::Update,
         )?;
     }
-    Ok(written)
+    Ok(outcome)
 }
 
 pub fn bus_field_policy_get(
@@ -32332,6 +32492,13 @@ pub fn bus_field_policy_list_for_topic(
     Ok(rows)
 }
 
+/// Removes one rule. With `expected_updated_at_ms` the rule must still carry
+/// exactly that `updated_at_ms`, checked in the same writer transaction as the
+/// delete, so a second administrator's change cannot be deleted unseen; a rule
+/// that changed or vanished meanwhile returns `false` and nothing is removed.
+/// Without it the delete is unconditional and idempotent (older clients,
+/// internal callers). `true` means the rule is gone.
+#[allow(clippy::too_many_arguments)]
 pub fn bus_field_policy_delete(
     pool: &DbPool,
     instance_id: &str,
@@ -32340,15 +32507,38 @@ pub fn bus_field_policy_delete(
     subject_type: &str,
     subject_id: &str,
     direction: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let row: Option<DbBusFieldPolicy> = conn
-        .query_row(
-            &format!(
-                "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
-                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
-                   AND subject_id = ?5 AND direction = ?6"
-            ),
+    expected_updated_at_ms: Option<i64>,
+) -> Result<bool> {
+    let deleted: Option<Option<DbBusFieldPolicy>> = with_writer_tx(pool, |tx| {
+        let row: Option<DbBusFieldPolicy> = tx
+            .query_row(
+                &format!(
+                    "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+                       AND subject_id = ?5 AND direction = ?6"
+                ),
+                rusqlite::params![
+                    instance_id,
+                    org_id,
+                    topic,
+                    subject_type,
+                    subject_id,
+                    direction
+                ],
+                map_bus_field_policy_row,
+            )
+            .optional()?;
+        if let Some(expected) = expected_updated_at_ms {
+            if row.as_ref().map(|r| r.updated_at_ms) != Some(expected) {
+                return Ok(None);
+            }
+        }
+        let Some(row) = row else {
+            return Ok(Some(None));
+        };
+        tx.execute(
+            "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 \
+             AND topic = ?3 AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
             rusqlite::params![
                 instance_id,
                 org_id,
@@ -32357,26 +32547,20 @@ pub fn bus_field_policy_delete(
                 subject_id,
                 direction
             ],
-            map_bus_field_policy_row,
-        )
-        .optional()?;
-    let Some(row) = row else { return Ok(()) };
-    conn.execute(
-        "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 \
-         AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
-        rusqlite::params![
-            instance_id,
-            org_id,
-            topic,
-            subject_type,
-            subject_id,
-            direction
-        ],
-    )?;
-    drop(conn);
-    let _ =
-        publish_bus_field_policy_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
-    Ok(())
+        )?;
+        Ok(Some(Some(row)))
+    })?;
+    let Some(deleted) = deleted else {
+        return Ok(false);
+    };
+    if let Some(row) = deleted {
+        let _ = publish_bus_field_policy_capture(
+            pool,
+            &row,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        )?;
+    }
+    Ok(true)
 }
 
 /// Deletes every `bus_field_policies` row of one topic inside the caller's
@@ -33540,7 +33724,7 @@ pub mod bus_test_support {
                 instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 subject TEXT NOT NULL,
-                schema_type TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift')),
+                schema_type TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift','xsd','hl7v2_profile')),
                 compatibility TEXT NOT NULL DEFAULT 'backward' CHECK(compatibility IN ('none','backward','forward','full')),
                 deprecated_at_ms INTEGER,
                 created_by TEXT,
@@ -33672,12 +33856,114 @@ mod bus_repository_tests {
     fn field_policy_set_refuses_a_missing_topic() {
         let db = fresh_db();
         let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
-        assert!(!bus_field_policy_set(&db, &row).unwrap());
-        assert!(bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap(),
+            BusFieldPolicyWrite::TopicMissing
+        );
+        assert!(
+            bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
+                .unwrap()
+                .is_empty()
+        );
         bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
-        assert!(bus_field_policy_set(&db, &row).unwrap());
+        assert_eq!(
+            bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap(),
+            BusFieldPolicyWrite::Written
+        );
+    }
+
+    /// The expectation is judged in the write's own transaction, and a
+    /// replacing write never repeats the stamp a compare-and-set reads —
+    /// two writes in one millisecond would otherwise look like no write.
+    #[test]
+    fn field_policy_set_checks_what_it_expects_and_moves_the_stamp() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
+        let get = || {
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "read").unwrap()
+        };
+        let write = |expect| bus_field_policy_set(&db, &row, expect).unwrap();
+
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Changed,
+            "nothing stored yet"
+        );
+        assert!(get().is_none());
+        assert_eq!(
+            write(BusFieldPolicyExpect::Absent),
+            BusFieldPolicyWrite::Written
+        );
+        assert_eq!(get().unwrap().updated_at_ms, 1_000);
+        assert_eq!(
+            write(BusFieldPolicyExpect::Absent),
+            BusFieldPolicyWrite::Changed,
+            "now it exists"
+        );
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(999)),
+            BusFieldPolicyWrite::Changed
+        );
+
+        // The same millisecond again: the stamp still moves.
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Written
+        );
+        assert_eq!(get().unwrap().updated_at_ms, 1_001);
+        assert_eq!(
+            write(BusFieldPolicyExpect::UpdatedAt(1_000)),
+            BusFieldPolicyWrite::Changed,
+            "the first reader lost"
+        );
+        assert_eq!(
+            write(BusFieldPolicyExpect::Any),
+            BusFieldPolicyWrite::Written
+        );
+
+        let missing = field_policy_row(T1, "org-1", "gone", "any", "*", "read");
+        assert_eq!(
+            bus_field_policy_set(&db, &missing, BusFieldPolicyExpect::Absent).unwrap(),
+            BusFieldPolicyWrite::TopicMissing,
+            "a missing topic is reported before the expectation"
+        );
+    }
+
+    #[test]
+    fn field_policy_delete_compares_the_stamp_in_the_write() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
+        bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap();
+        let delete = |expected| {
+            bus_field_policy_delete(
+                &db,
+                T1,
+                "org-1",
+                "patients.updated",
+                "any",
+                "*",
+                "read",
+                expected,
+            )
+            .unwrap()
+        };
+        let exists = || {
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "read")
+                .unwrap()
+                .is_some()
+        };
+
+        assert!(!delete(Some(row.updated_at_ms + 1)), "a stale stamp");
+        assert!(exists(), "nothing was removed");
+        assert!(delete(Some(row.updated_at_ms)));
+        assert!(!exists());
+        assert!(
+            !delete(Some(row.updated_at_ms)),
+            "a vanished rule is a change"
+        );
+        assert!(delete(None), "unconditional and idempotent");
     }
 
     #[test]
@@ -33685,7 +33971,7 @@ mod bus_repository_tests {
         let db = fresh_db();
         bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
         let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
-        bus_field_policy_set(&db, &row).unwrap();
+        bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).unwrap();
 
         let fetched =
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
@@ -33697,7 +33983,7 @@ mod bus_repository_tests {
         let mut updated_row = row.clone();
         updated_row.required_fields_json = Some(r#"["status"]"#.to_string());
         updated_row.updated_at_ms = 2_000;
-        bus_field_policy_set(&db, &updated_row).unwrap();
+        bus_field_policy_set(&db, &updated_row, BusFieldPolicyExpect::Any).unwrap();
 
         let updated =
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
@@ -33712,11 +33998,21 @@ mod bus_repository_tests {
         assert_eq!(updated.created_at_ms, 1_000);
 
         let read_row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
-        bus_field_policy_set(&db, &read_row).unwrap();
+        bus_field_policy_set(&db, &read_row, BusFieldPolicyExpect::Any).unwrap();
         let listed = bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated").unwrap();
         assert_eq!(listed.len(), 2);
 
-        bus_field_policy_delete(&db, T1, "org-1", "patients.updated", "any", "*", "write").unwrap();
+        bus_field_policy_delete(
+            &db,
+            T1,
+            "org-1",
+            "patients.updated",
+            "any",
+            "*",
+            "write",
+            None,
+        )
+        .unwrap();
         assert!(
             bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
                 .unwrap()
@@ -34525,16 +34821,19 @@ mod bus_repository_tests {
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-1", "labs.results", "any", "*", "read"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-2", "invoices.created", "any", "*", "write"),
+            BusFieldPolicyExpect::Any,
         )
         .unwrap();
 

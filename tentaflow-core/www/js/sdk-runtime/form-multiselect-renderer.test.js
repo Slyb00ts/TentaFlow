@@ -350,9 +350,11 @@ test('MultiSelect clear emits change=[]', () => {
     3: { kind: 'literal', value: 'L' },
   }))));
   let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
+  let edits = null;
+  el.addEventListener('change', (e) => { got = e.detail; edits = e.__tfBoundEdits; });
   el.querySelector('.tf-multiselect-clear').click();
   assertEq(got, { value: [], kind: 'array' });
+  assertEq(edits, [{ path: PATH('sel'), value: [] }]);
 });
 
 test('MultiSelect show_select_all=true renders the "Select all" button', () => {

@@ -781,6 +781,9 @@ pub fn statevector(
     Ok(backend.amplitudes())
 }
 
+/// Gates handed to the backend in one call.
+const MAX_BATCH: usize = 64;
+
 /// Applies a whole compiled program to `backend`, handing every measurement to
 /// `on_measure`. Every straight-line walk of a program goes through here, so
 /// the cancellation question is asked at exactly one place: a step is a full
@@ -796,12 +799,29 @@ fn apply_program(
     cancel: Cancel<'_>,
     mut on_measure: impl FnMut(usize, usize),
 ) -> Result<()> {
+    // Consecutive unitaries go to the backend as one batch, so it can take the
+    // state through memory once for a run of gates instead of once per gate.
+    // The batch is cut before anything that reads or rescales the state, and at
+    // `MAX_BATCH` so a stop request still lands within a bounded amount of work.
+    let mut batch: Vec<GateOp> = Vec::new();
     for step in program {
         if cancel.stopped() {
             return Err(Error::Cancelled);
         }
+        if let Instruction::Unitary(op) = &step.instruction {
+            batch.push(*op);
+            if batch.len() == MAX_BATCH {
+                backend.apply(&batch);
+                batch.clear();
+            }
+            continue;
+        }
+        if !batch.is_empty() {
+            backend.apply(&batch);
+            batch.clear();
+        }
         match &step.instruction {
-            Instruction::Unitary(op) => backend.apply(std::slice::from_ref(op)),
+            Instruction::Unitary(_) => unreachable!("handled above"),
             Instruction::GlobalPhase(angle) => backend.apply_global_phase(*angle),
             Instruction::Barrier => {}
             Instruction::Measure { qubit, clbit } => on_measure(*qubit, *clbit),
@@ -809,6 +829,9 @@ fn apply_program(
                 unreachable!("rejected by require_unitary or by needs_shot_by_shot")
             }
         }
+    }
+    if !batch.is_empty() {
+        backend.apply(&batch);
     }
     Ok(())
 }

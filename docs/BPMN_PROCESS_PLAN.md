@@ -245,7 +245,7 @@ Odpowiednik Camunda Cockpit, dostępny w samym Flow Builderze:
 ## 10. Stan realizacji (2026-10-08)
 
 Źródłem prawdy jest kod: `tentaflow-core/src/processes/` (model, parser, runtime, repozytorium,
-symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-protocol/src/processes.rs`
+symulacja), migracje 183–199 w `db/migrations.rs`, protokół `tentaflow-protocol/src/processes.rs`
 (`ProcessPayload`) i Flow Builder (`www/js/modules/flows-builder/`).
 
 ### 10.1 Zrealizowane
@@ -266,25 +266,25 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   i dowodami (§4.4). Walidacja grafu przy zapisie przepływu, szablon w palecie przepływów,
   a wykonawca uznaje przebieg z takim blokiem za błąd (`ACTIVITY_RESULT_NOT_PRODUCED`), gdy
   terminal się nie wykonał — brak wyniku nigdy nie jest sukcesem.
-- **Trwałe wywołania usług** (migracja 196, `bpmn_service_invocations`): wywołanie zadania
+- **Trwałe wywołania usług** (migracja 198, `bpmn_service_invocations`): wywołanie zadania
   usługi ma fazy `prepared` → `may_have_executed` / `uncertain` → `observed` → `accepted` oraz
   ogrodzenie próby, więc wynik zaobserwowany po zamknięciu aktywności nie jest ponownie
   wykonywany ani cicho gubiony.
-- **Wejścia i wyjścia aktywności (IO)** (migracje 195–197): skojarzenia danych wejściowych
+- **Wejścia i wyjścia aktywności (IO)** (migracje 197–199): skojarzenia danych wejściowych
   i wyjściowych na ośmiu rodzajach aktywności (użytkownika, skrypt, usługa, ręczna, wysłanie,
   odbiór, podproces, wywołanie), z trwałym świadkiem (`bpmn_activity_io_witnesses`) dla fazy
   przechwycenia wejść, zaakceptowanego wyniku i zastosowanych albo zablokowanych wyjść.
   Właściciel fazy to aktywność zwykła, porządkowa albo koordynator powtórzeń. Zablokowane
   mapowanie wyjścia zostawia aktywność oczekującą z incydentem, bez ponownego wykonania pracy.
 - **Zdarzenia brzegowe na powtarzanej aktywności**: zewnętrzny timer albo wiadomość jest
-  uzbrojony na koordynatorze i rozbrajany dopiero po zakończeniu całej grupy; migracja 194
+  uzbrojony na koordynatorze i rozbrajany dopiero po zakończeniu całej grupy; migracja 196
   (`bpmn_repetition_accepted_source_instance`) wiąże przyjęte źródło porządkowe z instancją.
 - **Dokumenty wieloprocesowe i modelowanie** (import i eksport BPMN XML, `processes/bpmn.rs`):
   wiele wykonywalnych procesów w jednym dokumencie z katalogiem startów, wywołanie procesu
   z tego samego dokumentu (`ProcessCallTarget::LocalBody`) obok opublikowanego, kolaboracja
   (uczestnicy, przepływy wiadomości), tory, obiekty i magazyny danych, adnotacje i skojarzenia
   zachowywane przy eksporcie, zdarzenia linku (throw/catch), przypięcie wybranego procesu
-  i startu do instancji (migracja 195).
+  i startu do instancji (migracja 197).
 - **Symulacja procesu** (`processes/simulation.rs`, `SimulationRegistry`, okno w Flow
   Builderze): deterministyczne uruchomienie w prywatnej bazie SQLite z zegarem symulacji,
   stałymi identyfikatorami i śladem kroków. Obsługuje zadania skryptowe, użytkownika
@@ -296,7 +296,7 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
 
 ### 10.2a Poprawki po przeglądzie (2026-10-09)
 
-- **Migracja 196 nie odmawia rozruchu z powodu kształtu historii zadań.** Historia zadań usługi,
+- **Migracja 198 nie odmawia rozruchu z powodu kształtu historii zadań.** Historia zadań usługi,
   której poprzednia wersja nie mogła „udowodnić”, jest przekształcana w jawny stan zamiast
   przerywać migrację (po awarii nowy plik wykonywalny nigdy by nie wystartował). Zadanie
   `running` jest traktowane jak po rozruchowym `recover_jobs`: zadanie `error` z podbitym
@@ -447,12 +447,12 @@ spójnie bez nowej migracji i nowej gałęzi walidatora:
 
 ### 10.4 Ryzyka integracyjne
 
-- **Numeracja migracji.** Gałąź zajmuje 178–197 (178–180 to struktura organizacyjna, 181–197
-  BPMN), a `origin/main` ma już 178 (`cameras_depth_camera_offset`) i 179
-  (`bus_schema_registry_widen_types`). Przed scaleniem trzeba przesunąć numery gałęzi o dwa
-  (do 180–199) wraz z testami, które przypinają numery (`run_ladder_up_to(194)` i asercje
-  `MAX(version)` w `db/migrations.rs`, `call_pin_tests.rs`). Baza, która zastosowała numery
-  gałęzi, nie może przejść na numerację scaloną bez ręcznej reconcylacji.
+- **Numeracja migracji.** `origin/main` zajmuje 178 (`cameras_depth_camera_offset`) i 179
+  (`bus_schema_registry_widen_types`), dlatego migracje gałęzi po scaleniu mają numery 180–199
+  (180–182 to struktura organizacyjna, 183–199 BPMN; przesunięcie o dwa względem wcześniejszych
+  178–197). Testy przypinające numery (`run_ladder_up_to`, asercje `MAX(version)` w
+  `db/migrations.rs`, `call_pin_tests.rs`) używają nowej numeracji. Baza, która zastosowała
+  numery sprzed scalenia, nie może przejść na nową numerację bez ręcznej reconcylacji.
 - **`SCHEMA_VERSION`.** Zmiany protokołu w tym kroku są addytywne: dopisane warianty
   `ProcessPayload::Simulation*` (tagi po NAZWIE), pole `ProcessModel.data_stores` z
   `#[serde(default)]` i serializacja `CallActivity` zgodna z dotychczasowym kształtem.

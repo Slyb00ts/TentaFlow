@@ -33,7 +33,7 @@ use tentaflow_protocol::{
 };
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::services::detection_bus::{self, Detection, DetectionsMessage};
+use crate::services::detection_bus::{self, Detection, DetectionsMessage, PoseMessage};
 use crate::services::rbac::OrgContext;
 
 use super::subscription::{push_chunk_async, push_end, StreamHandlerMeta, Subscription};
@@ -141,6 +141,34 @@ pub(crate) fn to_wire(msg: DetectionsMessage) -> CameraDetectionsFrame {
         pts_ns: msg.pts_ns,
         proc_ms: msg.proc_ms,
         items: msg.items.into_iter().map(item_to_wire).collect(),
+        source: String::new(),
+    }
+}
+
+/// A gesture-engine frame on the same overlay stream, tagged `source = "pose"`.
+pub(crate) fn pose_to_wire(msg: PoseMessage) -> CameraDetectionsFrame {
+    CameraDetectionsFrame {
+        camera_id: msg.camera_id,
+        ts_ms: msg.ts_ms,
+        pts_ns: msg.pts_ns,
+        proc_ms: msg.proc_ms,
+        items: msg
+            .items
+            .into_iter()
+            .map(|p| DetectionItem {
+                klasa: p.klasa.to_string(),
+                bbox: p.bbox,
+                score: p.score,
+                stan: Vec::new(),
+                tekst: p.label,
+                tekst_conf: None,
+                track_id: 0,
+                vx: 0.0,
+                vy: 0.0,
+                keypoints: p.keypoints,
+            })
+            .collect(),
+        source: "pose".to_string(),
     }
 }
 
@@ -155,6 +183,7 @@ fn item_to_wire(d: Detection) -> DetectionItem {
         track_id: d.track_id,
         vx: d.vx,
         vy: d.vy,
+        keypoints: Vec::new(),
     }
 }
 
@@ -232,12 +261,16 @@ fn camera_detections_subscribe_handler(
         }
 
         let mut rx = detection_bus::subscribe(&camera_id);
+        let mut pose_rx = detection_bus::subscribe_pose(&camera_id);
         loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    let body = MessageBody::CameraAdminBody(CameraAdminPayload::DetectionsFrame(
-                        to_wire(msg),
-                    ));
+            let frame = tokio::select! {
+                r = rx.recv() => r.map(to_wire),
+                r = pose_rx.recv() => r.map(pose_to_wire),
+            };
+            match frame {
+                Ok(frame) => {
+                    let body =
+                        MessageBody::CameraAdminBody(CameraAdminPayload::DetectionsFrame(frame));
                     // Receiver closed (client cancelled / disconnected) → stop
                     // draining the bus so the broadcast ring can be reclaimed.
                     if push_chunk_async(&sub, body).await.is_err() {
@@ -249,7 +282,7 @@ fn camera_detections_subscribe_handler(
                 // skipped frame is irrelevant — the next one overwrites it.
                 // Never block, never end the stream on lag.
                 Err(RecvError::Lagged(_)) => continue,
-                // The sender is process-wide and never closes for a healthy
+                // The senders are process-wide and never close for a healthy
                 // node, but handle it defensively.
                 Err(RecvError::Closed) => break,
             }
@@ -308,6 +341,31 @@ mod tests {
         // No env set in the default test process → stub stays off.
         std::env::remove_var(STUB_ENV);
         assert!(!detection_stub_enabled());
+    }
+
+    #[test]
+    fn pose_to_wire_tags_the_frame_and_keeps_keypoints_and_label() {
+        let msg = PoseMessage {
+            camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
+            ts_ms: 1_700_000_000_500,
+            pts_ns: Some(96_733_000_000_000),
+            proc_ms: 7,
+            items: vec![crate::services::detection_bus::PoseItem {
+                klasa: "pose",
+                bbox: [0.1, 0.2, 0.3, 0.6],
+                score: 0.8,
+                keypoints: vec![[0.2, 0.25, 0.9]; 17],
+                label: Some("wave".into()),
+            }],
+        };
+        let frame = pose_to_wire(msg);
+        assert_eq!(frame.source, "pose");
+        assert_eq!(frame.pts_ns, Some(96_733_000_000_000));
+        assert_eq!(frame.proc_ms, 7);
+        assert_eq!(frame.items.len(), 1);
+        assert_eq!(frame.items[0].klasa, "pose");
+        assert_eq!(frame.items[0].keypoints.len(), 17);
+        assert_eq!(frame.items[0].tekst.as_deref(), Some("wave"));
     }
 
     #[test]

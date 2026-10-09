@@ -3884,6 +3884,17 @@
     "install_singleton_done": "Aplicación de instancia única — ya instalada",
     "install_done": "Instancia «{name}» instalada",
     "install_failed": "Instalación fallida",
+    "install_steps": {
+      "title": "Terminar la configuración de {name}",
+      "intro": "La instancia está instalada. Estos pasos la comprueban o la preparan; cada uno puede ejecutarse de nuevo.",
+      "run": "Ejecutar",
+      "run_again": "Ejecutar de nuevo",
+      "retry": "Reintentar",
+      "run_all": "Ejecutar todos los pasos",
+      "finish": "Terminar",
+      "field_required": "El campo «{field}» es obligatorio",
+      "closed_incomplete": "{name} está instalada, pero {count} {count|paso de configuración no se ha superado|pasos de configuración no se han superado}."
+    },
     "instance_name": "Nombre de la instancia",
     "instance_name_hint": "Este paquete admite varias instancias, cada una con sus propios datos y su propia matriz de permisos.",
     "instance_name_required": "Introduce el nombre de la instancia",
@@ -5435,7 +5446,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Laboratorio cuántico: cuadernos, circuitos, simulación y QPU reales"
+      "desc": "Laboratorio cuántico: cuadernos, circuitos, simulación y QPU reales",
+      "install": {
+        "bell_test": {
+          "title": "Prueba de Bell",
+          "desc": "Ejecuta un circuito de Bell de dos cúbits en el simulador de este nodo y comprueba que solo se miden 00 y 11."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",
@@ -10114,7 +10131,13 @@
       "dlq_record_handled": "Este mensaje ya se reintentó o descartó — actualice la lista.",
       "dlq_retry_deduplicated": "El topic entrega un mensaje una vez por ventana y este ya se entregó en ella: podrá reintentarse cuando pase la ventana. El mensaje sigue en la lista.",
       "dlq_retry_source_not_leader": "Este node no dirige la partición del topic a la que vuelve el mensaje: reinténtalo en el node que la dirige.",
-      "dlq_retry_requarantine_failed": "El patrón del topic volvió a rechazar el mensaje y su nueva copia no pudo guardarse entre los no procesados: el mensaje sigue en la lista."
+      "dlq_retry_requarantine_failed": "El patrón del topic volvió a rechazar el mensaje y su nueva copia no pudo guardarse entre los no procesados: el mensaje sigue en la lista.",
+      "key_needs_topic_wide_rule": "Una clave no puede leer ni enviar los mensajes de este topic hasta que el topic tenga una regla de ocultación de datos para todos — las reglas solo para personas concretas no cubren las claves.",
+      "subject_is_addon": "Este identificador pertenece a un addon, no a un usuario. Quita esta entrada y concede acceso al addon (A quién: Addon).",
+      "subject_not_found": "No se encontró esta persona, clave o addon: puede que se haya eliminado o que no pertenezca a esta organización. Actualiza la página.",
+      "org_mismatch": "Un derecho sobre un topic solo se puede conceder desde su propia organización.",
+      "record_not_found": "Esta partición no tiene ningún mensaje con ese número.",
+      "field_policy_changed": "La regla cambió mientras tanto, así que no se guardó nada. Actualiza la lista de reglas y vuelve a hacer el cambio."
     },
     "shell": {
       "instance": "Instancia",
@@ -10322,7 +10345,7 @@
       "version": {
         "title": "Nueva versión del patrón {name}",
         "text_label": "Texto del patrón — versión {version}",
-        "draft_kept": "Es el texto del intento anterior, que el servidor no aceptó. Corrígelo o cambia antes la compatibilidad del patrón.",
+        "draft_kept": "Es el texto de la última vez que se abrió esta ventana: no se añadió como versión.",
         "diff": "Diferencia con la versión {version}: {changes}.",
         "diff_added_optional": "campo nuevo y opcional «{field}»",
         "diff_added_required": "campo nuevo y obligatorio «{field}»",
@@ -10343,7 +10366,8 @@
         "added_text_unused": "Ningún topic usa todavía este patrón.",
         "same_title": "No se añadió ninguna versión nueva",
         "same_text": "La versión {version} ya tiene el mismo texto. No cambió nada.",
-        "load_failed": "No se pudo cargar el texto de la versión {version}."
+        "load_failed": "No se pudo cargar el texto de la versión {version}.",
+        "discard_kept": "Esta versión aún no se ha añadido. El texto se conserva y vuelve cuando abras otra vez esta ventana. Cierra la ventana otra vez o vuelve a editar."
       },
       "incompat": {
         "lead": "Este patrón tiene la compatibilidad «{compat}», y {reason}.",
@@ -10589,7 +10613,8 @@
         "kept_keys": "Se conservan: las claves API de sistemas externos; pertenecen a la instancia y a la organización y solo pierden sus derechos sobre este tópico.",
         "retype": "Escribe el nombre del tópico para confirmar:",
         "confirm": "Eliminar el tópico {name}",
-        "lost_empty_partitions": "{count} {n|partición vacía|particiones vacías|particiones vacías}"
+        "lost_empty_partitions": "{count} {n|partición vacía|particiones vacías|particiones vacías}",
+        "lost_rules_unknown": "No se pudieron contar las reglas de ocultación de datos de este topic; si tiene alguna, también se eliminará."
       },
       "preview": {
         "title": "Vista previa de mensajes — {topic}",
@@ -10631,6 +10656,8 @@
       "section": {
         "state": "Estado",
         "settings": "Ajustes",
+        "access": "Acceso",
+        "hiding": "Ocultar datos",
         "partitions": "Particiones y copias",
         "dlq": "Sin procesar"
       },
@@ -10664,7 +10691,8 @@
         "consumers_none": "Ningún consumidor lee todavía este topic.",
         "consumer_running": "en marcha",
         "consumer_paused": "en pausa",
-        "consumer_waiting": "{count} en espera"
+        "consumer_waiting": "{count} en espera",
+        "consumer_key_gone": "la clave ya no existe — aquí no lee nadie"
       }
     },
     "settings": {
@@ -10945,7 +10973,12 @@
         "auto_after_success": "Tras procesarlo con éxito",
         "explicit": "El programa avisa cuando termina",
         "at_most_once": "En cuanto se lee"
-      }
+      },
+      "key_group": "Clave {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Clave eliminada",
+      "key_sub": "Receptor de la clave de un sistema externo",
+      "key_gone_sub": "La clave ya no existe — aquí no lee nadie"
     },
     "consumer": {
       "back": "Todos los receptores",
@@ -11181,6 +11214,476 @@
         "done_title": "Mensaje descartado",
         "done_text": "{what} salió de los mensajes sin procesar."
       }
+    },
+    "access": {
+      "subjects_title": "Personas, grupos y addons",
+      "explain": "Lectura — obtener mensajes. Escritura — enviar mensajes. Administración — cambiar los ajustes, el acceso y la ocultación de datos de este topic.",
+      "col_who": "Quién",
+      "right_title": {
+        "read": "Lectura",
+        "write": "Escritura",
+        "admin": "Administración"
+      },
+      "right_hint": {
+        "read": "obtener mensajes",
+        "write": "enviar mensajes",
+        "admin": "ajustes, acceso y ocultación de datos"
+      },
+      "right": {
+        "read": "lectura",
+        "write": "escritura",
+        "admin": "administración"
+      },
+      "about": {
+        "read": "la lectura",
+        "write": "la escritura",
+        "admin": "la administración"
+      },
+      "can": {
+        "read": "leer mensajes",
+        "write": "enviar mensajes",
+        "admin": "cambiar los ajustes, el acceso y la ocultación de datos"
+      },
+      "allowed": "permitido",
+      "denied": "prohibido",
+      "not_set": "sin definir",
+      "not_set_title": "Sin definir aquí — decide el rol en la organización.",
+      "legend": "— sin definir aquí: decide el rol en la organización. «Prohibido» gana a «permitido» de un grupo.",
+      "kind": {
+        "user": "Usuario",
+        "group": "Grupo",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|persona|personas}",
+      "unknown_subject": "Persona, grupo o addon desconocido",
+      "unknown_sub": "{kind} · identificador {id}",
+      "empty_title": "Aquí nadie tiene todavía una entrada",
+      "empty_text": "El acceso a este topic lo decide el rol en la organización. Concede acceso para permitir o prohibir a personas, grupos o addons concretos.",
+      "rights_label": "Derechos en el topic {topic}",
+      "level": {
+        "allow": "Permitir",
+        "deny": "Prohibir",
+        "unset": "No definir"
+      },
+      "grant": {
+        "button": "Conceder acceso",
+        "window_title": "Conceder acceso — {topic}",
+        "who": "A quién",
+        "search": "Buscar por nombre",
+        "pick": {
+          "user": "Qué usuario",
+          "group": "Qué grupo",
+          "addon": "Qué addon"
+        },
+        "pick_hint": {
+          "user": "La lista muestra los usuarios que aún no tienen entrada.",
+          "group": "La lista muestra los grupos que aún no tienen entrada.",
+          "addon": "La lista muestra los addons con acceso a esta instancia que aún no tienen entrada."
+        },
+        "none": {
+          "user": "Todos los usuarios de la organización ya tienen una entrada en este topic.",
+          "group": "Todos los grupos de la organización ya tienen una entrada en este topic (o la organización no tiene grupos).",
+          "addon": "No hay ningún addon con acceso a esta instancia sin entrada en este topic."
+        },
+        "none_found": "Nada coincide con el nombre escrito, o la coincidencia ya tiene entrada.",
+        "truncated": "Se muestran los 50 primeros — escribe parte del nombre para acotar la lista.",
+        "group_option": "{name} ({count} {n|persona|personas})",
+        "pick_first": "Elige a quién conceder acceso.",
+        "pick_right": "Define al menos un derecho: permitir o prohibir.",
+        "impact_group": "{count} {n|persona del grupo|personas del grupo} {name} {n|podrá|podrán} {doing} en el topic {topic}.",
+        "impact_group_plain": "El grupo «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_user": "El usuario «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_addon": "El addon «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_deny": "Prohibido para «{name}»: {rights} — gana al rol en la organización y al permiso de un grupo.",
+        "impact_unset": "Sobre {rights} decidirá el rol en la organización.",
+        "saved_title": "Acceso concedido"
+      },
+      "change": {
+        "button": "Cambiar",
+        "window_title": "Cambiar acceso — {name}",
+        "impact_line": "{right} para «{name}» pasará de «{from}» a «{to}».",
+        "impact_role": {
+          "read": "Decidirá el rol en la organización.",
+          "write": "Decidirá el rol en la organización.",
+          "admin": "Decidirá el rol en la organización."
+        },
+        "impact_rest": "Los demás derechos no cambian.",
+        "saved_title": "Guardado",
+        "impact_allow": "Se podrá {doing}.",
+        "impact_deny": "No se podrá {doing}, aunque lo permita el rol en la organización."
+      },
+      "remove": {
+        "button": "Quitar",
+        "window_title": "Quitar acceso — {name}",
+        "lead": "{name} perderá la entrada en este topic: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Quitar «prohibido» puede dar estos derechos si el rol en la organización los permite.",
+        "impact_title": "Qué pasará al quitar:",
+        "impact": "el acceso al topic {topic} lo decidirá el rol en la organización.",
+        "confirm": "Quitar entrada",
+        "saved_title": "Entrada quitada",
+        "saved_text": "{name} ya no tiene entrada en este topic; el acceso lo decide el rol en la organización."
+      },
+      "keys": {
+        "title": "Sistemas externos (claves API)",
+        "sub": "La clave funciona en la instancia {instance} y la organización {org}. Los derechos sobre los patrones de mensajes abarcan toda la instancia, no solo este topic.",
+        "sub_reader": "La clave funciona en la instancia {instance} y la organización {org}. Aquí se ven los derechos de las claves sobre los mensajes de este topic; los derechos sobre patrones y el último uso los ve el administrador del servidor.",
+        "site_admin_only": "Las claves las emite el administrador del servidor.",
+        "col_system": "Sistema",
+        "col_rights": "Derechos",
+        "col_used": "Último uso",
+        "kind": "Clave API",
+        "empty": "Ningún sistema externo tiene todavía una clave con derechos sobre este topic.",
+        "never": "todavía no",
+        "just_now": "hace un momento",
+        "org_unknown": "sin nombre",
+        "right": {
+          "readMessages": "Lee mensajes",
+          "writeMessages": "Envía mensajes",
+          "readSchemas": "Lee patrones",
+          "writeSchemas": "Añade patrones"
+        },
+        "right_hint": {
+          "readMessages": "Obtiene mensajes del topic {topic}.",
+          "writeMessages": "Escribe mensajes nuevos en el topic {topic}.",
+          "readSchemas": "Obtiene patrones y sus versiones (toda la instancia).",
+          "writeSchemas": "Añade patrones y versiones, retira versiones, cambia la compatibilidad. No incluye la lectura."
+        },
+        "issue": {
+          "button": "Emitir clave",
+          "window_title": "Emitir una clave para un sistema externo",
+          "name_label": "Nombre del sistema",
+          "name_hint": "Nombre visible en la lista de claves y en el registro de auditoría.",
+          "name_first": "Escribe el nombre del sistema.",
+          "name_too_long": "El nombre puede tener como máximo {max} caracteres.",
+          "right_first": "Marca al menos un derecho.",
+          "impact": "{name} recibirá una clave con los derechos: {rights} (topic {topic}). La clave solo la verás una vez.",
+          "saved_title": "Clave emitida",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Clave para el sistema «{name}»",
+          "once": "Copia la clave ahora. Después no se podrá ver — habría que emitir una nueva.",
+          "k_key": "Clave",
+          "k_system": "Sistema",
+          "k_instance": "Instancia",
+          "k_rights": "Derechos",
+          "k_address": "Dirección para el sistema",
+          "topic": "topic {topic}",
+          "how": "El sistema envía la clave en la cabecera «Authorization: Bearer …». Envía mensajes con POST a esta dirección y los lee con GET añadiendo el parámetro group={group} (o {group}.nombre si leen varios programas independientes).",
+          "copy_key": "Copiar clave",
+          "copy_url": "Copiar dirección para el sistema",
+          "done": "Listo",
+          "copied_key": "Clave copiada.",
+          "copied_url": "Dirección copiada.",
+          "copy_failed": "El navegador no permitió copiar — selecciona el texto y cópialo a mano.",
+          "developer": "Para el programador",
+          "copy_group": "Copiar nombre del receptor",
+          "copied_group": "Nombre del receptor copiado.",
+          "close_confirm": "La clave ya no se podrá ver. Cópiala ahora o cierra la ventana otra vez."
+        },
+        "rights": {
+          "window_title": "Derechos de la clave — {name}",
+          "impact_added": "{name} obtendrá los derechos: {rights}.",
+          "impact_removed": "{name} perderá los derechos: {rights}.",
+          "impact_none": "La clave no tendrá derechos sobre este topic ni sobre los patrones de esta instancia y desaparecerá de esta lista, pero seguirá existiendo.",
+          "impact_rest": "Los demás derechos no cambian; la clave en sí no cambia.",
+          "saved_title": "Derechos de la clave guardados"
+        },
+        "revoke": {
+          "button": "Revocar",
+          "window_title": "Revocar clave — {name}",
+          "lead": "No se puede deshacer — habría que emitir una clave nueva.",
+          "impact_title": "Qué pasará al revocar:",
+          "impact": "La clave dejará de funcionar de inmediato. {name} perderá los derechos: {rights}.",
+          "impact_other": "También {n|dejará|dejarán} de funcionar {count} {n|derecho más|derechos más} de esta clave fuera de este topic.",
+          "audit": "La revocación quedará registrada en el registro de auditoría.",
+          "saved_title": "Clave revocada",
+          "saved_text": "{name} ya no puede conectarse a TentaBus."
+        },
+        "gone": "Clave eliminada",
+        "gone_sub": "La clave ya no existe — estos derechos no hacen nada.",
+        "clear": {
+          "button": "Quitar derechos",
+          "window_title": "Quitar los derechos de una clave eliminada",
+          "lead": "La clave a la que pertenecen estos derechos ya no existe, así que nadie puede usarlos. Quedan de datos anteriores.",
+          "impact": "desaparecerán las entradas de la clave eliminada en el topic {topic}.",
+          "saved_title": "Derechos quitados",
+          "saved_text": "Los derechos de la clave eliminada ya no están en la lista."
+        }
+      }
+    },
+    "hiding": {
+      "everyone": "Todos",
+      "everyone_sub": "Cualquiera sin una regla propia ni de su grupo",
+      "and_more": "y {count} {n|campo más|campos más}",
+      "action": {
+        "show": "Mostrar",
+        "hide": "Ocultar"
+      },
+      "write": {
+        "allow": "Permitido",
+        "require": "Obligatorio",
+        "forbid": "No permitido"
+      },
+      "direction": {
+        "read": "Lectura",
+        "write": "Escritura"
+      },
+      "direction_of": {
+        "read": "lectura",
+        "write": "escritura"
+      },
+      "direction_do": {
+        "read": "leer",
+        "write": "escribir en"
+      },
+      "title": "Reglas para ocultar datos",
+      "explain": "Ocultar datos decide qué campos de un mensaje ve o puede escribir una persona, un grupo o un addon. El mensaje guardado se conserva entero.",
+      "col_who": "Quién",
+      "col_what": "Ve de otra forma",
+      "col_when": "Cuándo",
+      "col_changed": "Modificado",
+      "empty_title": "Este topic no tiene reglas para ocultar datos",
+      "empty_text": "Cualquiera que pueda leer este topic ve los mensajes completos. Añade una regla para ocultar campos concretos.",
+      "blocked_title": "Las reglas de este topic no se editan aquí",
+      "blocked_text": "Las reglas de este topic no se editan en esta pantalla porque su contenido es binario y no se puede leer como campos. Esta pantalla funciona con mensajes JSON, XML y HL7 v2. El tipo de contenido se fija al crear el topic.",
+      "keys_closed": "Los sistemas externos con clave de API tienen cerrado este topic para {directions}: solo hay reglas para personas, grupos o addons elegidos y ninguna para todos.",
+      "sees_only": "Ve solo: {fields}",
+      "sees_nothing": "No ve ningún campo",
+      "hides_none": "No oculta ninguno de los campos conocidos",
+      "writes_only": "Solo puede escribir: {fields}",
+      "writes_nothing": "No puede escribir ningún campo",
+      "writes_all": "Acepta todos los campos conocidos",
+      "legend": {
+        "hide": "El campo desaparece del mensaje.",
+        "reject_name": "Rechazar el mensaje",
+        "reject": "Al escribir: un mensaje con un campo no permitido, o sin uno obligatorio, no llega al topic.",
+        "precedence": "La regla de una persona gana a la de su grupo, y esta a la de todos — las reglas no se suman."
+      },
+      "field_problem": {
+        "empty": "Escribe el nombre de un campo.",
+        "hl7_msh": "{name} contiene los separadores del propio mensaje — no se puede ocultar. Elige otro campo.",
+        "hl7_shape": "«{name}» no es una dirección de campo HL7. Una dirección tiene la forma SEGMENTO-número, p. ej. PID-5.",
+        "xml_name": "«{name}» no es un nombre de elemento XML. Un nombre empieza por una letra o _ y no tiene espacios.",
+        "hl7_case": "«{name}» parece una errata. ¿Querías decir {suggestion}? La dirección se escribe en mayúsculas y con guion.",
+        "typed_known": "«{name}» está en la lista de campos con un ajuste distinto al escrito abajo. Déjalo en un solo sitio."
+      },
+      "need": {
+        "read": "Pon al menos un campo en «Ocultar». La lista contiene todos los campos de este topic, así que una regla que los muestra todos no cambia nada: para detenerla, elimínala.",
+        "read_typed": "Escribe al menos un campo que siga visible. Sin ningún campo visible, la regla ocultaría todo el mensaje.",
+        "write": "Pon al menos un campo en «Obligatorio» o «No permitido». La lista contiene todos los campos de este topic, así que una regla que lo permite todo no comprueba nada: para detenerla, elimínala.",
+        "write_typed": "Escribe al menos un campo que se pueda escribir. Sin ningún campo permitido, la regla rechazaría todos los mensajes."
+      },
+      "impact": {
+        "read_only": "Para {who} solo serán visibles estos campos: {fields}. Todos los demás quedarán ocultos.",
+        "read_hidden": "Para {who} desaparecerán de los mensajes estos campos: {fields}.",
+        "read_shown": "Para {who} aparecerán en los mensajes estos campos: {fields}.",
+        "rest": "Los demás campos de la lista no cambian.",
+        "read_unlisted": "Los campos que no están en la lista también desaparecen, salvo que los añadas.",
+        "write_only": "Un mensaje de {whoFrom} solo se acepta con los campos: {fields}. Un mensaje con cualquier otro campo se rechaza.",
+        "write_forbidden": "Un mensaje de {whoFrom} que contenga alguno de los campos {fields} se rechaza y no llega al topic.",
+        "write_required": "Un mensaje de {whoFrom} al que le falte alguno de los campos {fields} se rechaza y no llega al topic.",
+        "write_rest": "Se rechaza el mensaje entero, no solo el campo.",
+        "write_unlisted": "Un mensaje con un campo que no está en la lista también se rechaza, salvo que añadas ese campo.",
+        "keys_closed": "Los sistemas externos con clave de API no podrán {action} este topic hasta que añadas una regla para todos.",
+        "read_unlisted_only": "Para {who}, los campos que no están en la lista desaparecen. Todos los campos de la lista siguen visibles.",
+        "write_unlisted_only": "De {whoFrom} solo se acepta un mensaje con los campos de la lista. Un mensaje con cualquier otro campo se rechaza.",
+        "write_accepted": "Se aceptan los mensajes de {whoFrom} con los campos {fields}.",
+        "write_not_required": "Ya no se exigen estos campos a {whoFrom}: {fields}.",
+        "write_unlisted_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que añadas su dirección.",
+        "write_unlisted_hl7_saved": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento se rechaza.",
+        "write_unlisted_only_hl7": "Se aceptan los mensajes de {whoFrom} con los segmentos de la lista, también en sus demás posiciones (p. ej. PID-4, PV1-1). Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza.",
+        "read_unlisted_saved": "Los campos que no están en la lista también desaparecen.",
+        "write_unlisted_saved": "Un mensaje con un campo fuera de la lista también se rechaza."
+      },
+      "fields_label": "Campos",
+      "source": {
+        "schema": "Los campos proceden del patrón de mensaje {name}, versión {version}.",
+        "dictionary": "La lista contiene los campos HL7 v2 más habituales. Añade otro campo más abajo escribiendo su dirección.",
+        "failed": "No se pudo leer el patrón de mensaje de este topic, así que no se conocen sus campos. Escribe abajo los campos que siguen visibles.",
+        "manual": "No se conocen los campos de este topic: ningún patrón de mensaje los enumera. Escribe abajo los campos que siguen visibles.",
+        "complex": "El patrón de mensaje de este topic contiene campos que no se pueden enumerar a partir de él (una referencia a otro archivo o nombres de campo libres), así que no se conoce la lista completa. Escribe abajo los campos que siguen visibles."
+      },
+      "extra": {
+        "shown": "Otros campos que siguen visibles",
+        "shown_typed": "Campos que siguen visibles",
+        "allowed": "Otros campos que se pueden escribir",
+        "allowed_typed": "Campos que se pueden escribir",
+        "required": "Campos obligatorios",
+        "hint_hl7": "Escribe una dirección de campo, p. ej. PID-5, y pulsa Intro.",
+        "hint_xml": "Escribe un nombre de elemento, p. ej. patient, y pulsa Intro.",
+        "hint_json": "Escribe un nombre de campo, p. ej. patient, y pulsa Intro."
+      },
+      "unlisted": {
+        "read": "Los campos que no están en la lista también se ocultan (incluso los que aparezcan más tarde), salvo que los escribas abajo.",
+        "write": "Un mensaje con un campo fuera de la lista se rechaza, salvo que escribas ese campo abajo.",
+        "write_hl7": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza, salvo que escribas su dirección abajo."
+      },
+      "add": {
+        "button": "Añadir una regla",
+        "window_title": "Nueva regla para ocultar datos — {topic}",
+        "save": "Guardar la regla",
+        "who": "Para quién",
+        "when": "Cuándo se aplica",
+        "any_hint": "La regla para todos se aplica a quien no tiene regla propia ni regla de su grupo. Los sistemas con clave de API solo están sujetos a esta regla.",
+        "any_taken": "Ya existe una regla para todos de {direction}: cámbiala en su fila.",
+        "none_free": "Todos los de esta lista ya tienen una regla así en este topic.",
+        "pick_hint": "La lista muestra personas, grupos o addons que aún no tienen una regla así.",
+        "pick_first": "Elige para quién es la regla.",
+        "taken": "Esta persona, grupo o addon ya tiene una regla de {direction}: cámbiala en su fila.",
+        "saved_title": "Regla guardada",
+        "search": "Buscar en la lista",
+        "choose": "Elegir…",
+        "none_exist": {
+          "group": "Esta organización aún no tiene ningún grupo.",
+          "user": "Esta organización no tiene usuarios.",
+          "addon": "Ningún addon tiene acceso a esta instancia."
+        }
+      },
+      "change": {
+        "button": "Cambiar",
+        "window_title": "Regla para ocultar datos — {name}",
+        "fixed": "La regla pertenece a esta persona, grupo o addon: eso no cambia.",
+        "saved_title": "Cambio de la regla guardado"
+      },
+      "remove": {
+        "button": "Eliminar",
+        "window_title": "Eliminar la regla para ocultar datos — {name}",
+        "lead_read": "Regla de lectura para: {who}. Oculta los campos: {fields}.",
+        "lead_read_none": "Regla de lectura para: {who}. No oculta ninguno de los campos conocidos.",
+        "lead_read_only": "Regla de lectura para: {who}. Deja visibles solo estos campos: {fields}.",
+        "lead_read_nothing": "Regla de lectura para: {who}. No deja visible ningún campo.",
+        "lead_write": "Regla de escritura para: {who} — {parts}.",
+        "part_forbidden": "campos no permitidos: {fields}",
+        "part_required": "campos obligatorios: {fields}",
+        "part_only": "solo se permiten estos campos: {fields}",
+        "part_nothing": "ningún campo está permitido",
+        "part_none": "todos los campos conocidos están permitidos",
+        "impact_title": "Qué pasa tras eliminarla:",
+        "impact_any_read": "Cualquiera sin una regla de lectura propia verá los mensajes completos en el topic {topic}.",
+        "impact_any_write": "La escritura en el topic {topic} dejará de comprobarse para cualquiera sin una regla de escritura propia.",
+        "impact_keys": "Solo quedan reglas para personas, grupos o addons elegidos, así que los sistemas externos con clave de API no podrán {action} este topic.",
+        "confirm": "Eliminar la regla",
+        "saved_title": "Regla eliminada",
+        "saved_text": "Se eliminó la regla de {direction} para: {who}.",
+        "impact_read_user": "Para el usuario «{who}» en el topic {topic} pasa a aplicarse la regla de lectura de uno de sus grupos y, si ninguno la tiene, la regla para todos; si no hay ninguna, ve los mensajes completos.",
+        "impact_read_group": "Las personas del grupo «{who}» leen el topic {topic} según la regla de lectura de otro de sus grupos y, si no la tienen, según la regla para todos; si no hay ninguna, ven los mensajes completos.",
+        "impact_read_addon": "El addon «{who}» lee el topic {topic} según la regla para todos; si no la hay, ve los mensajes completos.",
+        "impact_write_user": "Los mensajes del usuario «{who}» al topic {topic} se comprueban con la regla de escritura de uno de sus grupos y, si ninguno la tiene, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
+        "impact_write_group": "Los mensajes de las personas del grupo «{who}» al topic {topic} se comprueban con la regla de escritura de otro de sus grupos y, si no la tienen, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
+        "impact_write_addon": "Los mensajes del addon «{who}» al topic {topic} se comprueban con la regla para todos; si no la hay, no se comprueban en absoluto."
+      },
+      "preview": {
+        "button": "Vista previa de lo que ve…",
+        "window_title": "Vista previa de lo que ve… — {topic}",
+        "audit_title": "Esta vista previa se registra en el registro de auditoría.",
+        "audit_text": "Registra quién miró, cuándo, qué mensaje y como quién. Muestra un mensaje real del topic tras aplicar las reglas de lectura de la persona, grupo o addon elegido. Solo para el administrador del topic.",
+        "who": "Lo que ve",
+        "who_any": "cualquiera sin una regla propia",
+        "sees": "Así la ve: {who}",
+        "any_hint": "Verás el mensaje como lo ve alguien sin una regla propia ni de su grupo.",
+        "none": {
+          "user": "No se encontró ningún usuario.",
+          "group": "No se encontró ningún grupo.",
+          "addon": "No se encontró ningún addon con acceso a esta instancia."
+        },
+        "number_label": "Número de mensaje",
+        "show": "Mostrar",
+        "record_title": "mensaje {number} · partición {partition} · escrito {when}",
+        "hidden": "oculto",
+        "shown": "visible",
+        "rules_title": "Qué hicieron las reglas",
+        "summary_hidden": "Las reglas ocultaron {count} {n|campo|campos}: {fields}.",
+        "summary_none": "Las reglas no ocultaron ningún campo de este mensaje.",
+        "limited_title": "Esta vista previa es más estrecha que la vista de la persona, el grupo o el addon elegido",
+        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá la persona, el grupo o el addon elegido: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
+        "limited_missing": "Estos campos del patrón no aparecen en esta vista previa: {fields}. Los ocultó una regla que también se aplica a ti, o el mensaje no los tiene.",
+        "who_user": "usuario {name}",
+        "who_group": "grupo {name}",
+        "who_addon": "addon {name}",
+        "summary_limited": "No se citan los campos que ya oculta una regla que también se aplica a ti."
+      },
+      "hl7": {
+        "msh_3": "Aplicación emisora",
+        "msh_4": "Centro emisor",
+        "msh_5": "Aplicación receptora",
+        "msh_6": "Centro receptor",
+        "msh_7": "Fecha y hora del mensaje",
+        "msh_9": "Tipo de mensaje",
+        "msh_10": "Identificador del mensaje",
+        "pid_2": "ID del paciente",
+        "pid_3": "Lista de identificadores del paciente",
+        "pid_5": "Nombre del paciente",
+        "pid_6": "Apellido de soltera de la madre",
+        "pid_7": "Fecha de nacimiento",
+        "pid_8": "Sexo",
+        "pid_10": "Raza",
+        "pid_11": "Dirección del paciente",
+        "pid_13": "Teléfono del domicilio",
+        "pid_14": "Teléfono del trabajo",
+        "pid_15": "Idioma principal",
+        "pid_16": "Estado civil",
+        "pid_17": "Religión",
+        "pid_18": "Número de cuenta del paciente",
+        "pid_19": "Número de identificación nacional",
+        "pid_22": "Grupo étnico",
+        "pid_23": "Lugar de nacimiento",
+        "pid_29": "Fecha y hora del fallecimiento",
+        "pid_30": "Indicador de fallecimiento",
+        "pv1_2": "Clase de paciente",
+        "pv1_3": "Ubicación asignada al paciente",
+        "pv1_7": "Médico tratante",
+        "pv1_8": "Médico remitente",
+        "pv1_9": "Médico consultor",
+        "pv1_10": "Servicio hospitalario",
+        "pv1_17": "Médico que ingresa",
+        "pv1_19": "Número de visita",
+        "pv1_44": "Fecha y hora de ingreso",
+        "pv1_45": "Fecha y hora de alta",
+        "nk1_2": "Nombre del familiar",
+        "nk1_3": "Parentesco",
+        "nk1_4": "Dirección del familiar",
+        "nk1_5": "Teléfono del familiar",
+        "in1_2": "ID del plan de seguro",
+        "in1_3": "ID de la aseguradora",
+        "in1_4": "Nombre de la aseguradora",
+        "in1_16": "Nombre del asegurado",
+        "in1_36": "Número de póliza",
+        "orc_2": "Número de orden del solicitante",
+        "orc_12": "Profesional que ordena",
+        "obr_4": "Prueba solicitada",
+        "obr_7": "Fecha y hora de la observación",
+        "obr_16": "Profesional que ordena la prueba",
+        "obx_2": "Tipo de valor",
+        "obx_3": "Identificador de la observación",
+        "obx_5": "Valor de la observación",
+        "obx_6": "Unidades",
+        "obx_7": "Rango de referencia",
+        "obx_8": "Indicadores de anomalía",
+        "obx_11": "Estado del resultado",
+        "obx_14": "Fecha y hora del resultado",
+        "dg1_3": "Código de diagnóstico",
+        "dg1_4": "Descripción del diagnóstico",
+        "al1_3": "Alérgeno",
+        "msh_8": "Seguridad",
+        "msh_11": "ID de procesamiento",
+        "msh_12": "Versión HL7"
+      },
+      "blocked_settings": "Abrir los ajustes del topic",
+      "blocked_preview": "La vista previa no está disponible: el contenido de este topic no se puede leer como campos.",
+      "writes_rest": "Otros campos o falta un campo obligatorio: rechazar el mensaje",
+      "reads_rest": "Campos fuera de la lista: ocultar",
+      "fields_search": "Buscar campos",
+      "fields_none": "Ningún campo coincide con la búsqueda.",
+      "who": {
+        "named": "«{name}»",
+        "everyone_for": "todos",
+        "everyone_from": "todos"
+      },
+      "visible_outside": "También deja visibles: {fields}",
+      "changed_title": "No se guardó nada: la regla cambió mientras tanto",
+      "changed_text": "Alguien cambió, añadió o eliminó esta regla antes de que se guardara tu cambio, así que no se sobrescribió nada. La tabla muestra las reglas tal como están ahora; si aún quieres el cambio, hazlo de nuevo."
     }
   },
   "composer": {
@@ -11261,7 +11764,11 @@
       "not_found": "Laboratorio no disponible",
       "not_found_sub": "Esta instancia no existe, o la matriz de permisos no te da acceso.",
       "load_failed": "No se pudo cargar el panel del laboratorio",
-      "tab_runs": "Ejecuciones"
+      "tab_runs": "Ejecuciones",
+      "tab_course": "Curso",
+      "tab_devices": "Dispositivos",
+      "tab_examples": "Ejemplos",
+      "tab_settings": "Ajustes"
     },
     "dash": {
       "kpi_my_projects": "Mis proyectos",
@@ -11967,6 +12474,160 @@
       "before": "antes de la primera puerta",
       "empty": "sin evolución grabada",
       "step": "paso"
+    },
+    "course": {
+      "load_failed": "No se pudo cargar el curso",
+      "kata_load_failed": "No se pudo cargar la tarea",
+      "submit_failed": "No se pudo comprobar la solución",
+      "kpi_progress": "Progreso del curso",
+      "progress_value": "{done} / {total} {total|kata|katas}",
+      "kpi_progress_delta": "{percent} % del curso",
+      "kpi_points": "Puntos",
+      "kpi_points_delta": "de {max} posibles",
+      "kpi_position": "Posición en el laboratorio",
+      "position_value": "{position} / {total}",
+      "kpi_position_delta": "{n} {n|persona|personas} en el ranking",
+      "kpi_position_none": "Supera tu primer kata para entrar en el ranking",
+      "group_complete": "completado",
+      "group_current": "en curso",
+      "group_locked": "tras «{group}»",
+      "group_count": "{done} / {total}",
+      "status_passed": "superada",
+      "status_attempted": "intentada",
+      "status_open": "pendiente",
+      "status_locked": "bloqueada",
+      "kata_heading": "Kata {n} · {title}",
+      "kata_meta": "{group} · {n} de {total}",
+      "points_value": "{n} pts",
+      "attempts": "{n} {n|intento|intentos}",
+      "task_title": "Tarea",
+      "code_title": "Tu solución (OpenQASM 3)",
+      "code_hint": "Core lo comprueba con el simulador nativo: el resultado es determinista.",
+      "action_check": "Comprobar",
+      "action_reset": "Restaurar la plantilla",
+      "action_next": "Siguiente kata: {title}",
+      "run_required": "Comprobar una respuesta requiere el permiso quant.run.",
+      "result_passed": "¡Superado! +{n} pts",
+      "result_passed_again": "Superado de nuevo: ya tienes los puntos de este kata",
+      "result_failed": "Todavía no",
+      "result_invalid": "El programa no es válido",
+      "diagnostic_at": "línea {line}: {message}",
+      "reason_mismatch": "El estado final o la matriz difiere de lo esperado.",
+      "reason_above_threshold": "La distribución de resultados se aleja de la esperada más de lo que permite el umbral.",
+      "reason_unexpected_outcomes": "Aparecieron resultados que una solución correcta nunca produce.",
+      "reason_qubit_count": "El circuito tiene {got} {got|cúbit|cúbits}; la tarea pide {expected} {expected|cúbit|cúbits}.",
+      "reason_clbit_count": "La tarea mide {expected} {expected|bit|bits}: declara un registro clásico de ese tamaño.",
+      "reason_not_unitary": "Esta tarea compara el estado o la matriz del circuito: quita mediciones, reinicios y condiciones clásicas.",
+      "reason_no_measurement": "Mide los cúbits en un registro clásico: esta tarea evalúa la distribución de resultados.",
+      "metric_fidelity": "Fidelidad del estado {value} (requerida {threshold})",
+      "metric_process_fidelity": "Fidelidad del proceso {value} (requerida {threshold})",
+      "metric_tvd": "TVD respecto al ideal {value} (umbral {threshold})",
+      "run_info": "{shots} {shots|disparo|disparos} en {ms} ms",
+      "ranking_title": "Ranking del laboratorio",
+      "ranking_sub": "Top {n} de {total} {total|persona|personas} · puntos de katas",
+      "ranking_you": "tú",
+      "ranking_empty": "Nadie ha superado un kata todavía",
+      "ranking_empty_sub": "El primer kata superado coloca a una persona en el ranking.",
+      "ranking_off": "El ranking está desactivado",
+      "ranking_off_sub": "Un supervisor desactivó el ranking del curso. Tus puntos y tu progreso se siguen guardando.",
+      "ranking_load_failed": "No se pudo cargar el ranking"
+    },
+    "devices": {
+      "browser_title": "Navegador (WASM)",
+      "browser_sub": "El mismo simulador en wasm32, en tu equipo",
+      "core_sub": "Nativo en Core: vector de estado en Rust",
+      "empty": "El laboratorio no informa de ningún destino de ejecución",
+      "kpi_available": "Destinos disponibles",
+      "kpi_available_value": "{n} de {total}",
+      "kpi_widest": "Registro más ancho",
+      "kpi_nodes": "Nodos con Core (T1)",
+      "qubits_value": "{n} {n|cúbit|cúbits}",
+      "state_available": "disponible",
+      "state_unavailable": "no disponible",
+      "where_browser": "este equipo",
+      "where_this_node": "el nodo al que estás conectado",
+      "where_other_node": "otro nodo de la flota",
+      "row_where": "Se ejecuta en",
+      "row_max_qubits": "Máx. cúbits",
+      "row_precision": "Precisión",
+      "row_memory": "Memoria de estado en el límite",
+      "auto_title": "La regla device=\"auto\"",
+      "auto_sub": "Pregunta a Core adónde iría una ejecución de cierto ancho, con la misma regla que usan el Studio, un cuaderno y el SDK.",
+      "probe_qubits": "Número de cúbits",
+      "probe_dec": "Menos cúbits",
+      "probe_inc": "Más cúbits",
+      "probe_browser": "Pregunto desde el navegador",
+      "probe_browser_sub": "El navegador podría calcular el circuito él mismo (T0).",
+      "probe_kernel": "Una celda de Python",
+      "probe_kernel_sub": "Necesita un kernel, así que el navegador solo no basta.",
+      "probe_failed": "No se pudo consultar la regla",
+      "skipped": "{tier}: {reason}",
+      "missing_title": "Niveles que esta versión no tiene",
+      "missing_sub": "No son dispositivos entre los que elegir. Se indica el motivo para que un circuito grande no busque un lugar que no existe."
+    },
+    "settings": {
+      "load_failed": "No se pudieron cargar los ajustes",
+      "save": "Guardar",
+      "saved": "Ajustes guardados",
+      "save_failed": "No se pudieron guardar los ajustes",
+      "ranking_title": "Curso",
+      "ranking_name": "Clasificación del laboratorio",
+      "ranking_sub": "Las personas ven el top cinco y su propio puesto. Al desactivarla, la clasificación desaparece de la pestaña Curso; los katas aprobados y los puntos se conservan.",
+      "limits_title": "Límites del laboratorio",
+      "limits_sub": "Core aplica estos números: el rango de los destinos de la pestaña Dispositivos y cuántas ejecuciones se calculan a la vez. Todos los leen, un administrador los cambia.",
+      "limits_admin_only": "Los límites los cambia quien tenga quant.admin.",
+      "limit_maxQubitsBrowser": "Cúbits en el navegador (T0)",
+      "limit_maxQubitsBrowser_hint": "El registro más ancho que acepta el navegador cuando lo eliges explícitamente.",
+      "limit_maxQubitsCore": "Cúbits en Core (T1)",
+      "limit_maxQubitsCore_hint": "No más de lo que admite el simulador de esta versión; Core responderá si introduces demasiado.",
+      "limit_maxConcurrentCoreRuns": "Ejecuciones simultáneas en Core",
+      "limit_maxConcurrentCoreRuns_hint": "Cuántas ejecuciones T1 calcula el laboratorio a la vez en un nodo; el resto espera en cola. Cada una mantiene un vector de estado completo.",
+      "limit_dec": "Disminuir",
+      "limit_inc": "Aumentar",
+      "access_title": "Acceso",
+      "access_sub": "La matriz de permisos es aquí de solo lectura. Se edita en Addons, junto con la visibilidad del laboratorio.",
+      "access_edit": "Editar en Addons",
+      "access_you": "Tu rol",
+      "col_person": "Persona",
+      "col_role": "Rol",
+      "col_permissions": "Permisos",
+      "people_empty": "La matriz no admite a nadie",
+      "people_footer": "{n} {n|persona|personas} con acceso",
+      "people_roles": "administradores: {admin} · tutores: {supervisor} · usuarios: {user} · observadores: {observer}",
+      "people_failed": "No se pudo cargar la lista de personas",
+      "people_supervisor_only": "La lista de personas la ve un tutor (quant.instruct)."
+    },
+    "examples": {
+      "load_failed": "No se pudieron cargar los ejemplos",
+      "search_placeholder": "Buscar ejemplos…",
+      "level_all": "Cualquier nivel",
+      "level_intro": "Principiante",
+      "level_core": "Intermedio",
+      "level_advanced": "Avanzado",
+      "empty_title": "Ningún ejemplo coincide con este filtro",
+      "empty_sub": "Cambia la búsqueda o el nivel.",
+      "footer": "Mostrando {n} de {total}",
+      "run_required": "Copiar un ejemplo a tu propio proyecto requiere el permiso quant.run.",
+      "action_preview": "Vista previa",
+      "action_fork": "Copiar a los míos",
+      "action_studio": "Abrir en el estudio",
+      "back": "Todos los ejemplos",
+      "stat_width": "Registro",
+      "stat_depth": "Profundidad",
+      "width_fixed": "{n} {n|cúbit|cúbits}",
+      "width_range": "{min}–{max} {max|cúbit|cúbits}",
+      "depth_value": "profundidad {n}",
+      "width_label": "Número de cúbits",
+      "width_hint": "De {min} a {max}. Solo cambia el ancho del registro del circuito.",
+      "width_dec": "Menos cúbits",
+      "width_inc": "Más cúbits",
+      "circuit_title": "Circuito",
+      "view_circuit": "Esquema",
+      "view_text": "Texto",
+      "expected_title": "Resultado esperado",
+      "expected_sub": "Una ejecución correcta ({shots} {shots|shot|shots}) pone sus recuentos solo en los resultados siguientes, con una TVD respecto a la teoría inferior a {tolerance}.",
+      "fork_ok": "Proyecto «{name}» creado",
+      "fork_failed": "No se pudo copiar el ejemplo"
     }
   },
   "access_keys": {
@@ -14125,5 +14786,9 @@
     "simulation_timer_pending": "Pendiente",
     "simulation_timer_fired": "Ejecutado",
     "simulation_timer_blocked": "Bloqueado"
+  },
+  "gestures": {
+    "wave": "saludo",
+    "heart": "corazón"
   }
 }

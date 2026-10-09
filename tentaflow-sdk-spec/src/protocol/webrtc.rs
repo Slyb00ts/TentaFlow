@@ -112,6 +112,10 @@ pub struct WebRtcMessage {
     pub is_text: bool,
     #[n(1)]
     pub data_b64: String,
+    /// Host wall-clock (Unix ms) when the message arrived, not when it was drained:
+    /// lets an addon time-stamp sensor data that other streams are matched against.
+    #[n(2)]
+    pub received_unix_ms: u64,
 }
 
 /// Input for `webrtc_drain_v1`.
@@ -190,6 +194,12 @@ pub struct WebRtcRegisterCameraInput {
     /// pair). `None` ⇒ core default (1.0 = no correction).
     #[n(6)]
     pub camera_depth_scale: Option<f32>,
+    /// Camera optical centre relative to the robot body origin the pose reports,
+    /// in metres, body frame (x forward, y left, z up). Without it the depth cloud
+    /// is projected from the body origin and lands offset from the lidar map by the
+    /// camera's mount distance. `None` ⇒ the camera sits at the body origin.
+    #[n(7)]
+    pub camera_mount_offset_m: Option<[f32; 3]>,
 }
 
 /// Output of `webrtc_register_camera_v1`.
@@ -229,6 +239,7 @@ mod tests {
             messages: vec![WebRtcMessage {
                 is_text: true,
                 data_b64: "aGk=".into(),
+                received_unix_ms: 1_700_000_000_123,
             }],
             dropped_count: 3,
             queue_len: 5,
@@ -247,10 +258,12 @@ mod tests {
                 WebRtcMessage {
                     is_text: true,
                     data_b64: "aGk=".into(),
+                    received_unix_ms: 1,
                 },
                 WebRtcMessage {
                     is_text: false,
                     data_b64: "AAEC".into(),
+                    received_unix_ms: 2,
                 },
             ],
             dropped_count: 7,

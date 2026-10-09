@@ -14,7 +14,7 @@
 use bytes::Bytes;
 use tentaflow_sdk_spec::{
     BaroSample, GnssFix, ImuSample, LidarFrameHeader, MagSample, PoseSample, BARO_SAMPLE_LEN,
-    GNSS_FIX_LEN, IMU_SAMPLE_LEN,
+    GNSS_FIX_LEN, IMU_SAMPLE_LEN, POSE_SAMPLE_LEN,
 };
 
 use super::{
@@ -199,6 +199,38 @@ pub fn gnss_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_l
         audit(caller.data(), "sensor.gps", "error", Some("bad_fix"));
         return ABI_ERR_OPERATION;
     }
+    ABI_OK
+}
+
+/// `robot_pose_publish_v1(in_ptr, in_len) -> i32` — one canonical `PoseSample` with a
+/// robot's own odometry pose in its map frame (the frame its LiDAR map lives in).
+/// Unlike a phone's AR pose this is trusted as-is (no AR↔ENU alignment), and it
+/// reaches the scene at the robot's own rate, so a camera frame is placed with the
+/// pose from its capture time instead of one sampled seconds earlier. Rides the
+/// `lidar.publish` grant: it is the same robot's spatial data, in the same frame.
+pub fn robot_pose_publish_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    in_ptr: i32,
+    in_len: i32,
+) -> i32 {
+    let bytes = match read_sensor_bytes(
+        &mut caller,
+        "robot.pose",
+        PERM_LIDAR_PUBLISH,
+        POSE_SAMPLE_LEN,
+        in_ptr,
+        in_len,
+    ) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    let Some(s) = PoseSample::decode(&bytes).filter(PoseSample::is_finite) else {
+        audit(caller.data(), "robot.pose", "error", Some("bad_sample"));
+        return ABI_ERR_OPERATION;
+    };
+    let position = s.position.map(f64::from);
+    let quat = s.quat_xyzw.map(f64::from);
+    SlamSceneManager::global().on_pose(&caller.data().addon_id, &position, &quat, s.timestamp_us);
     ABI_OK
 }
 

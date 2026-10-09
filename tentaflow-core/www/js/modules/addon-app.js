@@ -29,8 +29,18 @@ const TAG_SLOT_HIDE      = 0x0113;
 const TAG_STATE_SNAPSHOT = 0x0120;
 const TAG_STATE_PATCH    = 0x0121;
 const TAG_STATE_RESET    = 0x0122;
-const TAG_PATCH_REJECTED = 0x0123;
 const TAG_ACTION_ACK     = 0x0131;
+
+// How long sendAction waits for its ActionAck before forgetting the request.
+// No rollback on timeout: the store's pending-edit expiry already converges
+// the control to whatever the addon reports.
+const ACTION_ACK_TIMEOUT_MS = 30000;
+
+// ActionAck statuses that mean the action did not take effect. Anything else
+// (ok, redirected) leaves the optimistic edit to the server's echo.
+const FAILED_ACK_STATUSES = new Set([
+  'error', 'rejected', 'permission_denied', 'rate_limited', 'validation_failed',
+]);
 
 // SlotSemantics values whose content is rendered into a dynamic overlay
 // container (Modal/Drawer/Sheet/Popover) created by the overlay renderer
@@ -246,10 +256,6 @@ function handleUiMessage(cborBytes) {
     case TAG_STATE_RESET:
       if (s.store) s.store.applyReset({ panel_epoch: decoded.panelEpoch, new_revision: decoded.newRevision });
       break;
-    case TAG_PATCH_REJECTED:
-      break;
-    case TAG_ACTION_ACK:
-      break;
     default:
       break;
   }
@@ -288,12 +294,27 @@ function handlePanelShell(decoded) {
       if (!handler) return;
       if (handler.kind === 'backend' || handler.kind === 'both') {
         const params = { ...(handler.params || {}) };
-        if (dom_event && dom_event.detail && typeof dom_event.detail === 'object') {
-          Object.assign(params, dom_event.detail);
+        const detail = dom_event && dom_event.detail && typeof dom_event.detail === 'object'
+          ? dom_event.detail
+          : null;
+        if (detail) Object.assign(params, detail);
+        // A bound control's new value goes into the store before the action
+        // leaves: the addon echoes it only after handling the action, and any
+        // push in between would otherwise repaint the control with the old one.
+        const editTokens = [];
+        const edits = (dom_event && dom_event.__tfBoundEdits) || [];
+        if (_session && _session.store) {
+          for (const { path, value } of edits) {
+            try {
+              const token = _session.store.setLocalEdit(path, value);
+              if (token != null) editTokens.push(token);
+            } catch (e) {
+              console.warn('[addon-app] optimistic edit skipped:', e);
+            }
+          }
         }
-        sendAction(addon_id, panel_id, panel_epoch, handler.action_id, params);
+        sendAction(addon_id, panel_id, panel_epoch, handler.action_id, params, editTokens);
       }
-      // Local actions handled by renderer infrastructure
     },
   };
 
@@ -426,9 +447,19 @@ function stringifyWithBigInt(value) {
   });
 }
 
-async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
+// Sends a UiAction and awaits its ActionAck on the request's own correlation
+// id. A failed action (failure ack or protocol error such as an epoch
+// mismatch) drops exactly the optimistic edits it made — a newer edit of the
+// same control keeps its own token. A lost connection proves nothing about the
+// action, so it leaves the edits to the store's expiry.
+async function sendAction(addonId, panelId, panelEpoch, actionId, params, editTokens = []) {
   if (!_session) return;
   const s = _session;
+  const settleEdits = (ok) => {
+    if (editTokens.length === 0 || _session !== s || !s.store) return;
+    if (ok) s.store.ackLocalEdits(editTokens);
+    else s.store.rejectLocalEdits(editTokens);
+  };
   try {
     const client = await ApiBinary.client();
     const correlationId = client.nextCorrelationId();
@@ -443,8 +474,38 @@ async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
       BigInt(correlationId), BigInt(sequence),
       messageKind.META_HEARTBEAT, body
     );
+    const ackPromise = new Promise((resolve, reject) => {
+      const key = correlationId.toString();
+      const timer = setTimeout(() => {
+        client.pending.delete(key);
+        resolve(null);
+      }, ACTION_ACK_TIMEOUT_MS);
+      client.pending.set(key, {
+        resolve: (result) => { clearTimeout(timer); resolve(result); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      });
+    });
     client._send(frame);
     console.log('[addon-app] sendAction sent OK, corrId:', correlationId);
+    let response;
+    try {
+      response = await ackPromise;
+    } catch (e) {
+      // binary-ws-client rejects a request with `protocol error …` when the
+      // server answered with an error frame; any other rejection is transport.
+      if (String(e && e.message).startsWith('protocol error')) settleEdits(false);
+      console.warn('[addon-app] action', actionId, 'got no ack:', e);
+      return;
+    }
+    if (response == null || response.body.variant !== 'UiChannelCbor') return;
+    const ack = s.wasm.decodeUiPayload(response.body.cbor);
+    if (ack.tag !== TAG_ACTION_ACK) return;
+    if (FAILED_ACK_STATUSES.has(ack.status)) {
+      console.warn('[addon-app] action', actionId, 'failed:', ack.status);
+      settleEdits(false);
+    } else {
+      settleEdits(true);
+    }
   } catch (e) {
     console.error('[addon-app] sendAction failed:', e);
   }
@@ -464,4 +525,4 @@ function __setSessionForTest(session) {
 }
 
 export default AddonAppScreen;
-export { VIEW_ID, isOverlaySlot, handleSlotContent, stringifyWithBigInt, __setSessionForTest };
+export { VIEW_ID, isOverlaySlot, handleSlotContent, sendAction, stringifyWithBigInt, __setSessionForTest };

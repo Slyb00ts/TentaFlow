@@ -24,7 +24,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, patchKeyedList, paintStatCards, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtSince, fmtWhen, fmtDuration, contentTypeLabel } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtSince, fmtWhen, fmtDuration, contentTypeLabel, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
 import { CONSUMER_SECTIONS } from '/js/modules/tentabus/routes.js';
 import { isLagging, isPausedWithBacklog, lagWording } from '/js/modules/tentabus/alerts.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
@@ -219,6 +219,9 @@ function paintPage(body, view, ctx) {
   const live = (view.stats?.groups || []).find((g) => g.group === view.group && g.topic === view.topic) || null;
   const paused = live ? Boolean(live.paused) : Boolean(detail.paused);
 
+  const title = body.querySelector('.tb-title');
+  setText(title, consumerLabel(detail));
+  title.classList.toggle('mono', !isKeyGroup(detail));
   setText(body.querySelector('[data-role="desc"]'), consumerSubline(view.topic));
   const actions = body.querySelector('[data-role="actions"]');
   patchHtml(actions, canAdmin

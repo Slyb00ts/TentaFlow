@@ -1,7 +1,7 @@
 //! The record of a handover: what was asked, of whom, to whom and how far each
 //! item got. It is written BEFORE the first item moves, so a failure half way
 //! leaves a record the retry and the return job can finish from. Node-local
-//! (migration 180): it describes rows of stores that are not replicated.
+//! (migration 182): it describes rows of stores that are not replicated.
 
 use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension};

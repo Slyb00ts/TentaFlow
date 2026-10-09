@@ -4799,7 +4799,6 @@ mod tests {
             protocol: "iscsi".to_string(),
             wwn: "iqn.2026-09.pl.euvic:helios.vm-store".to_string(),
             enabled: true,
-            allowlist_mode: false,
             luns: vec![NasTargetLun {
                 index: 0,
                 source: "tank/vm-store".to_string(),
@@ -4841,6 +4840,7 @@ mod tests {
             created_at: "2026-09-03T12:00:00Z".to_string(),
             updated_at: "2026-09-03T12:00:00Z".to_string(),
             state_reasons: vec![NasHealthReason { code: "target_no_auth".to_string(), params: Default::default() }],
+            allowlist_mode: true,
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
             target: target.clone(),

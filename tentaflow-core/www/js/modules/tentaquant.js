@@ -9,9 +9,12 @@
 //       (`#/tentaquant?instance=…`). Membership is that matrix in Addons — this
 //       screen never edits it and never invents a members table of its own.
 //
-//       Tabs stop at Pulpit, Projekty and Runy on purpose: Urządzenia,
-//       Przykłady, Kurs and Ustawienia arrive with their backends. Nothing here
-//       renders a section whose data does not exist.
+//       Tabs are Pulpit, Projekty, Runy, Urządzenia, Przykłady, Kurs and
+//       Ustawienia (the last one for a supervisor or an admin only). Each is
+//       drawn from what Core answers today; nothing here renders a section
+//       whose data does not exist, which is why Urządzenia lists only the
+//       tiers `Target::List` returns and Ustawienia only the settings Core
+//       stores and applies.
 //
 //       A project is the second level of the same screen (`?project=…&ptab=…`):
 //       the laboratory stays in the breadcrumb and the project draws its own
@@ -30,6 +33,10 @@ import {
 } from '/js/modules/tentaquant/format.js';
 import { drawLabs } from '/js/modules/tentaquant/labs.js';
 import { drawDashboard } from '/js/modules/tentaquant/dashboard.js';
+import { courseState, drawCourse } from '/js/modules/tentaquant/course.js';
+import { drawDevices } from '/js/modules/tentaquant/devices.js';
+import { drawExamples, examplesState } from '/js/modules/tentaquant/examples.js';
+import { drawSettings, settingsAccess } from '/js/modules/tentaquant/settings.js';
 import { drawProjects } from '/js/modules/tentaquant/projects.js';
 import { openNewProjectWindow, openShareWindow, confirmDeleteProject } from '/js/modules/tentaquant/dialogs.js';
 import { PROJECT_TABS, drawProject, drawProjectTab } from '/js/modules/tentaquant/project.js';
@@ -57,7 +64,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-window.js';
 
-const TABS = ['dashboard', 'projects', 'runs'];
+const TABS = ['dashboard', 'projects', 'runs', 'devices', 'examples', 'course', 'settings'];
 
 // The catalog package one laboratory is an instance of.
 const PACKAGE_ID = 'tentaquant';
@@ -84,6 +91,13 @@ const TentaQuantScreen = {
     this.files = [];
     this.notebookId = null;
     this.studio = studioState();
+    // The open kata and the drafts of the Kurs tab; a draft survives a switch
+    // to another tab and back, because losing typed work to a tab click is the
+    // one thing a course must not do.
+    this.course = courseState({ kataId: params.kata || null });
+    this.examples = examplesState({ exampleId: params.example || null });
+    // The width asked of the `auto` rule on the Urządzenia tab.
+    this.probe = null;
     // A project view owns a wasm simulator and an animation frame; whatever
     // draws one leaves the handle that releases them here.
     this.projectViewDispose = null;
@@ -415,6 +429,8 @@ const TentaQuantScreen = {
       if (this.projectTab !== 'notebook') q.set('ptab', this.projectTab);
     }
     if (this.runId) q.set('run', this.runId);
+    if (this.instanceId && this.tab === 'course' && this.course?.kataId) q.set('kata', this.course.kataId);
+    if (this.instanceId && this.tab === 'examples' && this.examples?.exampleId) q.set('example', this.examples.exampleId);
     if (this.resultRunId) {
       q.set('result', this.resultRunId);
       if (this.resultTab !== 'evolution') q.set('rtab', this.resultTab);
@@ -443,6 +459,10 @@ const TentaQuantScreen = {
     this.instanceId = instanceId;
     this.tab = 'dashboard';
     this.projectId = null;
+    // Progress belongs to the laboratory it was made in.
+    this.course = courseState();
+    this.examples = examplesState();
+    this.probe = null;
     await this.enter();
   },
 
@@ -517,6 +537,10 @@ const TentaQuantScreen = {
       return;
     }
     const projectCount = this.projects.filter((p) => !p.archivedAt).length;
+    const lab = this.lab;
+    // The settings tab belongs to a supervisor or an admin; a route that names
+    // it for anybody else lands on the dashboard rather than on a dead panel.
+    if (this.tab === 'settings' && !settingsAccess(lab.myPermissions).canOpen) this.tab = 'dashboard';
     this.root.innerHTML = `
       <tf-breadcrumb class="tq-crumbs">
         <tf-breadcrumb-item href="#/tentaquant" data-crumb="root">${escapeHtml(T('title'))}</tf-breadcrumb-item>
@@ -527,6 +551,10 @@ const TentaQuantScreen = {
         <tf-tab id="dashboard" icon="home">${escapeHtml(T('lab.tab_dashboard'))}</tf-tab>
         <tf-tab id="projects" icon="folder" count="${projectCount}">${escapeHtml(T('lab.tab_projects'))}</tf-tab>
         <tf-tab id="runs" icon="clock" count="${this.runs.length}">${escapeHtml(T('lab.tab_runs'))}</tf-tab>
+        <tf-tab id="devices" icon="chip">${escapeHtml(T('lab.tab_devices'))}</tf-tab>
+        <tf-tab id="examples" icon="flask">${escapeHtml(T('lab.tab_examples'))}</tf-tab>
+        <tf-tab id="course" icon="catalog">${escapeHtml(T('lab.tab_course'))}</tf-tab>
+        ${settingsAccess(lab.myPermissions).canOpen ? `<tf-tab id="settings" icon="settings">${escapeHtml(T('lab.tab_settings'))}</tf-tab>` : ''}
       </tf-tabs>
       <div id="tq-panel"></div>`;
 
@@ -553,6 +581,22 @@ const TentaQuantScreen = {
     if (this.tab !== 'runs') this.runsHost = null;
     if (this.tab === 'runs') {
       this.showRuns(panel, {});
+      return;
+    }
+    if (this.tab === 'course') {
+      drawCourse(this, panel);
+      return;
+    }
+    if (this.tab === 'devices') {
+      drawDevices(this, panel);
+      return;
+    }
+    if (this.tab === 'examples') {
+      drawExamples(this, panel);
+      return;
+    }
+    if (this.tab === 'settings') {
+      drawSettings(this, panel);
       return;
     }
     if (this.tab === 'projects') {

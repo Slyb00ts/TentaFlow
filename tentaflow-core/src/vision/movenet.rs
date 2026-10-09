@@ -2,11 +2,19 @@
 // File: vision/movenet.rs
 // Description: MoveNet Lightning single-person pose estimator through ONNX.
 // =============================================================================
+//
+// Under `vision-ort` the whole graph runs on ONNX Runtime (CUDA → CPU), decode
+// included: int32 NHWC in, `[1,1,17,3]` (y, x, score) out. Without it, tract runs
+// a re-rooted graph (see `load`) and the decode is done here.
 
 use std::path::Path;
+#[cfg(not(feature = "vision-ort"))]
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+#[cfg(not(feature = "vision-ort"))]
+use anyhow::Context;
+#[cfg(not(feature = "vision-ort"))]
 use tract_onnx::prelude::*;
 
 use super::preprocessing::rgb_buf_to_image;
@@ -15,26 +23,89 @@ use super::yolo_pose::COCO_KEYPOINT_NAMES;
 use super::{PoseDetection, PoseEstimator, PoseKeypoint};
 
 const INPUT_SIZE: u32 = 192;
-const GRID: usize = 48;
 const KEYPOINT_THRESHOLD: f32 = 0.2;
+#[cfg(not(feature = "vision-ort"))]
+const GRID: usize = 48;
+#[cfg(not(feature = "vision-ort"))]
 const DIST_OFFSET: f32 = 1.8;
 
 // tract zawiesza optymalizacje na prefiksie preprocessingu wejscia (int32 ->
 // Cast/Split/normalizacja/Transpose), wiec re-rootujemy graf na tensor PO transpozycji
 // (NCHW f32, wejscie pierwszego konwolutu) i wyprowadzamy cztery surowe glowy.
+#[cfg(not(feature = "vision-ort"))]
 const INPUT_TENSOR: &str =
     "StatefulPartitionedCall/center_net_mobile_net_v2fpn_feature_extractor/model_1/model/Conv1/Conv2D__7:0";
+#[cfg(not(feature = "vision-ort"))]
 const HEAD_CENTER: &str = "StatefulPartitionedCall/center_0/conv2d_4/BiasAdd:0";
+#[cfg(not(feature = "vision-ort"))]
 const HEAD_HEATMAP: &str = "StatefulPartitionedCall/kpt_heatmap_0/conv2d_5/BiasAdd:0";
+#[cfg(not(feature = "vision-ort"))]
 const HEAD_REGRESS: &str = "StatefulPartitionedCall/kpt_regress_0/conv2d_6/BiasAdd:0";
+#[cfg(not(feature = "vision-ort"))]
 const HEAD_OFFSET: &str = "StatefulPartitionedCall/kpt_offset_0/conv2d_7/BiasAdd:0";
 
+#[cfg(not(feature = "vision-ort"))]
 type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
+#[cfg(feature = "vision-ort")]
+pub struct MovenetEngine {
+    pool: crate::vision::ort_common::SessionPool,
+}
+
+#[cfg(not(feature = "vision-ort"))]
 pub struct MovenetEngine {
     model: Arc<Runnable>,
 }
 
+#[cfg(feature = "vision-ort")]
+impl PoseEstimator for MovenetEngine {
+    fn estimate(&self, image_rgb: &[u8], width: u32, height: u32) -> Result<Vec<PoseDetection>> {
+        let img = rgb_buf_to_image(image_rgb, width, height).ok_or_else(|| {
+            anyhow!(
+                "MoveNet: invalid RGB buffer ({} bytes for {}x{})",
+                image_rgb.len(),
+                width,
+                height
+            )
+        })?;
+        let resized = resize_rgb_image(&img, INPUT_SIZE, INPUT_SIZE)
+            .map_err(|e| anyhow!("MoveNet: resize failed: {e}"))?;
+        let n = INPUT_SIZE as usize;
+        let input: Vec<i32> = resized.into_raw().into_iter().map(i32::from).collect();
+        let raw = self.pool.run(move |session| {
+            let name = session
+                .inputs()
+                .first()
+                .map(|i| i.name().to_string())
+                .ok_or_else(|| anyhow!("MoveNet: model has no inputs"))?;
+            let value = ort::value::Tensor::from_array(([1usize, n, n, 3], input))
+                .map_err(|e| anyhow!("MoveNet: input tensor: {e}"))?;
+            let outputs = session
+                .run(ort::inputs! { name => value })
+                .map_err(|e| anyhow!("MoveNet: session.run: {e}"))?;
+            let (_, data) = outputs[0]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("MoveNet: extract keypoints: {e}"))?;
+            Ok(data.to_vec())
+        })?;
+        if raw.len() != 17 * 3 {
+            return Err(anyhow!("MoveNet: expected 17×3 keypoint values, got {}", raw.len()));
+        }
+        let keypoints: Vec<PoseKeypoint> = (0..17)
+            .filter(|&k| raw[k * 3 + 2] >= KEYPOINT_THRESHOLD)
+            .map(|k| PoseKeypoint {
+                id: k as u8,
+                name: COCO_KEYPOINT_NAMES[k],
+                x: raw[k * 3 + 1] * width as f32,
+                y: raw[k * 3] * height as f32,
+                score: raw[k * 3 + 2],
+            })
+            .collect();
+        Ok(pose_from(keypoints, width, height))
+    }
+}
+
+#[cfg(not(feature = "vision-ort"))]
 impl PoseEstimator for MovenetEngine {
     fn estimate(&self, image_rgb: &[u8], width: u32, height: u32) -> Result<Vec<PoseDetection>> {
         let img = rgb_buf_to_image(image_rgb, width, height).ok_or_else(|| {
@@ -92,20 +163,45 @@ impl PoseEstimator for MovenetEngine {
             .context("MoveNet: offset not f32")?;
 
         let keypoints = decode_pose(center, heatmap, regress, offset, width, height);
-        if keypoints.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let (x1, y1, x2, y2) = keypoint_bounds(&keypoints, width, height);
-        let score = keypoints.iter().map(|k| k.score).sum::<f32>() / keypoints.len() as f32;
-        Ok(vec![PoseDetection {
-            bbox: (x1, y1, x2, y2),
-            score,
-            keypoints,
-        }])
+        Ok(pose_from(keypoints, width, height))
     }
 }
 
+/// The one person MoveNet reports, or nothing when no keypoint passed the threshold.
+fn pose_from(keypoints: Vec<PoseKeypoint>, width: u32, height: u32) -> Vec<PoseDetection> {
+    if keypoints.is_empty() {
+        return Vec::new();
+    }
+    let (x1, y1, x2, y2) = keypoint_bounds(&keypoints, width, height);
+    let score = keypoints.iter().map(|k| k.score).sum::<f32>() / keypoints.len() as f32;
+    vec![PoseDetection {
+        bbox: (x1, y1, x2, y2),
+        score,
+        keypoints,
+    }]
+}
+
+#[cfg(feature = "vision-ort")]
+pub fn load(model_path: &Path) -> Result<MovenetEngine> {
+    if !model_path.exists() {
+        return Err(anyhow!("MoveNet ONNX missing: {}", model_path.display()));
+    }
+    crate::vision::ort_common::ensure_ort_dylib();
+    let pool = crate::vision::ort_common::build_session_pool_from_file(
+        model_path,
+        &model_path.with_file_name("trt-cache-movenet"),
+        None,
+        1,
+        false,
+        // The int32 preprocessing prefix splits the graph between EPs; a
+        // TensorRT engine for a model this small would not pay for its build.
+        crate::vision::ort_common::EpChain::CudaOnly,
+    )
+    .map_err(|e| anyhow!("MoveNet ort session for {}: {e:#}", model_path.display()))?;
+    Ok(MovenetEngine { pool })
+}
+
+#[cfg(not(feature = "vision-ort"))]
 pub fn load(model_path: &Path) -> Result<MovenetEngine> {
     if !model_path.exists() {
         return Err(anyhow!("MoveNet ONNX missing: {}", model_path.display()));
@@ -136,6 +232,7 @@ pub fn load(model_path: &Path) -> Result<MovenetEngine> {
     Ok(MovenetEngine { model })
 }
 
+#[cfg(not(feature = "vision-ort"))]
 /// MoveNet (CenterNet single-pose) decode z czterech glow modelu, kazda NCHW [1,C,48,48]:
 /// 1) center = argmax sigmoid(center)/(1.8 + dystans_od_srodka_siatki),
 /// 2) regresja: pozycje 17 punktow = (cy,cx) + regress[*, cy, cx],

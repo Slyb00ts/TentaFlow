@@ -1010,7 +1010,7 @@ mod tests {
         }
         // The config import's target reasons and the rdma reasons are built
         // as bare reasons.
-        let targets_js = read("www/js/modules/tentanas/targets.js") + &read("www/js/modules/tentanas/target-wizard.js");
+        let targets_js = read("www/js/modules/tentanas/targets.js") + read("www/js/modules/tentanas/target-wizard.js").as_str();
         for rust in ["src/tentanas/config_io.rs", "src/tentanas/targets.rs"] {
             for code in codes_in(&read(rust), "coded_reason(") {
                 assert!(targets_js.contains(&format!("['{code}',")), "{rust} sends '{code}' without words");

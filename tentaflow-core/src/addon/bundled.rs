@@ -427,6 +427,50 @@ pub fn package_dir(package_id: &str, version: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A shipped package's install steps must be runnable and readable: a hook
+    /// exists for the package, and every i18n key the wizard will look up is
+    /// present in all five locales (a missing one would render the raw key).
+    #[test]
+    fn every_native_package_with_install_steps_has_a_hook_and_translations() {
+        let locales: Vec<(String, serde_json::Value)> = ["pl", "en", "de", "es", "fr"]
+            .iter()
+            .map(|l| {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("www/i18n")
+                    .join(format!("{l}.json"));
+                let text = std::fs::read_to_string(&path).expect("locale file");
+                (l.to_string(), serde_json::from_str(&text).expect("locale json"))
+            })
+            .collect();
+        let has_key = |root: &serde_json::Value, key: &str| {
+            key.split('.')
+                .try_fold(root, |node, part| node.get(part))
+                .is_some_and(|v| v.is_string())
+        };
+        for (name, manifest_toml) in NATIVE_APP_PACKAGES {
+            let manifest =
+                crate::addon::lifecycle::parse_manifest_toml(manifest_toml).expect("manifest");
+            if manifest.install_steps.is_empty() {
+                continue;
+            }
+            let hooks = crate::addon::native_apps::hooks_for(&manifest.addon_id)
+                .unwrap_or_else(|| panic!("'{name}' declares install steps but has no hooks"));
+            assert!(hooks.install_step.is_some(), "'{name}' declares install steps without a hook");
+            for step in &manifest.install_steps {
+                let keys = std::iter::once(&step.title_key)
+                    .chain(step.description_key.iter())
+                    .chain(step.fields.iter().flat_map(|f| {
+                        std::iter::once(&f.label_key).chain(f.options.iter().map(|o| &o.label_key))
+                    }));
+                for key in keys {
+                    for (locale, root) in &locales {
+                        assert!(has_key(root, key), "'{name}' step '{}': key '{key}' missing in {locale}", step.id);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn instance_id_shape_guard() {
         // Real instance ids (base-<8hex>) — must be recognized as instances.

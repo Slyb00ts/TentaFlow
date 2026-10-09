@@ -74,6 +74,16 @@ test('a click selects the section and says so; a disabled one stays out of reach
   assert.equal(document.activeElement, button(host, 'state'), 'focus skips the disabled section');
 });
 
+test('a hidden section is out of the arrow moves as well as out of sight', () => {
+  const host = mount({ orientation: 'vertical', value: 'state' }, ['state', 'settings', 'access', 'partitions']);
+  host.querySelector('tf-tab#access').hidden = true;
+  button(host, 'settings').focus();
+  key(button(host, 'settings'), 'ArrowDown');
+  assert.equal(document.activeElement, button(host, 'partitions'), 'focus never lands on a section the reader cannot see');
+  key(button(host, 'partitions'), 'ArrowUp');
+  assert.equal(document.activeElement, button(host, 'settings'));
+});
+
 test('the menu never scrolls sideways and keeps the indicator hidden', () => {
   const host = mount({ orientation: 'vertical', value: 'settings' });
   const scroller = host.querySelector('[role="tablist"]');

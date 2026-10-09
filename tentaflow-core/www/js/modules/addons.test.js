@@ -72,6 +72,10 @@ await import('../components/tf-select.js');
 await import('../components/tf-chip.js');
 await import('../components/tf-searchbox.js');
 await import('../components/tf-toggle.js');
+await import('../components/tf-checkbox.js');
+await import('../components/tf-multiselect.js');
+await import('../components/tf-alert.js');
+await import('../components/tf-spinner.js');
 
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { Router } = await import('../router.js');
@@ -155,6 +159,63 @@ test('installing any other package navigates nowhere', async () => {
 
   assert.ok(calls.some((c) => c.kind === 'addonInstanceInstallRequest'), 'the install ran');
   assert.deepEqual(navigations, [], 'only TentaNas needs a privilege channel chosen after install');
+  AddonsScreen.unmount();
+});
+
+const bellStep = {
+  id: 'bell-test', titleKey: 'apps.tentaquant.install.bell_test.title',
+  descriptionKey: 'apps.tentaquant.install.bell_test.desc', fields: [],
+};
+
+test('a package that declares install steps gets them after the instance exists, run against that instance', async () => {
+  await install('tentaquant', {
+    addonCatalogListRequest: { packages: [{ ...pkg('tentaquant', 'TentaQuant'), installSteps: [bellStep] }] },
+    addonInstanceInstallRequest: { ok: true, addonId: 'tentaquant-1a2b3c4d' },
+    addonInstanceInstallStepRequest: { status: 'ok', message: 'Bell test passed', details: [] },
+  });
+
+  const steps = document.querySelector('tf-window [data-step="bell-test"]');
+  assert.ok(steps, 'the steps window opened after the install');
+  steps.querySelector('[data-role="run"]').click();
+  for (let i = 0; i < 4; i += 1) await flush();
+  const sent = calls.find((c) => c.kind === 'addonInstanceInstallStepRequest');
+  assert.deepEqual(sent.payload, { addonId: 'tentaquant-1a2b3c4d', stepId: 'bell-test', values: [] });
+  assert.ok(
+    calls.findIndex((c) => c.kind === 'addonInstanceInstallRequest')
+      < calls.findIndex((c) => c.kind === 'addonInstanceInstallStepRequest'),
+    'the step runs only after the instance was created',
+  );
+  document.querySelectorAll('tf-window').forEach((w) => w.remove());
+  AddonsScreen.unmount();
+});
+
+test('a package without install steps opens no steps window', async () => {
+  await install('tentaquant');
+  assert.equal(document.querySelectorAll('[data-step]').length, 0);
+  AddonsScreen.unmount();
+});
+
+test('a multi-instance package refuses a name another instance already carries', async () => {
+  calls.length = 0;
+  stubTransport(fixtures({
+    addonsListRequest: { addons: [{ addonId: 'tentaquant-1a2b3c4d', name: 'tentaquant', displayName: 'Physics lab', packageId: 'tentaquant', isEnabled: true, runtime: 'native' }] },
+    addonCatalogListRequest: { packages: [{ ...pkg('tentaquant', 'TentaQuant'), installedInstances: 1 }] },
+  }));
+  document.body.innerHTML = '<div id="main"></div>';
+  document.getElementById('main').innerHTML = AddonsScreen.render();
+  await AddonsScreen.mount({ install: 'tentaquant' });
+  await flush();
+  const win = [...document.querySelectorAll('tf-window')].at(-1);
+  const name = win.querySelector('#inst-name');
+  name.value = ' physics LAB ';
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 4; i += 1) await flush();
+  assert.ok(!calls.some((c) => c.kind === 'addonInstanceInstallRequest'), 'a taken name is never sent');
+  name.value = 'Chemistry lab';
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 6; i += 1) await flush();
+  assert.equal(calls.find((c) => c.kind === 'addonInstanceInstallRequest').payload.displayName, 'Chemistry lab',
+    'a second instance under its own name is allowed');
   AddonsScreen.unmount();
 });
 

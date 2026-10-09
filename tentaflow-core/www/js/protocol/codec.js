@@ -3456,6 +3456,23 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonInstanceBody(ReqInstallStep) — one app step of an installed
+   *  instance; `values` is an Array<[fieldId, value]>. */
+  addonInstanceInstallStepRequest(
+    correlationId,
+    { addonId, stepId, values = [] },
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeAddonInstanceInstallStepRequest(addonId, stepId, values);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji. */
   addonInstanceVersionsRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
@@ -4162,7 +4179,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::AclListRequest (M03 ACL tab). payload: { instanceId, topic }. */
+  /** BusPayload::AclListRequest (a topic's Dostęp section). payload: { instanceId, topic }. */
   busAclListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusAclListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
@@ -4170,9 +4187,9 @@ export const encode = {
   },
 
   /**
-   * BusPayload::AclSetRequest. payload: { topic, subjectType, subjectId, accessLevel: 'allow'|'deny'|'clear' }.
-   * NOTE: `resource_permissions` has no produce/consume/admin action column (see
-   * `services/bus_authorizer.rs`'s doc) — `accessLevel` gates the whole topic, not one action.
+   * BusPayload::AclSetRequest. payload: { topic, subjectType: 'user'|'group'|'addon'|'api_key',
+   * subjectId, accessLevel: 'allow'|'deny'|'clear', action: 'read'|'write'|'admin'|'*' }.
+   * One row per subject AND action (migration 168): 'clear' removes only that action's row.
    */
   busAclSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -4297,8 +4314,11 @@ export const encode = {
 
   /**
    * BusPayload::FieldPolicySetRequest. payload: { topic, subjectType, subjectId, direction:
-   * 'write'|'read', fields: string[], requiredFields: string[] }. `requiredFields` must be a
-   * subset of `fields` (validated server-side).
+   * 'write'|'read', fields: string[], requiredFields: string[], expectedUpdatedAtMs?: number,
+   * expectAbsent?: boolean }. `requiredFields` must be a subset of `fields` (validated
+   * server-side). `expectedUpdatedAtMs` is the `updatedAtMs` of the rule being changed and
+   * `expectAbsent` marks an add; the server refuses with `bus.field_policy_changed` when the
+   * stored rule is no longer that. Neither set writes unconditionally.
    */
   busFieldPolicySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -4310,11 +4330,13 @@ export const encode = {
       String(payload.direction ?? 'write'),
       (payload.fields ?? []).map(String),
       (payload.requiredFields ?? payload.required_fields ?? []).map(String),
+      payload.expectedUpdatedAtMs == null ? undefined : BigInt(payload.expectedUpdatedAtMs),
+      payload.expectAbsent === true,
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read' }. */
+  /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read', expectedUpdatedAtMs? } (the rule's updated_at_ms the delete is based on). */
   busFieldPolicyDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusFieldPolicyDeleteRequest(
@@ -4323,6 +4345,7 @@ export const encode = {
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
       String(payload.subjectId ?? payload.subject_id ?? ''),
       String(payload.direction ?? 'write'),
+      payload.expectedUpdatedAtMs == null ? undefined : BigInt(payload.expectedUpdatedAtMs),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -12699,6 +12722,72 @@ export const encode = {
       needs_kernel: Boolean(payload.needsKernel ?? payload.needs_kernel),
     };
     const body = _wasm.encodeTentaQuantTargetResolveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataListRequest). payload: { instanceId } — the course in its fixed order with the caller's progress. */
+  tentaQuantKataListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantKataListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataGetRequest). payload: { instanceId, kataId } — task text and starter code; a locked kata answers NotFound. */
+  tentaQuantKataGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqLab(payload), kata_id: csText(payload.kataId ?? payload.kata_id) };
+    const body = _wasm.encodeTentaQuantKataGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataSubmitRequest). payload: { instanceId, kataId, qasm3 } — graded in Core, deterministic. */
+  tentaQuantKataSubmitRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      kata_id: csText(payload.kataId ?? payload.kata_id),
+      qasm3: csText(payload.qasm3),
+    };
+    const body = _wasm.encodeTentaQuantKataSubmitRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(KataRankingRequest). payload: { instanceId } — top five with names plus the caller's own place; empty when a supervisor switched it off. */
+  tentaQuantKataRankingRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantKataRankingRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ExampleListRequest). payload: { instanceId } — the shipped examples in their fixed order. */
+  tentaQuantExampleListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantExampleListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ExampleGetRequest). payload: { instanceId, exampleId, qubits? } — README, circuit and reference outcome; `qubits` picks the width of a parametric example. */
+  tentaQuantExampleGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      example_id: csText(payload.exampleId ?? payload.example_id),
+      qubits: csOptNumber(payload.qubits),
+    };
+    const body = _wasm.encodeTentaQuantExampleGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ExampleForkRequest). payload: { instanceId, exampleId, qubits?, language } — a new private project holding the example as a notebook. */
+  tentaQuantExampleForkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      example_id: csText(payload.exampleId ?? payload.example_id),
+      qubits: csOptNumber(payload.qubits),
+      language: csText(payload.language),
+    };
+    const body = _wasm.encodeTentaQuantExampleForkRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

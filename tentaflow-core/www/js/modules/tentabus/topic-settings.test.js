@@ -325,7 +325,7 @@ test('pattern window: only patterns for the topic\'s content, "bez wzoru" clears
   assert.match(saved[0].text, /nie ma wzoru/);
 });
 
-test('Escape and the close button ask once before dropping a changed setting; "Anuluj" drops it without asking', async () => {
+test('Escape and the close button ask once before dropping a changed setting; "Anuluj" asks too', async () => {
   const later = () => new Promise((r) => setTimeout(r, 300));
   const untouched = openWindow('retention').win;
   untouched.close();
@@ -345,6 +345,9 @@ test('Escape and the close button ask once before dropping a changed setting; "A
 
   const cancelled = openWindow('retention').win;
   pick(cancelled.querySelector('#tb-set-retention'), String(7 * 86_400_000));
+  cancelled.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(cancelled.isConnected, true, '"Anuluj" asks like the close button');
   cancelled.querySelector('[data-act="cancel"]').click();
   await later();
   assert.equal(cancelled.isConnected, false);

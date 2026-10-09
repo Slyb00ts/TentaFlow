@@ -456,6 +456,8 @@ export function openSchemaVersion(ctx) {
     saveLabel: T('schemas.version.button'),
     saveIcon: 'plus',
     willHappen: T('schemas.will_happen_add'),
+    // The text of a window closed without adding is kept for the next one (`onDraft`).
+    discardText: T('schemas.version.discard_kept'),
     fields: () => `
       ${ctx.draftText != null ? `<div class="tb-explain-box">${escapeHtml(T('schemas.version.draft_kept'))}</div>` : ''}
       ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), '', start)}

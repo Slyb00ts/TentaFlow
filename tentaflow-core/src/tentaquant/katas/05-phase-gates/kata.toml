@@ -1,0 +1,11 @@
+id = "05-phase-gates"
+points = 100
+tier = "T0"
+
+[title]
+pl = "Faza: Z, S, T"
+en = "Phase: Z, S and T"
+
+[summary]
+pl = "czemu pomiar jej nie widzi"
+en = "why a measurement cannot see it"

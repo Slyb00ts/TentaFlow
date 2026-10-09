@@ -188,7 +188,8 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   const kinds = creatorContentTypes(capabilities.contentTypes);
   const plan = copiesPlan(capabilities);
   const draft = newDraft(kinds);
-  const state = { step: 0, nameTouched: false, busy: false, error: '', subjects, reloading: false };
+  const state = { step: 0, nameTouched: false, busy: false, error: '', subjects, reloading: false, discard: false };
+  const untouched = newDraft(kinds);
   const steps = [T('topics.creator.step_1'), T('topics.creator.step_2'), T('topics.creator.step_3')];
 
   const win = document.createElement('tf-window');
@@ -347,11 +348,17 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   };
 
   const syncNext = () => {
+    withdrawDiscard();
     const btn = win.querySelector('[data-act="next"]');
     if (!btn) return;
     if (canProceed()) btn.removeAttribute('disabled');
     else btn.setAttribute('disabled', '');
   };
+
+  // Work worth asking about: a later step, or anything the administrator
+  // changed on the first (the pattern the later steps preselect is not a change of theirs).
+  const dirty = () => state.step > 0
+    || ['name', 'description', 'contentType', 'partitions', 'retentionDays', 'limitGb', 'durabilityClass'].some((k) => draft[k] !== untouched[k]);
 
   const draw = () => {
     win.innerHTML = `
@@ -359,6 +366,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
         ${header()}
         <div class="install-step-body">${[stepName, stepStorage, stepSchema][state.step]()}</div>
         <div class="tb-window-error" role="alert" ${state.error ? '' : 'hidden'}>${sprite('alert')}<span>${escapeHtml(state.error)}</span></div>
+        <div class="tb-window-error" role="alert" data-role="discard" ${state.discard ? '' : 'hidden'}>${sprite('alert')}<span>${escapeHtml(T('settings.discard_confirm'))}</span></div>
       </div>
       <div slot="footer">${footer()}</div>`;
     wire();
@@ -505,12 +513,28 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   };
 
   // While the request is out the window stays: closing it would hide the answer.
-  win.addEventListener('close-request', (e) => { if (state.busy) e.preventDefault(); });
+  // The close button, Escape and "Anuluj" all ask once before dropping a changed draft, like every other window here.
+  win.addEventListener('close-request', (e) => {
+    if (state.busy) { e.preventDefault(); return; }
+    if (state.discard || !dirty()) return;
+    e.preventDefault();
+    state.discard = true;
+    win.querySelector('[data-role="discard"]').hidden = false;
+  });
+  // Any further edit withdraws the question: the next close asks again.
+  function withdrawDiscard() {
+    if (!state.discard) return;
+    state.discard = false;
+    win.querySelector('[data-role="discard"]').hidden = true;
+  }
+  win.addEventListener('input', withdrawDiscard);
+  win.addEventListener('change', withdrawDiscard);
   win.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn || btn.hasAttribute('disabled')) return;
     const act = btn.dataset.act;
-    if (act === 'cancel') win.close(true);
+    if (act !== 'cancel') withdrawDiscard();
+    if (act === 'cancel') win.close();
     else if (act === 'back' && state.step > 0) toStep(state.step - 1);
     else if (act === 'next') advance();
     else if (act === 'reload-subjects' && !state.reloading) reload(true);

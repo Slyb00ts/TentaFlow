@@ -8,7 +8,11 @@
 //   - a paused consumer is an alert only while something waits for it;
 //   - every replica the leader reports as lagging is an alert, one per node.
 // A lag the node could not measure (`lagTotal == null`) never raises or
-// clears anything: an unknown is not a zero.
+// clears anything: an unknown is not a zero. The group of an API key that no
+// longer exists (`keyGone`) waits for nobody: it raises nothing and counts
+// toward no delay.
+
+import { consumerLabel } from '/js/modules/tentabus/format.js';
 
 export const LAGGING_MIN_RISE_MS = 10 * 60_000;
 export const LAGGING_MIN_WAITING = 1000;
@@ -22,7 +26,7 @@ const measured = (v) => v != null && Number.isFinite(Number(v));
 
 /** A consumer whose lag grows for ≥ 10 min with more than 1 000 waiting. */
 export function isLagging(group, nowMs) {
-  if (!group || group.paused || !measured(group.lagTotal) || !measured(group.lagRisingSinceMs)) return false;
+  if (!group || group.keyGone || group.paused || !measured(group.lagTotal) || !measured(group.lagRisingSinceMs)) return false;
   return Number(group.lagTotal) > LAGGING_MIN_WAITING && nowMs - Number(group.lagRisingSinceMs) >= LAGGING_MIN_RISE_MS;
 }
 
@@ -45,12 +49,12 @@ export function lagWording(samples, nowMs) {
 
 /** A paused consumer that has messages waiting. */
 export function isPausedWithBacklog(group) {
-  return Boolean(group?.paused) && measured(group.lagTotal) && Number(group.lagTotal) > 0;
+  return Boolean(group?.paused) && !group.keyGone && measured(group.lagTotal) && Number(group.lagTotal) > 0;
 }
 
 /** Consumers with anything waiting — the "Odbiorcy z opóźnieniem" tile. */
 export function delayedGroups(groups) {
-  return (groups || []).filter((g) => measured(g.lagTotal) && Number(g.lagTotal) > 0);
+  return (groups || []).filter((g) => !g.keyGone && measured(g.lagTotal) && Number(g.lagTotal) > 0);
 }
 
 /**
@@ -97,6 +101,7 @@ export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagS
     kind: 'lagging',
     tone: 'warning',
     group: g.group,
+    label: consumerLabel(g),
     topic: g.topic,
     waiting: Number(g.lagTotal),
     risingSinceMs: Number(g.lagRisingSinceMs),
@@ -118,6 +123,7 @@ export function computeAlerts({ groups = [], topics = [], replicaLags = [], lagS
     kind: 'paused',
     tone: 'warning',
     group: g.group,
+    label: consumerLabel(g),
     topic: g.topic,
     waiting: Number(g.lagTotal),
   }));

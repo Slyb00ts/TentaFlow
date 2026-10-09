@@ -60,6 +60,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
+  `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
+  i znaczniki usunięcia bez zmian). Na razie są tylko przechowywane, jak
+  `avro`/`protobuf`/`thrift`: nie mają walidatora, więc `GET capabilities`
+  nadal wymienia wyłącznie `json_schema`, włączenie walidacji na takim wzorcu
+  jest odrzucane, a druga wersja przy zgodności innej niż `none` także
+  (brak porównania, którego można by udawać). Rejestracja wersji `xsd` lub
+  `hl7v2_profile` wymaga `compatibility: none`: przy domyślnym `backward`
+  odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
+  z tematem `application/xml` albo `text/xml`, `hl7v2_profile` tylko
+  z `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema`
+  nadal tylko z JSON-em; formaty binarne wiążą się niezależnie od
+  `content_type`. Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego
+  typu (konflikt w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca
+  dociera do takiego węzła przy następnym zapisie po uaktualnieniu, ale
+  wersje zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
+  (`reseed_core_state_from_current_rows`). Rzadki przypadek: stary węzeł
+  z podmiotem o tej samej nazwie z generacji 0 może podpiąć wersje nowego
+  typu pod swój stary wiersz i zmienić `content_type` tematu powiązanego
+  z tym podmiotem. Uaktualnij wszystkie węzły sieci razem, zanim ktoś
+  zarejestruje wzorzec XSD lub profil HL7; B4 i B5 zakładają to jako warunek
+  wstępny.
+
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo
   addonów (`BusSubjectWire`: rodzaj, identyfikator, nazwa, liczba członków
@@ -167,6 +190,148 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja
   trafia do konfliktów synchronizacji) i dalej traktuje addony jak
   użytkowników — nody trzeba zaktualizować razem.
+- Strona topiku ma sekcję „Dostęp” (widoczną tylko dla administratora
+  topiku; pozostali nie widzą jej w menu). Tabela „Osoby, grupy i addony”
+  pokazuje dla każdego wpisu nazwę, rodzaj i liczebność grupy oraz Czytanie /
+  Zapis / Administracja jako „pozwolono”, „zabroniono” albo „—” (decyduje rola
+  w organizacji). „Nadaj dostęp” wybiera użytkownika, grupę albo addon
+  z katalogu (tylko tych bez wpisu), „Zmień” i „Usuń” działają w wierszu;
+  każde okno mówi przed zapisem, co się stanie, a usunięcie „zabroniono”
+  ostrzega, że rola w organizacji może dać te prawa. Stary wpis na wszystkie
+  prawa naraz jest przy zmianie rozpisywany na trzy osobne. Wpis
+  użytkownika o identyfikatorze addonu jest pokazany jako nieznany podmiot
+  z identyfikatorem i można go usunąć.
+- Karta „Systemy zewnętrzne (klucze API)” w tej sekcji pokazuje klucze
+  z prawami do wiadomości topiku lub do wzorów wiadomości instancji.
+  Administrator serwera widzi też ostatnie użycie i może wydać klucz (nazwa
+  i prawa: czyta/wysyła wiadomości, czyta/dodaje wzory — klucz pokazany raz,
+  z adresem dla systemu i nazwą grupy odbiorców `k:<id klucza>`), zmienić
+  jego prawa i go unieważnić. Pozostali administratorzy topiku widzą prawa
+  kluczy do wiadomości tylko do odczytu, z informacją, że klucze wydaje
+  administrator serwera. Nowe tłumaczenia błędów: klucz bez zasady ukrywania
+  danych dla wszystkich (`bus.key_needs_topic_wide_rule`), wpis użytkownika
+  o identyfikatorze addonu, nieznany klucz, prawo spoza własnej organizacji.
+  Protokół: `BusCapabilitiesWire.{org_id, org_name}` (organizacja wywołującego;
+  pusta u starszego serwera).
+- Unieważnienie klucza API usuwa w tej samej transakcji wszystkie jego prawa
+  (wiersze `resource_permissions` z `subject_type = 'api_key'` każdego rodzaju
+  zasobu), każde jako zsynchronizowane usunięcie; wpis audytu `apikey.delete`
+  wymienia usunięte prawa. Wpisy klucza, którego już nie ma (starsze dane),
+  karta kluczy pokazuje jako „Klucz usunięty” bez zielonych praw i bez
+  liczenia w liczniku sekcji; administrator serwera usuwa je przyciskiem
+  „Usuń prawa”.
+- Grupa odbiorców klucza (`k:<id klucza>[.<nazwa>]`) nazywa się wszędzie nazwą
+  klucza („Klucz Portal”, „Portal · raporty”); grupa klucza, którego już nie
+  ma, jest opisana jako „Klucz usunięty”, nie wywołuje alertów i nie wlicza się
+  do „Czeka na odbiorców” ani sum zaległości. Protokół:
+  `BusGroupSummaryWire`/`BusGroupStatsWire`/`BusGroupDetailWire.{key_name, key_gone}`.
+- Zmiana i usunięcie wpisu dostępu wysyłają żądania w kolejności, w której
+  przerwanie w dowolnym miejscu nigdy nie daje szerszego dostępu niż przed
+  zmianą i po niej: najpierw nowe zakazy, potem zdjęcie pozwoleń, nowe
+  pozwolenia, a zdjęcie zakazów na końcu (także starego wpisu na wszystkie
+  prawa). Okno „Zmień” mówi, co nowe prawo pozwala albo czego zabrania.
+- Okno z jednorazowo pokazanym kluczem pyta raz przed zamknięciem klawiszem
+  Escape lub krzyżykiem, jeśli klucza nie skopiowano; wskazówka techniczna jest
+  zwinięta w „Dla programisty” z przyciskiem „Kopiuj nazwę odbiorcy”.
+- Strona topiku ma sekcję „Ukrywanie danych” (tylko dla administratora topiku).
+  Tabela pokazuje zasady: kto (osoba, grupa, addon albo Wszyscy), jakie pola
+  ukrywa albo odrzuca przy zapisie, czy dotyczy odczytu czy zapisu i kiedy ją
+  zmieniono. Serwer zapisuje pola **dozwolone**, więc ekran pokazuje odwrotność
+  (znane pola bez dozwolonych); pole, którego nie ma na liście okna, też jest
+  ukryte (a przy zapisie odrzucane), chyba że wpisze się je osobno. Listę pól
+  daje wzór wiadomości topiku JSON (właściwości, także z `allOf`, `oneOf`,
+  `anyOf`, `if`/`then`/`else` i lokalnych `$ref`; wzór z odwołaniem do innego
+  pliku, `patternProperties` albo `additionalProperties` jako schematem
+  traktujemy jak brak listy; tak samo wzór zagłębiony ponad 32 poziomy,
+  `$ref` do schematu `true`/`false`, `unevaluatedProperties` jako schemat
+  i `dependentSchemas`), podręczny słownik około sześćdziesięciu pól HL7 v2
+  z nazwami w pięciu językach. Przy **zapisie** pozostałe pozycje tych
+  segmentów (MSH-11, PID-1, PID-4, EVN-1, …; do szerokości z HL7 v2.8, także
+  PV2, PD1, ROL, GT1, IN2, SFT, TQ1, SPM, MSA, ERR, MRG i NTE-1…9) są domyślnie
+  dozwolone, więc zwykła wiadomość nie jest odrzucana, a okno mówi, że
+  odrzucony zostanie dopiero inny segment (np. Z). Zasada **odczytu** nigdy
+  ich nie dodaje: co nie jest na liście, jest ukryte, tak jak mówi okno
+  (wcześniej nowa zasada odczytu zostawiała widoczne ok. 290 pozycji, np.
+  PID-4, PID-20, NK1-*, IN1-*). Zapisana wcześniej zasada odczytu, która
+  przepuszcza takie pozycje, pokazuje je w „Zmień” jako wpisane pola (można je
+  usunąć), a tabela wymienia je w „Zostawia też widoczne”. Adres spoza
+  słownika wpisuje się ręcznie i jest sprawdzany przed wysłaniem tak jak na
+  serwerze; błędny adres jest zaznaczony na swoim chipie i opisany pod polem,
+  także zanim wybrano, dla kogo jest zasada albo, gdy listy nie ma
+  (XML, JSON bez wzoru), pola do pozostawienia wpisuje się w całości. Długą
+  listę pól można przeszukać. Topik z treścią binarną nie jest tu edytowany,
+  a sekcja mówi dlaczego i odsyła do ustawień topiku.
+- Zapis zasady jest porównywany z tym, co jest zapisane, **na serwerze, w tej
+  samej transakcji co zapis** (`FieldPolicySetRequest.expected_updated_at_ms`
+  — zasada ma istnieć z dokładnie tym czasem zmiany — albo `expect_absent` —
+  zasady jeszcze nie ma; oba pola dopisane na końcu z `#[serde(default)]`,
+  więc starsi klienci zapisują bezwarunkowo, a oba naraz to
+  `bus.invalid_argument`). Rozbieżność daje `bus.field_policy_changed`
+  (`Conflict`): okno zamyka się z notatką „Nic nie zapisano — zasada zmieniła
+  się w międzyczasie”, tabela pokazuje aktualne zasady i nic nie jest
+  nadpisane. Zapis, który zastępuje zasadę, zawsze ustawia czas zmiany
+  powyżej poprzedniego, żeby dwa zapisy w tej samej milisekundzie nie miały
+  wspólnej wartości porównania. Odczyt przed zapisem po stronie przeglądarki
+  został usunięty. Synchronizacja tabeli `bus_field_policies` między nodami
+  (ledger, operacje stosowane w kolejności HLC) nie jest ruszana i porównania
+  nie wykonuje: zmiana zreplikowana na ten node przed zapisem zmienia czas
+  zmiany zasady, więc okno otwarte na starej wersji jest odrzucane, a zmiana,
+  która dotrze po zapisie, stosuje się jak każda replikowana (ostatnia w
+  kolejności HLC wygrywa). Usunięcie zasady porównuje się tak samo
+  (`FieldPolicyDeleteRequest.expected_updated_at_ms`, dopisane z `#[serde(default)]`):
+  okno „Usuń” na starej wersji zasady nic nie usuwa i pokazuje tę samą notatkę.
+  Wpisów dostępu do topiku nie da się już wyczyścić ścieżką uprawnień IAM
+  (`IamClearPermissionRequest` odrzuca `topic`, jak ustawianie) — tylko w TentaBus,
+  ze sprawdzeniem administratora topiku i wpisem audytu `bus.acl.set`. Okno „Dodaj zasadę” ostrzega przed zapisem, gdy pierwsza zasada
+  dla wybranych osób zamknie topik dla systemów z kluczem API; nikogo nie
+  wybiera za administratora.
+- Lista zasad topiku (`FieldPolicyListRequest`) jest tylko dla administratora
+  tego topiku; czytelnik widzi wyłącznie podgląd wiadomości z własnym ukrywaniem.
+  Jedno sprawdzenie (`require_topic_admin`: administrator tego topiku według
+  jego ACL, w tym zakaz `admin`, i rola Admin w organizacji) stoi teraz za
+  listą, zapisem i usunięciem zasady, podglądem, wzorem pochodnym
+  (`SchemaDerivedGetRequest`) i nadawaniem albo zabranianiem dostępu
+  (`AclSetRequest`). `SchemaDerivedGetRequest` był dostępny dla każdego
+  czytelnika instancji i pozwalał odczytać wzór pochodny dowolnej zasady
+  oraz sprawdzić, czy zasada istnieje; nie używa go żaden ekran ani addon,
+  więc jest tylko dla administratora topiku. Ta sama zasada obejmuje usuwanie
+  wpisu dostępu (`clear`): operator, któremu zakazano administracji topiku, nie
+  zdejmie ani własnego zakazu, ani cudzego zakazu odczytu lub zapisu. Jedynym
+  wyjątkiem jest administrator serwera, który zawsze może usunąć wpis — to droga
+  powrotu do topiku, w którym każdy administrator dostał zakaz. Prawo klucza API
+  do topiku (tworzenie klucza z zakresem topiku i `ApiKeyScopeSetRequest`) też
+  wymaga administracji tym topikiem; odebranie prawa działa jak dotąd.
+- „Dodaj zasadę” wybiera osobę, grupę, addon z katalogu (tylko tych, którzy nie
+  mają jeszcze zasady w tym kierunku) albo Wszystkich, kierunek i dla każdego
+  pola Pokaż / Ukryj (przy zapisie: Dozwolone / Wymagane / Niedozwolone);
+  „Zmień” zachowuje podmiot i kierunek, „Usuń” mówi, co zasada robi teraz i kto
+  zobaczy całe wiadomości po jej usunięciu (osobno dla osoby, grupy i addonu,
+  w kolejności, w jakiej serwer wybiera zasadę). „Zamaskuj” i „Zahaszuj” dojdą
+  razem z działaniem na pole w protokole.
+- „Podgląd, jak widzi…” pokazuje prawdziwą wiadomość (domyślnie najnowszą
+  z najbardziej obciążonej partycji) tak, jak czyta ją wybrany podmiot, z listą
+  ukrytych pól. Okno mówi, że każdy podgląd zapisuje się w dzienniku audytu,
+  a gdy zasada obowiązująca samego administratora ukrywa pola, które zobaczy
+  wybrany odbiorca (`limited_by_caller`), wyjaśnia, że podgląd jest węższy niż
+  jego widok, wymienia pola wzoru, których w podglądzie nie ma (ukryła je
+  zasada, która obowiązuje także administratora, albo wiadomość ich nie ma),
+  i mówi, że pól ukrytych już przez jego zasadę nie wymienia w „Co zrobiły
+  zasady”. Wynik znika, gdy zmieni się osoba, grupa albo wiadomość.
+  Pod tabelą widać, w którym kierunku topik jest zamknięty dla kluczy API (są
+  zasady dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich).
+- Błędy: `bus.record_not_found` ma tłumaczenie, a `bus.subject_not_found`
+  mówi o osobie, kluczu albo addonie (nie tylko o kluczu); nowy
+  `bus.field_policy_changed`.
+- Notatka po zapisie nie odsyła do zamkniętego okna („chyba że je dopiszesz”),
+  a dla wzoru zamkniętego (`additionalProperties: false`) nie mówi o polach
+  spoza listy. W zdaniach o skutkach zasada dla wszystkich brzmi „dla
+  wszystkich”, a nie „dla „Wszyscy””. Pola nazwane `__proto__` albo
+  `constructor` zachowują swoje ustawienie.
+- „Usuń topik” mówi, że zasad ukrywania danych nie udało się policzyć, gdy
+  lista zasad nie odpowiedziała, zamiast liczyć je jako zero. „Nowa wersja”
+  wzoru mówi przed zamknięciem, że tekst zostanie zachowany (bo tak jest).
+  „Nadaj dostęp” nie wybiera za administratora pierwszej grupy z listy, a
+  kreator topiku pyta przed porzuceniem wpisanych danych tak jak inne okna.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

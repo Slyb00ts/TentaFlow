@@ -422,6 +422,14 @@ addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
 (`ABI_OUTPUT_BUFFER_TOO_SMALL`: required length on `out_len_ptr`) by reallocating the
 `on_request` output buffer and retrying, up to 8 MB; code 2 and other errors still fail.
 
+Native packages may declare `[[install_step]]` (`addon/install_steps.rs`): the Addons install UI
+(`www/js/modules/addons/install-steps.js`) renders each step's field schema (`select`,
+`multiselect`, `checkbox`, `text`; static options) after the instance exists and runs it through
+`AddonInstancePayload::ReqInstallStep` → `NativeAppHooks::install_step`. The instance stays
+installed whatever a step reports; a failed step is shown as failed with a re-run, hooks must be
+idempotent, and an `Err` from a hook reaches the wizard as `failed`. Step ids, field types and
+key shapes are validated at manifest load; `bundled.rs` tests check the hook and that every key exists in all five locales.
+
 Notable bundled addons: `eureka`, `company-lookup`, `contacts` (CRM source of truth), `memory`,
 `embeddings-chunker`, `notes` (SQLite source of truth + `graph_outbox` → Cozo `notes_kg` + zvec
 namespaces, hybrid RRF search), `deep-research` (thin facade over the web-research service).

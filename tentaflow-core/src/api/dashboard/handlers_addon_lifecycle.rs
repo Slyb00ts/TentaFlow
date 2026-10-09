@@ -12,7 +12,8 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     AddonConfigField, AddonConfigGetResponse, AddonConfigSetResponse, AddonInstallResponse,
-    AddonInstanceInstallResponse, AddonInstancePayload, AddonInstanceUpdateResponse,
+    AddonInstallStepStatus, AddonInstanceInstallResponse, AddonInstanceInstallStepResponse,
+    AddonInstancePayload, AddonInstanceUpdateResponse,
     AddonInstanceVersionsResponse, AddonKvStats, AddonLogEntry, AddonLogsResponse,
     AddonMilvusService, AddonNetworkRuleDecl, AddonNetworkRulesGetResponse,
     AddonNetworkRulesSetResponse, AddonPackageInfo, AddonRecordingStats, AddonReloadResponse,
@@ -26,6 +27,7 @@ use tentaflow_protocol::{
     MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
+use crate::addon::install_steps::InstallStepStatus;
 use crate::db::repository;
 use crate::dispatch::HandlerContext;
 
@@ -237,8 +239,15 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 
     // Native apps: run the enable/disable hook only when the flag actually
     // flipped — a no-op toggle (same value written twice) must not restart
-    // whatever the hook starts/stops.
+    // whatever the hook starts/stops. The same holds for a service-mode addon's
+    // background tick, started/stopped below.
+    let mut message = None;
     if prev != payload.enabled {
+        if let Some(mgr) = ctx.state.addon_manager.as_ref() {
+            if let Err(e) = mgr.apply_enabled(&payload.addon_id, payload.enabled) {
+                message = Some(format!("zapisano, ale usluga addonu nie ruszyla: {e}"));
+            }
+        }
         if let Ok(Some(addon)) = repository::get_addon(&ctx.state.db, &payload.addon_id) {
             if let Ok(manifest) = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json)
             {
@@ -267,7 +276,7 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     Ok(MessageBody::AddonToggleResponseBody(AddonToggleResponse {
         ok: true,
         enabled: payload.enabled,
-        message: None,
+        message,
     }))
 }
 
@@ -1310,9 +1319,9 @@ pub async fn addon_requirement_install(
             payload.addon_id, payload.engine_id
         )));
     }
-    if !gpu_vision_available() {
+    if !crate::vision::camera_cv_models::bundle_runs_on_this_host(&payload.engine_id) {
         return Err(ProtocolError::bad_request(
-            "this node cannot run the GPU vision path, installing the model would not help",
+            "this build cannot run the pipeline these models serve, installing them would not help",
         ));
     }
     let engine = crate::services::manifest::registry()
@@ -1348,7 +1357,7 @@ fn vision_engine_requirements(manifest_json: &str) -> Vec<tentaflow_protocol::Ad
     crate::addon::lifecycle::parse_required_vision_engines(manifest_json)
         .into_iter()
         .map(|engine_id| {
-            let status = if !gpu_vision_available() {
+            let status = if !crate::vision::camera_cv_models::bundle_runs_on_this_host(&engine_id) {
                 "unsupported_host"
             } else if vision_bundle_installed(&engine_id) {
                 "installed"
@@ -1361,16 +1370,6 @@ fn vision_engine_requirements(manifest_json: &str) -> Vec<tentaflow_protocol::Ad
             }
         })
         .collect()
-}
-
-/// True when this build runs the GPU vision path the camera-CV engines need.
-fn gpu_vision_available() -> bool {
-    cfg!(all(
-        any(target_os = "linux", target_os = "windows"),
-        feature = "inference-vision-gpu",
-        feature = "vision-ort",
-        feature = "vision-cuda-preprocess"
-    ))
 }
 
 /// True when every file of the engine's camera-CV bundle is present locally.
@@ -2134,6 +2133,10 @@ pub fn addon_instance_dispatch(
                 // packages duplicate freely).
                 let singleton = crate::addon::lifecycle::manifest_is_singleton(&row.manifest_json)
                     .unwrap_or(false);
+                let install_steps =
+                    crate::addon::lifecycle::parse_manifest_toml(&row.manifest_json)
+                        .map(|m| m.install_steps.iter().map(install_step_info).collect())
+                        .unwrap_or_default();
                 packages.push(AddonPackageInfo {
                     package_id: row.package_id,
                     name: row.name,
@@ -2146,6 +2149,7 @@ pub fn addon_instance_dispatch(
                     ),
                     connection_params,
                     singleton,
+                    install_steps,
                 });
             }
             P::ResCatalogList { packages }
@@ -2231,8 +2235,31 @@ pub fn addon_instance_dispatch(
             };
             P::ResUpdate(res)
         }
+        P::ReqInstallStep(r) => {
+            validate_addon_id(&r.addon_id)?;
+            let outcome = crate::addon::install_steps::run_instance_step(
+                db,
+                &r.addon_id,
+                &r.step_id,
+                &r.values,
+            )
+            .map_err(|refusal| ProtocolError::bad_request(refusal.to_string()))?;
+            P::ResInstallStep(AddonInstanceInstallStepResponse {
+                status: match outcome.status {
+                    InstallStepStatus::Ok => AddonInstallStepStatus::Ok,
+                    InstallStepStatus::Warning => AddonInstallStepStatus::Warning,
+                    InstallStepStatus::Failed => AddonInstallStepStatus::Failed,
+                },
+                message: outcome.message,
+                details: outcome.details,
+            })
+        }
         // Res* nie sa prawidlowymi requestami.
-        P::ResCatalogList { .. } | P::ResInstall(_) | P::ResVersions(_) | P::ResUpdate(_) => {
+        P::ResCatalogList { .. }
+        | P::ResInstall(_)
+        | P::ResVersions(_)
+        | P::ResUpdate(_)
+        | P::ResInstallStep(_) => {
             return Err(ProtocolError::bad_request("unexpected response variant"));
         }
     };
@@ -2282,6 +2309,41 @@ register_addon_instance_variant!(
     "tentaflow_ws_handler_addon_instance_update",
     crate::dispatch::SessionAuthKind::Admin
 );
+register_addon_instance_variant!(
+    "AddonInstanceInstallStepRequest",
+    "tentaflow_ws_handler_addon_instance_install_step",
+    crate::dispatch::SessionAuthKind::Admin
+);
+
+/// A manifest step as the catalog sends it to the install UI.
+fn install_step_info(
+    step: &crate::addon::install_steps::InstallStepSpec,
+) -> tentaflow_protocol::AddonInstallStepInfo {
+    tentaflow_protocol::AddonInstallStepInfo {
+        id: step.id.clone(),
+        title_key: step.title_key.clone(),
+        description_key: step.description_key.clone(),
+        fields: step
+            .fields
+            .iter()
+            .map(|f| tentaflow_protocol::AddonInstallStepField {
+                id: f.id.clone(),
+                kind: f.kind.as_str().to_string(),
+                label_key: f.label_key.clone(),
+                required: f.required,
+                default_value: f.default.clone(),
+                options: f
+                    .options
+                    .iter()
+                    .map(|o| tentaflow_protocol::AddonInstallStepOption {
+                        value: o.value.clone(),
+                        label_key: o.label_key.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
 
 // =============================================================================
 // Storage stats addona (zakladka Powiazania) — KV / SQL / Vector / Recording.

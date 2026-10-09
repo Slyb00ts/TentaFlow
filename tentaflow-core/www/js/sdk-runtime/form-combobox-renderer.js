@@ -21,7 +21,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
@@ -398,7 +398,7 @@ function renderCombobox(component, ctx) {
       return;
     }
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, bindPath));
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));
@@ -516,7 +516,7 @@ function renderAutocomplete(component, ctx) {
       detail: { value: q, kind: 'tstr' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, bindPath));
     if (q.length < minSearchChars) {
       if (debounceTimer) {
         clearTimeout(debounceTimer);
@@ -543,7 +543,7 @@ function renderAutocomplete(component, ctx) {
       detail: { value: el.value, kind: 'tstr' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, bindPath));
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

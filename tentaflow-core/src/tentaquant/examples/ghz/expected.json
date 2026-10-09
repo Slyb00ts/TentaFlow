@@ -1,0 +1,7 @@
+{
+  "shots": 4096,
+  "seed": 7,
+  "tolerance": 0.05,
+  "fill": "qubits",
+  "outcomes": { "0": 0.5, "1": 0.5 }
+}

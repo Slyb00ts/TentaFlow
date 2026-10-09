@@ -144,7 +144,7 @@ pub enum CoreSyncResourceKind {
     /// the scene's owner — which is what keeps LWW from ever deciding between
     /// a human's placement and a drift correction.
     MapDevicePlacement,
-    /// Organization structure (migration 178). Every one of these is a fact
+    /// Organization structure (migration 180). Every one of these is a fact
     /// about the organization itself, edited by an administrator on any node,
     /// so all nine travel; see `services::org_structure::replication` for the
     /// shared row shape.
@@ -157,7 +157,7 @@ pub enum CoreSyncResourceKind {
     OrgAssignment,
     OrgStructureSettings,
     OrgChangeSet,
-    /// Deputies and absences (migration 179).
+    /// Deputies and absences (migration 181).
     OrgDeputy,
     OrgAbsence,
 }

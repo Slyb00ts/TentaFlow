@@ -95,6 +95,24 @@ export function fmtDuration(ms) {
   return T('fmt.seconds', { count: fmtCount(secs), n: secs });
 }
 
+/**
+ * How a consumer is named: a key's group (`k:<key id>[.<name>]`) after its
+ * key — "Klucz Portal", "Portal · raporty" — the group of a key that no
+ * longer exists as such, any other group by its own name.
+ */
+export function consumerLabel(g) {
+  const id = String(g?.group ?? '');
+  if (g?.keyGone) return T('consumers.key_gone');
+  if (!g?.keyName) return id;
+  const dot = id.indexOf('.');
+  return dot > 0
+    ? T('consumers.key_group_named', { name: g.keyName, suffix: id.slice(dot + 1) })
+    : T('consumers.key_group', { name: g.keyName });
+}
+
+/** Whether a consumer is a key's group (its raw name is then not a name to show). */
+export const isKeyGroup = (g) => Boolean(g?.keyName || g?.keyGone);
+
 /** A calendar date in the reader's locale: "24.08.2026". `—` for no value. */
 export function fmtDate(ms) {
   const at = new Date(Number(ms));

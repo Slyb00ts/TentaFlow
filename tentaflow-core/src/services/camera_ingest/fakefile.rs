@@ -1389,10 +1389,10 @@ pub fn crop_nv12(
     (out, ex0, ey0, ecw, ech)
 }
 
-/// Convert a whole packed NV12 frame to tightly-packed RGB24. Used by the lazy
-/// snapshot convert and the analysis-flow image blob — both rare paths where an
-/// RGB frame is genuinely needed (never the per-frame hot path). Delegates to
-/// [`crop_nv12`] over the full frame (origin already even).
+/// Convert a whole packed NV12 frame to tightly-packed RGB24: snapshots, the
+/// analysis-flow image blob, and every frame the gesture and depth engines read.
+/// Row bands convert on all cores at once — a 1080p frame is ~2 M pixels, and on
+/// one core the conversion alone would cap those engines' frame rate.
 pub fn nv12_frame_to_rgb24(
     data: &[u8],
     width: u32,
@@ -1411,11 +1411,39 @@ pub fn nv12_frame_to_rgb24(
     else {
         return None;
     };
-    let (rgb, _, _, _, _) = crop_nv12(
-        data, width, height, y_stride, uv_stride, y_offset, uv_offset, kr, kb, full_range, 0, 0,
-        width, height,
-    );
-    Some(rgb)
+    let (w, h) = (width as usize, height as usize);
+    let (ys, uvs) = (y_stride as usize, uv_stride as usize);
+    let (yp, uvp) = (data.get(y_offset as usize..)?, data.get(uv_offset as usize..)?);
+    if w == 0 || h == 0 || yp.len() < (h - 1) * ys + w || uvp.len() < ((h - 1) / 2) * uvs + ((w - 1) / 2) * 2 + 2 {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 3];
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    // Bands of whole row pairs, so a band never splits a chroma row.
+    let band_rows = (h.div_ceil(threads) + 1) & !1;
+    std::thread::scope(|scope| {
+        for (band, rows) in out.chunks_mut(band_rows.max(2) * w * 3).enumerate() {
+            scope.spawn(move || {
+                let first = band * band_rows.max(2);
+                for (i, row) in rows.chunks_exact_mut(w * 3).enumerate() {
+                    let sy = first + i;
+                    let (y_row, uv_row) = (sy * ys, (sy >> 1) * uvs);
+                    for (sx, px) in row.chunks_exact_mut(3).enumerate() {
+                        let c = uv_row + (sx >> 1) * 2;
+                        px.copy_from_slice(&nv12_yuv_to_rgb_u8(
+                            yp[y_row + sx],
+                            uvp[c],
+                            uvp[c + 1],
+                            kr,
+                            kb,
+                            full_range,
+                        ));
+                    }
+                }
+            });
+        }
+    });
+    Some(out)
 }
 
 /// Seek the pipeline back to position 0. Used on EOS to implement the replay
@@ -1432,6 +1460,31 @@ pub fn seek_to_start(pipeline: &gst::Pipeline) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_frame_conversion_matches_the_crop_path_on_every_pixel() {
+        // Odd sizes and padded strides, so band edges and the last chroma column
+        // are exercised.
+        let (w, h, ys, uvs) = (37u32, 23u32, 40u32, 40u32);
+        let uv_offset = ys * h;
+        let len = (uv_offset + uvs * h.div_ceil(2)) as usize;
+        let data: Vec<u8> = (0..len).map(|i| (i * 7919 % 251) as u8).collect();
+        let format = DetectFrameFormat::Nv12 {
+            y_stride: ys,
+            uv_stride: uvs,
+            y_offset: 0,
+            uv_offset,
+            kr: 0.2126,
+            kb: 0.0722,
+            full_range: false,
+        };
+        let fast = nv12_frame_to_rgb24(&data, w, h, &format).unwrap();
+        let (reference, ..) =
+            crop_nv12(&data, w, h, ys, uvs, 0, uv_offset, 0.2126, 0.0722, false, 0, 0, w, h);
+        assert_eq!(fast, reference);
+        // A buffer too short for its strides is refused, not read past.
+        assert!(nv12_frame_to_rgb24(&data[..len - 10], w, h, &format).is_none());
+    }
 
     #[test]
     fn test_resolve_file_url_strips_scheme() {

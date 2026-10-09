@@ -126,3 +126,16 @@ test('empty, loading and failed tab', () => {
   failed.body.querySelector('[data-go="retry"]').click();
   assert.deepEqual(failed.moves, [{ kind: 'retry' }]);
 });
+
+test('a key\'s consumer is named after its key; a gone key\'s consumer is said to be gone and waits for nobody', () => {
+  const groups = [
+    { group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki-badan', commitMode: 'explicit', paused: false, lagTotal: 5, keyName: 'Portal' },
+    { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c.nocny', topic: 'wyniki-badan', commitMode: 'explicit', paused: false, lagTotal: 900, keyGone: true },
+  ];
+  const rows = consumerRows({ groups, stats: null, nowMs: NOW });
+  assert.deepEqual(rows.map((r) => r.label), ['Klucz Portal', 'Klucz usunięty']);
+  const { rows: shown, counts } = filterConsumerRows(rows, {});
+  assert.equal(counts.delayed, 1, 'only the live key\'s consumer is delayed');
+  assert.deepEqual(consumersFooter(shown), { consumers: 2, waiting: 5, paused: 0 });
+  assert.equal(filterConsumerRows(rows, { query: 'portal' }).rows.length, 1, 'found by the key\'s name');
+});

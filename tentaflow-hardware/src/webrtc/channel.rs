@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
@@ -89,6 +89,15 @@ pub enum DcMessage {
     Binary(Vec<u8>),
 }
 
+/// An inbound message with the wall-clock time it arrived. A consumer polls the
+/// queue on its own cadence, so the poll time can trail the arrival by a whole
+/// poll interval — too late for data matched against other sensors by time.
+#[derive(Debug, Clone)]
+pub struct DcInbound {
+    pub msg: DcMessage,
+    pub received_unix_ms: u64,
+}
+
 /// Application-level keepalive used to measure true round-trip latency to the
 /// peer (the transport ICE RTT is unreliable on LAN). The caller supplies the
 /// vendor-specific ping text and a substring that identifies the peer's reply,
@@ -148,7 +157,7 @@ impl Default for WebRtcConfig {
 pub struct WebRtcChannel {
     pc: Arc<RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
-    inbound: Arc<Mutex<VecDeque<DcMessage>>>,
+    inbound: Arc<Mutex<VecDeque<DcInbound>>>,
     inbound_capacity: usize,
     dropped: Arc<AtomicU64>,
     state: Arc<AtomicU8>,
@@ -285,7 +294,7 @@ impl WebRtcChannel {
             Box::pin(async {})
         }));
 
-        let inbound = Arc::new(Mutex::new(VecDeque::<DcMessage>::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::<DcInbound>::new()));
         let dropped = Arc::new(AtomicU64::new(0));
         let inbound_cb = inbound.clone();
         let dropped_cb = dropped.clone();
@@ -300,7 +309,11 @@ impl WebRtcChannel {
             let last_ka = last_ka_cb.clone();
             let rtt = rtt_cb.clone();
             Box::pin(async move {
-                let item = if msg.is_string {
+                let received_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let msg = if msg.is_string {
                     match String::from_utf8(msg.data.to_vec()) {
                         Ok(s) => {
                             // App-level keepalive RTT: the reply is identified by
@@ -320,6 +333,7 @@ impl WebRtcChannel {
                 } else {
                     DcMessage::Binary(msg.data.to_vec())
                 };
+                let item = DcInbound { msg, received_unix_ms };
                 let mut q = inbound.lock().await;
                 if q.len() >= cap {
                     q.pop_front();
@@ -407,7 +421,7 @@ impl WebRtcChannel {
     /// Drain all buffered inbound messages (pull model — the addon polls this).
     pub async fn dc_drain(&self) -> Vec<DcMessage> {
         let mut q = self.inbound.lock().await;
-        q.drain(..).collect()
+        q.drain(..).map(|i| i.msg).collect()
     }
 
     /// Drain up to `max_count` inbound messages (stopping early once accumulated
@@ -419,12 +433,12 @@ impl WebRtcChannel {
         &self,
         max_count: usize,
         max_bytes: usize,
-    ) -> (Vec<DcMessage>, usize) {
+    ) -> (Vec<DcInbound>, usize) {
         let mut q = self.inbound.lock().await;
         let mut out = Vec::new();
         let mut bytes = 0usize;
         while out.len() < max_count {
-            let sz = match q.front() {
+            let sz = match q.front().map(|i| &i.msg) {
                 Some(DcMessage::Text(s)) => s.len(),
                 Some(DcMessage::Binary(b)) => b.len(),
                 None => break,

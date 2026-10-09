@@ -20,8 +20,9 @@ platforms = ["linux"]
 wasm_file = "addon.wasm"
 
 # Service tick drives the connection state machine (validation handshake) and
-# continuous telemetry (battery + RTT). 200ms so the validation challenge is
-# answered promptly; telemetry/publish is throttled inside on_tick.
+# continuous telemetry (battery + RTT); status/publish is throttled to once a
+# second inside on_tick. Connecting itself runs on a worker (go2.connect started
+# in the background), so a robot that does not answer never stalls the tick.
 [service]
 enabled = true
 # 100ms = sweet spot for LiDAR: the Go2 firmware publishes the voxel map at only
@@ -100,6 +101,11 @@ provider = "unitree"
 [[requires.vision_engine]]
 engine = "privacy-cv"
 
+# Gesture reactions (wave → hello, heart → heart) read body pose and hand
+# keypoints with the models of this bundle.
+[[requires.vision_engine]]
+engine = "gesture-cv"
+
 [config.schema]
 ip = { type = "string", label = "Adres IP robota", required = true }
 serial = { type = "string", label = "Numer seryjny (opcjonalnie)", required = false }
@@ -160,8 +166,8 @@ risk = "medium"
 
 [[permission]]
 id = "lidar.publish"
-display_name = "Publikacja chmury punktów LiDAR"
-description = "Publikacja kanonicznej, niezależnej od producenta ramki chmury punktów (spakowane f32) robota do hosta na potrzeby podglądu 3D."
+display_name = "Publikacja chmury punktów LiDAR i pozycji robota"
+description = "Publikacja kanonicznej, niezależnej od producenta ramki chmury punktów (spakowane f32) oraz pozycji robota z odometrii do hosta — podgląd 3D i umieszczanie chmury głębi z kamery."
 risk = "low"
 
 [[permission]]

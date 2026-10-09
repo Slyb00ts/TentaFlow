@@ -20,7 +20,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef, formatValue } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, formatValue, tagBoundEdit, tagBoundEdits } from './bind-resolver.js';
 
 // =============================================================================
 // Walidatory
@@ -302,24 +302,26 @@ function renderSlider(component, ctx) {
     if (!e.detail || typeof e.detail.value !== 'string') return;
     const v = Number.parseFloat(e.detail.value);
     if (!Number.isFinite(v)) return;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new CustomEvent('input', {
         bubbles: false,
         detail: { value: v, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   const onChange = (e) => {
     e.stopPropagation();
     if (!e.detail || typeof e.detail.value !== 'string') return;
     const v = Number.parseFloat(e.detail.value);
     if (!Number.isFinite(v)) return;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new CustomEvent('change', {
         bubbles: false,
         detail: { value: v, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   slider.addEventListener('input', onInput);
   slider.addEventListener('change', onChange);
@@ -414,23 +416,25 @@ function buildSliderUi({
     e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('input', {
         bubbles: false,
         detail: { value: v, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   const onChange = (e) => {
     e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: v, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   input.addEventListener('input', onInput);
   input.addEventListener('change', onChange);
@@ -608,12 +612,13 @@ function renderRangeSlider(component, ctx) {
       return;
     }
     lastMin = lo; lastMax = hi;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdits(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: { min: lo, max: hi }, kind: 'range', changed: which },
-      })
-    );
+      }),
+      [[bindPathMin, lo], [bindPathMax, hi]]
+    ));
   };
   // Native change bubbles to the wrapper; stop it so the dispatcher only
   // sees the validated SDK range event.
@@ -885,37 +890,40 @@ function buildNumericUi({
     e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) {
-      wrapper.dispatchEvent(
+      wrapper.dispatchEvent(tagBoundEdit(
         new (globalThis.CustomEvent || globalThis.Event)('change', {
           bubbles: false,
           detail: { value: null, kind: null },
-        })
-      );
+        }),
+        bindPath
+      ));
       return;
     }
     // Round na precision miejsc — defensywne; browser już clamp'uje wartość
     // do step ale precision niezawsze.
     const factor = Math.pow(10, precision);
     const rounded = Math.round(v * factor) / factor;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: extraSpec
           ? { value: rounded, kind: 'f64', currency: extraSpec.currencyCode }
           : { value: rounded, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   const onInput = (e) => {
     e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('input', {
         bubbles: false,
         detail: { value: v, kind: 'f64' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   input.addEventListener('change', onChange);
   input.addEventListener('input', onInput);

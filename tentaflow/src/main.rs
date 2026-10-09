@@ -810,6 +810,9 @@ async fn run_server(args: Args) -> Result<()> {
     // Wpiecie reconcilera mesh-sync: gdy zreplikowana instancja addona wyladuje,
     // sync runtime kaze AddonManagerowi zaladowac/odladowac runtime wg stanu DB.
     tentaflow_core::sync::runtime::set_global_addon_reconciler(addon_manager.clone());
+    // Lets a service addon hand slow work (a robot reconnect) to a worker
+    // instead of stalling its own tick.
+    tentaflow_core::addon::background::set_manager(&addon_manager);
     router
         .service_manager()
         .set_event_bus(addon_manager.event_bus().clone());

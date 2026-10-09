@@ -34,6 +34,19 @@ pub const KEY_STATUS: &str = "live:status";
 /// the old `robot_live.lidar_enabled` column did.
 pub const KEY_LIDAR_ENABLED: &str = "lidar:enabled";
 
+/// Operator intent: react to people's gestures seen by the robot camera. Default
+/// OFF (absent ⇒ false) and reset to OFF at every process start: reactions move
+/// the robot on their own, so they run only after someone switched them on in
+/// the current run. Survives reconnects. Core's gesture engine follows it through
+/// the robot's status.
+pub const KEY_GESTURES_ENABLED: &str = "gestures:enabled";
+
+/// Marks that this process already applied the session defaults (LiDAR on,
+/// gestures off). Ephemeral (lives as long as the host process) and shared by all
+/// instances: `on_start` runs for every pooled worker, so without it each new
+/// worker would reset the operator's choices.
+pub const KEY_SESSION_DEFAULTS_APPLIED: &str = "live:session_defaults_applied";
+
 /// Operator CONNECT intent. Durable, DEFAULT-ON (absent ⇒ true): the service tick
 /// auto-connects when offline so a robot comes online by itself; an explicit
 /// disconnect sets it false so it stays down (no auto-reconnect) until reconnected.

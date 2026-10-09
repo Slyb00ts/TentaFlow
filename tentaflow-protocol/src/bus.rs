@@ -322,6 +322,15 @@ pub struct BusGroupSummaryWire {
     /// from a peer built before this field existed.
     #[serde(default)]
     pub can_admin: bool,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 /// One partition's state for `GroupDetailResponse` — `committed_offset` is
@@ -342,6 +351,15 @@ pub struct BusGroupDetailWire {
     pub commit_mode: String,
     pub paused: bool,
     pub partitions: Vec<BusGroupPartitionDetailWire>,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 /// `OffsetResetRequest.mode` (PLAN M04's "4 tryby" reset-offset modal).
@@ -581,7 +599,7 @@ pub struct BusFieldActionWire {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusSchemaSubjectWire {
     pub subject: String,
-    /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+    /// 'json_schema' | 'avro' | 'protobuf' | 'thrift' | 'xsd' | 'hl7v2_profile'.
     pub schema_type: String,
     /// 'none' | 'backward' | 'forward' | 'full'.
     pub compatibility: String,
@@ -719,6 +737,15 @@ pub struct BusGroupStatsWire {
     /// integer keeps sub-1/s consumers visible.
     #[serde(default)]
     pub consume_rate_per_min: Option<u64>,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -800,6 +827,15 @@ pub struct BusCapabilitiesWire {
     /// 'mask'/'hash' once implemented).
     #[serde(default)]
     pub field_actions: Vec<String>,
+    /// The caller's organisation every call of this session runs in — the
+    /// middle part of a topic right's id and the `?org_id=` of the REST
+    /// address a system is given with its key. Empty on a peer built before
+    /// this field existed.
+    #[serde(default)]
+    pub org_id: String,
+    /// That organisation's display name; `None` when unknown to this node.
+    #[serde(default)]
+    pub org_name: Option<String>,
 }
 
 /// The calling session's effective rights on ONE topic
@@ -1240,6 +1276,18 @@ pub enum BusPayload {
         fields: Vec<String>,
         #[serde(default)]
         required_fields: Vec<String>,
+        /// Compare-and-set against the stored row, checked in the same
+        /// transaction as the write. `Some(ts)`: the rule must exist and
+        /// carry exactly this `updated_at_ms` (what the list returned),
+        /// otherwise `bus.field_policy_changed`. `None` together with
+        /// `expect_absent == false` writes unconditionally (older clients).
+        #[serde(default)]
+        expected_updated_at_ms: Option<i64>,
+        /// The rule must not exist yet (an "add"); a rule that appeared
+        /// meanwhile is refused with `bus.field_policy_changed`. Sent
+        /// together with `expected_updated_at_ms` it is `InvalidArgument`.
+        #[serde(default)]
+        expect_absent: bool,
     },
     FieldPolicySetResponse,
     FieldPolicyDeleteRequest {
@@ -1247,6 +1295,12 @@ pub enum BusPayload {
         subject_type: String,
         subject_id: String,
         direction: String,
+        /// The rule must still carry exactly this `updated_at_ms` (what the
+        /// list returned), checked in the delete's own transaction; a rule
+        /// that changed or vanished is refused with `bus.field_policy_changed`
+        /// and nothing is removed. `None` deletes unconditionally.
+        #[serde(default)]
+        expected_updated_at_ms: Option<i64>,
     },
     FieldPolicyDeleteResponse,
 
@@ -1296,7 +1350,7 @@ pub enum BusPayload {
     },
     SchemaRegisterRequest {
         subject: String,
-        /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+        /// 'json_schema' | 'avro' | 'protobuf' | 'thrift' | 'xsd' | 'hl7v2_profile'.
         schema_type: String,
         schema_text: String,
         /// 'none' | 'backward' | 'forward' | 'full'; `None` = leave/default
@@ -1690,6 +1744,8 @@ mod tests {
                 updated_at_ms: 2,
                 lag_total: Some(18_420),
                 can_admin: true,
+                key_name: Some("Portal wyników".to_string()),
+                key_gone: false,
             }],
         });
     }
@@ -1711,6 +1767,8 @@ mod tests {
                     committed_offset: 100,
                     lag: 5,
                 }],
+                key_name: None,
+                key_gone: true,
             },
         });
     }
@@ -1993,6 +2051,8 @@ mod tests {
                     paused: false,
                     lag_rising_since_ms: Some(1_755_999_000_000),
                     consume_rate_per_min: Some(24_000),
+                    key_name: None,
+                    key_gone: false,
                 }],
             },
         });
@@ -2248,6 +2308,8 @@ mod tests {
                 ],
                 schema_types: vec!["json_schema".to_string()],
                 field_actions: vec!["hide".to_string()],
+                org_id: "org-default".to_string(),
+                org_name: Some("Przychodnia Zdrowie".to_string()),
             },
         });
     }
@@ -2428,6 +2490,18 @@ mod tests {
             direction: "read".to_string(),
             fields: vec!["patient_id".to_string()],
             required_fields: vec![],
+            expected_updated_at_ms: Some(2000),
+            expect_absent: false,
+        });
+        round_trip(BusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+            direction: "write".to_string(),
+            fields: vec![],
+            required_fields: vec![],
+            expected_updated_at_ms: None,
+            expect_absent: true,
         });
         round_trip(BusPayload::FieldPolicySetResponse);
         round_trip(BusPayload::FieldPolicyDeleteRequest {
@@ -2435,6 +2509,14 @@ mod tests {
             subject_type: "user".to_string(),
             subject_id: "u-1".to_string(),
             direction: "read".to_string(),
+            expected_updated_at_ms: None,
+        });
+        round_trip(BusPayload::FieldPolicyDeleteRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            direction: "read".to_string(),
+            expected_updated_at_ms: Some(1_790_000_000_123),
         });
         round_trip(BusPayload::FieldPolicyDeleteResponse);
     }
@@ -2566,9 +2648,46 @@ mod tests {
         let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
         match decoded {
             BusPayload::FieldPolicySetRequest {
-                required_fields, ..
-            } => assert!(required_fields.is_empty()),
+                required_fields,
+                expected_updated_at_ms,
+                expect_absent,
+                ..
+            } => {
+                assert!(required_fields.is_empty());
+                // Older clients write unconditionally.
+                assert_eq!(expected_updated_at_ms, None);
+                assert!(!expect_absent);
+            }
             other => panic!("expected FieldPolicySetRequest, got {other:?}"),
+        }
+    }
+
+    /// A client built before `FieldPolicyDeleteRequest.expected_updated_at_ms`
+    /// existed still deletes, unconditionally.
+    #[test]
+    fn field_policy_delete_expected_updated_at_defaults_when_absent() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            FieldPolicyDeleteRequest {
+                topic: String,
+                subject_type: String,
+                subject_id: String,
+                direction: String,
+            },
+        }
+        let legacy = LegacyBusPayload::FieldPolicyDeleteRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+            direction: "read".to_string(),
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode");
+        match crate::cbor::decode::<BusPayload>(&bytes).expect("decode") {
+            BusPayload::FieldPolicyDeleteRequest {
+                expected_updated_at_ms,
+                ..
+            } => assert_eq!(expected_updated_at_ms, None),
+            other => panic!("expected FieldPolicyDeleteRequest, got {other:?}"),
         }
     }
 
@@ -2994,6 +3113,8 @@ mod tests {
                     content_types: vec![],
                     schema_types: vec![],
                     field_actions: vec![],
+                    org_id: String::new(),
+                    org_name: None,
                 },
             }
         );

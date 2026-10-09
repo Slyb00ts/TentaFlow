@@ -495,6 +495,10 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::FieldPolicyPayloadMalformed { topic, format } => ProtocolError::bad_request(
             format!("bus.field_policy_payload_malformed: topic '{topic}' expected {format}"),
         ),
+        BusServiceError::FieldPolicyChanged { topic } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.field_policy_changed: topic '{topic}'"),
+        ),
         BusServiceError::KeyNeedsTopicWideRule { topic, direction } => ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             format!("bus.key_needs_topic_wide_rule: topic '{topic}' direction={direction}"),
@@ -1497,6 +1501,8 @@ pub async fn bus_dispatch(
             direction,
             fields,
             required_fields,
+            expected_updated_at_ms,
+            expect_absent,
         } => {
             field_policy_set_v1(
                 ctx,
@@ -1507,6 +1513,8 @@ pub async fn bus_dispatch(
                 direction.clone(),
                 fields.clone(),
                 required_fields.clone(),
+                *expected_updated_at_ms,
+                *expect_absent,
             )
             .await?
         }
@@ -1515,6 +1523,7 @@ pub async fn bus_dispatch(
             subject_type,
             subject_id,
             direction,
+            expected_updated_at_ms,
         } => {
             field_policy_delete_v1(
                 ctx,
@@ -1523,6 +1532,7 @@ pub async fn bus_dispatch(
                 subject_type.clone(),
                 subject_id.clone(),
                 direction.clone(),
+                *expected_updated_at_ms,
             )
             .await?
         }
@@ -2148,20 +2158,27 @@ async fn group_list_v1(
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
     let org_admin = is_org_admin(ctx);
+    let db = ctx.state.db.clone();
     let groups = run_blocking(move || {
         let rows = visible_groups(&svc, &bctx, &org_id)?;
+        let keys = KeyGroupNames::load(&db)?;
         let mut access = TopicAccessCache::default();
         Ok(rows
             .into_iter()
-            .map(|g| BusGroupSummaryWire {
-                lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
-                can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
-                group: g.group_id,
-                topic: g.topic,
-                commit_mode: g.commit_mode,
-                paused: g.paused,
-                created_at_ms: g.created_at_ms,
-                updated_at_ms: g.updated_at_ms,
+            .map(|g| {
+                let (key_name, key_gone) = keys.of(&g.group_id);
+                BusGroupSummaryWire {
+                    lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
+                    can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
+                    group: g.group_id,
+                    topic: g.topic,
+                    commit_mode: g.commit_mode,
+                    paused: g.paused,
+                    created_at_ms: g.created_at_ms,
+                    updated_at_ms: g.updated_at_ms,
+                    key_name,
+                    key_gone,
+                }
             })
             .collect())
     })
@@ -2169,8 +2186,86 @@ async fn group_list_v1(
     Ok(BusPayload::GroupListResponse { groups })
 }
 
+/// The names of the API keys behind `k:<key uid>[.<name>]` consumer groups,
+/// read once per request: a key's group is listed under its key's name, and
+/// the group of a key that no longer exists is marked as such.
+struct KeyGroupNames(std::collections::HashMap<String, String>);
+
+impl KeyGroupNames {
+    fn load(db: &crate::db::DbPool) -> Result<Self, ProtocolError> {
+        Ok(Self(
+            repository::list_api_keys(db)
+                .map_err(|e| db_err("list_api_keys", e))?
+                .into_iter()
+                .map(|k| (k.uid, k.name))
+                .collect(),
+        ))
+    }
+
+    /// `(key_name, key_gone)` of a group: the key's name while the key
+    /// exists, `key_gone` for a key's group whose key does not; `(None,
+    /// false)` for every other group.
+    fn of(&self, group: &str) -> (Option<String>, bool) {
+        let Some(rest) = group.strip_prefix(bus::API_KEY_GROUP_PREFIX) else {
+            return (None, false);
+        };
+        let uid = rest.split_once('.').map_or(rest, |(uid, _)| uid);
+        match self.0.get(uid) {
+            Some(name) => (Some(name.clone()), false),
+            None => (None, true),
+        }
+    }
+}
+
 fn is_org_admin(ctx: &HandlerContext) -> bool {
     ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"))
+}
+
+/// The one check behind everything that changes who is restricted from what
+/// on a topic (its data-hiding rules, the schema derived from them, its access
+/// entries, and an API key's topic right) and behind listing the rules: the
+/// caller must administer THAT topic — a topic ACL deny on `admin` counts —
+/// and hold the organisation Admin role. The instance `bus.admin` tier alone
+/// is not enough; it is what an operator delegated by the matrix holds without
+/// being an administrator of every topic. Reading the access list itself
+/// (`acl_list_v1`) stays at `gate_read`.
+async fn require_topic_admin(
+    ctx: &HandlerContext,
+    g: &Gate,
+    topic: &str,
+) -> Result<(), ProtocolError> {
+    let bctx = bus_ctx(ctx, g);
+    let svc = g.svc.clone();
+    let topic_for_access = topic.to_string();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    topic_admin_verdict(ctx, topic_admin, topic)
+}
+
+/// `require_topic_admin` for the synchronous API key handlers, which cannot
+/// await; the same answer, asked of the same engine.
+fn require_topic_admin_blocking(
+    ctx: &HandlerContext,
+    g: &Gate,
+    topic: &str,
+) -> Result<(), ProtocolError> {
+    let (_, _, topic_admin) = g.svc.topic_access(&bus_ctx(ctx, g), topic);
+    topic_admin_verdict(ctx, topic_admin, topic)
+}
+
+fn topic_admin_verdict(
+    ctx: &HandlerContext,
+    topic_admin: bool,
+    topic: &str,
+) -> Result<(), ProtocolError> {
+    if topic_admin && is_org_admin(ctx) {
+        Ok(())
+    } else {
+        Err(map_bus_error(BusServiceError::PermissionDenied {
+            action: bus::BusAction::Admin.as_str(),
+            topic: topic.to_string(),
+        }))
+    }
 }
 
 /// `BusService::topic_access` per distinct topic: a group list touches the
@@ -2277,6 +2372,9 @@ async fn group_detail_v1(
     })
     .await?;
 
+    let db = ctx.state.db.clone();
+    let keys = run_blocking(move || KeyGroupNames::load(&db)).await?;
+    let (key_name, key_gone) = keys.of(&row.group_id);
     Ok(BusPayload::GroupDetailResponse {
         detail: BusGroupDetailWire {
             group: row.group_id,
@@ -2284,6 +2382,8 @@ async fn group_detail_v1(
             commit_mode: row.commit_mode,
             paused: row.paused,
             partitions,
+            key_name,
+            key_gone,
         },
     })
 }
@@ -2829,6 +2929,15 @@ async fn acl_set_v1(
 ) -> Result<BusPayload, ProtocolError> {
     // §4.3: authorization surface — admin tier.
     let g = gate_admin(ctx, instance_id)?;
+    // Every access change — granting, denying and clearing alike — is
+    // administration of THIS topic, so a topic administrator's deny holds
+    // against an operator holding only the instance tier, and against that
+    // operator clearing it. The one exception is a site administrator, who
+    // may always clear: it is the way back into a topic whose every
+    // administrator ended up denied.
+    if access_level != "clear" || !SessionAuthKind::Admin.session_satisfies(&ctx.session) {
+        require_topic_admin(ctx, &g, &topic).await?;
+    }
     // plan-app-platform §7 W4 finding 8: validation only guards the SET
     // path. A `clear` request must always be able to remove an ACL row,
     // even one keyed by a topic name that a LATER rule change made invalid
@@ -3002,9 +3111,10 @@ pub(crate) fn audit_acl_set(
 /// entry, however it is written. The API key handlers (`ApiKeyCreateRequest`
 /// scopes, `ApiKeyScopeSetRequest`/`ClearRequest`) are site-admin only, but
 /// that alone would let a site administrator open a topic of an organisation
-/// they do not administer; so they also pass the gate `AclSetRequest` does —
-/// `bus.admin` on the instance plus the organisation's admin role — for the
-/// organisation the entry names. Returns the caller's user id and the
+/// they do not administer; so they also pass the gates `AclSetRequest` does —
+/// `bus.admin` on the instance plus the organisation's admin role for the
+/// organisation the entry names, and administration of that topic (a topic
+/// deny on `admin` holds here too). Returns the caller's user id and the
 /// topic, for the `bus.acl.set` audit row.
 pub(crate) fn require_key_topic_rights_admin(
     ctx: &HandlerContext,
@@ -3023,6 +3133,7 @@ pub(crate) fn require_key_topic_rights_admin(
             "bus.org_mismatch: a topic right is granted from within its own organisation",
         ));
     }
+    require_topic_admin_blocking(ctx, &g, topic)?;
     Ok((g.user_id, topic.to_string()))
 }
 
@@ -3083,10 +3194,12 @@ pub(crate) fn require_key_topic_rights_clear(
 // =============================================================================
 // Field policies (SUM/tentabus/POLITYKI-POL.md, F0 follow-up
 // SUM/tentabus/POLITYKI-POL-FORMATY.md — per-field access control, distinct
-// from the coarse per-topic ACL above). §4.3: List is `gate_read` (reading
-// policy shape is not itself privileged); Set/Delete are `gate_admin`
-// (authorization surface — a field policy gates exactly what PII a subject
-// can see or write).
+// from the coarse per-topic ACL above). List, Set and Delete are the admin
+// tier (authorization surface — a field policy gates exactly what PII a
+// subject can see or write, and listing it names who is restricted from what).
+// List is narrower than `gate_read` + instance admin: the caller must be an
+// administrator of THAT topic, the same check that gives the dashboard its
+// `can_admin`. A reader sees the topic only through their own hiding.
 // =============================================================================
 
 async fn field_policy_list_v1(
@@ -3095,6 +3208,7 @@ async fn field_policy_list_v1(
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    require_topic_admin(ctx, &g, &topic).await?;
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -3145,12 +3259,26 @@ async fn field_policy_set_v1(
     direction: String,
     fields: Vec<String>,
     required_fields: Vec<String>,
+    expected_updated_at_ms: Option<i64>,
+    expect_absent: bool,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
+    require_topic_admin(ctx, &g, &topic).await?;
     require_valid_subject_id(&subject_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
+    let expect = match (expected_updated_at_ms, expect_absent) {
+        (None, false) => field_policies::BusFieldPolicyExpect::Any,
+        (None, true) => field_policies::BusFieldPolicyExpect::Absent,
+        (Some(ts), false) => field_policies::BusFieldPolicyExpect::UpdatedAt(ts),
+        (Some(_), true) => {
+            return Err(ProtocolError::bad_request(
+                "bus.invalid_argument: a rule cannot be both expected absent and expected \
+                 changed at a time",
+            ))
+        }
+    };
     let org_id = g.org_id.clone();
     let actor = g.user_id.clone();
     let db = ctx.state.db.clone();
@@ -3170,6 +3298,7 @@ async fn field_policy_set_v1(
             dir,
             &fields_set,
             &required_set,
+            expect,
         )
         .map_err(map_bus_error)
     })
@@ -3196,8 +3325,10 @@ async fn field_policy_delete_v1(
     subject_type: String,
     subject_id: String,
     direction: String,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
+    require_topic_admin(ctx, &g, &topic).await?;
     // Like an ACL clear: any stored id must stay removable.
     require_non_empty_subject_id(&subject_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
@@ -3218,6 +3349,7 @@ async fn field_policy_delete_v1(
             &subject_type2,
             &subject_id2,
             dir,
+            expected_updated_at_ms,
         )
         .map_err(map_bus_error)
     })
@@ -3495,6 +3627,7 @@ async fn field_policy_preview(
             field_policies::SUBJECT_ANY
         )));
     }
+    require_topic_admin(ctx, &g, &topic).await?;
     let bctx = bus_ctx(ctx, &g);
     let svc = g.svc.clone();
     let db = ctx.state.db.clone();
@@ -3505,12 +3638,6 @@ async fn field_policy_preview(
         (topic.clone(), subject_type.clone(), subject_id.clone());
     let (record, applied, limited_by_caller) = run_blocking(move || {
         let topic = topic2;
-        if !svc.topic_access(&bctx, &topic).2 {
-            return Err(map_bus_error(BusServiceError::PermissionDenied {
-                action: bus::BusAction::Admin.as_str(),
-                topic,
-            }));
-        }
         let subject = field_policies::PolicySubject::parse(&subject_type2, &subject_id2)
             .expect("validated before the blocking task");
         if let field_policies::PolicySubject::Actor(ActorKind::User, user_id) = subject {
@@ -3724,6 +3851,10 @@ async fn schema_derived_get_v1(
     direction: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
+    // The derived schema is a rule's projection, and asking for it also
+    // tells whether a rule exists for a subject: the topic's administrators
+    // only, like the rule list.
+    require_topic_admin(ctx, &g, &topic).await?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
@@ -3755,9 +3886,10 @@ async fn schema_register_v1(
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
     let kind = schema_registry::SchemaType::parse(&schema_type).ok_or_else(|| {
-        ProtocolError::bad_request(
-            "bus.invalid_argument: schema_type must be one of json_schema|avro|protobuf|thrift",
-        )
+        ProtocolError::bad_request(format!(
+            "bus.invalid_argument: schema_type must be one of {}",
+            schema_registry::SchemaType::accepted_list()
+        ))
     })?;
     let compat = compatibility
         .as_deref()
@@ -3954,7 +4086,8 @@ async fn stats_snapshot_v1(
     let svc = g.svc.clone();
     let instance_id = svc.instance_id().to_string();
     let bctx_groups = bctx.clone();
-    let (topics, groups) = run_blocking(move || {
+    let main_db = ctx.state.db.clone();
+    let (topics, groups, keys) = run_blocking(move || {
         let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
         // Filtered here, once, exactly like `GroupList` (hidden `tf-*`
         // groups and groups of topics the caller may not read), so every
@@ -3963,7 +4096,8 @@ async fn stats_snapshot_v1(
         // what `GroupList` itself shows (M1-R2 review N-2/N-7, coordinator
         // decisions 3/7).
         let groups = visible_groups(&svc, &bctx_groups, &org_id)?;
-        Ok::<_, ProtocolError>((topics, groups))
+        let keys = KeyGroupNames::load(&main_db)?;
+        Ok::<_, ProtocolError>((topics, groups, keys))
     })
     .await?;
     let topic_count = topics.len() as u32;
@@ -4004,7 +4138,10 @@ async fn stats_snapshot_v1(
                 // A group this session cannot measure here keeps `None` and
                 // stays out of the per-topic sum.
                 let lag_total = group_lag_total(&svc, &bctx2, &row.group_id, &row.topic);
-                if let Some(lag) = lag_total {
+                let (key_name, key_gone) = keys.of(&row.group_id);
+                // Nothing reads for a key that is gone: what waits for its
+                // group waits for nobody, so it is no topic's backlog.
+                if let (Some(lag), false) = (lag_total, key_gone) {
                     *lag_by_topic.entry(row.topic.clone()).or_insert(0) += lag;
                 }
                 // The trend is derived from the same lag, so it is shown
@@ -4022,6 +4159,8 @@ async fn stats_snapshot_v1(
                     paused: row.paused,
                     lag_rising_since_ms: trend.rising_since_ms,
                     consume_rate_per_min: trend.consume_rate_per_min,
+                    key_name,
+                    key_gone,
                 });
             }
 
@@ -4212,8 +4351,15 @@ async fn capabilities_v1(
     let is_org_admin = ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"));
     let svc = g.svc.clone();
     let org_id = g.org_id.clone();
-    let (default_replication_factor, node_count) =
-        run_blocking(move || Ok(svc.default_replication(&org_id))).await?;
+    let db = ctx.state.db.clone();
+    let (default_replication_factor, node_count, org_name) = run_blocking(move || {
+        let (rf, nodes) = svc.default_replication(&org_id);
+        let org_name = crate::services::org::get_organization(&db, &org_id)
+            .map_err(|e| db_err("org::get_organization", e.into()))?
+            .map(|o| o.name);
+        Ok((rf, nodes, org_name))
+    })
+    .await?;
     let capabilities = BusCapabilitiesWire {
         can_read: true,
         can_write: can(PERM_WRITE),
@@ -4233,6 +4379,8 @@ async fn capabilities_v1(
             .map(|t| t.as_str().to_string())
             .collect(),
         field_actions: vec![FIELD_ACTION_HIDE.to_string()],
+        org_id: g.org_id.clone(),
+        org_name,
     };
     Ok(BusPayload::CapabilitiesResponse { capabilities })
 }
@@ -5131,6 +5279,17 @@ mod tests {
         }
     }
 
+    /// A context that holds the instance tier and the organisation role but
+    /// is not a site administrator (`handler_ctx` mints one).
+    fn operator_ctx(db: DbPool, org: crate::services::rbac::OrgContext) -> HandlerContext {
+        let mut ctx = handler_ctx(db, org);
+        ctx.session = SessionAuth::UserSession {
+            user_id: *uuid::Uuid::new_v4().as_bytes(),
+            role: Some("user".to_string()),
+        };
+        ctx
+    }
+
     /// Test-only helper: opens a FRESH consumer handle for `(group, topic)`
     /// off the async runtime (`tokio::task::spawn_blocking` — `bus::*`
     /// calls block synchronously, this file's own module-level BLOCKING
@@ -5938,6 +6097,44 @@ mod tests {
                 // other (see `capabilities_is_site_admin_false_for_a_non_
                 // admin_role_session` for the opposite case).
                 assert!(capabilities.is_site_admin);
+                // An organisation this node has no row for keeps its id and
+                // has no name to show.
+                assert_eq!(capabilities.org_id, org_id);
+                assert_eq!(capabilities.org_name, None);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// The access section builds a topic right's id and the REST address a
+    /// key is given from the caller's organisation; it names it too.
+    #[tokio::test]
+    async fn capabilities_name_the_callers_organisation() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-caps-org-{}", uuid::Uuid::new_v4());
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let org = crate::services::org::create_organization(
+            &db,
+            &format!("Przychodnia Zdrowie {tag}"),
+            &format!("przychodnia-{tag}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("organisation");
+        seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let ctx = handler_ctx(db, org_context(&org.org_id, &user_id, &[]));
+        match capabilities_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("capabilities")
+        {
+            BusPayload::CapabilitiesResponse { capabilities } => {
+                assert_eq!(capabilities.org_id, org.org_id);
+                assert_eq!(
+                    capabilities.org_name.as_deref(),
+                    Some(format!("Przychodnia Zdrowie {tag}").as_str())
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -6969,14 +7166,9 @@ mod tests {
 
     // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
 
-    /// plan-app-platform §4.3: `FieldPolicyListRequest` is `gate_read`, not
-    /// `gate_admin` — "reading who may touch a topic is not itself
-    /// privileged" (same rationale as `AclListRequest`). This test used to
-    /// grant `bus.read` and assert DENIAL, i.e. it asserted the OLD,
-    /// admin-only boundary; the plan moves that boundary down to `bus.
-    /// read`, so the ASSERTION (not just the setup) changes to match — a
-    /// caller with NO grant at all is denied, one with only `bus.read`
-    /// (`field_policy_list_a_read_only_caller_is_allowed` below) succeeds.
+    /// `FieldPolicyListRequest` needs no grant at all to be refused: a caller
+    /// with nothing on the instance never reaches the topic check. (Readers
+    /// and other topics' administrators: the tests below.)
     #[tokio::test]
     async fn field_policy_list_denied_without_bus_read_permission() {
         let (_guard, db) = bus_fixture();
@@ -7243,20 +7435,617 @@ mod tests {
         }
     }
 
+    /// The list names who is restricted from what, so a reader (instance
+    /// `bus.read`, however many topics) is refused; only an administrator of
+    /// the topic itself is answered, and a deny on another topic's admin
+    /// right does not carry over.
     #[tokio::test]
-    async fn field_policy_list_a_read_only_caller_is_allowed() {
+    async fn field_policy_list_is_for_the_topic_administrator_only() {
         let (_guard, db) = bus_fixture();
-        let user_id = "u-read-only-field-policy".to_string();
-        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
-        let org = org_context(&org_id, &user_id, &[]);
-        let ctx = handler_ctx(db, org);
-        field_policy_list_v1(
-            &ctx,
-            fixture_instance_id().as_str(),
-            "patients.updated".to_string(),
+        let instance = fixture_instance_id();
+        let reader_id = "u-reader-field-policy".to_string();
+        let reader_org = seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&reader_org, &reader_id, &[]));
+        let err = field_policy_list_v1(&reader, instance.as_str(), "patients.updated".to_string())
+            .await
+            .expect_err("a reader must not list the rules");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        let admin_id = format!("u-fp-admin-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let admin = handler_ctx(db.clone(), org_context(&admin_org, &admin_id, &["org.admin"]));
+        let (own, other) = ("fp.list.own".to_string(), "fp.list.other".to_string());
+        for topic in [&own, &other] {
+            topic_create_v1(&admin, instance.as_str(), topic.clone(), BusTopicOptionsWire::default())
+                .await
+                .expect("topic create");
+        }
+        field_policy_list_v1(&admin, instance.as_str(), own.clone())
+            .await
+            .expect("the topic's administrator is answered");
+        acl_set_v1(
+            &admin,
+            instance.as_str(),
+            other.clone(),
+            "user".to_string(),
+            admin_id.clone(),
+            "deny".to_string(),
+            "admin".to_string(),
         )
         .await
-        .expect("bus.read alone must be enough to list field policies");
+        .expect("deny admin on the other topic");
+        let err = field_policy_list_v1(&admin, instance.as_str(), other)
+            .await
+            .expect_err("administering one topic is not administering another");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        field_policy_list_v1(&admin, instance.as_str(), own)
+            .await
+            .expect("the first topic is still listed");
+    }
+
+    /// An instance administrator who is not an organisation administrator
+    /// has no `can_admin` on the dashboard either, and gets no list.
+    #[tokio::test]
+    async fn field_policy_list_needs_the_organisation_administrator_too() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-fp-matrix-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let ctx = handler_ctx(db, org_context(&org_id, &user_id, &[]));
+        let err = field_policy_list_v1(&ctx, fixture_instance_id().as_str(), "patients.updated".to_string())
+            .await
+            .expect_err("matrix admin without org.admin");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// An operator whose own admin right on the topic is denied by the
+    /// topic's ACL has the instance tier and the organisation role, and still
+    /// neither lists, writes, deletes, previews nor derives from the topic's
+    /// rules, nor grants, denies or clears access on it — the one check
+    /// (`require_topic_admin`) stands behind all of them. Only a site
+    /// administrator may still clear (see the tests below).
+    #[tokio::test]
+    async fn rules_and_access_changes_need_admin_on_that_topic() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let admin_id = format!("u-topic-deny-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let admin = operator_ctx(
+            db.clone(),
+            org_context(&admin_org, &admin_id, &["org.admin"]),
+        );
+        let topic = format!("deny.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &admin,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        field_policy_set_v1(
+            &admin,
+            instance.as_str(),
+            topic.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "read".to_string(),
+            vec!["a".to_string()],
+            vec![],
+            None,
+            false,
+        )
+        .await
+        .expect("a rule while still the topic's administrator");
+        acl_set_v1(
+            &admin,
+            instance.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id.clone(),
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("deny admin on the topic");
+
+        let denied = |what: &str, r: Result<BusPayload, ProtocolError>| {
+            let err = r.expect_err(what);
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{what}: {err:?}");
+        };
+        denied(
+            "list",
+            field_policy_list_v1(&admin, instance.as_str(), topic.clone()).await,
+        );
+        denied(
+            "set",
+            field_policy_set_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                "any".to_string(),
+                "*".to_string(),
+                "write".to_string(),
+                vec!["a".to_string()],
+                vec![],
+                None,
+                false,
+            )
+            .await,
+        );
+        denied(
+            "delete",
+            field_policy_delete_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                "any".to_string(),
+                "*".to_string(),
+                "read".to_string(),
+                None,
+            )
+            .await,
+        );
+        denied(
+            "preview",
+            field_policy_preview_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                0,
+                0,
+                "any".to_string(),
+                "*".to_string(),
+            )
+            .await,
+        );
+        denied(
+            "derived schema",
+            schema_derived_get_v1(
+                &admin,
+                instance.as_str(),
+                "whatever".to_string(),
+                None,
+                topic.clone(),
+                "any".to_string(),
+                "*".to_string(),
+                "read".to_string(),
+            )
+            .await,
+        );
+        denied(
+            "acl grant",
+            acl_set_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                "user".to_string(),
+                "someone".to_string(),
+                "allow".to_string(),
+                "read".to_string(),
+            )
+            .await,
+        );
+
+        denied(
+            "acl clear of its own deny",
+            acl_set_v1(
+                &admin,
+                instance.as_str(),
+                topic.clone(),
+                "user".to_string(),
+                admin_id.clone(),
+                "clear".to_string(),
+                "admin".to_string(),
+            )
+            .await,
+        );
+
+        let site_admin = handler_ctx(
+            db.clone(),
+            org_context(&admin_org, &admin_id, &["org.admin"]),
+        );
+        acl_set_v1(
+            &site_admin,
+            instance.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id.clone(),
+            "clear".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("a site administrator may always clear");
+        field_policy_delete_v1(
+            &admin,
+            instance.as_str(),
+            topic,
+            "any".to_string(),
+            "*".to_string(),
+            "read".to_string(),
+            None,
+        )
+        .await
+        .expect("with the deny gone the topic's rules are the administrator's again");
+    }
+
+    /// A deny is lifted by the topic's administrators and by a site
+    /// administrator, not by any operator who holds only the instance tier:
+    /// not another subject's read deny, and not the operator's own admin
+    /// deny.
+    #[tokio::test]
+    async fn clearing_an_access_entry_needs_admin_on_that_topic() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let operator_id = format!("u-clear-op-{}", uuid::Uuid::new_v4());
+        let org = seed_membership(&db, &operator_id, "org_admin");
+        let operator = operator_ctx(db.clone(), org_context(&org, &operator_id, &["org.admin"]));
+        let topic = format!("clear.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &operator,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        async fn acl(
+            ctx: &HandlerContext,
+            topic: &str,
+            subject: &str,
+            level: &str,
+            action: &str,
+        ) -> Result<BusPayload, ProtocolError> {
+            acl_set_v1(
+                ctx,
+                fixture_instance_id().as_str(),
+                topic.to_string(),
+                "user".to_string(),
+                subject.to_string(),
+                level.to_string(),
+                action.to_string(),
+            )
+            .await
+        }
+        async fn remaining(ctx: &HandlerContext, topic: &str) -> usize {
+            match acl_list_v1(ctx, fixture_instance_id().as_str(), topic.to_string())
+                .await
+                .expect("list")
+            {
+                BusPayload::AclListResponse { entries } => entries.len(),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        acl(&operator, &topic, "u-patient-reader", "deny", "read")
+            .await
+            .expect("the topic's administrator denies a reader");
+        acl(&operator, &topic, &operator_id, "deny", "admin")
+            .await
+            .expect("and is then denied administration itself");
+
+        for (subject, action) in [
+            ("u-patient-reader", "read"),
+            (operator_id.as_str(), "admin"),
+        ] {
+            let err = acl(&operator, &topic, subject, "clear", action)
+                .await
+                .expect_err("an operator who no longer administers the topic cannot clear");
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{err:?}");
+        }
+        assert_eq!(remaining(&operator, &topic).await, 2, "nothing was cleared");
+
+        let site_admin = handler_ctx(db, org_context(&org, &operator_id, &["org.admin"]));
+        // The IAM permission path would skip the topic-admin check and the
+        // bus audit row, so it refuses topic entries even for a site admin.
+        let iam_clear = MessageBody::IamBody(tentaflow_protocol::IamPayload::ReqClearPermission {
+            resource_type: "topic".to_string(),
+            resource_id: crate::services::bus_authorizer::topic_acl_resource_id(
+                instance.as_str(),
+                &org,
+                &topic,
+            ),
+            subject_type: "user".to_string(),
+            subject_id: "u-patient-reader".to_string(),
+        });
+        let err = crate::dispatch::handlers::iam_dispatch(&iam_clear, &site_admin)
+            .expect_err("topic entries are cleared in TentaBus only");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{err:?}");
+        assert_eq!(remaining(&operator, &topic).await, 2, "the IAM path cleared nothing");
+        for (subject, action) in [
+            ("u-patient-reader", "read"),
+            (operator_id.as_str(), "admin"),
+        ] {
+            acl(&site_admin, &topic, subject, "clear", action)
+                .await
+                .expect("a site administrator may always clear");
+        }
+        assert_eq!(remaining(&operator, &topic).await, 0);
+    }
+
+    /// The projection a rule gives a schema, and the fact that a rule exists
+    /// for a subject, are the topic administrator's to see: a reader of the
+    /// instance is refused whatever subject, version or topic it names.
+    #[tokio::test]
+    async fn schema_derived_get_is_for_the_topic_administrator_only() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let admin_id = format!("u-derived-admin-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let admin = handler_ctx(
+            db.clone(),
+            org_context(&admin_org, &admin_id, &["org.admin"]),
+        );
+        let subject = format!("derived.{}", uuid::Uuid::new_v4().simple());
+        let topic = format!("derived.{}", uuid::Uuid::new_v4().simple());
+        schema_register_v1(
+            &admin,
+            instance.as_str(),
+            subject.clone(),
+            "json_schema".to_string(),
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                .to_string(),
+            None,
+        )
+        .await
+        .expect("register");
+        topic_create_v1(
+            &admin,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        field_policy_set_v1(
+            &admin,
+            instance.as_str(),
+            topic.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "read".to_string(),
+            vec!["a".to_string()],
+            vec![],
+            None,
+            false,
+        )
+        .await
+        .expect("rule");
+
+        let derive = |ctx: HandlerContext| {
+            let (subject, topic) = (subject.clone(), topic.clone());
+            async move {
+                schema_derived_get_v1(
+                    &ctx,
+                    fixture_instance_id().as_str(),
+                    subject,
+                    None,
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                )
+                .await
+            }
+        };
+        let reader_id = "u-derived-reader".to_string();
+        let reader_org = seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&reader_org, &reader_id, &[]));
+        let err = derive(reader).await.expect_err("a reader must not derive");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        match derive(admin)
+            .await
+            .expect("the topic's administrator derives")
+        {
+            BusPayload::SchemaDerivedGetResponse { schema_text } => {
+                assert!(
+                    schema_text.contains("\"a\"") && !schema_text.contains("\"b\""),
+                    "{schema_text}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A rule is written only against what the writer last saw: an add
+    /// against "no such rule", a change against its `updated_at_ms`. The
+    /// check is the server's, in the write's own transaction, so a second
+    /// administrator's save cannot be overwritten however the first one's
+    /// window got there; a request that names neither still writes (older
+    /// clients), and naming both is refused.
+    #[tokio::test]
+    async fn field_policy_set_is_compare_and_set() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let admin_id = format!("u-cas-admin-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let ctx = handler_ctx(db, org_context(&admin_org, &admin_id, &["org.admin"]));
+        let topic = format!("cas.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        let set = |fields: &[&str], expected: Option<i64>, absent: bool| {
+            let (ctx, topic) = (&ctx, topic.clone());
+            let fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            async move {
+                field_policy_set_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                    fields,
+                    vec![],
+                    expected,
+                    absent,
+                )
+                .await
+            }
+        };
+        let stamp = || async {
+            match field_policy_list_v1(&ctx, instance.as_str(), topic.clone())
+                .await
+                .expect("list")
+            {
+                BusPayload::FieldPolicyListResponse { policies } => policies
+                    .first()
+                    .map(|p| (p.updated_at_ms, p.fields.clone())),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        };
+        let changed = |r: Result<BusPayload, ProtocolError>| {
+            let err = r.expect_err("must be refused as changed");
+            assert_eq!(err.code, ProtocolErrorCode::Conflict, "{err:?}");
+            assert!(
+                err.message.starts_with("bus.field_policy_changed"),
+                "{err:?}"
+            );
+        };
+
+        // A change of a rule nobody stored is a change of a rule that vanished.
+        changed(set(&["a"], Some(1), false).await);
+        assert_eq!(stamp().await, None, "nothing was written");
+
+        set(&["a"], None, true)
+            .await
+            .expect("an add against no rule");
+        let (first, _) = stamp().await.expect("stored");
+        changed(set(&["z"], None, true).await);
+        assert_eq!(
+            stamp().await.map(|s| s.1),
+            Some(vec!["a".to_string()]),
+            "the add that lost wrote nothing"
+        );
+
+        set(&["a", "b"], Some(first), false)
+            .await
+            .expect("a change of the rule as listed");
+        let (second, fields) = stamp().await.expect("stored");
+        assert_eq!(fields, vec!["a".to_string(), "b".to_string()]);
+        assert!(second > first, "a replacing write always moves the stamp");
+
+        // The window that listed the rule before that change loses.
+        changed(set(&["c"], Some(first), false).await);
+        assert_eq!(
+            stamp().await.map(|s| s.1),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+
+        let both = set(&["a"], Some(second), true)
+            .await
+            .expect_err("both is not a request");
+        assert_eq!(both.code, ProtocolErrorCode::BadRequest);
+
+        set(&["only"], None, false)
+            .await
+            .expect("older clients write unconditionally");
+        assert_eq!(stamp().await.map(|s| s.1), Some(vec!["only".to_string()]));
+    }
+
+    /// A delete is made against what the administrator last saw: a window
+    /// that listed the rule before someone changed it, or after someone
+    /// removed it, is refused as changed and removes nothing; a request that
+    /// names no stamp (older clients) still deletes.
+    #[tokio::test]
+    async fn field_policy_delete_is_compare_and_set() {
+        let (_guard, db) = bus_fixture();
+        let instance = fixture_instance_id();
+        let admin_id = format!("u-del-cas-{}", uuid::Uuid::new_v4());
+        let admin_org = seed_membership(&db, &admin_id, "org_admin");
+        let ctx = handler_ctx(db, org_context(&admin_org, &admin_id, &["org.admin"]));
+        let topic = format!("delcas.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        let set = |fields: &[&str], expected: Option<i64>| {
+            let (ctx, topic) = (&ctx, topic.clone());
+            let fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            async move {
+                field_policy_set_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                    fields,
+                    vec![],
+                    expected,
+                    expected.is_none(),
+                )
+                .await
+            }
+        };
+        let stamp = || async {
+            match field_policy_list_v1(&ctx, instance.as_str(), topic.clone())
+                .await
+                .expect("list")
+            {
+                BusPayload::FieldPolicyListResponse { policies } => {
+                    policies.first().map(|p| p.updated_at_ms)
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        };
+        let delete = |expected: Option<i64>| {
+            let (ctx, topic) = (&ctx, topic.clone());
+            async move {
+                field_policy_delete_v1(
+                    ctx,
+                    fixture_instance_id().as_str(),
+                    topic,
+                    "any".to_string(),
+                    "*".to_string(),
+                    "read".to_string(),
+                    expected,
+                )
+                .await
+            }
+        };
+        let changed = |r: Result<BusPayload, ProtocolError>| {
+            let err = r.expect_err("must be refused as changed");
+            assert_eq!(err.code, ProtocolErrorCode::Conflict, "{err:?}");
+            assert!(
+                err.message.starts_with("bus.field_policy_changed"),
+                "{err:?}"
+            );
+        };
+
+        set(&["a"], None).await.expect("add");
+        let first = stamp().await.expect("stored");
+        set(&["a", "b"], Some(first))
+            .await
+            .expect("a second administrator's change");
+        let second = stamp().await.expect("stored");
+
+        changed(delete(Some(first)).await);
+        assert_eq!(
+            stamp().await,
+            Some(second),
+            "the stale delete removed nothing"
+        );
+
+        delete(Some(second))
+            .await
+            .expect("a delete of the rule as listed");
+        assert_eq!(stamp().await, None);
+
+        changed(delete(Some(second)).await);
+        set(&["c"], None).await.expect("re-add");
+        delete(None)
+            .await
+            .expect("older clients delete unconditionally");
+        assert_eq!(stamp().await, None);
     }
 
     #[tokio::test]
@@ -7286,6 +8075,8 @@ mod tests {
             "write".to_string(),
             vec!["patient_id".to_string(), "status".to_string()],
             vec!["patient_id".to_string()],
+            None,
+            false,
         )
         .await
         .expect("field policy set must succeed");
@@ -7315,6 +8106,7 @@ mod tests {
             "any".to_string(),
             "*".to_string(),
             "write".to_string(),
+            None,
         )
         .await
         .expect("field policy delete must succeed");
@@ -7362,6 +8154,8 @@ mod tests {
             "sideways".to_string(),
             vec!["patient_id".to_string()],
             vec![],
+            None,
+            false,
         )
         .await
         .expect_err("invalid direction must be rejected");
@@ -7385,6 +8179,8 @@ mod tests {
             "write".to_string(),
             vec!["patient_id".to_string()],
             vec![],
+            None,
+            false,
         )
         .await
         .expect_err("field policy on a nonexistent topic must be rejected");
@@ -7678,6 +8474,8 @@ mod tests {
             "read".to_string(),
             vec!["patient_id".to_string(), "status".to_string()],
             vec![],
+            None,
+            false,
         )
         .await
         .expect("field policy set must succeed");
@@ -8076,6 +8874,128 @@ mod tests {
         }
     }
 
+    /// A key's consumer group is named after its key; the group of a key
+    /// that no longer exists says so and its backlog counts toward no
+    /// topic's waiting total, in the snapshot, the list and the detail alike.
+    #[tokio::test]
+    async fn key_groups_carry_their_keys_name_and_a_gone_keys_group_waits_for_nobody() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let (_, live_key) = repository::create_api_key(
+            &db,
+            &format!("v-{tag}"),
+            "sk-...live",
+            &format!("Portal {tag}"),
+            "general",
+            None,
+            60,
+        )
+        .unwrap();
+        let live_group = format!("k:{live_key}.raporty");
+        let gone_group = format!("k:{}", uuid::Uuid::new_v4());
+        let plain_group = format!("lekarze-{tag}");
+        let g = gate_read(&ctx, inst.as_str()).expect("gate");
+        for group in [&live_group, &gone_group, &plain_group] {
+            repository::bus_group_upsert(
+                g.svc.local_db(),
+                &repository::DbBusGroup {
+                    org_id: org_id.clone(),
+                    group_id: group.clone(),
+                    topic: topic.clone(),
+                    commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                    paused: false,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let now = bus::now_ms();
+        publish_records(
+            &ctx,
+            &topic,
+            (0..3).map(|i| (format!("r-{i}"), now)).collect(),
+        )
+        .await;
+
+        match stats_snapshot_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let of = |id: &str| {
+                    snapshot
+                        .groups
+                        .iter()
+                        .find(|g| g.group == id)
+                        .expect("group")
+                };
+                assert_eq!(
+                    of(&live_group).key_name.as_deref(),
+                    Some(format!("Portal {tag}").as_str())
+                );
+                assert!(!of(&live_group).key_gone);
+                assert!(of(&gone_group).key_gone);
+                assert_eq!(of(&gone_group).key_name, None);
+                assert_eq!(
+                    of(&gone_group).lag_total,
+                    Some(3),
+                    "its own backlog is still shown"
+                );
+                assert_eq!(
+                    (of(&plain_group).key_name.clone(), of(&plain_group).key_gone),
+                    (None, false)
+                );
+                let topic_row = snapshot
+                    .topics
+                    .iter()
+                    .find(|t| t.topic == topic)
+                    .expect("topic");
+                assert_eq!(
+                    topic_row.total_lag, 6,
+                    "the gone key's backlog waits for nobody"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match group_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::GroupListResponse { groups } => {
+                let gone = groups
+                    .iter()
+                    .find(|g| g.group == gone_group)
+                    .expect("listed");
+                assert!(gone.key_gone);
+                let live = groups
+                    .iter()
+                    .find(|g| g.group == live_group)
+                    .expect("listed");
+                assert_eq!(
+                    live.key_name.as_deref(),
+                    Some(format!("Portal {tag}").as_str())
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match group_detail_v1(&ctx, inst.as_str(), gone_group.clone(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::GroupDetailResponse { detail } => assert!(detail.key_gone),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn topic_detail_reports_access_admin_labels_and_oldest_record_time() {
         let (_guard, db) = bus_fixture();
@@ -8274,6 +9194,8 @@ mod tests {
             "read".to_string(),
             vec!["id".to_string()],
             vec![],
+            None,
+            false,
         )
         .await
         .expect("field policy set");
@@ -10459,6 +11381,8 @@ mod tests {
                 "read".to_string(),
                 fields.into_iter().map(str::to_string).collect(),
                 vec![],
+                None,
+                false,
             )
             .await
             .expect("field policy set");
@@ -10599,6 +11523,8 @@ mod tests {
             "read".to_string(),
             vec!["id".to_string(), "name".to_string()],
             vec![],
+            None,
+            false,
         )
         .await
         .expect("caller's own rule");
@@ -10781,6 +11707,7 @@ mod tests {
             field_policies::Direction::Read,
             &["id".to_string()].into_iter().collect(),
             &std::collections::BTreeSet::new(),
+            field_policies::BusFieldPolicyExpect::Any,
         )
         .expect("stored rule");
         field_policy_delete_v1(
@@ -10790,6 +11717,7 @@ mod tests {
             "user".to_string(),
             "legacy id".to_string(),
             "read".to_string(),
+            None,
         )
         .await
         .expect("any stored id can be deleted");
@@ -10806,6 +11734,7 @@ mod tests {
             "user".to_string(),
             String::new(),
             "read".to_string(),
+            None,
         )
         .await
         .expect_err("an empty id");

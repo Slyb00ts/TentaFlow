@@ -4058,6 +4058,17 @@
     "install_singleton_done": "Aplikacja jednoinstancyjna — już zainstalowana",
     "install_done": "Zainstalowano instancję „{name}”",
     "install_failed": "Instalacja nieudana",
+    "install_steps": {
+      "title": "Dokończ konfigurację: {name}",
+      "intro": "Instancja jest zainstalowana. Te kroki sprawdzają lub przygotowują ją; każdy można uruchomić ponownie.",
+      "run": "Uruchom",
+      "run_again": "Uruchom ponownie",
+      "retry": "Ponów",
+      "run_all": "Uruchom wszystkie kroki",
+      "finish": "Zakończ",
+      "field_required": "Pole „{field}” jest wymagane",
+      "closed_incomplete": "{name} jest zainstalowana, ale {count} {count|krok konfiguracji nie przeszedł|kroki konfiguracji nie przeszły|kroków konfiguracji nie przeszło}."
+    },
     "instance_name": "Nazwa instancji",
     "instance_name_hint": "Ten pakiet działa w wielu instancjach — każda ma własne dane i własną matrycę uprawnień.",
     "instance_name_required": "Podaj nazwę instancji",
@@ -6554,7 +6565,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Laboratorium kwantowe: notatniki, obwody, symulacja i prawdziwe QPU"
+      "desc": "Laboratorium kwantowe: notatniki, obwody, symulacja i prawdziwe QPU",
+      "install": {
+        "bell_test": {
+          "title": "Test Bella",
+          "desc": "Uruchamia dwukubitowy obwód Bella na symulatorze tego węzła i sprawdza, że mierzone są tylko stany 00 i 11."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",
@@ -11349,7 +11366,13 @@
       "dlq_record_handled": "Tę wiadomość już ponowiono albo odrzucono — odśwież listę.",
       "dlq_retry_deduplicated": "Topik ma regułę jednorazowego dostarczenia i tę wiadomość już raz dostarczono w jej oknie — ponowienie jest możliwe po upływie tego okna. Wiadomość zostaje na liście.",
       "dlq_retry_source_not_leader": "Ten node nie prowadzi partycji topiku, do której wiadomość ma wrócić — ponów ją na nodzie, który ją prowadzi.",
-      "dlq_retry_requarantine_failed": "Wzór topiku znów odrzucił wiadomość, a jej nowej kopii nie udało się zapisać wśród nieprzetworzonych — wiadomość zostaje na liście."
+      "dlq_retry_requarantine_failed": "Wzór topiku znów odrzucił wiadomość, a jej nowej kopii nie udało się zapisać wśród nieprzetworzonych — wiadomość zostaje na liście.",
+      "key_needs_topic_wide_rule": "Klucz nie może czytać ani wysyłać wiadomości tego topiku, dopóki topik nie ma zasady ukrywania danych dla wszystkich — zasady ustawione tylko dla wybranych osób nie obejmują kluczy.",
+      "subject_is_addon": "Ten identyfikator należy do addonu, nie do użytkownika. Usuń ten wpis i nadaj dostęp addonowi (Komu: Addon).",
+      "subject_not_found": "Nie znaleziono tej osoby, tego klucza ani addonu — mógł zostać usunięty albo nie należy do tej organizacji. Odśwież stronę.",
+      "org_mismatch": "Prawo do topiku można nadać tylko z jego własnej organizacji.",
+      "record_not_found": "W tej partycji nie ma wiadomości o tym numerze.",
+      "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz."
     },
     "shell": {
       "instance": "Instancja",
@@ -11557,7 +11580,7 @@
       "version": {
         "title": "Nowa wersja wzoru {name}",
         "text_label": "Tekst wzoru — wersja {version}",
-        "draft_kept": "To tekst z poprzedniej próby, której serwer nie przyjął. Popraw go albo najpierw zmień zgodność wzoru.",
+        "draft_kept": "To tekst z poprzedniego otwarcia tego okna — nie został dodany jako wersja.",
         "diff": "Różnica względem wersji {version}: {changes}.",
         "diff_added_optional": "nowe, nieobowiązkowe pole „{field}”",
         "diff_added_required": "nowe, wymagane pole „{field}”",
@@ -11578,7 +11601,8 @@
         "added_text_unused": "Żaden topik jeszcze nie używa tego wzoru.",
         "same_title": "Nie dodano nowej wersji",
         "same_text": "Taki sam tekst ma już wersja {version}. Nic się nie zmieniło.",
-        "load_failed": "Nie udało się wczytać tekstu wersji {version}."
+        "load_failed": "Nie udało się wczytać tekstu wersji {version}.",
+        "discard_kept": "Ta wersja nie jest jeszcze dodana. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie. Zamknij okno jeszcze raz albo wróć do edycji."
       },
       "incompat": {
         "lead": "Ten wzór ma zgodność „{compat}”, a {reason}.",
@@ -11824,7 +11848,8 @@
         "kept_keys": "Zostają: klucze API systemów zewnętrznych — należą do instancji i organizacji; stracą tylko prawa do tego topiku.",
         "retype": "Przepisz nazwę topiku, aby potwierdzić:",
         "confirm": "Usuń topik {name}",
-        "lost_empty_partitions": "{count} {n|pusta partycja|puste partycje|pustych partycji}"
+        "lost_empty_partitions": "{count} {n|pusta partycja|puste partycje|pustych partycji}",
+        "lost_rules_unknown": "Zasad ukrywania danych tego topiku nie udało się policzyć — jeśli jakieś ma, też zostaną usunięte."
       },
       "preview": {
         "title": "Podgląd wiadomości — {topic}",
@@ -11866,6 +11891,8 @@
       "section": {
         "state": "Stan",
         "settings": "Ustawienia",
+        "access": "Dostęp",
+        "hiding": "Ukrywanie danych",
         "partitions": "Partycje i kopie",
         "dlq": "Nieprzetworzone"
       },
@@ -11899,7 +11926,8 @@
         "consumers_none": "Tego topiku nie czyta jeszcze żaden odbiorca.",
         "consumer_running": "działa",
         "consumer_paused": "wstrzymany",
-        "consumer_waiting": "{count} czeka"
+        "consumer_waiting": "{count} czeka",
+        "consumer_key_gone": "klucza już nie ma — nikt tu nie czyta"
       }
     },
     "settings": {
@@ -12180,7 +12208,12 @@
         "auto_after_success": "Po udanym przetworzeniu",
         "explicit": "Program sam daje znać, że skończył",
         "at_most_once": "Od razu przy odczycie"
-      }
+      },
+      "key_group": "Klucz {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Klucz usunięty",
+      "key_sub": "Odbiorca klucza systemu zewnętrznego",
+      "key_gone_sub": "Klucza już nie ma — nikt tu nie czyta"
     },
     "consumer": {
       "back": "Wszyscy odbiorcy",
@@ -12416,6 +12449,476 @@
         "done_title": "Odrzucono wiadomość",
         "done_text": "{what} zniknęła z nieprzetworzonych."
       }
+    },
+    "access": {
+      "subjects_title": "Osoby, grupy i addony",
+      "explain": "Czytanie — pobieranie wiadomości. Zapis — wysyłanie wiadomości. Administracja — zmiana ustawień, dostępu i ukrywania danych tego topiku.",
+      "col_who": "Kto",
+      "right_title": {
+        "read": "Czytanie",
+        "write": "Zapis",
+        "admin": "Administracja"
+      },
+      "right_hint": {
+        "read": "pobieranie wiadomości",
+        "write": "wysyłanie wiadomości",
+        "admin": "ustawienia, dostęp i ukrywanie danych"
+      },
+      "right": {
+        "read": "czytanie",
+        "write": "zapis",
+        "admin": "administracja"
+      },
+      "about": {
+        "read": "czytaniu",
+        "write": "zapisie",
+        "admin": "administracji"
+      },
+      "can": {
+        "read": "czytać wiadomości",
+        "write": "wysyłać wiadomości",
+        "admin": "zmieniać ustawienia, dostęp i ukrywanie danych"
+      },
+      "allowed": "pozwolono",
+      "denied": "zabroniono",
+      "not_set": "nie ustawiono",
+      "not_set_title": "Nie ustawiono tutaj — decyduje rola w organizacji.",
+      "legend": "— nie ustawiono tutaj: decyduje rola w organizacji. „Zabroniono” wygrywa z „pozwolono” z grupy.",
+      "kind": {
+        "user": "Użytkownik",
+        "group": "Grupa",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|osoba|osoby|osób}",
+      "unknown_subject": "Nieznany podmiot",
+      "unknown_sub": "{kind} · identyfikator {id}",
+      "empty_title": "Nikt nie ma tu jeszcze wpisu",
+      "empty_text": "O dostępie do tego topiku decyduje rola w organizacji. Nadaj dostęp, aby pozwolić albo zabronić wybranym osobom, grupom lub addonom.",
+      "rights_label": "Prawa w topiku {topic}",
+      "level": {
+        "allow": "Pozwól",
+        "deny": "Zabroń",
+        "unset": "Nie ustawiaj"
+      },
+      "grant": {
+        "button": "Nadaj dostęp",
+        "window_title": "Nadaj dostęp — {topic}",
+        "who": "Komu",
+        "search": "Szukaj po nazwie",
+        "pick": {
+          "user": "Który użytkownik",
+          "group": "Która grupa",
+          "addon": "Który addon"
+        },
+        "pick_hint": {
+          "user": "Na liście są użytkownicy, którzy nie mają jeszcze wpisu.",
+          "group": "Na liście są grupy, które nie mają jeszcze wpisu.",
+          "addon": "Na liście są addony z dostępem do tej instancji, które nie mają jeszcze wpisu."
+        },
+        "none": {
+          "user": "Każdy użytkownik organizacji ma już wpis w tym topiku.",
+          "group": "Każda grupa organizacji ma już wpis w tym topiku (albo organizacja nie ma grup).",
+          "addon": "Nie ma addonu z dostępem do tej instancji bez wpisu w tym topiku."
+        },
+        "none_found": "Nic nie pasuje do wpisanej nazwy albo pasujący ma już wpis.",
+        "truncated": "Pokazano pierwsze 50 — wpisz część nazwy, aby zawęzić listę.",
+        "group_option": "{name} ({count} {n|osoba|osoby|osób})",
+        "pick_first": "Wybierz, komu nadać dostęp.",
+        "pick_right": "Ustaw co najmniej jedno prawo: pozwól albo zabroń.",
+        "impact_group": "{count} {n|osoba z grupy|osoby z grupy|osób z grupy} {name} {n|będzie mogła|będą mogły|będzie mogło} {doing} w topiku {topic}.",
+        "impact_group_plain": "Grupa „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_user": "Użytkownik „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_addon": "Addon „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_deny": "Zakaz dla „{name}”: {rights} — wygrywa z rolą w organizacji i z pozwoleniem z grupy.",
+        "impact_unset": "O {rights} zdecyduje rola w organizacji.",
+        "saved_title": "Nadano dostęp"
+      },
+      "change": {
+        "button": "Zmień",
+        "window_title": "Zmień dostęp — {name}",
+        "impact_line": "{right} dla „{name}” zmieni się z „{from}” na „{to}”.",
+        "impact_role": {
+          "read": "Zdecyduje o nim rola w organizacji.",
+          "write": "Zdecyduje o nim rola w organizacji.",
+          "admin": "Zdecyduje o niej rola w organizacji."
+        },
+        "impact_rest": "Pozostałe prawa bez zmian.",
+        "saved_title": "Zapisano",
+        "impact_allow": "Będzie można {doing}.",
+        "impact_deny": "Nie będzie można {doing}, nawet jeśli pozwala na to rola w organizacji."
+      },
+      "remove": {
+        "button": "Usuń",
+        "window_title": "Usuń dostęp — {name}",
+        "lead": "{name} straci wpis w tym topiku: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Usunięcie „zabroniono” może dać te prawa, jeśli pozwala na nie rola w organizacji.",
+        "impact_title": "Co się stanie po usunięciu:",
+        "impact": "o dostępie do topiku {topic} zdecyduje rola w organizacji.",
+        "confirm": "Usuń wpis",
+        "saved_title": "Usunięto wpis",
+        "saved_text": "{name} nie ma już wpisu w tym topiku; o dostępie decyduje rola w organizacji."
+      },
+      "keys": {
+        "title": "Systemy zewnętrzne (klucze API)",
+        "sub": "Klucz działa w instancji {instance} i organizacji {org}. Prawa do wzorów wiadomości dotyczą całej instancji, nie tylko tego topiku.",
+        "sub_reader": "Klucz działa w instancji {instance} i organizacji {org}. Tu widać prawa kluczy do wiadomości tego topiku; prawa do wzorów i ostatnie użycie klucza widzi administrator serwera.",
+        "site_admin_only": "Klucze wydaje administrator serwera.",
+        "col_system": "System",
+        "col_rights": "Prawa",
+        "col_used": "Ostatnio użyty",
+        "kind": "Klucz API",
+        "empty": "Żaden system zewnętrzny nie ma jeszcze klucza z prawami do tego topiku.",
+        "never": "jeszcze nie",
+        "just_now": "przed chwilą",
+        "org_unknown": "bez nazwy",
+        "right": {
+          "readMessages": "Czyta wiadomości",
+          "writeMessages": "Wysyła wiadomości",
+          "readSchemas": "Czyta wzory",
+          "writeSchemas": "Dodaje wzory"
+        },
+        "right_hint": {
+          "readMessages": "Pobiera wiadomości z topiku {topic}.",
+          "writeMessages": "Zapisuje nowe wiadomości do topiku {topic}.",
+          "readSchemas": "Pobiera wzory i ich wersje (cała instancja).",
+          "writeSchemas": "Dodaje wzory i wersje, wycofuje wersje, zmienia zgodność. Nie obejmuje czytania."
+        },
+        "issue": {
+          "button": "Wydaj klucz",
+          "window_title": "Wydaj klucz dla systemu zewnętrznego",
+          "name_label": "Nazwa systemu",
+          "name_hint": "Nazwa widoczna na liście kluczy i w dzienniku audytu.",
+          "name_first": "Wpisz nazwę systemu.",
+          "name_too_long": "Nazwa może mieć najwyżej {max} znaków.",
+          "right_first": "Zaznacz co najmniej jedno prawo.",
+          "impact": "{name} dostanie klucz z prawami: {rights} (topik {topic}). Klucz zobaczysz tylko raz.",
+          "saved_title": "Wydano klucz",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Klucz dla systemu „{name}”",
+          "once": "Skopiuj klucz teraz. Później nie będzie można go zobaczyć — trzeba będzie wydać nowy.",
+          "k_key": "Klucz",
+          "k_system": "System",
+          "k_instance": "Instancja",
+          "k_rights": "Prawa",
+          "k_address": "Adres dla systemu",
+          "topic": "topik {topic}",
+          "how": "System wysyła klucz w nagłówku „Authorization: Bearer …”. Wiadomości wysyła metodą POST na ten adres, a czyta metodą GET z dodanym parametrem group={group} (albo {group}.nazwa, gdy czyta kilka niezależnych programów).",
+          "copy_key": "Kopiuj klucz",
+          "copy_url": "Kopiuj adres dla systemu",
+          "done": "Gotowe",
+          "copied_key": "Skopiowano klucz.",
+          "copied_url": "Skopiowano adres.",
+          "copy_failed": "Przeglądarka nie pozwoliła skopiować — zaznacz tekst i skopiuj go ręcznie.",
+          "developer": "Dla programisty",
+          "copy_group": "Kopiuj nazwę odbiorcy",
+          "copied_group": "Skopiowano nazwę odbiorcy.",
+          "close_confirm": "Klucz nie będzie już widoczny. Skopiuj go teraz albo zamknij okno jeszcze raz."
+        },
+        "rights": {
+          "window_title": "Prawa klucza — {name}",
+          "impact_added": "{name} dostanie prawa: {rights}.",
+          "impact_removed": "{name} straci prawa: {rights}.",
+          "impact_none": "Klucz nie będzie miał praw do tego topiku ani do wzorów tej instancji i zniknie z tej listy, ale nadal będzie istniał.",
+          "impact_rest": "Pozostałe prawa bez zmian; klucz się nie zmienia.",
+          "saved_title": "Zapisano prawa klucza"
+        },
+        "revoke": {
+          "button": "Unieważnij",
+          "window_title": "Unieważnij klucz — {name}",
+          "lead": "Tego nie da się cofnąć — trzeba będzie wydać nowy klucz.",
+          "impact_title": "Co się stanie po unieważnieniu:",
+          "impact": "Klucz przestanie działać od razu. {name} straci prawa: {rights}.",
+          "impact_other": "{n|Przestanie|Przestaną|Przestanie} działać także {count} {n|inne prawo|inne prawa|innych praw} tego klucza poza tym topikiem.",
+          "audit": "Unieważnienie zapisze się w dzienniku audytu.",
+          "saved_title": "Unieważniono klucz",
+          "saved_text": "{name} nie może już łączyć się z TentaBus."
+        },
+        "gone": "Klucz usunięty",
+        "gone_sub": "Klucza już nie ma — te prawa nic nie dają.",
+        "clear": {
+          "button": "Usuń prawa",
+          "window_title": "Usuń prawa usuniętego klucza",
+          "lead": "Klucz, do którego należą te prawa, już nie istnieje, więc nikt nie może ich użyć. Zostały ze starszych danych.",
+          "impact": "znikną wpisy usuniętego klucza w topiku {topic}.",
+          "saved_title": "Usunięto prawa",
+          "saved_text": "Na liście nie ma już praw usuniętego klucza."
+        }
+      }
+    },
+    "hiding": {
+      "everyone": "Wszyscy",
+      "everyone_sub": "Każdy bez własnej zasady i bez zasady swojej grupy",
+      "and_more": "i jeszcze {count} {n|pole|pola|pól}",
+      "action": {
+        "show": "Pokaż",
+        "hide": "Ukryj"
+      },
+      "write": {
+        "allow": "Dozwolone",
+        "require": "Wymagane",
+        "forbid": "Niedozwolone"
+      },
+      "direction": {
+        "read": "Odczyt",
+        "write": "Zapis"
+      },
+      "direction_of": {
+        "read": "odczytu",
+        "write": "zapisu"
+      },
+      "direction_do": {
+        "read": "czytać",
+        "write": "zapisywać do"
+      },
+      "title": "Zasady ukrywania danych",
+      "explain": "Ukrywanie danych decyduje, które pola wiadomości zobaczy albo może zapisać wybrana osoba, grupa lub addon. Zapisana wiadomość zostaje cała.",
+      "col_who": "Kto",
+      "col_what": "Co widzi inaczej",
+      "col_when": "Kiedy",
+      "col_changed": "Zmieniono",
+      "empty_title": "Ten topik nie ma zasad ukrywania danych",
+      "empty_text": "Każdy, kto może czytać ten topik, widzi całe wiadomości. Dodaj zasadę, aby ukryć wybrane pola.",
+      "blocked_title": "Zasady tego topiku nie są tu edytowane",
+      "blocked_text": "Zasad tego topiku nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól. Ten ekran obsługuje wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
+      "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich.",
+      "sees_only": "Widzi tylko: {fields}",
+      "sees_nothing": "Nie widzi żadnego pola",
+      "hides_none": "Nie ukrywa żadnego ze znanych pól",
+      "writes_only": "Może zapisać tylko: {fields}",
+      "writes_nothing": "Nie może zapisać żadnego pola",
+      "writes_all": "Przyjmuje wszystkie znane pola",
+      "legend": {
+        "hide": "Pole znika z wiadomości.",
+        "reject_name": "Odrzuć wiadomość",
+        "reject": "Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku.",
+        "precedence": "Zasada osoby wygrywa z zasadą jej grupy, a ta z zasadą dla wszystkich — zasady się nie sumują."
+      },
+      "field_problem": {
+        "empty": "Wpisz nazwę pola.",
+        "hl7_msh": "{name} to separatory samej wiadomości — nie można ich ukryć. Wybierz inne pole.",
+        "hl7_shape": "„{name}” nie jest adresem pola HL7. Adres ma postać SEGMENT-numer, np. PID-5.",
+        "xml_name": "„{name}” nie jest nazwą elementu XML. Nazwa zaczyna się od litery albo znaku _ i nie ma spacji.",
+        "hl7_case": "„{name}” wygląda na literówkę. Czy chodziło o {suggestion}? Adres pisze się wielkimi literami, z myślnikiem.",
+        "typed_known": "„{name}” jest na liście pól i ma tam inne ustawienie niż wpisane niżej. Zostaw je tylko w jednym miejscu."
+      },
+      "need": {
+        "read": "Ustaw co najmniej jedno pole na „Ukryj”. Lista zawiera wszystkie pola tego topiku, więc zasada, która pokazuje je wszystkie, niczego nie zmienia — żeby przestała działać, usuń ją.",
+        "read_typed": "Wpisz co najmniej jedno pole, które ma zostać widoczne. Bez żadnego widocznego pola zasada ukryłaby całą wiadomość.",
+        "write": "Ustaw co najmniej jedno pole na „Wymagane” albo „Niedozwolone”. Lista zawiera wszystkie pola tego topiku, więc zasada, która wszystko dopuszcza, niczego nie sprawdza — żeby przestała działać, usuń ją.",
+        "write_typed": "Wpisz co najmniej jedno pole, które wolno zapisać. Bez żadnego dozwolonego pola zasada odrzucałaby każdą wiadomość."
+      },
+      "impact": {
+        "read_only": "Dla {who} widoczne będą tylko pola: {fields}. Wszystkie inne zostaną ukryte.",
+        "read_hidden": "Dla {who} znikną z wiadomości pola: {fields}.",
+        "read_shown": "Dla {who} pojawią się w wiadomościach pola: {fields}.",
+        "rest": "Pozostałe pola z listy bez zmian.",
+        "read_unlisted": "Pola spoza listy też znikną, chyba że je dopiszesz.",
+        "write_only": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami: {fields}. Wiadomość z innym polem zostanie odrzucona.",
+        "write_forbidden": "Wiadomość od {whoFrom}, w której jest którekolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
+        "write_required": "Wiadomość od {whoFrom}, w której brakuje któregokolwiek z pól: {fields}, zostanie odrzucona i nie trafi do topiku.",
+        "write_rest": "Odrzucona zostaje cała wiadomość, a nie samo pole.",
+        "write_unlisted": "Wiadomość z polem spoza listy też zostanie odrzucona, chyba że dopiszesz to pole.",
+        "keys_closed": "Systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku, dopóki nie dodasz zasady dla wszystkich.",
+        "read_unlisted_only": "Dla {who} znikną pola spoza listy. Wszystkie pola z listy zostają widoczne.",
+        "write_unlisted_only": "Od {whoFrom} zostanie przyjęta wiadomość tylko z polami z listy. Wiadomość z innym polem zostanie odrzucona.",
+        "write_accepted": "Od {whoFrom} będą przyjmowane wiadomości z polami: {fields}.",
+        "write_not_required": "Od {whoFrom} przestanie być wymagane: {fields}.",
+        "write_unlisted_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że dopiszesz jego adres.",
+        "write_unlisted_hl7_saved": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.",
+        "write_unlisted_only_hl7": "Od {whoFrom} będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach (np. PID-4, PV1-1). Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona.",
+        "read_unlisted_saved": "Pola spoza listy też znikną.",
+        "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona."
+      },
+      "fields_label": "Pola",
+      "source": {
+        "schema": "Pola pochodzą ze wzoru wiadomości {name}, wersja {version}.",
+        "dictionary": "Lista to najczęstsze pola HL7 v2. Inne pole dopiszesz niżej, podając jego adres.",
+        "failed": "Nie udało się wczytać wzoru wiadomości tego topiku, więc nie znamy jego pól. Wpisz niżej pola, które mają zostać widoczne.",
+        "manual": "Nie znamy pól tego topiku — nie ma wzoru wiadomości, który by je wymieniał. Wpisz niżej pola, które mają zostać widoczne.",
+        "complex": "Wzór wiadomości tego topiku zawiera pola, których nie da się z niego wypisać (odwołanie do innego pliku albo dowolne nazwy pól), więc nie znamy pełnej listy. Wpisz niżej pola, które mają zostać widoczne."
+      },
+      "extra": {
+        "shown": "Inne pola, które mają zostać widoczne",
+        "shown_typed": "Pola, które mają zostać widoczne",
+        "allowed": "Inne pola, które wolno zapisać",
+        "allowed_typed": "Pola, które wolno zapisać",
+        "required": "Pola wymagane",
+        "hint_hl7": "Wpisz adres pola, np. PID-5, i naciśnij Enter.",
+        "hint_xml": "Wpisz nazwę elementu, np. pacjent, i naciśnij Enter.",
+        "hint_json": "Wpisz nazwę pola, np. pacjent, i naciśnij Enter."
+      },
+      "unlisted": {
+        "read": "Pola, których nie ma na liście, też zostaną ukryte (także te, które pojawią się później), chyba że wpiszesz je niżej.",
+        "write": "Wiadomość z polem spoza listy zostanie odrzucona, chyba że wpiszesz je niżej.",
+        "write_hl7": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona, chyba że wpiszesz jego adres niżej."
+      },
+      "add": {
+        "button": "Dodaj zasadę",
+        "window_title": "Nowa zasada ukrywania danych — {topic}",
+        "save": "Zapisz zasadę",
+        "who": "Dla kogo",
+        "when": "Kiedy działa",
+        "any_hint": "Zasada dla wszystkich obowiązuje każdego, kto nie ma własnej zasady ani zasady swojej grupy. Systemy z kluczem API podlegają tylko tej zasadzie.",
+        "any_taken": "Zasada {direction} dla wszystkich już istnieje — zmienisz ją w jej wierszu.",
+        "none_free": "Każdy z tej listy ma już taką zasadę w tym topiku.",
+        "pick_hint": "Na liście są osoby, grupy lub addony, które nie mają jeszcze takiej zasady.",
+        "pick_first": "Wybierz, dla kogo jest zasada.",
+        "taken": "Ta osoba, grupa lub ten addon ma już zasadę {direction} — zmienisz ją w jej wierszu.",
+        "saved_title": "Zapisano zasadę",
+        "search": "Szukaj na liście",
+        "choose": "Wybierz…",
+        "none_exist": {
+          "group": "W tej organizacji nie ma jeszcze żadnej grupy.",
+          "user": "W tej organizacji nie ma żadnych użytkowników.",
+          "addon": "Żaden addon nie ma dostępu do tej instancji."
+        }
+      },
+      "change": {
+        "button": "Zmień",
+        "window_title": "Zasada ukrywania danych — {name}",
+        "fixed": "Zasada należy do tej osoby, grupy lub addonu — tego się nie zmienia.",
+        "saved_title": "Zapisano zmianę zasady"
+      },
+      "remove": {
+        "button": "Usuń",
+        "window_title": "Usuń zasadę ukrywania danych — {name}",
+        "lead_read": "Zasada odczytu dla: {who}. Ukrywa pola: {fields}.",
+        "lead_read_none": "Zasada odczytu dla: {who}. Nie ukrywa żadnego ze znanych pól.",
+        "lead_read_only": "Zasada odczytu dla: {who}. Zostawia widoczne tylko pola: {fields}.",
+        "lead_read_nothing": "Zasada odczytu dla: {who}. Nie zostawia widocznego żadnego pola.",
+        "lead_write": "Zasada zapisu dla: {who} — {parts}.",
+        "part_forbidden": "niedozwolone pola: {fields}",
+        "part_required": "wymagane pola: {fields}",
+        "part_only": "dozwolone tylko pola: {fields}",
+        "part_nothing": "żadne pole nie jest dozwolone",
+        "part_none": "wszystkie znane pola są dozwolone",
+        "impact_title": "Co się stanie po usunięciu:",
+        "impact_any_read": "Każdy, kto nie ma własnej zasady odczytu, zobaczy w topiku {topic} całe wiadomości.",
+        "impact_any_write": "Zapis do topiku {topic} przestanie być sprawdzany u każdego, kto nie ma własnej zasady zapisu.",
+        "impact_keys": "Zostaną tylko zasady dla wybranych osób, grup lub addonów, więc systemy zewnętrzne z kluczem API nie będą mogły {action} tego topiku.",
+        "confirm": "Usuń zasadę",
+        "saved_title": "Usunięto zasadę",
+        "saved_text": "Usunięto zasadę {direction} dla: {who}.",
+        "impact_read_user": "Dla użytkownika „{who}” w topiku {topic} zacznie obowiązywać zasada odczytu jednej z jego grup, a gdy żadna z nich jej nie ma — zasada dla wszystkich; gdy nie ma żadnej, zobaczy całe wiadomości.",
+        "impact_read_group": "Osoby z grupy „{who}” w topiku {topic} będą czytać według zasady odczytu swojej innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, zobaczą całe wiadomości.",
+        "impact_read_addon": "Addon „{who}” w topiku {topic} będzie czytał według zasady dla wszystkich; gdy jej nie ma, zobaczy całe wiadomości.",
+        "impact_write_user": "Wiadomości użytkownika „{who}” do topiku {topic} będą sprawdzane według zasady zapisu jednej z jego grup, a gdy żadna z nich jej nie ma — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
+        "impact_write_group": "Wiadomości osób z grupy „{who}” do topiku {topic} będą sprawdzane według zasady zapisu ich innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
+        "impact_write_addon": "Wiadomości addonu „{who}” do topiku {topic} będą sprawdzane według zasady dla wszystkich; gdy jej nie ma, nie będą sprawdzane wcale."
+      },
+      "preview": {
+        "button": "Podgląd, jak widzi…",
+        "window_title": "Podgląd, jak widzi… — {topic}",
+        "audit_title": "Ten podgląd zapisuje się w dzienniku audytu.",
+        "audit_text": "Zapisujemy, kto oglądał, kiedy, którą wiadomość i jako kto. Pokazuje prawdziwą wiadomość z topiku po zastosowaniu zasad odczytu wybranej osoby, grupy lub addonu. Dostępny tylko dla administratora topiku.",
+        "who": "Jak widzi",
+        "who_any": "wszyscy bez własnej zasady",
+        "sees": "Tak widzi ją: {who}",
+        "any_hint": "Zobaczysz wiadomość tak, jak widzi ją ktoś, kto nie ma własnej zasady ani zasady swojej grupy.",
+        "none": {
+          "user": "Nie znaleziono żadnego użytkownika.",
+          "group": "Nie znaleziono żadnej grupy.",
+          "addon": "Nie znaleziono addonu z dostępem do tej instancji."
+        },
+        "number_label": "Numer wiadomości",
+        "show": "Pokaż",
+        "record_title": "wiadomość {number} · partycja {partition} · zapisana {when}",
+        "hidden": "ukryte",
+        "shown": "widoczne",
+        "rules_title": "Co zrobiły zasady",
+        "summary_hidden": "Zasady ukryły {count} {n|pole|pola|pól}: {fields}.",
+        "summary_none": "Zasady nie ukryły żadnego pola tej wiadomości.",
+        "limited_title": "Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu",
+        "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.",
+        "limited_missing": "W tym podglądzie nie ma pól wzoru: {fields}. Ukryła je zasada, która obowiązuje także Ciebie, albo wiadomość ich nie zawiera.",
+        "who_user": "użytkownik {name}",
+        "who_group": "grupa {name}",
+        "who_addon": "addon {name}",
+        "summary_limited": "Nie wymieniamy pól, które ukrywa już zasada obowiązująca także Ciebie."
+      },
+      "hl7": {
+        "msh_3": "Aplikacja wysyłająca",
+        "msh_4": "Placówka wysyłająca",
+        "msh_5": "Aplikacja odbierająca",
+        "msh_6": "Placówka odbierająca",
+        "msh_7": "Data i godzina wiadomości",
+        "msh_9": "Typ wiadomości",
+        "msh_10": "Identyfikator wiadomości",
+        "pid_2": "Identyfikator pacjenta",
+        "pid_3": "Lista identyfikatorów pacjenta",
+        "pid_5": "Imię i nazwisko pacjenta",
+        "pid_6": "Nazwisko panieńskie matki",
+        "pid_7": "Data urodzenia",
+        "pid_8": "Płeć",
+        "pid_10": "Rasa",
+        "pid_11": "Adres pacjenta",
+        "pid_13": "Telefon domowy",
+        "pid_14": "Telefon służbowy",
+        "pid_15": "Język podstawowy",
+        "pid_16": "Stan cywilny",
+        "pid_17": "Wyznanie",
+        "pid_18": "Numer konta pacjenta",
+        "pid_19": "Numer identyfikacyjny (np. PESEL)",
+        "pid_22": "Grupa etniczna",
+        "pid_23": "Miejsce urodzenia",
+        "pid_29": "Data i godzina zgonu",
+        "pid_30": "Znacznik zgonu",
+        "pv1_2": "Rodzaj pobytu pacjenta",
+        "pv1_3": "Miejsce pobytu pacjenta",
+        "pv1_7": "Lekarz prowadzący",
+        "pv1_8": "Lekarz kierujący",
+        "pv1_9": "Lekarz konsultant",
+        "pv1_10": "Oddział lub usługa szpitala",
+        "pv1_17": "Lekarz przyjmujący",
+        "pv1_19": "Numer wizyty",
+        "pv1_44": "Data i godzina przyjęcia",
+        "pv1_45": "Data i godzina wypisu",
+        "nk1_2": "Imię i nazwisko osoby bliskiej",
+        "nk1_3": "Stopień pokrewieństwa",
+        "nk1_4": "Adres osoby bliskiej",
+        "nk1_5": "Telefon osoby bliskiej",
+        "in1_2": "Identyfikator planu ubezpieczenia",
+        "in1_3": "Identyfikator ubezpieczyciela",
+        "in1_4": "Nazwa ubezpieczyciela",
+        "in1_16": "Imię i nazwisko ubezpieczonego",
+        "in1_36": "Numer polisy",
+        "orc_2": "Numer zlecenia nadany przez zlecającego",
+        "orc_12": "Lekarz zlecający",
+        "obr_4": "Zlecone badanie",
+        "obr_7": "Data i godzina badania",
+        "obr_16": "Lekarz zlecający badanie",
+        "obx_2": "Typ wartości wyniku",
+        "obx_3": "Rodzaj wyniku",
+        "obx_5": "Wartość wyniku",
+        "obx_6": "Jednostki wyniku",
+        "obx_7": "Zakres referencyjny",
+        "obx_8": "Znaczniki nieprawidłowego wyniku",
+        "obx_11": "Stan wyniku",
+        "obx_14": "Data i godzina wyniku",
+        "dg1_3": "Kod rozpoznania",
+        "dg1_4": "Opis rozpoznania",
+        "al1_3": "Alergen",
+        "msh_8": "Zabezpieczenia",
+        "msh_11": "Tryb przetwarzania",
+        "msh_12": "Wersja HL7"
+      },
+      "blocked_settings": "Otwórz ustawienia topiku",
+      "blocked_preview": "Podgląd jest niedostępny: treść tego topiku nie jest czytelna jako pola.",
+      "writes_rest": "Inne pola albo brak wymaganych: odrzuć wiadomość",
+      "reads_rest": "Pola spoza listy: ukryj",
+      "fields_search": "Szukaj pola",
+      "fields_none": "Żadne pole nie pasuje do wyszukiwania.",
+      "who": {
+        "named": "„{name}”",
+        "everyone_for": "wszystkich",
+        "everyone_from": "wszystkich"
+      },
+      "visible_outside": "Zostawia też widoczne: {fields}",
+      "changed_title": "Nic nie zapisano — zasada zmieniła się w międzyczasie",
+      "changed_text": "Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz."
     }
   },
   "composer": {
@@ -12496,7 +12999,11 @@
       "not_found": "Laboratorium niedostępne",
       "not_found_sub": "Ta instancja nie istnieje albo matryca uprawnień nie daje Ci do niej dostępu.",
       "load_failed": "Nie udało się wczytać pulpitu laboratorium",
-      "tab_runs": "Runy"
+      "tab_runs": "Runy",
+      "tab_course": "Kurs",
+      "tab_devices": "Urządzenia",
+      "tab_examples": "Przykłady",
+      "tab_settings": "Ustawienia"
     },
     "dash": {
       "kpi_my_projects": "Moje projekty",
@@ -13202,6 +13709,160 @@
       "before": "przed pierwszą bramką",
       "empty": "brak nagranej ewolucji",
       "step": "krok"
+    },
+    "course": {
+      "load_failed": "Nie udało się wczytać kursu",
+      "kata_load_failed": "Nie udało się wczytać zadania",
+      "submit_failed": "Nie udało się sprawdzić rozwiązania",
+      "kpi_progress": "Postęp kursu",
+      "progress_value": "{done} / {total} {total|kata|katy|kat}",
+      "kpi_progress_delta": "{percent}% kursu",
+      "kpi_points": "Punkty",
+      "kpi_points_delta": "z {max} do zdobycia",
+      "kpi_position": "Pozycja w laboratorium",
+      "position_value": "{position} / {total}",
+      "kpi_position_delta": "{n} {n|osoba|osoby|osób} w rankingu",
+      "kpi_position_none": "Zalicz pierwszą katę, by trafić do rankingu",
+      "group_complete": "ukończone",
+      "group_current": "w toku",
+      "group_locked": "po grupie „{group}”",
+      "group_count": "{done} / {total}",
+      "status_passed": "zaliczona",
+      "status_attempted": "podjęta",
+      "status_open": "do zrobienia",
+      "status_locked": "zablokowana",
+      "kata_heading": "Kata {n} · {title}",
+      "kata_meta": "{group} · {n} z {total}",
+      "points_value": "{n} pkt",
+      "attempts": "{n} {n|próba|próby|prób}",
+      "task_title": "Zadanie",
+      "code_title": "Twoje rozwiązanie (OpenQASM 3)",
+      "code_hint": "Sprawdza Core natywnym symulatorem — wynik jest deterministyczny.",
+      "action_check": "Sprawdź",
+      "action_reset": "Przywróć szkielet",
+      "action_next": "Następna kata: {title}",
+      "run_required": "Sprawdzanie wymaga uprawnienia quant.run.",
+      "result_passed": "Zaliczone! +{n} pkt",
+      "result_passed_again": "Zaliczone ponownie — punkty za tę katę masz już przyznane",
+      "result_failed": "Jeszcze nie",
+      "result_invalid": "Program nie przeszedł walidacji",
+      "diagnostic_at": "linia {line}: {message}",
+      "reason_mismatch": "Stan końcowy lub macierz różni się od oczekiwanej.",
+      "reason_above_threshold": "Rozkład wyników odbiega od oczekiwanego o więcej, niż dopuszcza próg.",
+      "reason_unexpected_outcomes": "Pojawiły się wyniki, których poprawne rozwiązanie nie daje.",
+      "reason_qubit_count": "Obwód ma {got} {got|kubit|kubity|kubitów}, a zadanie wymaga {expected} {expected|kubitu|kubitów|kubitów}.",
+      "reason_clbit_count": "Zadanie mierzy {expected} {expected|bit|bity|bitów} — zadeklaruj taki rejestr klasyczny.",
+      "reason_not_unitary": "To zadanie porównuje stan lub macierz obwodu — usuń pomiary, resety i warunki klasyczne.",
+      "reason_no_measurement": "Zmierz kubity do rejestru klasycznego — to zadanie ocenia rozkład wyników.",
+      "metric_fidelity": "Wierność stanu {value} (wymagana {threshold})",
+      "metric_process_fidelity": "Wierność operacji {value} (wymagana {threshold})",
+      "metric_tvd": "TVD od ideału {value} (próg {threshold})",
+      "run_info": "{shots} {shots|strzał|strzały|strzałów} w {ms} ms",
+      "ranking_title": "Ranking laboratorium",
+      "ranking_sub": "Top {n} z {total} {total|osoby|osób|osób} · punkty z kat",
+      "ranking_you": "to Ty",
+      "ranking_empty": "Nikt jeszcze nie zaliczył katy",
+      "ranking_empty_sub": "Pierwsza zaliczona kata wprowadza do rankingu.",
+      "ranking_off": "Ranking jest wyłączony",
+      "ranking_off_sub": "Opiekun laboratorium wyłączył ranking kursu. Twoje punkty i postęp nadal się zapisują.",
+      "ranking_load_failed": "Nie udało się wczytać rankingu"
+    },
+    "devices": {
+      "browser_title": "Przeglądarka (WASM)",
+      "browser_sub": "Ten sam symulator w wasm32, na Twoim komputerze",
+      "core_sub": "Natywnie w Core: statevector w Rust",
+      "empty": "Laboratorium nie zgłasza żadnego celu wykonania",
+      "kpi_available": "Dostępne cele",
+      "kpi_available_value": "{n} z {total}",
+      "kpi_widest": "Największy rejestr",
+      "kpi_nodes": "Nody z Core (T1)",
+      "qubits_value": "{n} {n|kubit|kubity|kubitów}",
+      "state_available": "dostępny",
+      "state_unavailable": "niedostępny",
+      "where_browser": "ten komputer",
+      "where_this_node": "node, z którym jesteś połączony",
+      "where_other_node": "inny node floty",
+      "row_where": "Działa na",
+      "row_max_qubits": "Maks. kubitów",
+      "row_precision": "Precyzja",
+      "row_memory": "Pamięć stanu przy limicie",
+      "auto_title": "Reguła device=\"auto\"",
+      "auto_sub": "Zapytaj Core, gdzie trafiłby run o danej szerokości — tą samą regułą, którą stosuje Studio, notatnik i SDK.",
+      "probe_qubits": "Liczba kubitów",
+      "probe_dec": "Mniej kubitów",
+      "probe_inc": "Więcej kubitów",
+      "probe_browser": "Pytam z przeglądarki",
+      "probe_browser_sub": "Przeglądarka może sama policzyć obwód (T0).",
+      "probe_kernel": "Komórka Python",
+      "probe_kernel_sub": "Wymaga jądra, więc samą przeglądarką się nie obejdzie.",
+      "probe_failed": "Nie udało się zapytać o regułę",
+      "skipped": "{tier}: {reason}",
+      "missing_title": "Warstwy, których ta wersja nie ma",
+      "missing_sub": "To nie są urządzenia do wyboru. Powód jest podany, żeby duży obwód nie szukał miejsca, którego nie ma."
+    },
+    "settings": {
+      "load_failed": "Nie udało się pobrać ustawień",
+      "save": "Zapisz",
+      "saved": "Ustawienia zapisane",
+      "save_failed": "Nie udało się zapisać ustawień",
+      "ranking_title": "Kurs",
+      "ranking_name": "Ranking laboratorium",
+      "ranking_sub": "Osoby widzą pierwszą piątkę i swoje miejsce. Po wyłączeniu ranking znika z zakładki Kurs; zaliczone katy i punkty zostają.",
+      "limits_title": "Limity laboratorium",
+      "limits_sub": "Te liczby stosuje Core: zakres celów w zakładce Urządzenia i liczbę runów liczonych jednocześnie. Czytają je wszyscy, zmienia administrator.",
+      "limits_admin_only": "Limity zmienia osoba z uprawnieniem quant.admin.",
+      "limit_maxQubitsBrowser": "Kubity w przeglądarce (T0)",
+      "limit_maxQubitsBrowser_hint": "Najszerszy rejestr, jaki przeglądarka przyjmie, gdy wybierzesz ją jawnie.",
+      "limit_maxQubitsCore": "Kubity w Core (T1)",
+      "limit_maxQubitsCore_hint": "Nie więcej, niż liczy symulator tej wersji — Core odpowie, jeśli wpiszesz za dużo.",
+      "limit_maxConcurrentCoreRuns": "Równoległe runy w Core",
+      "limit_maxConcurrentCoreRuns_hint": "Ile runów T1 laboratorium liczy naraz na nodzie; reszta czeka w kolejce. Każdy trzyma cały wektor stanu.",
+      "limit_dec": "Zmniejsz",
+      "limit_inc": "Zwiększ",
+      "access_title": "Dostęp",
+      "access_sub": "Macierz uprawnień jest tu tylko do odczytu. Edytuje się ją w Addons, razem z widocznością laboratorium.",
+      "access_edit": "Edytuj w Addons",
+      "access_you": "Twoja rola",
+      "col_person": "Osoba",
+      "col_role": "Rola",
+      "col_permissions": "Uprawnienia",
+      "people_empty": "Macierz nie dopuszcza nikogo",
+      "people_footer": "{n} {n|osoba|osoby|osób} z dostępem",
+      "people_roles": "administratorów: {admin} · opiekunów: {supervisor} · użytkowników: {user} · obserwatorów: {observer}",
+      "people_failed": "Nie udało się pobrać listy osób",
+      "people_supervisor_only": "Listę osób widzi opiekun (quant.instruct)."
+    },
+    "examples": {
+      "load_failed": "Nie udało się pobrać przykładów",
+      "search_placeholder": "Szukaj przykładu…",
+      "level_all": "Dowolny poziom",
+      "level_intro": "Początkujący",
+      "level_core": "Średni",
+      "level_advanced": "Zaawansowany",
+      "empty_title": "Brak przykładów dla tego filtra",
+      "empty_sub": "Zmień wyszukiwanie albo poziom.",
+      "footer": "Pokazuję {n} z {total}",
+      "run_required": "Skopiowanie przykładu do własnego projektu wymaga uprawnienia quant.run.",
+      "action_preview": "Podgląd",
+      "action_fork": "Kopiuj do moich",
+      "action_studio": "Otwórz w studio",
+      "back": "Wszystkie przykłady",
+      "stat_width": "Rejestr",
+      "stat_depth": "Głębokość",
+      "width_fixed": "{n} {n|kubit|kubity|kubitów}",
+      "width_range": "{min}–{max} {max|kubit|kubity|kubitów}",
+      "depth_value": "głębokość {n}",
+      "width_label": "Liczba kubitów",
+      "width_hint": "Od {min} do {max}. Zmienia tylko szerokość rejestru w obwodzie.",
+      "width_dec": "Mniej kubitów",
+      "width_inc": "Więcej kubitów",
+      "circuit_title": "Obwód",
+      "view_circuit": "Schemat",
+      "view_text": "Tekst",
+      "expected_title": "Oczekiwany wynik",
+      "expected_sub": "Poprawny run ({shots} {shots|shot|shoty|shotów}) kładzie zliczenia tylko na poniższych wynikach, a odległość TVD od teorii jest mniejsza niż {tolerance}.",
+      "fork_ok": "Utworzono projekt „{name}”",
+      "fork_failed": "Nie udało się skopiować przykładu"
     }
   },
   "access_keys": {
@@ -15360,5 +16021,9 @@
     "simulation_timer_pending": "Oczekuje",
     "simulation_timer_fired": "Uruchomiony",
     "simulation_timer_blocked": "Zablokowany"
+  },
+  "gestures": {
+    "wave": "machanie",
+    "heart": "serce"
   }
 }

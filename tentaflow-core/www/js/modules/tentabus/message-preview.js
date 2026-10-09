@@ -36,6 +36,12 @@ export function pickPartition(partitions) {
   return best ? best.partition : 0;
 }
 
+/** The number of a partition's newest message, or `null` for a partition that keeps none. */
+export function newestOffset(partition) {
+  if (!partition) return null;
+  return highWatermark(partition) > earliest(partition) ? highWatermark(partition) - 1 : null;
+}
+
 /** Where the first page of a partition starts: its newest page, never before the oldest kept message. */
 export function previewStart(partition, pageSize = PREVIEW_PAGE) {
   if (!partition) return null;

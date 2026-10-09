@@ -6,7 +6,8 @@
 // Partycje i kopie and the preview, with the reason; Stan's tiles, alerts
 // and consumers come from the live snapshot of this topic only; the
 // partitions table offers "Przenieś prowadzenie" only where a node can take
-// over; a deleted topic says so instead of an empty page.
+// over; a deleted topic says so instead of an empty page. Dostęp is in the
+// menu of the topic's administrators only, never merely disabled.
 // =============================================================================
 
 import { window } from './_test-setup.js';
@@ -15,7 +16,7 @@ import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
-const { drawTopicDetail, effectiveSection, sectionOpen, topicDetailLoader } = await import('./topic-detail.js');
+const { drawTopicDetail, effectiveSection, sectionOpen, sectionListed, topicDetailLoader } = await import('./topic-detail.js');
 const { stateKpis, topicAlerts, topicConsumers } = await import('./topic-state.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ');
@@ -52,7 +53,7 @@ const replicaTopics = [{
   ],
 }];
 
-function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {} } = {}) {
+function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null, hidingData = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -71,6 +72,9 @@ function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, sec
     lagSeries: new Map(),
     notice: null,
     justMoved: new Set(),
+    accessData,
+    hidingData,
+    instanceId: 'tentabus-a1b2c3d4',
     instanceLabel: 'Produkcja',
     nowMs: NOW,
   };
@@ -87,16 +91,94 @@ test('sections open with read access, Ustawienia always; a closed one falls back
   assert.equal(effectiveSection('nonsense', { canRead: true }), 'state');
 });
 
+test('Dostęp opens for the topic\'s administrator only and is not even listed for anyone else', () => {
+  assert.equal(sectionOpen('access', { canRead: true, canAdmin: false }), false);
+  assert.equal(sectionOpen('access', { canRead: false, canAdmin: true }), true, 'administration without read access still manages access');
+  assert.equal(sectionListed('access', { canAdmin: false }), false);
+  assert.equal(sectionListed('state', { canRead: false }), true, 'a closed read section stays in the menu with its reason');
+  assert.equal(effectiveSection('access', { canRead: true, canAdmin: false }), 'state');
+  assert.equal(effectiveSection('access', { canRead: true, canAdmin: true }), 'access');
+
+  const reader = mount({ access: { canRead: true, canWrite: false, canAdmin: false }, section: 'access' });
+  const tab = reader.body.querySelector('[data-role="menu"] tf-tab#access');
+  assert.equal(tab.hidden, true);
+  assert.equal(tab.hasAttribute('disabled'), false, 'hidden, not shown as locked');
+  assert.equal(reader.body.querySelector('[data-section="state"]').hidden, false, 'an address naming Dostęp opens Stan');
+  assert.deepEqual([...reader.body.querySelectorAll('[data-role="pick"] select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Nieprzetworzone', 'Partycje i kopie']);
+});
+
+test('Dostęp\'s counter is its entries plus the keys, once they are loaded', () => {
+  const loading = mount();
+  assert.equal(loading.body.querySelector('tf-tab#access').getAttribute('count'), null, 'nothing is guessed before the entries answer');
+  const loaded = mount({
+    accessData: {
+      acl: [
+        { subjectType: 'group', subjectId: 'g-1', accessLevel: 'allow', action: 'read', subjectLabel: 'Lekarze', memberCount: 12 },
+        { subjectType: 'user', subjectId: 'u-1', accessLevel: 'deny', action: 'write', subjectLabel: 'Piotr Zieliński' },
+        { subjectType: 'user', subjectId: 'u-1', accessLevel: 'deny', action: 'read', subjectLabel: 'Piotr Zieliński' },
+        { subjectType: 'api_key', subjectId: 'k-1', accessLevel: 'allow', action: 'read', subjectLabel: 'Portal' },
+      ],
+      keys: null,
+    },
+  });
+  assert.equal(loaded.body.querySelector('tf-tab#access').getAttribute('count'), '3');
+});
+
+test('Ukrywanie danych opens for the topic\'s administrator only; its counter is the number of rules once they are loaded', () => {
+  assert.equal(sectionOpen('hiding', { canRead: true, canAdmin: false }), false);
+  assert.equal(sectionOpen('hiding', { canRead: false, canAdmin: true }), true, 'administration without read access still manages the rules');
+  assert.equal(sectionListed('hiding', { canAdmin: false }), false);
+  assert.equal(effectiveSection('hiding', { canRead: true, canAdmin: false }), 'state', 'an address naming it opens Stan for a reader');
+  assert.equal(effectiveSection('hiding', { canRead: true, canAdmin: true }), 'hiding');
+
+  const reader = mount({ access: { canRead: true, canWrite: false, canAdmin: false }, section: 'hiding' });
+  assert.equal(reader.body.querySelector('[data-role="menu"] tf-tab#hiding').hidden, true);
+  assert.equal(reader.body.querySelector('[data-section="state"]').hidden, false);
+  assert.equal(reader.body.querySelector('[data-section="hiding"]').hidden, true);
+  assert.equal(reader.body.querySelector('[data-section="hiding"]').children.length, 0, 'nothing of it is drawn for a reader');
+
+  const loading = mount({ section: 'hiding', hidingData: { policies: null, policiesError: null, schema: null, schemaSettled: false } });
+  assert.equal(loading.body.querySelector('tf-tab#hiding').getAttribute('count'), null, 'nothing is guessed before the rules answer');
+  assert.ok(loading.body.querySelector('[data-section="hiding"] tf-spinner'));
+  const policies = [
+    { subjectType: 'group', subjectId: 'g-1', direction: 'read', fields: ['a'], requiredFields: [], updatedAtMs: NOW, subjectLabel: 'Lekarze', memberCount: 12 },
+    { subjectType: 'any', subjectId: '*', direction: 'write', fields: ['a'], requiredFields: [], updatedAtMs: NOW, subjectLabel: null, memberCount: null },
+  ];
+  const loaded = mount({ section: 'hiding', hidingData: { policies, policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(loaded.body.querySelector('tf-tab#hiding').getAttribute('count'), '2');
+  const host = loaded.body.querySelector('[data-section="hiding"]');
+  assert.equal(host.hidden, false);
+  assert.equal(host.querySelector('[data-role="rules"]').rows.length, 2);
+  host.querySelector('[data-go="hiding-add"]').click();
+  assert.deepEqual(loaded.moves.at(-1), { kind: 'hiding-add' });
+  host.querySelector('[data-go="hiding-preview"]').click();
+  assert.deepEqual(loaded.moves.at(-1), { kind: 'hiding-preview' });
+  const empty = mount({ section: 'hiding', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(empty.body.querySelector('tf-tab#hiding').getAttribute('count'), null, 'a topic without rules has no counter');
+});
+
+test('the failed rules load offers a retry that reaches the shell, and a binary topic offers the settings', () => {
+  const failed = mount({ section: 'hiding', hidingData: { policies: null, policiesError: 'Brak uprawnień do tej operacji.', schema: null, schemaSettled: true } });
+  const host = failed.body.querySelector('[data-section="hiding"]');
+  host.querySelector('[data-go="hiding-reload"]').click();
+  assert.deepEqual(failed.moves.at(-1), { kind: 'hiding-reload' }, 'the shell is asked to load the rules again');
+  const binary = mount({ section: 'hiding', topicOverrides: { contentType: 'application/octet-stream' }, hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+  binary.body.querySelector('[data-section="hiding"] [data-go="section"]').click();
+  assert.deepEqual(binary.moves.at(-1), { kind: 'section', section: 'settings' });
+});
+
 test('the page: back link, title with what the topic carries, the vertical menu and one section', () => {
   const { body, moves } = mount();
   assert.equal(body.querySelector('.tb-title').textContent, 'wyniki-badan');
   assert.equal(body.querySelector('[data-role="desc"]').textContent, 'HL7 v2 · bez wzoru');
   const menu = body.querySelector('[data-role="menu"]');
   assert.equal(menu.getAttribute('orientation'), 'vertical');
-  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'dlq', 'partitions']);
+  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'access', 'hiding', 'dlq', 'partitions']);
+  assert.equal(menu.querySelector('tf-tab#access').hidden, false, 'the administrator sees Dostęp');
+  assert.equal(menu.querySelector('tf-tab#hiding').hidden, false, 'and Ukrywanie danych');
   assert.equal(menu.querySelector('tf-tab#partitions').getAttribute('count'), '2');
   assert.equal(menu.querySelector('tf-tab#dlq').getAttribute('count'), '14', 'the unprocessed count of the stats snapshot');
-  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['dlq', true], ['partitions', true]]);
+  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['access', true], ['hiding', true], ['dlq', true], ['partitions', true]]);
   body.querySelector('[data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
 });
@@ -129,7 +211,7 @@ test('moving between sections goes through the shell; the phone list offers the 
   body.querySelector('[data-role="menu"] tf-tab#settings > button').click();
   assert.deepEqual(moves.at(-1), { kind: 'section', section: 'settings' });
   const pick = body.querySelector('[data-role="pick"]');
-  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Nieprzetworzone', 'Partycje i kopie']);
+  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Dostęp', 'Ukrywanie danych', 'Nieprzetworzone', 'Partycje i kopie']);
 });
 
 test('Nieprzetworzone is a section of the page; Stan\'s "Zobacz i ponów" leads to it', () => {
@@ -202,6 +284,26 @@ test('Stan\'s figures come from this topic only', () => {
   assert.equal(k.oldestMs, Date.UTC(2026, 7, 24));
   assert.deepEqual(topicAlerts({ topic: 'faktury', stats, replicaLags: [], nowMs: NOW }).map((a) => a.kind), ['paused']);
   assert.deepEqual(topicConsumers(groups).map((c) => [c.group, c.share]), [['aplikacja-lekarza', 100], ['raporty-laboratorium', 0]]);
+});
+
+test('Stan names a key\'s consumer after its key; a gone key\'s consumer is said to be gone and raises nothing', () => {
+  const keyGroups = [
+    { group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki-badan', lagTotal: 40, paused: false, keyName: 'Portal' },
+    { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki-badan', lagTotal: 9000, paused: true, lagRisingSinceMs: NOW - 60 * MIN, keyGone: true },
+  ];
+  const withKeys = { ...stats, groups: [...stats.groups, ...keyGroups] };
+  const k = stateKpis({ topicStats: withKeys.topics[0], stats: withKeys, partitions, groups: withKeys.groups.filter((g) => g.topic === 'wyniki-badan'), nowMs: NOW });
+  assert.deepEqual(k.lagging, ['aplikacja-lekarza'], 'a gone key\'s backlog is nobody\'s delay');
+  assert.deepEqual(topicAlerts({ topic: 'wyniki-badan', stats: withKeys, replicaLags: [], nowMs: NOW }).map((a) => a.kind), ['lagging', 'dlq']);
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  drawTopicDetail(body, { view: () => ({ ...mount().view, stats: withKeys }), go: () => {} });
+  const rows = [...body.querySelectorAll('.tb-consumer-row')];
+  const names = rows.map((r) => norm(r.querySelector('.job-name').textContent));
+  assert.ok(names.includes('Klucz Portal'));
+  assert.ok(names.includes('Klucz usunięty'));
+  const gone = rows.find((r) => r.textContent.includes('Klucz usunięty'));
+  assert.equal(gone.querySelector('[data-role="state"]').textContent, 'klucza już nie ma — nikt tu nie czyta');
 });
 
 test('only the newest answer about a topic lands: a poll that left before a save cannot paint over it', async () => {

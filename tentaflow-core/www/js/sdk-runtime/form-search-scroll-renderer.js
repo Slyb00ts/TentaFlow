@@ -6,7 +6,7 @@
 // tentaflow-sdk-spec/src/protocol/ui/layout/containers.rs (ScrollContainer).
 // =============================================================================
 
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 import {
   requireEnum, requireBool, requireU16, requireString, requirePath,
   assertOnlyKnownFields,
@@ -105,7 +105,7 @@ export function renderSearchBox(component, ctx) {
   const reemit = (name, detail) => {
     const ce = new CustomEvent(name, { bubbles: false, detail });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(name === 'search' ? ce : tagBoundEdit(ce, bindPath));
   };
   const onSearch = (e) => {
     if (e.__tfReemit) return;

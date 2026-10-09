@@ -9,7 +9,8 @@
 // page (Stan, Ustawienia, Nieprzetworzone, Partycje i kopie), Odbiorcy with a
 // consumer's page (Stan, Miejsce czytania, Ustawienia), Nieprzetworzone
 // wiadomości, Wzory wiadomości with a pattern's page and Kopie i nody live in
-// modules/tentabus/*.
+// modules/tentabus/*; a topic's page also carries Dostęp (its entries and the
+// keys of outside systems).
 //
 // Every request names its instance (`BusEnvelope.instance_id`): `mount`
 // resolves `state.instanceId` from `?instance=` (or the same-screen instance
@@ -38,6 +39,10 @@ import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
 import { openMessagePreview } from '/js/modules/tentabus/message-preview.js';
 import { drawTopicDetail, effectiveSection, topicDetailLoader } from '/js/modules/tentabus/topic-detail.js';
 import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
+import { subjectRows, keyRows, openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyRights, openKeyRevoke, openGoneKeyClear } from '/js/modules/tentabus/topic-access.js';
+import { policyRows, topicFormat, fieldSource } from '/js/modules/tentabus/topic-hiding.js';
+import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
+import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
 import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
@@ -179,7 +184,7 @@ function mapBusErrorMessage(message, translate) {
 // errors out — every gated control stays hidden rather than guessing "yes"
 // (tor U task 5; mirrors the earlier `me.role === 'admin'` guess it replaces,
 // but erring the opposite direction on failure).
-const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSiteAdmin: false };
+const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSiteAdmin: false, orgId: '', orgName: null };
 
 // `ApiBinary.one('busCapabilitiesRequest')` resolves to the raw dispatch
 // body, which is an ENVELOPE, not the capabilities object itself:
@@ -195,8 +200,9 @@ const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSi
 // (`{ canRead, ... }` with no `.capabilities`) so a future wire
 // simplification degrades to "read the fields" instead of re-introducing
 // the same silent all-hidden failure. `isSiteAdmin` is still decoded here —
-// the wire field has not been retired — but nothing in this module gates on
-// it any more; see `canAdmin`'s own comment.
+// the wire field has not been retired — and gates only the keys of outside
+// systems on a topic's Dostęp: issuing, changing and revoking a key is the
+// server administrator's (see `canAdmin` for everything else).
 function unwrapCapabilities(resp) {
   if (resp && typeof resp === 'object') {
     if (resp.capabilities && typeof resp.capabilities === 'object') return resp.capabilities;
@@ -266,6 +272,10 @@ const state = {
   // "Zapisano …" / "Przeniesiono prowadzenie" over the section it concerns
   // (`{ section, title, text }`), until the reader moves to another section.
   detailNotice: null,
+  // The open topic's Dostęp — see `freshAccess`.
+  access: freshAccess(),
+  // The open topic's Ukrywanie danych — see `freshHiding`.
+  hiding: freshHiding(),
   // Partitions whose leadership was moved from this page: marked "zmieniono
   // przed chwilą" and not offered again until the reader refreshes. Numbers
   // on a topic's page, `topic:partition` on Kopie i nody.
@@ -308,6 +318,22 @@ const state = {
 // list shows, and the note over the tab.
 function freshUnprocessed() {
   return { byTopic: new Map(), access: new Map(), asked: new Map(), shown: LIST_STEP, sectionShown: LIST_STEP, notice: null };
+}
+
+// The open topic's entries (`AclList`, `null` until they answer) and the
+// general keys with their scopes (asked only for the server administrator,
+// `null` until they answer), each with its failed load.
+function freshAccess(topic = null) {
+  return { topic, acl: null, aclError: null, keys: null, keysError: null };
+}
+
+// The open topic's rules (`FieldPolicyList`, `null` until they answer) with
+// the failed load, and the pattern its fields are read from: `{ subject,
+// version, text }`, `{ failed: true }` when it could not be read, `null` for
+// a topic without one; `schemaFor` names the pattern it was read for and
+// `schemaSettled` says that the read is over.
+function freshHiding(topic = null) {
+  return { topic, policies: null, policiesError: null, schema: null, schemaFor: null, schemaSettled: false };
 }
 
 // The open pattern's versions (`null` until they answer) and the failed
@@ -516,6 +542,8 @@ const TentaBusScreen = {
     state.detail = null;
     state.detailError = null;
     state.detailNotice = null;
+    state.access = freshAccess();
+    accessTurn += 1;
     state.justMoved = new Set();
     state.replicationNotice = null;
     state.groups = null;
@@ -763,8 +791,10 @@ async function refreshAll() {
   refreshReplicas();
   loadSubjects();
   await Promise.all([loadTopics(), loadGroups()]);
-  if (state.view?.kind === 'topic-detail') loadTopicDetail(state.view.name);
-  else if (state.view?.kind === 'consumer-detail') {
+  if (state.view?.kind === 'topic-detail') {
+    loadTopicDetail(state.view.name);
+    if (state.detail?.access?.canAdmin) loadTopicAccess(state.view.name);
+  } else if (state.view?.kind === 'consumer-detail') {
     state.consumerMoved = new Set();
     consumerDlqDue = true;
     loadConsumer(consumerKey(state.view.group, state.view.topic));
@@ -1155,6 +1185,10 @@ function openTopicDetail(name, section = DEFAULT_SECTION) {
     state.detail = null;
     state.detailError = null;
     state.detailNotice = null;
+    state.access = freshAccess(name);
+    accessTurn += 1;
+    state.hiding = freshHiding(name);
+    hidingTurn += 1;
     state.justMoved = new Set();
     state.unprocessed.sectionShown = LIST_STEP;
   }
@@ -1169,6 +1203,10 @@ function closeTopicDetail() {
   state.detail = null;
   state.detailError = null;
   state.detailNotice = null;
+  state.access = freshAccess();
+  accessTurn += 1;
+  state.hiding = freshHiding();
+  hidingTurn += 1;
   state.justMoved = new Set();
 }
 
@@ -1179,8 +1217,14 @@ const loadTopicDetail = topicDetailLoader({
   context: () => ({ instanceId: state.instanceId, name: state.view?.name }),
   apply({ detail, error }) {
     if (!error) {
+      const firstAdmin = detail?.access?.canAdmin === true && state.detail?.access?.canAdmin !== true;
       state.detail = detail;
       state.detailError = null;
+      // The counters of Dostęp and Ukrywanie danych need their entries, whatever section is open.
+      if (firstAdmin && state.access.acl == null) loadTopicAccess(state.view.name);
+      if (detail?.access?.canAdmin === true && (firstAdmin || (state.hiding.schemaSettled && state.hiding.schemaFor !== (detail.topic?.schemaId || '')))) {
+        loadTopicHiding(state.view.name);
+      }
     } else {
       const missing = busErrorCode(error?.message) === 'topic_not_found';
       // A failed reload keeps the page it had; only "gone" replaces it.
@@ -1220,6 +1264,9 @@ const detailContext = {
       justMoved: state.justMoved,
       unprocessed: state.unprocessed.byTopic.get(state.view.name) ?? null,
       unprocessedShown: state.unprocessed.sectionShown,
+      accessData: state.access.topic === state.view.name ? state.access : null,
+      hidingData: state.hiding.topic === state.view.name ? state.hiding : null,
+      instanceId: state.instanceId,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
     };
@@ -1248,6 +1295,10 @@ const detailContext = {
     else if (action.kind === 'transfer') openPartitionTransfer(name, action.partition, 'topic');
     else if (action.kind === 'group') openConsumer(action.group, name);
     else if (action.kind === 'retry') { state.detailError = null; renderPanel(); loadTopicDetail(name); }
+    else if (action.kind === 'access-reload') loadTopicAccess(name);
+    else if (action.kind === 'hiding-reload') loadTopicHiding(name);
+    else if (action.kind.startsWith('access-') || action.kind.startsWith('key-')) openAccessWindow(name, action);
+    else if (action.kind.startsWith('hiding-')) openHidingWindow(name, action);
   },
 };
 
@@ -1268,6 +1319,233 @@ function openTopicSettings(name, card) {
       if (card === 'write') refreshReplicas();
     },
   });
+}
+
+// =============================================================================
+// A topic's Dostęp: the entries of people, groups and addons, and the keys of
+// outside systems (modules/tentabus/topic-access.js). Loaded for a topic's
+// administrator only; the keys' own list and scopes for the server
+// administrator only (those requests are site-admin on the server).
+// =============================================================================
+
+let accessTurn = 0;
+
+async function fetchKeys() {
+  const list = await ApiBinary.list('apiKeyListRequest', { arrayKey: 'keys' });
+  const general = (list || []).filter((k) => k.keyType === 'general');
+  return Promise.all(general.map(async (k) => ({
+    keyId: k.keyId,
+    name: k.name,
+    lastUsedAtEpoch: k.lastUsedAtEpoch ?? null,
+    scopes: (await ApiBinary.action('apiKeyScopeListRequest', { keyUid: k.keyId }))?.entries || [],
+  })));
+}
+
+// Only the newest answer for the open topic lands: a load asked before a
+// change must not paint the entries as they were before it.
+async function loadTopicAccess(name) {
+  const instanceId = state.instanceId;
+  const turn = ++accessTurn;
+  const current = () => accessTurn === turn && state.instanceId === instanceId && state.view?.name === name;
+  const siteAdmin = state.capabilities?.isSiteAdmin === true;
+  const [acl, keys] = await Promise.allSettled([
+    ApiBinary.one('busAclListRequest', { instanceId: requireInstanceId(instanceId), topic: name }),
+    siteAdmin ? fetchKeys() : Promise.resolve(null),
+  ]);
+  if (!current()) return;
+  const next = freshAccess(name);
+  if (acl.status === 'fulfilled') next.acl = acl.value?.entries || [];
+  else next.aclError = describeBusError(acl.reason);
+  if (keys.status === 'fulfilled') next.keys = keys.value;
+  else next.keysError = describeBusError(keys.reason);
+  // A failed reload keeps what the section showed.
+  if (!next.acl && state.access.topic === name && state.access.acl) {
+    next.acl = state.access.acl;
+    next.aclError = null;
+  }
+  state.access = next;
+  renderPanel();
+}
+
+function openAccessWindow(name, action) {
+  const detail = state.detail;
+  if (!detail?.access?.canAdmin || !state.access.acl) return;
+  const instanceId = state.instanceId;
+  const where = { instanceId: requireInstanceId(instanceId), orgId: state.capabilities.orgId || '', topic: name };
+  const rows = subjectRows(state.access.acl);
+  const still = () => state.instanceId === instanceId && state.view?.name === name;
+  const onSaved = async (notice) => {
+    if (!still()) return;
+    state.detailNotice = { section: 'access', tone: 'success', title: notice.title, text: notice.text };
+    await loadTopicAccess(name);
+    loadTopicDetail(name);
+  };
+  // Several requests may have gone through before one was refused: the
+  // section shows what the server holds either way.
+  const reloadAfter = (send) => async (request) => {
+    try {
+      return await send(request);
+    } finally {
+      if (still()) loadTopicAccess(name);
+    }
+  };
+  const subjectCtx = {
+    instanceId: where.instanceId,
+    topic: name,
+    rows,
+    directory: ({ kind, query }) => ApiBinary.one('busSubjectDirectoryRequest', { instanceId: where.instanceId, kind, query }),
+    setAcl: reloadAfter((request) => ApiBinary.action('busAclSetRequest', request)),
+    describeError: describeBusError,
+    onSaved,
+  };
+  if (action.kind === 'access-grant') { openAccessGrant(subjectCtx); return; }
+  if (action.kind === 'access-change' || action.kind === 'access-remove') {
+    const row = rows.find((r) => `${r.subjectType}:${r.subjectId}` === action.subject);
+    if (!row) return;
+    if (action.kind === 'access-change') openAccessChange(row, subjectCtx);
+    else openAccessRemove(row, subjectCtx);
+    return;
+  }
+  if (state.capabilities?.isSiteAdmin !== true || !where.orgId) return;
+  const keyCtx = {
+    where,
+    instanceLabel: state.instanceLabel,
+    orgName: state.capabilities.orgName,
+    origin: window.location.origin,
+    describeError: describeBusError,
+    onSaved,
+  };
+  if (action.kind === 'key-issue') {
+    openKeyIssue({
+      ...keyCtx,
+      create: (request) => ApiBinary.action('apiKeyCreateRequest', request),
+      onIssued: onSaved,
+    });
+    return;
+  }
+  const keys = keyRows({ aclEntries: state.access.acl, keys: state.access.keys, instanceId: where.instanceId, orgId: where.orgId });
+  if (action.kind === 'key-clear') {
+    const gone = keys.find((k) => k.keyId === action.keyId && k.gone);
+    if (gone) openGoneKeyClear(gone, { ...keyCtx, aclEntries: state.access.acl, setAcl: subjectCtx.setAcl });
+    return;
+  }
+  const key = keys.find((k) => k.keyId === action.keyId && k.known);
+  if (!key) return;
+  if (action.kind === 'key-rights') {
+    openKeyRights(key, { ...keyCtx, scope: reloadAfter(({ kind, payload }) => ApiBinary.action(kind, payload)) });
+  } else if (action.kind === 'key-revoke') {
+    openKeyRevoke(key, { ...keyCtx, revoke: reloadAfter((request) => ApiBinary.action('apiKeyRevokeRequest', request)) });
+  }
+}
+
+// =============================================================================
+// A topic's Ukrywanie danych: the rules of what each person, group or addon
+// sees or may write (modules/tentabus/topic-hiding.js). Loaded for a topic's
+// administrator only, with the message pattern the fields are read from.
+// =============================================================================
+
+let hidingTurn = 0;
+
+// The pattern a JSON topic checks with, for its field list: the version the
+// topic validates against (`SchemaGet` without a version).
+async function fetchFieldSchema(instanceId, topic) {
+  if (!topic?.schemaId || topicFormat(topic.contentType) !== 'json') return null;
+  try {
+    const got = await ApiBinary.one('busSchemaGetRequest', { instanceId, subject: topic.schemaId });
+    return { subject: topic.schemaId, version: got?.schema?.version ?? null, text: got?.schemaText ?? '' };
+  } catch {
+    return { failed: true };
+  }
+}
+
+// Only the newest answer for the open topic lands, like `loadTopicAccess`.
+// The pattern is read once per pattern the topic uses.
+async function loadTopicHiding(name) {
+  const instanceId = state.instanceId;
+  const turn = ++hidingTurn;
+  const current = () => hidingTurn === turn && state.instanceId === instanceId && state.view?.name === name;
+  const topic = state.detail?.topic;
+  const schemaFor = topic?.schemaId || '';
+  const kept = state.hiding.topic === name && state.hiding.schemaSettled && state.hiding.schemaFor === schemaFor;
+  const iid = requireInstanceId(instanceId);
+  const [policies, schema] = await Promise.allSettled([
+    ApiBinary.one('busFieldPolicyListRequest', { instanceId: iid, topic: name }),
+    kept ? Promise.resolve(state.hiding.schema) : fetchFieldSchema(iid, topic),
+  ]);
+  if (!current()) return;
+  const next = freshHiding(name);
+  next.schema = schema.status === 'fulfilled' ? schema.value : { failed: true };
+  next.schemaFor = schemaFor;
+  next.schemaSettled = true;
+  if (policies.status === 'fulfilled') next.policies = policies.value?.policies || [];
+  else next.policiesError = describeBusError(policies.reason);
+  // A failed reload keeps what the section showed.
+  if (!next.policies && state.hiding.topic === name && state.hiding.policies) {
+    next.policies = state.hiding.policies;
+    next.policiesError = null;
+  }
+  state.hiding = next;
+  renderPanel();
+}
+
+function openHidingWindow(name, action) {
+  const detail = state.detail;
+  const hiding = state.hiding;
+  if (!detail?.access?.canAdmin || !hiding.policies || hiding.topic !== name) return;
+  const instanceId = requireInstanceId(state.instanceId);
+  const format = topicFormat(detail.topic.contentType);
+  const source = fieldSource({ format, schema: hiding.schema });
+  const still = () => state.instanceId === instanceId && state.view?.name === name;
+  const directory = ({ kind, query }) => ApiBinary.one('busSubjectDirectoryRequest', { instanceId, kind, query });
+  if (action.kind === 'hiding-preview') {
+    if (!detail.access.canRead || source.mode === 'blocked') return;
+    openHidingPreview({
+      instanceId,
+      topic: name,
+      partitionCount: detail.topic.partitions ?? 1,
+      source,
+      directory,
+      loadPartitions: async () => (await ApiBinary.one('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
+      preview: (request) => ApiBinary.one('busFieldPolicyPreviewRequest', request),
+      describeError: describeBusError,
+    });
+    return;
+  }
+  if (!hiding.schemaSettled) return;
+  const rules = policyRows(hiding.policies);
+  // Several requests may have gone through before one was refused: the
+  // section shows what the server holds either way.
+  const reloadAfter = (send) => async (request) => {
+    try {
+      return await send(request);
+    } finally {
+      if (still()) loadTopicHiding(name);
+    }
+  };
+  const ctx = {
+    instanceId,
+    topic: name,
+    format,
+    source,
+    rules,
+    directory,
+    setPolicy: reloadAfter((request) => ApiBinary.action('busFieldPolicySetRequest', request)),
+    deleteRule: reloadAfter((request) => ApiBinary.action('busFieldPolicyDeleteRequest', request)),
+    describeError: describeBusError,
+    onSaved: async (notice) => {
+      if (!still()) return;
+      state.detailNotice = { section: 'hiding', tone: notice.tone || 'success', title: notice.title, text: notice.text };
+      await loadTopicHiding(name);
+    },
+  };
+  if (action.kind === 'hiding-add') {
+    if (source.mode !== 'blocked') openHidingAdd(ctx);
+    return;
+  }
+  const row = rules.find((r) => r.key === action.rule);
+  if (!row) return;
+  if (action.kind === 'hiding-change') openHidingChange(row, ctx);
+  else if (action.kind === 'hiding-remove') openHidingRemove(row, ctx);
 }
 
 // "Przenieś prowadzenie" from a topic's Partycje i kopie (`from = 'topic'`)

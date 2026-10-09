@@ -97,6 +97,8 @@ const NON_CONTROL_KINDS = new Set([
   // Obstacle avoidance is rendered as a dedicated toggle in buildControls, not a
   // generic action button, so exclude it from the generic control surface.
   'obstacle_avoid_on', 'obstacle_avoid_off',
+  // LiDAR and gesture reactions have their own toggles on the media tiles.
+  'lidar_on', 'lidar_off', 'gestures_on', 'gestures_off',
 ]);
 
 // Authoritative client-side set of known dangerous kinds. Defense-in-depth: the
@@ -165,6 +167,12 @@ let sharedMapMode = false;
 //          lastPoints:Float32Array|null,
 //          timing:{atMs,decodeMs,intervalMs,e2eMs,hostMs,netMs}[] }.
 let lidarLive = new Map();
+// Operator toggles (LiDAR, gestures) not yet confirmed by a robots poll:
+// `${kind}:${robotId}` → { value, until }. The robots list is cached server-side
+// and can still carry the previous value for a few seconds; while an entry is
+// pending the toggle shows the operator's choice instead of bouncing back.
+const pendingToggles = new Map();
+const TOGGLE_PENDING_MS = 15000;
 // Single shared slow timer that re-renders the open detail's LiDAR status so the
 // freshness badge flips to "nieaktualne" when frames stop arriving. NOT a poll.
 let lidarTimer = null;
@@ -301,7 +309,9 @@ const RobotsScreen = {
       window.clearInterval(refreshTimer);
       refreshTimer = null;
     }
+    stopDetailMediaFit();
     stopLidarLoop();
+    pendingToggles.clear();
     disposeVoxel();
     stopPadLoop();
     destroyDetectionOverlays();
@@ -354,6 +364,36 @@ function telemetry(r) {
 // when the robot has no LiDAR capability.
 function lidar(r) {
   return field(r, 'lidar', 'lidar') || null;
+}
+
+// The state a toggle shows: the operator's pending choice until a poll echoes it
+// (or it expires), otherwise what the robot reports.
+function effectiveToggle(kind, id, reported) {
+  const key = `${kind}:${id}`;
+  const p = pendingToggles.get(key);
+  if (p) {
+    if (reported === p.value || performance.now() > p.until) pendingToggles.delete(key);
+    else return p.value;
+  }
+  return reported;
+}
+
+function setPendingToggle(kind, id, value) {
+  pendingToggles.set(`${kind}:${id}`, { value, until: performance.now() + TOGGLE_PENDING_MS });
+}
+
+function clearPendingToggle(kind, id) {
+  pendingToggles.delete(`${kind}:${id}`);
+}
+
+function lidarEnabled(r) {
+  const l = lidar(r);
+  if (!l) return false;
+  return effectiveToggle('lidar', robotId(r), !!l.enabled);
+}
+
+function gesturesEnabled(r) {
+  return effectiveToggle('gestures', robotId(r), !!field(r, 'gesturesEnabled', 'gestures_enabled'));
 }
 
 function telNum(t, camel, snake) {
@@ -523,12 +563,55 @@ function backToList() {
 // subscription, the staleness sweep and the wgpu voxel view. Called on back,
 // robot-gone, error and unmount.
 function closeDetail() {
+  stopDetailMediaFit();
   stopLidarLoop();
   disposeVoxel();
   stopPadLoop();
   // Pad is ON by default for each freshly opened detail; a per-session toggle-off
   // does not carry across to a different robot. padMaxSpeed intentionally persists.
   padEnabled = true;
+}
+
+// The tab panel takes exactly the height the screen has left below the detail
+// header, so the page itself never scrolls: previews fill it and a long tab
+// scrolls inside it. The header wraps differently per width (action row, KPIs),
+// so a fixed calc() cannot know it: measure the panel's offset inside the scroll
+// container and publish the rest as `--robots-media-h` for robots.css.
+let detailMediaObs = null;
+
+function scrollContainerOf(el) {
+  for (let n = el.parentElement; n; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if (oy === 'auto' || oy === 'scroll') return n;
+  }
+  return document.scrollingElement || document.documentElement;
+}
+
+function fitDetailMedia(shell) {
+  const panel = shell.querySelector('[data-field="panel"]');
+  if (!panel || !shell.isConnected) return;
+  const scroller = scrollContainerOf(shell);
+  const cs = getComputedStyle(scroller);
+  const offset = panel.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+    - scroller.clientTop + scroller.scrollTop;
+  const avail = scroller.clientHeight - offset - (parseFloat(cs.paddingBottom) || 0);
+  shell.style.setProperty('--robots-media-h', `${Math.max(0, Math.floor(avail))}px`);
+}
+
+function startDetailMediaFit(shell) {
+  stopDetailMediaFit();
+  detailMediaObs = new ResizeObserver(() => fitDetailMedia(shell));
+  detailMediaObs.observe(scrollContainerOf(shell));
+  for (const sel of ['.robots-detail-toolbar', '.robots-detail-kpis', '[data-field="actionrow"]', 'tf-tabs']) {
+    const el = shell.querySelector(sel);
+    if (el) detailMediaObs.observe(el);
+  }
+  fitDetailMedia(shell);
+}
+
+function stopDetailMediaFit() {
+  detailMediaObs?.disconnect();
+  detailMediaObs = null;
 }
 
 // =============================================================================
@@ -592,8 +675,8 @@ function renderSharedMap() {
       const id = robotId(r);
       if (!id) continue;
       present.add(id);
-      if (!lidarLive.has(id)) startRobotLidar(id);
-      const live = lidarLive.get(id);
+      const live = startRobotLidar(id);
+      setLiveLidarStreams(id, live, true);
       // Attempt the camera-depth stream ONCE per robot per map session. The backend
       // rejects `scene-depth:` for non-local robots; without this guard the failure
       // (which clears depthSceneUnsub) would re-fire a failing subscribe every poll.
@@ -666,15 +749,15 @@ function renderMapSidePanel() {
     <div class="robots-map-card">
       <h3>Warstwy</h3>
       <div class="robots-map-legend">
-        <span class="robots-map-leg"><i class="dot lidar"></i>LiDAR (głębia)</span>
-        <span class="robots-map-leg"><i class="dot depth"></i>Kamera (depth)</span>
+        <span class="robots-map-leg">LiDAR + głębia z kamery</span>
+        <span class="robots-map-leg"><i class="dot range"></i>blisko → daleko od robota</span>
       </div>
     </div>`;
 }
 
 // Union every robot's clouds into the single voxel view. LiDAR layer prefers the
 // accumulated scene, falling back to the live frame for robots whose scene is
-// still empty; the camera-depth layer is the magenta overlay.
+// still empty; the camera-depth layer is the overlay (same distance colours).
 function renderSharedClouds() {
   if (!voxelView || !voxelView.setMapPoints) return;
   const lidarParts = [];
@@ -1053,6 +1136,7 @@ function renderDetail() {
     shell = byId('robots-detail');
     shell.dataset.robot = id;
     shell.dataset.activeTab = 'overview';
+    startDetailMediaFit(shell);
 
     shell.querySelector('[data-detail-back]')?.addEventListener('click', backToList);
 
@@ -1227,7 +1311,7 @@ function updateDetailHeader(shell, r) {
   } else {
     const l = lidar(r);
     const pts = l ? Number(l.pointCount ?? l.point_count ?? 0) : 0;
-    setDkpi(shell, 'lidar', l ? (l.enabled ? '…' : 'wył.') : '—');
+    setDkpi(shell, 'lidar', l ? (lidarEnabled(r) ? '…' : 'wył.') : '—');
     setDkpi(shell, 'lidar-sub', l && pts > 0 ? `${pts} pkt` : (l ? 'oczekiwanie' : 'brak'));
   }
 
@@ -1286,18 +1370,18 @@ function renderDetailPanel(shell, tabId) {
 
   if (tabId === 'overview') {
     panel.innerHTML = `
-      <div class="robots-tiles">
+      <div class="robots-overview">
         <div class="robots-tile" data-field="camera-tile"></div>
         <div class="robots-tile robots-tile-lidar" data-field="lidar-tile"></div>
-      </div>
-      <div class="robots-panels">
-        <div class="robots-section" data-field="telemetry"></div>
-        <div class="robots-section">
-          <div class="robots-section-head"><h3>Szybkie sterowanie</h3></div>
-          <div class="robots-controls" data-field="quickmove"></div>
+        <div class="robots-overview-side">
+          <div class="robots-section" data-field="telemetry"></div>
+          <div class="robots-section">
+            <div class="robots-section-head"><h3>Szybkie sterowanie</h3></div>
+            <div class="robots-controls" data-field="quickmove"></div>
+          </div>
         </div>
       </div>`;
-    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, false);
+    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r);
     mountLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
     buildQuickMove(panel.querySelector('[data-field="quickmove"]'), id, r);
     updateTelemetry(panel.querySelector('[data-field="telemetry"]'), r);
@@ -1306,7 +1390,7 @@ function renderDetailPanel(shell, tabId) {
 
   if (tabId === 'camera') {
     panel.innerHTML = `<div class="robots-tile robots-tile-full" data-field="camera-tile"></div>`;
-    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, true);
+    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r);
     return;
   }
 
@@ -1462,12 +1546,12 @@ function updateDetailPanel(shell, r) {
   syncDetailLidar(r, lidarSurfaceOpen);
 
   if (tabId === 'overview') {
-    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, false);
+    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r);
     updateTelemetry(panel.querySelector('[data-field="telemetry"]'), r);
     reconcileLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
     refreshOfflineDisable(panel, r);
   } else if (tabId === 'camera') {
-    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, true);
+    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r);
   } else if (tabId === 'lidar') {
     reconcileLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
   } else if (tabId === 'control') {
@@ -1502,8 +1586,9 @@ function refreshOfflineDisable(panel, r) {
 // =============================================================================
 
 // Mounts the live camera stream into a tile. The <tf-video-stream> is keyed by
-// stream-id so a poll never rebuilds the live MSE element. `full` controls tile
-// height (full-size on the Kamera tab).
+// stream-id so a poll never rebuilds the live MSE element. The tile height comes
+// from the detail's measured media height (see fitDetailMedia); `fit="contain"`
+// keeps the whole frame visible and letterboxes instead of cropping.
 /// Drop every camera tile's detections overlay (stream subscription + rAF loop)
 /// — a screen unmount must not leave them running on a detached element.
 function destroyDetectionOverlays() {
@@ -1513,7 +1598,7 @@ function destroyDetectionOverlays() {
   });
 }
 
-function mountCameraTile(host, r, full) {
+function mountCameraTile(host, r) {
   if (!host) return;
   // The tile is rebuilt on camera/size changes: drop the previous overlay's
   // stream subscription and rAF loop before the element it drew on is gone.
@@ -1521,27 +1606,32 @@ function mountCameraTile(host, r, full) {
   host._detectionsOverlay = null;
   const cam = cameraId(r);
   const id = robotId(r);
-  // Key the tile by camera id + size so reconcileCameraTile() can detect a flip
-  // and avoid rebuilding the live <tf-video-stream> when nothing changed.
+  // Key the tile by camera id so reconcileCameraTile() can detect a flip and
+  // avoid rebuilding the live <tf-video-stream> when nothing changed.
   host.dataset.cam = String(cam ?? '');
-  host.dataset.full = full ? '1' : '';
   if (!cam) {
     host.classList.add('robots-tile-empty');
     host.innerHTML = `<div class="robots-tile-ph">Brak kamery</div>`;
     return;
   }
   host.classList.remove('robots-tile-empty');
-  const h = full ? 520 : 280;
   host.innerHTML = `
     <div class="robots-tile-top"><span class="robots-tile-title">Kamera</span><span class="robots-tile-rec">● na żywo</span><span class="robots-speed-badge" data-speed-badge>—</span></div>
-    <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" height-px="${h}"></tf-video-stream>
-    <div class="robots-tile-bottom">
+    <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" fit="contain"></tf-video-stream>
+    <div class="robots-tile-bottom robots-camera-bar">
       <tf-button variant="outline" size="sm" icon="image" data-share-camera="${escapeAttr(cam)}" data-robot="${escapeAttr(id)}">Dodaj do TentaVision</tf-button>
+      <span class="robots-toggle-opt" title="Machanie ręką → robot macha, serce z dłoni → robot robi serce"><tf-toggle data-gestures-toggle></tf-toggle><span class="robots-lidar-label">Gesty</span></span>
     </div>`;
   host.querySelector('[data-share-camera]')?.addEventListener('click', (e) => {
     const btn = e.currentTarget;
     handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
   });
+  const gesturesToggle = host.querySelector('[data-gestures-toggle]');
+  gesturesToggle?.addEventListener('change', (e) => {
+    const on = e?.detail?.checked ?? e?.detail ?? gesturesToggle.checked ?? gesturesToggle.hasAttribute('checked');
+    handleGesturesToggle(id, !!on, gesturesToggle);
+  });
+  updateGesturesToggle(host, r);
   // Live detections (persons from the camera's privacy probe, or whatever else
   // publishes for this camera) drawn over the tile, same as the SDK renderer.
   const tile = host.querySelector('tf-video-stream');
@@ -1557,14 +1647,67 @@ function mountCameraTile(host, r, full) {
 }
 
 // Keyed camera reconcile across polls: rebuild the tile (and its live MSE element)
-// ONLY when the camera id (or tile size) actually changed — a steady camera keeps
-// the same <tf-video-stream> playing, mirroring the list's old keyed reconcile.
-function reconcileCameraTile(host, r, full) {
+// ONLY when the camera id actually changed — a steady camera keeps the same
+// <tf-video-stream> playing, mirroring the list's old keyed reconcile.
+function reconcileCameraTile(host, r) {
   if (!host) return;
-  const wantCam = String(cameraId(r) ?? '');
-  const wantFull = full ? '1' : '';
-  if (host.dataset.cam === wantCam && host.dataset.full === wantFull) return;
-  mountCameraTile(host, r, full);
+  if (host.dataset.cam !== String(cameraId(r) ?? '')) {
+    mountCameraTile(host, r);
+    return;
+  }
+  updateGesturesToggle(host, r);
+}
+
+// Mirrors the robot's gesture-reaction state (pending-aware) onto the camera
+// tile's toggle; unusable while the robot is offline.
+function updateGesturesToggle(host, r) {
+  const toggle = host?.querySelector('[data-gestures-toggle]');
+  if (!toggle || toggle.dataset.busy) return;
+  if (gesturesEnabled(r)) toggle.setAttribute('checked', '');
+  else toggle.removeAttribute('checked');
+  if (isControllable(r.status || '')) toggle.removeAttribute('disabled');
+  else toggle.setAttribute('disabled', '');
+}
+
+// Re-renders every gesture toggle of `id` on the open detail.
+function refreshGesturesUi(id) {
+  const r = findRobot(id);
+  if (!r || id !== selectedRobotId) return;
+  document.querySelectorAll('#robots-detail [data-field="camera-tile"]').forEach((host) => {
+    updateGesturesToggle(host, r);
+  });
+}
+
+// Gesture reactions (gestures_on / gestures_off → go2.gestures_on/off, routed
+// locally or over the mesh). Pending until a poll echoes it, like LiDAR.
+async function handleGesturesToggle(id, on, toggle) {
+  if (!id) return;
+  setPendingToggle('gestures', id, on);
+  toggle.dataset.busy = '1';
+  toggle.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.action('robotControlRequest', {
+      robotId: id,
+      kind: on ? 'gestures_on' : 'gestures_off',
+      vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
+    });
+    if (resp.ok) {
+      pushLog('success', `Reakcje na gesty ${on ? 'włączone' : 'wyłączone'}`);
+      toast(`Gesty ${on ? 'włączone' : 'wyłączone'} ✓`, 'success');
+    } else {
+      clearPendingToggle('gestures', id);
+      const reason = resp.rejected ? `odrzucono — ${resp.rejected}` : `błąd — ${resp.error || 'nieznany'}`;
+      pushLog('error', `Gesty: ${reason}`);
+      toast(`Gesty: ${reason}`, 'error');
+    }
+  } catch (err) {
+    clearPendingToggle('gestures', id);
+    pushLog('error', `Gesty: ${err.message}`);
+    toast(`Gesty: ${err.message}`, 'error');
+  } finally {
+    delete toggle.dataset.busy;
+    refreshGesturesUi(id);
+  }
 }
 
 // =============================================================================
@@ -1591,7 +1734,7 @@ function mountLidarTile(host, r) {
   host.classList.remove('robots-tile-empty');
   host.innerHTML = `
     <div class="robots-tile-top">
-      <span class="robots-tile-title">LiDAR — głębia</span>
+      <span class="robots-tile-title">Widok 3D — LiDAR i kamera</span>
       <span class="robots-tile-rec" data-lidar-rec>● —</span>
       <span class="robots-speed-badge" data-speed-badge>—</span>
     </div>
@@ -1599,11 +1742,9 @@ function mountLidarTile(host, r) {
       <div class="robots-voxel-ph" data-voxel-ph>renderer się uruchamia…</div>
     </div>
     <div class="robots-tile-bottom robots-lidar-bar">
-      <tf-toggle data-lidar-toggle></tf-toggle>
-      <span class="robots-lidar-label">Strumień 3D</span>
+      <span class="robots-toggle-opt"><tf-toggle data-lidar-toggle></tf-toggle><span class="robots-lidar-label">LiDAR</span></span>
+      <span class="robots-toggle-opt"><tf-toggle data-depth-toggle></tf-toggle><span class="robots-lidar-label">Głębia z kamery</span></span>
       <span class="robots-lidar-status" data-lidar-status>—</span>
-      <tf-toggle data-depth-toggle></tf-toggle>
-      <span class="robots-lidar-label">Kamera (depth)</span>
     </div>
     <div class="robots-lidar-diag" data-lidar-diag hidden></div>`;
 
@@ -1643,8 +1784,8 @@ function updateLidarTile(host, r) {
   const l = lidar(r);
   if (!l) return;
   const offline = !isControllable(r.status || '');
-  const enabled = !!l.enabled;
-  const available = !!l.available;
+  const enabled = lidarEnabled(r);
+  const available = enabled && !!l.available;
   const snapshotPoints = Number(l.pointCount ?? l.point_count ?? 0);
   const resolution = l.resolution;
 
@@ -1656,10 +1797,10 @@ function updateLidarTile(host, r) {
     else toggle.removeAttribute('disabled');
   }
 
-  // The depth overlay piggybacks on the live scene subscription, so it's only
-  // usable while the 3D stream is live. Disable it (and clear its checked state)
-  // when there's no live entry, and otherwise mirror the actual overlay state so
-  // the toggle can never read "on" without a `scene-depth` subscription.
+  // The depth overlay lives on the detail's live entry (open while the 3D view is
+  // visible and the robot online), independent of the LiDAR stream. Disable it
+  // when there's no live entry, otherwise mirror the actual overlay state so the
+  // toggle can never read "on" without a `scene-depth` subscription.
   const depthToggle = host.querySelector('[data-depth-toggle]');
   if (depthToggle) {
     const live = lidarLive.get(robotId(r));
@@ -1851,10 +1992,11 @@ async function ensureVoxel(container) {
       if (live && voxelView) {
         if (live.lastScenePoints && voxelView.setMapPoints) {
           renderMap(selectedRobotId, live);
-          renderOverlay(selectedRobotId, live);
         } else if (live.lastPoints) {
           try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
         }
+        // The camera layer stands on its own: replay it with or without a LiDAR map.
+        renderOverlay(selectedRobotId, live);
       }
       applyRobotPose(selectedRobotId);
     }
@@ -2410,22 +2552,84 @@ function computeLidarFps(live) {
   return ((times.length - 1) * 1000) / spanMs;
 }
 
-// Owns the single detail LiDAR subscription. Subscribes only when a LiDAR surface
-// is open AND lidar is enabled AND the robot is online; otherwise closes it.
+// Owns the detail's live 3D entry: open while a 3D surface is visible and the
+// robot is online. Inside it the LiDAR streams follow the LiDAR toggle and the
+// camera-depth overlay follows its own toggle, so either works without the other.
 function syncDetailLidar(r, surfaceOpen) {
   const id = robotId(r);
-  const l = lidar(r);
   const offline = !isControllable(r.status || '');
-  const want = !!(surfaceOpen && l && l.enabled && !offline);
-  if (want) startRobotLidar(id);
-  else stopRobotLidar(id);
+  if (!(surfaceOpen && lidar(r) && !offline)) {
+    stopRobotLidar(id);
+    return;
+  }
+  const fresh = !lidarLive.has(id);
+  const live = startRobotLidar(id);
+  setLiveLidarStreams(id, live, lidarEnabled(r));
+  // The camera-depth overlay is on by default for every newly opened 3D surface;
+  // the toggle still switches it off until the surface closes.
+  if (fresh) handleDepthToggle(id, true);
 }
 
-// Opens the real-time PUSH subscription (idempotent) and ensures the staleness
-// sweep is running.
+// Opens or closes the LiDAR half of a live entry (`lidar:` frames + `scene:`
+// map). Closing also drops the LiDAR cloud from the view so only the camera
+// layer stays.
+function setLiveLidarStreams(id, live, on) {
+  if (on === live.lidarOn) return;
+  live.lidarOn = on;
+  if (on) {
+    live.resubUsed = false;
+    openLidarSubscription(id, live);
+    // The server-side SHARED MAP is the source of truth: subscribe to `scene:<id>`
+    // and render its full snapshots via setMapPoints. The live `lidar:` frames
+    // still union on top between snapshots for low-latency feel.
+    openSceneSubscription(id, live);
+    return;
+  }
+  closeLiveLidarStreams(live);
+  live.frameTimes = [];
+  live.timing = [];
+  live.lastPointCount = 0;
+  live.lastFrameAtMs = 0;
+  live.lastPoints = null;
+  live.lastScenePoints = null;
+  live.lastSceneCount = 0;
+  if (sharedMapMode) { renderSharedClouds(); return; }
+  if (voxelView && id === selectedRobotId) {
+    try {
+      // An empty authoritative map also drops the live-lidar union; unlike
+      // clearAccumulation it keeps the user's orbit and zoom.
+      voxelView.setMapPoints?.(new Float32Array(0), 0);
+      perfStats.sceneN = 0;
+      perfStats.liveN = 0;
+    } catch (e) {
+      console.warn('[robots] voxel clear threw:', e?.message ?? e);
+    }
+  }
+}
+
+// Fires the LiDAR subscription handles of a live entry (each emits the
+// StreamCloseRequest on its original correlation id) and cancels a pending
+// re-subscribe.
+function closeLiveLidarStreams(live) {
+  if (live.resubTimer != null) {
+    window.clearTimeout(live.resubTimer);
+    live.resubTimer = null;
+  }
+  if (live.unsub) {
+    try { live.unsub(); } catch { /* ignore */ }
+    live.unsub = null;
+  }
+  if (live.sceneUnsub) {
+    try { live.sceneUnsub(); } catch { /* ignore */ }
+    live.sceneUnsub = null;
+  }
+}
+
+// Creates the live entry (idempotent) without opening any stream, ensures the
+// staleness sweep is running and returns the entry.
 function startRobotLidar(id) {
-  if (!id) return;
-  if (lidarLive.has(id)) return;
+  const existing = lidarLive.get(id);
+  if (existing) return existing;
   const live = {
     unsub: null,
     sceneUnsub: null,
@@ -2443,16 +2647,13 @@ function startRobotLidar(id) {
     lastDepthPoints: null,
     lastDepthCount: 0,
     timing: [],
+    lidarOn: false,
   };
   lidarLive.set(id, live);
   if (lidarTimer == null) {
     lidarTimer = window.setInterval(sweepLidarStaleness, LIDAR_STALE_SWEEP_MS);
   }
-  openLidarSubscription(id, live);
-  // The server-side SHARED MAP is the source of truth: subscribe to `scene:<id>`
-  // and render its full snapshots via setMapPoints. The live `lidar:` frames above
-  // still union on top between snapshots for low-latency feel.
-  openSceneSubscription(id, live);
+  return live;
 }
 
 // Subscribes to `lidar:<id>` and wires the per-frame / end / error handlers.
@@ -2526,11 +2727,11 @@ function onSceneChunk(id, live, body) {
   if (body.variant !== 'StreamFrame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
-  if (lidarLive.get(id) !== live) return;
+  if (lidarLive.get(id) !== live || !live.lidarOn) return;
   const t = performance.now();
   decodeFrameAsync(`scene:${id}`, data, (f) => {
     perfStats.decodeMs = performance.now() - t;
-    if (lidarLive.get(id) !== live) return;
+    if (lidarLive.get(id) !== live || !live.lidarOn) return;
     if (!f || !f.hasFrame) return;
     // Stash the authoritative map so a view that mounts AFTER this snapshot (renderer
     // init is async, and the server skips re-sending an unchanged map) can replay it.
@@ -2542,7 +2743,7 @@ function onSceneChunk(id, live, body) {
 
 // A camera depth-map snapshot (`scene:<id>-depth`): same canonical frame as the
 // LiDAR scene, but the cloud reconstructed from the camera. Stashed separately and
-// rendered as a distinct-colour overlay (renderOverlay → setOverlayPoints).
+// rendered as the overlay layer (renderOverlay → setOverlayPoints).
 function onDepthSceneChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
   if (body.variant !== 'StreamFrame') return;
@@ -2594,7 +2795,7 @@ function renderMap(id, live) {
   }
 }
 
-// Render the camera-depth overlay as a SECOND cloud in a distinct colour (the
+// Render the camera-depth overlay as a SECOND cloud (the
 // renderer's setOverlayPoints), or clear it when the overlay is off. Kept separate
 // from the LiDAR map so the two can be compared/calibrated against each other.
 function renderOverlay(id, live) {
@@ -2760,7 +2961,7 @@ function onLidarChunk(id, live, body) {
   if (body.variant !== 'StreamFrame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
-  if (lidarLive.get(id) !== live) return;
+  if (lidarLive.get(id) !== live || !live.lidarOn) return;
   const tOnChunk = Date.now() * 1000;
   const arrivalMs = performance.now();
   const intervalMs = live.lastFrameAtMs ? arrivalMs - live.lastFrameAtMs : 0;
@@ -2877,7 +3078,7 @@ function onLidarEnd(id, live, body) {
     live.resubUsed = true;
     live.resubTimer = window.setTimeout(() => {
       live.resubTimer = null;
-      if (lidarLive.get(id) !== live) return;
+      if (lidarLive.get(id) !== live || !live.lidarOn) return;
       openLidarSubscription(id, live);
     }, LIDAR_RESUBSCRIBE_DELAY_MS);
     return;
@@ -2908,18 +3109,8 @@ function stopRobotLidar(id) {
 // correlation id — the only id the server's close handler can cancel by).
 function closeLidarSubscription(id, live) {
   live.closed = true;
-  if (live.resubTimer != null) {
-    window.clearTimeout(live.resubTimer);
-    live.resubTimer = null;
-  }
-  if (live.unsub) {
-    try { live.unsub(); } catch { /* ignore */ }
-    live.unsub = null;
-  }
-  if (live.sceneUnsub) {
-    try { live.sceneUnsub(); } catch { /* ignore */ }
-    live.sceneUnsub = null;
-  }
+  live.lidarOn = false;
+  closeLiveLidarStreams(live);
   if (live.depthSceneUnsub) {
     try { live.depthSceneUnsub(); } catch { /* ignore */ }
     live.depthSceneUnsub = null;
@@ -2957,8 +3148,12 @@ function refreshLidarUi(id) {
 
 // Sends a LiDAR enable/disable through the standard robot control path
 // (lidar_on / lidar_off → go2.lidar_on/off, routed locally or over the mesh).
+// The operator's choice applies to the view at once (pending until a poll echoes
+// it); a refused or failed request drops it and the robot's state returns.
 async function handleLidarToggle(id, on, toggle) {
   if (!id) return;
+  setPendingToggle('lidar', id, on);
+  applyLidarChoice(id);
   toggle.setAttribute('disabled', '');
   try {
     const resp = await ApiBinary.action('robotControlRequest', {
@@ -2967,33 +3162,47 @@ async function handleLidarToggle(id, on, toggle) {
       vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
     });
     if (resp.ok) {
-      const r = findRobot(id);
-      const l = r ? lidar(r) : null;
-      if (l) l.enabled = on;
-      // Gate the (re)subscription through the CURRENT detail/tab state: an in-flight
-      // lidar_on must not resurrect a subscription if the user already left the
-      // LiDAR surface (tab switch / back to list) while the request was pending.
-      const shell = byId('robots-detail');
-      const tabId = shell?.dataset.activeTab || 'overview';
-      const surfaceOpen = !!r && id === selectedRobotId && (tabId === 'overview' || tabId === 'lidar');
-      if (r) syncDetailLidar(r, surfaceOpen);
-      else stopRobotLidar(id);
-      refreshLidarUi(id);
       pushLog('success', `LiDAR ${on ? 'włączony' : 'wyłączony'}`);
       toast(`LiDAR ${on ? 'włączony' : 'wyłączony'} ✓`, 'success');
-    } else if (resp.rejected) {
-      pushLog('error', `LiDAR odrzucony: ${resp.rejected}`);
-      toast(`LiDAR: odrzucono — ${resp.rejected}`, 'error');
     } else {
-      pushLog('error', `LiDAR błąd: ${resp.error || 'nieznany'}`);
-      toast(`LiDAR: błąd — ${resp.error || 'nieznany'}`, 'error');
+      clearPendingToggle('lidar', id);
+      if (resp.rejected) {
+        pushLog('error', `LiDAR odrzucony: ${resp.rejected}`);
+        toast(`LiDAR: odrzucono — ${resp.rejected}`, 'error');
+      } else {
+        pushLog('error', `LiDAR błąd: ${resp.error || 'nieznany'}`);
+        toast(`LiDAR: błąd — ${resp.error || 'nieznany'}`, 'error');
+      }
     }
   } catch (err) {
+    clearPendingToggle('lidar', id);
     pushLog('error', `LiDAR: ${err.message}`);
     toast(`LiDAR: ${err.message}`, 'error');
   } finally {
     toggle.removeAttribute('disabled');
+    applyLidarChoice(id);
   }
+}
+
+// Re-applies the effective LiDAR state to the open detail: streams through the
+// CURRENT detail/tab state (a late answer must not resurrect a subscription the
+// user already left), then the tile and KPIs.
+function applyLidarChoice(id) {
+  // The shared map runs every robot's streams itself; a late answer from a detail
+  // the user already left must not stop them.
+  if (sharedMapMode || id !== selectedRobotId) {
+    refreshLidarUi(id);
+    return;
+  }
+  const r = findRobot(id);
+  if (!r) {
+    stopRobotLidar(id);
+    return;
+  }
+  const shell = byId('robots-detail');
+  const tabId = shell?.dataset.activeTab || 'overview';
+  syncDetailLidar(r, tabId === 'overview' || tabId === 'lidar');
+  refreshLidarUi(id);
 }
 
 // =============================================================================

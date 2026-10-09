@@ -5,6 +5,7 @@
 // =============================================================================
 
 pub mod app_db;
+pub mod background;
 pub mod bundled;
 pub mod native_apps;
 pub mod errors;
@@ -13,6 +14,7 @@ pub mod event_publish;
 pub mod flow_blocks;
 pub mod fs_sandbox;
 pub mod host_functions;
+pub mod install_steps;
 pub mod lifecycle;
 pub mod manifest;
 pub mod migrations;
@@ -230,6 +232,10 @@ pub struct AddonManifest {
     /// resolves the owning addon by this block and reads `[robot.safety]`.
     #[serde(default)]
     pub robot: Option<RobotManifestSection>,
+    /// `[[install_step]]` — app steps the install wizard runs after the
+    /// instance exists (native packages only; see `install_steps`).
+    #[serde(default)]
+    pub install_steps: Vec<install_steps::InstallStepSpec>,
 }
 
 /// `[robot]` manifest section — marks an addon as a robot controller and carries
@@ -307,6 +313,13 @@ impl AddonManifest {
     /// stay unreachable for these.
     pub fn is_native(&self) -> bool {
         self.runtime.as_deref() == Some(NATIVE_RUNTIME)
+    }
+
+    /// Whether the addon runs a background service tick while enabled.
+    pub fn runs_service(&self) -> bool {
+        self.service
+            .as_ref()
+            .is_some_and(|s| s.enabled && s.tick_interval_ms.is_some_and(|i| i > 0))
     }
 }
 
@@ -1771,6 +1784,14 @@ impl AddonManager {
             "Instancja '{}' (pakiet '{}' v{}) zainstalowana",
             instance_id, package_id, version
         );
+        // A new instance is enabled; a service-mode addon (a robot driver) must
+        // start ticking now, not at the next process start. A failed start does
+        // not undo the install — boot auto-start and the toggle retry it.
+        if manifest.runs_service() {
+            if let Err(e) = self.start_addon(&instance_id, None, None) {
+                warn!("install_instance: start '{}' failed: {}", instance_id, e);
+            }
+        }
         Ok(instance_id)
     }
 
@@ -2388,12 +2409,7 @@ impl AddonManager {
                     continue;
                 }
             };
-            let has_service = manifest
-                .service
-                .as_ref()
-                .map(|s| s.enabled && s.tick_interval_ms.map(|i| i > 0).unwrap_or(false))
-                .unwrap_or(false);
-            if !has_service {
+            if !manifest.runs_service() {
                 continue;
             }
             match self.start_addon(&a.addon_id, None, None) {
@@ -2612,20 +2628,13 @@ impl AddonManager {
     ///   wlaczyc z powrotem bez deinstalacji.
     /// - `enabled = true`: aktualizuje flage; jezeli addon ma service mode,
     ///   startuje swiezo instancje.
-    pub fn set_addon_enabled(&self, addon_id: &str, enabled: bool) -> Result<()> {
-        info!("Toggle is_enabled dla addonu '{}' -> {}", addon_id, enabled);
-
-        {
-            let conn = self.db.write().unwrap();
-            conn.execute(
-                "UPDATE addons SET is_enabled = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
-                rusqlite::params![enabled as i64, addon_id],
-            )
-            .map_err(|e| anyhow::anyhow!("UPDATE is_enabled: {e}"))?;
-        }
-
+    /// Brings a service-mode addon's background tick in line with its enabled
+    /// flag (already written by the caller): stops every running instance on
+    /// disable, starts one on enable. Without this a toggle only flipped the DB
+    /// row — a disabled addon kept ticking and an enabled one stayed idle until
+    /// the next process start.
+    pub fn apply_enabled(&self, addon_id: &str, enabled: bool) -> Result<()> {
         if !enabled {
-            // Zatrzymaj wszystkie instancje
             let instance_ids: Vec<String> = {
                 let instances = self.instances.lock();
                 instances
@@ -2635,22 +2644,14 @@ impl AddonManager {
             };
             for iid in instance_ids {
                 if let Err(e) = self.stop_addon(&iid) {
-                    warn!("set_addon_enabled stop '{}': {}", iid, e);
+                    warn!("apply_enabled stop '{}': {}", iid, e);
                 }
             }
-        } else {
-            // Sprawdz czy ma service mode — jesli tak, wystartuj
-            let manifest = self.load_addon_manifest(addon_id)?;
-            let has_service = manifest
-                .service
-                .as_ref()
-                .map(|s| s.enabled && s.tick_interval_ms.map(|i| i > 0).unwrap_or(false))
-                .unwrap_or(false);
-            if has_service {
-                self.start_addon(addon_id, None, None)?;
-            }
+            return Ok(());
         }
-
+        if self.load_addon_manifest(addon_id)?.runs_service() {
+            self.start_addon(addon_id, None, None)?;
+        }
         Ok(())
     }
 

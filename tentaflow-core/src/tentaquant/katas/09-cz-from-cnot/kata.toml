@@ -1,0 +1,11 @@
+id = "09-cz-from-cnot"
+points = 100
+tier = "T0"
+
+[title]
+pl = "Bramki CZ i SWAP"
+en = "The CZ and SWAP gates"
+
+[summary]
+pl = "równoważność CZ = H·CNOT·H"
+en = "the identity CZ = H·CNOT·H"

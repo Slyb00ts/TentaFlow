@@ -3884,6 +3884,17 @@
     "install_singleton_done": "Application à instance unique — déjà installée",
     "install_done": "Instance « {name} » installée",
     "install_failed": "Échec de l'installation",
+    "install_steps": {
+      "title": "Terminer la configuration de {name}",
+      "intro": "L'instance est installée. Ces étapes la vérifient ou la préparent ; chacune peut être relancée.",
+      "run": "Lancer",
+      "run_again": "Relancer",
+      "retry": "Réessayer",
+      "run_all": "Lancer toutes les étapes",
+      "finish": "Terminer",
+      "field_required": "Le champ « {field} » est obligatoire",
+      "closed_incomplete": "{name} est installée, mais {count} {count|étape de configuration n'a pas réussi|étapes de configuration n'ont pas réussi}."
+    },
     "instance_name": "Nom de l'instance",
     "instance_name_hint": "Ce paquet fonctionne en plusieurs instances — chacune avec ses propres données et sa propre matrice de permissions.",
     "instance_name_required": "Saisissez le nom de l'instance",
@@ -5435,7 +5446,13 @@
     },
     "tentaquant": {
       "name": "TentaQuant",
-      "desc": "Laboratoire quantique : carnets, circuits, simulation et véritables QPU"
+      "desc": "Laboratoire quantique : carnets, circuits, simulation et véritables QPU",
+      "install": {
+        "bell_test": {
+          "title": "Test de Bell",
+          "desc": "Exécute un circuit de Bell à deux qubits sur le simulateur de ce nœud et vérifie que seuls 00 et 11 sont mesurés."
+        }
+      }
     },
     "tentabus": {
       "name": "TentaBus",
@@ -10114,7 +10131,13 @@
       "dlq_record_handled": "Ce message a déjà été relancé ou rejeté — actualisez la liste.",
       "dlq_retry_deduplicated": "Le topic ne livre un message qu’une fois par fenêtre et celui-ci y a déjà été livré — il pourra être relancé une fois la fenêtre passée. Le message reste dans la liste.",
       "dlq_retry_source_not_leader": "Ce node ne dirige pas la partition du topic vers laquelle le message retourne — relancez-le sur le node qui la dirige.",
-      "dlq_retry_requarantine_failed": "Le modèle du topic a de nouveau rejeté le message et sa nouvelle copie n’a pas pu être enregistrée parmi les messages non traités — le message reste dans la liste."
+      "dlq_retry_requarantine_failed": "Le modèle du topic a de nouveau rejeté le message et sa nouvelle copie n’a pas pu être enregistrée parmi les messages non traités — le message reste dans la liste.",
+      "key_needs_topic_wide_rule": "Une clé ne peut ni lire ni envoyer les messages de ce topic tant que le topic n’a pas de règle de masquage des données pour tous — les règles réservées à des personnes choisies ne couvrent pas les clés.",
+      "subject_is_addon": "Cet identifiant appartient à un addon, pas à un utilisateur. Supprimez cette entrée et accordez l’accès à l’addon (À qui : Addon).",
+      "subject_not_found": "Cette personne, cette clé ou cet addon est introuvable — elle a peut-être été supprimée ou n'appartient pas à cette organisation. Actualisez la page.",
+      "org_mismatch": "Un droit sur un topic ne peut être accordé que depuis sa propre organisation.",
+      "record_not_found": "Cette partition n'a aucun message portant ce numéro.",
+      "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification."
     },
     "shell": {
       "instance": "Instance",
@@ -10322,7 +10345,7 @@
       "version": {
         "title": "Nouvelle version du modèle {name}",
         "text_label": "Texte du modèle — version {version}",
-        "draft_kept": "C’est le texte de la tentative précédente, que le serveur n’a pas accepté. Corrigez-le ou changez d’abord la compatibilité du modèle.",
+        "draft_kept": "C’est le texte de la dernière ouverture de cette fenêtre — il n’a pas été ajouté comme version.",
         "diff": "Différence avec la version {version} : {changes}.",
         "diff_added_optional": "nouveau champ facultatif « {field} »",
         "diff_added_required": "nouveau champ obligatoire « {field} »",
@@ -10343,7 +10366,8 @@
         "added_text_unused": "Aucun topic n’utilise encore ce modèle.",
         "same_title": "Aucune nouvelle version ajoutée",
         "same_text": "La version {version} a déjà le même texte. Rien n’a changé.",
-        "load_failed": "Impossible de charger le texte de la version {version}."
+        "load_failed": "Impossible de charger le texte de la version {version}.",
+        "discard_kept": "Cette version n’est pas encore ajoutée. Le texte est conservé et revient quand vous rouvrez cette fenêtre. Refermez la fenêtre, ou reprenez la saisie."
       },
       "incompat": {
         "lead": "Ce modèle a la compatibilité « {compat} », et {reason}.",
@@ -10589,7 +10613,8 @@
         "kept_keys": "Restent : les clés API des systèmes externes — elles appartiennent à l’instance et à l’organisation ; elles perdent seulement leurs droits sur ce topic.",
         "retype": "Saisissez le nom du topic pour confirmer :",
         "confirm": "Supprimer le topic {name}",
-        "lost_empty_partitions": "{count} {n|partition vide|partitions vides|partitions vides}"
+        "lost_empty_partitions": "{count} {n|partition vide|partitions vides|partitions vides}",
+        "lost_rules_unknown": "Les règles de masquage des données de ce topic n’ont pas pu être comptées ; s’il en a, elles sont supprimées aussi."
       },
       "preview": {
         "title": "Aperçu des messages — {topic}",
@@ -10631,6 +10656,8 @@
       "section": {
         "state": "État",
         "settings": "Réglages",
+        "access": "Accès",
+        "hiding": "Dissimulation des données",
         "partitions": "Partitions et copies",
         "dlq": "Non traités"
       },
@@ -10664,7 +10691,8 @@
         "consumers_none": "Aucun consommateur ne lit encore ce topic.",
         "consumer_running": "actif",
         "consumer_paused": "en pause",
-        "consumer_waiting": "{count} en attente"
+        "consumer_waiting": "{count} en attente",
+        "consumer_key_gone": "la clé n’existe plus — personne ne lit ici"
       }
     },
     "settings": {
@@ -10945,7 +10973,12 @@
         "auto_after_success": "Après un traitement réussi",
         "explicit": "Le programme signale quand il a fini",
         "at_most_once": "Dès la lecture"
-      }
+      },
+      "key_group": "Clé {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Clé supprimée",
+      "key_sub": "Destinataire de la clé d’un système externe",
+      "key_gone_sub": "La clé n’existe plus — personne ne lit ici"
     },
     "consumer": {
       "back": "Tous les destinataires",
@@ -11181,6 +11214,476 @@
         "done_title": "Message rejeté",
         "done_text": "{what} a quitté les messages non traités."
       }
+    },
+    "access": {
+      "subjects_title": "Personnes, groupes et addons",
+      "explain": "Lecture — récupérer les messages. Écriture — envoyer des messages. Administration — modifier les réglages, l’accès et le masquage des données de ce topic.",
+      "col_who": "Qui",
+      "right_title": {
+        "read": "Lecture",
+        "write": "Écriture",
+        "admin": "Administration"
+      },
+      "right_hint": {
+        "read": "récupérer les messages",
+        "write": "envoyer des messages",
+        "admin": "réglages, accès et masquage des données"
+      },
+      "right": {
+        "read": "lecture",
+        "write": "écriture",
+        "admin": "administration"
+      },
+      "about": {
+        "read": "la lecture",
+        "write": "l’écriture",
+        "admin": "l’administration"
+      },
+      "can": {
+        "read": "lire les messages",
+        "write": "envoyer des messages",
+        "admin": "modifier les réglages, l’accès et le masquage des données"
+      },
+      "allowed": "autorisé",
+      "denied": "interdit",
+      "not_set": "non défini",
+      "not_set_title": "Non défini ici — le rôle dans l’organisation décide.",
+      "legend": "— non défini ici : le rôle dans l’organisation décide. « Interdit » l’emporte sur « autorisé » venant d’un groupe.",
+      "kind": {
+        "user": "Utilisateur",
+        "group": "Groupe",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|personne|personnes}",
+      "unknown_subject": "Personne, groupe ou addon inconnu",
+      "unknown_sub": "{kind} · identifiant {id}",
+      "empty_title": "Personne n’a encore d’entrée ici",
+      "empty_text": "L’accès à ce topic est décidé par le rôle dans l’organisation. Accordez un accès pour autoriser ou interdire des personnes, groupes ou addons choisis.",
+      "rights_label": "Droits dans le topic {topic}",
+      "level": {
+        "allow": "Autoriser",
+        "deny": "Interdire",
+        "unset": "Ne pas définir"
+      },
+      "grant": {
+        "button": "Accorder l’accès",
+        "window_title": "Accorder l’accès — {topic}",
+        "who": "À qui",
+        "search": "Rechercher par nom",
+        "pick": {
+          "user": "Quel utilisateur",
+          "group": "Quel groupe",
+          "addon": "Quel addon"
+        },
+        "pick_hint": {
+          "user": "La liste montre les utilisateurs qui n’ont pas encore d’entrée.",
+          "group": "La liste montre les groupes qui n’ont pas encore d’entrée.",
+          "addon": "La liste montre les addons ayant accès à cette instance qui n’ont pas encore d’entrée."
+        },
+        "none": {
+          "user": "Chaque utilisateur de l’organisation a déjà une entrée dans ce topic.",
+          "group": "Chaque groupe de l’organisation a déjà une entrée dans ce topic (ou l’organisation n’a pas de groupes).",
+          "addon": "Aucun addon ayant accès à cette instance n’est sans entrée dans ce topic."
+        },
+        "none_found": "Rien ne correspond au nom saisi, ou la correspondance a déjà une entrée.",
+        "truncated": "Les 50 premiers sont affichés — saisissez une partie du nom pour affiner la liste.",
+        "group_option": "{name} ({count} {n|personne|personnes})",
+        "pick_first": "Choisissez à qui accorder l’accès.",
+        "pick_right": "Définissez au moins un droit : autoriser ou interdire.",
+        "impact_group": "{count} {n|personne du groupe|personnes du groupe} {name} {n|pourra|pourront} {doing} dans le topic {topic}.",
+        "impact_group_plain": "Le groupe « {name} » obtiendra dans le topic {topic} : {rights}.",
+        "impact_user": "L’utilisateur « {name} » obtiendra dans le topic {topic} : {rights}.",
+        "impact_addon": "L’addon « {name} » obtiendra dans le topic {topic} : {rights}.",
+        "impact_deny": "Interdit pour « {name} » : {rights} — l’emporte sur le rôle dans l’organisation et sur une autorisation venant d’un groupe.",
+        "impact_unset": "Le rôle dans l’organisation décidera de {rights}.",
+        "saved_title": "Accès accordé"
+      },
+      "change": {
+        "button": "Modifier",
+        "window_title": "Modifier l’accès — {name}",
+        "impact_line": "{right} pour « {name} » passera de « {from} » à « {to} ».",
+        "impact_role": {
+          "read": "Le rôle dans l’organisation en décidera.",
+          "write": "Le rôle dans l’organisation en décidera.",
+          "admin": "Le rôle dans l’organisation en décidera."
+        },
+        "impact_rest": "Les autres droits ne changent pas.",
+        "saved_title": "Enregistré",
+        "impact_allow": "Il sera possible de {doing}.",
+        "impact_deny": "Il ne sera plus possible de {doing}, même si le rôle dans l’organisation le permet."
+      },
+      "remove": {
+        "button": "Supprimer",
+        "window_title": "Supprimer l’accès — {name}",
+        "lead": "{name} perdra son entrée dans ce topic : {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Supprimer « interdit » peut donner ces droits si le rôle dans l’organisation les autorise.",
+        "impact_title": "Ce qui se passera après la suppression :",
+        "impact": "l’accès au topic {topic} sera décidé par le rôle dans l’organisation.",
+        "confirm": "Supprimer l’entrée",
+        "saved_title": "Entrée supprimée",
+        "saved_text": "{name} n’a plus d’entrée dans ce topic ; l’accès est décidé par le rôle dans l’organisation."
+      },
+      "keys": {
+        "title": "Systèmes externes (clés API)",
+        "sub": "La clé fonctionne dans l’instance {instance} et l’organisation {org}. Les droits sur les modèles de messages couvrent toute l’instance, pas seulement ce topic.",
+        "sub_reader": "La clé fonctionne dans l’instance {instance} et l’organisation {org}. On voit ici les droits des clés sur les messages de ce topic ; les droits sur les modèles et la dernière utilisation sont visibles par l’administrateur du serveur.",
+        "site_admin_only": "Les clés sont émises par l’administrateur du serveur.",
+        "col_system": "Système",
+        "col_rights": "Droits",
+        "col_used": "Dernière utilisation",
+        "kind": "Clé API",
+        "empty": "Aucun système externe n’a encore de clé avec des droits sur ce topic.",
+        "never": "pas encore",
+        "just_now": "à l’instant",
+        "org_unknown": "sans nom",
+        "right": {
+          "readMessages": "Lit les messages",
+          "writeMessages": "Envoie des messages",
+          "readSchemas": "Lit les modèles",
+          "writeSchemas": "Ajoute des modèles"
+        },
+        "right_hint": {
+          "readMessages": "Récupère les messages du topic {topic}.",
+          "writeMessages": "Écrit de nouveaux messages dans le topic {topic}.",
+          "readSchemas": "Récupère les modèles et leurs versions (toute l’instance).",
+          "writeSchemas": "Ajoute des modèles et des versions, retire des versions, change la compatibilité. N’inclut pas la lecture."
+        },
+        "issue": {
+          "button": "Émettre une clé",
+          "window_title": "Émettre une clé pour un système externe",
+          "name_label": "Nom du système",
+          "name_hint": "Nom affiché dans la liste des clés et dans le journal d’audit.",
+          "name_first": "Saisissez le nom du système.",
+          "name_too_long": "Le nom peut avoir au plus {max} caractères.",
+          "right_first": "Cochez au moins un droit.",
+          "impact": "{name} recevra une clé avec les droits : {rights} (topic {topic}). Vous ne verrez la clé qu’une seule fois.",
+          "saved_title": "Clé émise",
+          "saved_text": "{name} : {rights}."
+        },
+        "issued": {
+          "window_title": "Clé pour le système « {name} »",
+          "once": "Copiez la clé maintenant. Elle ne pourra plus être affichée — il faudrait en émettre une nouvelle.",
+          "k_key": "Clé",
+          "k_system": "Système",
+          "k_instance": "Instance",
+          "k_rights": "Droits",
+          "k_address": "Adresse pour le système",
+          "topic": "topic {topic}",
+          "how": "Le système envoie la clé dans l’en-tête « Authorization: Bearer … ». Il envoie les messages en POST à cette adresse et les lit en GET en ajoutant le paramètre group={group} (ou {group}.nom si plusieurs programmes indépendants lisent).",
+          "copy_key": "Copier la clé",
+          "copy_url": "Copier l’adresse pour le système",
+          "done": "Terminé",
+          "copied_key": "Clé copiée.",
+          "copied_url": "Adresse copiée.",
+          "copy_failed": "Le navigateur n’a pas permis la copie — sélectionnez le texte et copiez-le à la main.",
+          "developer": "Pour le développeur",
+          "copy_group": "Copier le nom du destinataire",
+          "copied_group": "Nom du destinataire copié.",
+          "close_confirm": "La clé ne sera plus visible. Copiez-la maintenant ou fermez la fenêtre encore une fois."
+        },
+        "rights": {
+          "window_title": "Droits de la clé — {name}",
+          "impact_added": "{name} obtiendra les droits : {rights}.",
+          "impact_removed": "{name} perdra les droits : {rights}.",
+          "impact_none": "La clé n’aura plus de droits sur ce topic ni sur les modèles de cette instance et disparaîtra de cette liste, mais elle existera toujours.",
+          "impact_rest": "Les autres droits ne changent pas ; la clé elle-même ne change pas.",
+          "saved_title": "Droits de la clé enregistrés"
+        },
+        "revoke": {
+          "button": "Révoquer",
+          "window_title": "Révoquer la clé — {name}",
+          "lead": "C’est irréversible — il faudrait émettre une nouvelle clé.",
+          "impact_title": "Ce qui se passera après la révocation :",
+          "impact": "La clé cesse de fonctionner immédiatement. {name} perd les droits : {rights}.",
+          "impact_other": "{count} {n|autre droit|autres droits} de cette clé hors de ce topic {n|cesse|cessent} aussi de fonctionner.",
+          "audit": "La révocation sera inscrite dans le journal d’audit.",
+          "saved_title": "Clé révoquée",
+          "saved_text": "{name} ne peut plus se connecter à TentaBus."
+        },
+        "gone": "Clé supprimée",
+        "gone_sub": "La clé n’existe plus — ces droits ne servent à rien.",
+        "clear": {
+          "button": "Supprimer les droits",
+          "window_title": "Supprimer les droits d’une clé supprimée",
+          "lead": "La clé à laquelle appartiennent ces droits n’existe plus, personne ne peut donc les utiliser. Ils proviennent de données plus anciennes.",
+          "impact": "les entrées de la clé supprimée dans le topic {topic} disparaîtront.",
+          "saved_title": "Droits supprimés",
+          "saved_text": "Les droits de la clé supprimée ne sont plus dans la liste."
+        }
+      }
+    },
+    "hiding": {
+      "everyone": "Tout le monde",
+      "everyone_sub": "Toute personne sans règle propre ni règle de son groupe",
+      "and_more": "et {count} {n|autre champ|autres champs}",
+      "action": {
+        "show": "Afficher",
+        "hide": "Dissimuler"
+      },
+      "write": {
+        "allow": "Autorisé",
+        "require": "Obligatoire",
+        "forbid": "Interdit"
+      },
+      "direction": {
+        "read": "Lecture",
+        "write": "Écriture"
+      },
+      "direction_of": {
+        "read": "lecture",
+        "write": "écriture"
+      },
+      "direction_do": {
+        "read": "lire",
+        "write": "écrire dans"
+      },
+      "title": "Règles de dissimulation des données",
+      "explain": "La dissimulation des données décide quels champs d'un message une personne, un groupe ou un addon voit ou peut écrire. Le message enregistré reste entier.",
+      "col_who": "Qui",
+      "col_what": "Voit autrement",
+      "col_when": "Quand",
+      "col_changed": "Modifié",
+      "empty_title": "Ce topic n'a aucune règle de dissimulation des données",
+      "empty_text": "Toute personne qui peut lire ce topic voit les messages entiers. Ajoutez une règle pour dissimuler certains champs.",
+      "blocked_title": "Les règles de ce topic ne sont pas modifiées ici",
+      "blocked_text": "Les règles de ce topic ne se modifient pas sur cet écran, car son contenu est binaire et ne peut pas être lu comme des champs. Cet écran prend en charge les messages JSON, XML et HL7 v2. Le type de contenu est fixé à la création du topic.",
+      "keys_closed": "Les systèmes externes avec une clé d’API n’ont pas accès à ce topic en {directions} : il n’a de règles que pour des personnes, groupes ou addons choisis et aucune pour tout le monde.",
+      "sees_only": "Voit seulement : {fields}",
+      "sees_nothing": "Ne voit aucun champ",
+      "hides_none": "Ne dissimule aucun des champs connus",
+      "writes_only": "Peut écrire seulement : {fields}",
+      "writes_nothing": "Ne peut écrire aucun champ",
+      "writes_all": "Accepte tous les champs connus",
+      "legend": {
+        "hide": "Le champ disparaît du message.",
+        "reject_name": "Rejeter le message",
+        "reject": "À l'écriture : un message avec un champ interdit, ou sans champ obligatoire, n'arrive pas dans le topic.",
+        "precedence": "La règle d'une personne l'emporte sur celle de son groupe, qui l'emporte sur celle pour tout le monde — les règles ne s'additionnent pas."
+      },
+      "field_problem": {
+        "empty": "Saisissez le nom d'un champ.",
+        "hl7_msh": "{name} contient les séparateurs du message lui-même — il ne peut pas être dissimulé. Choisissez un autre champ.",
+        "hl7_shape": "« {name} » n'est pas une adresse de champ HL7. Une adresse a la forme SEGMENT-numéro, p. ex. PID-5.",
+        "xml_name": "« {name} » n'est pas un nom d'élément XML. Un nom commence par une lettre ou _ et ne contient pas d'espace.",
+        "hl7_case": "« {name} » ressemble à une faute de frappe. Vouliez-vous dire {suggestion} ? Une adresse s’écrit en majuscules, avec un tiret.",
+        "typed_known": "« {name} » figure dans la liste des champs avec un réglage différent de celui saisi ci-dessous. Ne le gardez qu’à un seul endroit."
+      },
+      "need": {
+        "read": "Réglez au moins un champ sur « Masquer ». La liste contient tous les champs de ce topic : une règle qui les montre tous ne change rien. Pour l’arrêter, supprimez-la.",
+        "read_typed": "Saisissez au moins un champ qui reste visible. Sans champ visible, la règle dissimulerait tout le message.",
+        "write": "Réglez au moins un champ sur « Obligatoire » ou « Interdit ». La liste contient tous les champs de ce topic : une règle qui autorise tout ne vérifie rien. Pour l’arrêter, supprimez-la.",
+        "write_typed": "Saisissez au moins un champ qu'il est permis d'écrire. Sans champ autorisé, la règle rejetterait chaque message."
+      },
+      "impact": {
+        "read_only": "Pour {who}, seuls ces champs seront visibles : {fields}. Tous les autres seront dissimulés.",
+        "read_hidden": "Pour {who}, ces champs disparaissent des messages : {fields}.",
+        "read_shown": "Pour {who}, ces champs apparaissent dans les messages : {fields}.",
+        "rest": "Les autres champs de la liste restent inchangés.",
+        "read_unlisted": "Les champs absents de la liste disparaissent aussi, sauf si vous les ajoutez.",
+        "write_only": "Un message de {whoFrom} n'est accepté qu'avec les champs : {fields}. Un message avec un autre champ est rejeté.",
+        "write_forbidden": "Un message de {whoFrom} qui contient l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
+        "write_required": "Un message de {whoFrom} auquel manque l'un des champs {fields} est rejeté et n'arrive pas dans le topic.",
+        "write_rest": "Le message entier est rejeté, pas seulement le champ.",
+        "write_unlisted": "Un message avec un champ absent de la liste est aussi rejeté, sauf si vous ajoutez ce champ.",
+        "keys_closed": "Les systèmes externes avec une clé d’API ne pourront pas {action} ce topic tant que vous n’aurez pas ajouté une règle pour tout le monde.",
+        "read_unlisted_only": "Pour {who}, les champs absents de la liste disparaissent. Tous les champs de la liste restent visibles.",
+        "write_unlisted_only": "De {whoFrom}, un message n’est accepté qu’avec les champs de la liste. Un message avec un autre champ est rejeté.",
+        "write_accepted": "Les messages de {whoFrom} avec les champs {fields} sont acceptés.",
+        "write_not_required": "Ces champs ne sont plus exigés de {whoFrom} : {fields}.",
+        "write_unlisted_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous ajoutez son adresse.",
+        "write_unlisted_hl7_saved": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment est rejeté.",
+        "write_unlisted_only_hl7": "Les messages de {whoFrom} sont acceptés avec les segments de la liste, y compris leurs autres positions (p. ex. PID-4, PV1-1). Un message avec un autre segment, p. ex. un segment Z, est rejeté.",
+        "read_unlisted_saved": "Les champs absents de la liste disparaissent aussi.",
+        "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté."
+      },
+      "fields_label": "Champs",
+      "source": {
+        "schema": "Les champs proviennent du modèle de message {name}, version {version}.",
+        "dictionary": "La liste contient les champs HL7 v2 les plus courants. Ajoutez un autre champ ci-dessous en saisissant son adresse.",
+        "failed": "Le modèle de message de ce topic n'a pas pu être lu, ses champs ne sont donc pas connus. Saisissez ci-dessous les champs qui restent visibles.",
+        "manual": "Les champs de ce topic ne sont pas connus — aucun modèle de message ne les énumère. Saisissez ci-dessous les champs qui restent visibles.",
+        "complex": "Le modèle de message de ce topic contient des champs qu’on ne peut pas en extraire (renvoi vers un autre fichier ou noms de champs libres), la liste complète n’est donc pas connue. Saisissez ci-dessous les champs qui restent visibles."
+      },
+      "extra": {
+        "shown": "Autres champs qui restent visibles",
+        "shown_typed": "Champs qui restent visibles",
+        "allowed": "Autres champs qu'il est permis d'écrire",
+        "allowed_typed": "Champs qu'il est permis d'écrire",
+        "required": "Champs obligatoires",
+        "hint_hl7": "Saisissez une adresse de champ, p. ex. PID-5, puis appuyez sur Entrée.",
+        "hint_xml": "Saisissez un nom d'élément, p. ex. patient, puis appuyez sur Entrée.",
+        "hint_json": "Saisissez un nom de champ, p. ex. patient, puis appuyez sur Entrée."
+      },
+      "unlisted": {
+        "read": "Les champs absents de la liste sont dissimulés aussi (y compris ceux qui apparaîtront plus tard), sauf si vous les saisissez ci-dessous.",
+        "write": "Un message avec un champ hors de la liste est rejeté, sauf si vous saisissez ce champ ci-dessous.",
+        "write_hl7": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment, p. ex. un segment Z, est rejeté, sauf si vous saisissez son adresse ci-dessous."
+      },
+      "add": {
+        "button": "Ajouter une règle",
+        "window_title": "Nouvelle règle de dissimulation des données — {topic}",
+        "save": "Enregistrer la règle",
+        "who": "Pour qui",
+        "when": "Quand elle s'applique",
+        "any_hint": "La règle pour tout le monde s’applique à quiconque n’a ni règle propre ni règle de son groupe. Les systèmes avec une clé d’API ne sont soumis qu’à cette règle.",
+        "any_taken": "Une règle pour tout le monde en {direction} existe déjà — modifiez-la dans sa ligne.",
+        "none_free": "Chaque entrée de cette liste a déjà une telle règle dans ce topic.",
+        "pick_hint": "La liste montre les personnes, groupes ou addons qui n'ont pas encore une telle règle.",
+        "pick_first": "Choisissez à qui la règle s'applique.",
+        "taken": "Cette personne, ce groupe ou cet addon a déjà une règle en {direction} — modifiez-la dans sa ligne.",
+        "saved_title": "Règle enregistrée",
+        "search": "Rechercher dans la liste",
+        "choose": "Choisir…",
+        "none_exist": {
+          "group": "Cette organisation n’a pas encore de groupe.",
+          "user": "Cette organisation n’a aucun utilisateur.",
+          "addon": "Aucun addon n’a accès à cette instance."
+        }
+      },
+      "change": {
+        "button": "Modifier",
+        "window_title": "Règle de dissimulation des données — {name}",
+        "fixed": "La règle appartient à cette personne, ce groupe ou cet addon : cela ne change pas.",
+        "saved_title": "Modification de la règle enregistrée"
+      },
+      "remove": {
+        "button": "Supprimer",
+        "window_title": "Supprimer la règle de dissimulation des données — {name}",
+        "lead_read": "Règle de lecture pour : {who}. Elle dissimule les champs : {fields}.",
+        "lead_read_none": "Règle de lecture pour : {who}. Elle ne dissimule aucun des champs connus.",
+        "lead_read_only": "Règle de lecture pour : {who}. Elle ne laisse visibles que ces champs : {fields}.",
+        "lead_read_nothing": "Règle de lecture pour : {who}. Elle ne laisse aucun champ visible.",
+        "lead_write": "Règle d'écriture pour : {who} — {parts}.",
+        "part_forbidden": "champs interdits : {fields}",
+        "part_required": "champs obligatoires : {fields}",
+        "part_only": "seuls ces champs sont autorisés : {fields}",
+        "part_nothing": "aucun champ n'est autorisé",
+        "part_none": "tous les champs connus sont autorisés",
+        "impact_title": "Ce qui se passe après la suppression :",
+        "impact_any_read": "Toute personne sans règle de lecture propre verra les messages entiers dans le topic {topic}.",
+        "impact_any_write": "L'écriture dans le topic {topic} ne sera plus vérifiée pour toute personne sans règle d'écriture propre.",
+        "impact_keys": "Il ne reste que des règles pour des personnes, groupes ou addons choisis : les systèmes externes avec une clé d’API ne pourront pas {action} ce topic.",
+        "confirm": "Supprimer la règle",
+        "saved_title": "Règle supprimée",
+        "saved_text": "La règle en {direction} pour : {who} a été supprimée.",
+        "impact_read_user": "Pour l’utilisateur « {who} » dans le topic {topic}, c’est la règle de lecture de l’un de ses groupes qui s’applique, à défaut la règle pour tout le monde ; s’il n’y en a aucune, il voit les messages entiers.",
+        "impact_read_group": "Les membres du groupe « {who} » lisent le topic {topic} selon la règle de lecture d’un autre de leurs groupes, à défaut selon la règle pour tout le monde ; s’il n’y en a aucune, ils voient les messages entiers.",
+        "impact_read_addon": "L’addon « {who} » lit le topic {topic} selon la règle pour tout le monde ; s’il n’y en a pas, il voit les messages entiers.",
+        "impact_write_user": "Les messages de l’utilisateur « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture de l’un de ses groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
+        "impact_write_group": "Les messages des membres du groupe « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture d’un autre de leurs groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
+        "impact_write_addon": "Les messages de l’addon « {who} » vers le topic {topic} sont vérifiés selon la règle pour tout le monde ; s’il n’y en a pas, ils ne sont pas vérifiés du tout."
+      },
+      "preview": {
+        "button": "Aperçu de ce que voit…",
+        "window_title": "Aperçu de ce que voit… — {topic}",
+        "audit_title": "Cet aperçu est enregistré dans le journal d'audit.",
+        "audit_text": "Il consigne qui a regardé, quand, quel message et en tant que qui. Il montre un vrai message du topic après les règles de lecture de la personne, du groupe ou de l'addon choisi. Réservé à l'administrateur du topic.",
+        "who": "Ce que voit",
+        "who_any": "toute personne sans règle propre",
+        "sees": "Voici comment la voit : {who}",
+        "any_hint": "Vous verrez le message tel que le voit quelqu'un sans règle propre ni règle de son groupe.",
+        "none": {
+          "user": "Aucun utilisateur trouvé.",
+          "group": "Aucun groupe trouvé.",
+          "addon": "Aucun addon avec accès à cette instance trouvé."
+        },
+        "number_label": "Numéro du message",
+        "show": "Afficher",
+        "record_title": "message {number} · partition {partition} · écrit {when}",
+        "hidden": "dissimulé",
+        "shown": "visible",
+        "rules_title": "Ce que les règles ont fait",
+        "summary_hidden": "Les règles ont dissimulé {count} {n|champ|champs} : {fields}.",
+        "summary_none": "Les règles n'ont dissimulé aucun champ de ce message.",
+        "limited_title": "Cet aperçu est plus étroit que la vue de la personne, du groupe ou de l’addon choisi",
+        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra la personne, le groupe ou l'addon choisi : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
+        "limited_missing": "Ces champs du modèle ne figurent pas dans cet aperçu : {fields}. Une règle qui s’applique aussi à vous les a masqués, ou le message ne les contient pas.",
+        "who_user": "utilisateur {name}",
+        "who_group": "groupe {name}",
+        "who_addon": "addon {name}",
+        "summary_limited": "Les champs qu’une règle valable aussi pour vous masque déjà ne sont pas cités."
+      },
+      "hl7": {
+        "msh_3": "Application émettrice",
+        "msh_4": "Établissement émetteur",
+        "msh_5": "Application réceptrice",
+        "msh_6": "Établissement récepteur",
+        "msh_7": "Date et heure du message",
+        "msh_9": "Type de message",
+        "msh_10": "Identifiant du message",
+        "pid_2": "Identifiant du patient",
+        "pid_3": "Liste des identifiants du patient",
+        "pid_5": "Nom du patient",
+        "pid_6": "Nom de jeune fille de la mère",
+        "pid_7": "Date de naissance",
+        "pid_8": "Sexe",
+        "pid_10": "Race",
+        "pid_11": "Adresse du patient",
+        "pid_13": "Téléphone du domicile",
+        "pid_14": "Téléphone professionnel",
+        "pid_15": "Langue principale",
+        "pid_16": "Situation matrimoniale",
+        "pid_17": "Religion",
+        "pid_18": "Numéro de compte du patient",
+        "pid_19": "Numéro d'identification national",
+        "pid_22": "Groupe ethnique",
+        "pid_23": "Lieu de naissance",
+        "pid_29": "Date et heure du décès",
+        "pid_30": "Indicateur de décès",
+        "pv1_2": "Classe du patient",
+        "pv1_3": "Localisation attribuée au patient",
+        "pv1_7": "Médecin traitant",
+        "pv1_8": "Médecin prescripteur",
+        "pv1_9": "Médecin consultant",
+        "pv1_10": "Service hospitalier",
+        "pv1_17": "Médecin admettant",
+        "pv1_19": "Numéro de visite",
+        "pv1_44": "Date et heure d'admission",
+        "pv1_45": "Date et heure de sortie",
+        "nk1_2": "Nom du proche",
+        "nk1_3": "Lien de parenté",
+        "nk1_4": "Adresse du proche",
+        "nk1_5": "Téléphone du proche",
+        "in1_2": "Identifiant du plan d'assurance",
+        "in1_3": "Identifiant de l'assureur",
+        "in1_4": "Nom de l'assureur",
+        "in1_16": "Nom de l'assuré",
+        "in1_36": "Numéro de police",
+        "orc_2": "Numéro de commande du demandeur",
+        "orc_12": "Prescripteur",
+        "obr_4": "Examen demandé",
+        "obr_7": "Date et heure de l'observation",
+        "obr_16": "Prescripteur de l'examen",
+        "obx_2": "Type de valeur",
+        "obx_3": "Identifiant de l'observation",
+        "obx_5": "Valeur de l'observation",
+        "obx_6": "Unités",
+        "obx_7": "Plage de référence",
+        "obx_8": "Indicateurs d'anomalie",
+        "obx_11": "Statut du résultat",
+        "obx_14": "Date et heure du résultat",
+        "dg1_3": "Code du diagnostic",
+        "dg1_4": "Description du diagnostic",
+        "al1_3": "Allergène",
+        "msh_8": "Sécurité",
+        "msh_11": "ID de traitement",
+        "msh_12": "Version HL7"
+      },
+      "blocked_settings": "Ouvrir les paramètres du topic",
+      "blocked_preview": "L’aperçu n’est pas disponible : le contenu de ce topic ne peut pas être lu comme des champs.",
+      "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
+      "reads_rest": "Champs hors de la liste : masqués",
+      "fields_search": "Rechercher un champ",
+      "fields_none": "Aucun champ ne correspond à la recherche.",
+      "who": {
+        "named": "« {name} »",
+        "everyone_for": "tous",
+        "everyone_from": "tous"
+      },
+      "visible_outside": "Laisse aussi visibles : {fields}",
+      "changed_title": "Rien n’a été enregistré : la règle a changé entre-temps",
+      "changed_text": "Quelqu’un a modifié, ajouté ou supprimé cette règle avant l’enregistrement de votre modification, donc rien n’a été écrasé. Le tableau montre les règles telles qu’elles sont maintenant ; si vous voulez toujours cette modification, refaites-la."
     }
   },
   "composer": {
@@ -11261,7 +11764,11 @@
       "not_found": "Laboratoire indisponible",
       "not_found_sub": "Cette instance n'existe pas, ou la matrice de permissions ne vous y donne pas accès.",
       "load_failed": "Impossible de charger le tableau de bord du laboratoire",
-      "tab_runs": "Exécutions"
+      "tab_runs": "Exécutions",
+      "tab_course": "Cours",
+      "tab_devices": "Appareils",
+      "tab_examples": "Exemples",
+      "tab_settings": "Paramètres"
     },
     "dash": {
       "kpi_my_projects": "Mes projets",
@@ -11967,6 +12474,160 @@
       "before": "avant la première porte",
       "empty": "aucune évolution enregistrée",
       "step": "étape"
+    },
+    "course": {
+      "load_failed": "Impossible de charger le cours",
+      "kata_load_failed": "Impossible de charger l'exercice",
+      "submit_failed": "Impossible de vérifier la solution",
+      "kpi_progress": "Progression du cours",
+      "progress_value": "{done} / {total} {total|kata|katas}",
+      "kpi_progress_delta": "{percent} % du cours",
+      "kpi_points": "Points",
+      "kpi_points_delta": "sur {max} possibles",
+      "kpi_position": "Position dans le laboratoire",
+      "position_value": "{position} / {total}",
+      "kpi_position_delta": "{n} {n|personne classée|personnes classées}",
+      "kpi_position_none": "Réussissez votre premier kata pour entrer au classement",
+      "group_complete": "terminé",
+      "group_current": "en cours",
+      "group_locked": "après « {group} »",
+      "group_count": "{done} / {total}",
+      "status_passed": "réussi",
+      "status_attempted": "tenté",
+      "status_open": "à faire",
+      "status_locked": "verrouillé",
+      "kata_heading": "Kata {n} · {title}",
+      "kata_meta": "{group} · {n} sur {total}",
+      "points_value": "{n} pts",
+      "attempts": "{n} {n|essai|essais}",
+      "task_title": "Exercice",
+      "code_title": "Votre solution (OpenQASM 3)",
+      "code_hint": "Core vérifie avec le simulateur natif : le verdict est déterministe.",
+      "action_check": "Vérifier",
+      "action_reset": "Rétablir le squelette",
+      "action_next": "Kata suivant : {title}",
+      "run_required": "La vérification nécessite la permission quant.run.",
+      "result_passed": "Réussi ! +{n} pts",
+      "result_passed_again": "Réussi à nouveau : vous avez déjà obtenu les points de ce kata",
+      "result_failed": "Pas encore",
+      "result_invalid": "Le programme n'est pas valide",
+      "diagnostic_at": "ligne {line} : {message}",
+      "reason_mismatch": "L'état final ou la matrice diffère de celui attendu.",
+      "reason_above_threshold": "La distribution des résultats s'écarte de l'attendu plus que le seuil ne le permet.",
+      "reason_unexpected_outcomes": "Des résultats sont apparus qu'une solution correcte ne produit jamais.",
+      "reason_qubit_count": "Le circuit a {got} {got|qubit|qubits}, l'exercice en demande {expected} {expected|qubit|qubits}.",
+      "reason_clbit_count": "L'exercice mesure {expected} {expected|bit|bits} : déclarez un registre classique de cette taille.",
+      "reason_not_unitary": "Cet exercice compare l'état ou la matrice du circuit : retirez mesures, réinitialisations et conditions classiques.",
+      "reason_no_measurement": "Mesurez les qubits dans un registre classique : cet exercice évalue la distribution des résultats.",
+      "metric_fidelity": "Fidélité de l'état {value} (requise {threshold})",
+      "metric_process_fidelity": "Fidélité du processus {value} (requise {threshold})",
+      "metric_tvd": "TVD par rapport à l'idéal {value} (seuil {threshold})",
+      "run_info": "{shots} {shots|tir|tirs} en {ms} ms",
+      "ranking_title": "Classement du laboratoire",
+      "ranking_sub": "Top {n} sur {total} {total|personne|personnes} · points des katas",
+      "ranking_you": "vous",
+      "ranking_empty": "Personne n'a encore réussi de kata",
+      "ranking_empty_sub": "Le premier kata réussi place une personne au classement.",
+      "ranking_off": "Le classement est désactivé",
+      "ranking_off_sub": "Un responsable a désactivé le classement du cours. Vos points et votre progression restent enregistrés.",
+      "ranking_load_failed": "Impossible de charger le classement"
+    },
+    "devices": {
+      "browser_title": "Navigateur (WASM)",
+      "browser_sub": "Le même simulateur en wasm32, sur votre ordinateur",
+      "core_sub": "Natif dans Core : vecteur d’état en Rust",
+      "empty": "Le laboratoire ne signale aucune cible d’exécution",
+      "kpi_available": "Cibles disponibles",
+      "kpi_available_value": "{n} sur {total}",
+      "kpi_widest": "Plus grand registre",
+      "kpi_nodes": "Nœuds avec Core (T1)",
+      "qubits_value": "{n} {n|qubit|qubits}",
+      "state_available": "disponible",
+      "state_unavailable": "indisponible",
+      "where_browser": "cet ordinateur",
+      "where_this_node": "le nœud auquel vous êtes connecté",
+      "where_other_node": "un autre nœud de la flotte",
+      "row_where": "S’exécute sur",
+      "row_max_qubits": "Qubits max.",
+      "row_precision": "Précision",
+      "row_memory": "Mémoire d’état à la limite",
+      "auto_title": "La règle device=\"auto\"",
+      "auto_sub": "Demandez à Core où irait une exécution de cette largeur — selon la règle qu’appliquent le Studio, un carnet et le SDK.",
+      "probe_qubits": "Nombre de qubits",
+      "probe_dec": "Moins de qubits",
+      "probe_inc": "Plus de qubits",
+      "probe_browser": "Demande depuis le navigateur",
+      "probe_browser_sub": "Le navigateur pourrait calculer le circuit lui-même (T0).",
+      "probe_kernel": "Une cellule Python",
+      "probe_kernel_sub": "Nécessite un noyau : le navigateur seul ne suffit pas.",
+      "probe_failed": "Impossible d’interroger la règle",
+      "skipped": "{tier} : {reason}",
+      "missing_title": "Niveaux absents de cette version",
+      "missing_sub": "Ce ne sont pas des appareils à choisir. Le motif est indiqué pour qu’un grand circuit ne cherche pas un endroit qui n’existe pas."
+    },
+    "settings": {
+      "load_failed": "Impossible de charger les paramètres",
+      "save": "Enregistrer",
+      "saved": "Paramètres enregistrés",
+      "save_failed": "Impossible d’enregistrer les paramètres",
+      "ranking_title": "Cours",
+      "ranking_name": "Classement du laboratoire",
+      "ranking_sub": "Chacun voit le top cinq et sa propre place. Une fois désactivé, le classement disparaît de l’onglet Cours ; les katas réussis et les points restent.",
+      "limits_title": "Limites du laboratoire",
+      "limits_sub": "Core applique ces nombres : la plage des cibles de l’onglet Appareils et le nombre d’exécutions calculées en même temps. Tout le monde les lit, un administrateur les modifie.",
+      "limits_admin_only": "Les limites sont modifiées par une personne disposant de quant.admin.",
+      "limit_maxQubitsBrowser": "Qubits dans le navigateur (T0)",
+      "limit_maxQubitsBrowser_hint": "Le plus grand registre accepté par le navigateur lorsque vous le choisissez explicitement.",
+      "limit_maxQubitsCore": "Qubits dans Core (T1)",
+      "limit_maxQubitsCore_hint": "Pas plus que ce que le simulateur de cette version peut tenir — Core répond si vous saisissez trop.",
+      "limit_maxConcurrentCoreRuns": "Exécutions simultanées dans Core",
+      "limit_maxConcurrentCoreRuns_hint": "Combien d’exécutions T1 le laboratoire calcule en même temps sur un nœud ; les autres attendent en file. Chacune garde un vecteur d’état entier.",
+      "limit_dec": "Diminuer",
+      "limit_inc": "Augmenter",
+      "access_title": "Accès",
+      "access_sub": "La matrice de permissions est ici en lecture seule. Elle se modifie dans Addons, avec la visibilité du laboratoire.",
+      "access_edit": "Modifier dans Addons",
+      "access_you": "Votre rôle",
+      "col_person": "Personne",
+      "col_role": "Rôle",
+      "col_permissions": "Permissions",
+      "people_empty": "La matrice n’admet personne",
+      "people_footer": "{n} {n|personne|personnes} avec accès",
+      "people_roles": "administrateurs : {admin} · encadrants : {supervisor} · utilisateurs : {user} · observateurs : {observer}",
+      "people_failed": "Impossible de charger la liste des personnes",
+      "people_supervisor_only": "La liste des personnes est visible par un encadrant (quant.instruct)."
+    },
+    "examples": {
+      "load_failed": "Impossible de charger les exemples",
+      "search_placeholder": "Rechercher un exemple…",
+      "level_all": "Tout niveau",
+      "level_intro": "Débutant",
+      "level_core": "Intermédiaire",
+      "level_advanced": "Avancé",
+      "empty_title": "Aucun exemple pour ce filtre",
+      "empty_sub": "Modifiez la recherche ou le niveau.",
+      "footer": "{n} sur {total} affichés",
+      "run_required": "Copier un exemple dans votre propre projet nécessite la permission quant.run.",
+      "action_preview": "Aperçu",
+      "action_fork": "Copier dans mes projets",
+      "action_studio": "Ouvrir dans le studio",
+      "back": "Tous les exemples",
+      "stat_width": "Registre",
+      "stat_depth": "Profondeur",
+      "width_fixed": "{n} {n|qubit|qubits}",
+      "width_range": "{min}–{max} {max|qubit|qubits}",
+      "depth_value": "profondeur {n}",
+      "width_label": "Nombre de qubits",
+      "width_hint": "De {min} à {max}. Seule la largeur du registre du circuit change.",
+      "width_dec": "Moins de qubits",
+      "width_inc": "Plus de qubits",
+      "circuit_title": "Circuit",
+      "view_circuit": "Schéma",
+      "view_text": "Texte",
+      "expected_title": "Résultat attendu",
+      "expected_sub": "Une exécution correcte ({shots} {shots|shot|shots}) ne place ses comptages que sur les résultats ci-dessous, avec une TVD par rapport à la théorie inférieure à {tolerance}.",
+      "fork_ok": "Projet « {name} » créé",
+      "fork_failed": "Impossible de copier l’exemple"
     }
   },
   "access_keys": {
@@ -14125,5 +14786,9 @@
     "simulation_timer_pending": "En attente",
     "simulation_timer_fired": "Déclenché",
     "simulation_timer_blocked": "Bloqué"
+  },
+  "gestures": {
+    "wave": "salut de la main",
+    "heart": "cœur"
   }
 }

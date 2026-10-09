@@ -30,7 +30,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 
 // =============================================================================
 // Validators
@@ -354,7 +354,7 @@ function renderMentionInput(component, ctx) {
       detail: { value: e.detail.value, kind: 'tstr' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, bindPath));
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));

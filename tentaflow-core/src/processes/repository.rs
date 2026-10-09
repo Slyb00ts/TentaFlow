@@ -23574,7 +23574,7 @@ pub fn cancel_instance(
     })
 }
 
-/// `witnesses` is false only while migration 196 runs, before the activity I/O
+/// `witnesses` is false only while migration 198 runs, before the activity I/O
 /// witness table exists, so retained bytes are measured without it.
 pub(crate) fn cancel_instance_on(
     tx: &Connection,

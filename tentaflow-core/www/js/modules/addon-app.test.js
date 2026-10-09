@@ -45,7 +45,9 @@ register('data:text/javascript,' + encodeURIComponent(hookSource), import.meta.u
 globalThis.addEventListener?.('unhandledrejection', (e) => e.preventDefault?.());
 process.on('unhandledRejection', () => {});
 
-const { isOverlaySlot, handleSlotContent, stringifyWithBigInt, __setSessionForTest } = await import('./addon-app.js');
+const { isOverlaySlot, handleSlotContent, sendAction, stringifyWithBigInt, __setSessionForTest } = await import('./addon-app.js');
+const { ApiBinary } = await import('../protocol/api-binary-shim.js');
+const { StateStore } = await import('../sdk-runtime/state-store.js');
 await import('../protocol/codec.js')
   .then((m) => m.codecReady)
   .catch(() => {});
@@ -152,4 +154,103 @@ test('stringifyWithBigInt: out-of-range BigInt serializes as decimal string', ()
 test('stringifyWithBigInt: nested params and plain values pass through', () => {
   const json = stringifyWithBigInt({ a: [1n, 'x', { b: 2n }], c: true, d: null });
   assert.deepEqual(JSON.parse(json), { a: [1, 'x', { b: 2 }], c: true, d: null });
+});
+
+// ---- sendAction: ActionAck drives the optimistic edit ----
+
+const ON = [{ kind: 'key', value: 'on' }];
+
+// A fake WS client that answers every sent frame through the pending map, the
+// same path binary-ws-client uses for a response on the request's correlation.
+function fakeClient(answer) {
+  return {
+    pending: new Map(),
+    _corr: 0,
+    nextCorrelationId() { this._corr += 1; return this._corr; },
+    takeSequence() { return 1; },
+    _send() {
+      const key = String(this._corr);
+      const p = this.pending.get(key);
+      this.pending.delete(key);
+      queueMicrotask(() => answer(p));
+    },
+  };
+}
+
+function withSession(store, ackStatus, answer, fn) {
+  const realClient = ApiBinary.client;
+  ApiBinary.client = async () => fakeClient(answer);
+  __setSessionForTest({
+    store,
+    wasm: {
+      encodeUiAction: () => new Uint8Array(),
+      messageKind: () => ({ META_HEARTBEAT: 0 }),
+      encodeEnvelopeDirect: () => new Uint8Array(),
+      decodeUiPayload: () => ({ tag: 0x0131, status: ackStatus }),
+    },
+  });
+  return fn().finally(() => {
+    ApiBinary.client = realClient;
+    __setSessionForTest(null);
+    store.destroy();
+  });
+}
+
+function newStoreOff() {
+  const store = new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n });
+  store.applySnapshot({ entries: [{ path: ON, value: false }], state_revision: 0, truncated: false });
+  return store;
+}
+
+async function runAction(answer, ackStatus) {
+  const store = newStoreOff();
+  const token = store.setLocalEdit(ON, true);
+  let shown;
+  let entry;
+  await withSession(store, ackStatus, answer, async () => {
+    await sendAction('a', 'p', 1, 'set_on', { value: true }, [token]);
+    shown = store.read(ON);
+    entry = [...store._pending.values()][0];
+  });
+  return { shown, entry };
+}
+
+const UI_RESPONSE = { envelope: { isError: false }, body: { variant: 'UiChannelCbor', cbor: new Uint8Array() } };
+
+test('sendAction: ok ack keeps the edit and marks it acked', async () => {
+  const { shown, entry } = await runAction((p) => p.resolve(UI_RESPONSE), 'ok');
+  assert.equal(shown, true);
+  assert.equal(entry.acked, true);
+});
+
+test('sendAction: error ack restores the server value', async () => {
+  assert.equal((await runAction((p) => p.resolve(UI_RESPONSE), 'error')).shown, false);
+});
+
+test('sendAction: redirected is not a failure', async () => {
+  assert.equal((await runAction((p) => p.resolve(UI_RESPONSE), 'redirected')).shown, true);
+});
+
+test('sendAction: protocol error restores the server value', async () => {
+  const r = await runAction((p) => p.reject(new Error('protocol error BadRequest: epoch mismatch')), 'ok');
+  assert.equal(r.shown, false);
+});
+
+test('sendAction: a dropped connection leaves the edit pending', async () => {
+  const r = await runAction((p) => p.reject(new Error('transport closed')), 'ok');
+  assert.equal(r.shown, true);
+  assert.equal(r.entry.acked, false);
+});
+
+test('sendAction: a late failure of an older action keeps the newer edit', async () => {
+  const store = newStoreOff();
+  const older = store.setLocalEdit(ON, true);
+  store.setLocalEdit(ON, false);
+  store.setLocalEdit(ON, true);
+  let shown;
+  await withSession(store, 'error', (p) => p.resolve(UI_RESPONSE), async () => {
+    await sendAction('a', 'p', 1, 'set_on', { value: true }, [older]);
+    shown = store.read(ON);
+  });
+  assert.equal(shown, true);
 });

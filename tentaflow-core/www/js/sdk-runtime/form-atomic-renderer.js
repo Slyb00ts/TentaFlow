@@ -13,7 +13,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 
 const TONES = new Set([
   'neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted',
@@ -231,12 +231,13 @@ function renderToggle(component, ctx) {
       e.preventDefault();
       return;
     }
-    wrapper.dispatchEvent(
+    wrapper.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: e.detail.checked, kind: 'bool' },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   toggle.addEventListener('change', onChange);
   ctx.registerCleanup(() => toggle.removeEventListener('change', onChange));
@@ -344,7 +345,7 @@ function renderCheckbox(component, ctx) {
       detail: { value: e.detail.checked, kind: 'bool' },
     });
     ce.__tfReemit = true;
-    el.dispatchEvent(ce);
+    el.dispatchEvent(tagBoundEdit(ce, bindPath));
   };
   el.addEventListener('change', onChange);
   ctx.registerCleanup(() => el.removeEventListener('change', onChange));
@@ -409,12 +410,13 @@ function renderRadio(component, ctx) {
   const onClick = (e) => {
     if (isDisabledFn()) return;
     e.stopPropagation();
-    el.dispatchEvent(
+    el.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: parsedValue.value, kind: parsedValue.tag },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   el.addEventListener('click', onClick);
   ctx.registerCleanup(() => el.removeEventListener('click', onClick));

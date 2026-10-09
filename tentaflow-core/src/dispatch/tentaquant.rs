@@ -30,10 +30,10 @@ use std::path::PathBuf;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::tentaquant::{
-    FileInfo, LabAdminSettings, LabInfo, LabNodeInfo, LabSettings, NotebookInfo,
+    FileInfo, KataRankingEntry, LabAdminSettings, LabInfo, LabNodeInfo, LabSettings, NotebookInfo,
     NotebookVersionInfo, ProjectInfo, ProjectShareInfo, RunArtifactInfo, RunInfo, RunMetrics,
-    SimulateOptions, TentaQuantPayload as P, PEOPLE_CANDIDATES_LIMIT_MAX, RUN_COMPARE_MAX,
-    RUN_EXPORT_PARTS, RUN_STATE_QUERY_TOP_K_MAX,
+    SimulateOptions, TentaQuantPayload as P, KATA_SOURCE_MAX_BYTES, PEOPLE_CANDIDATES_LIMIT_MAX,
+    RUN_COMPARE_MAX, RUN_EXPORT_PARTS, RUN_STATE_QUERY_TOP_K_MAX,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -41,7 +41,7 @@ use super::{HandlerContext, SessionAuthKind};
 use crate::addon::native_apps::NODE_STATUS_KEY_PREFIX;
 use crate::db::DbPool;
 use crate::tentaquant::{
-    cas, circuit, compare, db as store, export,
+    cas, circuit, compare, db as store, examples, export, kata,
     people::{self, PERM_ADMIN, PERM_INSTRUCT, PERM_READ, PERM_RUN, PERM_RUN_GPU},
     runs::{self, MIME_EXPORT},
     state, targets, PACKAGE_ID,
@@ -2169,6 +2169,266 @@ fn target_resolve(
 }
 
 // =============================================================================
+// Course (Kurs, plan §12.3)
+// =============================================================================
+
+fn kata_not_found() -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::NotFound, "kata not found")
+}
+
+/// The caller's own rows of the course.
+fn kata_rows(g: &Lab) -> Result<std::collections::HashMap<String, kata::Progress>, ProtocolError> {
+    store::kata_progress(&g.db, &g.user_id).map_err(|e| internal("kata progress", e))
+}
+
+/// A kata the caller may open: it exists AND its group is open for them. A
+/// locked kata answers exactly like an unknown one, so the task text of a group
+/// is not readable ahead of its turn.
+fn open_kata(
+    progress: &std::collections::HashMap<String, kata::Progress>,
+    kata_id: &str,
+) -> Result<&'static kata::Kata, ProtocolError> {
+    let catalog = kata::catalog();
+    let found = catalog.kata(kata_id).ok_or_else(kata_not_found)?;
+    if !catalog.is_unlocked(found, progress) {
+        return Err(kata_not_found());
+    }
+    Ok(found)
+}
+
+fn kata_list(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let overview = kata::catalog().overview(&kata_rows(&g)?);
+    Ok(tq(P::KataListResponse {
+        instance_id: g.instance_id,
+        groups: overview.groups,
+        katas: overview.katas,
+        passed_count: overview.passed_count,
+        total_count: overview.total_count,
+        points: overview.points,
+        max_points: overview.max_points,
+    }))
+}
+
+fn kata_get(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    kata_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let progress = kata_rows(&g)?;
+    let found = open_kata(&progress, kata_id)?;
+    Ok(tq(P::KataGetResponse {
+        instance_id: g.instance_id,
+        kata: kata::catalog().info(found, true, &progress),
+        task: found.task.clone(),
+        starter_code: found.starter.clone(),
+    }))
+}
+
+/// Grades one program and records the attempt. Grading is a few microseconds of
+/// simulation on at most a handful of qubits, so it runs inline rather than on
+/// a blocking thread; the size cap is what keeps that true.
+fn kata_submit(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    kata_id: &str,
+    qasm3: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    if qasm3.len() > KATA_SOURCE_MAX_BYTES {
+        return Err(ProtocolError::bad_request(format!(
+            "a kata answer is at most {KATA_SOURCE_MAX_BYTES} bytes"
+        )));
+    }
+    let progress = kata_rows(&g)?;
+    let found = open_kata(&progress, kata_id)?;
+    let grade = kata::grade(found, qasm3);
+
+    // A program the front end rejected is not an attempt at the answer, so it
+    // neither counts nor writes: the editor shows the diagnostic and nothing
+    // else about the kata changes.
+    let mut after = progress;
+    let mut points_awarded = 0;
+    if grade.outcome != kata::OUTCOME_INVALID {
+        let (row, awarded) =
+            store::update_kata_progress(&g.db, &g.user_id, &found.id, |previous| {
+                kata::record(previous, found, &grade)
+            })
+            .map_err(|e| internal("kata progress write", e))?;
+        after.insert(found.id.clone(), row);
+        points_awarded = awarded;
+    }
+    Ok(tq(P::KataSubmitResponse {
+        instance_id: g.instance_id,
+        kata: kata::catalog().info(found, true, &after),
+        grade,
+        points_awarded,
+    }))
+}
+
+fn kata_ranking(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let enabled = store::settings(&g.db)
+        .map_err(|e| internal("settings", e))?
+        .ranking_enabled;
+    if !enabled {
+        return Ok(tq(P::KataRankingResponse {
+            instance_id: g.instance_id,
+            enabled: false,
+            total: 0,
+            entries: Vec::new(),
+            me: None,
+        }));
+    }
+    let standings = store::kata_standings(&g.db).map_err(|e| internal("kata standings", e))?;
+    let (total, top, me) = kata::ranking(standings, &g.user_id);
+    let entry = |(position, standing): (u32, kata::Standing)| KataRankingEntry {
+        position,
+        display_name: people::display_name(&ctx.state.db, &standing.user_id),
+        is_me: standing.user_id == g.user_id,
+        user_id: standing.user_id,
+        katas_passed: standing.katas_passed,
+        points: standing.points,
+    };
+    Ok(tq(P::KataRankingResponse {
+        instance_id: g.instance_id.clone(),
+        enabled: true,
+        total,
+        entries: top.into_iter().map(entry).collect(),
+        me: me.map(entry),
+    }))
+}
+
+// =============================================================================
+// Examples (Przykłady, plan §12.1)
+// =============================================================================
+
+fn example_not_found() -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::NotFound, "example not found")
+}
+
+/// An example and the width a request asked for, refused with a `BadRequest`
+/// the caller can show when the width does not belong to it.
+fn example_at(
+    example_id: &str,
+    qubits: Option<u32>,
+) -> Result<(&'static examples::Example, u32), ProtocolError> {
+    let example = examples::catalog()
+        .example(example_id)
+        .ok_or_else(example_not_found)?;
+    let width = example.width(qubits).map_err(ProtocolError::bad_request)?;
+    Ok((example, width))
+}
+
+fn example_list(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let examples = examples::catalog()
+        .examples
+        .iter()
+        .map(|example| example.info(example.qubits_default))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal("example list", e))?;
+    Ok(tq(P::ExampleListResponse {
+        instance_id: g.instance_id,
+        examples,
+    }))
+}
+
+fn example_get(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    example_id: &str,
+    qubits: Option<u32>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let (example, width) = example_at(example_id, qubits)?;
+    Ok(tq(P::ExampleGetResponse {
+        instance_id: g.instance_id,
+        example: example
+            .info(width)
+            .map_err(|e| internal("example info", e))?,
+        readme: example.readme.clone(),
+        qasm3: example.qasm_at(width),
+        expected: example.expected_at(width),
+    }))
+}
+
+/// The text of a language map in the caller's language, then English.
+fn pick_language<'a>(
+    texts: &'a std::collections::BTreeMap<String, String>,
+    language: &str,
+) -> &'a str {
+    texts
+        .get(language)
+        .or_else(|| texts.get("en"))
+        .map_or("", String::as_str)
+}
+
+/// Copies an example into a new private project of the caller's: one notebook
+/// whose first cell is the README and whose second is the circuit. It goes
+/// through the same two store writes as creating a project and a notebook by
+/// hand, so a fork is an ordinary project from the first moment — owned,
+/// shareable and deletable like any other. A notebook that cannot be written
+/// takes the project it was meant for with it, so a failed fork leaves nothing
+/// half-made behind.
+fn example_fork(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    example_id: &str,
+    qubits: Option<u32>,
+    language: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    let (example, width) = example_at(example_id, qubits)?;
+    let title = validate_name(pick_language(&example.titles, language))?;
+    let description = pick_language(&example.descriptions, language);
+    let readme = pick_language(&example.readme, language);
+
+    let circuit_cell_id = uuid::Uuid::new_v4().to_string();
+    let cells = serde_json::json!([
+        { "id": uuid::Uuid::new_v4().to_string(), "kind": "markdown", "source": readme },
+        { "id": circuit_cell_id, "kind": "circuit", "source": example.qasm_at(width) },
+    ])
+    .to_string();
+    let path = cas::validate_path(&format!("notebooks/{}.ipynb", slug(&title)))
+        .map_err(|e| internal("example notebook path", e))?;
+
+    let project_id = store::create_project(&g.db, &g.user_id, &title, description, "private", None)
+        .map_err(|e| internal("example project", e))?;
+    let notebook =
+        match store::create_notebook(&g.db, &project_id, &title, &path, &cells, &g.user_id) {
+            Ok(store::NotebookCreation::Created(record)) => record,
+            Ok(store::NotebookCreation::PathTaken) => {
+                // A brand-new project has no files, so this is unreachable; still
+                // roll the project back rather than leave an empty one.
+                discard_project(&g, &project_id);
+                return Err(internal("example notebook", "path already taken"));
+            }
+            Err(e) => {
+                discard_project(&g, &project_id);
+                return Err(internal("example notebook", e));
+            }
+        };
+    let record = store::project(&g.db, &project_id)
+        .map_err(|e| internal("project", e))?
+        .ok_or_else(not_found)?;
+    let role = role(&g, &project_id)?;
+    Ok(tq(P::ExampleForkResponse {
+        instance_id: g.instance_id.clone(),
+        project: one_project_info(ctx, &g, &record, Some(role))?,
+        notebook: notebook_info(notebook),
+        circuit_cell_id,
+    }))
+}
+
+fn discard_project(g: &Lab, project_id: &str) {
+    if let Err(e) = store::delete_project(&g.db, project_id) {
+        tracing::warn!(error = %e, project_id, "could not roll back a failed example fork");
+    }
+}
+
+// =============================================================================
 // Dispatcher
 // =============================================================================
 
@@ -2410,6 +2670,31 @@ pub async fn tentaquant_dispatch(
             top_k,
         } => run_state_query(ctx, instance_id, run_id, pairs, *top_k).await,
 
+        P::KataListRequest { instance_id } => kata_list(ctx, instance_id),
+        P::KataGetRequest {
+            instance_id,
+            kata_id,
+        } => kata_get(ctx, instance_id, kata_id),
+        P::KataSubmitRequest {
+            instance_id,
+            kata_id,
+            qasm3,
+        } => kata_submit(ctx, instance_id, kata_id, qasm3),
+        P::KataRankingRequest { instance_id } => kata_ranking(ctx, instance_id),
+
+        P::ExampleListRequest { instance_id } => example_list(ctx, instance_id),
+        P::ExampleGetRequest {
+            instance_id,
+            example_id,
+            qubits,
+        } => example_get(ctx, instance_id, example_id, *qubits),
+        P::ExampleForkRequest {
+            instance_id,
+            example_id,
+            qubits,
+            language,
+        } => example_fork(ctx, instance_id, example_id, *qubits, language),
+
         P::TargetListRequest { instance_id } => target_list(ctx, instance_id),
         P::TargetResolveRequest {
             instance_id,
@@ -2590,6 +2875,34 @@ register_tentaquant_variant!(
 register_tentaquant_variant!(
     "TentaQuantRunStateQueryRequest",
     "tentaflow_ws_handler_tq_run_state_query"
+);
+register_tentaquant_variant!(
+    "TentaQuantKataListRequest",
+    "tentaflow_ws_handler_tq_kata_list"
+);
+register_tentaquant_variant!(
+    "TentaQuantKataGetRequest",
+    "tentaflow_ws_handler_tq_kata_get"
+);
+register_tentaquant_variant!(
+    "TentaQuantKataSubmitRequest",
+    "tentaflow_ws_handler_tq_kata_submit"
+);
+register_tentaquant_variant!(
+    "TentaQuantKataRankingRequest",
+    "tentaflow_ws_handler_tq_kata_ranking"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleListRequest",
+    "tentaflow_ws_handler_tq_example_list"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleGetRequest",
+    "tentaflow_ws_handler_tq_example_get"
+);
+register_tentaquant_variant!(
+    "TentaQuantExampleForkRequest",
+    "tentaflow_ws_handler_tq_example_fork"
 );
 register_tentaquant_variant!(
     "TentaQuantTargetListRequest",
@@ -4917,5 +5230,453 @@ mod tests {
         )
         .await;
         assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
+    }
+
+    // =========================================================================
+    // Course
+    // =========================================================================
+
+    async fn kata_submit_of(
+        who: &HandlerContext,
+        lab: &str,
+        kata_id: &str,
+        qasm3: &str,
+    ) -> (
+        tentaflow_protocol::tentaquant::KataInfo,
+        tentaflow_protocol::tentaquant::KataGrade,
+        u32,
+    ) {
+        match call(
+            who,
+            P::KataSubmitRequest {
+                instance_id: lab.to_string(),
+                kata_id: kata_id.to_string(),
+                qasm3: qasm3.to_string(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataSubmitResponse {
+                kata,
+                grade,
+                points_awarded,
+                ..
+            }) => (kata, grade, points_awarded),
+            other => panic!("expected KataSubmitResponse, got {other:?}"),
+        }
+    }
+
+    /// The whole loop of one person: an empty answer is an attempt that pays
+    /// nothing, the reference answer pays the kata once, and a second pass pays
+    /// nothing again. The shipped skeleton and solution are the inputs, so the
+    /// test also proves the handler grades what the course ships.
+    #[tokio::test]
+    async fn a_kata_is_graded_recorded_and_paid_once() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "50505050", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let first = kata::catalog().katas[0].clone();
+
+        let (info, grade, awarded) = kata_submit_of(&anna, &lab, &first.id, &first.starter).await;
+        assert_eq!(grade.outcome, kata::OUTCOME_FAILED);
+        assert_eq!(
+            (info.status.as_str(), info.attempts, awarded),
+            ("attempted", 1, 0)
+        );
+
+        let (info, grade, awarded) = kata_submit_of(&anna, &lab, &first.id, &first.solution).await;
+        assert_eq!(grade.outcome, kata::OUTCOME_PASSED);
+        assert_eq!((info.status.as_str(), info.attempts), ("passed", 2));
+        assert_eq!((awarded, info.points_earned), (first.points, first.points));
+
+        let (info, _, awarded) = kata_submit_of(&anna, &lab, &first.id, &first.solution).await;
+        assert_eq!(
+            (awarded, info.points_earned, info.attempts),
+            (0, first.points, 3)
+        );
+
+        // A program the front end rejects is not an attempt.
+        let (info, grade, awarded) =
+            kata_submit_of(&anna, &lab, &first.id, "OPENQASM 3.0;\nnot_a_gate q[0];\n").await;
+        assert_eq!(grade.outcome, kata::OUTCOME_INVALID);
+        assert!(grade.diagnostic.is_some());
+        assert_eq!((info.attempts, awarded), (3, 0));
+
+        match call(
+            &anna,
+            P::KataListRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataListResponse {
+                katas,
+                passed_count,
+                points,
+                max_points,
+                ..
+            }) => {
+                assert_eq!(katas.len(), kata::catalog().katas.len());
+                assert_eq!((passed_count, points), (1, first.points));
+                assert_eq!(max_points, kata::catalog().max_points());
+            }
+            other => panic!("expected KataListResponse, got {other:?}"),
+        }
+    }
+
+    /// A later group is closed until the earlier one is complete: it can be
+    /// neither read nor submitted to, and the refusal is the one an unknown
+    /// kata gets.
+    #[tokio::test]
+    async fn a_locked_group_can_neither_be_read_nor_submitted_to() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "60606060", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let catalog = kata::catalog();
+        let locked = catalog.katas[catalog.groups[1].katas[0]].clone();
+
+        for request in [
+            P::KataGetRequest {
+                instance_id: lab.clone(),
+                kata_id: locked.id.clone(),
+            },
+            P::KataSubmitRequest {
+                instance_id: lab.clone(),
+                kata_id: locked.id.clone(),
+                qasm3: locked.solution.clone(),
+            },
+            P::KataGetRequest {
+                instance_id: lab.clone(),
+                kata_id: "99-no-such-kata".to_string(),
+            },
+        ] {
+            assert_eq!(fail(&anna, request).await.code, ProtocolErrorCode::NotFound);
+        }
+
+        // Completing the first group opens the second.
+        for index in &catalog.groups[0].katas {
+            let k = &catalog.katas[*index];
+            let (_, grade, _) = kata_submit_of(&anna, &lab, &k.id, &k.solution).await;
+            assert_eq!(grade.outcome, kata::OUTCOME_PASSED, "{}", k.id);
+        }
+        match call(
+            &anna,
+            P::KataGetRequest {
+                instance_id: lab.clone(),
+                kata_id: locked.id.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataGetResponse {
+                kata,
+                task,
+                starter_code,
+                ..
+            }) => {
+                assert_eq!(kata.status, "open");
+                assert!(task.contains_key("pl") && task.contains_key("en"));
+                assert_eq!(starter_code, locked.starter);
+            }
+            other => panic!("expected KataGetResponse, got {other:?}"),
+        }
+    }
+
+    /// Reading the course needs `quant.read`; submitting needs `quant.run`.
+    #[tokio::test]
+    async fn submitting_a_kata_needs_the_run_permission() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "70707070", "marek", &[PERM_READ]);
+        // The manifest grants `quant.run` by default; withdraw it for this person.
+        test_support::set_permission(&fx.state, &lab, "user", "marek", PERM_RUN, "deny");
+        let marek = ctx(&fx, "marek");
+        let first = kata::catalog().katas[0].clone();
+
+        assert!(matches!(
+            call(
+                &marek,
+                P::KataListRequest {
+                    instance_id: lab.clone()
+                }
+            )
+            .await,
+            MessageBody::TentaQuantBody(P::KataListResponse { .. })
+        ));
+        let denied = fail(
+            &marek,
+            P::KataSubmitRequest {
+                instance_id: lab.clone(),
+                kata_id: first.id.clone(),
+                qasm3: first.solution.clone(),
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    // =========================================================================
+    // Examples
+    // =========================================================================
+
+    /// The gallery is the same document for everyone who may read; a width is
+    /// only accepted where the example has one to give.
+    #[tokio::test]
+    async fn the_gallery_lists_and_opens_examples_at_a_requested_width() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "90909090", "anna", &[PERM_READ]);
+        let anna = ctx(&fx, "anna");
+
+        match call(
+            &anna,
+            P::ExampleListRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::ExampleListResponse { examples, .. }) => {
+                let ids: Vec<&str> = examples.iter().map(|e| e.example_id.as_str()).collect();
+                assert_eq!(ids, ["bell-state", "ghz"]);
+                assert_eq!((examples[0].qubits, examples[0].depth), (2, 3));
+                assert_eq!((examples[1].qubits, examples[1].qubits_max), (5, 28));
+            }
+            other => panic!("expected ExampleListResponse, got {other:?}"),
+        }
+
+        match call(
+            &anna,
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(7),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::ExampleGetResponse {
+                example,
+                readme,
+                qasm3,
+                expected,
+                ..
+            }) => {
+                assert_eq!(example.qubits, 7);
+                assert!(qasm3.contains("qubit[7] q;"));
+                assert!(readme.contains_key("pl") && readme.contains_key("en"));
+                let keys: Vec<&String> = expected.outcomes.keys().collect();
+                assert_eq!(keys, ["0000000", "1111111"]);
+            }
+            other => panic!("expected ExampleGetResponse, got {other:?}"),
+        }
+
+        for request in [
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(29),
+            },
+            P::ExampleGetRequest {
+                instance_id: lab.clone(),
+                example_id: "bell-state".to_string(),
+                qubits: Some(3),
+            },
+        ] {
+            assert_eq!(
+                fail(&anna, request).await.code,
+                ProtocolErrorCode::BadRequest
+            );
+        }
+        assert_eq!(
+            fail(
+                &anna,
+                P::ExampleGetRequest {
+                    instance_id: lab.clone(),
+                    example_id: "no-such-example".to_string(),
+                    qubits: None,
+                },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+    }
+
+    /// A fork is an ordinary private project of the caller's holding the README
+    /// and the circuit, and it needs `quant.run` like any new project.
+    #[tokio::test]
+    async fn forking_an_example_makes_a_private_project_with_its_notebook() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "91919191", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let fork = call(
+            &anna,
+            P::ExampleForkRequest {
+                instance_id: lab.clone(),
+                example_id: "ghz".to_string(),
+                qubits: Some(9),
+                language: "pl".to_string(),
+            },
+        )
+        .await;
+        let MessageBody::TentaQuantBody(P::ExampleForkResponse {
+            project,
+            notebook,
+            circuit_cell_id,
+            ..
+        }) = fork
+        else {
+            panic!("expected ExampleForkResponse, got {fork:?}");
+        };
+        assert_eq!(project.name, "Stan GHZ — n kubitów");
+        assert_eq!(project.visibility, "private");
+        assert_eq!(project.my_role, "owner");
+        assert_eq!(project.notebook_count, 1);
+
+        match call(
+            &anna,
+            P::NotebookGetRequest {
+                instance_id: lab.clone(),
+                project_id: project.project_id.clone(),
+                notebook_id: notebook.notebook_id.clone(),
+                version: None,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::NotebookGetResponse { cells_json, .. }) => {
+                let cells: serde_json::Value = serde_json::from_str(&cells_json).expect("cells");
+                let cells = cells.as_array().expect("array");
+                assert_eq!(cells.len(), 2);
+                assert_eq!(cells[0]["kind"], "markdown");
+                assert!(cells[0]["source"].as_str().expect("readme").contains("GHZ"));
+                assert_eq!(cells[1]["kind"], "circuit");
+                assert_eq!(cells[1]["id"], circuit_cell_id.as_str());
+                assert!(cells[1]["source"]
+                    .as_str()
+                    .expect("qasm")
+                    .contains("qubit[9] q;"));
+            }
+            other => panic!("expected NotebookGetResponse, got {other:?}"),
+        }
+
+        // A reader may open the gallery but not copy from it.
+        let marek_lab = install_lab(&mut fx, "92929292", "marek", &[PERM_READ]);
+        test_support::set_permission(&fx.state, &marek_lab, "user", "marek", PERM_RUN, "deny");
+        let marek = ctx(&fx, "marek");
+        let denied = fail(
+            &marek,
+            P::ExampleForkRequest {
+                instance_id: marek_lab,
+                example_id: "bell-state".to_string(),
+                qubits: None,
+                language: "en".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// The ranking lists people with names and the caller's own place, and a
+    /// supervisor's switch empties it.
+    #[tokio::test]
+    async fn the_ranking_names_people_and_honours_the_lab_switch() {
+        let mut fx = fixture();
+        let lab = install_lab(
+            &mut fx,
+            "80808080",
+            "anna",
+            &[PERM_READ, PERM_RUN, PERM_INSTRUCT],
+        );
+        let anna = ctx(&fx, "anna");
+        let first = kata::catalog().katas[0].clone();
+
+        match call(
+            &anna,
+            P::KataRankingRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataRankingResponse {
+                enabled,
+                total,
+                entries,
+                me,
+                ..
+            }) => {
+                assert!(enabled);
+                assert_eq!(total, 0);
+                assert!(entries.is_empty() && me.is_none());
+            }
+            other => panic!("expected KataRankingResponse, got {other:?}"),
+        }
+
+        kata_submit_of(&anna, &lab, &first.id, &first.solution).await;
+        match call(
+            &anna,
+            P::KataRankingRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataRankingResponse {
+                total, entries, me, ..
+            }) => {
+                assert_eq!(total, 1);
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].is_me && entries[0].position == 1);
+                assert_eq!(entries[0].points, first.points);
+                assert!(!entries[0].display_name.is_empty());
+                assert_eq!(me.expect("own place").user_id, "anna");
+            }
+            other => panic!("expected KataRankingResponse, got {other:?}"),
+        }
+
+        let mut settings = match call(
+            &anna,
+            P::SettingsGetRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::SettingsResponse { settings, .. }) => settings,
+            other => panic!("expected SettingsResponse, got {other:?}"),
+        };
+        settings.ranking_enabled = false;
+        call(
+            &anna,
+            P::SettingsSetRequest {
+                instance_id: lab.clone(),
+                settings,
+                admin: None,
+            },
+        )
+        .await;
+        match call(
+            &anna,
+            P::KataRankingRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::KataRankingResponse {
+                enabled,
+                total,
+                entries,
+                me,
+                ..
+            }) => {
+                assert!(!enabled);
+                assert_eq!(total, 0);
+                assert!(entries.is_empty() && me.is_none());
+            }
+            other => panic!("expected KataRankingResponse, got {other:?}"),
+        }
     }
 }

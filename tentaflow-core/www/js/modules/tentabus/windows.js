@@ -45,15 +45,17 @@ export function windowEl({ title, icon, width, cls }) {
  * locked button go as soon as the fields change. `onSaved(draft,
  * result)` runs after the window closed. `saveLabel`/`saveIcon` name the
  * action and `willHappen` the impact line; `current` is what is there now —
- * the save unlocks only once the draft differs from it. "Popraw zaznaczone
- * pole" is said only once a field is actually marked. The close button and
- * Escape ask once before dropping a changed draft ("Anuluj" is the explicit
- * way out and never asks).
+ * the save unlocks only once the draft differs from it. `problem(draft)`, when
+ * given, names what the draft still lacks (nobody picked, no right set): the
+ * sentence stands in for the impact and the save stays locked. "Popraw zaznaczone
+ * pole" is said only once a field is actually marked. The close button, Escape
+ * and "Anuluj" all ask once before dropping a changed draft.
  */
 export function openChangeWindow({
   title, icon, width = 620, cls = 'tb-change-window', fields, wire, draft, current, impact,
-  save, describeError, errorHtml = null, onSaved,
+  save, describeError, errorHtml = null, onSaved, problem = null,
   saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'),
+  discardText = T('settings.discard_confirm'),
 }) {
   const win = windowEl({ title, icon, width, cls });
   win.innerHTML = `
@@ -61,7 +63,7 @@ export function openChangeWindow({
       ${fields()}
       <div class="tb-will-happen" data-role="impact" aria-live="polite"></div>
       <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<div data-role="error-text"></div></div>
-      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('settings.discard_confirm'))}</div></div>
+      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(discardText)}</div></div>
     </div>
     <div slot="footer">
       <tf-button variant="ghost" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
@@ -78,20 +80,23 @@ export function openChangeWindow({
   const discardEl = win.querySelector('[data-role="discard"]');
   const sync = () => {
     const d = draft(win);
-    const lines = d == null ? [] : impact(d);
+    const lacking = d == null || !problem ? null : problem(d);
+    const lines = d == null || lacking ? [] : impact(d);
     const marked = win.querySelector('[slot="body"] [error]') != null;
     patchHtml(impactEl, d == null
       ? `${sprite('info')}<div>${escapeHtml(T('settings.fix_fields'))}</div>`
-      : changed(d)
-        ? `${sprite('info')}<div><b>${escapeHtml(willHappen)}</b> ${lines.map(escapeHtml).join(' ')}</div>`
-        : `${sprite('info')}<div>${escapeHtml(T('settings.nothing_changed'))}</div>`);
+      : lacking
+        ? `${sprite('info')}<div>${escapeHtml(lacking)}</div>`
+        : changed(d)
+          ? `${sprite('info')}<div><b>${escapeHtml(willHappen)}</b> ${lines.map(escapeHtml).join(' ')}</div>`
+          : `${sprite('info')}<div>${escapeHtml(T('settings.nothing_changed'))}</div>`);
     impactEl.hidden = d == null && !marked;
     if (refusedSig != null && JSON.stringify(d) !== refusedSig) {
       refusedSig = null;
       errEl.hidden = true;
     }
     discardEl.hidden = true;
-    saveBtn.toggleAttribute('disabled', busy || !changed(d) || refusedSig != null);
+    saveBtn.toggleAttribute('disabled', busy || !changed(d) || lacking != null || refusedSig != null);
     cancelBtn.toggleAttribute('disabled', busy);
   };
   wire(win, sync);
@@ -115,10 +120,10 @@ export function openChangeWindow({
   win.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn || btn.hasAttribute('disabled')) return;
-    if (btn.dataset.act === 'cancel') { win.close(true); return; }
+    if (btn.dataset.act === 'cancel') { win.close(); return; }
     if (btn.dataset.act !== 'save') return;
     const d = draft(win);
-    if (!changed(d)) return;
+    if (!changed(d) || (problem && problem(d))) return;
     busy = true;
     sync();
     errEl.hidden = true;

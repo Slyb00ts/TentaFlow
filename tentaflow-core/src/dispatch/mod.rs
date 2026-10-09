@@ -1523,6 +1523,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::AddonInstancePayload::ReqUpdate(_) => "AddonInstanceUpdateRequest",
             tentaflow_protocol::AddonInstancePayload::ResUpdate(_) => "AddonInstanceUpdateResponse",
+            tentaflow_protocol::AddonInstancePayload::ReqInstallStep(_) => {
+                "AddonInstanceInstallStepRequest"
+            }
+            tentaflow_protocol::AddonInstancePayload::ResInstallStep(_) => {
+                "AddonInstanceInstallStepResponse"
+            }
         },
         MessageBody::AddonStorageBody(p) => match p {
             tentaflow_protocol::AddonStoragePayload::StatsRequest(_) => "AddonStorageStatsRequest",
@@ -2771,6 +2777,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::RunExportResponse { .. } => "TentaQuantRunExportResponse",
                 Tq::RunStateQueryRequest { .. } => "TentaQuantRunStateQueryRequest",
                 Tq::RunStateQueryResponse { .. } => "TentaQuantRunStateQueryResponse",
+                Tq::KataListRequest { .. } => "TentaQuantKataListRequest",
+                Tq::KataListResponse { .. } => "TentaQuantKataListResponse",
+                Tq::KataGetRequest { .. } => "TentaQuantKataGetRequest",
+                Tq::KataGetResponse { .. } => "TentaQuantKataGetResponse",
+                Tq::KataSubmitRequest { .. } => "TentaQuantKataSubmitRequest",
+                Tq::KataSubmitResponse { .. } => "TentaQuantKataSubmitResponse",
+                Tq::KataRankingRequest { .. } => "TentaQuantKataRankingRequest",
+                Tq::KataRankingResponse { .. } => "TentaQuantKataRankingResponse",
+                Tq::ExampleListRequest { .. } => "TentaQuantExampleListRequest",
+                Tq::ExampleListResponse { .. } => "TentaQuantExampleListResponse",
+                Tq::ExampleGetRequest { .. } => "TentaQuantExampleGetRequest",
+                Tq::ExampleGetResponse { .. } => "TentaQuantExampleGetResponse",
+                Tq::ExampleForkRequest { .. } => "TentaQuantExampleForkRequest",
+                Tq::ExampleForkResponse { .. } => "TentaQuantExampleForkResponse",
             }
         }
         // Family prefix + the variant's own name, verbatim — the browser

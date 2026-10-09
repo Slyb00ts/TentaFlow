@@ -4,8 +4,9 @@
 // what disappears with the topic — its messages, its unprocessed messages,
 // the access entries and data-hiding rules set on it, the consumers that
 // stop receiving — and what stays (the message pattern and the API keys,
-// which belong to the instance). Counts that could not be read are left out
-// rather than guessed; the delete button unlocks only on the exact name.
+// which belong to the instance). A count that could not be read is not
+// guessed as zero: the rules say they could not be counted; the delete button
+// unlocks only on the exact name.
 
 import { escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
@@ -18,10 +19,12 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
  * The lines of the window, as `{ lost: string[], kept: string }` (plain
  * text; the caller escapes). `topic` = the list row (`partitions`,
  * `schemaId`), `stats` = its stats row or null, `consumers` = names of the
- * consumers reading it, `aclCount` / `policyCount` = the entries on it, or
- * `null` when they could not be read.
+ * consumers reading it, `aclCount` / `policyCount` = the entries on it,
+ * `null` when they could not be read and left out while nobody asked yet
+ * (`undefined`). Rules that could not be counted are said so: a topic goes
+ * with whatever rules it has, and "none" would be a guess.
  */
-export function deleteImpact({ topic, stats, consumers = [], aclCount = null, policyCount = null }) {
+export function deleteImpact({ topic, stats, consumers = [], aclCount, policyCount }) {
   const lost = [];
   const partitions = Number(topic?.partitions) || 0;
   const bytes = Number(stats?.totalBytesOnDisk) || 0;
@@ -39,6 +42,7 @@ export function deleteImpact({ topic, stats, consumers = [], aclCount = null, po
   if (acl > 0 && policies > 0) lost.push(T('topics.delete.lost_rules_and_access', { rules: fmtCount(policies), r: policies, entries: fmtCount(acl), n: acl }));
   else if (policies > 0) lost.push(T('topics.delete.lost_rules', { count: fmtCount(policies), n: policies }));
   else if (acl > 0) lost.push(T('topics.delete.lost_access', { count: fmtCount(acl), n: acl }));
+  if (policyCount === null) lost.push(T('topics.delete.lost_rules_unknown'));
   const names = [...new Set(consumers)].sort();
   if (names.length) {
     const list = new Intl.ListFormat(I18n.getLanguage(), { type: 'conjunction' }).format(names);

@@ -1,0 +1,35 @@
+# =============================================================================
+# File: gesture-cv.toml
+# Purpose: gesture recognition models for robot cameras — the body pose
+#          (MoveNet single-pose lightning) points at the hands, the MediaPipe
+#          palm detector finds them in a crop around the wrist, and the
+#          MediaPipe hand landmark model reads 21 finger keypoints. Embedded:
+#          ONNX Runtime (CUDA) under `vision-ort`, tract (CPU) otherwise,
+#          loaded lazily by the gesture engine; deploy only downloads the
+#          three files into vision_models_dir(). All come from the authors'
+#          releases, pinned to a commit and a sha256 in
+#          `vision/camera_cv_models.rs` (bundle `gesture-cv`).
+#
+#          Licenses: MoveNet — Apache-2.0 (Google, Xenova ONNX export);
+#          palm_detection_mediapipe and handpose_estimation_mediapipe —
+#          Apache-2.0 (OpenCV zoo).
+# =============================================================================
+
+[engine]
+id = "gesture-cv"
+category = "vision"
+name = "Gesty (MoveNet + MediaPipe Hands)"
+description_pl = "Poza ciała i punkty dłoni do rozpoznawania gestów (machanie, serce) na kamerach robotów — robot odpowiada własnym gestem."
+description_en = "Body pose and hand keypoints for gesture recognition (wave, heart) on robot cameras — the robot answers with its own gesture."
+homepage = "https://github.com/opencv/opencv_zoo"
+license = "Apache-2.0 (MoveNet, MediaPipe palm detection, MediaPipe hand landmarks)"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "movenet-lightning+mediapipe-hands-2023feb"
+service_surfaces = ["camera_cv"]
+input_modalities = ["image"]
+
+[deploy.native]
+platforms = ["linux", "windows", "macos"]
+runtime = "embedded"

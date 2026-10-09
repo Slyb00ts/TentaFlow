@@ -40,7 +40,8 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 
 use crate::auth::actor::ActorKind;
-use crate::db::repository::{self, DbBusFieldPolicy};
+pub use crate::db::repository::BusFieldPolicyExpect;
+use crate::db::repository::{self, BusFieldPolicyWrite, DbBusFieldPolicy};
 use crate::db::DbPool;
 
 use super::dlq;
@@ -327,6 +328,8 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
 /// `required_fields` must be a subset of `fields` — a field cannot be
 /// required if it is not even allowed. A `__`-prefixed reserved topic is
 /// refused outright, since `resolve` never applies a policy to one.
+/// `expect` is checked atomically with the write: a stored rule that is not
+/// what it names is `FieldPolicyChanged` and nothing is written.
 #[allow(clippy::too_many_arguments)]
 pub fn set_policy(
     pool: &DbPool,
@@ -338,6 +341,7 @@ pub fn set_policy(
     direction: Direction,
     fields: &BTreeSet<String>,
     required_fields: &BTreeSet<String>,
+    expect: BusFieldPolicyExpect,
 ) -> Result<(), BusServiceError> {
     if !["user", "group", "addon", "any"].contains(&subject_type) {
         return Err(BusServiceError::InvalidArgument(format!(
@@ -414,16 +418,21 @@ pub fn set_policy(
         created_at_ms,
         updated_at_ms: now,
     };
-    // The topic is checked again where the rule is written: it may have been
-    // deleted since it was read above.
-    if !repository::bus_field_policy_set(pool, &row)? {
-        return Err(BusServiceError::TopicNotFound {
+    // The topic and `expect` are checked again where the rule is written: the
+    // topic may have been deleted, or the rule changed, since they were read.
+    match repository::bus_field_policy_set(pool, &row, expect)? {
+        BusFieldPolicyWrite::Written => Ok(()),
+        BusFieldPolicyWrite::TopicMissing => Err(BusServiceError::TopicNotFound {
             name: topic.to_string(),
-        });
+        }),
+        BusFieldPolicyWrite::Changed => Err(BusServiceError::FieldPolicyChanged {
+            topic: topic.to_string(),
+        }),
     }
-    Ok(())
 }
 
+/// Removes a rule; with `expected_updated_at_ms` only while it still carries
+/// that value (`FieldPolicyChanged` otherwise, nothing removed).
 #[allow(clippy::too_many_arguments)]
 pub fn delete_policy(
     pool: &DbPool,
@@ -433,8 +442,9 @@ pub fn delete_policy(
     subject_type: &str,
     subject_id: &str,
     direction: Direction,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<(), BusServiceError> {
-    repository::bus_field_policy_delete(
+    let removed = repository::bus_field_policy_delete(
         pool,
         instance_id,
         org_id,
@@ -442,8 +452,15 @@ pub fn delete_policy(
         subject_type,
         subject_id,
         direction.as_str(),
+        expected_updated_at_ms,
     )?;
-    Ok(())
+    if removed {
+        Ok(())
+    } else {
+        Err(BusServiceError::FieldPolicyChanged {
+            topic: topic.to_string(),
+        })
+    }
 }
 
 pub fn list_policies(
@@ -602,6 +619,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect_err("a reserved topic must not accept a field policy");
         match err {
@@ -649,6 +667,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("an ordinary topic still accepts a field policy");
         assert_eq!(
@@ -699,6 +718,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("set a read policy on the source topic");
 
@@ -813,6 +833,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("set an addon-scoped read policy");
 
@@ -892,6 +913,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("set a group-scoped read policy");
 
@@ -961,6 +983,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id", "status"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("set a group-scoped read policy");
         set_policy(
@@ -973,6 +996,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect("set a user-scoped read policy");
 
@@ -1018,6 +1042,7 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
         )
         .expect_err("an unknown subject_type must be rejected");
         assert!(matches!(err, BusServiceError::InvalidArgument(_)));
@@ -1062,6 +1087,7 @@ mod tests {
                 Direction::Read,
                 &field_set(&fields),
                 &BTreeSet::new(),
+                BusFieldPolicyExpect::Any,
             )
             .expect("set policy");
         }

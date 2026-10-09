@@ -140,6 +140,10 @@ pub struct DetectionItem {
     /// Box-center velocity, normalized units/s (Y axis).
     #[serde(default)]
     pub vy: f32,
+    /// Body/hand keypoints `[x, y, score]`, normalized 0..1, in the model's fixed
+    /// order (17 COCO body points or 21 hand points). Empty for plain boxes.
+    #[serde(default)]
+    pub keypoints: Vec<[f32; 3]>,
 }
 
 /// One streamed detection frame (server→client chunk). Carries the normalized
@@ -159,6 +163,10 @@ pub struct CameraDetectionsFrame {
     #[serde(default)]
     pub proc_ms: u32,
     pub items: Vec<DetectionItem>,
+    /// Producer of the frame: empty for object detections, `"pose"` for the
+    /// gesture engine (body + hands). The overlay keeps the two apart.
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Inner-enum pack — keeps every admin camera RPC in a single
@@ -364,6 +372,7 @@ mod tests {
                     track_id: 7,
                     vx: 0.01,
                     vy: -0.02,
+                    keypoints: Vec::new(),
                 },
                 DetectionItem {
                     klasa: "nalepka_3".into(),
@@ -375,8 +384,10 @@ mod tests {
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
+                    keypoints: vec![[0.5, 0.25, 0.9], [0.4, 0.3, 0.0]],
                 },
             ],
+            source: "pose".into(),
         });
         assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
     }
@@ -400,7 +411,9 @@ mod tests {
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
+                    keypoints: Vec::new(),
                 }],
+                source: String::new(),
             },
         ));
         let bytes = crate::cbor::encode(&body).expect("encode");

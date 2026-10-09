@@ -36,6 +36,15 @@ routes = ["tentaquant"]
 db_file = "tentaquant.db"
 i18n_namespace = "tentaquant"
 
+# App step of the install wizard (platform feature, plan §2.2 point 4): after
+# the instance exists the wizard runs this through `native_install_step`. The
+# GPU-node and Python-service steps of mockup Q14 are NOT declared here — no
+# backend exists for them yet.
+[[install_step]]
+id = "bell-test"
+title_key = "apps.tentaquant.install.bell_test.title"
+description_key = "apps.tentaquant.install.bell_test.desc"
+
 # The six permission ids of plan §10.2 — the whole access model of a lab.
 # `read` and `run` default to allow, so a group the Visibility tab shows the
 # tile to can enter and compute; an administrator takes either away with one

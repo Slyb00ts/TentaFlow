@@ -193,10 +193,13 @@ test('Select option pick re-emits change with { value, kind } SelectValue', () =
     3: { kind: 'literal', value: 'L' },
   }))));
   const got = [];
-  el.addEventListener('change', (e) => got.push(e.detail));
+  const paths = [];
+  el.addEventListener('change', (e) => { got.push(e.detail); paths.push(e.__tfBoundEdits[0].path); });
   pick(el, 'tstr:b');
   // Exactly one SDK event — the raw serialized-string event must be blocked.
   assertEq(got, [{ value: 'b', kind: 'tstr' }]);
+  // Tagged as a user edit of the bound path, so the dispatcher can apply it.
+  assertEq(paths, [PATH('sel')]);
 });
 
 test('Select u32 option emits numeric value with kind=u32', () => {

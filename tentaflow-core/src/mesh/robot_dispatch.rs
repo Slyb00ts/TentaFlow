@@ -113,6 +113,12 @@ pub struct AdvertisedRobot {
     /// APPEND-AT-END rule): an old peer decodes it as `None`.
     #[serde(default)]
     pub lidar: Option<RobotLidarSnapshot>,
+    /// Operator setting: the robot reacts to people's gestures seen by its camera.
+    /// A setting, not live data, so unlike `lidar` it IS part of
+    /// `robots_structurally_equal` — peers learn of a toggle with the next delta.
+    /// Appended last (`#[serde(default)]`): an old peer decodes it as off.
+    #[serde(default)]
+    pub gestures_enabled: bool,
 }
 
 /// SMALL LiDAR availability snapshot mirrored from the owning addon's
@@ -356,6 +362,39 @@ impl MeshRobotRegistry {
         self.by_node.read().values().flatten().cloned().collect()
     }
 
+    /// Apply an accepted LiDAR toggle to the cached entries of `robot_id` at once.
+    /// The advertiser refreshes them only every ~10 s, and until then every robots
+    /// list would hand the dashboard the old value and flip its toggle back. The
+    /// next refresh replaces the entry with what the robot reports.
+    pub fn set_lidar_enabled(&self, robot_id: &str, enabled: bool) {
+        let apply = |r: &mut AdvertisedRobot| {
+            if r.robot_id != robot_id {
+                return;
+            }
+            if let Some(l) = r.lidar.as_mut() {
+                l.enabled = enabled;
+                if !enabled {
+                    l.available = false;
+                }
+            }
+        };
+        self.by_node.write().values_mut().flatten().for_each(apply);
+        self.local_offline.write().iter_mut().for_each(apply);
+    }
+
+    /// Apply an accepted gesture-reaction toggle to the cached entries of
+    /// `robot_id` at once, for the same reason as `set_lidar_enabled`; the gesture
+    /// engine also follows this cache, so reactions start/stop with the toggle.
+    pub fn set_gestures_enabled(&self, robot_id: &str, enabled: bool) {
+        let apply = |r: &mut AdvertisedRobot| {
+            if r.robot_id == robot_id {
+                r.gestures_enabled = enabled;
+            }
+        };
+        self.by_node.write().values_mut().flatten().for_each(apply);
+        self.local_offline.write().iter_mut().for_each(apply);
+    }
+
     /// Snapshot of the robots THIS node owns, read straight from the cached local
     /// entry the advertiser refreshes every ~10 s. Serves the `RobotsGet` reply
     /// without re-running any addon status tool, so a trusted peer's GET is a cheap
@@ -366,6 +405,20 @@ impl MeshRobotRegistry {
             .get(local_node_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// `(robot_id, camera_id)` of every robot THIS node owns that has gesture
+    /// reactions on and a camera — the work-list of the gesture engine. Only
+    /// online robots are in the local entry, so an offline robot never reacts.
+    pub fn local_gesture_robots(&self, local_node_id: &str) -> Vec<(String, String)> {
+        self.local_robots(local_node_id)
+            .into_iter()
+            .filter(|r| r.gestures_enabled)
+            .filter_map(|r| {
+                let cam = r.camera_id.filter(|c| !c.is_empty())?;
+                Some((r.robot_id, cam))
+            })
+            .collect()
     }
 
     /// Replace this node's configured-but-offline robots (owner-local view only).
@@ -453,6 +506,7 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
                 actions_meta: Vec::new(),
                 telemetry: None,
                 lidar: None,
+                gestures_enabled: false,
             });
             continue;
         }
@@ -464,19 +518,6 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             .camera_id
             .clone()
             .or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
-        // Feed the robot's world pose into the shared SLAM scene (option B: the
-        // device's own odometry, trusted). Drives GlobalPose + marker placement; the
-        // map itself accumulates from the lidar frames at their own (faster) cadence.
-        if let Some(t) = telemetry.telemetry.as_ref() {
-            if t.pose_position.len() == 3 && t.pose_orientation.len() == 4 {
-                crate::services::slam_scene::SlamSceneManager::global().on_pose(
-                    &c.addon_id,
-                    &t.pose_position,
-                    &t.pose_orientation,
-                    now_us(),
-                );
-            }
-        }
         // Tenant of this robot, read from the running addon instance's
         // `AddonState`. A service/boot-started instance has no user org context
         // (`instance_org_id` is None), and an unscoped install carries an empty
@@ -498,6 +539,7 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             actions_meta: telemetry.actions_meta,
             telemetry: telemetry.telemetry,
             lidar: telemetry.lidar,
+            gestures_enabled: telemetry.gestures_enabled,
         });
     }
     // Shared registry + peer broadcast get ONLINE robots only (resolver and
@@ -522,6 +564,7 @@ pub struct RobotStatusTelemetry {
     pub actions_meta: Vec<AdvertisedAction>,
     pub telemetry: Option<RobotTelemetrySnapshot>,
     pub lidar: Option<RobotLidarSnapshot>,
+    pub gestures_enabled: bool,
 }
 
 impl RobotStatusTelemetry {
@@ -537,6 +580,7 @@ impl RobotStatusTelemetry {
             actions_meta: Vec::new(),
             telemetry: None,
             lidar: None,
+            gestures_enabled: false,
         }
     }
 }
@@ -633,6 +677,10 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
     let actions_meta = parse_actions_meta(status);
     let telemetry = parse_telemetry_snapshot(status);
     let lidar = parse_lidar_snapshot(status);
+    let gestures_enabled = status
+        .get("gestures_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     RobotStatusTelemetry {
         is_online,
         status: raw_status,
@@ -643,6 +691,7 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
         actions_meta,
         telemetry,
         lidar,
+        gestures_enabled,
     }
 }
 
@@ -911,6 +960,7 @@ fn robots_structurally_equal(a: &AdvertisedRobot, b: &AdvertisedRobot) -> bool {
         && a.battery_percent == b.battery_percent
         && a.capabilities == b.capabilities
         && a.actions_meta == b.actions_meta
+        && a.gestures_enabled == b.gestures_enabled
 }
 
 /// PURE diff of two advertised-robot snapshots keyed by `robot_id`. Produces the
@@ -986,6 +1036,15 @@ pub fn set_dispatch_context(ctx: RobotDispatchContext) {
 /// Snapshot of the dispatch context, or `None` before startup wired it.
 pub fn dispatch_context() -> Option<RobotDispatchContext> {
     dispatch_ctx_cell().read().clone()
+}
+
+/// `local_gesture_robots` for this node; empty until the mesh context is wired
+/// (no robot can be advertised as owned before that anyway).
+pub fn local_gesture_cameras() -> Vec<(String, String)> {
+    match dispatch_context() {
+        Some(ctx) => global().local_gesture_robots(&ctx.local_node_id),
+        None => Vec::new(),
+    }
 }
 
 /// High-level entry used by the `robot_dispatch_v1` host function: build the real
@@ -1114,14 +1173,6 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Wall-clock microseconds since the epoch (GlobalPose / pose-adopt timestamp).
-fn now_us() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
 }
 
@@ -1341,9 +1392,49 @@ async fn execute_local(
     .await;
 
     match exec {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            if resp.ok {
+                apply_accepted_action(&request.robot_id, &request.action);
+                if !read_only && !request.action.is_setting() {
+                    note_manual_control(&request.robot_id);
+                }
+            }
+            resp
+        }
         Err(e) => RobotControlResponse::failed(format!("robot control task failed: {e}")),
     }
+}
+
+/// Reflect an accepted setting toggle in this node's cached robot entry at once.
+/// Runs on the node that owns the robot (so its gesture engine stops reacting the
+/// moment gestures are switched off) and on the node the operator used (so its
+/// dashboard does not show the old value until the next ~10 s refresh).
+pub fn apply_accepted_action(robot_id: &str, action: &RobotAction) {
+    match action {
+        RobotAction::LidarOn => global().set_lidar_enabled(robot_id, true),
+        RobotAction::LidarOff => global().set_lidar_enabled(robot_id, false),
+        RobotAction::GesturesOn => global().set_gestures_enabled(robot_id, true),
+        RobotAction::GesturesOff => global().set_gestures_enabled(robot_id, false),
+        _ => {}
+    }
+}
+
+fn manual_controls() -> &'static dashmap::DashMap<String, std::time::Instant> {
+    static M: OnceLock<dashmap::DashMap<String, std::time::Instant>> = OnceLock::new();
+    M.get_or_init(dashmap::DashMap::new)
+}
+
+/// Remember that an operator just moved this robot by hand.
+fn note_manual_control(robot_id: &str) {
+    manual_controls().insert(robot_id.to_string(), std::time::Instant::now());
+}
+
+/// True when an operator moved the robot within `window` — an automatic reaction
+/// (a gesture answer) must not cut into manual driving.
+pub fn manual_control_within(robot_id: &str, window: std::time::Duration) -> bool {
+    manual_controls()
+        .get(robot_id)
+        .is_some_and(|t| t.elapsed() < window)
 }
 
 #[cfg(test)]
@@ -1365,7 +1456,41 @@ mod tests {
             actions_meta: Vec::new(),
             telemetry: None,
             lidar: None,
+            gestures_enabled: false,
         }
+    }
+
+    // ----- gesture reactions -----
+
+    #[test]
+    fn gesture_robots_need_the_toggle_and_a_camera() {
+        let reg = MeshRobotRegistry::new();
+        let mut on = ad("go2-a", "go2", "local");
+        on.camera_id = Some("cam-a".into());
+        on.gestures_enabled = true;
+        let mut off = ad("go2-b", "go2", "local");
+        off.camera_id = Some("cam-b".into());
+        let mut no_cam = ad("go2-c", "go2", "local");
+        no_cam.gestures_enabled = true;
+        let mut remote = ad("go2-d", "go2", "peer");
+        remote.camera_id = Some("cam-d".into());
+        remote.gestures_enabled = true;
+        reg.replace_local("local", vec![on, off, no_cam]);
+        reg.replace_node("peer", vec![remote]);
+        assert_eq!(
+            reg.local_gesture_robots("local"),
+            vec![("go2-a".to_string(), "cam-a".to_string())]
+        );
+        reg.set_gestures_enabled("go2-b", true);
+        assert_eq!(reg.local_gesture_robots("local").len(), 2, "toggle applies at once");
+    }
+
+    #[test]
+    fn status_gestures_flag_parses_and_defaults_off() {
+        let on = serde_json::json!({ "status": "online", "gestures_enabled": true });
+        assert!(parse_status_telemetry(&on).gestures_enabled);
+        let absent = serde_json::json!({ "status": "online" });
+        assert!(!parse_status_telemetry(&absent).gestures_enabled);
     }
 
     // ----- status camera_id extraction (PURE) -----
@@ -2649,6 +2774,7 @@ mod tests {
             actions_meta: Vec::new(),
             telemetry: None,
             lidar: None,
+            gestures_enabled: false,
         };
 
         // A remote node advertises the SAME robot_id with its own camera id.

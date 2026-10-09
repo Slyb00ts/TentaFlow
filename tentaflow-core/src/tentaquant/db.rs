@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::kata::{Progress, Standing};
 use crate::addon::app_db;
 use crate::db::DbPool;
 
@@ -32,12 +33,12 @@ pub const PACKAGE_ID: &str = "tentaquant";
 ///
 /// Step 1 creates exactly ten tables: `user_settings`, `projects`,
 /// `project_shares`, `files`, `notebooks`, `notebook_versions`, `cell_outputs`,
-/// `runs`, `kata_progress` and `settings`. All but two are written here:
+/// `runs`, `kata_progress` and `settings`. All but one are written here:
 /// `runs` and `cell_outputs` carry the T1 execution tier — one row per run, one
-/// row per mime bundle it produced (plan §9.2, §4.3). `user_settings` and
-/// `kata_progress` are created unwritten: they complete the per-user shape the
-/// written tables already belong to, so the phase that starts filling them adds
-/// rows rather than a schema.
+/// row per mime bundle it produced (plan §9.2, §4.3), and `kata_progress` holds
+/// the course. `user_settings` is created unwritten: it completes the per-user
+/// shape the written tables already belong to, so the phase that starts filling
+/// it adds rows rather than a schema.
 ///
 /// A whole SUBSYSTEM, by contrast, stays out until the phase that owns it:
 /// providers, QPU budgets, ledgers, approvals, examples and kernel sessions get
@@ -1493,6 +1494,107 @@ pub fn cell_outputs(pool: &DbPool, run_id: &str) -> Result<Vec<CellOutputRecord>
     Ok(out)
 }
 
+// =============================================================================
+// Course progress
+// =============================================================================
+
+const KATA_PASSED: &str = "passed";
+const KATA_ATTEMPTED: &str = "attempted";
+
+fn progress_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Progress)> {
+    Ok((
+        row.get(0)?,
+        Progress {
+            passed: row.get::<_, String>(1)? == KATA_PASSED,
+            attempts: row.get(2)?,
+            best_score: row.get(3)?,
+            points: row.get(4)?,
+        },
+    ))
+}
+
+/// Every kata row of one person, by kata id.
+pub fn kata_progress(pool: &DbPool, user_id: &str) -> Result<HashMap<String, Progress>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT kata_id, status, attempts, best_score, points \
+             FROM kata_progress WHERE user_id = ?1",
+        )
+        .map_err(read_err)?;
+    let rows = stmt
+        .query_map(params![user_id], progress_row)
+        .map_err(read_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(read_err)?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Reads one person's row of one kata, lets `decide` turn it into the next one
+/// and stores the result — all under the writer, so two submissions of the same
+/// person cannot both see "not passed yet" and both be paid for the first pass.
+/// Returns what `decide` returned.
+pub fn update_kata_progress<T>(
+    pool: &DbPool,
+    user_id: &str,
+    kata_id: &str,
+    decide: impl FnOnce(Option<&Progress>) -> (Progress, T),
+) -> Result<(Progress, T)> {
+    let conn = pool.write().map_err(write_err)?;
+    let previous = conn
+        .query_row(
+            "SELECT kata_id, status, attempts, best_score, points \
+             FROM kata_progress WHERE user_id = ?1 AND kata_id = ?2",
+            params![user_id, kata_id],
+            progress_row,
+        )
+        .optional()
+        .map_err(write_err)?
+        .map(|(_, row)| row);
+    let (next, extra) = decide(previous.as_ref());
+    conn.execute(
+        "INSERT INTO kata_progress (user_id, kata_id, status, attempts, best_score, points, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) \
+         ON CONFLICT(user_id, kata_id) DO UPDATE SET \
+            status = excluded.status, attempts = excluded.attempts, \
+            best_score = excluded.best_score, points = excluded.points, \
+            updated_at = excluded.updated_at",
+        params![
+            user_id,
+            kata_id,
+            if next.passed { KATA_PASSED } else { KATA_ATTEMPTED },
+            next.attempts,
+            next.best_score,
+            next.points,
+        ],
+    )
+    .map_err(write_err)?;
+    Ok((next, extra))
+}
+
+/// The totals of everybody with a kata row, the input of the ranking.
+pub fn kata_standings(pool: &DbPool) -> Result<Vec<Standing>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT user_id, COALESCE(SUM(status = 'passed'), 0), COALESCE(SUM(points), 0) \
+             FROM kata_progress GROUP BY user_id",
+        )
+        .map_err(read_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Standing {
+                user_id: row.get(0)?,
+                katas_passed: row.get(1)?,
+                points: row.get(2)?,
+            })
+        })
+        .map_err(read_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(read_err)?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1762,5 +1864,56 @@ mod tests {
         delete_project(&db, &project).unwrap();
         assert!(run_row(&db, &run.id).unwrap().is_none());
         assert!(cell_outputs(&db, &run.id).unwrap().is_empty());
+    }
+
+    /// The store keeps what `kata::record` decided: one row per person and
+    /// kata, attempts counting up, the pass sticky and the points paid once.
+    #[test]
+    fn kata_progress_is_one_row_per_person_and_kata() {
+        use crate::tentaquant::kata::{catalog, grade, record};
+
+        let db = pool();
+        let kata = catalog().kata("01-superposition-h").expect("kata");
+        let failed = grade(kata, &kata.starter);
+        let passed = grade(kata, &kata.solution);
+
+        assert!(kata_progress(&db, "anna").unwrap().is_empty());
+        let (row, awarded) =
+            update_kata_progress(&db, "anna", &kata.id, |old| record(old, kata, &failed)).unwrap();
+        assert!(!row.passed);
+        assert_eq!((row.attempts, awarded), (1, 0));
+
+        let (row, awarded) =
+            update_kata_progress(&db, "anna", &kata.id, |old| record(old, kata, &passed)).unwrap();
+        assert!(row.passed);
+        assert_eq!((row.attempts, awarded), (2, kata.points));
+
+        let (row, awarded) =
+            update_kata_progress(&db, "anna", &kata.id, |old| record(old, kata, &passed)).unwrap();
+        assert_eq!((row.attempts, row.points, awarded), (3, kata.points, 0));
+
+        let stored = kata_progress(&db, "anna").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[&kata.id], row);
+        assert!(kata_progress(&db, "marek").unwrap().is_empty());
+
+        update_kata_progress(&db, "marek", &kata.id, |old| record(old, kata, &failed)).unwrap();
+        let mut standings = kata_standings(&db).unwrap();
+        standings.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        assert_eq!(
+            standings,
+            vec![
+                Standing {
+                    user_id: "anna".into(),
+                    katas_passed: 1,
+                    points: kata.points
+                },
+                Standing {
+                    user_id: "marek".into(),
+                    katas_passed: 0,
+                    points: 0
+                },
+            ]
+        );
     }
 }

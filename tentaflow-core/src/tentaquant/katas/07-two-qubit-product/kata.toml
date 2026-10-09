@@ -1,0 +1,11 @@
+id = "07-two-qubit-product"
+points = 80
+tier = "T0"
+
+[title]
+pl = "Dwa kubity: iloczyn tensorowy"
+en = "Two qubits: the tensor product"
+
+[summary]
+pl = "stany 00, 01, 10, 11"
+en = "the states 00, 01, 10, 11"

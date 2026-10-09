@@ -205,6 +205,42 @@ test('step 1: an optional description, too long stops Dalej, and it reaches the 
   assert.equal(sent[0].options.description, 'Wyniki z pracowni RTG');
 });
 
+test('"Anuluj", the close button and Escape ask once before dropping a changed draft; an untouched window leaves at once', async () => {
+  const later = () => new Promise((r) => setTimeout(r, 300));
+  const untouched = open().win;
+  untouched.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(untouched.isConnected, false, 'nothing typed, nothing to ask');
+
+  const { win } = open();
+  typeName(win, 'wyniki-z-pracowni');
+  win.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(win.isConnected, true, 'the first click only asks');
+  const asked = win.querySelector('[data-role="discard"]');
+  assert.equal(asked.hidden, false);
+  assert.match(asked.textContent, /Zamknij okno jeszcze raz/);
+  // Typing on withdraws the question; the next close asks again.
+  typeName(win, 'wyniki-z-pracowni-2');
+  assert.equal(win.querySelector('[data-role="discard"]').hidden, true);
+  win.close();
+  await later();
+  assert.equal(win.isConnected, true, 'the close button asks too');
+  win.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(win.isConnected, false, 'the second one closes');
+
+  // A later step is work too, even with the name unchanged.
+  const stepped = open().win;
+  typeName(stepped, 'nowy');
+  nextBtn(stepped).click();
+  stepped.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(stepped.isConnected, true);
+  assert.equal(stepped.querySelector('[data-role="discard"]').hidden, false, 'and the question survives the redraw');
+  stepped.remove();
+});
+
 test('HL7 v2 with no fitting pattern: step 3 says the topic starts without one', () => {
   const { win } = open();
   typeName(win, 'nowy');

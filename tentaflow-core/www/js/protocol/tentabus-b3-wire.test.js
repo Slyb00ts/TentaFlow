@@ -7,7 +7,11 @@
 //       - `SubjectDirectoryResponse` / `FieldPolicyPreviewResponse` decode to
 //         the objects the access and data-hiding windows read, including an
 //         answer without the `#[serde(default)]` fields;
-//       - an addon row of `AclListResponse` keeps its own subject type.
+//       - an addon row of `AclListResponse` keeps its own subject type;
+//       - U6 Dostęp: `AclSetRequest` carries one right of one subject, and
+//         `CapabilitiesResponse` hands over the caller's organisation (the
+//         middle part of a topic right's id and the REST address's `org_id`),
+//         empty on an answer that predates it.
 // =============================================================================
 
 import { test } from 'node:test';
@@ -223,4 +227,41 @@ test('an addon row of the access list keeps its own subject type and label', { s
   assert.equal(body.entries[0].subjectType, 'addon');
   assert.equal(body.entries[0].subjectLabel, 'Asystent lekarza');
   assert.equal(body.entries[0].memberCount, null);
+});
+
+test('an access entry request names one right of one subject', { skip }, () => {
+  const sent = sentEnvelope('busAclSetRequest', { instanceId: INSTANCE, topic: 'wyniki', subjectType: 'addon', subjectId: 'asystent', accessLevel: 'deny', action: 'write' });
+  assert.deepEqual(sent.payload, { AclSetRequest: { topic: 'wyniki', subject_type: 'addon', subject_id: 'asystent', access_level: 'deny', action: 'write' } });
+});
+
+test('the capabilities answer carries the caller\'s organisation, empty when an older server sends none', { skip }, () => {
+  const base = { can_read: true, can_write: true, can_admin: true, is_site_admin: true, default_replication_factor: 1, node_count: 1, content_types: [], schema_types: [], field_actions: [] };
+  const body = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: { ...base, org_id: 'org-default', org_name: 'Przychodnia Zdrowie' } } } } });
+  assert.equal(body.capabilities.orgId, 'org-default');
+  assert.equal(body.capabilities.orgName, 'Przychodnia Zdrowie');
+  const older = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: base } } } });
+  assert.equal(older.capabilities.orgId, '');
+  assert.equal(older.capabilities.orgName, null);
+});
+
+test('consumer groups carry their key\'s name, or that the key is gone, and decode without both from an older server', { skip }, () => {
+  const stats = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { StatsSnapshotResponse: { snapshot: {
+    topic_count: 1, dlq_topic_count: 0, partition_count_total: 1, group_count: 2, paused_group_count: 0, total_msgs_in_per_sec: 0,
+    total_bytes_in_per_sec: 0, total_bytes_on_disk: 0, total_lag: 0, total_dlq_depth: 0, topics: [],
+    groups: [
+      { group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', lag_total: 3, paused: false, key_name: 'Portal', key_gone: false },
+      { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', lag_total: 3, paused: false, key_name: null, key_gone: true },
+      { group: 'lekarze', topic: 'wyniki', lag_total: 3, paused: false },
+    ],
+  } } } } });
+  assert.deepEqual(stats.groups.map((g) => [g.keyName, g.keyGone]), [['Portal', false], [null, true], [null, false]]);
+  const list = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupListResponse: { groups: [
+    { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, created_at_ms: 1, updated_at_ms: 2, key_gone: true },
+  ] } } } });
+  assert.equal(list.groups[0].keyGone, true);
+  const detail = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupDetailResponse: { detail: {
+    group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, partitions: [], key_name: 'Portal',
+  } } } } });
+  assert.equal(detail.detail.keyName, 'Portal');
+  assert.equal(detail.detail.keyGone, false);
 });

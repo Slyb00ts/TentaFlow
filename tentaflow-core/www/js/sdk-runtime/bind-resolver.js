@@ -55,6 +55,21 @@ export function resolveBindRef(bindRef, store) {
   return store.read(bindRef.path);
 }
 
+/// Marks an SDK re-emit of a bound form control as a user edit of `bindPath`
+/// with the event's `detail.value`, which already has the store shape for that
+/// path. The dispatcher writes it into the store before the action goes out,
+/// so the control never bounces back while the addon catches up.
+export function tagBoundEdit(event, bindPath) {
+  return tagBoundEdits(event, [[bindPath, event.detail.value]]);
+}
+
+/// `tagBoundEdit` for a control bound to several paths at once (a range with
+/// separate min/max or from/to paths): `edits` is `[[path, value], ...]`.
+export function tagBoundEdits(event, edits) {
+  event.__tfBoundEdits = edits.map(([path, value]) => ({ path, value }));
+  return event;
+}
+
 /// Subskrybuje zmiany pod `BindRef`. Dla Literal: zwraca no-op unsub
 /// (literal się nigdy nie zmienia). Dla Bound: deleguje do
 /// `store.subscribe(path, callback)`. Callback dostaje

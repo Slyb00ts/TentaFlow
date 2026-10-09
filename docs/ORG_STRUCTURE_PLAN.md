@@ -310,7 +310,7 @@ Zakończenie przypisania (`valid_to`) nie usuwa niczego, ale:
   (testerem albo lepiej przy pozycji testowej), właściciel projektu nie odchodzi bez wskazania
   następcy, managera usuwa tylko właściciel.
 - **Atomowość (uczciwie):** struktura i Project Studio to różne bazy, więc jedna transakcja jest
-  niemożliwa. Zapis przekazania (`org_handovers`/`org_handover_items`, migracja 180, lokalna dla
+  niemożliwa. Zapis przekazania (`org_handovers`/`org_handover_items`, migracja 182, lokalna dla
   węzła, bo opisuje niereplikowane bazy) powstaje PRZED pierwszym ruchem; wszystkie pozycje
   struktury idą w JEDNEJ transakcji organizacji razem ze stanem w zapisie (jedna odrzucona = żadna
   i nic dalej się nie zaczyna); elementy Project Studio idą po jednym, każdy jednym warunkowym

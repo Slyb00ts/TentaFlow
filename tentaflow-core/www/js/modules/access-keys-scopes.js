@@ -1,6 +1,7 @@
 // =============================================================================
 // File: modules/access-keys-scopes.js — scope ids for API-key grants that carry
-//       an action (the schema registry REST, "Wzory wiadomości")
+//       an action (the schema registry REST, "Wzory wiadomości", and a topic's
+//       messages)
 // =============================================================================
 // A `bus_schema_registry` grant is stored under the same composite id the REST
 // gate rebuilds from the request path and `?org_id=` (`sync::resource_id::
@@ -16,11 +17,24 @@ const SEP = '\u001f';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
-/** Composite scope id for one TentaBus instance and one organisation. */
-export function busSchemaScopeId(instanceId, orgId) {
-  return [instanceId, orgId]
+/** `sync::resource_id::composite_resource_id` of `parts`. */
+function compositeId(parts) {
+  return parts
     .map((part) => `${encoder.encode(part).length}${SEP}${part}`)
     .join('');
+}
+
+/** Composite scope id for one TentaBus instance and one organisation. */
+export function busSchemaScopeId(instanceId, orgId) {
+  return compositeId([instanceId, orgId]);
+}
+
+/**
+ * Composite id of one topic's rights (`bus_authorizer::topic_acl_resource_id`):
+ * the `topic` scope a general key reads or writes that topic's messages under.
+ */
+export function topicScopeId(instanceId, orgId, topic) {
+  return compositeId([instanceId, orgId, topic]);
 }
 
 /**

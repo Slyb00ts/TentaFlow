@@ -1240,10 +1240,13 @@ pub fn partition_dir(
 ///      by comparing against the OLD value, not by "was the field present
 ///      on the wire".
 ///   2. The subject's `schema_type` must match this topic's resolved
-///      `PayloadFormat`: `json_schema` only on `PayloadFormat::Json`.
-///      `avro`/`protobuf`/`thrift` bind on ANY format (no format resolves
-///      to them yet) but FORCE `cfg.validation` back to `Off` — silently,
-///      not rejected, so an integrator can stage a schema ahead of F4.
+///      `PayloadFormat` (`SchemaType::required_payload_format`):
+///      `json_schema` only on `Json`, `xsd` only on `Xml`,
+///      `hl7v2_profile` only on `Hl7V2`. `avro`/`protobuf`/`thrift` bind on
+///      ANY format (they carry their own encoding). Every kind without a
+///      validator FORCES `cfg.validation` back to `Off` — silently, not
+///      rejected, so an integrator can stage a schema ahead of its
+///      validator.
 ///   3. `validation != Off` requires a bound, non-empty `schema_id` whose
 ///      type actually has a validator in this build
 ///      (`SchemaType::has_validator`) — rejected otherwise. An explicit
@@ -1328,18 +1331,21 @@ fn apply_schema_binding_guard(
             ),
         })?;
     let format = PayloadFormat::from_content_type(&cfg.content_type);
-    if schema_type == SchemaType::JsonSchema && format != PayloadFormat::Json {
-        return Err(BusServiceError::InvalidTopicConfig {
-            reason: format!(
-                "schema subject '{subject_name}' is json_schema but this topic's content_type \
-                 resolves to {}",
-                format.as_str()
-            ),
-        });
+    if let Some(required) = schema_type.required_payload_format() {
+        if format != required {
+            return Err(BusServiceError::InvalidTopicConfig {
+                reason: format!(
+                    "schema subject '{subject_name}' is {} but this topic's content_type \
+                     resolves to {}",
+                    schema_type.as_str(),
+                    format.as_str()
+                ),
+            });
+        }
     }
     if !schema_type.has_validator() {
-        // avro/protobuf/thrift: binding is allowed, validation is not — but
-        // whether that is a silent downgrade or a hard rejection depends on
+        // avro/protobuf/thrift/xsd/hl7v2_profile: binding is allowed,
+        // validation is not — but whether that is a silent downgrade or a hard rejection depends on
         // WHAT this call actually asked for (review finding #5):
         //   - the call explicitly turned validation ON (or to any non-`Off`
         //     mode) for a type with no validator in this build: reject, the

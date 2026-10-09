@@ -59,6 +59,18 @@ struct Upstream {
 struct CvBundle {
     engine_id: &'static str,
     files: &'static [CvFile],
+    /// What the build must contain for the pipeline that runs these models.
+    runs_on: BundleHost,
+}
+
+#[derive(Clone, Copy)]
+enum BundleHost {
+    /// ORT + CUDA preprocessing on the NVDEC frame path (camera privacy probe).
+    GpuPrivacyPath,
+    /// The Burn GPU vision pipeline (camera analysis, depth).
+    GpuVision,
+    /// tract on the CPU — any build with cameras.
+    Cpu,
 }
 
 impl CvBundle {
@@ -108,9 +120,52 @@ const YUNET: CvFile = CvFile {
     }),
 };
 
+/// File names of the gesture models in `vision_models_dir()`.
+pub const MOVENET_FILE: &str = "movenet_singlepose_lightning.onnx";
+pub const PALM_DETECTION_FILE: &str = "palm_detection_mediapipe_2023feb.onnx";
+pub const HAND_LANDMARK_FILE: &str = "handpose_estimation_mediapipe_2023feb.onnx";
+
+/// MoveNet single-pose lightning (Google, Apache-2.0), ONNX export pinned to a
+/// commit: body keypoints that locate the hands for the gesture engine.
+const MOVENET: CvFile = CvFile {
+    name: MOVENET_FILE,
+    remote: true,
+    embedded: None,
+    ort_only: false,
+    upstream: Some(Upstream {
+        url: "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/ed0f314bb7356fd1dbf1e4f52c2d40791bf6534f/onnx/model.onnx",
+        sha256: "1ad4f8d6c2f776a9967db3993c9ca740bc350104f9d37c151dc183fc29a464ad",
+    }),
+};
+
+/// MediaPipe palm detector (OpenCV zoo, Apache-2.0).
+const PALM_DETECTION: CvFile = CvFile {
+    name: PALM_DETECTION_FILE,
+    remote: true,
+    embedded: None,
+    ort_only: false,
+    upstream: Some(Upstream {
+        url: "https://huggingface.co/opencv/palm_detection_mediapipe/resolve/233e619dcea1759bf6de707b9b904fe30881ea55/palm_detection_mediapipe_2023feb.onnx",
+        sha256: "78ff51c38496b7fc8b8ebdb6cc8c1abb02fa6c38427c6848254cdaba57fcce7c",
+    }),
+};
+
+/// MediaPipe hand landmarker, 21 keypoints (OpenCV zoo, Apache-2.0).
+const HAND_LANDMARK: CvFile = CvFile {
+    name: HAND_LANDMARK_FILE,
+    remote: true,
+    embedded: None,
+    ort_only: false,
+    upstream: Some(Upstream {
+        url: "https://huggingface.co/opencv/handpose_estimation_mediapipe/resolve/4b2a0b446e5cf2f11fb6b2c7251091c035d2c1f7/handpose_estimation_mediapipe_2023feb.onnx",
+        sha256: "db0898ae717b76b075d9bf563af315b29562e11f8df5027a1ef07b02bef6d81c",
+    }),
+};
+
 const BUNDLES: &[CvBundle] = &[
     CvBundle {
         engine_id: "rfdetr-adr",
+        runs_on: BundleHost::GpuVision,
         files: &[
             CvFile {
                 // Burn weights artifact (architecture is compiled in; only weights
@@ -145,6 +200,7 @@ const BUNDLES: &[CvBundle] = &[
     },
     CvBundle {
         engine_id: "nalepka-stan",
+        runs_on: BundleHost::GpuVision,
         files: &[
             CvFile {
                 name: "model_stan.bpk",
@@ -180,6 +236,7 @@ const BUNDLES: &[CvBundle] = &[
     },
     CvBundle {
         engine_id: "plate-ocr",
+        runs_on: BundleHost::GpuVision,
         files: &[
             CvFile {
                 name: "plate_ocr.bpk",
@@ -230,6 +287,7 @@ const BUNDLES: &[CvBundle] = &[
         // this file into `vision_models_dir()` and registers the service for mesh
         // discovery. Host the .bpk at the release URL.
         engine_id: "depth-native",
+        runs_on: BundleHost::GpuVision,
         files: &[CvFile {
             name: "depth-anything-v2-metric.bpk",
             remote: true,
@@ -244,9 +302,33 @@ const BUNDLES: &[CvBundle] = &[
         // third-party releases pinned by sha256, so the bundle needs no release
         // URL of ours.
         engine_id: "privacy-cv",
+        runs_on: BundleHost::GpuPrivacyPath,
         files: &[YOLOX_TINY, YUNET],
     },
+    CvBundle {
+        // Gesture recognition on robot cameras: body pose locates the hands, the
+        // palm detector + landmarker read the fingers. All three are third-party
+        // releases pinned by sha256 and run on tract (CPU), so no ORT build gate.
+        engine_id: "gesture-cv",
+        runs_on: BundleHost::Cpu,
+        files: &[MOVENET, PALM_DETECTION, HAND_LANDMARK],
+    },
 ];
+
+/// True when this build can run the pipeline that uses `engine_id`'s models —
+/// only then is installing them any use. `false` for a non camera-CV engine.
+pub fn bundle_runs_on_this_host(engine_id: &str) -> bool {
+    bundle(engine_id).is_some_and(|b| match b.runs_on {
+        BundleHost::GpuPrivacyPath => cfg!(all(
+            any(target_os = "linux", target_os = "windows"),
+            feature = "inference-vision-gpu",
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
+        )),
+        BundleHost::GpuVision => cfg!(feature = "inference-vision-gpu"),
+        BundleHost::Cpu => cfg!(feature = "camera"),
+    })
+}
 
 /// True when `engine_id` is one of the camera-CV pipeline services. Lets the
 /// vision deploy path route these away from the tract `LoadedEngine` registry.

@@ -1,0 +1,12 @@
+# The course in its fixed order. A group opens when every kata of the group
+# before it is passed; `katas` is the order inside it.
+
+[[group]]
+id = "basics"
+title = { pl = "Podstawy: kubit i bramki", en = "Basics: the qubit and its gates" }
+katas = ["01-superposition-h", "02-x-gate", "03-rotations", "04-bloch-sphere", "05-phase-gates", "06-x-basis-measurement"]
+
+[[group]]
+id = "entanglement"
+title = { pl = "Splątanie", en = "Entanglement" }
+katas = ["07-two-qubit-product", "08-cnot", "09-cz-from-cnot", "10-bell-state"]

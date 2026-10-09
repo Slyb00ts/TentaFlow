@@ -19,7 +19,7 @@ pub(crate) struct TableSpec {
     pub kind: Kind,
     pub table: &'static str,
     pub pk: &'static str,
-    /// Every column in the table, primary key included. Must match migrations 178 and 179.
+    /// Every column in the table, primary key included. Must match migrations 180 and 181.
     pub columns: &'static [&'static str],
 }
 

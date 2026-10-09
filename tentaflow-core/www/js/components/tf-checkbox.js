@@ -1,18 +1,21 @@
 // =============================================================================
 // File: tf-checkbox.js
 // Description: <tf-checkbox> — styled checkbox with checked, indeterminate and
-//              disabled states. Emits 'change' with detail.checked.
+//              disabled states and an optional second line (`description`)
+//              under the label. Emits 'change' with detail.checked.
 // Example: <tf-checkbox label="Accept terms" checked></tf-checkbox>
+//          <tf-checkbox label="Reads messages" description="Fetches the messages of this topic."></tf-checkbox>
 // =============================================================================
 
 class TfCheckbox extends HTMLElement {
-  static get observedAttributes() { return ['checked', 'label', 'disabled', 'indeterminate']; }
+  static get observedAttributes() { return ['checked', 'label', 'description', 'disabled', 'indeterminate']; }
 
   constructor() {
     super();
     this._root = null;
     this._input = null;
     this._textEl = null;
+    this._descEl = null;
     this._onClick = this._onClick.bind(this);
     this._onKey = this._onKey.bind(this);
   }
@@ -50,15 +53,22 @@ class TfCheckbox extends HTMLElement {
     input.setAttribute('role', 'checkbox');
     input.setAttribute('tabindex', '0');
 
+    const body = document.createElement('span');
+    body.className = 'tf-checkbox-body';
     const text = document.createElement('span');
     text.className = 'tf-checkbox-text';
+    const desc = document.createElement('span');
+    desc.className = 'tf-checkbox-desc';
+    body.appendChild(text);
+    body.appendChild(desc);
 
     label.appendChild(input);
-    label.appendChild(text);
+    label.appendChild(body);
     this.appendChild(label);
     this._root = label;
     this._input = input;
     this._textEl = text;
+    this._descEl = desc;
   }
 
   _update() {
@@ -68,6 +78,10 @@ class TfCheckbox extends HTMLElement {
     const indeterminate = this.hasAttribute('indeterminate');
 
     this._textEl.textContent = labelText;
+    const description = this.getAttribute('description') || '';
+    this._descEl.textContent = description;
+    this._descEl.hidden = !description;
+    this._root.classList.toggle('has-desc', Boolean(description));
     this._input.classList.toggle('checked', checked && !indeterminate);
     this._input.classList.toggle('indeterminate', indeterminate);
     this._root.classList.toggle('disabled', disabled);

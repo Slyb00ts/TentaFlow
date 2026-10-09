@@ -24,7 +24,8 @@ use tentaflow_protocol::{
         AddonAccessDecisionRequest, AddonAccessListRequest, AddonAdminOnlySetRequest,
         AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest, AddonDocumentPayload,
         AddonDocumentUploadChunkRequest, AddonInstallRequest, AddonInstanceDuplicateRequest,
-        AddonInstanceInstallRequest, AddonInstancePayload, AddonInstanceUpdateRequest,
+        AddonInstanceInstallRequest, AddonInstanceInstallStepRequest, AddonInstancePayload,
+        AddonInstanceUpdateRequest,
         AddonInstanceVersionsRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
@@ -1311,6 +1312,44 @@ pub fn encode_addon_instance_update_request(
     ))
 }
 
+/// MessageBody::AddonInstanceBody(ReqInstallStep) — runs one app step of an
+/// installed instance. `values` is a JS `Array<[fieldId, value]>`.
+#[wasm_bindgen(js_name = encodeAddonInstanceInstallStepRequest)]
+pub fn encode_addon_instance_install_step_request(
+    addon_id: String,
+    step_id: String,
+    values: JsValue,
+) -> Result<Vec<u8>, JsError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if !values.is_undefined() && !values.is_null() {
+        let arr: js_sys::Array = values
+            .dyn_into()
+            .map_err(|_| JsError::new("values must be Array<[fieldId, value]>"))?;
+        for i in 0..arr.length() {
+            let pair: js_sys::Array = arr
+                .get(i)
+                .dyn_into()
+                .map_err(|_| JsError::new("values element must be [fieldId, value]"))?;
+            let key = pair
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsError::new("field id must be a string"))?;
+            let value = pair
+                .get(1)
+                .as_string()
+                .ok_or_else(|| JsError::new("field value must be a string"))?;
+            pairs.push((key, value));
+        }
+    }
+    encode_addon_instance(AddonInstancePayload::ReqInstallStep(
+        AddonInstanceInstallStepRequest {
+            addon_id,
+            step_id,
+            values: pairs,
+        },
+    ))
+}
+
 /// MessageBody::AddonStorageBody(StatsRequest) — statystyki storage addona.
 #[wasm_bindgen(js_name = encodeAddonStorageStatsRequest)]
 pub fn encode_addon_storage_stats_request(addon_id: String) -> Result<Vec<u8>, JsError> {
@@ -2461,8 +2500,11 @@ pub fn encode_bus_field_policy_list_request(
 }
 
 /// `direction` is 'write' | 'read'; `required_fields` must be a subset of
-/// `fields` (validated server-side).
+/// `fields` (validated server-side). `expected_updated_at_ms` is the
+/// `updated_at_ms` of the rule being changed, `expect_absent` marks an add;
+/// both unset writes unconditionally.
 #[wasm_bindgen(js_name = encodeBusFieldPolicySetRequest)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_bus_field_policy_set_request(
     instance_id: String,
     topic: String,
@@ -2471,6 +2513,8 @@ pub fn encode_bus_field_policy_set_request(
     direction: String,
     fields: Vec<String>,
     required_fields: Vec<String>,
+    expected_updated_at_ms: Option<i64>,
+    expect_absent: bool,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2481,6 +2525,8 @@ pub fn encode_bus_field_policy_set_request(
             direction,
             fields,
             required_fields,
+            expected_updated_at_ms,
+            expect_absent,
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -2526,7 +2572,8 @@ pub fn encode_bus_field_policy_preview_request(
     .map_err(|e| JsError::new(&e))
 }
 
-/// `direction` is 'write' | 'read'.
+/// `direction` is 'write' | 'read'. `expected_updated_at_ms` is the
+/// `updated_at_ms` of the rule being removed; unset deletes unconditionally.
 #[wasm_bindgen(js_name = encodeBusFieldPolicyDeleteRequest)]
 pub fn encode_bus_field_policy_delete_request(
     instance_id: String,
@@ -2534,6 +2581,7 @@ pub fn encode_bus_field_policy_delete_request(
     subject_type: String,
     subject_id: String,
     direction: String,
+    expected_updated_at_ms: Option<i64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
@@ -2542,6 +2590,7 @@ pub fn encode_bus_field_policy_delete_request(
             subject_type,
             subject_id,
             direction,
+            expected_updated_at_ms,
         },
     }))
     .map_err(|e| JsError::new(&e))
@@ -7552,6 +7601,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         if let Some(provider) = pkg.cloud_account_provider {
                             set(&item, "cloudAccountProvider", provider.into());
                         }
+                        let steps = js_sys::Array::new();
+                        for step in pkg.install_steps {
+                            let sv = js_sys::Object::new();
+                            set(&sv, "id", step.id.into());
+                            set(&sv, "titleKey", step.title_key.into());
+                            if let Some(key) = step.description_key {
+                                set(&sv, "descriptionKey", key.into());
+                            }
+                            let fields = js_sys::Array::new();
+                            for field in step.fields {
+                                let fv = js_sys::Object::new();
+                                set(&fv, "id", field.id.into());
+                                set(&fv, "kind", field.kind.into());
+                                set(&fv, "labelKey", field.label_key.into());
+                                set(&fv, "required", field.required.into());
+                                if let Some(default) = field.default_value {
+                                    set(&fv, "defaultValue", default.into());
+                                }
+                                let options = js_sys::Array::new();
+                                for option in field.options {
+                                    let ov = js_sys::Object::new();
+                                    set(&ov, "value", option.value.into());
+                                    set(&ov, "labelKey", option.label_key.into());
+                                    options.push(&ov.into());
+                                }
+                                set(&fv, "options", options.into());
+                                fields.push(&fv.into());
+                            }
+                            set(&sv, "fields", fields.into());
+                            steps.push(&sv.into());
+                        }
+                        set(&item, "installSteps", steps.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());
@@ -7594,6 +7675,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     if let Some(e) = r.error {
                         set(&obj, "error", e.into());
                     }
+                }
+                AP::ReqInstallStep(_) => {
+                    set(&obj, "variant", "AddonInstanceInstallStepRequest".into());
+                }
+                AP::ResInstallStep(r) => {
+                    set(&obj, "variant", "AddonInstanceInstallStepResponse".into());
+                    let status = match r.status {
+                        tentaflow_protocol::AddonInstallStepStatus::Ok => "ok",
+                        tentaflow_protocol::AddonInstallStepStatus::Warning => "warning",
+                        tentaflow_protocol::AddonInstallStepStatus::Failed => "failed",
+                    };
+                    set(&obj, "status", status.into());
+                    set(&obj, "message", r.message.into());
+                    let details = js_sys::Array::new();
+                    for (name, value) in r.details {
+                        let dv = js_sys::Object::new();
+                        set(&dv, "name", name.into());
+                        set(&dv, "value", value.into());
+                        details.push(&dv.into());
+                    }
+                    set(&obj, "details", details.into());
                 }
             }
         }
@@ -10687,6 +10789,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 // Klient renderuje jako badge opóźnienia.
                 set(&obj, "proc_ms", (frame.proc_ms as f64).into());
                 set(&obj, "procMs", (frame.proc_ms as f64).into());
+                // "" = object detections, "pose" = gesture engine (body + hands).
+                set(&obj, "source", frame.source.into());
                 let items = js_sys::Array::new();
                 for det in frame.items {
                     let item = js_sys::Object::new();
@@ -10711,6 +10815,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "track_id", (det.track_id as f64).into());
                     set(&item, "vx", (det.vx as f64).into());
                     set(&item, "vy", (det.vy as f64).into());
+                    // Flat [x0, y0, s0, x1, y1, s1, …], normalized 0..1.
+                    let keypoints = js_sys::Float32Array::new_with_length((det.keypoints.len() * 3) as u32);
+                    for (i, k) in det.keypoints.iter().enumerate() {
+                        for (j, v) in k.iter().enumerate() {
+                            keypoints.set_index((i * 3 + j) as u32, *v);
+                        }
+                    }
+                    set(&item, "keypoints", keypoints.into());
                     items.push(&item.into());
                 }
                 set(&obj, "items", items.into());
@@ -11746,6 +11858,13 @@ fn bus_group_stats_to_js(g: &tentaflow_protocol::BusGroupStatsWire) -> JsValue {
         "consume_rate_per_min",
         opt_f64_to_js(g.consume_rate_per_min.map(|v| v as f64)),
     );
+    set_bus(
+        &o,
+        "keyName",
+        "key_name",
+        g.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set_bus(&o, "keyGone", "key_gone", g.key_gone.into());
     o.into()
 }
 
@@ -12054,6 +12173,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                     opt_f64_to_js(g.lag_total.map(|v| v as f64)),
                 );
                 set_bus(&o, "canAdmin", "can_admin", g.can_admin.into());
+                set_bus(
+                    &o,
+                    "keyName",
+                    "key_name",
+                    g.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
+                set_bus(&o, "keyGone", "key_gone", g.key_gone.into());
                 arr.push(&o);
             }
             set(obj, "groups", arr.into());
@@ -12077,6 +12203,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 parr.push(&po);
             }
             set(&o, "partitions", parr.into());
+            set_bus(
+                &o,
+                "keyName",
+                "key_name",
+                detail.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+            );
+            set_bus(&o, "keyGone", "key_gone", detail.key_gone.into());
             set(obj, "detail", o.into());
         }
         BP::GroupPauseRequest { .. } => set(obj, "variant", "BusGroupPauseRequest".into()),
@@ -12299,6 +12432,16 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 "fieldActions",
                 "field_actions",
                 string_vec_to_js(capabilities.field_actions).into(),
+            );
+            set_bus(&o, "orgId", "org_id", capabilities.org_id.into());
+            set_bus(
+                &o,
+                "orgName",
+                "org_name",
+                capabilities
+                    .org_name
+                    .map(JsValue::from)
+                    .unwrap_or(JsValue::NULL),
             );
             set(obj, "capabilities", o.into());
         }
@@ -13236,6 +13379,8 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
         Some(t) => set(&obj, "telemetry", robot_telemetry_to_js(t)),
         None => set(&obj, "telemetry", JsValue::NULL),
     }
+    set(&obj, "gesturesEnabled", r.gestures_enabled.into());
+    set(&obj, "gestures_enabled", r.gestures_enabled.into());
     obj
 }
 
@@ -25681,6 +25826,48 @@ pub fn encode_tentaquant_target_list_request(request_json: String) -> Result<Vec
 #[wasm_bindgen(js_name = encodeTentaQuantTargetResolveRequest)]
 pub fn encode_tentaquant_target_resolve_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentaquant_json_request("TargetResolveRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataListRequest) — the course in its fixed order with the caller's progress.
+#[wasm_bindgen(js_name = encodeTentaQuantKataListRequest)]
+pub fn encode_tentaquant_kata_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataGetRequest) — one kata with its task text and starter code.
+#[wasm_bindgen(js_name = encodeTentaQuantKataGetRequest)]
+pub fn encode_tentaquant_kata_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataSubmitRequest) — grades one OpenQASM 3 answer in Core.
+#[wasm_bindgen(js_name = encodeTentaQuantKataSubmitRequest)]
+pub fn encode_tentaquant_kata_submit_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataSubmitRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(KataRankingRequest) — the course ranking: top five plus the caller's own place.
+#[wasm_bindgen(js_name = encodeTentaQuantKataRankingRequest)]
+pub fn encode_tentaquant_kata_ranking_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("KataRankingRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ExampleListRequest) — the shipped examples in their fixed order.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleListRequest)]
+pub fn encode_tentaquant_example_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ExampleGetRequest) — one example with its README, circuit and reference outcome at a width.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleGetRequest)]
+pub fn encode_tentaquant_example_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ExampleForkRequest) — copies an example into a new private project of the caller's.
+#[wasm_bindgen(js_name = encodeTentaQuantExampleForkRequest)]
+pub fn encode_tentaquant_example_fork_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ExampleForkRequest", &request_json)
 }
 
 // TentaVM — the virtualization app (`MessageBody::TentaVmBody`). Every request

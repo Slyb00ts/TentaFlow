@@ -1,8 +1,8 @@
 // =============================================================================
 // File: lib.rs — browser WebGPU/WebGL voxel / occupancy-grid SLAM viewer
 // Live 3D view of a robot's LiDAR cloud (~30-47k points/frame) drawn as instanced
-// voxel cubes (Z-up) colored by horizontal radial distance from the robot (magenta
-// near -> green at the edges), each cube outlined with a dark Minecraft-style edge,
+// voxel cubes (Z-up) colored by horizontal radial distance from the robot (red
+// near -> blue at the edges; the camera-depth overlay uses the same ramp), each cube outlined with a dark Minecraft-style edge,
 // on top of a wireframe ground grid, with a small robot marker placed at the robot's
 // world pose and mouse orbit/zoom.
 //
@@ -112,10 +112,6 @@ struct Uniforms {
     // Rendered cube edge length in meters (voxel pitch * fill factor).
     voxel_size: f32,
     _pad: [f32; 3],
-    // Overlay mode + fixed color: `[mode, r, g, b]`. mode>0.5 makes the vertex
-    // shader use the fixed RGB instead of the radial colormap, so a second cloud
-    // (camera depth) renders in one distinct colour over the lidar map.
-    overlay: [f32; 4],
 }
 
 // Uniform for the robot marker: a world-space model transform applied on top of
@@ -165,18 +161,12 @@ const CUBE_INDICES: [u16; 36] = [
     1, 5, 6, 6, 2, 1, // +X
 ];
 
-// Fixed colour for the overlay (camera-depth) cloud — bright magenta, which the
-// lidar map's red→blue radial colormap never reaches, so the two layers never
-// blend into the same hue.
-const OVERLAY_COLOR: [f32; 3] = [1.0, 0.0, 1.0];
-
 const SHADER_SRC: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
     heatmap_origin: vec3<f32>,
     inv_heatmap_range: f32,
     voxel_size: f32,
-    overlay: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -221,18 +211,12 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = in.translation + in.position * u.voxel_size;
     out.clip_position = u.view_proj * vec4<f32>(world, 1.0);
 
-    // Overlay cloud (camera depth) renders in one fixed colour so it reads as a
-    // distinct layer over the lidar map; the lidar map keeps the radial colormap.
-    if (u.overlay.x > 0.5) {
-        out.color = u.overlay.yzw;
-    } else {
-        // Color by HORIZONTAL RADIAL DISTANCE from the cloud center (X-Y only, Z
-        // ignored). heatmap_origin carries the cloud center; inv_heatmap_range =
-        // 1 / max horizontal radius so green reaches the outer edge.
-        let dxy = in.translation.xy - u.heatmap_origin.xy;
-        let t = length(dxy) * u.inv_heatmap_range;
-        out.color = radialcolor(t);
-    }
+    // Color by HORIZONTAL RADIAL DISTANCE from the robot (X-Y only, Z ignored).
+    // Every cloud (lidar map, live lidar, camera depth) shares this one ramp, so a
+    // colour means the same distance whichever sensor produced the voxel.
+    let dxy = in.translation.xy - u.heatmap_origin.xy;
+    let t = length(dxy) * u.inv_heatmap_range;
+    out.color = radialcolor(t);
     out.local_pos = in.position;
     out.world_pos = world;
     return out;
@@ -472,17 +456,18 @@ struct State {
     live_instance_capacity: u32,
     live_instance_count: u32,
 
-    // Overlay (camera-depth) cloud: its own uniform (fixed-colour mode) + instance
-    // buffer + cell set, drawn with the SAME pipeline as the map after it. Kept fully
-    // separate from `cells` so it never affects framing, the grid, or the colormap.
+    // Overlay (camera-depth) cloud: its own pipeline (LessEqual depth, so it stays
+    // visible where it coincides with the map) + instance buffer, drawn after the
+    // map with the same colormap. Kept separate from `cells`; it drives framing, the
+    // grid and the colour scale only while the lidar map is empty.
     overlay_pipeline: wgpu::RenderPipeline,
-    overlay_uniform_buffer: wgpu::Buffer,
-    overlay_bind_group: wgpu::BindGroup,
     overlay_instance_buffer: wgpu::Buffer,
     overlay_instance_capacity: u32,
     overlay_instance_count: u32,
-    overlay_cells: HashMap<(i32, i32, i32), Vec3>,
-    overlay_cell_order: VecDeque<(i32, i32, i32)>,
+    // Bounds of the current overlay cloud: the colour scale, grid and first framing
+    // follow them while the lidar map is empty.
+    overlay_min: Vec3,
+    overlay_max: Vec3,
 
     // Pipeline for colored solid geometry on ModelUniforms (box-marker fallback).
     colored_pipeline: wgpu::RenderPipeline,
@@ -614,22 +599,9 @@ impl State {
             inv_heatmap_range: 1.0 / self.heatmap_range.max(0.5),
             voxel_size: self.voxel_size * VOXEL_FILL_FACTOR,
             _pad: [0.0; 3],
-            overlay: [0.0; 4], // map cloud: radial colormap (mode off)
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-
-        // Overlay cloud (camera depth): same view, fixed magenta so it stands out
-        // against the lidar map's rainbow colormap.
-        let overlay_uniforms = Uniforms {
-            overlay: [1.0, OVERLAY_COLOR[0], OVERLAY_COLOR[1], OVERLAY_COLOR[2]],
-            ..uniforms
-        };
-        self.queue.write_buffer(
-            &self.overlay_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&overlay_uniforms),
-        );
 
         // World-space colored geometry (grid): identity model.
         let world = ModelUniforms {
@@ -768,11 +740,10 @@ impl State {
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.live_instance_count);
             }
 
-            // Overlay cloud (camera depth) on top, same pipeline + fixed-colour bind
-            // group, so it overlays the map in a single distinct hue for comparison.
+            // Overlay cloud (camera depth) on top, same radial colormap as the map.
             if self.overlay_instance_count > 0 {
                 pass.set_pipeline(&self.overlay_pipeline);
-                pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_vertex_buffer(1, self.overlay_instance_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -1290,14 +1261,15 @@ impl State {
         }
     }
 
-    /// Direct upload of the OVERLAY (camera-depth) cloud — no bounds/grid needed.
-    fn upload_overlay_direct(&mut self, points: &[f32], n: usize) {
+    /// Direct upload of the OVERLAY (camera-depth) cloud → returns its (min, max)
+    /// bounds, `None` when empty.
+    fn upload_overlay_direct(&mut self, points: &[f32], n: usize) -> Option<(Vec3, Vec3)> {
         let n = n.min(MAX_ACCUMULATED_CELLS);
-        self.overlay_cells.clear();
-        self.overlay_cell_order.clear();
+        self.overlay_min = Vec3::splat(f32::INFINITY);
+        self.overlay_max = Vec3::splat(f32::NEG_INFINITY);
         if n == 0 {
             self.overlay_instance_count = 0;
-            return;
+            return None;
         }
         Self::grow_buffer(
             &mut self.overlay_instance_buffer,
@@ -1312,6 +1284,27 @@ impl State {
             bytemuck::cast_slice(&points[..n * 3]),
         );
         self.overlay_instance_count = n as u32;
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for i in 0..n {
+            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+            if p.is_finite() {
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
+        }
+        self.overlay_min = mn;
+        self.overlay_max = mx;
+        if mn.is_finite() && mx.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    }
+
+    /// Whether the lidar map currently has any extent.
+    fn map_has_bounds(&self) -> bool {
+        self.accum_min.is_finite() && self.accum_max.is_finite()
     }
 
     // Recompute the radial colormap origin + adaptive range from the current robot
@@ -1319,10 +1312,19 @@ impl State {
     // accumulated cells. Called both when a new frame arrives and when the pose
     // advances on its own, so colors keep radiating from the live robot position.
     fn refresh_color_field(&mut self) {
-        if !self.accum_min.is_finite() || !self.accum_max.is_finite() {
+        // The lidar map sets the distance scale both clouds share, so a colour means
+        // the same distance in each. The camera cloud is replaced several times a
+        // second and its far tail is noisy, so it drives the scale only while the
+        // map is empty — otherwise the whole map would shimmer with each frame.
+        let (mn, mx) = if self.map_has_bounds() {
+            (self.accum_min, self.accum_max)
+        } else {
+            (self.overlay_min, self.overlay_max)
+        };
+        if !mn.is_finite() || !mx.is_finite() {
             return;
         }
-        let center = (self.accum_min + self.accum_max) * 0.5;
+        let center = (mn + mx) * 0.5;
         let color_origin = if self.robot_pose_set {
             self.robot_position
         } else {
@@ -1333,8 +1335,8 @@ impl State {
         // corners. Cheap and cell-free, so the direct scene-map upload (which keeps
         // no CPU cell copy) still gets a correct radial colormap span.
         let mut max_radius = 0.0f32;
-        for &x in &[self.accum_min.x, self.accum_max.x] {
-            for &y in &[self.accum_min.y, self.accum_max.y] {
+        for &x in &[mn.x, mx.x] {
+            for &y in &[mn.y, mx.y] {
                 let dx = x - color_origin.x;
                 let dy = y - color_origin.y;
                 let r = (dx * dx + dy * dy).sqrt();
@@ -1522,23 +1524,6 @@ pub async fn init_voxel_view(
         }],
     });
 
-    // Overlay uniform + bind group: same layout, separate buffer so the overlay
-    // (camera-depth) draw can use fixed-colour mode while the map draw stays radial.
-    let overlay_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("voxel-overlay-uniforms"),
-        size: std::mem::size_of::<Uniforms>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("voxel-overlay-bg"),
-        layout: &bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: overlay_uniform_buffer.as_entire_binding(),
-        }],
-    });
-
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel-pl"),
         bind_group_layouts: &[Some(&bind_group_layout)],
@@ -1602,7 +1587,7 @@ pub async fn init_voxel_view(
     // Overlay (camera-depth) pipeline: identical to the map pipeline but with a
     // LESS_EQUAL depth test. The overlay draws AFTER the map; when the camera cloud
     // is correctly calibrated it quantizes to the SAME voxel centers (equal depth),
-    // and a strict `Less` test would reject it — hiding the magenta exactly where
+    // and a strict `Less` test would reject it — hiding the overlay exactly where
     // alignment is good. `LessEqual` lets the overlay win at equal depth so it stays
     // visible on top.
     let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1943,13 +1928,11 @@ pub async fn init_voxel_view(
         instance_capacity,
         instance_count: 0,
         overlay_pipeline,
-        overlay_uniform_buffer,
-        overlay_bind_group,
         overlay_instance_buffer,
         overlay_instance_capacity,
         overlay_instance_count: 0,
-        overlay_cells: HashMap::new(),
-        overlay_cell_order: VecDeque::new(),
+        overlay_min: Vec3::splat(f32::INFINITY),
+        overlay_max: Vec3::splat(f32::NEG_INFINITY),
         colored_pipeline,
         line_pipeline,
         robot_pipeline,
@@ -2232,6 +2215,8 @@ impl VoxelView {
             None => {
                 st.grid_vertex_count = 0;
                 st.grid_bounds = None;
+                // The camera layer now owns the colour scale.
+                st.refresh_color_field();
             }
             Some((min, max)) => {
                 let center = (min + max) * 0.5;
@@ -2248,10 +2233,10 @@ impl VoxelView {
     }
 
     /// Replace the OVERLAY cloud (camera-depth `scene-depth:<id>` snapshot) — a
-    /// second cloud rendered in one fixed colour over the lidar map for side-by-side
-    /// calibration. Like `setMapPoints` it is authoritative-replace, but it never
-    /// touches the camera framing, grid, or colormap (those stay driven by the map).
-    /// An empty frame clears the overlay.
+    /// second cloud drawn over the lidar map with the same distance colormap. Like
+    /// `setMapPoints` it is authoritative-replace. The colour scale, grid and first
+    /// framing follow it only while the lidar map is empty, so the camera alone is
+    /// still a usable 3D view. An empty frame clears it.
     #[wasm_bindgen(js_name = setOverlayPoints)]
     pub fn set_overlay_points(&self, points: &[f32], count: u32) {
         let state = match self.state.as_ref() {
@@ -2261,7 +2246,25 @@ impl VoxelView {
         let mut st = state.borrow_mut();
         let usable = (count as usize).min(points.len() / 3);
         // FAST PATH: server-deduped depth voxels uploaded straight to the GPU.
-        st.upload_overlay_direct(points, usable);
+        let bounds = st.upload_overlay_direct(points, usable);
+        st.refresh_color_field();
+        if st.map_has_bounds() {
+            return;
+        }
+        match bounds {
+            None => {
+                st.grid_vertex_count = 0;
+                st.grid_bounds = None;
+            }
+            Some((min, max)) => {
+                st.update_grid(min, max);
+                if !st.framed {
+                    st.camera.target = (min + max) * 0.5;
+                    st.camera.distance = (max - min).length().max(0.5) * 1.2;
+                    st.framed = true;
+                }
+            }
+        }
     }
 
     /// Reconfigure the surface and depth buffer for a new backing size in

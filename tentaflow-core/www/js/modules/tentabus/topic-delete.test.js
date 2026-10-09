@@ -32,15 +32,18 @@ test('what goes with the topic, in the mockup\'s words', () => {
   assert.match(kept, /wzór wiadomości wynik-badania oraz klucze API/);
 });
 
-test('one consumer, no rules, no pattern; unknown counts are left out', () => {
+test('one consumer, no rules, no pattern; rules that could not be counted are said so, counts nobody asked for yet are left out', () => {
   const { lost, kept } = deleteImpact({ topic: { name: 'faktury', partitions: 2 }, stats: { dlqDepth: 0, totalBytesOnDisk: 0 }, consumers: ['system-rozliczen'], aclCount: 2, policyCount: null });
   assert.deepEqual(lost.map(norm), [
     '2 puste partycje',
     '2 wpisy dostępu osób, grup i addonów',
+    'Zasad ukrywania danych tego topiku nie udało się policzyć — jeśli jakieś ma, też zostaną usunięte.',
     'odbiorca system-rozliczen przestanie dostawać wiadomości',
-  ]);
+  ], 'null is a count that failed: not zero rules');
   assert.match(kept, /^Zostają: klucze API/);
-  assert.equal(deleteImpact({ topic, stats: null, aclCount: null, policyCount: null }).lost.length, 1);
+  assert.equal(deleteImpact({ topic, stats: null }).lost.length, 1, 'before the counts are asked for nothing is claimed about rules');
+  assert.equal(deleteImpact({ topic, stats: null, aclCount: null, policyCount: null }).lost.length, 2);
+  assert.equal(deleteImpact({ topic, stats: null, aclCount: 0, policyCount: 0 }).lost.length, 1, 'a count of zero is a count');
 });
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -84,6 +87,14 @@ test('the window: counts join after they load, the button waits for the exact na
   await tick();
   assert.equal(calls.removed, 1);
   assert.equal(calls.deleted, 1);
+});
+
+test('the window does not turn rules it could not count into "none": it says they could not be counted', async () => {
+  const { win } = open({ loadCounts: async () => ({ aclCount: 3, policyCount: null }) });
+  assert.doesNotMatch(win.querySelector('[data-role="impact"]').textContent, /nie udało się policzyć/, 'nothing is claimed while the counts load');
+  await tick();
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /Zasad ukrywania danych tego topiku nie udało się policzyć/);
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /3 wpisy dostępu/);
 });
 
 test('a refusal stays in the window with its reason', async () => {

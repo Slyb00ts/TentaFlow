@@ -460,3 +460,37 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
   .tb-title-buttons { justify-content: flex-start; }
   .tb-schema-text tf-code-editor { height: 300px; }
 }
+
+/* =============================================================================
+   U6 Dostęp (T09): a topic's entries and the keys of outside systems, and
+   the windows over them (grant, change, remove; issue, rights, revoke).
+   ============================================================================= */
+.tb-access-window .stack { display: flex; flex-direction: column; gap: 14px; }
+.tb-access-window .tb-window-error { margin-top: 0; }
+.tb-window .tb-rights { display: flex; flex-direction: column; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); }
+.tb-window .tb-right-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 14px; padding: 10px 12px; }
+.tb-window .tb-right-row + .tb-right-row { border-top: 1px solid var(--tf-border); }
+.tb-window .tb-right-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 13px; color: var(--tf-text); }
+.tb-window .tb-right-name span { font-size: 12px; color: var(--tf-text-3); }
+.tb-window .tb-key-rights { display: flex; flex-direction: column; gap: 12px; padding: 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); }
+.tb-window .tb-key-rights tf-checkbox { display: block; }
+.tb-window.tb-key-issued .mono { overflow-wrap: anywhere; word-break: break-all; }
+.tb-window.tb-key-issued .tb-tech .tb-will-happen { margin-top: 8px; }
+.tb-window .tb-key-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+@media (max-width: 767px) {
+  .tb-window .tb-right-row tf-segmented { width: 100%; }
+}
+
+/* =============================================================================
+   U7 Ukrywanie danych (T07): a topic's rules and the windows over them (add,
+   change, delete; "Podgląd, jak widzi…"). The field rows reuse the rights
+   rows of Dostęp.
+   ============================================================================= */
+.tb-hiding-window .tb-right-row[hidden] { display: none; }
+.tb-hiding-window [data-role="field-search"] { display: block; margin-bottom: 8px; }
+.tb-hiding-window .tb-pick-box, .tb-hiding-preview .tb-pick-box { display: flex; flex-direction: column; gap: 12px; }
+.tb-hiding-window tf-tag-input { display: block; }
+.tb-hiding-window .tb-field-error { color: var(--tf-danger); font-size: 12px; }
+.tb-hiding-preview [data-role="result"] { display: flex; flex-direction: column; gap: 14px; }
+.tb-hiding-preview .tb-preview-record-head { justify-content: space-between; }
+.tb-hiding-preview [data-role="applied"] { max-height: 220px; overflow-y: auto; }

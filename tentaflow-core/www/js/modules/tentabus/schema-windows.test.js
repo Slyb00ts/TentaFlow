@@ -279,7 +279,25 @@ test('"Nowa wersja": starts from the newest text, says the difference, is refuse
   closeAll();
   const reopened = openSchemaVersion({ instanceId: 'i', subject: wizyta, latestText: V1, draftText: next, register: async () => ({ version: 3, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: () => {} });
   assert.equal(reopened.querySelector('[data-role="text"]').value, next);
-  assert.match(reopened.querySelector('.tb-explain-box').textContent, /z poprzedniej próby/);
+  assert.match(reopened.querySelector('.tb-explain-box').textContent, /To tekst z poprzedniego otwarcia tego okna — nie został dodany jako wersja\./);
+});
+
+test('"Nowa wersja": the question before closing a changed draft says the text is kept, because it is', async () => {
+  closeAll();
+  const drafts = [];
+  const win = openSchemaVersion({ instanceId: 'i', subject: wizyta, latestText: V1, draftText: null, register: async () => ({ version: 3, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: (t) => drafts.push(t) });
+  const next = JSON.stringify({ ...JSON.parse(V1), title: 'inna' });
+  type(win.querySelector('[data-role="text"]'), next);
+  win.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(win.isConnected, true, 'the first close only asks');
+  const asked = norm(win.querySelector('[data-role="discard"]').textContent);
+  assert.match(asked, /Ta wersja nie jest jeszcze dodana\. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie\./);
+  assert.doesNotMatch(asked, /porzuc/, 'nothing is discarded');
+  win.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(win.isConnected, false);
+  assert.deepEqual(drafts, [next], 'and it is kept, as the question said');
 });
 
 test('"Nowa wersja": a new version and the same text again both close with the answer', async () => {
@@ -383,7 +401,7 @@ test('the note after "Dodaj wzór" says what the server did: a new pattern, a ve
   assert.match(addedNotice({ subject: 'wizyta', schemaType: 'json_schema', version: 3, deduplicated: true }).text, /\(wersja 3\) — nic się nie zmieniło/);
 });
 
-test('Escape on a changed draft asks once; "Anuluj" leaves without asking', async () => {
+test('Escape on a changed draft asks once; "Anuluj" asks too', async () => {
   closeAll();
   const open = () => openSchemaAdd({ instanceId: 'i', schemaTypes: ['json_schema'], existingNames: () => [], register: async () => ({}), describeError: String, onAdded: () => {} });
   const win = open();
@@ -403,6 +421,9 @@ test('Escape on a changed draft asks once; "Anuluj" leaves without asking', asyn
 
   const cancelled = open();
   type(cancelled.querySelector('[data-role="name"]'), 'skierowanie');
+  cancelled.querySelector('[data-act="cancel"]').click();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(cancelled.isConnected, true, '"Anuluj" asks like the close button');
   cancelled.querySelector('[data-act="cancel"]').click();
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(cancelled.isConnected, false);

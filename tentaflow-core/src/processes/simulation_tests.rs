@@ -2288,7 +2288,7 @@ fn simulation_databases_are_independent_page_copies_of_one_schema_template() {
                 .expect("migration ladder"),
         );
     }
-    assert!(versions[0] >= 197 && versions[0] == versions[1]);
+    assert!(versions[0] >= 199 && versions[0] == versions[1]);
     first
         .execute(
             "INSERT INTO organizations(org_id,name,slug,status,created_at) VALUES('org-copy','Copy','copy','active',datetime('now'))",

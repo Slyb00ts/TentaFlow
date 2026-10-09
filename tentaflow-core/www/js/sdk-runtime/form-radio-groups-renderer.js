@@ -10,7 +10,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
-import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { resolveBindRef, subscribeBindRef, tagBoundEdit } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
@@ -212,12 +212,13 @@ function bindGroupSelection(group, options, bindPath, ctx) {
     const rawVal = e.detail && e.detail.value;
     const opt = options.find((o) => String(o.value.value) === String(rawVal));
     if (!opt) return;
-    group.dispatchEvent(
+    group.dispatchEvent(tagBoundEdit(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
         detail: { value: opt.value.value, kind: opt.value.tag },
-      })
-    );
+      }),
+      bindPath
+    ));
   };
   group.addEventListener('change', onChange);
   ctx.registerCleanup(() => group.removeEventListener('change', onChange));
