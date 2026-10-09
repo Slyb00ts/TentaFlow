@@ -13,7 +13,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind } = await import('./schemas.js');
+const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind, schemaKindMismatchText } = await import('./schemas.js');
 
 const subjects = [
   { subject: 'wizyta', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 5, deprecatedAtMs: null, usedByTopics: ['wizyty'] },
@@ -118,4 +118,15 @@ test('the empty instance leads an administrator to "Dodaj wzór"; a note stays o
   assert.deepEqual(moves, [{ kind: 'add' }]);
   const noted = mount({ subjects, canAdmin: true, notice: { tone: 'success', title: 'Dodano wzór skierowanie', text: 'JSON Schema, wersja 1.' } });
   assert.equal(noted.body.querySelector('[data-role="notice"] tf-alert').getAttribute('title'), 'Dodano wzór skierowanie');
+});
+
+test('binding a pattern to a topic of another payload kind is refused in plain words', () => {
+  const server = "protocol error BadRequest: bus.invalid_topic_config: schema subject 'faktura' is xsd but this topic's content_type resolves to json";
+  assert.equal(schemaKindMismatchText(server), 'Wzór faktura jest dla treści XML, a ten topik przyjmuje treść JSON.');
+  assert.equal(
+    schemaKindMismatchText("bus.invalid_topic_config: schema subject 'wynik' is hl7v2_profile but this topic's content_type resolves to xml"),
+    'Wzór wynik jest dla treści HL7 v2, a ten topik przyjmuje treść XML.',
+  );
+  assert.equal(schemaKindMismatchText('bus.invalid_topic_config: partitions must be 1-256, got 999'), '');
+  assert.equal(schemaKindMismatchText(undefined), '');
 });

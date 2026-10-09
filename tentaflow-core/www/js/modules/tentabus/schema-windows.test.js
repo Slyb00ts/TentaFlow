@@ -20,7 +20,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
-  profileChanges, hl7DropOffer, dropRequired,
+  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
@@ -133,7 +133,7 @@ test('the refusal box: known reasons in words, an unknown one with the server\'s
   assert.equal(unknown.querySelector('details summary').textContent, 'Szczegóły techniczne');
   assert.equal(unknown.querySelector('details pre').textContent, 'a sentence nobody mapped');
   const invalid = box(new Error("protocol error BadRequest: bus.invalid_argument: schema: invalid schema: /properties: unknown type 'strin'"));
-  assert.match(norm(invalid.textContent), /nie jest poprawny wzór w formacie JSON Schema/);
+  assert.match(norm(invalid.textContent), /Serwer nie przyjął tekstu jako wzoru w formacie JSON Schema/);
   assert.match(invalid.querySelector('details pre').textContent, /unknown type 'strin'/);
   const withdrawn = box(new Error("protocol error BadRequest: bus.invalid_argument: subject 'wizyta' is deprecated; cannot register a new version"));
   assert.match(norm(withdrawn.textContent), /Wzór został wycofany/);
@@ -451,6 +451,8 @@ test('"Dodaj wzór" hands on what the server did when the name was taken meanwhi
 
 const PROFILE_V3 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
 const PROFILE_V4 = JSON.stringify({ required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5', 'OBX-8'] });
+// V4 as the one-click fix leaves it: the field is gone, a changed description stays.
+const PROFILE_V4_DESCRIBED = JSON.stringify({ description: 'Wynik badania, wersja robocza', ...JSON.parse(PROFILE_V4) });
 const wynik = { subject: 'wynik-badania', schemaType: 'hl7v2_profile', compatibility: 'backward', latestVersion: 3, deprecatedAtMs: null, usedByTopics: ['wyniki-badan'] };
 const BACKWARD_OBX8 = 'backward (the new profile requires more than the old one guarantees): fields [OBX-8] are not guaranteed';
 
@@ -488,7 +490,7 @@ test('what a refused profile can drop, and the text without it', () => {
   assert.deepEqual(hl7DropOffer(BACKWARD_OBX8), { segments: [], fields: ['OBX-8'], items: ['OBX-8'] });
   assert.deepEqual(
     hl7DropOffer('backward (the new profile requires more than the old one guarantees): segments [NTE, OBX] are not guaranteed; fields [OBX-8] are not guaranteed'),
-    { segments: ['NTE', 'OBX'], fields: ['OBX-8'], items: ['OBX-8', 'NTE'] },
+    { segments: ['NTE', 'OBX'], fields: ['OBX-8'], items: ['NTE', 'OBX-8'] },
     'a segment only a dropped field needs is not offered separately',
   );
   assert.equal(hl7DropOffer('forward (the old profile requires more than the new one guarantees): fields [PID-3] are not guaranteed'), null, 'the other direction has no one-click fix');
@@ -533,17 +535,19 @@ test('"Nowa wersja" of an HL7 profile: "Usuń OBX-8 i dodaj wersję" removes the
     onDraft: () => {},
   });
   const text = win.querySelector('[data-role="text"]');
-  type(text, PROFILE_V4);
+  type(text, PROFILE_V4_DESCRIBED);
   assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 3: nowe, wymagane pole „OBX-8”.');
   win.querySelector('[data-act="save"]').click();
   await tick();
   const button = win.querySelector('[data-act="drop-required"]');
   assert.ok(button, 'the refusal offers the fix');
   assert.equal(norm(button.textContent), 'Usuń OBX-8 i dodaj wersję');
+  assert.match(norm(win.querySelector('[data-role="error"]').textContent), /Opis wzoru zostanie bez zmian — popraw go, jeśli wspominał usunięte pola\./, 'the description is kept, and the window says so before the click');
   button.click();
   await tick();
   assert.equal(sent.length, 2);
-  assert.deepEqual(JSON.parse(sent[1]), JSON.parse(PROFILE_V3), 'the field is gone from the text that was sent');
+  assert.deepEqual(JSON.parse(sent[1]), JSON.parse(PROFILE_V4_DESCRIBED.replace('"OBX-5","OBX-8"', '"OBX-5"')), 'the field is gone from the text that was sent'
+);
   assert.deepEqual(added, [{ version: 4, deduplicated: false }]);
   closeAll();
 });
@@ -583,4 +587,181 @@ test('"Dodaj wzór" offers an XSD and an HL7 profile when the server validates t
   assert.equal(sent[0].schemaType, 'xsd');
   assert.equal(sent[0].schemaText, xsd);
   closeAll();
+});
+
+test('a refused HL7 profile names segments and fields apart, and the button lists them without a double "i"', () => {
+  const detail = 'backward (the new profile requires more than the old one guarantees): segments [NK1] are not guaranteed; fields [PV1-7] are not guaranteed';
+  const reason = incompatibilityReason({ mode: 'backward', detail, newText: PROFILE_V4 });
+  assert.equal(reason.reason, 'nowa wersja wymaga segmentu „NK1” i pola „PV1-7”, których stare wiadomości mogą nie mieć');
+  assert.equal(reason.fix, 'Usuń „NK1” z wymaganych segmentów i „PV1-7” z pól wymaganych albo zmień zgodność wzoru.');
+  assert.deepEqual(hl7DropOffer(detail).items, ['NK1', 'PV1-7']);
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err: incompatible('backward', detail), title: 'Nie dodano wersji 4.', compatibility: 'backward', schemaType: 'hl7v2_profile', newText: JSON.stringify({ required_segments: ['PID', 'NK1'], required_fields: ['PV1-7'] }), describeError: String, offerDrop: true });
+  assert.equal(norm(el.querySelector('[data-act="drop-required"]').textContent), 'Usuń NK1, PV1-7 i dodaj wersję');
+  // Several fields use the plural forms.
+  const many = incompatibilityReason({ mode: 'backward', detail: 'backward (the new profile requires more than the old one guarantees): fields [PV1-7, PV1-8] are not guaranteed', newText: PROFILE_V4 });
+  assert.equal(many.reason, 'nowa wersja wymaga pól „PV1-7” i „PV1-8”, których stare wiadomości mogą nie mieć');
+});
+
+test('when removing what the old messages lack brings back the newest version, no button is offered and the window says why', () => {
+  const err = incompatible('backward', BACKWARD_OBX8);
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 4.', compatibility: 'backward', schemaType: 'hl7v2_profile', newText: PROFILE_V4, describeError: String, offerDrop: true, latest: { version: 3, text: PROFILE_V3 } });
+  assert.equal(el.querySelector('[data-act="drop-required"]'), null, 'a button that adds nothing is not offered');
+  assert.match(norm(el.textContent), /Po usunięciu OBX-8 nowa wersja niczym nie różniłaby się od wersji 3, więc nie ma czego dodawać\. Zmień zgodność wzoru albo wprowadź inne zmiany\.$/);
+});
+
+test('an XSD new version refusal names the element that is newly required', () => {
+  const backward = 'backward: /faktura: the new schema requires element \'termin\' where the old schema may have child element \'pozycja\'';
+  const reason = incompatibilityReason({ mode: 'backward', detail: backward, newText: '<xs:schema/>' });
+  assert.equal(reason.reason, 'nowa wersja wymaga elementu „termin”, którego stare wiadomości mogą nie mieć');
+  assert.equal(reason.fix, 'Dodaj minOccurs="0" do elementu „termin” albo zmień zgodność wzoru.');
+  const early = incompatibilityReason({ mode: 'backward', detail: "backward: /faktura: the old schema accepts a sequence of child elements that ends where the new schema still requires element 'termin'", newText: '' });
+  assert.match(early.reason, /wymaga elementu „termin”/);
+  const several = incompatibilityReason({ mode: 'backward', detail: "backward: /faktura: the new schema requires one of the elements 'x', 'y' where the old schema may have child element 'z'", newText: '' });
+  assert.equal(several.reason, 'nowa wersja wymaga elementów „x” i „y”, których stare wiadomości mogą nie mieć');
+  const forward = incompatibilityReason({ mode: 'forward', detail: "forward: /faktura: the old schema requires element 'termin' where the new schema may have child element 'pozycja'", newText: '' });
+  assert.equal(forward.reason, 'nowa wersja nie gwarantuje elementu „termin”, którego wymagają stare programy');
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err: incompatible('backward', backward), title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'xsd', newText: '', describeError: String });
+  assert.equal(norm(el.textContent), 'Nie dodano wersji 3. Ten wzór ma zgodność „nowe programy przeczytają stare wiadomości”, a nowa wersja wymaga elementu „termin”, którego stare wiadomości mogą nie mieć. Dodaj minOccurs="0" do elementu „termin” albo zmień zgodność wzoru.');
+  assert.equal(el.querySelector('details'), null);
+});
+
+// The exact messages of the Rust parsers (hl7v2_profile.rs, payload_format/hl7v2.rs, xsd.rs);
+// `schema_error_phrases_are_stable` there pins the same strings.
+const refused = (schemaType, serverText) => {
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err: new Error(`protocol error BadRequest: bus.invalid_argument: schema: invalid schema: ${serverText}`), title: 'Nie dodano wzoru x.', compatibility: 'backward', schemaType, newText: '', describeError: String });
+  return { text: norm(el.querySelector('div').textContent), technical: el.querySelector('details pre')?.textContent };
+};
+
+test('a refused HL7 profile text says in plain words what is wrong, the server\'s sentence folded below', () => {
+  const cases = [
+    ["hl7: 'MSH-1' is the message's own field-separator/encoding-characters definition and can never be filtered", /„MSH-1” opisuje same znaki podziału wiadomości, więc nie może być wymagane\. Usuń „MSH-1” z pól wymaganych\./],
+    ["hl7: 'pid5' is not SEGMENT-N shaped (e.g. 'PID-5')", /„pid5” to nie adres pola\. Adres ma postać SEGMENT-numer, np\. PID-5\./],
+    ["hl7: '0' is not a valid positive field number", /Numer pola w adresie musi być liczbą od 1 do 999/],
+    ['hl7: field number \'1000\' exceeds the supported maximum of 999', /Numer pola w adresie musi być liczbą od 1 do 999/],
+    ["hl7: 'PACJENT' is not a valid 3-character segment id", /„PACJENT” to nie nazwa segmentu\. Nazwa segmentu ma trzy znaki/],
+    ["'pid' is not a valid 3-character segment id", /„pid” to nie nazwa segmentu/],
+    ['not a valid HL7 v2 profile: unknown field `required`, expected one of `description`, `required_segments`, `required_fields` at line 1 column 11', /W profilu nie ma klucza „required”\. Dozwolone są: description, required_segments i required_fields\./],
+    ["required_fields lists 'PID-3' more than once", /„PID-3” jest na liście wymaganych pól więcej niż raz\. Zostaw jedno wystąpienie\./],
+    ["required_segments lists 'PID' more than once", /na liście wymaganych segmentów/],
+    ['required_fields lists 513 entries, exceeding the 512-entry limit', /Lista ma za dużo pozycji — najwyżej 512\./],
+    ['description exceeds 1000 characters', /Opis jest za długi/],
+    ['not a valid HL7 v2 profile: invalid type: string "x", expected a sequence at line 1 column 20', /Tekst nie jest profilem HL7 v2\./],
+  ];
+  for (const [server, expected] of cases) {
+    const got = refused('hl7v2_profile', server);
+    assert.match(got.text, expected, server);
+    assert.match(got.text, /^Nie dodano wzoru x\. /);
+    assert.doesNotMatch(got.text, /nie jest poprawny wzór/, 'a refusal is not called an invalid pattern');
+    assert.ok(got.technical.includes(server), 'the server\'s sentence stays available');
+  }
+});
+
+test('a refused XSD says which construct or type is not supported, and that the XSD itself may be fine', () => {
+  const cases = [
+    ['xs:include: schema composition is not supported; put every declaration in one document', /Ten XSD jest poprawny, ale konstrukcja xs:include nie jest obsługiwana\. Wklej wszystkie deklaracje do jednego pliku\./],
+    ['xs:import: schema composition is not supported; put every declaration in one document', /xs:import nie jest obsługiwana/],
+    ['xs:any: wildcards are not supported; declare the allowed elements and attributes explicitly', /konstrukcja xs:any nie jest obsługiwana\. Wypisz jawnie elementy i atrybuty/],
+    ['xs:group: named groups are not supported; declare the content inline', /konstrukcja xs:group nie jest obsługiwana\. Zapisz zawartość grupy bezpośrednio w elemencie\./],
+    ['xs:key: identity constraints are not supported', /xs:key nie jest obsługiwana\. Usuń ograniczenia unikalności i kluczy\./],
+    ['xs:complexContent: type derivation (extension/restriction of complex types) is not supported', /xs:complexContent nie jest obsługiwana/],
+    ['xs:union: list and union simple types are not supported', /xs:union nie jest obsługiwana/],
+    ['xs:attribute: global attributes are not supported; declare attributes inside a complexType', /Zadeklaruj atrybut wewnątrz elementu/],
+    ['xs:notation: notations are not supported', /xs:notation nie jest obsługiwana/],
+    ['xs:foo: this construct is not part of the supported XSD subset', /xs:foo nie jest obsługiwana\. Usuń ją albo zastąp prostszą\./],
+    ['built-in type xs:float is not supported (supported: string, int, integer, decimal, boolean, date, dateTime)', /Typ xs:float nie jest obsługiwany\. Obsługiwane są: string, int, integer, decimal, boolean, date i dateTime\. Zamiast niego użyj xs:decimal\.$/],
+    ['built-in type xs:gYear is not supported (supported: string, int, integer, decimal, boolean, date, dateTime)', /Typ xs:gYear nie jest obsługiwany\. Obsługiwane są: .* dateTime\.$/],
+    ['facet xs:totalDigits is not supported (supported: minLength, maxLength, pattern, enumeration)', /Ograniczenie xs:totalDigits nie jest obsługiwane/],
+    ['the schema declares no global element; at least one document root is required', /nie deklaruje żadnego elementu głównego/],
+    ['mixed content (mixed="true") is not supported', /Treść mieszana/],
+    ['xs:element ref= is not supported; declare it in place', /Odwołania ref= nie są obsługiwane/],
+  ];
+  for (const [server, expected] of cases) {
+    const got = refused('xsd', server);
+    assert.match(got.text, expected, server);
+    assert.ok(got.technical.includes(server));
+  }
+  // A parser message nobody mapped keeps the careful generic sentence.
+  const unknown = refused('xsd', 'something else entirely');
+  assert.match(unknown.text, /Serwer nie przyjął tekstu jako wzoru w formacie XSD\./);
+  assert.equal(unknown.technical, 'invalid schema: something else entirely');
+});
+
+test('the difference of a new XSD from the newest version, in words', () => {
+  const xsd = (inner, attrs = '') => `<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="faktura"><xs:complexType><xs:sequence>${inner}</xs:sequence></xs:complexType></xs:element></xs:schema>${attrs}`;
+  const base = xsd('<xs:element name="numer" type="xs:string"/><xs:element name="nabywca" type="xs:string"/>');
+  assert.equal(xsdChanges(base, base, 2), 'Tekst jest taki sam jak wersja 2.');
+  assert.equal(
+    xsdChanges(base, xsd('<xs:element name="numer" type="xs:string"/><xs:element name="nabywca" type="xs:string"/><xs:element name="termin" type="xs:date" minOccurs="0"/>'), 2),
+    'Różnica względem wersji 2: nowy, nieobowiązkowy element „termin”.',
+  );
+  assert.equal(
+    xsdChanges(base, xsd('<xs:element name="numer" type="xs:string"/><xs:element name="nabywca" type="xs:string"/><xs:element name="termin" type="xs:date"/>'), 2),
+    'Różnica względem wersji 2: nowy, wymagany element „termin”.',
+  );
+  assert.equal(
+    xsdChanges(base, xsd('<xs:element name="numer" type="xs:string" minOccurs="0"/>'), 2),
+    'Różnica względem wersji 2: usunięty element „nabywca” i element „numer” nie jest już wymagany.',
+  );
+  assert.equal(xsdChanges(base, xsd('<xs:choice><xs:element name="numer" type="xs:string"/></xs:choice><xs:element name="nabywca" type="xs:string"/>'), 2), 'Różnica względem wersji 2: element „numer” nie jest już wymagany.', 'an alternative of a choice may be left out');
+  assert.equal(xsdChanges(base, '<not xml', 2), null);
+});
+
+test('"Nowa wersja" of an XSD says the difference like the other formats', async () => {
+  closeAll();
+  const xsd = (inner) => `<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="faktura"><xs:complexType><xs:sequence>${inner}</xs:sequence></xs:complexType></xs:element></xs:schema>`;
+  const v2 = xsd('<xs:element name="numer" type="xs:string"/>');
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: { ...wizyta, subject: 'faktura', schemaType: 'xsd', latestVersion: 2 }, latestText: v2, draftText: null,
+    register: async () => ({ version: 3, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  type(win.querySelector('[data-role="text"]'), xsd('<xs:element name="numer" type="xs:string"/><xs:element name="termin" type="xs:date" minOccurs="0"/>'));
+  assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 2: nowy, nieobowiązkowy element „termin”.');
+  closeAll();
+});
+
+test('"Dodaj wzór" tells how to write an HL7 profile and which XSD work, following the chosen format', () => {
+  closeAll();
+  const win = openSchemaAdd({
+    instanceId: 'i', schemaTypes: ['json_schema', 'xsd', 'hl7v2_profile'], existingNames: () => [],
+    register: async () => ({ version: 1 }), describeError: String, onAdded: () => {},
+  });
+  const text = win.querySelector('[data-role="text"]');
+  const format = win.querySelector('[data-role="format"]');
+  assert.match(text.getAttribute('hint'), /^Możesz też wczytać plik\./);
+  pick(format, 'hl7v2_profile');
+  assert.ok(text.getAttribute('hint').includes(HL7_PROFILE_EXAMPLE), 'the shape of a profile is shown');
+  assert.ok(HL7_PROFILE_EXAMPLE.includes('"required_segments"') && HL7_PROFILE_EXAMPLE.includes('"required_fields"'));
+  assert.doesNotThrow(() => JSON.parse(HL7_PROFILE_EXAMPLE), 'the example is itself a valid profile text');
+  assert.equal(schemaTextProblem(HL7_PROFILE_EXAMPLE, 'hl7v2_profile'), null);
+  pick(format, 'xsd');
+  assert.match(text.getAttribute('hint'), /^Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików/);
+  pick(format, 'json_schema');
+  assert.match(text.getAttribute('hint'), /^Możesz też wczytać plik\./);
+  closeAll();
+});
+
+test('a refusal is scrolled into view when the form is taller than the window', async () => {
+  closeAll();
+  const scrolled = [];
+  const original = window.HTMLElement.prototype.scrollIntoView;
+  window.HTMLElement.prototype.scrollIntoView = function scrollIntoView(options) { scrolled.push([this.dataset.role, options]); };
+  try {
+    const win = openSchemaAdd({
+      instanceId: 'i', schemaTypes: ['hl7v2_profile'], existingNames: () => [],
+      register: async () => { throw new Error("protocol error BadRequest: bus.invalid_argument: schema: invalid schema: hl7: 'pid5' is not SEGMENT-N shaped (e.g. 'PID-5')"); },
+      describeError: String, onAdded: () => {},
+    });
+    type(win.querySelector('[data-role="name"]'), 'profil');
+    type(win.querySelector('[data-role="text"]'), '{"required_fields": ["pid5"]}');
+    win.querySelector('[data-act="save"]').click();
+    await tick();
+    assert.deepEqual(scrolled, [['error', { block: 'nearest' }]]);
+  } finally {
+    window.HTMLElement.prototype.scrollIntoView = original;
+    closeAll();
+  }
 });

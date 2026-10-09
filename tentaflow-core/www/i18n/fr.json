@@ -9770,7 +9770,8 @@
       "subject_not_found": "Cette personne, cette clé ou cet addon est introuvable — elle a peut-être été supprimée ou n'appartient pas à cette organisation. Actualisez la page.",
       "org_mismatch": "Un droit sur un topic ne peut être accordé que depuis sa propre organisation.",
       "record_not_found": "Cette partition n'a aucun message portant ce numéro.",
-      "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification."
+      "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification.",
+      "schema_kind_mismatch": "Le modèle {name} est destiné à un contenu {schemaKind}, mais ce topic accepte un contenu {topicKind}."
     },
     "shell": {
       "instance": "Instance",
@@ -9953,7 +9954,7 @@
       "text_empty": "Saisissez le texte du modèle ou chargez un fichier.",
       "text_too_big": "Le texte du modèle peut faire au plus 256 Ko.",
       "text_not_json": "Ce n’est pas un JSON valide, et ce format s’écrit en JSON.",
-      "text_refused": "Le serveur n’a pas accepté le texte : ce n’est pas un modèle valide au format {format}. Corrigez le texte et réessayez.",
+      "text_refused": "Le serveur n’a pas accepté le texte comme modèle au format {format}. Corrigez le texte et réessayez : le motif figure dans les détails techniques.",
       "add": {
         "title": "Nouveau modèle de message",
         "name_label": "Nom du modèle",
@@ -9973,7 +9974,9 @@
         "impact": "le modèle {name} ({format}) est créé en version 1.",
         "impact_unused": "Aucun topic ne l’utilise encore — vous le choisissez dans les paramètres d’un topic.",
         "button": "Ajouter le modèle",
-        "refused": "Le modèle {name} n’a pas été ajouté."
+        "refused": "Le modèle {name} n’a pas été ajouté.",
+        "text_hint_hl7v2_profile": "Un profil est un texte JSON avec des listes de segments et de champs obligatoires, par ex. {example}. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
+        "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
       },
       "version": {
         "title": "Nouvelle version du modèle {name}",
@@ -10003,7 +10006,14 @@
         "discard_kept": "Cette version n’est pas encore ajoutée. Le texte est conservé et revient quand vous rouvrez cette fenêtre. Refermez la fenêtre, ou reprenez la saisie.",
         "diff_segment_added": "nouveau segment obligatoire « {segment} »",
         "diff_segment_removed": "le segment « {segment} » n’est plus obligatoire",
-        "drop_and_add": "Retirer {items} et ajouter la version"
+        "drop_and_add": "Retirer {items} et ajouter la version",
+        "diff_added_optional_element": "nouvel élément facultatif « {field} »",
+        "diff_added_required_element": "nouvel élément obligatoire « {field} »",
+        "diff_removed_element": "élément supprimé « {field} »",
+        "diff_now_required_element": "l’élément « {field} » est désormais obligatoire",
+        "diff_now_optional_element": "l’élément « {field} » n’est plus obligatoire",
+        "drop_same": "Après le retrait de {items}, la nouvelle version ne différerait pas de la version {version} : il n’y a donc rien à ajouter. Changez la compatibilité du modèle ou faites d’autres modifications.",
+        "drop_description": "La description du modèle reste inchangée : corrigez-la si elle mentionnait les champs retirés."
       },
       "incompat": {
         "lead": "Ce modèle a la compatibilité « {compat} », et {reason}.",
@@ -10022,7 +10032,21 @@
         "fix_required_old": "Laissez « {field} » parmi les champs obligatoires ou changez la compatibilité du modèle.",
         "fix_generic": "Corrigez le texte ou changez la compatibilité du modèle.",
         "technical": "Détails techniques",
-        "widened": "la nouvelle version élargit le type de valeur du champ « {field} », alors que les anciens programmes n’acceptent que le plus étroit"
+        "widened": "la nouvelle version élargit le type de valeur du champ « {field} », alors que les anciens programmes n’acceptent que le plus étroit",
+        "quoted": "« {item} »",
+        "what_segments": "{n|le segment|les segments} {list}",
+        "what_fields": "{n|le champ|les champs} {list}",
+        "what_elements": "{n|l’élément|les éléments} {list}",
+        "requires_new": "la nouvelle version exige {what}, {n|que|que} les anciens messages peuvent ne pas avoir",
+        "requires_old": "la nouvelle version ne garantit pas {what}, {n|qu’|qu’}exigent les anciens programmes",
+        "drop_segments": "{list} des segments obligatoires",
+        "drop_fields": "{list} des champs obligatoires",
+        "keep_segments": "{list} parmi les segments obligatoires",
+        "keep_fields": "{list} parmi les champs obligatoires",
+        "fix_requires_new": "Retirez {items} ou changez la compatibilité du modèle.",
+        "fix_requires_old": "Laissez {items} ou changez la compatibilité du modèle.",
+        "fix_element_new": "Ajoutez minOccurs=\"0\" {n|à l’élément|aux éléments} {list} ou changez la compatibilité du modèle.",
+        "fix_element_old": "Laissez {list} parmi les éléments obligatoires ou changez la compatibilité du modèle."
       },
       "compat_window": {
         "title": "Changer la compatibilité — {name}",
@@ -10114,12 +10138,45 @@
         "profile_fields": "Champs obligatoires",
         "profile_field": "Champ",
         "profile_contains": "Ce qu’il contient",
-        "profile_none": "Ce profil n’exige aucun segment : il vérifie seulement que le message est lisible."
+        "profile_none": "Ce profil n’exige aucun segment : il vérifie seulement que le message est lisible.",
+        "versions_sub_reader": "Les versions ne peuvent pas être modifiées.",
+        "xsd_help_title": "Quels modèles XSD fonctionnent",
+        "xsd_help_works": "Un modèle ordinaire écrit dans un seul fichier fonctionne : quels éléments et attributs le document a, combien de fois ils peuvent apparaître, le choix d’une possibilité parmi plusieurs et des restrictions simples, par ex. la longueur d’un texte ou une liste de valeurs autorisées.",
+        "xsd_help_fails": "Un modèle qui inclut d’autres fichiers ou utilise des parties plus avancées de XSD ne fonctionne pas : à l’ajout, vous verrez ce qui manque."
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
       "added_existing_same": "Quelqu’un l’a ajouté entre-temps avec le même texte (version {version}) — rien n’a changé.",
-      "text_not_xml": "Ce n’est pas un document XML valide, et ce format s’écrit en XML."
+      "text_not_xml": "Ce n’est pas un document XML valide, et ce format s’écrit en XML.",
+      "refused": {
+        "hl7_msh": "« {field} » décrit les séparateurs du message lui-même et ne peut donc pas être obligatoire. Retirez « {field} » des champs obligatoires.",
+        "hl7_address": "« {name} » n’est pas une adresse de champ. Une adresse a la forme SEGMENT-numéro, par ex. PID-5.",
+        "hl7_number": "Le numéro de champ d’une adresse doit être un nombre de 1 à 999, par ex. PID-5.",
+        "hl7_segment": "« {segment} » n’est pas un nom de segment. Un nom de segment compte trois caractères, majuscules ou chiffres, par ex. PID.",
+        "hl7_unknown_key": "Le profil n’a pas de clé « {key} ». Les clés autorisées sont description, required_segments et required_fields.",
+        "hl7_duplicate": "« {item} » figure plus d’une fois dans la liste des {list}. Gardez-en un seul.",
+        "list_required_segments": "segments obligatoires",
+        "list_required_fields": "champs obligatoires",
+        "hl7_too_many": "La liste a trop d’entrées : 512 au plus.",
+        "hl7_description": "La description est trop longue : 1000 caractères au plus.",
+        "hl7_shape": "Le texte n’est pas un profil HL7 v2. Un profil est un objet JSON avec les clés description, required_segments et required_fields ; chaque liste ne contient que du texte.",
+        "xsd_type": "Le type xs:{type} n’est pas pris en charge. Les types pris en charge sont string, int, integer, decimal, boolean, date et dateTime. {advice}",
+        "xsd_type_advice": "Utilisez plutôt xs:{use}.",
+        "xsd_facet": "La restriction xs:{facet} n’est pas prise en charge. Celles prises en charge sont minLength, maxLength, pattern et enumeration.",
+        "xsd_no_root": "Ce XSD ne déclare aucun élément racine. Ajoutez au moins un xs:element nommé au niveau supérieur.",
+        "xsd_mixed": "Le contenu mixte (mixed=\"true\") n’est pas pris en charge. Décrivez séparément le texte et les éléments.",
+        "xsd_ref": "Les références avec ref= ne sont pas prises en charge. Déclarez l’élément là où vous l’utilisez.",
+        "xsd_construct": "Ce XSD est valide, mais la construction {construct} n’est pas prise en charge.",
+        "xsd_hint_composition": "Mettez toutes les déclarations dans un seul fichier.",
+        "xsd_hint_group": "Écrivez le contenu du groupe directement dans l’élément.",
+        "xsd_hint_wildcard": "Énumérez explicitement les éléments et attributs autorisés.",
+        "xsd_hint_identity": "Retirez les contraintes d’unicité et de clé.",
+        "xsd_hint_complex_content": "Décrivez le type en entier, sans étendre ni restreindre d’autres types complexes.",
+        "xsd_hint_list_union": "Utilisez un type simple ordinaire.",
+        "xsd_hint_global_attribute": "Déclarez l’attribut dans l’élément auquel il appartient.",
+        "xsd_hint_notation": "Retirez-la.",
+        "xsd_hint_other": "Retirez-la ou remplacez-la par quelque chose de plus simple."
+      }
     },
     "topics": {
       "title": "Topics",
@@ -10212,7 +10269,7 @@
         "validate_label": "Vérifier les messages avec un modèle",
         "validate_sub": "Chaque message envoyé est vérifié à l’écriture.",
         "schema_label": "Modèle",
-        "schema_hint": "La liste ne contient que des modèles au format {formats}, car le topic accepte du contenu {kind}.",
+        "schema_hint": "Seuls les modèles qui conviennent à un contenu {kind} sont proposés : {formats}.",
         "mismatch_label": "Quand un message ne correspond pas",
         "mismatch_dlq": "Déplacer vers les non traités",
         "mismatch_warn": "Accepter et consigner un avertissement",
@@ -10439,7 +10496,7 @@
         "schema_hint_withdrawn": "Le modèle est retiré : le topic vérifie encore les messages avec lui, mais après une modification il ne pourra plus être choisi.",
         "schema_none": "sans modèle",
         "schema_none_hint": "Les messages ne sont pas vérifiés.",
-        "schema_choice_hint": "Seuls les modèles {formats} sont proposés, car le topic accepte un contenu {kind}.",
+        "schema_choice_hint": "Seuls les modèles qui conviennent à un contenu {kind} sont proposés : {formats}.",
         "schema_choice_none": "Le topic peut rester sans modèle.",
         "none_for_kind": "Cette instance n’a pas de modèle pour un contenu {kind} ({formats}). Ajoutez-en un dans l’onglet Modèles de message.",
         "name_version": "{name} (version {version})",
@@ -10798,7 +10855,8 @@
         "permission_denied": "Aucune autorisation",
         "payload_too_large": "Le message est trop volumineux",
         "blob_missing": "Le fichier joint est manquant",
-        "unknown": "Motif inconnu"
+        "unknown": "Motif inconnu",
+        "schema_check_too_complex": "Le message n’a pas pu être vérifié avec le modèle : il est trop complexe"
       },
       "view": {
         "title": "Message non traité — partition {partition}, numéro {number}",
@@ -10856,6 +10914,10 @@
         "button": "Rejeter le message",
         "done_title": "Message rejeté",
         "done_text": "{what} a quitté les messages non traités."
+      },
+      "plain": {
+        "hl7_field": "Le champ {field} est obligatoire, mais il est vide ou absent dans l’occurrence {n} du segment {segment}.",
+        "hl7_segment": "Le segment obligatoire {segment} est absent."
       }
     },
     "access": {
@@ -11326,7 +11388,27 @@
       },
       "visible_outside": "Laisse aussi visibles : {fields}",
       "changed_title": "Rien n’a été enregistré : la règle a changé entre-temps",
-      "changed_text": "Quelqu’un a modifié, ajouté ou supprimé cette règle avant l’enregistrement de votre modification, donc rien n’a été écrasé. Le tableau montre les règles telles qu’elles sont maintenant ; si vous voulez toujours cette modification, refaites-la."
+      "changed_text": "Quelqu’un a modifié, ajouté ou supprimé cette règle avant l’enregistrement de votre modification, donc rien n’a été écrasé. Le tableau montre les règles telles qu’elles sont maintenant ; si vous voulez toujours cette modification, refaites-la.",
+      "hl7_segment": {
+        "msh": "en-tête du message",
+        "sft": "logiciel émetteur",
+        "evn": "événement",
+        "pid": "données du patient",
+        "pd1": "données complémentaires du patient",
+        "rol": "rôle",
+        "nk1": "proche",
+        "pv1": "visite",
+        "pv2": "données complémentaires de la visite",
+        "gt1": "garant",
+        "in1": "assurance",
+        "in2": "données complémentaires de l’assurance",
+        "orc": "ordre",
+        "obr": "demande d’examen",
+        "nte": "note",
+        "obx": "résultat",
+        "dg1": "diagnostic",
+        "al1": "allergie"
+      }
     }
   },
   "composer": {

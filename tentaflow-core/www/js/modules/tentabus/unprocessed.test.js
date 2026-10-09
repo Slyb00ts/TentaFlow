@@ -20,7 +20,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   unprocessedRecord, mergeNewest, commonReason, retryAllPlan, attemptsText, sourceText, whoCanRetry, receiversText,
-  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice,
+  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice, plainCheckError, reasonLabel, REASONS,
 } = await import('./unprocessed.js');
 const { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll, retryImpact, retryAllImpact } = await import('./unprocessed-windows.js');
 
@@ -369,4 +369,30 @@ test('"Ponów wszystkie" names the messages rejected at write it left, so they g
   const clean = retryAllDoneNotice({ topic: 'wizyty', resp: { retried: 2, failed: 0 }, consumers: [] });
   assert.equal(clean.tone, 'success');
   assert.doesNotMatch(norm(clean.text), /odrzucon/);
+});
+
+test('the HL7 profile check is told in plain words, anything else as the server wrote it', () => {
+  assert.equal(plainCheckError('PID-3 is required but empty or missing (segment occurrence 1)'), 'Pole PID-3 jest wymagane, a w 1. segmencie PID jest puste lub go nie ma.');
+  assert.equal(plainCheckError('OBX-5 is required but empty or missing (segment occurrence 12)'), 'Pole OBX-5 jest wymagane, a w 12. segmencie OBX jest puste lub go nie ma.');
+  assert.equal(plainCheckError("required segment 'PV1' is missing"), 'Brakuje wymaganego segmentu PV1.');
+  assert.equal(plainCheckError('/pacjent: required'), '');
+  assert.equal(plainCheckError('hl7: message does not start with an MSH segment'), '');
+  const rec = unprocessedRecord('wyniki-badan', {
+    ...writeRejection({ offset: 4, atMs: NOW - MIN }),
+    headers: headers({ 'dlq.source_topic': 'wyniki-badan', 'dlq.reason': 'schema_violation', 'dlq.error_message': 'PID-3 is required but empty or missing (segment occurrence 1)', 'dlq.rejected_at_ms': NOW - MIN }),
+  });
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.match(norm(win.textContent), /Szczegół techniczny\s*Pole PID-3 jest wymagane, a w 1\. segmencie PID jest puste lub go nie ma\./);
+  win.close(true);
+});
+
+test('a message the check gave up on has its own reason, not "does not match the pattern"', () => {
+  assert.ok(REASONS.includes('schema_check_too_complex'));
+  const rec = unprocessedRecord('faktury', {
+    ...writeRejection({ offset: 5, atMs: NOW - MIN }),
+    headers: headers({ 'dlq.source_topic': 'faktury', 'dlq.reason': 'schema_check_too_complex', 'dlq.error_message': '/faktura: document exceeds the validation work budget', 'dlq.rejected_at_ms': NOW - MIN }),
+  });
+  assert.equal(rec.reason, 'schema_check_too_complex');
+  assert.equal(reasonLabel(rec.reason), 'Wiadomości nie udało się sprawdzić wzorem — jest zbyt złożona');
+  assert.notEqual(reasonLabel(rec.reason), reasonLabel('schema_violation'));
 });

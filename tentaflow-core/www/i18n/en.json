@@ -11005,7 +11005,8 @@
       "subject_not_found": "This person, key or addon was not found — it may have been removed or may not belong to this organisation. Refresh the page.",
       "org_mismatch": "A right to a topic can only be granted from the topic's own organisation.",
       "record_not_found": "This partition has no message with that number.",
-      "field_policy_changed": "The rule changed in the meantime, so nothing was saved. Refresh the list of rules and make the change again."
+      "field_policy_changed": "The rule changed in the meantime, so nothing was saved. Refresh the list of rules and make the change again.",
+      "schema_kind_mismatch": "Pattern {name} is for {schemaKind} content, but this topic takes {topicKind} content."
     },
     "shell": {
       "instance": "Instance",
@@ -11188,7 +11189,7 @@
       "text_empty": "Type the pattern text or load a file.",
       "text_too_big": "The pattern text can be at most 256 KB.",
       "text_not_json": "This is not valid JSON, and this format is written in JSON.",
-      "text_refused": "The server did not accept the text: it is not a valid {format} pattern. Fix the text and try again.",
+      "text_refused": "The server did not accept the text as a {format} pattern. Fix the text and try again — the reason is in the technical details.",
       "add": {
         "title": "New message pattern",
         "name_label": "Pattern name",
@@ -11208,7 +11209,9 @@
         "impact": "pattern {name} ({format}) is created as version 1.",
         "impact_unused": "No topic uses it yet — you choose it in a topic's settings.",
         "button": "Add pattern",
-        "refused": "Pattern {name} was not added."
+        "refused": "Pattern {name} was not added.",
+        "text_hint_hl7v2_profile": "A profile is JSON text with lists of required segments and fields, e.g. {example}. You can also load a file. The pattern is checked when it is added; this will be version 1.",
+        "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1."
       },
       "version": {
         "title": "New version of pattern {name}",
@@ -11238,7 +11241,14 @@
         "discard_kept": "This version has not been added yet. The text is kept and comes back when you open this window again. Close the window again, or go back to editing.",
         "diff_segment_added": "new required segment “{segment}”",
         "diff_segment_removed": "segment “{segment}” is no longer required",
-        "drop_and_add": "Remove {items} and add the version"
+        "drop_and_add": "Remove {items} and add the version",
+        "diff_added_optional_element": "new optional element “{field}”",
+        "diff_added_required_element": "new required element “{field}”",
+        "diff_removed_element": "removed element “{field}”",
+        "diff_now_required_element": "element “{field}” is now required",
+        "diff_now_optional_element": "element “{field}” is no longer required",
+        "drop_same": "After removing {items}, the new version would not differ from version {version}, so there is nothing to add. Change the pattern's compatibility or make other changes.",
+        "drop_description": "The pattern's description stays as it is — fix it if it mentioned the removed fields."
       },
       "incompat": {
         "lead": "This pattern has compatibility “{compat}”, and {reason}.",
@@ -11257,7 +11267,21 @@
         "fix_required_old": "Keep “{field}” among the required fields or change the pattern's compatibility.",
         "fix_generic": "Fix the text or change the pattern's compatibility.",
         "technical": "Technical details",
-        "widened": "the new version widens the kind of value of field “{field}”, while old programs accept only the narrower one"
+        "widened": "the new version widens the kind of value of field “{field}”, while old programs accept only the narrower one",
+        "quoted": "“{item}”",
+        "what_segments": "{n|segment|segments} {list}",
+        "what_fields": "{n|field|fields} {list}",
+        "what_elements": "{n|element|elements} {list}",
+        "requires_new": "the new version requires {what}, {n|which|which} old messages may not have",
+        "requires_old": "the new version does not guarantee {what}, {n|which|which} old programs require",
+        "drop_segments": "{list} from the required segments",
+        "drop_fields": "{list} from the required fields",
+        "keep_segments": "{list} among the required segments",
+        "keep_fields": "{list} among the required fields",
+        "fix_requires_new": "Remove {items} or change the pattern's compatibility.",
+        "fix_requires_old": "Keep {items} or change the pattern's compatibility.",
+        "fix_element_new": "Add minOccurs=\"0\" to the {n|element|elements} {list} or change the pattern's compatibility.",
+        "fix_element_old": "Keep {list} among the required elements or change the pattern's compatibility."
       },
       "compat_window": {
         "title": "Change compatibility — {name}",
@@ -11349,12 +11373,45 @@
         "profile_fields": "Required fields",
         "profile_field": "Field",
         "profile_contains": "What it holds",
-        "profile_none": "This profile requires no segment — it only checks that the message can be read."
+        "profile_none": "This profile requires no segment — it only checks that the message can be read.",
+        "versions_sub_reader": "Versions cannot be changed.",
+        "xsd_help_title": "Which XSD patterns will work",
+        "xsd_help_works": "An ordinary pattern written in one file will work: which elements and attributes the document has, how many times they may occur, a choice of one of several possibilities and simple restrictions, e.g. the length of a text or a list of allowed values.",
+        "xsd_help_fails": "A pattern that includes other files or uses more advanced parts of XSD will not — when you add it, you will see what is missing."
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
       "added_existing_same": "Someone added it meanwhile with the same text (version {version}) — nothing changed.",
-      "text_not_xml": "This is not a valid XML document, and this format is written in XML."
+      "text_not_xml": "This is not a valid XML document, and this format is written in XML.",
+      "refused": {
+        "hl7_msh": "“{field}” describes the message's own separators, so it cannot be required. Remove “{field}” from the required fields.",
+        "hl7_address": "“{name}” is not a field address. An address looks like SEGMENT-number, e.g. PID-5.",
+        "hl7_number": "The field number in an address must be a number from 1 to 999, e.g. PID-5.",
+        "hl7_segment": "“{segment}” is not a segment name. A segment name has three characters, capital letters or digits, e.g. PID.",
+        "hl7_unknown_key": "The profile has no key “{key}”. The allowed keys are description, required_segments and required_fields.",
+        "hl7_duplicate": "“{item}” is on the list of {list} more than once. Keep just one.",
+        "list_required_segments": "required segments",
+        "list_required_fields": "required fields",
+        "hl7_too_many": "The list has too many entries — at most 512.",
+        "hl7_description": "The description is too long — at most 1000 characters.",
+        "hl7_shape": "The text is not an HL7 v2 profile. A profile is a JSON object with the keys description, required_segments and required_fields; each list holds only text.",
+        "xsd_type": "Type xs:{type} is not supported. The supported types are string, int, integer, decimal, boolean, date and dateTime. {advice}",
+        "xsd_type_advice": "Use xs:{use} instead.",
+        "xsd_facet": "Restriction xs:{facet} is not supported. The supported ones are minLength, maxLength, pattern and enumeration.",
+        "xsd_no_root": "This XSD declares no root element. Add at least one named xs:element at the top level.",
+        "xsd_mixed": "Mixed content (mixed=\"true\") is not supported. Describe the text and the elements separately.",
+        "xsd_ref": "References with ref= are not supported. Declare the element where you use it.",
+        "xsd_construct": "This XSD is valid, but the construct {construct} is not supported.",
+        "xsd_hint_composition": "Put every declaration in one file.",
+        "xsd_hint_group": "Write the content of the group directly in the element.",
+        "xsd_hint_wildcard": "List the elements and attributes that may be sent.",
+        "xsd_hint_identity": "Remove the uniqueness and key constraints.",
+        "xsd_hint_complex_content": "Describe the type in full, without extending or restricting other complex types.",
+        "xsd_hint_list_union": "Use a plain simple type.",
+        "xsd_hint_global_attribute": "Declare the attribute inside the element it belongs to.",
+        "xsd_hint_notation": "Remove it.",
+        "xsd_hint_other": "Remove it or replace it with something simpler."
+      }
     },
     "topics": {
       "title": "Topics",
@@ -11447,7 +11504,7 @@
         "validate_label": "Check messages against a pattern",
         "validate_sub": "Every message sent is checked when it is written.",
         "schema_label": "Pattern",
-        "schema_hint": "The list only has patterns in {formats} format, because the topic takes {kind} content.",
+        "schema_hint": "Only patterns that fit {kind} content are listed: {formats}.",
         "mismatch_label": "When a message does not match",
         "mismatch_dlq": "Move to unprocessed",
         "mismatch_warn": "Accept and log a warning",
@@ -11674,7 +11731,7 @@
         "schema_hint_withdrawn": "The pattern is withdrawn: the topic still checks messages with it, but after a change it cannot be chosen again.",
         "schema_none": "no pattern",
         "schema_none_hint": "Messages are not checked.",
-        "schema_choice_hint": "Only {formats} patterns are listed, because the topic takes {kind} content.",
+        "schema_choice_hint": "Only patterns that fit {kind} content are listed: {formats}.",
         "schema_choice_none": "The topic can stay without a pattern.",
         "none_for_kind": "This instance has no pattern for {kind} content ({formats}). Add one in the Message patterns tab.",
         "name_version": "{name} (version {version})",
@@ -12033,7 +12090,8 @@
         "permission_denied": "No permission",
         "payload_too_large": "The message is too large",
         "blob_missing": "The attached file is missing",
-        "unknown": "Unknown reason"
+        "unknown": "Unknown reason",
+        "schema_check_too_complex": "The message could not be checked against the pattern — it is too complex"
       },
       "view": {
         "title": "Unprocessed message — partition {partition}, number {number}",
@@ -12091,6 +12149,10 @@
         "button": "Discard message",
         "done_title": "Message discarded",
         "done_text": "{what} left the unprocessed messages."
+      },
+      "plain": {
+        "hl7_field": "Field {field} is required, but it is empty or missing in occurrence {n} of segment {segment}.",
+        "hl7_segment": "The required segment {segment} is missing."
       }
     },
     "access": {
@@ -12561,7 +12623,27 @@
       },
       "visible_outside": "Also leaves visible: {fields}",
       "changed_title": "Nothing was saved — the rule changed in the meantime",
-      "changed_text": "Someone changed, added or removed this rule before your change was saved, so nothing was overwritten. The table shows the rules as they are now — if you still want the change, make it again."
+      "changed_text": "Someone changed, added or removed this rule before your change was saved, so nothing was overwritten. The table shows the rules as they are now — if you still want the change, make it again.",
+      "hl7_segment": {
+        "msh": "message header",
+        "sft": "sending software",
+        "evn": "event",
+        "pid": "patient details",
+        "pd1": "additional patient details",
+        "rol": "role",
+        "nk1": "next of kin",
+        "pv1": "visit",
+        "pv2": "additional visit details",
+        "gt1": "guarantor",
+        "in1": "insurance",
+        "in2": "additional insurance details",
+        "orc": "order",
+        "obr": "observation request",
+        "nte": "note",
+        "obx": "result",
+        "dg1": "diagnosis",
+        "al1": "allergy"
+      }
     }
   },
   "composer": {

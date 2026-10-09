@@ -9770,7 +9770,8 @@
       "subject_not_found": "Diese Person, dieser Schlüssel oder dieses Addon wurde nicht gefunden — er wurde vielleicht entfernt oder gehört nicht zu dieser Organisation. Laden Sie die Seite neu.",
       "org_mismatch": "Ein Recht an einem Topic kann nur aus seiner eigenen Organisation gewährt werden.",
       "record_not_found": "Diese Partition enthält keine Nachricht mit dieser Nummer.",
-      "field_policy_changed": "Die Regel hat sich in der Zwischenzeit geändert, daher wurde nichts gespeichert. Aktualisieren Sie die Regelliste und nehmen Sie die Änderung noch einmal vor."
+      "field_policy_changed": "Die Regel hat sich in der Zwischenzeit geändert, daher wurde nichts gespeichert. Aktualisieren Sie die Regelliste und nehmen Sie die Änderung noch einmal vor.",
+      "schema_kind_mismatch": "Das Muster {name} ist für {schemaKind}-Inhalt, dieses Topic nimmt aber {topicKind}-Inhalt an."
     },
     "shell": {
       "instance": "Instanz",
@@ -9953,7 +9954,7 @@
       "text_empty": "Geben Sie den Mustertext ein oder laden Sie eine Datei.",
       "text_too_big": "Der Mustertext darf höchstens 256 KB groß sein.",
       "text_not_json": "Das ist kein gültiges JSON, und dieses Format wird in JSON geschrieben.",
-      "text_refused": "Der Server hat den Text nicht angenommen: Es ist kein gültiges Muster im Format {format}. Korrigieren Sie den Text und versuchen Sie es erneut.",
+      "text_refused": "Der Server hat den Text nicht als Muster im Format {format} angenommen. Korrigieren Sie den Text und versuchen Sie es erneut – der Grund steht in den technischen Details.",
       "add": {
         "title": "Neues Nachrichtenmuster",
         "name_label": "Name des Musters",
@@ -9973,7 +9974,9 @@
         "impact": "Muster {name} ({format}) entsteht als Version 1.",
         "impact_unused": "Noch verwendet es kein Topic — Sie wählen es in den Einstellungen eines Topics.",
         "button": "Muster hinzufügen",
-        "refused": "Muster {name} wurde nicht hinzugefügt."
+        "refused": "Muster {name} wurde nicht hinzugefügt.",
+        "text_hint_hl7v2_profile": "Ein Profil ist JSON-Text mit Listen der verlangten Segmente und Felder, z. B. {example}. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
+        "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1."
       },
       "version": {
         "title": "Neue Version des Musters {name}",
@@ -10003,7 +10006,14 @@
         "discard_kept": "Diese Version wurde noch nicht hinzugefügt. Der Text bleibt erhalten und erscheint wieder, wenn Sie dieses Fenster erneut öffnen. Schließen Sie das Fenster noch einmal oder bearbeiten Sie weiter.",
         "diff_segment_added": "neues Pflichtsegment „{segment}“",
         "diff_segment_removed": "Segment „{segment}“ ist keine Pflicht mehr",
-        "drop_and_add": "{items} entfernen und Version hinzufügen"
+        "drop_and_add": "{items} entfernen und Version hinzufügen",
+        "diff_added_optional_element": "neues optionales Element „{field}“",
+        "diff_added_required_element": "neues verlangtes Element „{field}“",
+        "diff_removed_element": "entferntes Element „{field}“",
+        "diff_now_required_element": "Element „{field}“ ist jetzt verlangt",
+        "diff_now_optional_element": "Element „{field}“ ist nicht mehr verlangt",
+        "drop_same": "Nach dem Entfernen von {items} unterschiede sich die neue Version nicht von Version {version}, es gibt also nichts hinzuzufügen. Ändern Sie die Kompatibilität des Musters oder nehmen Sie andere Änderungen vor.",
+        "drop_description": "Die Beschreibung des Musters bleibt unverändert – korrigieren Sie sie, falls sie die entfernten Felder erwähnte."
       },
       "incompat": {
         "lead": "Dieses Muster hat die Kompatibilität „{compat}“, und {reason}.",
@@ -10022,7 +10032,21 @@
         "fix_required_old": "Lassen Sie „{field}“ unter den Pflichtfeldern oder ändern Sie die Kompatibilität des Musters.",
         "fix_generic": "Korrigieren Sie den Text oder ändern Sie die Kompatibilität des Musters.",
         "technical": "Technische Details",
-        "widened": "die neue Version erweitert die Werteart des Felds „{field}“, alte Programme akzeptieren aber nur die engere"
+        "widened": "die neue Version erweitert die Werteart des Felds „{field}“, alte Programme akzeptieren aber nur die engere",
+        "quoted": "„{item}“",
+        "what_segments": "{n|das Segment|die Segmente} {list}",
+        "what_fields": "{n|das Feld|die Felder} {list}",
+        "what_elements": "{n|das Element|die Elemente} {list}",
+        "requires_new": "die neue Version verlangt {what}, {n|das|die} alte Nachrichten nicht haben müssen",
+        "requires_old": "die neue Version garantiert {what} nicht, {n|das|die} alte Programme verlangen",
+        "drop_segments": "{list} aus den verlangten Segmenten",
+        "drop_fields": "{list} aus den Pflichtfeldern",
+        "keep_segments": "{list} unter den verlangten Segmenten",
+        "keep_fields": "{list} unter den Pflichtfeldern",
+        "fix_requires_new": "Entfernen Sie {items} oder ändern Sie die Kompatibilität des Musters.",
+        "fix_requires_old": "Lassen Sie {items} stehen oder ändern Sie die Kompatibilität des Musters.",
+        "fix_element_new": "Fügen Sie minOccurs=\"0\" {n|zum Element|zu den Elementen} {list} hinzu oder ändern Sie die Kompatibilität des Musters.",
+        "fix_element_old": "Lassen Sie {list} unter den verlangten Elementen oder ändern Sie die Kompatibilität des Musters."
       },
       "compat_window": {
         "title": "Kompatibilität ändern — {name}",
@@ -10114,12 +10138,45 @@
         "profile_fields": "Pflichtfelder",
         "profile_field": "Feld",
         "profile_contains": "Was es enthält",
-        "profile_none": "Dieses Profil verlangt kein Segment – es prüft nur, ob sich die Nachricht lesen lässt."
+        "profile_none": "Dieses Profil verlangt kein Segment – es prüft nur, ob sich die Nachricht lesen lässt.",
+        "versions_sub_reader": "Versionen lassen sich nicht ändern.",
+        "xsd_help_title": "Welche XSD-Muster funktionieren",
+        "xsd_help_works": "Ein gewöhnliches Muster in einer einzigen Datei funktioniert: welche Elemente und Attribute das Dokument hat, wie oft sie vorkommen dürfen, die Auswahl einer von mehreren Möglichkeiten und einfache Einschränkungen, z. B. die Länge eines Textes oder eine Liste erlaubter Werte.",
+        "xsd_help_fails": "Ein Muster, das andere Dateien einbindet oder fortgeschrittenere Teile von XSD nutzt, funktioniert nicht – beim Hinzufügen sehen Sie, was fehlt."
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
       "added_existing_same": "Jemand hat es inzwischen mit demselben Text hinzugefügt (Version {version}) — nichts hat sich geändert.",
-      "text_not_xml": "Das ist kein gültiges XML-Dokument, und dieses Format wird in XML geschrieben."
+      "text_not_xml": "Das ist kein gültiges XML-Dokument, und dieses Format wird in XML geschrieben.",
+      "refused": {
+        "hl7_msh": "„{field}“ beschreibt die Trennzeichen der Nachricht selbst und kann deshalb nicht verlangt werden. Entfernen Sie „{field}“ aus den Pflichtfeldern.",
+        "hl7_address": "„{name}“ ist keine Feldadresse. Eine Adresse hat die Form SEGMENT-Nummer, z. B. PID-5.",
+        "hl7_number": "Die Feldnummer in einer Adresse muss eine Zahl von 1 bis 999 sein, z. B. PID-5.",
+        "hl7_segment": "„{segment}“ ist kein Segmentname. Ein Segmentname hat drei Zeichen, Großbuchstaben oder Ziffern, z. B. PID.",
+        "hl7_unknown_key": "Das Profil hat keinen Schlüssel „{key}“. Erlaubt sind description, required_segments und required_fields.",
+        "hl7_duplicate": "„{item}“ steht mehr als einmal in der Liste der {list}. Behalten Sie nur einen Eintrag.",
+        "list_required_segments": "verlangten Segmente",
+        "list_required_fields": "Pflichtfelder",
+        "hl7_too_many": "Die Liste hat zu viele Einträge – höchstens 512.",
+        "hl7_description": "Die Beschreibung ist zu lang – höchstens 1000 Zeichen.",
+        "hl7_shape": "Der Text ist kein HL7-v2-Profil. Ein Profil ist ein JSON-Objekt mit den Schlüsseln description, required_segments und required_fields; jede Liste enthält nur Text.",
+        "xsd_type": "Der Typ xs:{type} wird nicht unterstützt. Unterstützt sind string, int, integer, decimal, boolean, date und dateTime. {advice}",
+        "xsd_type_advice": "Verwenden Sie stattdessen xs:{use}.",
+        "xsd_facet": "Die Einschränkung xs:{facet} wird nicht unterstützt. Unterstützt sind minLength, maxLength, pattern und enumeration.",
+        "xsd_no_root": "Dieses XSD deklariert kein Wurzelelement. Fügen Sie auf oberster Ebene mindestens ein benanntes xs:element hinzu.",
+        "xsd_mixed": "Gemischter Inhalt (mixed=\"true\") wird nicht unterstützt. Beschreiben Sie Text und Elemente getrennt.",
+        "xsd_ref": "Verweise mit ref= werden nicht unterstützt. Deklarieren Sie das Element dort, wo Sie es verwenden.",
+        "xsd_construct": "Dieses XSD ist gültig, aber das Konstrukt {construct} wird nicht unterstützt.",
+        "xsd_hint_composition": "Legen Sie alle Deklarationen in einer Datei ab.",
+        "xsd_hint_group": "Schreiben Sie den Inhalt der Gruppe direkt in das Element.",
+        "xsd_hint_wildcard": "Führen Sie die erlaubten Elemente und Attribute einzeln auf.",
+        "xsd_hint_identity": "Entfernen Sie die Eindeutigkeits- und Schlüsselbedingungen.",
+        "xsd_hint_complex_content": "Beschreiben Sie den Typ vollständig, ohne andere komplexe Typen zu erweitern oder einzuschränken.",
+        "xsd_hint_list_union": "Verwenden Sie einen einfachen Typ.",
+        "xsd_hint_global_attribute": "Deklarieren Sie das Attribut im Element, zu dem es gehört.",
+        "xsd_hint_notation": "Entfernen Sie sie.",
+        "xsd_hint_other": "Entfernen Sie sie oder ersetzen Sie sie durch etwas Einfacheres."
+      }
     },
     "topics": {
       "title": "Topics",
@@ -10212,7 +10269,7 @@
         "validate_label": "Nachrichten nach Muster prüfen",
         "validate_sub": "Jede gesendete Nachricht wird beim Schreiben geprüft.",
         "schema_label": "Muster",
-        "schema_hint": "Die Liste enthält nur Muster im Format {formats}, weil das Topic Inhalt vom Typ {kind} annimmt.",
+        "schema_hint": "Aufgeführt sind nur Muster, die zu {kind}-Inhalt passen: {formats}.",
         "mismatch_label": "Wenn eine Nachricht nicht passt",
         "mismatch_dlq": "Zu den unverarbeiteten verschieben",
         "mismatch_warn": "Annehmen und Warnung speichern",
@@ -10439,7 +10496,7 @@
         "schema_hint_withdrawn": "Das Muster ist zurückgezogen: das Topic prüft Nachrichten weiter damit, aber nach einer Änderung kann es nicht wieder gewählt werden.",
         "schema_none": "kein Muster",
         "schema_none_hint": "Nachrichten werden nicht geprüft.",
-        "schema_choice_hint": "Aufgeführt sind nur {formats}-Muster, weil das Topic {kind}-Inhalt annimmt.",
+        "schema_choice_hint": "Aufgeführt sind nur Muster, die zu {kind}-Inhalt passen: {formats}.",
         "schema_choice_none": "Das Topic kann ohne Muster bleiben.",
         "none_for_kind": "Diese Instanz hat kein Muster für {kind}-Inhalt ({formats}). Fügen Sie eines im Tab Nachrichtenmuster hinzu.",
         "name_version": "{name} (Version {version})",
@@ -10798,7 +10855,8 @@
         "permission_denied": "Keine Berechtigung",
         "payload_too_large": "Die Nachricht ist zu groß",
         "blob_missing": "Die angehängte Datei fehlt",
-        "unknown": "Unbekannter Grund"
+        "unknown": "Unbekannter Grund",
+        "schema_check_too_complex": "Die Nachricht ließ sich nicht gegen das Muster prüfen – sie ist zu komplex"
       },
       "view": {
         "title": "Unverarbeitete Nachricht — Partition {partition}, Nummer {number}",
@@ -10856,6 +10914,10 @@
         "button": "Nachricht verwerfen",
         "done_title": "Nachricht verworfen",
         "done_text": "{what} ist aus den unverarbeiteten Nachrichten verschwunden."
+      },
+      "plain": {
+        "hl7_field": "Das Feld {field} ist verlangt, aber im {n}. Vorkommen des Segments {segment} leer oder fehlt.",
+        "hl7_segment": "Das verlangte Segment {segment} fehlt."
       }
     },
     "access": {
@@ -11326,7 +11388,27 @@
       },
       "visible_outside": "Lässt außerdem sichtbar: {fields}",
       "changed_title": "Nichts gespeichert – die Regel hat sich zwischenzeitlich geändert",
-      "changed_text": "Jemand hat diese Regel geändert, hinzugefügt oder entfernt, bevor Ihre Änderung gespeichert wurde, daher wurde nichts überschrieben. Die Tabelle zeigt die Regeln, wie sie jetzt sind – wenn Sie die Änderung weiterhin möchten, nehmen Sie sie noch einmal vor."
+      "changed_text": "Jemand hat diese Regel geändert, hinzugefügt oder entfernt, bevor Ihre Änderung gespeichert wurde, daher wurde nichts überschrieben. Die Tabelle zeigt die Regeln, wie sie jetzt sind – wenn Sie die Änderung weiterhin möchten, nehmen Sie sie noch einmal vor.",
+      "hl7_segment": {
+        "msh": "Nachrichtenkopf",
+        "sft": "sendende Software",
+        "evn": "Ereignis",
+        "pid": "Patientendaten",
+        "pd1": "weitere Patientendaten",
+        "rol": "Rolle",
+        "nk1": "Angehörige",
+        "pv1": "Besuch",
+        "pv2": "weitere Besuchsdaten",
+        "gt1": "Kostenträger",
+        "in1": "Versicherung",
+        "in2": "weitere Versicherungsdaten",
+        "orc": "Auftrag",
+        "obr": "Untersuchung",
+        "nte": "Notiz",
+        "obx": "Ergebnis",
+        "dg1": "Diagnose",
+        "al1": "Allergie"
+      }
     }
   },
   "composer": {

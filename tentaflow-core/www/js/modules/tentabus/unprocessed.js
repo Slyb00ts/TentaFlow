@@ -39,7 +39,7 @@ export const LIST_STEP = 10;
 /** What one "Ponów wszystkie" republishes at most (`DLQ_RETRY_ALL_MAX` on the server). */
 export const RETRY_ALL_MAX = 500;
 
-export const REASONS = ['schema_violation', 'consumer_error', 'consumer_timeout', 'permission_denied', 'payload_too_large', 'blob_missing'];
+export const REASONS = ['schema_violation', 'schema_check_too_complex', 'consumer_error', 'consumer_timeout', 'permission_denied', 'payload_too_large', 'blob_missing'];
 
 const asNumber = (text) => (text != null && /^\d+$/.test(text) ? Number(text) : null);
 
@@ -77,6 +77,19 @@ export function unprocessedRecord(topic, r) {
     isBlobRef: Boolean(r.isBlobRef),
     truncated: Boolean(r.truncated),
   };
+}
+
+/**
+ * The checker's sentence for one message in plain words — the HL7 profile's
+ * two sentences (hl7v2_profile.rs `validate`) — or `''` for any other text,
+ * which the caller then shows as the server wrote it.
+ */
+export function plainCheckError(text) {
+  const field = /^([A-Z0-9]{3}-\d+) is required but empty or missing \(segment occurrence (\d+)\)$/.exec(text);
+  if (field) return T('unprocessed.plain.hl7_field', { field: field[1], segment: field[1].slice(0, 3), n: field[2] });
+  const segment = /^required segment '([A-Z0-9]{3})' is missing$/.exec(text);
+  if (segment) return T('unprocessed.plain.hl7_segment', { segment: segment[1] });
+  return '';
 }
 
 /** "Program odbiorcy zgłosił błąd". */

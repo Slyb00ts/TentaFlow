@@ -68,3 +68,23 @@ export function hl7LabelKey(address) {
 export function hl7FieldLabel(address) {
   return KNOWN.has(address) ? T(hl7LabelKey(address)) : '';
 }
+
+/**
+ * The segments of an HL7 v2 message in the order a message carries them
+ * (header, patient, visit, insurance, order, result, diagnosis); those this
+ * list does not know (Z-segments of a local profile) follow in the order given.
+ */
+const SEGMENT_ORDER = ['MSH', 'SFT', 'EVN', 'PID', 'PD1', 'ROL', 'NK1', 'PV1', 'PV2', 'GT1', 'IN1', 'IN2', 'ORC', 'OBR', 'NTE', 'OBX', 'DG1', 'AL1'];
+
+export function orderSegments(segments) {
+  const rank = (s) => {
+    const i = SEGMENT_ORDER.indexOf(s);
+    return i < 0 ? SEGMENT_ORDER.length : i;
+  };
+  return segments.map((s, i) => ({ s, i })).sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i).map((x) => x.s);
+}
+
+/** The plain name of a segment ("dane pacjenta"), or '' for one outside the dictionary. */
+export function hl7SegmentLabel(segment) {
+  return SEGMENT_ORDER.includes(segment) ? T(`hiding.hl7_segment.${segment.toLowerCase()}`) : '';
+}

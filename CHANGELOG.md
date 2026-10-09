@@ -131,6 +131,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (`warn`) z powodem `schema_check_too_complex`, odrębnym od
   `schema_violation` (nowa wartość nagłówka `dlq.reason`; starsze programy
   pokażą ją jako „nieznany powód”).
+- Dashboard: odmowa dodania profilu HL7 lub XSD mówi po polsku, co jest nie tak
+  (adres pola, `MSH-1`/`MSH-2`, nieznany klucz, nieobsługiwana konstrukcja albo
+  typ XSD); tekst serwera zostaje w zwiniętych szczegółach. Odmowa nowej wersji
+  XSD wskazuje wymagany element, odmowa profilu HL7 rozróżnia segmenty i pola,
+  a „Usuń … i dodaj wersję” nie jest oferowane, gdy wynik byłby taki sam jak
+  poprzednia wersja. Okno „Dodaj wzór” podaje kształt profilu HL7 i opis
+  obsługiwanego XSD, strona XSD ma kartę „Jakie wzory XSD zadziałają”, a okno
+  nowej wersji XSD pokazuje różnicę. Segmenty profilu mają nazwy i kolejność
+  wiadomości, błąd wiązania wzoru z topikiem o innej treści jest opisany, a
+  szczegół nieprzetworzonej wiadomości z profilu HL7 jest po polsku.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

@@ -254,6 +254,13 @@ test('an XSD\'s description is its schema-level documentation, an HL7 profile\'s
   const xsd = (inner) => `<?xml version="1.0"?><xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">${inner}<xs:element name="a" type="xs:string"/></xs:schema>`;
   assert.equal(schemaDescription('xsd', xsd('<xs:annotation><xs:documentation>  Zgłoszenie pacjenta.  </xs:documentation></xs:annotation>')), 'Zgłoszenie pacjenta.');
   assert.equal(schemaDescription('xsd', xsd('')), '');
+  // Like the server (xsd.rs `documentation`), only elements in the XSD namespace count.
+  const foreign = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><annotation xmlns="urn:other"><documentation>Obcy opis.</documentation></annotation></xs:schema>';
+  assert.equal(schemaDescription('xsd', foreign), '', 'an annotation outside the XSD namespace is not the description');
+  const foreignDoc = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><documentation xmlns="urn:other">Obcy opis.</documentation></xs:annotation></xs:schema>';
+  assert.equal(schemaDescription('xsd', foreignDoc), '');
+  const wrongRoot = '<schema xmlns="urn:other"><annotation xmlns="http://www.w3.org/2001/XMLSchema"><documentation>Opis.</documentation></annotation></schema>';
+  assert.equal(schemaDescription('xsd', wrongRoot), '', 'a root outside the XSD namespace is not a schema');
   assert.equal(schemaDescription('xsd', '<xs:schema'), '', 'text that is not XML has no description');
   const nested = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a"><xs:annotation><xs:documentation>Tylko pole.</xs:documentation></xs:annotation><xs:complexType/></xs:element></xs:schema>';
   assert.equal(schemaDescription('xsd', nested), '', 'documentation of an element is not the schema\'s');
@@ -288,7 +295,7 @@ test('an HL7 profile\'s page shows its segments and fields in plain words above 
   assert.equal(body.querySelector('[data-role="about"]').textContent, 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
   const profile = body.querySelector('[data-role="profile"]');
   assert.equal(profile.hidden, false);
-  assert.deepEqual([...profile.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')), ['MSH', 'PID', 'OBX', 'ZZZ']);
+  assert.deepEqual([...profile.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')), ['MSH · nagłówek wiadomości', 'PID · dane pacjenta', 'OBX · wynik', 'ZZZ']);
   assert.match(norm(profile.textContent), /Wymagane segmenty .* Segment to jeden wiersz wiadomości HL7 v2/);
   const rows = body.querySelector('[data-role="profile-fields"]').rows;
   assert.equal(rows.length, 4);
@@ -298,4 +305,31 @@ test('an HL7 profile\'s page shows its segments and fields in plain words above 
   // Another format shows no profile.
   const plain = mount({});
   assert.equal(plain.body.querySelector('[data-role="profile"]').hidden, true);
+});
+
+test('segments of a profile follow the order of a message, with a name where the dictionary has one', () => {
+  const profile = JSON.stringify({ required_segments: ['IN1', 'ZPD', 'PID'], required_fields: ['IN1-2', 'ZPD-1', 'PID-19'] });
+  assert.deepEqual(hl7ProfileView(profile).segments, ['PID', 'IN1', 'ZPD']);
+  const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text: profile, error: null } });
+  assert.deepEqual(
+    [...body.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')),
+    ['PID · dane pacjenta', 'IN1 · ubezpieczenie', 'ZPD'],
+    'a segment outside the dictionary is shown as it is',
+  );
+});
+
+test('a reader is not told that versions can always be withdrawn', () => {
+  const admin = mount({});
+  assert.equal(admin.body.querySelector('[data-role="versions-sub"]').textContent, 'Wersji nie da się zmienić. Wycofać można zawsze.');
+  const reader = mount({ canAdmin: false });
+  assert.equal(reader.body.querySelector('[data-role="versions-sub"]').textContent, 'Wersji nie da się zmienić.');
+});
+
+test('an XSD\'s page says which XSD patterns work; no other format shows that card', () => {
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a" type="xs:string"/></xs:schema>';
+  const { body } = mount({ name: 'faktura', info: { ...wizyta, subject: 'faktura', schemaType: 'xsd' }, shown: { version: 3, text: xsd, error: null } });
+  const card = body.querySelector('[data-role="xsd-help"]');
+  assert.equal(card.hidden, false);
+  assert.match(norm(card.textContent), /^Jakie wzory XSD zadziałają Zadziała zwykły wzór zapisany w jednym pliku: .* Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje\.$/);
+  assert.equal(mount({}).body.querySelector('[data-role="xsd-help"]').hidden, true);
 });

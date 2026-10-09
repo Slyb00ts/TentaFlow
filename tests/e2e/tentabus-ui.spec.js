@@ -2488,7 +2488,8 @@ async function pickSegment(win, selector, label) {
 const PROFILE_NAME = `profil-wyniku-${RUN}`;
 const XSD_NAME = `zgloszenie-${RUN}`;
 const PROFILE_V1 = JSON.stringify({ description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.', required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
-const PROFILE_WITH_OBX8 = JSON.stringify({ ...JSON.parse(PROFILE_V1), required_fields: [...JSON.parse(PROFILE_V1).required_fields, 'OBX-8'] });
+// The description differs from version 1, so removing OBX-8 still leaves a genuinely new version.
+const PROFILE_WITH_OBX8 = JSON.stringify({ ...JSON.parse(PROFILE_V1), description: 'Profil HL7 v2: wynik badania z odczytem.', required_fields: [...JSON.parse(PROFILE_V1).required_fields, 'OBX-8'] });
 const XSD_V1 = `<?xml version="1.0" encoding="UTF-8"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:annotation><xs:documentation>Zgłoszenie pacjenta w rejestracji.</xs:documentation></xs:annotation>
@@ -2565,6 +2566,7 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: PROFILE_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
     await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
     await expect.poll(() => editorText(page)).not.toContain('OBX-8');
+    await expect(p.locator('[data-role="about"]')).toHaveText('Profil HL7 v2: wynik badania z odczytem.');
 
     // XSD: the text is checked as XML, its documentation is the description.
     await p.locator('[data-go="back"]').first().click();
@@ -2588,7 +2590,7 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     await p.locator('[data-role="new-version"]').click();
     await win.locator('[data-role="text"] textarea').fill(XSD_V1.replace('<xs:element name="zgloszenie">', '<xs:import namespace="urn:x"/><xs:element name="zgloszenie">'));
     await win.locator('[data-act="save"]').click();
-    await expect(win.locator('[data-role="error"]')).toContainText('Serwer nie przyjął tekstu', { timeout: 15000 });
+    await expect(win.locator('[data-role="error"]')).toContainText('Ten XSD jest poprawny, ale konstrukcja xs:import nie jest obsługiwana. Wklej wszystkie deklaracje do jednego pliku.', { timeout: 15000 });
     await expect(win.locator('[data-role="error"] details pre')).toContainText('schema composition is not supported');
     await cancelOut(win);
     await expect(win).toHaveCount(0);
@@ -2641,6 +2643,128 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     }
   } finally {
     await cleanup();
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+const FAKTURA_XSD = (inner) => `<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="faktura">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="numer" type="xs:string"/>
+        <xs:element name="nabywca" type="xs:string"/>${inner}
+        <xs:element name="pozycja" type="xs:string" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>`;
+
+test('F4 refusals in plain words: a profile and an XSD that cannot be added, a stale refusal gone with the edit, the element a new XSD version needs, a fix that would add nothing', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  const profile = `profil-przyjecia-${RUN}`;
+  const invoice = `faktura-${RUN}`;
+  const openAdd = async (format) => {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator(`tf-choice-card[value="${format}"]`).click();
+  };
+  try {
+    // The hint follows the format: the shape of a profile, the XSD that work.
+    await openAdd('hl7v2_profile');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /"required_segments".*"required_fields"/);
+    await win.locator('[data-role="name"] input').fill(profile);
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["MSH-1", "PID-3"]}');
+    await win.locator('[data-act="save"]').click();
+    const error = win.locator('[data-role="error"]');
+    await expect(error).toContainText('„MSH-1” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „MSH-1” z pól wymaganych.', { timeout: 15000 });
+    await expect(error).not.toContainText('nie jest poprawny wzór');
+    await expect(error.locator('details pre')).toContainText("'MSH-1' is the message's own field-separator");
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-msh1.png') });
+    // The refusal belongs to the text that was refused.
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["PID-3"]}');
+    await expect(error).toBeHidden();
+    await expect(win.locator('[data-act="save"]')).not.toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["pid5"]}');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('„pid5” to nie adres pola. Adres ma postać SEGMENT-numer, np. PID-5.', { timeout: 15000 });
+    await win.locator('[data-role="text"] textarea').fill('to nie jest JSON');
+    await expect(error).toBeHidden();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta', required_segments: ['PID'], required_fields: ['PID-3', 'PV1-3'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+
+    // An XSD that is valid but uses what the checker does not support.
+    await openAdd('xsd');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Zadziała zwykły wzór XSD zapisany w jednym pliku/);
+    await win.locator('[data-role="name"] input').fill(invoice);
+    const floatXsd = FAKTURA_XSD('').replace('type="xs:string" maxOccurs', 'type="xs:float" maxOccurs');
+    await win.locator('[data-role="text"] textarea').fill(floatXsd);
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('Typ xs:float nie jest obsługiwany. Obsługiwane są: string, int, integer, decimal, boolean, date i dateTime. Zamiast niego użyj xs:decimal.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-float.png') });
+    await win.locator('[data-role="text"] textarea').fill('<xs:schema');
+    await expect(error).toBeHidden();
+    await win.locator('[data-role="text"] textarea').fill(FAKTURA_XSD(''));
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+
+    // The XSD's page says which XSD work; the profile's chips are named and in message order.
+    await schemaRow(page, invoice).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(invoice, { timeout: 15000 });
+    await expect(p.locator('[data-role="xsd-help"]')).toContainText('Jakie wzory XSD zadziałają');
+    await expect(p.locator('[data-role="xsd-help"]')).toContainText('Nie zadziała wzór, który dołącza inne pliki');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-xsd-strona.png'), fullPage: true });
+
+    // A required element is refused with its name and the diff line; minOccurs="0" is accepted.
+    await p.locator('[data-role="new-version"]').click();
+    const required = FAKTURA_XSD('\n        <xs:element name="termin" type="xs:date"/>');
+    await win.locator('[data-role="text"] textarea').fill(required);
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowy, wymagany element „termin”.');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga elementu „termin”, którego stare wiadomości mogą nie mieć. Dodaj minOccurs="0" do elementu „termin” albo zmień zgodność wzoru.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-xsd-wersja-odmowa.png') });
+    await win.locator('[data-role="text"] textarea').fill(FAKTURA_XSD('\n        <xs:element name="termin" type="xs:date" minOccurs="0"/>'));
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowy, nieobowiązkowy element „termin”.');
+    await expect(error).toBeHidden();
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+
+    // Removing the only new requirement would bring back the newest version: nothing is offered to add.
+    await p.locator('[data-go="back"]').first().click();
+    await expect(schemaTable(page).locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+    await schemaRow(page, profile).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(profile, { timeout: 15000 });
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta', required_segments: ['PID'], required_fields: ['PID-3', 'PV1-3', 'PV1-7'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga pola „PV1-7”, którego stare wiadomości mogą nie mieć', { timeout: 15000 });
+    await expect(error).toContainText('Po usunięciu PV1-7 nowa wersja niczym nie różniłaby się od wersji 1, więc nie ma czego dodawać.');
+    await expect(error.locator('[data-act="drop-required"]')).toHaveCount(0);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-bez-zmiany.png') });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+
+    // A segment and a field are named apart, and the button lists them.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta, rozszerzone', required_segments: ['PID', 'NK1'], required_fields: ['PID-3', 'PV1-3', 'PV1-7'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga segmentu „NK1” i pola „PV1-7”, których stare wiadomości mogą nie mieć. Usuń „NK1” z wymaganych segmentów i „PV1-7” z pól wymaganych albo zmień zgodność wzoru.', { timeout: 15000 });
+    await expect(error.locator('[data-act="drop-required"]')).toHaveText('Usuń NK1, PV1-7 i dodaj wersję');
+    await expect(error).toContainText('Opis wzoru zostanie bez zmian');
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+  } finally {
+    for (const name of [profile, invoice]) {
+      await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
+    }
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
 });

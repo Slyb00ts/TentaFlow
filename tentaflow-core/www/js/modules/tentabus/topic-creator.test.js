@@ -168,7 +168,7 @@ test('the whole walk: kind, storage with the copies sentence, pattern, summary, 
   assert.match(summary, /Kopie 3, bo w tej instancji są 3 nody/);
   assert.match(summary, /Trwałość krytyczna/);
   assert.match(summary, /Wzór wiadomości ankieta, najnowsza wersja \(1\); niepasujące do nieprzetworzonych/);
-  assert.match(win.querySelector('#tb-cr-schema').getAttribute('hint'), /JSON Schema.*JSON/);
+  assert.equal(win.querySelector('#tb-cr-schema').getAttribute('hint'), 'Na liście są tylko wzory pasujące do treści JSON: JSON Schema.');
   win.querySelector('[data-act="back"]').click();
   assert.equal(win.querySelector('#tb-cr-retention') !== null, true, 'Wstecz returns to step 2');
   nextBtn(win).click();

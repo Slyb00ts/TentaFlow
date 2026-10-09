@@ -25,7 +25,7 @@ import { T, fmtCount, fmtDate } from '/js/modules/tentabus/format.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { schemaFormatLabel, schemaState, compatLabel, deleteBlocker, listText } from '/js/modules/tentabus/schemas.js';
 import { effectiveVersion } from '/js/modules/tentabus/schema-windows.js';
-import { hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
+import { hl7FieldLabel, hl7SegmentLabel, orderSegments } from '/js/modules/tentabus/hl7-fields.js';
 import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
 import '/js/components/tf-button.js';
@@ -57,15 +57,22 @@ export function downloadName(subject, version, type) {
   return `${subject}-v${version}.${FILE_EXTENSION[type] || 'txt'}`;
 }
 
-/** The first `annotation/documentation` directly under the root of an XSD, or `''`. */
+const XSD_NS = 'http://www.w3.org/2001/XMLSchema';
+
+/**
+ * The first `annotation/documentation` directly under the root of an XSD, or
+ * `''`. Like the server (`xsd.rs::documentation`), only elements in the XSD
+ * namespace count, so both show the same description.
+ */
 function xsdDocumentation(text) {
   if (typeof DOMParser === 'undefined') return '';
   try {
     const doc = new DOMParser().parseFromString(String(text || ''), 'application/xml');
     const root = doc.documentElement;
-    if (!root || root.localName !== 'schema' || doc.getElementsByTagName('parsererror').length) return '';
-    for (const annotation of Array.from(root.children).filter((c) => c.localName === 'annotation')) {
-      for (const documentation of Array.from(annotation.children).filter((c) => c.localName === 'documentation')) {
+    if (!root || root.localName !== 'schema' || root.namespaceURI !== XSD_NS || doc.getElementsByTagName('parsererror').length) return '';
+    const inXsd = (node, name) => node.namespaceURI === XSD_NS && node.localName === name;
+    for (const annotation of Array.from(root.children).filter((c) => inXsd(c, 'annotation'))) {
+      for (const documentation of Array.from(annotation.children).filter((c) => inXsd(c, 'documentation'))) {
         const value = (documentation.textContent || '').trim();
         if (value) return value;
       }
@@ -97,7 +104,8 @@ export function schemaDescription(type, text) {
 /**
  * An HL7 v2 profile spelled out: `{ segments, fields: [{ address, label }] }`.
  * Like the server, a required field also makes its segment required, so the
- * segment list is the listed segments followed by those only a field names.
+ * segment list holds the listed segments and those only a field names, in the
+ * order a message carries them (see `orderSegments`).
  * `label` is the dictionary name of the field ("numer pacjenta") or `''`.
  * `null` when the text is not a profile.
  */
@@ -116,7 +124,7 @@ export function hl7ProfileView(text) {
     const segment = f.split('-')[0];
     if (segment && !segments.includes(segment)) segments.push(segment);
   }
-  return { segments, fields: fields.map((address) => ({ address, label: hl7FieldLabel(address) })) };
+  return { segments: orderSegments(segments), fields: fields.map((address) => ({ address, label: hl7FieldLabel(address) })) };
 }
 
 /**
@@ -236,6 +244,10 @@ function pageHtml(name) {
               <tf-column key="version" label="${escapeAttr(T('schemas.col_version'))}" renderer="html" fill></tf-column>
               <tf-column key="state" label="${escapeAttr(T('schemas.col_state'))}" renderer="html"></tf-column>
             </tf-table>
+          </div>
+          <div class="section-card" data-role="xsd-help" hidden>
+            <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('schemas.detail.xsd_help_title'))}</div></div>
+            <div class="section-sub">${escapeHtml(T('schemas.detail.xsd_help_works'))} ${escapeHtml(T('schemas.detail.xsd_help_fails'))}</div>
           </div>
           <div class="section-card" data-role="compat-card"></div>
         </div>
@@ -388,10 +400,11 @@ function paintPage(body, view) {
 
   setAttr(body.querySelector('[data-role="versions-count"]'), 'label', fmtCount(versions.length));
   const allWithdrawn = !subjectDeprecated && versions.length > 0 && versions.every((v) => v.deprecatedAtMs != null);
-  let versionsSub = T('schemas.detail.versions_sub');
+  let versionsSub = T(canAdmin ? 'schemas.detail.versions_sub' : 'schemas.detail.versions_sub_reader');
   if (subjectDeprecated) versionsSub = T('schemas.detail.versions_sub_withdrawn');
   else if (allWithdrawn) versionsSub = T('schemas.detail.versions_sub_all_withdrawn', { version: fmtCount(effective) });
   setText(body.querySelector('[data-role="versions-sub"]'), versionsSub);
+  body.querySelector('[data-role="xsd-help"]').hidden = info.schemaType !== 'xsd';
   setRowsIfChanged(body.querySelector('[data-role="versions"]'), versionRows({ info, versions, shownVersion: view.shown?.version ?? effective, canAdmin }));
 
   const compatRows = valueRow(T('schemas.detail.compat_label'), compatLabel(info.compatibility), T(`schemas.compat_desc.${info.compatibility}`));
@@ -440,7 +453,10 @@ function paintProfile(body, profile) {
   el.hidden = !profile;
   if (!profile) return;
   patchHtml(body.querySelector('[data-role="profile-segments"]'), profile.segments.length
-    ? profile.segments.map((s) => `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(s)}"></tf-chip>`).join('')
+    ? profile.segments.map((s) => {
+      const name = hl7SegmentLabel(s);
+      return `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(name ? `${s} · ${name}` : s)}"></tf-chip>`;
+    }).join('')
     : `<span class="muted">${escapeHtml(T('schemas.detail.profile_none'))}</span>`);
   body.querySelector('[data-role="profile-fields-wrap"]').hidden = !profile.fields.length;
   setRowsIfChanged(body.querySelector('[data-role="profile-fields"]'), profile.fields.map((f) => ({

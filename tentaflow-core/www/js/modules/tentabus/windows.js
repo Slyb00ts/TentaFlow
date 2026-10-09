@@ -137,6 +137,8 @@ export function openChangeWindow({
       if (errorHtml) text.innerHTML = errorHtml(err, d);
       else text.textContent = describeError(err);
       errEl.hidden = false;
+      // A long form pushes the refusal below the fold of the window.
+      errEl.scrollIntoView?.({ block: 'nearest' });
       refusedSig = JSON.stringify(d);
       sync();
       return;

@@ -11005,7 +11005,8 @@
       "subject_not_found": "Nie znaleziono tej osoby, tego klucza ani addonu — mógł zostać usunięty albo nie należy do tej organizacji. Odśwież stronę.",
       "org_mismatch": "Prawo do topiku można nadać tylko z jego własnej organizacji.",
       "record_not_found": "W tej partycji nie ma wiadomości o tym numerze.",
-      "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz."
+      "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz.",
+      "schema_kind_mismatch": "Wzór {name} jest dla treści {schemaKind}, a ten topik przyjmuje treść {topicKind}."
     },
     "shell": {
       "instance": "Instancja",
@@ -11188,7 +11189,7 @@
       "text_empty": "Wpisz tekst wzoru albo wczytaj plik.",
       "text_too_big": "Tekst wzoru może mieć najwyżej 256 KB.",
       "text_not_json": "To nie jest poprawny JSON, a ten format zapisuje się w JSON.",
-      "text_refused": "Serwer nie przyjął tekstu: to nie jest poprawny wzór w formacie {format}. Popraw tekst i spróbuj ponownie.",
+      "text_refused": "Serwer nie przyjął tekstu jako wzoru w formacie {format}. Popraw tekst i spróbuj ponownie — powód jest w szczegółach technicznych.",
       "add": {
         "title": "Nowy wzór wiadomości",
         "name_label": "Nazwa wzoru",
@@ -11208,7 +11209,9 @@
         "impact": "powstanie wzór {name} ({format}), wersja 1.",
         "impact_unused": "Żaden topik go jeszcze nie używa — wybierzesz go w ustawieniach topiku.",
         "button": "Dodaj wzór",
-        "refused": "Nie dodano wzoru {name}."
+        "refused": "Nie dodano wzoru {name}.",
+        "text_hint_hl7v2_profile": "Profil to tekst JSON z listami wymaganych segmentów i pól, np. {example}. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
+        "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
       },
       "version": {
         "title": "Nowa wersja wzoru {name}",
@@ -11238,7 +11241,14 @@
         "discard_kept": "Ta wersja nie jest jeszcze dodana. Tekst zostanie zachowany i wróci, gdy otworzysz to okno ponownie. Zamknij okno jeszcze raz albo wróć do edycji.",
         "diff_segment_added": "nowy wymagany segment „{segment}”",
         "diff_segment_removed": "segment „{segment}” nie jest już wymagany",
-        "drop_and_add": "Usuń {items} i dodaj wersję"
+        "drop_and_add": "Usuń {items} i dodaj wersję",
+        "diff_added_optional_element": "nowy, nieobowiązkowy element „{field}”",
+        "diff_added_required_element": "nowy, wymagany element „{field}”",
+        "diff_removed_element": "usunięty element „{field}”",
+        "diff_now_required_element": "element „{field}” jest teraz wymagany",
+        "diff_now_optional_element": "element „{field}” nie jest już wymagany",
+        "drop_same": "Po usunięciu {items} nowa wersja niczym nie różniłaby się od wersji {version}, więc nie ma czego dodawać. Zmień zgodność wzoru albo wprowadź inne zmiany.",
+        "drop_description": "Opis wzoru zostanie bez zmian — popraw go, jeśli wspominał usunięte pola."
       },
       "incompat": {
         "lead": "Ten wzór ma zgodność „{compat}”, a {reason}.",
@@ -11257,7 +11267,21 @@
         "fix_required_old": "Zostaw „{field}” wśród pól wymaganych albo zmień zgodność wzoru.",
         "fix_generic": "Popraw tekst albo zmień zgodność wzoru.",
         "technical": "Szczegóły techniczne",
-        "widened": "nowa wersja poszerza rodzaj wartości pola „{field}”, a stare programy przyjmują tylko węższy"
+        "widened": "nowa wersja poszerza rodzaj wartości pola „{field}”, a stare programy przyjmują tylko węższy",
+        "quoted": "„{item}”",
+        "what_segments": "{n|segmentu|segmentów|segmentów} {list}",
+        "what_fields": "{n|pola|pól|pól} {list}",
+        "what_elements": "{n|elementu|elementów|elementów} {list}",
+        "requires_new": "nowa wersja wymaga {what}, {n|którego|których|których} stare wiadomości mogą nie mieć",
+        "requires_old": "nowa wersja nie gwarantuje {what}, {n|którego|których|których} wymagają stare programy",
+        "drop_segments": "{list} z wymaganych segmentów",
+        "drop_fields": "{list} z pól wymaganych",
+        "keep_segments": "{list} wśród wymaganych segmentów",
+        "keep_fields": "{list} wśród pól wymaganych",
+        "fix_requires_new": "Usuń {items} albo zmień zgodność wzoru.",
+        "fix_requires_old": "Zostaw {items} albo zmień zgodność wzoru.",
+        "fix_element_new": "Dodaj minOccurs=\"0\" do {n|elementu|elementów|elementów} {list} albo zmień zgodność wzoru.",
+        "fix_element_old": "Zostaw {list} wśród wymaganych elementów albo zmień zgodność wzoru."
       },
       "compat_window": {
         "title": "Zmień zgodność — {name}",
@@ -11349,12 +11373,45 @@
         "profile_fields": "Wymagane pola",
         "profile_field": "Pole",
         "profile_contains": "Co zawiera",
-        "profile_none": "Ten profil nie wymaga żadnego segmentu — sprawdza tylko, czy wiadomość da się odczytać."
+        "profile_none": "Ten profil nie wymaga żadnego segmentu — sprawdza tylko, czy wiadomość da się odczytać.",
+        "versions_sub_reader": "Wersji nie da się zmienić.",
+        "xsd_help_title": "Jakie wzory XSD zadziałają",
+        "xsd_help_works": "Zadziała zwykły wzór zapisany w jednym pliku: jakie elementy i atrybuty ma dokument, ile razy mogą wystąpić, wybór jednej z kilku możliwości i proste ograniczenia, np. długość tekstu albo lista dozwolonych wartości.",
+        "xsd_help_fails": "Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje."
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
       "added_existing_same": "Ktoś dodał go w międzyczasie z takim samym tekstem (wersja {version}) — nic się nie zmieniło.",
-      "text_not_xml": "To nie jest poprawny dokument XML, a ten format zapisuje się w XML."
+      "text_not_xml": "To nie jest poprawny dokument XML, a ten format zapisuje się w XML.",
+      "refused": {
+        "hl7_msh": "„{field}” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „{field}” z pól wymaganych.",
+        "hl7_address": "„{name}” to nie adres pola. Adres ma postać SEGMENT-numer, np. PID-5.",
+        "hl7_number": "Numer pola w adresie musi być liczbą od 1 do 999, np. PID-5.",
+        "hl7_segment": "„{segment}” to nie nazwa segmentu. Nazwa segmentu ma trzy znaki: wielkie litery lub cyfry, np. PID.",
+        "hl7_unknown_key": "W profilu nie ma klucza „{key}”. Dozwolone są: description, required_segments i required_fields.",
+        "hl7_duplicate": "„{item}” jest na liście {list} więcej niż raz. Zostaw jedno wystąpienie.",
+        "list_required_segments": "wymaganych segmentów",
+        "list_required_fields": "wymaganych pól",
+        "hl7_too_many": "Lista ma za dużo pozycji — najwyżej 512.",
+        "hl7_description": "Opis jest za długi — najwyżej 1000 znaków.",
+        "hl7_shape": "Tekst nie jest profilem HL7 v2. Profil to obiekt JSON z kluczami description, required_segments i required_fields; każda lista zawiera same teksty.",
+        "xsd_type": "Typ xs:{type} nie jest obsługiwany. Obsługiwane są: string, int, integer, decimal, boolean, date i dateTime. {advice}",
+        "xsd_type_advice": "Zamiast niego użyj xs:{use}.",
+        "xsd_facet": "Ograniczenie xs:{facet} nie jest obsługiwane. Obsługiwane są: minLength, maxLength, pattern i enumeration.",
+        "xsd_no_root": "Ten XSD nie deklaruje żadnego elementu głównego. Dodaj na najwyższym poziomie co najmniej jeden xs:element z nazwą.",
+        "xsd_mixed": "Treść mieszana (mixed=\"true\") nie jest obsługiwana. Opisz osobno tekst i elementy.",
+        "xsd_ref": "Odwołania ref= nie są obsługiwane. Zadeklaruj element w miejscu, w którym go używasz.",
+        "xsd_construct": "Ten XSD jest poprawny, ale konstrukcja {construct} nie jest obsługiwana.",
+        "xsd_hint_composition": "Wklej wszystkie deklaracje do jednego pliku.",
+        "xsd_hint_group": "Zapisz zawartość grupy bezpośrednio w elemencie.",
+        "xsd_hint_wildcard": "Wypisz jawnie elementy i atrybuty, które wolno przesłać.",
+        "xsd_hint_identity": "Usuń ograniczenia unikalności i kluczy.",
+        "xsd_hint_complex_content": "Opisz typ w całości, bez rozszerzania i zawężania innych typów złożonych.",
+        "xsd_hint_list_union": "Użyj zwykłego typu prostego.",
+        "xsd_hint_global_attribute": "Zadeklaruj atrybut wewnątrz elementu, do którego należy.",
+        "xsd_hint_notation": "Usuń ją.",
+        "xsd_hint_other": "Usuń ją albo zastąp prostszą."
+      }
     },
     "topics": {
       "title": "Topiki",
@@ -11447,7 +11504,7 @@
         "validate_label": "Sprawdzaj wiadomości według wzoru",
         "validate_sub": "Każda wysłana wiadomość jest sprawdzana przy zapisie.",
         "schema_label": "Wzór",
-        "schema_hint": "Na liście są tylko wzory w formacie {formats}, bo topik przyjmuje treść {kind}.",
+        "schema_hint": "Na liście są tylko wzory pasujące do treści {kind}: {formats}.",
         "mismatch_label": "Gdy wiadomość nie pasuje",
         "mismatch_dlq": "Przenieś do nieprzetworzonych",
         "mismatch_warn": "Przyjmij i zapisz ostrzeżenie",
@@ -11674,7 +11731,7 @@
         "schema_hint_withdrawn": "Wzór jest wycofany: topik dalej sprawdza nim wiadomości, ale po zmianie nie da się go wybrać ponownie.",
         "schema_none": "bez wzoru",
         "schema_none_hint": "Wiadomości nie są sprawdzane.",
-        "schema_choice_hint": "Na liście są tylko wzory {formats}, bo topik przyjmuje treść {kind}.",
+        "schema_choice_hint": "Na liście są tylko wzory pasujące do treści {kind}: {formats}.",
         "schema_choice_none": "Topik może zostać bez wzoru.",
         "none_for_kind": "W tej instancji nie ma wzoru dla treści {kind} ({formats}). Wzór dodasz w zakładce Wzory wiadomości.",
         "name_version": "{name} (wersja {version})",
@@ -12033,7 +12090,8 @@
         "permission_denied": "Brak uprawnień",
         "payload_too_large": "Wiadomość jest za duża",
         "blob_missing": "Brak załączonego pliku",
-        "unknown": "Nieznany powód"
+        "unknown": "Nieznany powód",
+        "schema_check_too_complex": "Wiadomości nie udało się sprawdzić wzorem — jest zbyt złożona"
       },
       "view": {
         "title": "Nieprzetworzona wiadomość — partycja {partition}, numer {number}",
@@ -12091,6 +12149,10 @@
         "button": "Odrzuć wiadomość",
         "done_title": "Odrzucono wiadomość",
         "done_text": "{what} zniknęła z nieprzetworzonych."
+      },
+      "plain": {
+        "hl7_field": "Pole {field} jest wymagane, a w {n}. segmencie {segment} jest puste lub go nie ma.",
+        "hl7_segment": "Brakuje wymaganego segmentu {segment}."
       }
     },
     "access": {
@@ -12561,7 +12623,27 @@
       },
       "visible_outside": "Zostawia też widoczne: {fields}",
       "changed_title": "Nic nie zapisano — zasada zmieniła się w międzyczasie",
-      "changed_text": "Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz."
+      "changed_text": "Ktoś zmienił, dodał albo usunął tę zasadę, zanim Twoja zmiana została zapisana, więc niczego nie nadpisaliśmy. Tabela pokazuje zasady tak, jak są teraz — jeśli nadal chcesz tej zmiany, wprowadź ją jeszcze raz.",
+      "hl7_segment": {
+        "msh": "nagłówek wiadomości",
+        "sft": "oprogramowanie nadawcy",
+        "evn": "zdarzenie",
+        "pid": "dane pacjenta",
+        "pd1": "dodatkowe dane pacjenta",
+        "rol": "rola osoby",
+        "nk1": "osoba bliska",
+        "pv1": "wizyta",
+        "pv2": "dodatkowe dane wizyty",
+        "gt1": "płatnik",
+        "in1": "ubezpieczenie",
+        "in2": "dodatkowe dane ubezpieczenia",
+        "orc": "zlecenie",
+        "obr": "badanie",
+        "nte": "uwaga",
+        "obx": "wynik",
+        "dg1": "rozpoznanie",
+        "al1": "alergia"
+      }
     }
   },
   "composer": {

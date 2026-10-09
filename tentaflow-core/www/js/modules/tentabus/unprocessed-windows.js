@@ -17,7 +17,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { bytesToPreviewText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
-import { reasonLabel, sourceText, attemptsText, receiversText, RETRY_ALL_MAX } from '/js/modules/tentabus/unprocessed.js';
+import { reasonLabel, sourceText, attemptsText, receiversText, plainCheckError, RETRY_ALL_MAX } from '/js/modules/tentabus/unprocessed.js';
 import { windowEl, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -53,7 +53,10 @@ export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
   // What the pattern check reports is the validator's own technical text.
   const errorKey = rec.atWrite ? 'unprocessed.view.k_error_at_write' : 'unprocessed.view.k_error';
   if (rec.errorHidden) facts.push([T(errorKey), escapeHtml(T('unprocessed.view.error_hidden'))]);
-  else if (rec.errorMessage) facts.push([T(errorKey), escapeHtml(rec.errorMessage)]);
+  else if (rec.errorMessage) {
+    const plain = plainCheckError(rec.errorMessage);
+    facts.push([T(errorKey), plain ? `<span title="${escapeAttr(rec.errorMessage)}">${escapeHtml(plain)}</span>` : escapeHtml(rec.errorMessage)]);
+  }
   facts.push([T('unprocessed.view.k_attempts'), escapeHtml(attemptsText(rec, maxAttempts))]);
   if (rec.atWrite) {
     facts.push([T('unprocessed.view.k_rejected'), when(rec.rejectedMs)]);
