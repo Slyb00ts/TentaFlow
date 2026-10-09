@@ -881,6 +881,22 @@ fn direct_child_cancel_creates_parent_incident_and_parent_cancel_preserves_child
 }
 
 #[test]
+fn parent_cancel_closes_its_waiting_call_without_a_child_cancelled_incident() {
+    let f = Fixture::new();
+    let leaf = publish_model(&f, &user_model(None));
+    let outer = publish_model(&f, &caller(&leaf, BTreeMap::new()));
+    let parent = messages::test_support::start_version(&f, &outer);
+    let child = child_id(&f, &parent.instance_id);
+    repository::cancel_instance(&f.db, &f.owner, &stamp("cancel parent"),
+        &parent.instance_id, parent.revision).unwrap();
+    let after = repository::get_instance(&f.db, &f.owner, &parent.instance_id, None).unwrap();
+    assert_eq!(after.status, ProcessInstanceStatus::Cancelled);
+    assert!(after.incidents.iter().all(|incident| incident.code != "CALL_CHILD_CANCELLED"));
+    assert_eq!(repository::get_instance(&f.db, &f.owner, &child, None).unwrap().status,
+        ProcessInstanceStatus::Cancelled);
+}
+
+#[test]
 fn uncaught_error_end_is_genuine_terminal_error_and_direct_parent_waits() {
     let f = Fixture::new();
     let leaf = publish_model(&f, &error_end_model());

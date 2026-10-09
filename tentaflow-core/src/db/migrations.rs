@@ -18456,6 +18456,101 @@ mod tests {
         assert!(snapshot.incidents.iter().any(|incident| incident.code == "REPETITION_LIMIT"));
     }
 
+    /// A waiting call from `parent` to `child` on top of the history fixture. Each
+    /// listed instance holds one open repetition group padded past the retained-byte
+    /// limit when it is named in `over`.
+    fn call_pair_capacity_fixture(conn: &Connection, parent: &str, child: &str, over: &[&str]) {
+        service_invocation_history_fixture(conn);
+        for id in [parent, child] {
+            conn.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,selected_process_id,start_node_id) SELECT ?1,definition_id,version,org_id,initiator_user_id,1,'waiting','{}',1,1,selected_process_id,start_node_id FROM bpmn_instances WHERE instance_id='selected-instance'",
+                [id]).unwrap();
+            conn.execute("INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES(?1,?1)", [id]).unwrap();
+            for (suffix, status) in [("source", "consumed"), ("parent", "waiting")] {
+                conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?2,'Service_1','Start_Service','[]',?3,1)",
+                    rusqlite::params![format!("{id}-{suffix}"), id, status]).unwrap();
+            }
+            if over.contains(&id) {
+                conn.execute("INSERT INTO bpmn_repetition_groups(group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,output_collection_variable,entry_variables_json,total_count,created_count,completed_count,loop_state_revision,next_ordinal,retained_bytes,revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?2,'selected-definition',1,'Service_1','mi_sequential','open',?3,?4,'results','{}',1,1,0,0,1,0,1,1,1)",
+                    rusqlite::params![format!("{id}-group"), id, format!("{id}-source"), format!("{id}-parent")]).unwrap();
+                let padding = serde_json::json!({"group_id":format!("{id}-group"),
+                    "padding":"x".repeat(65 * 1024 * 1024)}).to_string();
+                conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES(?1,?2,?2,10,1,'repetition_occurrence_started','Service_1',?3)",
+                    rusqlite::params![format!("{id}-padding"), id, padding]).unwrap();
+                conn.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE group_id=?2",
+                    rusqlite::params![i64::try_from(padding.len()).unwrap(), format!("{id}-group")]).unwrap();
+            }
+        }
+        conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('call-token',?1,?1,'Service_1','Start_Service','[]','waiting',1)",
+            [parent]).unwrap();
+        conn.execute("INSERT INTO bpmn_call_pins(definition_id,version,node_id,called_definition_id,called_version,called_element_json,model_sha256) VALUES('selected-definition',1,'Service_1','selected-definition',1,'{}',?1)",
+            ["a".repeat(64)]).unwrap();
+        conn.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,parent_arrival_edge_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,called_process_id,child_start_node_id,model_sha256,revision,status,created_at_ms,updated_at_ms) SELECT 'the-call',?1,?1,'call-token','Start_Service','Service_1',?2,'selected-definition',1,'selected-definition',1,selected_process_id,start_node_id,?3,1,'waiting',1,1 FROM bpmn_instances WHERE instance_id=?1",
+            rusqlite::params![parent, child, "a".repeat(64)]).unwrap();
+    }
+
+    #[test]
+    fn service_invocation_migration_does_not_latch_a_call_child_its_over_capacity_parent_already_closed() {
+        // Instances are met in id order, so the parent comes first here: its capacity
+        // cancel closes the child, which must then be skipped.
+        let conn = Connection::open_in_memory().unwrap();
+        call_pair_capacity_fixture(&conn, "aa-parent", "zz-child", &["aa-parent", "zz-child"]);
+        run(&conn).unwrap();
+        for id in ["aa-parent", "zz-child"] {
+            assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id=?1", [id],
+                |row| row.get::<_,String>(0)).unwrap(), "cancelled", "{id}");
+        }
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_calls WHERE call_id='the-call'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "cancelled");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='aa-parent' AND code='REPETITION_LIMIT' AND resolved_at_ms IS NULL", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='zz-child'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0, "a closed call child gains no incident");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events WHERE instance_id='zz-child' AND kind IN ('incident','repetition_group_blocked')", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0, "a closed call child gains no event");
+        assert_eq!(conn.query_row("SELECT terminal_capacity FROM bpmn_repetition_groups WHERE group_id='zz-child-group'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_latches_a_call_child_and_its_over_capacity_parent_once_each() {
+        // The child is met first: the parent is told, then latched by its own overrun.
+        let conn = Connection::open_in_memory().unwrap();
+        call_pair_capacity_fixture(&conn, "zz-parent", "aa-child", &["zz-parent", "aa-child"]);
+        run(&conn).unwrap();
+        for id in ["zz-parent", "aa-child"] {
+            assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id=?1", [id],
+                |row| row.get::<_,String>(0)).unwrap(), "cancelled", "{id}");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND code='REPETITION_LIMIT'", [id],
+                |row| row.get::<_,i64>(0)).unwrap(), 1, "{id}");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL AND code<>'REPETITION_LIMIT'", [id],
+                |row| row.get::<_,i64>(0)).unwrap(), 0, "{id}");
+        }
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='zz-parent' AND code='CALL_CHILD_CANCELLED' AND resolved_at_ms IS NOT NULL", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1, "the parent was told before its own cancel resolved it");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_tells_a_parent_below_the_limit_that_its_call_child_was_cancelled() {
+        let conn = Connection::open_in_memory().unwrap();
+        call_pair_capacity_fixture(&conn, "live-parent", "over-child", &["over-child"]);
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='over-child'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "cancelled");
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_calls WHERE call_id='the-call'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "cancelled");
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='live-parent'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
+        let incident: (String,String,Option<i64>) = conn.query_row(
+            "SELECT code,node_id,resolved_at_ms FROM bpmn_incidents WHERE instance_id='live-parent'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(incident, ("CALL_CHILD_CANCELLED".into(),"Service_1".into(),None));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events WHERE instance_id='live-parent' AND kind='incident' AND json_extract(data_json,'$.call_id')='the-call'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
     #[test]
     fn service_invocation_migration_rolls_back_created_uncertainty_on_later_unpinned_history() {
         let conn = Connection::open_in_memory().unwrap();
@@ -18528,13 +18623,18 @@ mod tests {
 
     #[test]
     fn service_invocation_migration_prepares_a_requeued_job_only_when_a_retry_names_it_as_the_new_job() {
-        for (evidence, prepared) in [("new_job", true), ("old_job", false), ("resolved_incident", false)] {
+        for (evidence, prepared) in [("new_job", true), ("old_job", false), ("resolved_incident", false),
+            ("claimed_before_retry", true), ("claimed_after_retry", false)] {
             let conn = Connection::open_in_memory().unwrap();
             service_invocation_history_fixture(&conn);
             conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1 WHERE job_id='queued-job'", []).unwrap();
             match evidence {
-                "new_job" => {
+                "new_job" | "claimed_before_retry" | "claimed_after_retry" => {
                     conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('retry-event','selected-instance','selected-instance',100,2,'job_retried','Service_1','{\"old_job_id\":\"older-job\",\"new_job_id\":\"queued-job\"}')", []).unwrap();
+                    if evidence != "new_job" {
+                        let seq = if evidence == "claimed_after_retry" { 101 } else { 99 };
+                        conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('claim-event','selected-instance','selected-instance',?1,2,'service_claimed','Service_1','{\"job_id\":\"queued-job\",\"attempt\":1,\"fence\":1}')", [seq]).unwrap();
+                    }
                 }
                 "old_job" => {
                     conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('retry-event','selected-instance','selected-instance',100,2,'job_retried','Service_1','{\"old_job_id\":\"queued-job\",\"new_job_id\":\"newer-job\"}')", []).unwrap();
@@ -19573,6 +19673,15 @@ fn resolve_historical_repetition_capacity(
     use rusqlite::{params, OptionalExtension};
     use uuid::Uuid;
 
+    // An earlier capacity cancel in this migration may have closed this instance
+    // already (a call child of a cancelled parent), and a closed instance must
+    // not receive a new incident.
+    let status: String = conn.query_row(
+        "SELECT status FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| row.get(0))?;
+    if matches!(status.as_str(), "completed" | "cancelled" | "error") {
+        return Ok(());
+    }
     let open_group: Option<(String, String, String, i64)> = conn.query_row(
         "SELECT group_id,scope_id,node_id,completed_count FROM bpmn_repetition_groups
          WHERE instance_id=?1 AND status='open' AND terminal_capacity=0
@@ -19801,9 +19910,12 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
         // names it as the NEW job. A resolved incident proves only that some earlier
         // attempt was handled, and an `old_job_id` match means the job was replaced
         // by a retry, so neither makes it dispatchable; it is treated like any
-        // attempted job.
+        // attempted job. A claim recorded after the retry means the new job was
+        // already dispatched once more, so the retry no longer proves it unsent.
         let retry_evidence = attempted && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND kind='job_retried' AND json_extract(data_json,'$.new_job_id')=?2)",
+            "SELECT EXISTS(SELECT 1 FROM bpmn_events r WHERE r.instance_id=?1 AND r.kind='job_retried' AND json_extract(r.data_json,'$.new_job_id')=?2
+                AND NOT EXISTS(SELECT 1 FROM bpmn_events c WHERE c.instance_id=r.instance_id AND c.kind='service_claimed'
+                    AND json_extract(c.data_json,'$.job_id')=?2 AND c.seq>r.seq))",
             params![instance_id,job_id], |row| row.get::<_, bool>(0))?;
         let unclaimed = !attempted && result_origin.is_none();
         let (phase, evidence, quarantine_code) = if accepted.is_some() {

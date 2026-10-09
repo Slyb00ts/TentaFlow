@@ -300,14 +300,17 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   której poprzednia wersja nie mogła „udowodnić”, jest przekształcana w jawny stan zamiast
   przerywać migrację (po awarii nowy plik wykonywalny nigdy by nie wystartował). Zadanie
   `running` jest traktowane jak po rozruchowym `recover_jobs`: zadanie `error` z podbitym
-  ogrodzeniem, instancja w `incident`, a wywołanie przechodzi w `uncertain` /
+  ogrodzeniem, a dla żywej aktywności także instancja w `incident` (zamknięta aktywność dostaje
+  zadanie `cancelled` i rozwiązany incydent, bez zmiany statusu instancji), a wywołanie przechodzi w `uncertain` /
   `boundary_unknown` z **jednym** incydentem `EXTERNAL_OUTCOME_UNCERTAIN` (bez bezpośredniego
   ponowienia); przyczyna `INTERRUPTED` jest polem `reason` zdarzenia incydentu, tak jak w
   `fail_job`. Zadanie `completed` bez przyjętego zdarzenia źródłowego dostaje
   `SERVICE_HISTORY_UNPROVEN`, a próba bez znanego wyniku `EXTERNAL_OUTCOME_UNCERTAIN`.
   Zadanie `queued` bez prób (`attempt=0`, bez ogrodzenia i pracownika) staje się `prepared`.
   Zadanie `queued` z próbami staje się `prepared` tylko wtedy, gdy zdarzenie `job_retried`
-  wymienia je jako NOWE zadanie (`new_job_id`); rozwiązany incydent dowodzi jedynie, że jakaś
+  wymienia je jako NOWE zadanie (`new_job_id`) i po tym zdarzeniu (wyższe `seq`) nie ma zdarzenia
+  `service_claimed` tego zadania — późniejsze pobranie oznacza ponowną wysyłkę, więc zadanie jest
+  `uncertain`; rozwiązany incydent dowodzi jedynie, że jakaś
   wcześniejsza próba została obsłużona, a `old_job_id` oznacza, że zadanie zastąpiono ponowieniem
   (jest wyparte, więc nie jest wysyłane ponownie). Bez dowodu zadanie jest `uncertain` + otwarty
   `EXTERNAL_OUTCOME_UNCERTAIN` i zadanie `error`
@@ -328,10 +331,19 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   w `cancel_instance_on` (powód `repetition_limit` z odwołaniem do zdarzenia blokady): tokeny,
   zadania, zlecenia Service, zadania użytkownika, timery, subskrypcje i wyścigi są zamykane, incydenty
   poza terminalnym incydentem grupy są rozwiązywane, a status instancji to `cancelled`. Dzięki temu
-  żadne późniejsze przejście nie trafia na zatrzaśniętą grupę żywej instancji. Gdy żywa instancja
-  przekracza limit, a nie ma już otwartej grupy do zatrzaśnięcia, migracja nie zawodzi: zapisuje
-  otwarty incydent `REPETITION_LIMIT` (`repetition_bytes`) i instancja zostaje w stanie
-  `incident` do decyzji operatora.
+  żadne późniejsze przejście nie trafia na zatrzaśniętą grupę żywej instancji. To rozstrzygnięcie
+  dotyczy wyłącznie instancji nadal żywej: status jest odczytywany ponownie na jego początku, więc
+  instancja zamknięta wcześniejszym anulowaniem w tej samej migracji (np. wywołane dziecko
+  anulowanego rodzica) nie dostaje incydentu ani zdarzenia. Gdy żywa instancja przekracza limit, a
+  nie ma już otwartej grupy do zatrzaśnięcia, migracja nie zawodzi: zapisuje otwarty incydent
+  `REPETITION_LIMIT` (`repetition_bytes`) i instancja zostaje w stanie `incident` do decyzji
+  operatora (jedyny przypadek przekroczenia limitu bez anulowania).
+  **Wywołane dziecko zamknięte anulowaniem pojemnościowym** (w środowisku uruchomieniowym i w
+  migracji) powiadamia rodzica tak jak anulowanie przez właściciela: oczekujący wiersz
+  `bpmn_calls` przechodzi w `cancelled`, a rodzic dostaje incydent `CALL_CHILD_CANCELLED` i status
+  `incident` — chyba że rodzic jest anulowany w tej samej operacji (wiersz zamyka wtedy zamknięcie
+  wywołań rodzica i incydent nie powstaje) albo jest już zamknięty (zmienia się tylko wiersz).
+  `cancel_instance_on` i zamknięcie wywołań wymagają transakcji.
   **Migracja nadal odmawia (i cofa się w całości) wyłącznie przy uszkodzeniu lub manipulacji
   danymi**, czyli: niepusty `foreign_key_check` na wejściu lub na wyjściu oraz błąd
   `integrity_check`; niedokładny licznik bajtów grupy powtórzeń; zmieniony przypięty model

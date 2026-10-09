@@ -1746,3 +1746,37 @@ fn active_occurrence_capacity_closes_repeated_manual_tasks_without_acknowledgmen
     assert_eq!(opened, 16);
     assert_eq!(acknowledged, 0);
 }
+
+#[test]
+fn capacity_cancel_of_a_call_child_tells_a_parent_below_the_limit() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("call child capacity", None));
+    let leaf = publish_model(&fixture,
+        &verification_capacity_model(&fixture.owner.user_id, &flow_id, false));
+    let outer = publish_model(&fixture,
+        &super::call_tests::caller(&leaf, BTreeMap::new()));
+    let parent = super::messages::test_support::start_version(&fixture, &outer);
+    let child_id = super::call_tests::child_id(&fixture, &parent.instance_id);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &child_id).unwrap();
+    let gate = snapshot.user_tasks.iter().find(|task|
+        task.node_id == "GateHuman" && task.status == ProcessUserTaskStatus::Open).unwrap();
+    let command = stamp("release capacity inside a call child");
+    let outputs = json!({"gate":"approved"});
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let plan = planned_completion(&snapshot, &gate.user_task_id, &command, &outputs, at_ms);
+    assert!(plan.repetition_capacity.is_some(), "real 65th ordinal denial in the child");
+    let committed = repository::complete_user_task(&fixture.db, &fixture.owner, &command,
+        &child_id, &gate.user_task_id, snapshot.instance.revision, &outputs, None,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms).unwrap();
+    assert_eq!(committed.instance.status, ProcessInstanceStatus::Cancelled);
+    let parent_after = repository::get_instance(&fixture.db, &fixture.owner,
+        &parent.instance_id, None).unwrap();
+    assert_eq!(parent_after.status, ProcessInstanceStatus::Incident);
+    assert_eq!(parent_after.active_node_ids, vec!["Call_1"]);
+    assert_eq!(parent_after.incidents.len(), 1);
+    assert_eq!(parent_after.incidents[0].code, "CALL_CHILD_CANCELLED");
+    let call_status: String = fixture.db.read().unwrap().query_row(
+        "SELECT status FROM bpmn_calls WHERE child_instance_id=?1", [&child_id],
+        |row| row.get(0)).unwrap();
+    assert_eq!(call_status, "cancelled");
+}

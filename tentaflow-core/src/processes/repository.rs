@@ -7485,7 +7485,7 @@ fn validate_call_tree_budget_on(conn: &Connection, instance_id: &str) -> Result<
 }
 
 fn call_incident_on(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     call: &CallActivation,
     actor_id: &str,
     code: &str,
@@ -7522,6 +7522,38 @@ fn call_incident_on(
     Ok(())
 }
 
+/// A call row still waiting when its child closes means no parent-side
+/// operation closed it first (call closure and scope cancellation flip the row
+/// before cancelling the child), so the parent would wait for a child that no
+/// longer runs. A parent that is already closed gets only the row update.
+fn notify_parent_of_cancelled_call_child_on(
+    tx: &Connection,
+    child_instance_id: &str,
+    actor_id: &str,
+    capacity: bool,
+    at_ms: i64,
+) -> Result<()> {
+    let Some(call) = calls_on(tx, child_instance_id)?
+        .into_iter()
+        .find(|c| c.child_instance_id == child_instance_id && c.status == ProcessCallStatus::Waiting)
+    else {
+        return Ok(());
+    };
+    tx.execute("UPDATE bpmn_calls SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE call_id=?2 AND revision=?3",params![at_ms,call.call_id,sql_incrementable(call.revision)?])?;
+    let parent_closed: bool = tx.query_row(
+        "SELECT status IN ('completed','cancelled','error') FROM bpmn_instances WHERE instance_id=?1",
+        [&call.parent_instance_id], |row| row.get(0))?;
+    if parent_closed {
+        return Ok(());
+    }
+    let message = if capacity {
+        "the called process was cancelled because its repetition capacity was exceeded"
+    } else {
+        "the called process was cancelled by its initiator"
+    };
+    call_incident_on(tx, &call, actor_id, "CALL_CHILD_CANCELLED", message, at_ms)
+}
+
 fn call_subtree_ids_on(conn: &Connection, root: &str) -> Result<Vec<String>> {
     let mut ids = vec![root.to_owned()];
     let mut index = 0;
@@ -7555,6 +7587,7 @@ fn cancel_call_children_on(
     capacity: Option<CapacityCause<'_>>,
     witnesses: bool,
 ) -> Result<Vec<CancelledJobClaim>> {
+    ensure!(!tx.is_autocommit(), "call closure requires a transaction");
     if let Some(source) = termination {
         let found: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND event_id=?2 AND kind='terminate_end_reached')",
@@ -21494,6 +21527,10 @@ fn apply_plan_on(
         affected == 1,
         "process instance revision conflict or closed instance"
     );
+    if status == ProcessInstanceStatus::Cancelled {
+        notify_parent_of_cancelled_call_child_on(tx, instance_id, actor_id,
+            plan.repetition_capacity.is_some(), at_ms)?;
+    }
     let mut staged_call_requests = BTreeMap::new();
     staged_call_requests.insert(instance_id.to_owned(), plan.call_requests.clone());
     let mut failed_call_requests = HashMap::new();
@@ -23528,20 +23565,6 @@ pub fn cancel_instance(
         });
     }
     let cancelled_claims = cancel_instance_on(&tx, actor, instance_id, expected_revision, at_ms, None, None, true)?;
-    if let Some(call) = calls_on(&tx, instance_id)?
-        .into_iter()
-        .find(|c| c.child_instance_id == instance_id && c.status == ProcessCallStatus::Waiting)
-    {
-        tx.execute("UPDATE bpmn_calls SET status='cancelled',revision=revision+1,updated_at_ms=?1 WHERE call_id=?2 AND revision=?3",params![at_ms,call.call_id,sql_incrementable(call.revision)?])?;
-        call_incident_on(
-            &tx,
-            &call,
-            &actor.user_id,
-            "CALL_CHILD_CANCELLED",
-            "the called process was cancelled by its initiator",
-            at_ms,
-        )?;
-    }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
@@ -23563,6 +23586,7 @@ pub(crate) fn cancel_instance_on(
     capacity: Option<CapacityCause<'_>>,
     witnesses: bool,
 ) -> Result<Vec<CancelledJobClaim>> {
+    ensure!(!tx.is_autocommit(), "instance cancellation requires a transaction");
     let reason = if termination.is_some() { "terminate_end" }
         else if capacity.is_some() { "repetition_limit" } else { "instance_cancelled" };
     let mut claims = tx.prepare("SELECT job_id,attempt,fence,worker_id FROM bpmn_jobs WHERE instance_id=?1 AND status='running' ORDER BY job_id")?;
@@ -23789,6 +23813,7 @@ pub(crate) fn cancel_instance_on(
         at_ms,
         None,
     )?;
+    notify_parent_of_cancelled_call_child_on(tx, instance_id, &actor.user_id, capacity.is_some(), at_ms)?;
     cancelled_claims.extend(cancel_call_children_on(
         tx,
         instance_id,
@@ -32139,5 +32164,18 @@ mod calendar_tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn instance_and_call_closure_refuse_a_connection_outside_a_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(conn.is_autocommit());
+        let actor = ProcessActor { org_id: "org".into(), user_id: "user".into() };
+        let error = cancel_instance_on(&conn, &actor, "instance", 1, 1, None, None, true)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("requires a transaction"), "{error:#}");
+        let error = cancel_call_children_on(&conn, "instance", None, &[], "user", "instance_cancelled",
+            1, None, None, true).unwrap_err();
+        assert!(format!("{error:#}").contains("requires a transaction"), "{error:#}");
     }
 }
