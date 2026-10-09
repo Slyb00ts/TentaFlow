@@ -289,9 +289,81 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   Builderze): deterministyczne uruchomienie w prywatnej bazie SQLite z zegarem symulacji,
   stałymi identyfikatorami i śladem kroków. Obsługuje zadania skryptowe, użytkownika
   i ręczne, bramki oraz timer-catch; autoryzacja według ACL przechwyconej przy starcie.
-  Limity: 16 uruchomień łącznie, 4 na właściciela, 16 MiB na uruchomienie. Protokół:
+  Limity: 16 uruchomień łącznie, 4 na organizację, 4 na właściciela, 16 MiB na uruchomienie,
+  wygaszanie po 30 min bezczynności. Protokół:
   sześć par żądanie/odpowiedź `ProcessPayload::Simulation*` (dopisane na końcu enuma),
   obsługa w `dispatch/processes.rs`, kodek JS i klucze i18n w pięciu językach.
+
+### 10.2a Poprawki po przeglądzie (2026-10-09)
+
+- **Migracja 196 nie odmawia już rozruchu.** Historia zadań usługi, której poprzednia wersja nie
+  mogła „udowodnić”, jest przekształcana w jawny stan zamiast przerywać migrację (po awarii nowy
+  plik wykonywalny nigdy by nie wystartował). Zadanie `running` jest traktowane jak po
+  rozruchowym `recover_jobs` starej wersji: zadanie `error` z podbitym ogrodzeniem, incydent
+  `INTERRUPTED`, instancja w `incident`, a wywołanie przechodzi w `uncertain` /
+  `boundary_unknown` z incydentem `EXTERNAL_OUTCOME_UNCERTAIN` (bez bezpośredniego ponowienia).
+  Zadanie `completed` bez przyjętego zdarzenia źródłowego, zadanie ponownie zakolejkowane po
+  próbach (`queued`, `attempt>0`) i próba w zamkniętej aktywności są klasyfikowane tak samo:
+  ponowne kolejkowanie po ręcznym „Ponów” daje `prepared`, reszta `uncertain` z incydentem
+  `SERVICE_HISTORY_UNPROVEN` (zaakceptowane z niezależnego dowodu) albo
+  `EXTERNAL_OUTCOME_UNCERTAIN`. Incydent jest otwarty tylko dla żywej aktywności; dla zamkniętej
+  zostaje rozwiązanym zapisem historii, więc nie blokuje instancji. Liczniki
+  `retained_bytes` grup powtórzeń są przeliczane dla dotkniętych zadań.
+- **Bramka oparta na zdarzeniach**: wejścia gałęzi Receive/Message/Signal są liczone przed
+  uzbrojeniem czegokolwiek. Błąd skojarzenia (np. `1 / 0`, brakująca zmienna) parkuje token na
+  gałęzi z incydentem `ACTIVITY_IO_INPUT_FAILED` (świadek `input_failed`), bez wyścigu,
+  subskrypcji ani timera rodzeństwa; wcześniej przejście kończyło się błędem bez incydentu.
+- **Budżet zdarzenia przechwycenia wejść** (384 KiB): `evaluate_activity_inputs` zlicza bajty
+  kolejnych wejść i po przekroczeniu zgłasza błąd skojarzenia, czyli ten sam incydent
+  `ACTIVITY_IO_INPUT_FAILED`; walidator odtworzeniowy wywołuje tę samą funkcję, więc wynik jest
+  identyczny po obu stronach. Nie deduplikujemy wartości w zdarzeniu: kształt zdarzenia jest
+  porównywany bajt w bajt przez walidator i czytany przez oś czasu, a świadek i tak zawiera
+  pełny wektor wejść; zmiana wymagałaby jednoczesnej zmiany formatu zdarzenia, walidatora i UI.
+- **Symulacja — zasoby.** Bezczynny przebieg wygasa po 30 min (`SIMULATION_IDLE_TTL`), limit
+  4 przebiegów na organizację (obok 4 na właściciela i 16 na węzeł), a każdy `Start` najpierw
+  odzyskuje przebiegi, których źródło zostało zarchiwizowane, zastąpione nową wersją lub którego
+  właściciel jest nieaktywny. Przebieg w trakcie operacji nigdy nie jest wygaszany.
+- **Symulacja — odpowiedzi.** Widok zwraca najnowsze zdarzenia (≤500, ≤4 MiB) i kroki śladu
+  (≤200, ≤1 MiB) mieszczące się w 12 MiB ramki oraz liczniki `events_omitted` /
+  `trace_steps_omitted` (pola dopisane z `#[serde(default)]`); okno symulacji pokazuje, ile
+  starszych zdarzeń pominięto.
+- **Symulacja — koszt `Start`.** `SimulationDatabase::open` odtwarzał pełną drabinkę migracji
+  (197 kroków i kontrole spójności) przy każdym `Start`. Pomiar (profil testowy, jeden wątek,
+  maszyna pod obciążeniem): 901 ms mediana z 5 prób (895–907 ms). Handlery synchroniczne
+  (`#[handler]` bez `async`) są wykonywane bezpośrednio w `Box::pin(async move { f(req, ctx) })`,
+  bez `spawn_blocking`, więc ten czas blokował wątek roboczy tokio. Schemat jest teraz budowany
+  raz na proces i kopiowany API backup SQLite (cecha `backup` rusqlite): mediana 0,3 ms z 9 prób.
+  Liczba w profilu release nie została zmierzona (nie budowano wariantu release); kopia stron
+  pamięciowej bazy nie zależy od liczby kroków drabinki.
+- **Symulacja — łączenie gałęzi w osobnych żądaniach.** Każde żądanie otwiera sklep od nowa z
+  nowym alokatorem identyfikatorów, więc aktywacja rozwidlenia z wcześniejszego żądania była
+  odrzucana jako „nie wydana przez alokator” przy dojściu do bramki łączącej. Plan może teraz
+  powoływać się na aktywacje utrwalone w tokenach i pokwitowaniach przebiegu.
+- **Symulacja — izolacja zapisu.** `ExecutionMode::Simulation` niesie dowód
+  `PrivateSimulationMode`, który tworzy wyłącznie `simulation.rs`, a każdy punkt wejścia
+  (`start_simulation_plan_on`, `apply_simulation_plan_on`, `fire_timer_on`) sprawdza, że
+  transakcja działa na prywatnej bazie symulacji; transakcja produkcyjna jest odrzucana.
+
+**Ponów dla zablokowanego mapowania wyjścia — decyzja.** Nie wdrożone, bo nie da się tego zrobić
+spójnie bez nowej migracji i nowej gałęzi walidatora:
+
+- `output_blocked` jest świadkiem dowodowym: wyzwalacz CAS dopuszcza tylko przejście
+  `result_accepted → output_applied | output_blocked`, a po zapisie incydent i wyjścia są
+  niezmienne. Ponowna ewaluacja skojarzeń wyjścia na tych samych (przypiętych) danych daje ten
+  sam błąd, więc „Ponów” miałoby sens wyłącznie jako ponowne liczenie względem bieżących zmiennych
+  — to nowa semantyka, której plan nie definiuje.
+- Wyświetlane `can_retry` pochodzi z `job_direct_retryable_on` (tylko zadanie usługi z fazą
+  `proved_no_effect`), a `retry_job` przyjmuje wyłącznie `AcceptedInputRef::Retry` dla zadania.
+- `SCRIPT_MAPPING_FAILED` z IO: świadek leży na tokenie aktywacji (`waiting`), a zaparkowany token
+  to inny `token_id`. `uq_bpmn_io_activation` (instancja, zakres, `token_id`, właściciel fazy,
+  porządek) nie blokuje zapisu świadka na zaparkowanym tokenie, ale ponowne użycie tokenu
+  zerwałoby więź z przechwyconymi wejściami (walidator wymaga, by aktywacja i jej wejścia
+  powstały w tym samym planie), a ponowne użycie tokenu aktywacji wymagałoby drugiego wiersza
+  świadka o tym samym kluczu. Odpowiedź: nie, bez generacji w kluczu.
+- B4 musi dodać: kolumnę generacji w kluczu `uq_bpmn_io_activation` i kolejny wiersz świadka po
+  `output_blocked`, wpis `AcceptedInputRef::OutputRetry`, gałąź walidatora planu ponowienia,
+  projekcję `can_retry` dla incydentów `ACTIVITY_IO_OUTPUT_FAILED` / `SCRIPT_MAPPING_FAILED` oraz
+  zasadę, względem jakich zmiennych liczone jest ponowienie.
 
 ### 10.3 Co zostaje
 
