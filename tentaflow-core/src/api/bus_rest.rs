@@ -295,6 +295,7 @@ pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         // caller-visible failure).
         BusServiceError::SchemaViolation { .. }
         | BusServiceError::SchemaIncompatible { .. }
+        | BusServiceError::SchemaCompareTooComplex { .. }
         | BusServiceError::SchemaTypeUnsupported { .. }
         | BusServiceError::SchemaRefIdCollision { .. } => error_response(
             StatusCode::BAD_REQUEST,
@@ -1355,6 +1356,31 @@ mod tests {
     // picks the options itself.
     use crate::bus::topics::TopicOptions;
     use test_support::start_test_instance;
+
+    #[test]
+    fn a_comparison_that_gave_up_answers_like_an_incompatibility() {
+        let status = |e: BusServiceError| map_bus_error(&e).status();
+        assert_eq!(
+            status(BusServiceError::SchemaCompareTooComplex {
+                subject: "s".into(),
+                mode: "backward",
+                detail: "d".into(),
+            }),
+            status(BusServiceError::SchemaIncompatible {
+                subject: "s".into(),
+                mode: "backward",
+                detail: "d".into(),
+            })
+        );
+        assert_eq!(
+            status(BusServiceError::SchemaCompareTooComplex {
+                subject: "s".into(),
+                mode: "backward",
+                detail: "d".into(),
+            }),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn parse_bus_records_path_matches_the_legacy_shape() {

@@ -588,6 +588,11 @@ pub fn register(
                     mode: effective_compatibility.as_str(),
                     detail,
                 },
+                SchemaError::LimitExceeded(detail) => BusServiceError::SchemaCompareTooComplex {
+                    subject: subject.to_string(),
+                    mode: effective_compatibility.as_str(),
+                    detail,
+                },
                 SchemaError::Unsupported {
                     schema_type,
                     operation,
@@ -1231,6 +1236,54 @@ mod tests {
                 .len(),
             1,
             "identical content must not create a second version row"
+        );
+    }
+
+    #[test]
+    fn register_reports_a_comparison_that_gave_up_apart_from_an_incompatibility() {
+        let chain = |extra: &str| {
+            let mut body = String::new();
+            for i in 0..100 {
+                body.push_str(&if i < 99 {
+                    format!(
+                        r#"<xs:complexType name="n{i}"><xs:sequence><xs:element name="c" type="n{}"/></xs:sequence></xs:complexType>"#,
+                        i + 1
+                    )
+                } else {
+                    format!(r#"<xs:complexType name="n{i}"/>"#)
+                });
+            }
+            format!(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{extra}{body}<xs:element name="r" type="n0"/></xs:schema>"#
+            )
+        };
+        let db = fresh_db();
+        let go = |text: &str| {
+            register(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "deep",
+                SchemaType::Xsd,
+                text,
+                None,
+                None,
+            )
+        };
+        go(&chain("")).unwrap();
+        let err = go(&chain(
+            "<xs:annotation><xs:documentation>x</xs:documentation></xs:annotation>",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                BusServiceError::SchemaCompareTooComplex {
+                    mode: "backward",
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 

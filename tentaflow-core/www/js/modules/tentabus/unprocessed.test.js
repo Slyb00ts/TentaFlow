@@ -20,7 +20,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   unprocessedRecord, mergeNewest, commonReason, retryAllPlan, attemptsText, sourceText, whoCanRetry, receiversText,
-  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice, plainCheckError, reasonLabel, REASONS,
+  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice, plainCheckError, shortPath, reasonLabel, REASONS,
 } = await import('./unprocessed.js');
 const { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll, retryImpact, retryAllImpact } = await import('./unprocessed-windows.js');
 
@@ -376,7 +376,8 @@ test('the HL7 profile check is told in plain words, anything else as the server 
   assert.equal(plainCheckError('OBX-5 is required but empty or missing (segment occurrence 12)'), 'Pole OBX-5 jest wymagane, a w 12. segmencie OBX jest puste lub go nie ma.');
   assert.equal(plainCheckError("required segment 'PV1' is missing"), 'Brakuje wymaganego segmentu PV1.');
   assert.equal(plainCheckError('/pacjent: required'), '');
-  assert.equal(plainCheckError('hl7: message does not start with an MSH segment'), '');
+  assert.equal(plainCheckError('hl7: message does not start with an MSH segment'), 'Wiadomość nie zaczyna się od segmentu MSH, więc to nie jest wiadomość HL7 v2.');
+  assert.equal(plainCheckError('something else entirely'), '');
   const rec = unprocessedRecord('wyniki-badan', {
     ...writeRejection({ offset: 4, atMs: NOW - MIN }),
     headers: headers({ 'dlq.source_topic': 'wyniki-badan', 'dlq.reason': 'schema_violation', 'dlq.error_message': 'PID-3 is required but empty or missing (segment occurrence 1)', 'dlq.rejected_at_ms': NOW - MIN }),
@@ -395,4 +396,65 @@ test('a message the check gave up on has its own reason, not "does not match the
   assert.equal(rec.reason, 'schema_check_too_complex');
   assert.equal(reasonLabel(rec.reason), 'Wiadomości nie udało się sprawdzić wzorem — jest zbyt złożona');
   assert.notEqual(reasonLabel(rec.reason), reasonLabel('schema_violation'));
+});
+
+// The exact messages of the Rust checkers (payload_format/hl7v2.rs, hl7v2_profile.rs, xsd.rs);
+// `schema_error_phrases_are_stable` pins the same strings there.
+test('every HL7 and XSD sentence a message can be refused with is told in Polish', () => {
+  const hl7 = [
+    ['hl7: message does not start with an MSH segment', 'Wiadomość nie zaczyna się od segmentu MSH, więc to nie jest wiadomość HL7 v2.'],
+    ['hl7: MSH segment has no field separator', 'Segment MSH nie zawiera znaku podziału pól.'],
+    ['hl7: segment id is not valid', 'Nazwa jednego z segmentów jest niepoprawna — powinna mieć trzy znaki: litery lub cyfry.'],
+    ['hl7: a segment is missing the field separator after its id', 'W jednym z segmentów po nazwie brakuje znaku podziału pól.'],
+    ['hl7: empty message', 'Wiadomość jest pusta.'],
+    ['hl7: not valid utf-8: invalid utf-8 sequence of 1 bytes from index 3', 'Wiadomość nie jest poprawnym tekstem UTF-8.'],
+  ];
+  for (const [server, expected] of hl7) assert.equal(plainCheckError(server), expected, server);
+  const xsd = [
+    ['/drzewo/dziecko: element is not allowed here', '/drzewo/dziecko: ten element nie może tu wystąpić.'],
+    ['/faktura/numer: element occurs more than once', '/faktura/numer: ten element występuje częściej, niż wolno.'],
+    ['/faktura: required child elements are missing', '/faktura: brakuje wymaganych elementów w środku.'],
+    ["/faktura: required child element 'termin' is missing", '/faktura: brakuje wymaganego elementu „termin”.'],
+    ['/faktura: character data is not allowed in element-only content', '/faktura: ten element zawiera tylko inne elementy, więc nie może mieć tekstu.'],
+    ['<root>: root element \'x\' is not declared', 'Element główny „x” nie jest opisany we wzorze.'],
+    ['<root>: more than one root element', 'Dokument ma więcej niż jeden element główny.'],
+    ['<root>: DOCTYPE declarations are not allowed', 'Deklaracje DOCTYPE są niedozwolone.'],
+    ['<root>: document has no root element', 'Dokument nie ma elementu głównego.'],
+    ['<root>: unmatched end tag', 'Znacznik zamykający nie ma pary.'],
+    ['/faktura: document ends inside an open element', '/faktura: dokument kończy się wewnątrz otwartego elementu.'],
+    ['/faktura: not well-formed XML', '/faktura: dokument nie jest poprawnym XML-em.'],
+    ['/faktura: entity references other than the five predefined ones are not supported', '/faktura: odwołania do encji innych niż pięć wbudowanych nie są obsługiwane.'],
+    ['/faktura/kwota: value is not a valid xs:decimal', '/faktura/kwota: wartość nie jest poprawną wartością typu xs:decimal.'],
+    ['/faktura/numer: value is shorter than minLength', '/faktura/numer: wartość jest krótsza niż minLength.'],
+    ['/faktura/numer: value is longer than maxLength', '/faktura/numer: wartość jest dłuższa niż maxLength.'],
+    ['/faktura/numer: value does not match the pattern', '/faktura/numer: wartość nie pasuje do wzorca pattern.'],
+    ['/faktura/typ: value is not one of the enumerated values', '/faktura/typ: wartość nie jest jedną z dozwolonych wartości.'],
+    ["/faktura: attribute 'id' is not declared", '/faktura: atrybut „id” nie jest opisany we wzorze.'],
+    ["/faktura: required attribute 'id' is missing", '/faktura: brakuje wymaganego atrybutu „id”.'],
+    ["/faktura: attribute 'xsi:type' is not supported (xsi:type and xsi:nil are not honoured)", '/faktura: atrybut „xsi:type” nie jest obsługiwany (xsi:type i xsi:nil nie są uwzględniane).'],
+    ["/faktura: attribute 'id' is longer than maxLength", '/faktura: wartość atrybutu „id” jest dłuższa niż maxLength.'],
+    ['/faktura: document is nested too deeply (more than 128 levels)', 'Dokument jest zagnieżdżony za głęboko (limit: 128 poziomów).'],
+    ['/faktura: document exceeds the validation work budget', '/faktura: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
+  ];
+  for (const [server, expected] of xsd) assert.equal(plainCheckError(server), expected, server);
+  assert.equal(plainCheckError('/pacjent: a sentence nobody mapped'), '');
+});
+
+test('a very deep path is shown as its first and last elements, the full text stays in the title', () => {
+  assert.equal(shortPath('/a/b/c/d/e'), '/a/b/c/d/e');
+  assert.equal(shortPath(`/drzewo${'/dziecko'.repeat(128)}`), '/drzewo/dziecko/…/dziecko/dziecko');
+  assert.equal(shortPath('/drzewo/dziecko/…/dziecko/dziecko'), '/drzewo/dziecko/…/dziecko/dziecko', 'a path the server already shortened is kept');
+  assert.ok(shortPath(`/${'n'.repeat(500)}`).length <= 121);
+  const deep = `/drzewo${'/dziecko'.repeat(128)}: element is not allowed here`;
+  assert.equal(plainCheckError(deep), '/drzewo/dziecko/…/dziecko/dziecko: ten element nie może tu wystąpić.');
+  const rec = unprocessedRecord('drzewa', {
+    ...writeRejection({ offset: 4, atMs: NOW - MIN }),
+    headers: headers({ 'dlq.source_topic': 'drzewa', 'dlq.reason': 'schema_violation', 'dlq.error_message': deep, 'dlq.rejected_at_ms': NOW - MIN }),
+  });
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  const span = win.querySelector('span[title]');
+  assert.equal(span.getAttribute('title'), deep);
+  assert.ok(norm(span.textContent).length < 100, norm(span.textContent));
+  const tooDeep = `/drzewo/dziecko/…/dziecko/dziecko: document is nested too deeply (more than 128 levels)`;
+  assert.equal(plainCheckError(tooDeep), 'Dokument jest zagnieżdżony za głęboko (limit: 128 poziomów).', 'no wall of path for a document that is too deep');
 });

@@ -73,7 +73,8 @@ function xsdDocumentation(text) {
     const inXsd = (node, name) => node.namespaceURI === XSD_NS && node.localName === name;
     for (const annotation of Array.from(root.children).filter((c) => inXsd(c, 'annotation'))) {
       for (const documentation of Array.from(annotation.children).filter((c) => inXsd(c, 'documentation'))) {
-        const value = (documentation.textContent || '').trim();
+        // Only the element's own text, like the server: text of nested elements is not part of it.
+        const value = Array.from(documentation.childNodes).filter((n) => n.nodeType === 3 || n.nodeType === 4).map((n) => n.nodeValue).join('').trim();
         if (value) return value;
       }
     }

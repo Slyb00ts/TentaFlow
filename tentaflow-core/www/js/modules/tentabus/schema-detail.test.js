@@ -333,3 +333,10 @@ test('an XSD\'s page says which XSD patterns work; no other format shows that ca
   assert.match(norm(card.textContent), /^Jakie wzory XSD zadziałają Zadziała zwykły wzór zapisany w jednym pliku: .* Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje\.$/);
   assert.equal(mount({}).body.querySelector('[data-role="xsd-help"]').hidden, true);
 });
+
+test('the description of an XSD is the documentation element\'s own text, like the server', () => {
+  const xsd = (doc) => `<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><xs:documentation>${doc}</xs:documentation></xs:annotation><xs:element name="a" type="xs:string"/></xs:schema>`;
+  assert.equal(schemaDescription('xsd', xsd('  Faktura  ')), 'Faktura');
+  assert.equal(schemaDescription('xsd', xsd('Faktura <b>pogrubiona</b> koniec')), 'Faktura  koniec', 'text of nested elements is not part of it');
+  assert.equal(schemaDescription('xsd', xsd('<b>tylko element</b>')), '');
+});

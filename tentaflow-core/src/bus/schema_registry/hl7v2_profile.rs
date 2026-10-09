@@ -103,6 +103,13 @@ fn parse_profile(schema_text: &str) -> Result<Profile, SchemaError> {
             schema_text.len()
         )));
     }
+    // serde reads a struct from a JSON array positionally, so `["PID-3"]`
+    // would become a profile that requires nothing; only an object is one.
+    if !schema_text.trim_start().starts_with('{') {
+        return Err(invalid(
+            "not a valid HL7 v2 profile: the profile must be a JSON object",
+        ));
+    }
     let raw: RawProfile = serde_json::from_str(schema_text)
         .map_err(|e| invalid(format!("not a valid HL7 v2 profile: {e}")))?;
     if let Some(d) = &raw.description {
@@ -378,6 +385,27 @@ mod tests {
                 "{text}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_json_object_is_a_profile() {
+        // serde would read each of these positionally as a struct.
+        for text in [
+            r#"["PID-3"]"#,
+            r#"["desc", ["PID"], ["PID-3"]]"#,
+            "[]",
+            "  [\"x\"]",
+            "null",
+            "\"PID-3\"",
+            "7",
+        ] {
+            let err = HL7V2_PROFILE_OPS.compile(text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.contains("not a valid HL7 v2 profile") && m.contains("JSON object")),
+                "{text}: {err:?}"
+            );
+        }
+        assert!(HL7V2_PROFILE_OPS.compile("  \n{}").is_ok());
     }
 
     #[test]

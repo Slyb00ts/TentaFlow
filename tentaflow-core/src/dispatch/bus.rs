@@ -533,6 +533,13 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         } => ProtocolError::bad_request(format!(
             "bus.schema_incompatible: '{subject}' mode={mode}: {detail}"
         )),
+        BusServiceError::SchemaCompareTooComplex {
+            subject,
+            mode,
+            detail,
+        } => ProtocolError::bad_request(format!(
+            "bus.schema_compare_too_complex: '{subject}' mode={mode}: {detail}"
+        )),
         BusServiceError::SchemaTypeUnsupported {
             schema_type,
             operation,
@@ -5077,6 +5084,25 @@ fn quota_set_v1(
 mod tests {
     use super::*;
     use crate::bus::groups;
+
+    #[test]
+    fn a_comparison_that_gave_up_maps_beside_an_incompatibility() {
+        let compare = |e: BusServiceError| map_bus_error(e);
+        let incompatible = compare(BusServiceError::SchemaIncompatible {
+            subject: "s".into(),
+            mode: "backward",
+            detail: "d".into(),
+        });
+        let too_complex = compare(BusServiceError::SchemaCompareTooComplex {
+            subject: "s".into(),
+            mode: "backward",
+            detail: "d".into(),
+        });
+        assert_eq!(too_complex.code, incompatible.code);
+        assert!(too_complex
+            .message
+            .starts_with("bus.schema_compare_too_complex: 's' mode=backward"));
+    }
     use crate::db::models::AuditLogFilters;
     use crate::db::DbPool;
     use std::sync::{Mutex, OnceLock};

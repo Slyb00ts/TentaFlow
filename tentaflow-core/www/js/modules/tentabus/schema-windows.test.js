@@ -765,3 +765,69 @@ test('a refusal is scrolled into view when the form is taller than the window', 
     closeAll();
   }
 });
+
+test('an HL7 profile must be a JSON object: a list, a text, a number or null is stopped before sending', async () => {
+  for (const text of ['["PID-3"]', '[]', 'null', '"PID-3"', '7', ' [ "x" ]']) {
+    assert.equal(schemaTextProblem(text, 'hl7v2_profile'), 'not_object', text);
+  }
+  assert.equal(schemaTextProblem('{}', 'hl7v2_profile'), null);
+  assert.equal(schemaTextProblem('["a"]', 'json_schema'), null, 'only the profile is an object by definition');
+  closeAll();
+  const win = openSchemaAdd({
+    instanceId: 'i', schemaTypes: ['json_schema', 'xsd', 'hl7v2_profile'], existingNames: () => [],
+    register: async () => ({ version: 1 }), describeError: String, onAdded: () => {},
+  });
+  pick(win.querySelector('[data-role="format"]'), 'hl7v2_profile');
+  type(win.querySelector('[data-role="name"]'), 'tablica');
+  const text = win.querySelector('[data-role="text"]');
+  type(text, '["PID-3"]');
+  assert.match(text.getAttribute('error'), /^Tekst nie jest profilem HL7 v2\. Profil to obiekt JSON/);
+  assert.equal(win.querySelector('[data-act="save"]').hasAttribute('disabled'), true, 'nothing is sent');
+  closeAll();
+});
+
+test('an XSD whose root is not xs:schema of the XSD namespace is stopped, and the server\'s namespace refusals are put in words', () => {
+  assert.equal(schemaTextProblem('<schema xmlns="urn:nie-xsd"><element name="a"/></schema>', 'xsd'), 'not_xsd');
+  assert.equal(schemaTextProblem('<a/>', 'xsd'), 'not_xsd');
+  assert.equal(schemaTextProblem('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>', 'xsd'), null);
+  assert.equal(schemaTextProblem('<schema xmlns="http://www.w3.org/2001/XMLSchema"/>', 'xsd'), null);
+  const cases = [
+    ['the root element must be xs:schema', /Główny element musi być xs:schema z przestrzeni nazw http:\/\/www\.w3\.org\/2001\/XMLSchema\./],
+    ["type 'p:x' belongs to namespace 'urn:inne'; types from other namespaces are not supported", /Typy z innej przestrzeni nazw \(urn:inne\) nie są obsługiwane\./],
+    ['namespace declarations are only supported on xs:schema', /Przestrzenie nazw można deklarować tylko na elemencie xs:schema/],
+    ["namespace prefix 'p' is not declared on xs:schema", /każdy użyty przedrostek musi być tam zadeklarowany/],
+    ["type 'p:x' uses a namespace prefix that is not declared on xs:schema", /każdy użyty przedrostek musi być tam zadeklarowany/],
+    ["element 'a' is not in the XML Schema namespace", /element spoza przestrzeni nazw XML Schema/],
+  ];
+  for (const [server, expected] of cases) {
+    const got = refused('xsd', server);
+    assert.match(got.text, expected, server);
+    assert.ok(got.technical.includes(server));
+  }
+});
+
+test('removing a newly required field together with its segment says so in the button, and the same-as-latest sentence lists with "i"', () => {
+  const detail = 'backward (the new profile requires more than the old one guarantees): segments [NK1] are not guaranteed; fields [NK1-2] are not guaranteed';
+  const newText = JSON.stringify({ required_segments: ['PID', 'NK1'], required_fields: ['PID-3', 'NK1-2'] });
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err: incompatible('backward', detail), title: 'Nie dodano wersji 4.', compatibility: 'backward', schemaType: 'hl7v2_profile', newText, describeError: String, offerDrop: true });
+  const button = el.querySelector('[data-act="drop-required"]');
+  assert.equal(norm(button.textContent), 'Usuń NK1, NK1-2 i dodaj wersję');
+  assert.deepEqual(JSON.parse(button.dataset.drop), { segments: ['NK1'], fields: ['NK1-2'] });
+  // A segment only implied by a field was never written by the author: not named.
+  const implied = 'backward (the new profile requires more than the old one guarantees): segments [PV1] are not guaranteed; fields [PV1-7] are not guaranteed';
+  el.innerHTML = refusalHtml({ err: incompatible('backward', implied), title: 'x', compatibility: 'backward', schemaType: 'hl7v2_profile', newText: JSON.stringify({ required_segments: ['PID'], required_fields: ['PV1-7'] }), describeError: String, offerDrop: true });
+  assert.equal(norm(el.querySelector('[data-act="drop-required"]').textContent), 'Usuń PV1-7 i dodaj wersję');
+  // Two items read "NK1 i PV1-7" in the sentence that explains why nothing is offered.
+  const latest = JSON.stringify({ required_segments: ['PID'], required_fields: ['PID-3'] });
+  const two = 'backward (the new profile requires more than the old one guarantees): segments [NK1] are not guaranteed; fields [PV1-7] are not guaranteed';
+  el.innerHTML = refusalHtml({ err: incompatible('backward', two), title: 'x', compatibility: 'backward', schemaType: 'hl7v2_profile', newText: JSON.stringify({ required_segments: ['PID', 'NK1'], required_fields: ['PID-3', 'PV1-7'] }), describeError: String, offerDrop: true, latest: { version: 1, text: latest } });
+  assert.match(norm(el.textContent), /Po usunięciu NK1 i PV1-7 nowa wersja niczym nie różniłaby się od wersji 1/);
+});
+
+test('a comparison that gave up is told as too complex, not as an incompatibility', () => {
+  const err = new Error("protocol error BadRequest: bus.schema_compare_too_complex: 'faktura' mode=backward: the schemas are too complex to compare; compatibility cannot be proven");
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'xsd', newText: '', describeError: String });
+  assert.equal(norm(el.textContent), 'Nie dodano wersji 3. Wzory są zbyt złożone do porównania, więc nie da się sprawdzić zgodności nowej wersji z poprzednią. Uprość wzór albo zmień zgodność wzoru.');
+});

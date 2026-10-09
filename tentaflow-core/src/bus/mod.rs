@@ -1010,6 +1010,16 @@ pub enum BusServiceError {
         mode: &'static str,
         detail: String,
     },
+    /// `registry::register`: the comparison with the subject's latest version
+    /// gave up (work budget, nesting depth) without proving the change
+    /// compatible or incompatible. Distinct from `SchemaIncompatible`, which
+    /// is a proven difference.
+    #[error("schema '{subject}' change cannot be compared under mode '{mode}': {detail}")]
+    SchemaCompareTooComplex {
+        subject: String,
+        mode: &'static str,
+        detail: String,
+    },
     /// `SchemaError::Unsupported` surfaced to a caller: the requested
     /// operation has no implementation for this schema type in this build
     /// (every operation but `compile`'s shape smoke-check, for
@@ -2503,6 +2513,10 @@ pub struct BusService {
     /// quarantines it) — the schema-registry counterpart to
     /// `throttled_total`, next to it below.
     schema_violations_total: AtomicU64,
+    /// Records whose schema check gave up (work budget, nesting depth)
+    /// without finding them invalid; counted apart from
+    /// `schema_violations_total` because they are not known to be invalid.
+    schema_check_too_complex_total: AtomicU64,
     /// Count of failures to write a `dlq`-mode quarantine copy to
     /// `__dlq.<topic>` (topic creation or the nested `publish` call itself
     /// failing — e.g. the DLQ topic's own `max_inline_bytes`/quota). This is
@@ -2991,6 +3005,7 @@ impl BusService {
             topic_config_cache: DashMap::new(),
             schema_cache: DashMap::new(),
             schema_violations_total: AtomicU64::new(0),
+            schema_check_too_complex_total: AtomicU64::new(0),
             schema_dlq_write_failures_total: AtomicU64::new(0),
             derived_schema_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is nonzero"),
@@ -3613,6 +3628,12 @@ impl BusService {
     /// the same way it reads `bus_metrics_snapshot` today.
     pub fn schema_violations_total(&self) -> u64 {
         self.schema_violations_total.load(Ordering::Relaxed)
+    }
+
+    /// Records the schema check gave up on since this service started; not
+    /// part of `schema_violations_total`.
+    pub fn schema_check_too_complex_total(&self) -> u64 {
+        self.schema_check_too_complex_total.load(Ordering::Relaxed)
     }
 
     /// Count of `dlq`-mode quarantine writes that themselves failed (see the
@@ -5298,10 +5319,21 @@ impl BusService {
                         kept.push(r);
                     }
                     Err((reason, detail)) => {
-                        self.schema_violations_total.fetch_add(1, Ordering::Relaxed);
+                        // A check that gave up is not a violation: it has
+                        // its own counter and audit action so a dashboard
+                        // rate of "invalid records" is not inflated by
+                        // documents that may well be valid.
+                        let (counter, action) = match reason {
+                            dlq::DlqReason::SchemaCheckTooComplex => (
+                                &self.schema_check_too_complex_total,
+                                "bus.schema.check_too_complex",
+                            ),
+                            _ => (&self.schema_violations_total, "bus.schema.violation"),
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
                         self.audit_windowed(
                             ctx,
-                            "bus.schema.violation",
+                            action,
                             Some(topic),
                             Some(&format!(
                                 "subject={subject} version={} reason={} {detail}",
@@ -19704,6 +19736,12 @@ mod tests {
         assert!(header("dlq.error_message")
             .unwrap()
             .contains("nested too deeply"));
+        // A check that gave up is counted and audited apart from violations.
+        assert_eq!(svc.schema_check_too_complex_total(), 1);
+        assert_eq!(svc.schema_violations_total(), 0);
+        svc.flush_audit_windows();
+        assert_eq!(count_audit_logs(&svc, "bus.schema.check_too_complex"), 1);
+        assert_eq!(count_audit_logs(&svc, "bus.schema.violation"), 0);
 
         // A real violation keeps the old reason.
         let (_tmp, svc, ctx, result) = publish_validated(
@@ -19714,6 +19752,11 @@ mod tests {
             &["<tree><other/></tree>"],
         );
         assert_eq!(result.schema_rejected, 1);
+        assert_eq!(svc.schema_violations_total(), 1);
+        assert_eq!(svc.schema_check_too_complex_total(), 0);
+        svc.flush_audit_windows();
+        assert_eq!(count_audit_logs(&svc, "bus.schema.violation"), 1);
+        assert_eq!(count_audit_logs(&svc, "bus.schema.check_too_complex"), 0);
         let dlq = svc
             .open_consumer(
                 &ctx,

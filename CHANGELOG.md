@@ -114,7 +114,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Poprawki walidatorów XSD i profilu HL7: numer pola w adresie (`PID-n`) ma
   najwyżej 999 (dłuższy numer w profilu lub polityce pola jest odrzucany
   zamiast zatrzymywać proces), drugi segment `MSH` w wiadomości jest numerowany
-  jak pierwszy, a jawne `""` (usuń wartość) nie spełnia pola wymaganego.
+  jak pierwszy (to zmienia też politykę pól na topikach z paczkami wiadomości:
+  reguły odczytu pokazują nazwane pole drugiego `MSH`, znaki podziału nie są już
+  zerowane, a reguły zapisu nie widzą `MSH-1`), a jawne `""` (usuń wartość) nie spełnia pola wymaganego.
   Komunikaty naruszeń nie zawierają już treści wiadomości (nazwy encji
   `&nazwa;`, błędy parsera, identyfikator błędnego segmentu). Zgodność XSD nie
   dowodzi już wyliczenia typu liczbowego lub `boolean` względem wzorca albo typu
@@ -141,6 +143,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nowej wersji XSD pokazuje różnicę. Segmenty profilu mają nazwy i kolejność
   wiadomości, błąd wiązania wzoru z topikiem o innej treści jest opisany, a
   szczegół nieprzetworzonej wiadomości z profilu HL7 jest po polsku.
+- Druga runda poprawek wzorów XSD i profilu HL7: klasa znaków w `pattern` z
+  nieucieczonym `]` zaraz po `[` lub `[^` jest odrzucana (kończyłaby się w innym
+  miejscu niż rozumie ją `regex`), łańcuch ograniczeń typu prostego i porównanie
+  zgodności zagnieżdżonych typów złożonych mają limit głębokości, a budżet pracy
+  porównania liczy się globalnie. Porównanie, które przekroczyło budżet, nie jest
+  niezgodnością: odpowiedź ma osobny kod `bus.schema_compare_too_complex`, a
+  wiadomość, której sprawdzenie przekroczyło limit, nie zwiększa
+  `schema_violations_total` i jest audytowana jako `bus.schema.check_too_complex`.
+  Profil HL7 musi być obiektem JSON (tablica była czytana pozycyjnie i dawała
+  profil bez wymagań), a element `xs:all` z `maxOccurs="0"` nadal jest sprawdzany
+  przy rejestracji.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

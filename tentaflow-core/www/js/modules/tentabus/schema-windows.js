@@ -77,22 +77,42 @@ function wellFormedXml(text) {
   }
 }
 
+const XSD_NAMESPACE = 'http://www.w3.org/2001/XMLSchema';
+
+/** Whether `text` is an XML document whose root is `schema` of the XSD namespace; assumed so where there is no XML parser to ask. */
+function xsdRoot(text) {
+  if (typeof DOMParser === 'undefined') return true;
+  try {
+    const root = new DOMParser().parseFromString(String(text), 'application/xml').documentElement;
+    return Boolean(root) && root.localName === 'schema' && root.namespaceURI === XSD_NAMESPACE;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Why a pattern text cannot be sent, or `null` when it can: `empty`,
- * `too_big` (over 256 KB), `not_json` for a format written in JSON or
- * `not_xml` for an XSD.
+ * `too_big` (over 256 KB), `not_json` for a format written in JSON,
+ * `not_object` for an HL7 v2 profile that is JSON but not an object (the
+ * server would read a list positionally), `not_xml` for an XSD that is not
+ * XML or `not_xsd` for XML whose root is not the XSD `schema`.
  */
 export function schemaTextProblem(text, schemaType) {
   const value = String(text || '');
   if (!value.trim()) return 'empty';
   if (byteLength(value) > TEXT_MAX_BYTES) return 'too_big';
-  if (schemaType === 'xsd' && !wellFormedXml(value)) return 'not_xml';
+  if (schemaType === 'xsd') {
+    if (!wellFormedXml(value)) return 'not_xml';
+    if (!xsdRoot(value)) return 'not_xsd';
+  }
   if (JSON_TEXT_TYPES.has(schemaType)) {
+    let parsed;
     try {
-      JSON.parse(value);
+      parsed = JSON.parse(value);
     } catch {
       return 'not_json';
     }
+    if (schemaType === 'hl7v2_profile' && (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))) return 'not_object';
   }
   return null;
 }
@@ -479,6 +499,11 @@ export function textRefusalReason(schemaType, serverText) {
     if (/^the schema declares no global element/.test(text)) return T('schemas.refused.xsd_no_root');
     if (/^mixed content/.test(text)) return T('schemas.refused.xsd_mixed');
     if (/ ref= is not supported/.test(text)) return T('schemas.refused.xsd_ref');
+    if (/^the root element must be xs:schema/.test(text)) return T('schemas.refused.xsd_root');
+    m = /^type '[^']*' belongs to namespace '([^']*)'/.exec(text);
+    if (m) return T('schemas.refused.xsd_other_namespace', { namespace: m[1] });
+    if (/^namespace declarations are only supported on xs:schema/.test(text) || /namespace prefix .*not declared/.test(text)) return T('schemas.refused.xsd_namespace');
+    if (/is not in the XML Schema namespace$/.test(text)) return T('schemas.refused.xsd_foreign_element');
     m = /^xs:(\w+): (.*)$/.exec(text);
     if (m) {
       const kind = XSD_CONSTRUCT_KINDS.find(([re]) => re.test(m[2]));
@@ -509,11 +534,16 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
       const drop = offerDrop && schemaType === 'hl7v2_profile' ? hl7DropOffer(incompatible.detail) : null;
       let extra = '';
       if (drop) {
-        const items = drop.items.join(', ');
+        // The segments the author wrote are taken out with their fields.
+        const written = Array.isArray(parseObject(newText)?.required_segments) ? parseObject(newText).required_segments : [];
+        const removed = [...drop.segments.filter((s) => written.includes(s)), ...drop.fields];
+        // The button keeps commas ("Usuń A, B i dodaj wersję"); the sentence about the same text uses the locale's list.
+        const items = removed.join(', ');
+        const itemsList = listText(removed);
         const without = parseObject(dropRequired(newText, drop));
         const sameAsLatest = latest && without && deepEqual(without, parseObject(latest.text));
         if (sameAsLatest) {
-          extra = `<div class="tb-vr-hint">${escapeHtml(T('schemas.version.drop_same', { items, version: fmtCount(latest.version) }))}</div>`;
+          extra = `<div class="tb-vr-hint">${escapeHtml(T('schemas.version.drop_same', { items: itemsList, version: fmtCount(latest.version) }))}</div>`;
         } else {
           const keepsDescription = typeof parseObject(newText)?.description === 'string' && parseObject(newText).description.trim();
           extra = `<div class="tb-window-actions"><tf-button variant="primary" size="sm" icon="plus" data-act="drop-required" data-drop="${escapeAttr(JSON.stringify({ segments: drop.segments, fields: drop.fields }))}">${escapeHtml(T('schemas.version.drop_and_add', { items }))}</tf-button></div>`
@@ -523,6 +553,10 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
       return `<div>${head} ${escapeHtml(T('schemas.incompat.lead', { compat, reason: known.reason }))} ${escapeHtml(known.fix)}</div>${extra}`;
     }
     return `<div>${head} ${escapeHtml(T('schemas.incompat.unknown', { compat }))} ${escapeHtml(T('schemas.incompat.fix_generic'))}</div>${technical(incompatible.detail)}`;
+  }
+  // The comparison gave up: neither proven compatible nor incompatible.
+  if (/\bbus\.schema_compare_too_complex: /.test(message)) {
+    return `<div>${head} ${escapeHtml(T('schemas.refused.compare_too_complex'))}</div>`;
   }
   const invalid = /\bbus\.invalid_argument: schema: ([\s\S]*)$/.exec(message);
   if (invalid) {
@@ -614,7 +648,7 @@ export function addedNotice({ subject, schemaType, version, deduplicated }) {
 // The windows
 // ---------------------------------------------------------------------------
 
-const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json', not_xml: 'schemas.text_not_xml' };
+const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json', not_xml: 'schemas.text_not_xml', not_object: 'schemas.refused.hl7_shape', not_xsd: 'schemas.refused.xsd_root' };
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
 
 function textField(label, hint, value = '') {

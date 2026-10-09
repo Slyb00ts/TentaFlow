@@ -384,6 +384,7 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         // existing code to "this request's inputs disagree with what is
         // already registered".
         BusServiceError::SchemaIncompatible { .. }
+        | BusServiceError::SchemaCompareTooComplex { .. }
         | BusServiceError::SchemaTypeUnsupported { .. }
         | BusServiceError::SchemaRefIdCollision { .. } => AbiError::Conflict,
         _ => AbiError::Operation,

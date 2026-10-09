@@ -62,7 +62,8 @@
 // Content models compile to an NFA (Thompson construction; counted
 // occurrences are expanded, bounded by a state budget) and are simulated with
 // state sets, so validation is linear in children x active states with a hard
-// step budget (a hostile document fails closed with a violation). Violation
+// step budget (a document that exceeds it, or nests deeper than the limit, is
+// `LimitExceeded`: the check gave up, the document is not known invalid). Violation
 // messages are PATH + CONSTRAINT only: never element text, attribute values
 // or a pattern's text — they reach audit rows, warn logs and DLQ headers.
 //
@@ -450,6 +451,12 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
                     out.push('^');
                     i += 1;
                 }
+                // The regex crate reads a leading ']' as a literal while this
+                // translator would close the class there, so the two would
+                // disagree on where the class ends.
+                if chars.get(i + 1) == Some(&']') {
+                    return Err("']' inside a character class must be escaped".to_string());
+                }
                 prev_quantifier = false;
             }
             ']' if in_class => {
@@ -605,6 +612,9 @@ struct GroupDef {
     min: u32,
     max: Max,
     items: Vec<Item>,
+    /// `xs:all` elements declared with `maxOccurs="0"`: they never match,
+    /// but their type and patterns are still checked at compile time.
+    prohibited: Vec<ElementDef>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1200,14 +1210,16 @@ impl Interpreter<'_> {
             ));
         }
         let mut items = Vec::new();
+        let mut prohibited = Vec::new();
         for child in content_children(node)? {
             match child.local.as_str() {
                 "element" => {
                     let el = self.element(child, false)?;
                     if kind == GroupKind::All {
                         // maxOccurs="0" prohibits the element: it must never
-                        // match, so it is not part of the group at all.
+                        // match, so it is not an item of the group.
                         if el.max == Max::Bounded(0) {
+                            prohibited.push(el);
                             continue;
                         }
                         if el.max != Max::Bounded(1) {
@@ -1240,6 +1252,7 @@ impl Interpreter<'_> {
             min,
             max,
             items,
+            prohibited,
         })
     }
 
@@ -1877,6 +1890,12 @@ impl<'d> Compiler<'d> {
                 "simple type '{name}' is defined in terms of itself"
             )));
         }
+        if self.simple_pending.len() > MAX_SCHEMA_DEPTH {
+            return Err(invalid(format!(
+                "simple type '{name}' is derived through a chain of more than \
+                 {MAX_SCHEMA_DEPTH} named types"
+            )));
+        }
         let doc = self.doc;
         let def = &doc
             .simple_types
@@ -1986,6 +2005,14 @@ impl<'d> Compiler<'d> {
         if !step.is_unconstrained() {
             st.steps.push(step);
         }
+        // Each derived type copies the steps of its base, so an unbounded
+        // chain would cost quadratic memory.
+        if st.steps.len() > MAX_SCHEMA_DEPTH {
+            return Err(invalid(format!(
+                "type '{what}': restrictions are stacked through more than \
+                 {MAX_SCHEMA_DEPTH} derived types"
+            )));
+        }
         Ok(st)
     }
 
@@ -2061,6 +2088,9 @@ impl<'d> Compiler<'d> {
         };
         if g.kind == GroupKind::All {
             let mut required = Vec::new();
+            for e in &g.prohibited {
+                self.element(e)?;
+            }
             for item in &g.items {
                 let Item::Element(e) = item else {
                     return Err(invalid("xs:all can hold elements only"));
@@ -2153,13 +2183,44 @@ fn compile_doc(doc: &Doc) -> Result<Compiled, SchemaError> {
 // Validation
 // =============================================================================
 
+/// Longest element path a violation message carries. A document nested up to
+/// `MAX_DOC_DEPTH` levels with long names would otherwise put kilobytes into
+/// audit rows and DLQ headers.
+const MAX_PATH_CHARS: usize = 256;
+
+/// `path` unchanged when short; otherwise its first two and last two
+/// segments around `…`, bounded in characters whatever the names are.
+fn shorten_path(path: &str) -> String {
+    if path.chars().count() <= MAX_PATH_CHARS {
+        return path.to_string();
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let joined = if segments.len() > 4 {
+        format!(
+            "/{}/{}/…/{}/{}",
+            segments[0],
+            segments[1],
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        )
+    } else {
+        path.to_string()
+    };
+    if joined.chars().count() <= MAX_PATH_CHARS {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(MAX_PATH_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 fn violation(path: &str, msg: &str) -> SchemaError {
-    SchemaError::Violation(format!("{path}: {msg}"))
+    SchemaError::Violation(format!("{}: {msg}", shorten_path(path)))
 }
 
 /// The check stopped before it could tell whether the document is valid.
 fn limit(path: &str, msg: &str) -> SchemaError {
-    SchemaError::LimitExceeded(format!("{path}: {msg}"))
+    SchemaError::LimitExceeded(format!("{}: {msg}", shorten_path(path)))
 }
 
 enum State {
@@ -2424,7 +2485,9 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
                 if stack.len() >= MAX_DOC_DEPTH {
                     return Err(limit(
                         &path_of(&stack, None),
-                        "document is nested too deeply",
+                        &format!(
+                            "document is nested too deeply (more than {MAX_DOC_DEPTH} levels)"
+                        ),
                     ));
                 }
                 let name = std::str::from_utf8(e.local_name().as_ref())
@@ -2543,6 +2606,7 @@ fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>, namespaced: bool) -> O
         min,
         max: g.max,
         items,
+        prohibited: Vec::new(),
     })
 }
 
@@ -2903,9 +2967,15 @@ struct Inclusion<'a> {
     visited: HashSet<(usize, usize)>,
     pairs: usize,
     max_pairs: usize,
-    /// NFA states touched by all product constructions so far.
+    /// NFA states touched by all product constructions so far, counted as
+    /// they happen so the budget holds across nested comparisons.
     work: u64,
+    /// Nesting of `types` calls; named complex types can chain far deeper
+    /// than the inline nesting limit.
+    depth: usize,
 }
+
+const MAX_COMPAT_DEPTH: usize = 64;
 
 const TOO_COMPLEX: &str = "the schemas are too complex to compare; compatibility cannot be proven";
 
@@ -2952,6 +3022,21 @@ impl<'a> Inclusion<'a> {
         if !self.visited.insert((sup_ty, sub_ty)) {
             return Ok(());
         }
+        if self.depth >= MAX_COMPAT_DEPTH {
+            return Err(TOO_COMPLEX.to_string());
+        }
+        self.depth += 1;
+        let result = self.types_unchecked(sup_ty, sub_ty, path);
+        self.depth -= 1;
+        result
+    }
+
+    fn types_unchecked(
+        &mut self,
+        sup_ty: usize,
+        sub_ty: usize,
+        path: &mut Vec<String>,
+    ) -> Result<(), String> {
         self.budget()?;
         let (sup_attrs, sup_content) = view(self.sup, sup_ty);
         let (sub_attrs, sub_content) = view(self.sub, sub_ty);
@@ -3188,7 +3273,6 @@ impl<'a> Inclusion<'a> {
     ) -> Result<(), String> {
         let mut sup_marks = Marks::new(sup.nfa.states.len());
         let mut sub_marks = Marks::new(sub.nfa.states.len());
-        let mut steps = 0u64;
         let start = (sub.nfa.start_set.clone(), sup.nfa.start_set.clone());
         let mut seen: HashSet<(Vec<u32>, Vec<u32>)> = HashSet::new();
         seen.insert(start.clone());
@@ -3196,7 +3280,7 @@ impl<'a> Inclusion<'a> {
         let mut typed: HashSet<u32> = HashSet::new();
         while let Some((s1, s2)) = queue.pop_front() {
             self.budget()?;
-            if self.work + steps > MAX_COMPAT_WORK {
+            if self.work > MAX_COMPAT_WORK {
                 return Err(TOO_COMPLEX.to_string());
             }
             if sub.nfa.accepts(&s1) && !sup.nfa.accepts(&s2) {
@@ -3211,9 +3295,9 @@ impl<'a> Inclusion<'a> {
                     ),
                 ));
             }
-            steps += (s1.len() + s2.len()) as u64;
+            self.work += (s1.len() + s2.len()) as u64;
             for label in sub.nfa.labels_from(&s1) {
-                if self.work + steps > MAX_COMPAT_WORK {
+                if self.work > MAX_COMPAT_WORK {
                     return Err(TOO_COMPLEX.to_string());
                 }
                 let child = &sub.children[label as usize];
@@ -3226,8 +3310,8 @@ impl<'a> Inclusion<'a> {
                         ),
                     ));
                 };
-                let mut next_sub = sub.nfa.step(&s1, label, &mut sub_marks, &mut steps);
-                let mut next_sup = sup.nfa.step(&s2, sup_label, &mut sup_marks, &mut steps);
+                let mut next_sub = sub.nfa.step(&s1, label, &mut sub_marks, &mut self.work);
+                let mut next_sup = sup.nfa.step(&s2, sup_label, &mut sup_marks, &mut self.work);
                 next_sub.sort_unstable();
                 next_sup.sort_unstable();
                 if next_sup.is_empty() {
@@ -3264,7 +3348,6 @@ impl<'a> Inclusion<'a> {
                 }
             }
         }
-        self.work += steps;
         Ok(())
     }
 }
@@ -3301,6 +3384,7 @@ fn included(
         pairs: 0,
         max_pairs: MAX_COMPAT_PAIRS,
         work: 0,
+        depth: 0,
     }
     .roots()
 }
@@ -3351,18 +3435,20 @@ impl SchemaKindOps for XsdOps {
         let new = compile_text(new_schema_text)?;
         let backward = || {
             included(&new, &old, "new", "old").map_err(|d| {
-                SchemaError::Incompatible(format!(
+                compat_failure(
+                    d,
                     "backward: a document valid under the old schema may be invalid under the \
-                     new one - {d}"
-                ))
+                     new one",
+                )
             })
         };
         let forward = || {
             included(&old, &new, "old", "new").map_err(|d| {
-                SchemaError::Incompatible(format!(
+                compat_failure(
+                    d,
                     "forward: a document valid under the new schema may be invalid under the \
-                     old one - {d}"
-                ))
+                     old one",
+                )
             })
         };
         match mode {
@@ -3371,6 +3457,16 @@ impl SchemaKindOps for XsdOps {
             Compatibility::Full => backward().and_then(|()| forward()),
             Compatibility::None => Ok(()),
         }
+    }
+}
+
+/// A comparison that ran out of budget proved nothing either way, so it is
+/// not an incompatibility (the registry reports it under its own outcome).
+fn compat_failure(detail: String, lead: &str) -> SchemaError {
+    if detail == TOO_COMPLEX {
+        SchemaError::LimitExceeded(detail)
+    } else {
+        SchemaError::Incompatible(format!("{lead} - {detail}"))
     }
 }
 
@@ -3495,6 +3591,27 @@ mod tests {
         );
         assert!(accepts(&s, "<a>cde</a>"));
         assert!(!accepts(&s, "<a>xcde</a>"));
+    }
+
+    #[test]
+    fn a_prohibited_all_element_is_still_checked_at_compile_time() {
+        let all = |gone: &str| {
+            schema(&format!(
+                r#"<xs:element name="r"><xs:complexType><xs:all>
+                     <xs:element name="a" type="xs:string"/>
+                     <xs:element name="gone" {gone} minOccurs="0" maxOccurs="0"/>
+                   </xs:all></xs:complexType></xs:element>"#
+            ))
+        };
+        let Err(SchemaError::Invalid(m)) = ops_compile(&all(r#"type="nope""#)) else {
+            panic!("an unknown type of a prohibited element must be refused");
+        };
+        assert!(m.contains("unknown type 'nope'"), "{m}");
+        let Err(SchemaError::Invalid(m)) = ops_compile(&all(r#"type="xs:float""#)) else {
+            panic!("an unsupported built-in must be refused");
+        };
+        assert!(m.contains("xs:float"), "{m}");
+        assert!(ops_compile(&all(r#"type="xs:string""#)).is_ok());
     }
 
     #[test]
@@ -3850,6 +3967,14 @@ mod tests {
         assert!(matches_pattern("[^a-c]", "d"));
         assert!(matches_pattern(r"[a\-z]", "-"));
         assert!(matches_pattern("[&~]", "&"));
+        // Set operators and nested classes of the regex crate stay literal.
+        assert!(matches_pattern("[a&&b]", "&"));
+        assert!(matches_pattern("[a&&b]", "a"));
+        assert!(!matches_pattern("[a&&b]", "c"));
+        assert!(matches_pattern("[a~~b]", "~"));
+        assert!(matches_pattern(r"[\]a]", "]"));
+        assert!(matches_pattern("[a-]", "-"));
+        assert!(matches_pattern("[-a]", "-"));
         assert!(matches_pattern(r"(ab){2,3}", "ababab"));
     }
 
@@ -3865,6 +3990,9 @@ mod tests {
             (r"a+*", "another quantifier"),
             (r"[a-z-[aeiou]]", "subtraction"),
             (r"[[]", "must be escaped"),
+            (r"[]a]", "']' inside a character class"),
+            (r"[^]a]", "']' inside a character class"),
+            (r"[](])|(.*[])]", "']' inside a character class"),
             (r"\p{IsBasicLatin}", "Unicode blocks"),
             (r"\p{L", "unterminated"),
             (r"[abc", "unterminated"),
@@ -4099,6 +4227,48 @@ mod tests {
             matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("nested too deeply")),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn a_violation_deep_in_the_document_carries_a_short_path() {
+        let s = schema(
+            r#"<xs:complexType name="node"><xs:sequence>
+                 <xs:element name="dziecko" type="node" minOccurs="0"/>
+               </xs:sequence></xs:complexType>
+               <xs:element name="drzewo" type="node"/>"#,
+        );
+        let depth = 100;
+        let deep = format!(
+            "<drzewo>{}<inne/>{}</drzewo>",
+            "<dziecko>".repeat(depth),
+            "</dziecko>".repeat(depth)
+        );
+        let m = violation_of(&s, &deep);
+        assert!(
+            m.starts_with("/drzewo/dziecko/…/dziecko/inne: element is not allowed here"),
+            "{m}"
+        );
+        assert!(m.chars().count() < MAX_PATH_CHARS + 64, "{m}");
+        // A shallow path is reported in full.
+        let m = violation_of(&s, "<drzewo><dziecko><inne/></dziecko></drzewo>");
+        assert!(m.starts_with("/drzewo/dziecko/inne: "), "{m}");
+        // Names are bounded too, so a few long segments cannot widen the text.
+        let (n1, n2, n3) = ("a".repeat(100), "b".repeat(100), "c".repeat(100));
+        let wide = schema(&format!(
+            r#"<xs:complexType name="t1"><xs:sequence><xs:element name="{n2}" type="t2"/></xs:sequence></xs:complexType>
+               <xs:complexType name="t2"><xs:sequence><xs:element name="{n3}" type="t3"/></xs:sequence></xs:complexType>
+               <xs:complexType name="t3"/>
+               <xs:element name="{n1}" type="t1"/>"#
+        ));
+        let m = violation_of(
+            &wide,
+            &format!("<{n1}><{n2}><{n3}><x/></{n3}></{n2}></{n1}>"),
+        );
+        assert!(
+            m.starts_with("/aaaa") && m.ends_with("…: element is not allowed here"),
+            "{m}"
+        );
+        assert!(m.chars().count() < MAX_PATH_CHARS + 64, "{}", m.len());
     }
 
     #[test]
@@ -4770,6 +4940,7 @@ mod tests {
             pairs: 0,
             max_pairs: 1,
             work: 0,
+            depth: 0,
         };
         let err = tight.roots().unwrap_err();
         assert!(err.contains("too complex to compare"), "{err}");
@@ -4857,9 +5028,93 @@ mod tests {
             pairs: 0,
             max_pairs: MAX_COMPAT_PAIRS,
             work: MAX_COMPAT_WORK,
+            depth: 0,
         };
         let err = spent.roots().unwrap_err();
         assert!(err.contains("too complex to compare"), "{err}");
+        assert!(
+            spent.work > MAX_COMPAT_WORK,
+            "the steps of a product construction count into the shared budget as they happen"
+        );
+    }
+
+    /// `n` named complex types, each holding one child of the next one.
+    fn complex_chain(n: usize, extra: &str) -> String {
+        let mut body = String::new();
+        for i in 0..n {
+            if i + 1 < n {
+                body.push_str(&format!(
+                    r#"<xs:complexType name="n{i}"><xs:sequence><xs:element name="c" type="n{}"/></xs:sequence></xs:complexType>"#,
+                    i + 1
+                ));
+            } else {
+                body.push_str(&format!(r#"<xs:complexType name="n{i}"/>"#));
+            }
+        }
+        schema(&format!(r#"{extra}{body}<xs:element name="r" type="n0"/>"#))
+    }
+
+    #[test]
+    fn a_long_named_complex_chain_is_too_complex_to_compare_not_incompatible() {
+        let note = "<xs:annotation><xs:documentation>x</xs:documentation></xs:annotation>";
+        let short = (complex_chain(10, ""), complex_chain(10, note));
+        assert!(XSD_OPS
+            .check_compatibility(&short.0, &short.1, Compatibility::Full)
+            .is_ok());
+        let long = (
+            complex_chain(MAX_COMPAT_DEPTH + 10, ""),
+            complex_chain(MAX_COMPAT_DEPTH + 10, note),
+        );
+        for mode in [
+            Compatibility::Backward,
+            Compatibility::Forward,
+            Compatibility::Full,
+        ] {
+            let got = XSD_OPS.check_compatibility(&long.0, &long.1, mode);
+            assert!(
+                matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("too complex to compare")),
+                "{mode:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chains_of_derived_simple_types_are_bounded() {
+        let stacked = |n: usize, reverse: bool| {
+            let mut types: Vec<String> = (0..n)
+                .map(|i| {
+                    let base = if i == 0 {
+                        "xs:string".to_string()
+                    } else {
+                        format!("t{}", i - 1)
+                    };
+                    format!(
+                        r#"<xs:simpleType name="t{i}"><xs:restriction base="{base}"><xs:maxLength value="{}"/></xs:restriction></xs:simpleType>"#,
+                        1000 - i
+                    )
+                })
+                .collect();
+            if reverse {
+                types.reverse();
+            }
+            schema(&format!(
+                r#"{}<xs:element name="r" type="t{}"/>"#,
+                types.concat(),
+                n - 1
+            ))
+        };
+        assert!(ops_compile(&stacked(MAX_SCHEMA_DEPTH, false)).is_ok());
+        let Err(SchemaError::Invalid(m)) = ops_compile(&stacked(MAX_SCHEMA_DEPTH + 8, false))
+        else {
+            panic!("a long chain of stacked restrictions must be refused");
+        };
+        assert!(m.contains("stacked through more than"), "{m}");
+        // Declared in reverse, the first type pulls the whole chain in at
+        // once: bounded by the nesting of named bases.
+        let Err(SchemaError::Invalid(m)) = ops_compile(&stacked(MAX_SCHEMA_DEPTH + 8, true)) else {
+            panic!("a deep chain of named bases must be refused");
+        };
+        assert!(m.contains("chain of more than"), "{m}");
     }
 
     // ---- derived schema against the XML projection ----------------------------

@@ -497,6 +497,17 @@ mod tests {
             "description exceeds 1000 characters",
         );
         for (body, phrase) in [
+            (r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element ref="b"/></xs:sequence></xs:complexType></xs:element>"#.to_string(), " ref= is not supported"),
+            (format!(r#"<xs:key name="k"/>{element}"#), "identity constraints are not supported"),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:complexContent/></xs:complexType></xs:element>"#.to_string(),
+                "type derivation",
+            ),
+            (format!(r#"<xs:simpleType name="s"><xs:list itemType="xs:int"/></xs:simpleType>{element}"#), "list and union simple types are not supported"),
+            (format!(r#"<xs:attribute name="x" type="xs:string"/>{element}"#), "global attributes are not supported"),
+            (format!(r#"<xs:foo/>{element}"#), "xs:foo: this construct is not part of the supported XSD subset"),
+            (format!(r#"<xs:element name="a" type="p:x" xmlns:p="urn:p"/>"#), "namespace declarations are only supported on xs:schema"),
+            (format!(r#"<xs:element name="a" type="q:x"/>"#), "uses a namespace prefix that is not declared"),
             (format!(r#"<xs:include schemaLocation="x.xsd"/>{element}"#), "xs:include: schema composition is not supported"),
             (format!(r#"<xs:group name="g"><xs:sequence/></xs:group>{element}"#), "xs:group: named groups are not supported"),
             (
@@ -517,6 +528,210 @@ mod tests {
         ] {
             invalid_with(SchemaType::Xsd, &xsd(&body), phrase);
         }
+        // The dashboard anchors these at the start of the sentence, so each
+        // must begin with its phrase (after `invalid schema: `).
+        let begins = |kind: SchemaType, text: &str, prefix: &str| {
+            let err = kind.ops().compile(text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.starts_with(prefix)),
+                "{text}: expected a start of {prefix:?}, got {err:?}"
+            );
+        };
+        for (text, prefix) in [
+            (r#"{"required_fields":["MSH-1"]}"#, "hl7: "),
+            (
+                r#"{"required_fields":["pid5"]}"#,
+                "hl7: 'pid5' is not SEGMENT-N shaped",
+            ),
+            (r#"{"required_fields":["PID-0"]}"#, "hl7: "),
+            (r#"{"required_fields":["PID-1000"]}"#, "hl7: field number"),
+            (
+                r#"{"required_fields":["PID-3","PID-3"]}"#,
+                "required_fields lists",
+            ),
+            (
+                r#"{"required_segments":["PID","PID"]}"#,
+                "required_segments lists",
+            ),
+            (r#"{"required":[]}"#, "not a valid HL7 v2 profile"),
+            ("not json at all", "not a valid HL7 v2 profile"),
+            (r#"["PID-3"]"#, "not a valid HL7 v2 profile"),
+        ] {
+            begins(SchemaType::Hl7v2Profile, text, prefix);
+        }
+        invalid_with(
+            SchemaType::Hl7v2Profile,
+            r#"["PID-3"]"#,
+            "the profile must be a JSON object",
+        );
+        for (body, prefix) in [
+            (
+                r#"<xs:element name="a" type="xs:float"/>"#,
+                "built-in type xs:float is not supported",
+            ),
+            (
+                r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:totalDigits value="2"/></xs:restriction></xs:simpleType></xs:element>"#,
+                "facet xs:totalDigits is not supported",
+            ),
+            (
+                r#"<xs:simpleType name="s"><xs:restriction base="xs:string"/></xs:simpleType>"#,
+                "the schema declares no global element",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType mixed="true"><xs:sequence/></xs:complexType></xs:element>"#,
+                "mixed content",
+            ),
+        ] {
+            begins(SchemaType::Xsd, &xsd(body), prefix);
+        }
+        begins(
+            SchemaType::Xsd,
+            r#"<schema xmlns="urn:nie-xsd"><element name="a"/></schema>"#,
+            "the root element must be xs:schema",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            &xsd(r#"<xs:element name="a" type="p:x" xmlns:p="urn:p"/>"#),
+            "namespace declarations are only supported on xs:schema",
+        );
+        let other_ns = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:p="urn:other" targetNamespace="urn:mine"><xs:element name="a" type="p:x"/></xs:schema>"#;
+        invalid_with(
+            SchemaType::Xsd,
+            other_ns,
+            "belongs to namespace 'urn:other'; types from other namespaces are not supported",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><a:foo xmlns:a="urn:x"/></xs:schema>"#,
+            "namespace declarations are only supported on xs:schema",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:o="urn:o"><o:foo/><xs:element name="a" type="xs:string"/></xs:schema>"#,
+            "element 'foo' is not in the XML Schema namespace",
+        );
+
+        // Instance-side phrases of the XSD checker the dashboard translates
+        // for a message that reached the unprocessed list.
+        let instance_schema = xsd(
+            r#"<xs:simpleType name="s"><xs:restriction base="xs:string"><xs:minLength value="2"/><xs:maxLength value="3"/><xs:pattern value="[a-z]+"/></xs:restriction></xs:simpleType>
+               <xs:simpleType name="e"><xs:restriction base="xs:string"><xs:enumeration value="x"/></xs:restriction></xs:simpleType>
+               <xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:int"/>
+                 <xs:element name="b" type="s" minOccurs="0"/>
+                 <xs:element name="c" type="e" minOccurs="0"/>
+               </xs:sequence><xs:attribute name="id" type="xs:int" use="required"/></xs:complexType></xs:element>
+               <xs:element name="u"><xs:complexType><xs:all>
+                 <xs:element name="a" type="xs:string"/>
+                 <xs:element name="b" type="xs:string"/>
+               </xs:all></xs:complexType></xs:element>"#,
+        );
+        let xsd_ops = SchemaType::Xsd.ops();
+        let compiled = xsd_ops.compile(&instance_schema).unwrap();
+        for (payload, expected) in [
+            (r#"<r id="1"><x/></r>"#, "/r/x: element is not allowed here"),
+            (r#"<r id="1"/>"#, "/r: required child elements are missing"),
+            (
+                r#"<r id="1"><a>x</a></r>"#,
+                "/r/a: value is not a valid xs:int",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>a</b></r>"#,
+                "/r/b: value is shorter than minLength",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>abcd</b></r>"#,
+                "/r/b: value is longer than maxLength",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>ab1</b></r>"#,
+                "/r/b: value does not match the pattern",
+            ),
+            (
+                r#"<r id="1"><a>1</a><c>y</c></r>"#,
+                "/r/c: value is not one of the enumerated values",
+            ),
+            (
+                r#"<r id="x"><a>1</a></r>"#,
+                "/r: attribute 'id' is not a valid xs:int",
+            ),
+            (
+                r#"<r><a>1</a></r>"#,
+                "/r: required attribute 'id' is missing",
+            ),
+            (
+                r#"<r id="1" z="2"><a>1</a></r>"#,
+                "/r: attribute 'z' is not declared",
+            ),
+            (
+                r#"<r id="1" xsi:type="x"><a>1</a></r>"#,
+                "/r: attribute 'xsi:type' is not supported (xsi:type and xsi:nil are not honoured)",
+            ),
+            (r#"<q/>"#, "<root>: root element 'q' is not declared"),
+            (
+                r#"<r id="1">text<a>1</a></r>"#,
+                "/r: character data is not allowed in element-only content",
+            ),
+            (r#"<u><a/><a/></u>"#, "/u/a: element occurs more than once"),
+            (
+                r#"<u><a/></u>"#,
+                "/u: required child element 'b' is missing",
+            ),
+            (
+                r#"<r id="1"><a>1</a></r><r/>"#,
+                "<root>: more than one root element",
+            ),
+            (
+                r#"<!DOCTYPE r><r/>"#,
+                "<root>: DOCTYPE declarations are not allowed",
+            ),
+            ("", "<root>: document has no root element"),
+            (r#"<r id="1"><a>1</b></r>"#, "/r/a: not well-formed XML"),
+            (
+                r#"<r id="1"><a>&foo;</a></r>"#,
+                "/r/a: entity references other than the five predefined ones are not supported",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    xsd_ops.validate(&compiled, payload.as_bytes()),
+                    Err(SchemaError::Violation(ref m)) if m == expected
+                ),
+                "{payload}: expected {expected:?}, got {:?}",
+                xsd_ops.validate(&compiled, payload.as_bytes())
+            );
+        }
+
+        // Instance-side phrases of the HL7 parser.
+        let hl7_ops = SchemaType::Hl7v2Profile.ops();
+        let msh_only = hl7_ops.compile(r#"{"required_segments":["MSH"]}"#).unwrap();
+        for (payload, expected) in [
+            (
+                &b"PID|1"[..],
+                "hl7: message does not start with an MSH segment",
+            ),
+            (b"MSH", "hl7: MSH segment has no field separator"),
+            (b"MSH|^~\\&|a\rP!D|1", "hl7: segment id is not valid"),
+            (
+                b"MSH|^~\\&|a\rPIDx",
+                "hl7: a segment is missing the field separator after its id",
+            ),
+            (b"", "hl7: empty message"),
+        ] {
+            assert!(
+                matches!(
+                    hl7_ops.validate(&msh_only, payload),
+                    Err(SchemaError::Violation(ref m)) if m == expected
+                ),
+                "{payload:?}: expected {expected:?}, got {:?}",
+                hl7_ops.validate(&msh_only, payload)
+            );
+        }
+        assert!(matches!(
+            hl7_ops.validate(&msh_only, b"\xff\xfe"),
+            Err(SchemaError::Violation(m)) if m.starts_with("hl7: not valid utf-8")
+        ));
+
         // Instance-side phrases the dashboard translates for an HL7 message.
         let compiled = SchemaType::Hl7v2Profile
             .ops()
