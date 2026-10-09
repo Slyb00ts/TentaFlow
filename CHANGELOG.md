@@ -166,30 +166,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zadziałają”): wartość wyliczenia do 1 KB, wszystkie wyliczenia razem do
   128 KB i 4096 wartości, wzorzec `pattern` do 512 znaków, do 256 wzorców,
   program jednego wzorca do 256 KB (cyfry `\d` są Unicode, więc PESEL `\d{11}`
-  potrzebuje 64 KB, a `\p{L}{60}` jest odrzucany) oraz 16 MB pamięci wszystkich
+  potrzebuje 64 KB, a `\p{L}{60}` jest odrzucany) oraz 32 MB pamięci wszystkich
   wzorców razem, najwyżej 1024 atrybuty w typie. Wzór przekraczający limit jest
   odrzucany z opisem po polsku. Pamięć podręczna skompilowanych wzorów magistrali
   ma granicę 1024 wpisów i 256 MB (najdawniej użyty wypada pierwszy), a zmiana
   wzoru innego tematu nie wymusza już ponownej kompilacji niezmienionych.
 - Trzecia runda poprawek kosztu sprawdzania XSD. `pattern` jest dopasowywany
   leniwym automatem (`regex-automata`, zależność tylko w głównym
-  `Cargo.toml`) i kosztuje jedną jednostkę na bajt; dopiero gdy automat
-  zrezygnuje (pamięć podręczna się trzęsie), płaci się z góry `liczba stanów ×
-  długość` za maszynę Pike VM. Realistyczne paczki (kilkanaście tysięcy PESEL,
+  `Cargo.toml`) i kosztuje jedną jednostkę na bajt; do tego płaci się
+  za stany zbudowane przez skanowanie oraz `liczba stanów` za każdą nową
+  pamięć podręczną automatu (każda równoległa walidacja ma własną z puli,
+  używaną ponownie). Gdy automat zrezygnuje (pamięć się trzęsie), płaci się z
+  góry `szerokość × długość` za maszynę Pike VM, gdzie szerokość to stany
+  plus wszystkie zakresy przejść (klasy Unicode są szerokie). Realistyczne paczki (kilkanaście tysięcy PESEL,
   NIP, kodów pocztowych i IBAN) mieszczą się więc w budżecie, a wzorzec
   `[01]*1[01]{200}` na megabajcie losowych bitów nadal jest odrzucany jako
   `schema_check_too_complex`. Grupy XSD są niekapturujące (`(?:…)`), pamięć
-  wzorca liczy jego program i do 2 pamięci podręcznych automatu, a waga wpisu
+  wzorca liczy jego program i do 4 pamięci podręcznych automatu (każda
+  kolejna równoległa walidacja tego wzorca dokłada jedną), a waga wpisu
   pamięci podręcznej uwzględnia automaty modeli treści (limit pamięci wzorców
-  jednego wzoru: 16 MB). Praca per element (kopia zbioru startowego,
+  jednego schematu: 32 MB). Tabela znaczników rekordu jest liczona z góry. Praca per element (kopia zbioru startowego,
   flagi `xs:all`) jest liczona w budżecie, a akceptacja modelu to odczyt jednego
   elementu. Pamięć podręczna skompilowanych wzorów ma udział na organizację
   (128 wpisów i 64 MB; przekroczone ogólne granice zwalnia najpierw organizacja
   zajmująca najwięcej), a równoczesne chybienia tego samego tematu czekają na
   jedną kompilację. **Jedna paczka publikacji ma wspólny budżet walidacji
   XSD**: 50 mln jednostek plus 64 na bajt ładunków paczki (limit 50 mln na
-  dokument obowiązuje nadal); rekordy, którym budżetu zabrakło, są traktowane
-  jak `schema_check_too_complex`. Wybór efektywnej wersji tematu z
+  dokument obowiązuje nadal). Opłata, która się nie mieści, jest odrzucana bez
+  dopisywania, więc rekord obciąża paczkę tylko pracą, która faktycznie się
+  wykonała (najwyżej jego udziałem); rekordy, którym budżetu zabrakło, są
+  traktowane jak `schema_check_too_complex`, a kolejne uczciwe rekordy
+  przechodzą, dopóki budżet paczki nie zostanie realnie wyczerpany. Błąd
+  budowy wzorca podaje powód (zły zakres powtórzeń, zbyt głębokie
+  zagnieżdżenie, zakres znaków od końca) i dashboard opisuje go po polsku. Wybór efektywnej wersji tematu z
   wycofaniami czyta tylko numery i skróty wersji, a tekst wybranej jednej.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:

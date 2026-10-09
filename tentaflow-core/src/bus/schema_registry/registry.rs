@@ -312,6 +312,32 @@ fn effective_version<'a>(
         .or(Some(latest))
 }
 
+/// Picks the effective version from the heads and reads its text. The two
+/// reads are separate queries, so a subject deleted and recreated in between
+/// could hand back another subject's version under the same number: the text
+/// must carry the hash of the head that was selected, or the pair is read
+/// again once. A second mismatch is an error, never a silently wrong schema.
+fn select_verified(
+    row: &DbBusSchemaSubject,
+    deprecated: &[DeprecatedVersion],
+    mut heads: impl FnMut() -> anyhow::Result<Vec<DbBusSchemaVersion>>,
+    mut read: impl FnMut(u32) -> anyhow::Result<Option<DbBusSchemaVersion>>,
+) -> Result<Option<DbBusSchemaVersion>, BusServiceError> {
+    for _ in 0..2 {
+        let heads = heads()?;
+        let Some(head) = effective_version(row, deprecated, &heads) else {
+            return Ok(None);
+        };
+        match read(head.version)? {
+            Some(chosen) if chosen.content_hash == head.content_hash => return Ok(Some(chosen)),
+            _ => {}
+        }
+    }
+    Err(BusServiceError::Db(
+        "the schema versions changed while the effective version was being read; retry".into(),
+    ))
+}
+
 /// `SchemaRegisterRequest`'s response.
 #[derive(Debug)]
 pub struct RegisterOutcome {
@@ -1073,13 +1099,12 @@ pub fn resolve_effective(
     let chosen = if deprecated.is_empty() {
         repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
     } else {
-        let heads = repository::bus_schema_version_heads(db, instance_id, org_id, subject)?;
-        match effective_version(&row, &deprecated, &heads).map(|v| v.version) {
-            Some(version) => {
-                repository::bus_schema_version_get(db, instance_id, org_id, subject, version)?
-            }
-            None => None,
-        }
+        select_verified(
+            &row,
+            &deprecated,
+            || repository::bus_schema_version_heads(db, instance_id, org_id, subject),
+            |version| repository::bus_schema_version_get(db, instance_id, org_id, subject, version),
+        )?
     };
     let Some(chosen) = chosen else {
         return Ok(None);
@@ -2312,6 +2337,62 @@ mod tests {
             matches!(err, BusServiceError::InvalidTopicConfig { ref reason } if reason.contains("deprecated")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_version_read_that_does_not_match_the_selected_head_is_read_again_once() {
+        let row = DbBusSchemaSubject {
+            instance_id: "tentabus-00000001".to_string(),
+            org_id: "org-1".to_string(),
+            subject: "orders".to_string(),
+            schema_type: SchemaType::JsonSchema.as_str().to_string(),
+            compatibility: Compatibility::None.as_str().to_string(),
+            deprecated_at_ms: None,
+            created_by: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deprecated_versions_json: Some("[]".to_string()),
+            generation: 0,
+        };
+        let version = |text: &str, hash: &str| DbBusSchemaVersion {
+            instance_id: row.instance_id.clone(),
+            org_id: row.org_id.clone(),
+            subject: row.subject.clone(),
+            version: 1,
+            schema_text: text.to_string(),
+            content_hash: hash.to_string(),
+            schema_ref_id: 1,
+            created_by: None,
+            created_at_ms: 1,
+            subject_generation: 0,
+        };
+        let head = || Ok(vec![version("", "hash-new")]);
+
+        // The first read lands on a recreated subject's version: retried.
+        let mut reads = vec![
+            version("{\"stale\":1}", "hash-old"),
+            version("{}", "hash-new"),
+        ];
+        let chosen = select_verified(&row, &[], head, |_| Ok(Some(reads.remove(0))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.schema_text, "{}");
+
+        // A second mismatch is an error, never the wrong text.
+        let mismatch = select_verified(&row, &[], head, |_| {
+            Ok(Some(version("{\"stale\":1}", "hash-old")))
+        });
+        assert!(mismatch.is_err(), "{mismatch:?}");
+
+        // A matching read is taken as it is, after one read.
+        let mut calls = 0;
+        let chosen = select_verified(&row, &[], head, |_| {
+            calls += 1;
+            Ok(Some(version("{}", "hash-new")))
+        })
+        .unwrap();
+        assert!(chosen.is_some());
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -471,6 +471,11 @@ const XSD_LIMIT_REFUSALS = [
   [/^the schema uses more than (\d+) patterns/, 'patterns'],
   [/^the patterns of the schema need more than (\d+) KiB of memory/, 'pattern_memory'],
   [/the compiled pattern is too large/, 'pattern_big'],
+  [/regular expression: exceed the maximum number of nested parentheses\/brackets \((\d+)\)/, 'pattern_nest'],
+  [/regular expression: (?:invalid repetition count range|repetition quantifier expects|decimal literal invalid)/, 'pattern_repeat'],
+  [/regular expression: invalid character class range/, 'pattern_range'],
+  [/regular expression: repetition operator missing expression/, 'pattern_operand'],
+  [/is not a valid or supported regular expression/, 'pattern_syntax'],
   [/^a type declares more than (\d+) attributes/, 'attributes'],
   [/^the schema exceeds the compile work limit/, 'compile'],
 ];

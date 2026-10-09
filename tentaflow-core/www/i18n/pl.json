@@ -11424,6 +11424,11 @@
         "xsd_limit_patterns": "We wzorze jest za dużo ograniczeń typu pattern (najwyżej {limit}). Połącz je albo usuń zbędne.",
         "xsd_limit_pattern_memory": "Wzorce pattern są razem zbyt rozbudowane: potrzebują ponad {limit} KB pamięci. Uprość je albo usuń zbędne.",
         "xsd_limit_pattern_big": "Jeden ze wzorców pattern jest zbyt rozbudowany, np. powtarza wiele razy klasę znaków. Uprość go.",
+        "xsd_limit_pattern_nest": "Jeden ze wzorców pattern zagnieżdża nawiasy zbyt głęboko (najwyżej {limit} poziomów). Spłaszcz go.",
+        "xsd_limit_pattern_repeat": "Jeden ze wzorców pattern ma błędne powtórzenie, np. {2,1} albo {,3}. Zapisz liczby jako {n}, {n,} lub {n,m}, gdzie n nie jest większe od m.",
+        "xsd_limit_pattern_range": "Jeden ze wzorców pattern ma zakres znaków zapisany od końca, np. [z-a]. Podaj najpierw znak mniejszy.",
+        "xsd_limit_pattern_operand": "Jeden ze wzorców pattern ma znak powtórzenia (*, + lub ?) bez niczego przed nim. Wstaw przed nim znak lub grupę, której dotyczy.",
+        "xsd_limit_pattern_syntax": "Jeden ze wzorców pattern nie jest poprawnym wyrażeniem regularnym. Sprawdź nawiasy, grupy i liczby powtórzeń.",
         "xsd_limit_attributes": "Jeden z typów ma za dużo atrybutów (najwyżej {limit}). Podziel go na mniejsze.",
         "xsd_limit_compile": "Ten wzór jest zbyt złożony, żeby go przyjąć. Uprość go: mniej typów, atrybutów i powtórzeń."
       }

@@ -10189,6 +10189,11 @@
         "xsd_limit_patterns": "El patrón tiene demasiadas restricciones pattern (máximo {limit}). Únelas o quita las que sobren.",
         "xsd_limit_pattern_memory": "Las restricciones pattern son en conjunto demasiado complejas: necesitan más de {limit} KB de memoria. Simplifícalas o quita las que sobren.",
         "xsd_limit_pattern_big": "Una de las restricciones pattern es demasiado compleja, p. ej. repite muchas veces una clase de caracteres. Simplifícala.",
+        "xsd_limit_pattern_nest": "Una de las restricciones pattern anida paréntesis demasiado profundamente (máximo {limit} niveles). Aplánala.",
+        "xsd_limit_pattern_repeat": "Una de las restricciones pattern tiene una repetición mal formada, p. ej. {2,1} o {,3}. Escribe los números como {n}, {n,} o {n,m}, con n no mayor que m.",
+        "xsd_limit_pattern_range": "Una de las restricciones pattern tiene un rango de caracteres escrito al revés, p. ej. [z-a]. Pon primero el carácter menor.",
+        "xsd_limit_pattern_operand": "Una de las restricciones pattern tiene un símbolo de repetición (*, + o ?) sin nada delante. Pon delante el carácter o grupo al que se aplica.",
+        "xsd_limit_pattern_syntax": "Una de las restricciones pattern no es una expresión regular válida. Revisa los paréntesis, los grupos y los números de repeticiones.",
         "xsd_limit_attributes": "Uno de los tipos tiene demasiados atributos (máximo {limit}). Divídelo en otros más pequeños.",
         "xsd_limit_compile": "Este patrón es demasiado complejo para aceptarlo. Simplifícalo: menos tipos, atributos y repeticiones."
       }

@@ -101,7 +101,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -111,6 +111,7 @@ use regex_automata::hybrid::dfa::{
 };
 use regex_automata::nfa::thompson::pikevm::PikeVM;
 use regex_automata::nfa::thompson::{self, WhichCaptures};
+use regex_automata::util::pool::Pool;
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input};
 
@@ -152,16 +153,21 @@ const PATTERN_NFA_LIMIT: usize = 256 * 1024;
 /// `PATTERN_CACHE_FLOOR` and refused above `PATTERN_CACHE_MAX`.
 const PATTERN_CACHE_FLOOR: usize = 16 * 1024;
 const PATTERN_CACHE_MAX: usize = 1024 * 1024;
-/// A pattern keeps at most this many idle lazy-DFA caches for reuse; further
-/// concurrent matches build a cache and drop it.
-const RETAINED_CACHES: usize = 2;
+/// Lazy-DFA caches a pattern is budgeted for: one per concurrent validator.
+/// The pool hands every concurrently running match its own cache and keeps
+/// it, so a pattern holds as many caches as it has seen simultaneous matches;
+/// `pattern_memory` accounts for this many, each further concurrent match
+/// adds at most `cache_capacity + fresh_cache_bytes`.
+const POOLED_CACHES: usize = 4;
 /// Memory proxy per schema, charged per pattern as
-/// `nfa.memory_usage() + RETAINED_CACHES x cache_capacity`: the forward
-/// program (shared with the Pike VM fallback; no reverse program is built,
-/// matching is anchored and forward-only) plus the lazy-DFA caches the pattern
-/// may keep. A Pike VM cache (~64 bytes per NFA state) exists only during a
+/// `nfa.memory_usage() + POOLED_CACHES x (cache_capacity + fresh_cache_bytes)`:
+/// the forward program (shared with the Pike VM fallback; no reverse program
+/// is built, matching is anchored and forward-only) plus the lazy-DFA caches
+/// of up to `POOLED_CACHES` concurrent matches (`fresh_cache_bytes` is the
+/// NFA-sized sparse sets and start table a cache holds before any state is
+/// built). A Pike VM cache (~64 bytes per NFA state) exists only during a
 /// charged fallback and is dropped afterwards, so it is not retained memory.
-const MAX_PATTERN_MEMORY: usize = 16 * 1024 * 1024;
+const MAX_PATTERN_MEMORY: usize = 32 * 1024 * 1024;
 const PATTERN_NEST_LIMIT: u32 = 32;
 const MAX_DOC_DEPTH: usize = 128;
 /// One unit is roughly 10 ns of work; 50M units bound a document to about
@@ -180,8 +186,8 @@ const COMPILE_WORK_REFUSAL: &str = "the schema exceeds the compile work limit; s
 
 const SUPPORTED_BUILTINS: &str = "string, int, integer, decimal, boolean, date, dateTime";
 
-/// The single meter every expensive primitive charges. Saturating, so an
-/// absurd charge (value length x pattern count) cannot wrap around.
+/// The single meter every expensive primitive charges. An absurd charge
+/// (value length x pattern count) cannot wrap around: it simply does not fit.
 #[derive(Debug)]
 struct Budget {
     used: u64,
@@ -197,12 +203,17 @@ impl Budget {
         Budget { used: 0, limit }
     }
 
+    /// Check before commit: a charge that does not fit is refused WITHOUT
+    /// being added, so `used` never exceeds `limit` and a shared batch is
+    /// debited only for work that was actually allowed to run.
     fn charge(&mut self, units: u64) -> Result<(), LimitExceeded> {
-        self.used = self.used.saturating_add(units);
-        if self.used > self.limit {
-            return Err(LimitExceeded);
+        match self.used.checked_add(units) {
+            Some(total) if total <= self.limit => {
+                self.used = total;
+                Ok(())
+            }
+            _ => Err(LimitExceeded),
         }
-        Ok(())
     }
 }
 
@@ -660,8 +671,54 @@ struct Matcher {
     dfa: DFA,
     pike: PikeVM,
     cache_capacity: usize,
-    caches: Mutex<Vec<DfaCache>>,
+    /// Pike VM work per input byte: NFA states plus every sparse transition
+    /// range and union alternate a step may have to scan.
+    width: u64,
+    /// One lazy-DFA cache per concurrently running match, reused across
+    /// matches (a fresh cache zeroes NFA-sized sets and recomputes every
+    /// transition, so it is charged when built).
+    caches: DfaCachePool,
     memory: usize,
+}
+
+type DfaCachePool = Pool<MatchCache, Box<dyn Fn() -> MatchCache + Send + Sync>>;
+
+#[derive(Debug)]
+struct MatchCache {
+    cache: DfaCache,
+    /// Not yet charged for being built.
+    fresh: bool,
+}
+
+/// Work of one Pike VM step over the whole automaton, counting what a
+/// Unicode class costs: one scan per sparse range, per union alternate.
+fn automaton_width(nfa: &thompson::NFA) -> u64 {
+    nfa.states().iter().fold(0u64, |width, state| {
+        let ranges = match state {
+            thompson::State::Sparse(t) => t.transitions.len(),
+            thompson::State::Dense(_) => 256,
+            thompson::State::Union { alternates } => alternates.len(),
+            thompson::State::BinaryUnion { .. } => 2,
+            _ => 0,
+        };
+        width.saturating_add(1).saturating_add(ranges as u64)
+    })
+}
+
+/// The reason of a pattern `BuildError`, in a stable phrase the dashboard
+/// maps: regex-syntax words its parse errors as a header, the pattern and a
+/// final `error: <reason>` line; only that reason is kept, never the text.
+fn build_error_reason(e: &thompson::BuildError) -> String {
+    let source = std::error::Error::source(e).map(ToString::to_string);
+    let reason = source
+        .as_deref()
+        .and_then(|s| {
+            s.lines()
+                .rev()
+                .find_map(|l| l.trim().strip_prefix("error: "))
+        })
+        .unwrap_or("the pattern could not be built");
+    reason.to_string()
 }
 
 /// A pattern longer than `MAX_PATTERN_CHARS`, malformed, or too large to
@@ -688,7 +745,10 @@ fn build_pattern(source: &str) -> Result<Matcher, String> {
             if e.size_limit().is_some() {
                 too_large()
             } else {
-                format!("pattern is not a valid or supported regular expression: {e}")
+                format!(
+                    "pattern is not a valid or supported regular expression: {}",
+                    build_error_reason(&e)
+                )
             }
         })?;
     let build_dfa = |cache_capacity: usize| {
@@ -715,12 +775,20 @@ fn build_pattern(source: &str) -> Result<Matcher, String> {
     let dfa = build_dfa(cache_capacity).ok_or_else(too_large)?;
     let pike = PikeVM::new_from_nfa(nfa.clone())
         .map_err(|e| format!("pattern is not a valid or supported regular expression: {e}"))?;
+    let fresh_cache_bytes = dfa.create_cache().memory_usage();
+    let pool_dfa = dfa.clone();
     Ok(Matcher {
-        memory: nfa.memory_usage() + RETAINED_CACHES * cache_capacity,
+        memory: nfa
+            .memory_usage()
+            .saturating_add(POOLED_CACHES.saturating_mul(cache_capacity + fresh_cache_bytes)),
+        width: automaton_width(&nfa),
         dfa,
         pike,
         cache_capacity,
-        caches: Mutex::new(Vec::new()),
+        caches: Pool::new(Box::new(move || MatchCache {
+            cache: pool_dfa.create_cache(),
+            fresh: true,
+        })),
     })
 }
 
@@ -731,31 +799,33 @@ impl Matcher {
     }
 
     /// Whether the whole of `value` matches. Costs one unit per byte of the
-    /// lazy-DFA scan; when the lazy DFA gives up (its cache thrashed on a
-    /// pattern whose state space explodes), the cache it burned and the Pike
-    /// VM's `states x length` are charged BEFORE the Pike VM runs.
+    /// lazy-DFA scan, plus the bytes of automaton state the scan had to
+    /// build (a new state costs about its encoded NFA set) and, once per
+    /// cache, `states` units for building it. When the lazy DFA gives up (its
+    /// cache thrashed on a pattern whose state space explodes), the cache it
+    /// burned and the Pike VM's `width x length` are charged BEFORE the Pike
+    /// VM runs.
     fn is_match(&self, value: &str, budget: &mut Budget) -> Result<bool, LimitExceeded> {
         let len = value.len() as u64;
         budget.charge(1 + len)?;
         let input = Input::new(value).anchored(Anchored::Yes).earliest(true);
-        let mut cache = self
-            .caches
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop()
-            .unwrap_or_else(|| self.dfa.create_cache());
-        match self.dfa.try_search_fwd(&mut cache, &input) {
+        let mut guard = self.caches.get();
+        if guard.fresh {
+            budget.charge(self.dfa.get_nfa().states().len() as u64)?;
+            guard.fresh = false;
+        }
+        let before = guard.cache.memory_usage();
+        match self.dfa.try_search_fwd(&mut guard.cache, &input) {
             Ok(found) => {
-                let mut idle = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
-                if idle.len() < RETAINED_CACHES {
-                    idle.push(cache);
-                }
+                let grown = guard.cache.memory_usage().saturating_sub(before);
+                budget.charge(grown as u64)?;
                 Ok(found.is_some())
             }
             Err(_) => {
-                let states = self.dfa.get_nfa().states().len() as u64;
+                guard.cache.reset(&self.dfa);
+                drop(guard);
                 budget.charge(
-                    (self.cache_capacity as u64).saturating_add(len.saturating_mul(states)),
+                    (self.cache_capacity as u64).saturating_add(len.saturating_mul(self.width)),
                 )?;
                 let mut cache = self.pike.create_cache();
                 Ok(self.pike.is_match(&mut cache, input))
@@ -2954,6 +3024,10 @@ fn validate_with(c: &Compiled, payload: &[u8], budget: &mut Budget) -> Result<()
     let decoder = reader.decoder();
     let mut stack: Vec<Frame> = Vec::new();
     let mut root_closed = false;
+    // The mark table is zeroed up front (4 bytes per state, about 8 per unit).
+    budget
+        .charge(c.max_nfa_states as u64 / 8)
+        .map_err(|_| limit("<root>", VALIDATION_BUDGET_MSG))?;
     let mut marks = Marks::new(c.max_nfa_states);
 
     loop {
@@ -5590,9 +5664,9 @@ mod tests {
         };
         let err = spent.roots().unwrap_err();
         assert!(err.contains("too complex to compare"), "{err}");
-        assert!(
-            spent.budget.used > MAX_COMPAT_WORK,
-            "the steps of a product construction count into the shared budget as they happen"
+        assert_eq!(
+            spent.budget.used, MAX_COMPAT_WORK,
+            "a refused step is not added"
         );
     }
 
@@ -6082,7 +6156,10 @@ mod tests {
         ));
         let msg = refusal_of(&many);
         assert!(
-            msg.contains("the patterns of the schema need more than 16384 KiB of memory"),
+            msg.contains(&format!(
+                "the patterns of the schema need more than {} KiB of memory",
+                MAX_PATTERN_MEMORY / 1024
+            )),
             "{msg}"
         );
         // One automaton past the largest tier is refused on its own.
@@ -6186,7 +6263,7 @@ mod tests {
         // intersection never runs.
         let mut tight = Budget::new(5000);
         assert_eq!(ty.effective_enumeration(&mut tight), Err(LimitExceeded));
-        assert!(tight.used > tight.limit);
+        assert!(tight.used <= tight.limit, "a refused charge is not added");
         let mut roomy = Budget::new(1_000_000);
         let members = ty.effective_enumeration(&mut roomy).unwrap().unwrap();
         assert_eq!(members.len(), 2048);
@@ -6213,7 +6290,49 @@ mod tests {
         );
         let mut b = Budget::new(10);
         assert_eq!(b.charge(u64::MAX), Err(LimitExceeded));
-        assert_eq!(b.charge(u64::MAX), Err(LimitExceeded), "saturating");
+        assert_eq!(b.charge(u64::MAX), Err(LimitExceeded), "cannot wrap");
+    }
+
+    #[test]
+    fn a_charge_that_does_not_fit_is_refused_without_being_added() {
+        let mut b = Budget::new(10);
+        b.charge(4).unwrap();
+        assert_eq!(b.charge(7), Err(LimitExceeded));
+        assert_eq!(b.used, 4, "check before commit");
+        b.charge(6).unwrap();
+        assert_eq!(b.used, 10);
+    }
+
+    #[test]
+    fn a_record_over_its_allowance_does_not_drain_the_batch() {
+        let pattern = "[01]*1[01]{200}";
+        let s = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&format!(r#"<xs:pattern value="{pattern}"/>"#))
+        ));
+        let c = compiled(&s);
+        // The give-up charge (cache + length x width) of this record dwarfs
+        // the whole allowance; it must not be debited from the batch.
+        let hostile = format!("<r>{}</r>", random_bits(300_000));
+        let honest = format!("<r>1{}</r>", "0".repeat(200));
+        let mut shared = ValidationBudget::for_batch(hostile.len() + 2 * honest.len());
+        let before = shared.remaining;
+        let first = XSD_OPS.validate_metered(&c, hostile.as_bytes(), &mut shared);
+        assert!(
+            matches!(&first, Err(SchemaError::LimitExceeded(_))),
+            "{first:?}"
+        );
+        assert!(
+            before - shared.remaining < 5_000_000,
+            "only the work that ran is debited: {}",
+            before - shared.remaining
+        );
+        XSD_OPS
+            .validate_metered(&c, honest.as_bytes(), &mut shared)
+            .unwrap();
+        XSD_OPS
+            .validate_metered(&c, honest.as_bytes(), &mut shared)
+            .unwrap();
     }
 
     // ---- accurate pattern charging, non-capturing groups, accounting --------
@@ -6284,7 +6403,12 @@ mod tests {
         let value = "7".repeat(1_000_000);
         let mut budget = Budget::new(u64::MAX);
         assert!(matcher.is_match(&value, &mut budget).unwrap());
-        assert_eq!(budget.used, 1 + value.len() as u64);
+        let scanned = 1 + value.len() as u64;
+        assert!(
+            (scanned..scanned + scanned / 100).contains(&budget.used),
+            "one unit per byte plus the states built once: {} vs {scanned}",
+            budget.used
+        );
     }
 
     #[test]
@@ -6307,6 +6431,99 @@ mod tests {
         );
         let mut tight = Budget::new(10_000_000);
         assert_eq!(matcher.is_match(&value, &mut tight), Err(LimitExceeded));
+    }
+
+    #[test]
+    fn the_pike_fallback_is_charged_by_the_unicode_width_of_the_automaton() {
+        let narrow = build_pattern("[01]*1[01]{200}").unwrap();
+        let wide = build_pattern(r"\p{L}+\d{3}").unwrap();
+        for matcher in [&narrow, &wide] {
+            assert!(matcher.width >= matcher.dfa.get_nfa().states().len() as u64);
+        }
+        let states = wide.dfa.get_nfa().states().len() as u64;
+        assert!(
+            wide.width > 3 * states,
+            "Unicode classes are sparse transitions of many ranges: {} vs {states} states",
+            wide.width
+        );
+    }
+
+    /// Eight validators share one pattern: every match gets its own cache from
+    /// the pool, the caches are reused, and the work stays near what is charged.
+    #[test]
+    fn concurrent_matches_of_one_pattern_do_bounded_work_near_their_charge() {
+        let cases: [(&str, String); 2] = [
+            ("[01]*1[01]{200}", random_bits(600)),
+            (r"\p{L}+\d{3}", format!("{}123", "żółć".repeat(150))),
+        ];
+        for (pattern, value) in cases {
+            let matcher = Arc::new(build_pattern(pattern).unwrap());
+            let started = std::time::Instant::now();
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let matcher = Arc::clone(&matcher);
+                    let value = value.clone();
+                    std::thread::spawn(move || {
+                        let began = std::time::Instant::now();
+                        let mut budget = Budget::new(u64::MAX);
+                        for _ in 0..100 {
+                            matcher.is_match(&value, &mut budget).unwrap();
+                        }
+                        (began.elapsed(), budget.used)
+                    })
+                })
+                .collect();
+            let (mut cpu, mut units) = (std::time::Duration::ZERO, 0u64);
+            for t in threads {
+                let (elapsed, used) = t.join().unwrap();
+                cpu += elapsed;
+                units += used;
+            }
+            let ns_per_unit = cpu.as_nanos() as f64 / units as f64;
+            eprintln!(
+                "{pattern}: wall {:?}, {units} units, {ns_per_unit:.1} ns/unit",
+                started.elapsed()
+            );
+            // A unit is documented as ~10 ns; allow generous headroom for
+            // loaded CI machines and debug builds, but not an unmetered
+            // multiple (the old per-match cache rebuilds cost far more).
+            let ceiling = if cfg!(debug_assertions) { 400.0 } else { 100.0 };
+            assert!(
+                ns_per_unit < ceiling,
+                "{pattern}: {ns_per_unit} ns per unit"
+            );
+            within(started, 60);
+        }
+    }
+
+    #[test]
+    fn building_a_fresh_cache_is_charged_once_per_cache() {
+        let matcher = build_pattern(r"\p{L}+\d{3}").unwrap();
+        let states = matcher.dfa.get_nfa().states().len() as u64;
+        let mut first = Budget::new(u64::MAX);
+        matcher.is_match("abc123", &mut first).unwrap();
+        assert!(first.used >= 1 + 6 + states, "{} vs {states}", first.used);
+        let mut warm = Budget::new(u64::MAX);
+        matcher.is_match("abc123", &mut warm).unwrap();
+        assert!(
+            warm.used < first.used - states / 2,
+            "the warm cache is not charged again"
+        );
+    }
+
+    #[test]
+    fn the_mark_table_of_a_record_is_charged_up_front() {
+        let CompiledSchema::Xsd(c) = compiled(&wide_choice_schema(4990)) else {
+            panic!("expected an xsd schema");
+        };
+        let mut budget = Budget::new(MAX_VALIDATION_STEPS);
+        validate_with(&c, b"<r/>", &mut budget).unwrap();
+        assert!(
+            budget.used >= c.max_nfa_states as u64 / 8,
+            "{} vs {}",
+            budget.used,
+            c.max_nfa_states
+        );
     }
 
     /// 10k records of a realistic national-identifier shape.
@@ -6396,11 +6613,11 @@ mod tests {
     }
 
     #[test]
-    fn pattern_memory_covers_the_program_and_the_retained_caches() {
+    fn pattern_memory_covers_the_program_and_the_pooled_caches() {
         let matcher = build_pattern(r"\d{11}").unwrap();
         assert!(
             matcher.memory_bytes()
-                >= matcher.dfa.get_nfa().memory_usage() + RETAINED_CACHES * PATTERN_CACHE_FLOOR
+                >= matcher.dfa.get_nfa().memory_usage() + POOLED_CACHES * PATTERN_CACHE_FLOOR
         );
         let one = schema(&format!(
             r#"{}<xs:element name="r" type="T"/>"#,
@@ -6493,8 +6710,12 @@ mod tests {
             matches!(&second, Err(SchemaError::LimitExceeded(_))),
             "{second:?}"
         );
-        assert_eq!(shared.remaining, 0);
-        let third = XSD_OPS.validate_metered(&c, b"<r/>", &mut shared);
+        assert!(
+            shared.remaining < 5_000,
+            "only the work that fitted was debited: {}",
+            shared.remaining
+        );
+        let third = XSD_OPS.validate_metered(&c, b"<r><x/></r>", &mut shared);
         assert!(
             matches!(&third, Err(SchemaError::LimitExceeded(_))),
             "{third:?}"

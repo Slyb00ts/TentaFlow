@@ -10189,6 +10189,11 @@
         "xsd_limit_patterns": "Das Muster hat zu viele pattern-Einschränkungen (höchstens {limit}). Fassen Sie sie zusammen oder entfernen Sie überflüssige.",
         "xsd_limit_pattern_memory": "Die pattern-Einschränkungen sind zusammen zu aufwendig: Sie brauchen mehr als {limit} KB Speicher. Vereinfachen Sie sie oder entfernen Sie überflüssige.",
         "xsd_limit_pattern_big": "Eine der pattern-Einschränkungen ist zu aufwendig, z. B. wiederholt sie eine Zeichenklasse sehr oft. Vereinfachen Sie sie.",
+        "xsd_limit_pattern_nest": "Eine der pattern-Einschränkungen verschachtelt Klammern zu tief (höchstens {limit} Ebenen). Vereinfachen Sie sie.",
+        "xsd_limit_pattern_repeat": "Eine der pattern-Einschränkungen hat eine fehlerhafte Wiederholung, z. B. {2,1} oder {,3}. Schreiben Sie die Anzahl als {n}, {n,} oder {n,m}, wobei n nicht größer als m ist.",
+        "xsd_limit_pattern_range": "Eine der pattern-Einschränkungen hat einen rückwärts geschriebenen Zeichenbereich, z. B. [z-a]. Nennen Sie zuerst das kleinere Zeichen.",
+        "xsd_limit_pattern_operand": "Eine der pattern-Einschränkungen hat ein Wiederholungszeichen (*, + oder ?) ohne Bezug davor. Setzen Sie das Zeichen oder die Gruppe davor, auf die es sich bezieht.",
+        "xsd_limit_pattern_syntax": "Eine der pattern-Einschränkungen ist kein gültiger regulärer Ausdruck. Prüfen Sie Klammern, Gruppen und Wiederholungszahlen.",
         "xsd_limit_attributes": "Einer der Typen hat zu viele Attribute (höchstens {limit}). Teilen Sie ihn in kleinere auf.",
         "xsd_limit_compile": "Dieses Muster ist zu komplex, um es anzunehmen. Vereinfachen Sie es: weniger Typen, Attribute und Wiederholungen."
       }

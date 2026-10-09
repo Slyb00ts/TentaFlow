@@ -10189,6 +10189,11 @@
         "xsd_limit_patterns": "Le modèle a trop de restrictions pattern (au plus {limit}). Fusionnez-les ou retirez les inutiles.",
         "xsd_limit_pattern_memory": "Les restrictions pattern sont ensemble trop complexes : elles demandent plus de {limit} Ko de mémoire. Simplifiez-les ou retirez les inutiles.",
         "xsd_limit_pattern_big": "Une des restrictions pattern est trop complexe, par ex. elle répète de nombreuses fois une classe de caractères. Simplifiez-la.",
+        "xsd_limit_pattern_nest": "Une des restrictions pattern imbrique les parenthèses trop profondément (au plus {limit} niveaux). Aplatissez-la.",
+        "xsd_limit_pattern_repeat": "Une des restrictions pattern a une répétition mal formée, par ex. {2,1} ou {,3}. Écrivez les nombres sous la forme {n}, {n,} ou {n,m}, avec n non supérieur à m.",
+        "xsd_limit_pattern_range": "Une des restrictions pattern a une plage de caractères écrite à l’envers, par ex. [z-a]. Placez d’abord le caractère le plus petit.",
+        "xsd_limit_pattern_operand": "Une des restrictions pattern a un symbole de répétition (*, + ou ?) sans rien devant. Placez devant le caractère ou le groupe concerné.",
+        "xsd_limit_pattern_syntax": "Une des restrictions pattern n’est pas une expression régulière valide. Vérifiez les parenthèses, les groupes et les nombres de répétitions.",
         "xsd_limit_attributes": "Un des types a trop d’attributs (au plus {limit}). Scindez-le en types plus petits.",
         "xsd_limit_compile": "Ce modèle est trop complexe pour être accepté. Simplifiez-le : moins de types, d’attributs et de répétitions."
       }

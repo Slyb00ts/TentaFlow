@@ -592,6 +592,42 @@ mod tests {
         ] {
             invalid_with(SchemaType::Xsd, &xsd(&body), phrase);
         }
+        // A pattern the engine cannot build keeps the engine's reason, in the
+        // words the dashboard maps to plain language.
+        for (pattern, phrase) in [
+            (
+                "a{2,1}",
+                "regular expression: invalid repetition count range, the start must be <= the end",
+            ),
+            (
+                "a{,3}",
+                "regular expression: repetition quantifier expects a valid decimal",
+            ),
+            (
+                "a{99999999999}",
+                "regular expression: decimal literal invalid",
+            ),
+            (
+                "[z-a]",
+                "regular expression: invalid character class range, the start must be <= the end",
+            ),
+            (
+                "a|*",
+                "regular expression: repetition operator missing expression",
+            ),
+            (
+                &format!("{}a{}", "(".repeat(40), ")".repeat(40)),
+                "regular expression: exceed the maximum number of nested parentheses/brackets (32)",
+            ),
+        ] {
+            invalid_with(
+                SchemaType::Xsd,
+                &xsd(&format!(
+                    r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:pattern value="{pattern}"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#
+                )),
+                phrase,
+            );
+        }
         // The dashboard anchors these at the start of the sentence, so each
         // must begin with its phrase (after `invalid schema: `).
         let begins = |kind: SchemaType, text: &str, prefix: &str| {

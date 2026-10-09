@@ -11424,6 +11424,11 @@
         "xsd_limit_patterns": "The schema has too many pattern restrictions (at most {limit}). Merge them or remove the unneeded ones.",
         "xsd_limit_pattern_memory": "The pattern restrictions together are too elaborate: they need more than {limit} KB of memory. Simplify them or remove the unneeded ones.",
         "xsd_limit_pattern_big": "One of the pattern restrictions is too elaborate, e.g. it repeats a character class many times. Simplify it.",
+        "xsd_limit_pattern_nest": "One of the pattern restrictions nests parentheses or brackets too deeply (at most {limit} levels). Flatten it.",
+        "xsd_limit_pattern_repeat": "One of the pattern restrictions has a malformed repetition, e.g. {2,1} or {,3}. Write the counts as {n}, {n,} or {n,m} with n not above m.",
+        "xsd_limit_pattern_range": "One of the pattern restrictions has a character range written backwards, e.g. [z-a]. Put the lower character first.",
+        "xsd_limit_pattern_operand": "One of the pattern restrictions has a repetition mark (*, + or ?) with nothing before it. Put the character or group it applies to in front of it.",
+        "xsd_limit_pattern_syntax": "One of the pattern restrictions is not a valid regular expression. Check its brackets, groups and repetition counts.",
         "xsd_limit_attributes": "One of the types has too many attributes (at most {limit}). Split it into smaller ones.",
         "xsd_limit_compile": "This schema is too complex to accept. Simplify it: fewer types, attributes and repetitions."
       }
