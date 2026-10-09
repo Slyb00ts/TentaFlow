@@ -105,7 +105,7 @@ fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i6
         )
         .optional()?;
     let Some(recorded) = recorded else {
-        return Ok(());
+        return reject_renumbered_ladder_database(conn);
     };
     if recorded != BUS_LADDER_FIRST_NAME {
         anyhow::bail!(
