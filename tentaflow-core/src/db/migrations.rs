@@ -18151,15 +18151,15 @@ mod tests {
     }
 
     #[test]
-    fn service_invocation_migration_rolls_back_created_uncertainty_on_later_ambiguous_history() {
+    fn service_invocation_migration_rolls_back_created_uncertainty_on_later_unpinned_history() {
         let conn = Connection::open_in_memory().unwrap();
         service_invocation_history_fixture(&conn);
         conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='failed-job'", []).unwrap();
-        conn.execute("UPDATE bpmn_jobs SET status='completed',result_json='{}',result_origin='envelope' WHERE job_id='queued-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_jobs SET node_id='Missing_Node' WHERE job_id='queued-job'", []).unwrap();
         let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
         let old_incidents: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [], |row| row.get(0)).unwrap();
         let error = run(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("unproved completed Service history"), "{error:#}");
+        assert!(format!("{error:#}").contains("no unique pinned scoped Service node"), "{error:#}");
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
             |row| row.get::<_,i64>(0)).unwrap(), 195);
         assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
@@ -18201,81 +18201,126 @@ mod tests {
     }
 
     #[test]
-    fn service_invocation_migration_refuses_attempted_queued_history_atomically() {
+    fn service_invocation_migration_prepares_a_requeued_retry_without_losing_its_history() {
         let conn = Connection::open_in_memory().unwrap();
         service_invocation_history_fixture(&conn);
-        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='queued-job'", []).unwrap();
-        let before_jobs: Vec<(String,String,i64)> = conn.prepare(
-            "SELECT job_id,status,fence FROM bpmn_jobs ORDER BY job_id").unwrap()
-            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
-        let before_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
-            |row| row.get(0)).unwrap();
-        let error = run(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("attempted queued history without an original dispatch tuple"),
-            "{error:#}");
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_, i64>(0)).unwrap(), 195);
-        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
-        let after_jobs: Vec<(String,String,i64)> = conn.prepare(
-            "SELECT job_id,status,fence FROM bpmn_jobs ORDER BY job_id").unwrap()
-            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(after_jobs,before_jobs);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
-            |row| row.get::<_, i64>(0)).unwrap(),before_events);
-        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
-            |row| row.get::<_, i64>(0)).unwrap(),1);
+        conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1 WHERE job_id='queued-job'", []).unwrap();
+        run(&conn).unwrap();
+        let row: (String,String,String) = conn.query_row(
+            "SELECT v.phase,v.dispatch_evidence,j.status FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id WHERE v.job_id='queued-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(row, ("prepared".into(),"no_boundary".into(),"queued".into()));
+        assert_eq!(conn.query_row("SELECT attempt FROM bpmn_jobs WHERE job_id='queued-job'", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 1);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
     }
 
     #[test]
-    fn service_invocation_migration_refuses_closed_attempted_history_atomically() {
+    fn service_invocation_migration_records_closed_attempted_history_as_resolved_uncertainty() {
         let conn = Connection::open_in_memory().unwrap();
         service_invocation_history_fixture(&conn);
         conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1,worker_id='old-worker' WHERE job_id='failed-job'", []).unwrap();
         conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='failed-token'", []).unwrap();
-        let old_jobs: Vec<(String,String)> = conn.prepare(
-            "SELECT job_id,status FROM bpmn_jobs ORDER BY job_id").unwrap()
-            .query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
-        let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
-        let old_incidents: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [], |row| row.get(0)).unwrap();
-        let error = run(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("closed historical external uncertainty without original dispatch identity"), "{error:#}");
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 195);
-        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
-        let jobs: Vec<(String,String)> = conn.prepare(
-            "SELECT job_id,status FROM bpmn_jobs ORDER BY job_id").unwrap()
-            .query_map([], |row| Ok((row.get(0)?,row.get(1)?))).unwrap()
-            .collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(jobs,old_jobs);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
-            |row| row.get::<_,i64>(0)).unwrap(),old_events);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents", [],
-            |row| row.get::<_,i64>(0)).unwrap(),old_incidents);
+        run(&conn).unwrap();
+        let row: (String,String,Option<i64>,String) = conn.query_row(
+            "SELECT v.phase,v.dispatch_evidence,i.resolved_at_ms,i.code FROM bpmn_service_invocations v JOIN bpmn_incidents i ON i.incident_id=v.uncertainty_incident_id WHERE v.job_id='failed-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!((&row.0[..],&row.1[..],&row.3[..]),
+            ("uncertain","boundary_unknown","EXTERNAL_OUTCOME_UNCERTAIN"));
+        assert!(row.2.is_some(), "a closed activation keeps only a resolved record");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(),"ok");
-        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
-            |row| row.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]
-    fn service_invocation_migration_refuses_nonrepeated_completed_without_accepted_source() {
+    fn service_invocation_migration_converts_a_crashed_running_job_into_a_visible_incident() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("crashed-running.db");
+        let conn = Connection::open(&path).unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET status='running',attempt=1,fence=1,worker_id='dead-worker',lease_until_ms=?1 WHERE job_id='failed-job'",
+            [i64::MAX]).unwrap();
+        conn.execute("UPDATE bpmn_instances SET status='running' WHERE instance_id='selected-instance'", []).unwrap();
+        run(&conn).unwrap();
+        let job: (String,Option<String>,Option<i64>,i64) = conn.query_row(
+            "SELECT status,worker_id,lease_until_ms,fence FROM bpmn_jobs WHERE job_id='failed-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(job, ("error".into(),None,None,2), "the old lease must be unusable");
+        let invocation: (String,String) = conn.query_row(
+            "SELECT phase,dispatch_evidence FROM bpmn_service_invocations WHERE job_id='failed-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(invocation, ("uncertain".into(),"boundary_unknown".into()));
+        let codes: Vec<String> = conn.prepare(
+            "SELECT code FROM bpmn_incidents WHERE job_id='failed-job' AND resolved_at_ms IS NULL ORDER BY code").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(codes, vec!["EXTERNAL_OUTCOME_UNCERTAIN","INTERRUPTED"]);
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let actor = crate::processes::repository::ProcessActor {
+            org_id: "org-default".into(), user_id: "selected-owner".into(),
+        };
+        let snapshot = crate::processes::repository::runtime_snapshot(
+            &pool, &actor, "selected-instance").unwrap();
+        assert!(snapshot.incidents.iter().any(|incident|
+            incident.job_id.as_deref() == Some("failed-job")
+                && incident.code == "EXTERNAL_OUTCOME_UNCERTAIN" && !incident.can_retry));
+        assert_eq!(crate::processes::repository::recover_jobs(&pool, None, i64::MAX / 2).unwrap(), 0,
+            "a migrated job must not be picked up as a running lease");
+    }
+
+    #[test]
+    fn service_invocation_migration_closes_a_running_job_whose_activation_is_gone() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET status='running',attempt=1,fence=1,worker_id='dead-worker',lease_until_ms=1 WHERE job_id='failed-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='failed-token'", []).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_jobs WHERE job_id='failed-job'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "cancelled");
+        assert_eq!(conn.query_row("SELECT phase FROM bpmn_service_invocations WHERE job_id='failed-job'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "uncertain");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE job_id='failed-job' AND resolved_at_ms IS NULL", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_quarantines_completed_history_without_an_accepted_source() {
         let conn = Connection::open_in_memory().unwrap();
         service_invocation_history_fixture(&conn);
         conn.execute("UPDATE bpmn_jobs SET status='completed',result_json='{}',result_origin='envelope' WHERE job_id='queued-job'", []).unwrap();
-        let old_events: i64 = conn.query_row("SELECT COUNT(*) FROM bpmn_events", [], |row| row.get(0)).unwrap();
-        let error = run(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains("unproved completed Service history"), "{error:#}");
-        assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 195);
-        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events", [],
-            |row| row.get::<_,i64>(0)).unwrap(),old_events);
-        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_,i64>(0)).unwrap(),1);
+        conn.execute("UPDATE bpmn_instances SET status='running' WHERE instance_id='selected-instance'", []).unwrap();
+        run(&conn).unwrap();
+        let row: (String,String,String,Option<i64>) = conn.query_row(
+            "SELECT v.phase,j.status,i.code,i.resolved_at_ms FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_incidents i ON i.incident_id=v.uncertainty_incident_id WHERE v.job_id='queued-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!((&row.0[..],&row.1[..],&row.2[..],row.3),
+            ("uncertain","error","SERVICE_HISTORY_UNPROVEN",None));
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events WHERE kind='incident' AND json_extract(data_json,'$.code')='SERVICE_HISTORY_UNPROVEN'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_keeps_closed_completed_history_unblocking() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("UPDATE bpmn_jobs SET status='completed',result_json='{}',result_origin='envelope' WHERE job_id='queued-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_tokens SET status='consumed' WHERE token_id='queued-token'", []).unwrap();
+        conn.execute("UPDATE bpmn_instances SET status='running' WHERE instance_id='selected-instance'", []).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_jobs WHERE job_id='queued-job'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "completed");
+        assert_eq!(conn.query_row("SELECT i.resolved_at_ms IS NOT NULL FROM bpmn_service_invocations v JOIN bpmn_incidents i ON i.incident_id=v.uncertainty_incident_id WHERE v.job_id='queued-job'", [],
+            |row| row.get::<_,bool>(0)).unwrap(), true);
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "running");
     }
 
     #[test]
@@ -19077,9 +19122,60 @@ FOR EACH ROW BEGIN
 END;
 "#;
 
+struct HistoricalIncident<'a> {
+    instance_id: &'a str,
+    scope_id: &'a str,
+    node_id: &'a str,
+    job_id: &'a str,
+    code: &'a str,
+    message: &'a str,
+    event_kind: &'a str,
+    resolved: bool,
+    at_ms: i64,
+    extra: serde_json::Value,
+}
+
+/// Records an incident and its history event for a job converted by the Service
+/// invocation migration. An open incident also moves the instance (and a child
+/// scope) to `incident`, exactly like runtime recovery does.
+fn historical_incident(conn: &Connection, incident: &HistoricalIncident<'_>) -> Result<String> {
+    use rusqlite::params;
+    use uuid::Uuid;
+
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![id, incident.instance_id, incident.scope_id, incident.node_id,
+            incident.job_id, incident.code, incident.message, incident.at_ms,
+            incident.resolved.then_some(incident.at_ms)])?;
+    let seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [incident.instance_id], |row| row.get(0))?;
+    let mut data = serde_json::json!({
+        "incident_id": id, "job_id": incident.job_id,
+        "code": incident.code, "message": incident.message,
+    });
+    if let (Some(data), Some(extra)) = (data.as_object_mut(), incident.extra.as_object()) {
+        data.extend(extra.clone());
+    }
+    conn.execute(
+        "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,?8)",
+        params![Uuid::new_v4().to_string(), incident.instance_id, incident.scope_id,
+            seq, incident.at_ms, incident.event_kind, incident.node_id, data.to_string()])?;
+    if !incident.resolved {
+        conn.execute(
+            "UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status NOT IN ('completed','cancelled','error','incident')",
+            params![incident.at_ms, incident.instance_id])?;
+        conn.execute(
+            "UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error','incident')",
+            params![incident.at_ms, incident.instance_id, incident.scope_id])?;
+    }
+    Ok(id)
+}
+
 fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
     use anyhow::{bail, ensure, Context};
-    use rusqlite::params;
+    use rusqlite::{params, OptionalExtension};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use tentaflow_protocol::processes::{ProcessModel, ProcessNodeKind};
@@ -19133,6 +19229,7 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis())?;
 
+    let mut touched_jobs = Vec::<String>::new();
     for (job_id, instance_id, scope_id, node_id, token_id, input_json, status,
         attempt, fence, worker_id, result_json, result_origin, created_at_ms,
         updated_at_ms, definition_id, version, selected_process_id, model_json,
@@ -19173,8 +19270,6 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
                 == pins[0].info.graph_sha256,
             "service invocation migration has no unique immutable flow pin");
 
-        let unclaimed = attempt == 0 && fence == 0 && worker_id.is_none()
-            && result_json.is_none() && result_origin.is_none();
         let accepted = if result_json.is_some() && result_origin.is_some() {
             let mut accepted = conn.prepare(
                 "SELECT e.event_id,e.at_ms,e.data_json FROM bpmn_repetition_occurrences o \
@@ -19208,39 +19303,83 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
              AND t.token_id=?3 AND t.node_id=?4 AND t.status='waiting' \
              AND i.status NOT IN ('completed','cancelled','error'))",
             params![instance_id,scope_id,token_id,node_id], |row| row.get(0))?;
-        ensure!(status != "running",
-            "service invocation migration requires old workers to be quiesced");
-        let (phase, evidence) = if accepted.is_some() {
-            ("accepted", "boundary_unknown")
-        } else if unclaimed && live && status == "queued" {
-            ("prepared", "no_boundary")
-        } else if unclaimed && (status == "error" || status == "cancelled" && !live) {
-            ("proved_no_effect", "no_boundary")
-        } else if status == "completed" {
-            bail!("service invocation migration refuses unproved completed Service history")
-        } else if attempt > 0 || fence > 0 || worker_id.is_some() || result_json.is_some() {
-            ("uncertain", "boundary_unknown")
+        // Nothing here may refuse a database for the shape of its job history: a
+        // refusal after a crash leaves the new binary unable to boot, so every job
+        // state the previous binary could write is converted to an explicit,
+        // operator-visible state instead.
+        let mut status = status;
+        let mut fence = fence;
+        let mut worker_id = worker_id;
+        if status == "running" {
+            // The previous process owned this lease and is gone, so the lease is
+            // stale by construction. Reproduce its own boot-time recovery (job
+            // `error`, instance `incident`, INTERRUPTED incident) so that the
+            // common attempted-job path below classifies the outcome as unknown.
+            fence += 1;
+            worker_id = None;
+            if live {
+                conn.execute("UPDATE bpmn_jobs SET status='error',fence=?1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE job_id=?3",
+                    params![i64::try_from(fence)?,cutover_at_ms,job_id])?;
+                historical_incident(conn, &HistoricalIncident {
+                    instance_id: &instance_id, scope_id: &scope_id, node_id: &node_id,
+                    job_id: &job_id, code: "INTERRUPTED",
+                    message: "The worker stopped before the external effect was confirmed",
+                    event_kind: "job_interrupted", resolved: false, at_ms: cutover_at_ms,
+                    extra: serde_json::json!({}),
+                })?;
+                status = "error".into();
+            } else {
+                conn.execute("UPDATE bpmn_jobs SET status='cancelled',fence=?1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE job_id=?3",
+                    params![i64::try_from(fence)?,cutover_at_ms,job_id])?;
+                status = "cancelled".into();
+            }
+            touched_jobs.push(job_id.clone());
+        }
+        let attempted = attempt > 0 || fence > 0 || worker_id.is_some() || result_json.is_some();
+        let unclaimed = !attempted && result_origin.is_none();
+        let (phase, evidence, quarantine_code) = if accepted.is_some() {
+            ("accepted", "boundary_unknown", None)
+        } else if status == "queued" && live {
+            // A queued job with earlier attempts was re-queued by an explicit
+            // operator retry; its next claim is a fresh, intended dispatch.
+            ("prepared", "no_boundary", None)
+        } else if unclaimed && (status == "error" || !live) {
+            if status == "queued" {
+                conn.execute("UPDATE bpmn_jobs SET status='cancelled',updated_at_ms=?1 WHERE job_id=?2",
+                    params![cutover_at_ms,job_id])?;
+                touched_jobs.push(job_id.clone());
+            }
+            ("proved_no_effect", "no_boundary", None)
+        } else if attempted && status != "completed" {
+            if status == "queued" {
+                conn.execute("UPDATE bpmn_jobs SET status='cancelled',updated_at_ms=?1 WHERE job_id=?2",
+                    params![cutover_at_ms,job_id])?;
+                touched_jobs.push(job_id.clone());
+            }
+            ("uncertain", "boundary_unknown", Some(("EXTERNAL_OUTCOME_UNCERTAIN",
+                "The external effect may have occurred; direct retry is unavailable")))
         } else {
-            bail!("service invocation migration refuses inconsistent Service history")
+            // A completed job without an accepted source event, or a state no
+            // previous code path writes. Its outcome cannot be proved, so it is
+            // quarantined; a still-waiting activation becomes an open incident.
+            if live && status != "error" {
+                conn.execute("UPDATE bpmn_jobs SET status='error',updated_at_ms=?1 WHERE job_id=?2",
+                    params![cutover_at_ms,job_id])?;
+                touched_jobs.push(job_id.clone());
+            }
+            ("uncertain", "boundary_unknown", Some(("SERVICE_HISTORY_UNPROVEN",
+                "The historical Service outcome could not be proved during upgrade; inspect the external system before cancelling")))
         };
-        ensure!(phase != "uncertain" || status == "error",
-            "service invocation migration refuses attempted queued history without an original dispatch tuple");
-        ensure!(phase != "uncertain" || live,
-            "service invocation migration refuses closed historical external uncertainty without original dispatch identity");
         let invocation_id = Uuid::new_v4().to_string();
         let stable_request_id = (evidence == "no_boundary").then(|| invocation_id.clone());
-        let incident_id = if phase == "uncertain" {
-            let id = Uuid::new_v4().to_string();
-            let code = "EXTERNAL_OUTCOME_UNCERTAIN";
-            let message = "The external effect may have occurred; direct retry is unavailable";
-            conn.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![id,instance_id,scope_id,node_id,job_id,code,message,cutover_at_ms])?;
-            let seq: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-                [&instance_id], |row| row.get(0))?;
-            conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,'incident',?6,NULL,?7)",
-                params![Uuid::new_v4().to_string(),instance_id,scope_id,seq,cutover_at_ms,node_id,
-                    serde_json::json!({"incident_id":id,"job_id":job_id,"code":code,"message":message,"invocation_id":invocation_id}).to_string()])?;
+        let incident_id = if let Some((code, message)) = quarantine_code {
+            let id = historical_incident(conn, &HistoricalIncident {
+                instance_id: &instance_id, scope_id: &scope_id, node_id: &node_id,
+                job_id: &job_id, code, message, event_kind: "incident",
+                resolved: !live, at_ms: cutover_at_ms,
+                extra: serde_json::json!({"invocation_id":invocation_id}),
+            })?;
+            touched_jobs.push(job_id.clone());
             Some(id)
         } else { None };
         let observed_hash = result_json.as_ref()
@@ -19273,6 +19412,20 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
                     AND v.observed_result_json IS NOT NULL)",
         [],
     )?;
+    touched_jobs.sort();
+    touched_jobs.dedup();
+    for job_id in &touched_jobs {
+        let group: Option<(String, String)> = conn.query_row(
+            "SELECT instance_id,group_id FROM bpmn_repetition_occurrences WHERE job_id=?1",
+            [job_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        if let Some((instance_id, group_id)) = group {
+            let measured = crate::processes::repository::measured_repetition_retained_bytes_before_witnesses_on(
+                conn, &instance_id, &group_id)?;
+            conn.execute(
+                "UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE instance_id=?2 AND group_id=?3",
+                params![i64::try_from(measured)?, instance_id, group_id])?;
+        }
+    }
     let mut reservations = std::collections::HashMap::<String, u64>::new();
     let mut reserved_jobs = conn.prepare(
         "SELECT o.instance_id,j.status,v.phase,v.dispatch_evidence,v.reserved_result_event_id
