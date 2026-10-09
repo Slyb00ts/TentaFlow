@@ -5077,7 +5077,7 @@ mod tests {
         // Depth is bounded rather than recursing without limit.
         let deep = format!(
             "<tree>{}</tree>",
-            "<label>x</label><child>".repeat(MAX_DOC_DEPTH) + &"</child>".repeat(MAX_DOC_DEPTH)
+            "<label>x</label><child>".repeat(MAX_DOC_DEPTH) + "</child>".repeat(MAX_DOC_DEPTH).as_str()
         );
         let got = XSD_OPS.validate(&compiled(&s), deep.as_bytes());
         assert!(
