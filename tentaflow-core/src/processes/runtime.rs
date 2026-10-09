@@ -179,6 +179,9 @@ pub(super) enum ActivityIoOutputOwner {
     Coordinator,
 }
 
+/// Room left for the capture event envelope inside the 384 KiB event budget.
+const MAX_ACTIVITY_IO_INPUTS_EVENT_BYTES: usize = 384 * 1024 - 4096;
+
 pub(super) fn evaluate_activity_inputs(
     io: &ProcessActivityIo,
     modeling: &ProcessBodyModeling,
@@ -188,6 +191,7 @@ pub(super) fn evaluate_activity_inputs(
 ) -> Result<Vec<IoObservedInput>> {
     let local = local.as_object().context("activity IO local variables must be an object")?;
     let mut ordered = Vec::with_capacity(io.input_set.len());
+    let mut captured_bytes = 0_usize;
     for (position, declaration_id) in io.input_set.iter().enumerate() {
         ensure!(io.data_inputs.iter().any(|input| input.id == *declaration_id),
             "activity IO input set references an undeclared input");
@@ -219,10 +223,25 @@ pub(super) fn evaluate_activity_inputs(
                 (id.clone(), None, IoObservedValue::Present { value })
             }
         };
-        ordered.push(IoObservedInput {
+        let input = IoObservedInput {
             position, declaration_id: declaration_id.clone(), association_id,
             source_object_ref_id, observed,
-        });
+        };
+        // The capture event repeats every observed value, so the inputs of one
+        // activation must fit one event. Failing here, inside the authored
+        // association, turns an unrepresentable activation into the same visible
+        // ACTIVITY_IO_INPUT_FAILED incident as any other bad input, and the replay
+        // validator reaches the identical verdict from the same function.
+        captured_bytes = captured_bytes.saturating_add(serde_json::to_vec(&input)?.len() + 1);
+        if captured_bytes > MAX_ACTIVITY_IO_INPUTS_EVENT_BYTES {
+            return Err(ActivityIoAssociationFailure {
+                position, association_id: input.association_id,
+                source: anyhow::anyhow!(
+                    "activity IO inputs exceed the {} byte event budget",
+                    MAX_ACTIVITY_IO_INPUTS_EVENT_BYTES),
+            }.into());
+        }
+        ordered.push(input);
     }
     Ok(ordered)
 }
@@ -1268,11 +1287,21 @@ impl<'a> Transition<'a> {
         &mut self, node: &ProcessNode, source: &ProcessToken,
         error: &anyhow::Error,
     ) -> Result<()> {
+        let waiting_token_id = self.wait(source, "waiting");
+        self.record_activity_io_input_failure(node, source, waiting_token_id, error)
+    }
+
+    /// Records the parked incident for an authored input that failed to evaluate.
+    /// `waiting_token_id` is the activation the failure parks; it is the source's own
+    /// successor except for an event-race branch, which parks on the branch node.
+    fn record_activity_io_input_failure(
+        &mut self, node: &ProcessNode, source: &ProcessToken,
+        waiting_token_id: String, error: &anyhow::Error,
+    ) -> Result<()> {
         let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
             anyhow::bail!("configured activity IO input failed without an association: {error:#}");
         };
         let repeated = self.repetition_for_token(&source.token_id);
-        let waiting_token_id = self.wait(source, "waiting");
         let event_index = self.plan.events.len();
         self.record_event_id(event_index);
         self.incident(&node.id, None, "ACTIVITY_IO_INPUT_FAILED",
@@ -3729,6 +3758,40 @@ impl<'a> Transition<'a> {
         Ok(())
     }
     fn enter_event_race(&mut self, node: &ProcessNode, token: &ProcessToken) -> Result<()> {
+        // Every branch captures its authored inputs from the gateway activation. They
+        // are evaluated before anything is armed so that one failing association parks
+        // the whole gateway as an incident instead of leaving a half-armed race.
+        let mut branches = Vec::new();
+        for edge in self.outgoing(&node.id) {
+            let target = self.body()?.1.iter().find(|f| f.id == edge)
+                .context("race branch edge missing")?.target_id.clone();
+            let child = self.node(&target)?.clone();
+            let inputs = if child.activity_io.is_some() && matches!(&child.kind,
+                ProcessNodeKind::MessageCatch { .. } | ProcessNodeKind::ReceiveTask { .. }
+                | ProcessNodeKind::SignalCatch { .. }) {
+                match self.activity_io_inputs(&child, token) {
+                    Ok(Some(inputs)) => Some(inputs),
+                    Ok(None) => anyhow::bail!("configured race branch lost its authored IO"),
+                    Err(error) => {
+                        if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+                            return Err(error);
+                        }
+                        self.consume(&token.token_id);
+                        let waiting = self.create_token(ProcessToken {
+                            token_id: String::new(),
+                            scope_id: self.current_scope.clone(),
+                            node_id: child.id.clone(),
+                            arrival_edge_id: Some(edge),
+                            fork_stack: token.fork_stack.clone(),
+                            status: "waiting".into(),
+                        }, Some(&token.token_id));
+                        return self.record_activity_io_input_failure(
+                            &child, token, waiting, &error);
+                    }
+                }
+            } else { None };
+            branches.push((edge, child, inputs));
+        }
         let id = self.next_id("runtime");
         let race = super::repository::EventRace {
             race_id: id.clone(),
@@ -3753,14 +3816,7 @@ impl<'a> Transition<'a> {
             Some(node.id.clone()),
             json!({"race_id":id,"activation_id":token.token_id}),
         );
-        for edge in self.outgoing(&node.id) {
-            let branch = self
-                .body()?
-                .1
-                .iter()
-                .find(|f| f.id == edge)
-                .context("race branch edge missing")?;
-            let child = self.node(&branch.target_id)?.clone();
+        for (edge, child, inputs) in branches {
             let waiting = self.create_token(ProcessToken {
                 token_id: String::new(),
                 scope_id: self.current_scope.clone(),
@@ -3773,14 +3829,9 @@ impl<'a> Transition<'a> {
                 ProcessNodeKind::MessageCatch { .. }
                 | ProcessNodeKind::ReceiveTask { .. }
                 | ProcessNodeKind::SignalCatch { .. } => {
-                    if child.activity_io.is_some() {
+                    if let Some(inputs) = inputs {
                         // A branch has no ready activation of its own: the consumed
                         // gateway token is the source of the authored input capture.
-                        let inputs = self.activity_io_inputs(&child, token)
-                            .with_context(|| format!(
-                                "event race branch {} could not capture its authored inputs",
-                                child.id))?
-                            .context("configured race branch lost its authored IO")?;
                         self.capture_activity_io_inputs(&child, token, &waiting, inputs);
                     }
                     self.arm_subscription(&child, &waiting, Some(id.clone()))?

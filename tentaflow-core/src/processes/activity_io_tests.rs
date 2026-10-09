@@ -54,15 +54,17 @@ fn configured_user(expression: &str) -> tentaflow_protocol::processes::ProcessMo
     model
 }
 
-fn configured_user_with_shared_inputs() -> tentaflow_protocol::processes::ProcessModel {
+fn configured_user_with_shared_inputs(
+    input_count: usize,
+) -> tentaflow_protocol::processes::ProcessModel {
     let mut model = user_model(None);
     model.variables.insert("shared".into(), Value::Null);
-    let mut data_objects = Vec::with_capacity(16);
-    let mut data_object_references = Vec::with_capacity(16);
-    let mut data_inputs = Vec::with_capacity(16);
-    let mut input_set = Vec::with_capacity(16);
-    let mut input_associations = Vec::with_capacity(16);
-    for position in 0..16 {
+    let mut data_objects = Vec::with_capacity(input_count);
+    let mut data_object_references = Vec::with_capacity(input_count);
+    let mut data_inputs = Vec::with_capacity(input_count);
+    let mut input_set = Vec::with_capacity(input_count);
+    let mut input_associations = Vec::with_capacity(input_count);
+    for position in 0..input_count {
         let input_id = format!("Input_{position}");
         let object_id = format!("Object_Input_{position}");
         let reference_id = format!("Ref_Input_{position}");
@@ -1493,13 +1495,13 @@ fn script_io_mapping_failure_rejects_a_forged_action_source_without_writing_rows
 }
 
 #[test]
-fn user_task_wire_budget_is_rechecked_by_writer_and_survives_near_boundary_reopen() {
+fn writer_rejects_a_forged_plan_whose_task_detail_exceeds_the_wire_budget() {
     let fixture = Fixture::new();
-    let model = configured_user_with_shared_inputs();
+    let model = configured_user_with_shared_inputs(16);
     let version = runtime::test_support::publish_model(&fixture, &model);
     let start_node_id = runtime::test_support::ordinary_start_id(&version.model).to_owned();
-    // Sixteen captured copies must fit one 384 KiB history event, so the planner and the
-    // writer share the same boundary well below the task detail wire budget.
+    // An honest plan can never reach the 900 KiB task detail budget, because the 384 KiB
+    // capture event of the same inputs is exhausted first; only a forged plan can.
     let low_variables = json!({"shared": "x".repeat(8 * 1024)});
     let forged_instance_id = Uuid::new_v4().to_string();
     let forged_command = stamp("reject forged oversized user task detail");
@@ -1576,11 +1578,20 @@ fn user_task_wire_budget_is_rechecked_by_writer_and_survives_near_boundary_reope
     .unwrap_err();
     assert!(format!("{error:#}").contains("wire budget"), "{error:#}");
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
+}
 
-    let probe_command = stamp("find canonical task wire boundary");
+#[test]
+fn input_capture_stops_exactly_at_the_event_budget_and_the_boundary_start_reopens() {
+    let fixture = Fixture::new();
+    let model = configured_user_with_shared_inputs(16);
+    let version = runtime::test_support::publish_model(&fixture, &model);
+    let start_node_id = runtime::test_support::ordinary_start_id(&version.model).to_owned();
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let probe_command = stamp("find the capture event boundary");
     let probe_instance_id = Uuid::new_v4().to_string();
-    let probe = |bytes| {
-        runtime::plan_start(
+    // A planned start never fails on the budget: past it the plan parks an input incident.
+    let captures = |bytes: usize| {
+        let plan = runtime::plan_start(
             &version.model,
             &version.model.process_id,
             &start_node_id,
@@ -1594,32 +1605,37 @@ fn user_task_wire_budget_is_rechecked_by_writer_and_survives_near_boundary_reope
             runtime::test_support::manual_input(&probe_command),
             None,
         )
-        .is_ok()
+        .expect("an over-budget input is an incident, not a failed plan");
+        let captured = plan.activity_io_inputs.iter().any(|fact|
+            matches!(fact, repository::ActivityIoInputFact::Captured { .. }));
+        let failed = plan.activity_io_inputs.iter().any(|fact|
+            matches!(fact, repository::ActivityIoInputFact::Failed { .. }));
+        assert!(captured != failed);
+        captured
     };
     let maximum_variable_bytes = super::model::MAX_VARIABLE_BYTES - 64;
-    assert!(probe(0));
-    assert!(!probe(maximum_variable_bytes));
+    assert!(captures(0));
+    assert!(!captures(maximum_variable_bytes));
     let mut low = 0;
     let mut high = maximum_variable_bytes;
     while low < high {
         let middle = low + (high - low + 1) / 2;
-        if probe(middle) {
+        if captures(middle) {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-    assert!(low < maximum_variable_bytes);
-    assert!(probe(low));
-    assert!(!probe(low + 1));
+    assert!(low > 0 && low < maximum_variable_bytes);
+    assert!(captures(low));
+    assert!(!captures(low + 1));
 
     let canonical_instance_id = Uuid::new_v4().to_string();
-    let canonical_command = stamp("persist canonical near boundary task");
     let canonical_variables = json!({"shared": "x".repeat(low)});
     let started = repository::start_instance(
         &fixture.db,
         &fixture.owner,
-        &canonical_command,
+        &stamp("persist canonical near boundary task"),
         &canonical_instance_id,
         &version.definition_id,
         version.version,
@@ -1645,6 +1661,119 @@ fn user_task_wire_budget_is_rechecked_by_writer_and_survives_near_boundary_reope
         ProcessUserTaskInputValue::Present(value) if value == &canonical_variables["shared"]
     )));
     runtime::ensure_user_task_wire_budget(&task).unwrap();
+}
+
+fn start_with_shared_variable(
+    fixture: &Fixture,
+    version: &tentaflow_protocol::processes::ProcessVersion,
+    bytes: usize,
+) -> tentaflow_protocol::processes::ProcessInstance {
+    repository::start_instance(
+        &fixture.db,
+        &fixture.owner,
+        &stamp("start over the capture event budget"),
+        &Uuid::new_v4().to_string(),
+        &version.definition_id,
+        version.version,
+        &json!({"shared": "x".repeat(bytes)}),
+        None,
+        None,
+        repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .expect("an input set that exceeds the event budget must still start the instance")
+}
+
+fn assert_parked_on_the_event_budget(
+    fixture: &Fixture,
+    started: &tentaflow_protocol::processes::ProcessInstance,
+) {
+    let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+    let snapshot = repository::runtime_snapshot(&reopened, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(snapshot.instance.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Incident);
+    let incidents = snapshot.incidents.iter()
+        .filter(|incident| incident.code == "ACTIVITY_IO_INPUT_FAILED")
+        .collect::<Vec<_>>();
+    assert_eq!(incidents.len(), 1);
+    assert!(incidents[0].message.contains("event budget"), "{}", incidents[0].message);
+    assert!(!incidents[0].can_retry);
+    assert!(snapshot.user_tasks.is_empty(), "no task may open over an unrecorded input");
+    assert!(snapshot.activity_io_witnesses.iter().any(|row| row.phase == "input_failed"));
+    assert!(snapshot.tokens.iter().any(|token| token.status == "waiting"));
+}
+
+#[test]
+fn two_inputs_over_a_large_variable_park_an_incident_instead_of_failing_the_start() {
+    let fixture = Fixture::new();
+    let version = runtime::test_support::publish_model(&fixture,
+        &configured_user_with_shared_inputs(2));
+    let started = start_with_shared_variable(&fixture, &version, 200 * 1024);
+    assert_parked_on_the_event_budget(&fixture, &started);
+}
+
+#[test]
+fn sixteen_inputs_over_a_medium_variable_park_an_incident_instead_of_failing_the_start() {
+    let fixture = Fixture::new();
+    let version = runtime::test_support::publish_model(&fixture,
+        &configured_user_with_shared_inputs(16));
+    let started = start_with_shared_variable(&fixture, &version, 25 * 1024);
+    assert_parked_on_the_event_budget(&fixture, &started);
+}
+
+fn race_model_with_input(expression: &str) -> tentaflow_protocol::processes::ProcessModel {
+    let configured = configured_receive("outputs.value");
+    let mut model = super::send_receive_tests::receive_race_model();
+    model.variables.insert("mapped".into(), Value::Null);
+    model.modeling = configured.modeling;
+    let mut io = configured.nodes.iter().find(|node| node.id == "Catch_1").unwrap()
+        .activity_io.clone().unwrap();
+    io.data_inputs.push(ProcessIoDataInput { id: "Input_Race".into(), name: None });
+    io.input_set.push("Input_Race".into());
+    io.input_associations.push(ProcessInputAssociation::CelAssignment {
+        id: "Association_Race_Input".into(),
+        from_expression: expression.into(),
+        target_input_id: "Input_Race".into(),
+    });
+    model.nodes.iter_mut().find(|node| node.id == "Catch_1").unwrap().activity_io = Some(io);
+    model
+}
+
+#[test]
+fn event_based_gateway_branch_input_failure_parks_an_incident_without_arming_the_race() {
+    for expression in ["1 / 0", "vars.absent_variable"] {
+        let fixture = Fixture::new();
+        let version = runtime::test_support::publish_model(&fixture,
+            &race_model_with_input(expression));
+        let receiver = super::messages::test_support::start_version(&fixture, &version);
+        let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
+        let snapshot = repository::runtime_snapshot(&reopened, &fixture.owner,
+            &receiver.instance_id).unwrap();
+        assert_eq!(snapshot.instance.status,
+            tentaflow_protocol::processes::ProcessInstanceStatus::Incident, "{expression}");
+        let incidents = snapshot.incidents.iter()
+            .filter(|incident| incident.code == "ACTIVITY_IO_INPUT_FAILED")
+            .collect::<Vec<_>>();
+        assert_eq!(incidents.len(), 1, "{expression}");
+        assert_eq!(incidents[0].node_id.as_deref(), Some("Catch_1"));
+        assert!(!incidents[0].can_retry);
+        assert!(snapshot.event_races.is_empty(), "{expression}: no half-armed race");
+        assert!(snapshot.subscriptions.is_empty(), "{expression}");
+        assert!(snapshot.timers.is_empty(), "{expression}: the sibling timer stays unarmed");
+        let failed = snapshot.activity_io_witnesses.iter()
+            .filter(|row| row.phase == "input_failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1, "{expression}");
+        assert!(snapshot.tokens.iter().any(|token|
+            token.token_id == failed[0].token_id && token.node_id == "Catch_1"
+                && token.status == "waiting"));
+        let events = repository::list_events(&reopened, &fixture.owner,
+            &receiver.instance_id, 0, 100).unwrap().0;
+        assert_eq!(events.iter().filter(|event| event.kind == "event_race_armed").count(), 0);
+        assert_eq!(events.iter().filter(|event| event.kind == "incident"
+            && event.data["code"] == "ACTIVITY_IO_INPUT_FAILED").count(), 1);
+    }
 }
 
 #[test]
