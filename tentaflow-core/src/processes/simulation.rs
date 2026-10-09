@@ -5,6 +5,7 @@ use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -36,6 +37,14 @@ const PROFILE_NAME: &str = "script_user_manual";
 const MAX_ACL_BYTES: usize = 256 * 1024;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_TRACE_BYTES: usize = 4 * 1024 * 1024;
+// A view is one transport frame. The private database may hold far more history
+// than a frame carries, so a view returns the newest events and trace steps that
+// fit and reports how many older ones it left out.
+const MAX_VIEW_BYTES: usize = tentaflow_transport::MAX_FRAME_SIZE / 4 * 3;
+const MAX_VIEW_EVENTS: usize = 500;
+const MAX_VIEW_EVENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_VIEW_TRACE_STEPS: usize = 200;
+const MAX_VIEW_TRACE_BYTES: usize = 1024 * 1024;
 // A private run is bounded by measured SQLite pages as well as the existing
 // model, variable, task, and trace payload limits. The registry reserves the
 // same finite envelope for every retained run, so one actor cannot pin the
@@ -43,6 +52,12 @@ const MAX_TRACE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SIMULATION_DATABASE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SIMULATION_REGISTRY_RUNS: usize = 16;
 const MAX_SIMULATION_RUNS_PER_OWNER: usize = 4;
+// The node-wide pool is shared by every organization; without a per-organization
+// share, one tenant's retained runs could starve all others.
+const MAX_SIMULATION_RUNS_PER_ORG: usize = 4;
+/// A retained run that nobody touched for this long is dropped, so abandoned
+/// browser tabs cannot pin the finite pool until the process restarts.
+pub(crate) const SIMULATION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_SIMULATION_REGISTRY_BYTES: u64 =
     MAX_SIMULATION_DATABASE_BYTES * MAX_SIMULATION_REGISTRY_RUNS as u64;
 
@@ -266,6 +281,46 @@ pub(crate) fn simulation_scenario_sha256(
     Ok(hex::encode(hash.finalize()))
 }
 
+/// Proof that a production writer call runs against a private simulation
+/// database. The simulation modes of `ExecutionMode` skip the owner, call-control
+/// and pinned-flow checks that a durable transition needs, so they must be
+/// unreachable from any other caller: the sealed field makes this type
+/// constructible only in this module, and `verify_on` re-checks every
+/// transaction it is presented with against the private schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrivateSimulationMode {
+    sealed: (),
+}
+
+impl PrivateSimulationMode {
+    fn prove(conn: &Connection) -> Result<Self> {
+        let mode = Self { sealed: () };
+        mode.verify_on(conn)?;
+        Ok(mode)
+    }
+
+    /// Rejects a connection that is not a private simulation database. The
+    /// production schema never contains `simulation_meta`, and a private
+    /// database always holds exactly the rows its store inserted.
+    #[cfg(test)]
+    pub(crate) fn prove_for_test(conn: &Connection) -> Result<Self> {
+        Self::prove(conn)
+    }
+
+    pub(crate) fn verify_on(&self, conn: &Connection) -> Result<()> {
+        let private_tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('simulation_meta','simulation_clock','simulation_source_pins')",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            private_tables == 3,
+            "simulation transition requires a private simulation database"
+        );
+        Ok(())
+    }
+}
+
 /// Owns the disposable database used by one simulation.
 ///
 /// Keeping connection construction here prevents a caller from handing the
@@ -287,12 +342,42 @@ fn connection_resident_bytes(conn: &Connection) -> Result<u64> {
         .context("private simulation resident size overflow")
 }
 
+/// The migrated production process schema plus the simulation schema, built once
+/// per process. Running the whole migration ladder for every Start would block the
+/// calling worker for the better part of a second, so each private database is a
+/// page copy of this template. The template is only ever read after it is built.
+static SCHEMA_TEMPLATE: Mutex<Option<Connection>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) static SCHEMA_TEMPLATE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn build_schema_template() -> Result<Connection> {
+    let conn = Connection::open_in_memory().context("open simulation schema template")?;
+    crate::db::migrations::run(&conn).context("initialize the private production process schema")?;
+    simulation_schema::initialize(&conn)?;
+    #[cfg(test)]
+    SCHEMA_TEMPLATE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(conn)
+}
+
 impl SimulationDatabase {
     pub(crate) fn open() -> Result<Self> {
-        let conn = Connection::open_in_memory().context("open disposable simulation database")?;
-        crate::db::migrations::run(&conn)
-            .context("initialize the private production process schema")?;
-        simulation_schema::initialize(&conn)?;
+        let mut conn =
+            Connection::open_in_memory().context("open disposable simulation database")?;
+        let mut template = SCHEMA_TEMPLATE
+            .lock()
+            .map_err(|_| anyhow::anyhow!("simulation schema template lock is poisoned"))?;
+        if template.is_none() {
+            *template = Some(build_schema_template()?);
+        }
+        let source = template
+            .as_ref()
+            .context("simulation schema template was not built")?;
+        rusqlite::backup::Backup::new(source, &mut conn)
+            .and_then(|backup| backup.run_to_completion(1024, Duration::ZERO, None))
+            .context("copy the simulation schema template")?;
+        drop(template);
         Ok(Self { conn })
     }
 
@@ -325,6 +410,28 @@ struct SimulationRegistryEntry {
     owner_user_id: String,
     resident_bytes: u64,
     release_requested: bool,
+    last_used: Instant,
+    liveness: SimulationLivenessKey,
+}
+
+/// The published source a retained run was pinned to; a run whose source is
+/// archived, superseded, or whose owner is deactivated can never be authorized
+/// again and is reclaimed instead of waiting for its idle deadline.
+#[derive(Debug, Clone)]
+struct SimulationLivenessKey {
+    definition_id: String,
+    version: u32,
+    model_sha256: String,
+}
+
+impl From<&SimulationSourcePin> for SimulationLivenessKey {
+    fn from(source: &SimulationSourcePin) -> Self {
+        Self {
+            definition_id: source.definition_id.clone(),
+            version: source.version,
+            model_sha256: source.model_sha256.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +442,7 @@ struct SimulationRegistryState {
 
 #[derive(Debug)]
 struct SimulationStartReservationEntry {
+    org_id: String,
     owner_user_id: String,
 }
 
@@ -343,6 +451,7 @@ struct SimulationStartReservationEntry {
 #[derive(Debug)]
 pub(crate) struct SimulationStartReservation {
     token: String,
+    org_id: String,
     owner_user_id: String,
     state: Weak<Mutex<SimulationRegistryState>>,
     active: bool,
@@ -370,9 +479,29 @@ enum ReleaseTarget {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SimulationRegistry {
     state: Arc<Mutex<SimulationRegistryState>>,
+    idle_ttl: Duration,
+}
+
+impl Default for SimulationRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            idle_ttl: SIMULATION_IDLE_TTL,
+        }
+    }
+}
+
+/// Drops every run that is parked in the registry (not mid-operation) and has
+/// been idle for `ttl`. An in-flight run is never evicted: its operation owns
+/// the database and returns it with a fresh timestamp.
+fn evict_idle(state: &mut SimulationRegistryState, ttl: Duration) {
+    let now = Instant::now();
+    state.databases.retain(|_, entry| {
+        entry.database.is_none() || now.saturating_duration_since(entry.last_used) < ttl
+    });
 }
 
 impl SimulationRegistry {
@@ -380,23 +509,80 @@ impl SimulationRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_idle_ttl(idle_ttl: Duration) -> Self {
+        Self {
+            idle_ttl,
+            ..Self::default()
+        }
+    }
+
+    /// Reclaims capacity held by dead runs: those idle past the TTL, and those
+    /// whose published source or owner can no longer authorize any operation.
+    /// A failed repository check keeps the run; only a definitive "no longer
+    /// live" answer drops it.
+    pub(crate) fn reclaim(&self, pool: &DbPool) -> Result<usize> {
+        let candidates = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("simulation registry lock is poisoned"))?;
+            evict_idle(&mut state, self.idle_ttl);
+            state
+                .databases
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        entry.org_id.clone(),
+                        entry.owner_user_id.clone(),
+                        entry.liveness.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut reclaimed = 0;
+        for (simulation_id, org_id, owner_user_id, key) in candidates {
+            let live = repository::simulation_source_is_live(
+                pool,
+                &org_id,
+                &owner_user_id,
+                &key.definition_id,
+                key.version,
+                &key.model_sha256,
+            );
+            if matches!(live, Ok(false)) {
+                self.mark_release_requested(&simulation_id)?;
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
+
     /// Reserves one complete per-run envelope before opening SQLite or
     /// materializing the production schema. The reservation is released by
     /// Drop unless the caller commits the finished database.
-    pub(crate) fn reserve_start(&self, owner_user_id: &str) -> Result<SimulationStartReservation> {
-        self.reserve_start_with_token(Uuid::new_v4().to_string(), owner_user_id)
+    pub(crate) fn reserve_start(
+        &self,
+        org_id: &str,
+        owner_user_id: &str,
+    ) -> Result<SimulationStartReservation> {
+        self.reserve_start_with_token(Uuid::new_v4().to_string(), org_id, owner_user_id)
     }
 
     fn reserve_start_with_token(
         &self,
         token: String,
+        org_id: &str,
         owner_user_id: &str,
     ) -> Result<SimulationStartReservation> {
         ensure!(!owner_user_id.is_empty(), "simulation owner is empty");
+        ensure!(!org_id.is_empty(), "simulation organization is empty");
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("simulation registry lock is poisoned"))?;
+        evict_idle(&mut state, self.idle_ttl);
         ensure!(
             state
                 .databases
@@ -409,6 +595,10 @@ impl SimulationRegistry {
         ensure!(
             owner_count < MAX_SIMULATION_RUNS_PER_OWNER,
             "simulation owner has reached the active run limit"
+        );
+        ensure!(
+            registry_org_count(&state, org_id) < MAX_SIMULATION_RUNS_PER_ORG,
+            "simulation organization has reached the active run limit"
         );
         let resident_total = registry_resident_bytes(&state.databases)?;
         let reserved_total = registry_reserved_bytes(&state.reservations)?;
@@ -423,6 +613,7 @@ impl SimulationRegistry {
         match state.reservations.entry(token.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(SimulationStartReservationEntry {
+                    org_id: org_id.to_owned(),
                     owner_user_id: owner_user_id.to_owned(),
                 });
             }
@@ -430,6 +621,7 @@ impl SimulationRegistry {
         }
         Ok(SimulationStartReservation {
             token,
+            org_id: org_id.to_owned(),
             owner_user_id: owner_user_id.to_owned(),
             state: Arc::downgrade(&self.state),
             active: true,
@@ -464,6 +656,10 @@ impl SimulationRegistry {
             owner_count < MAX_SIMULATION_RUNS_PER_OWNER,
             "simulation owner has reached the active run limit"
         );
+        ensure!(
+            registry_org_count(&state, &source.org_id) < MAX_SIMULATION_RUNS_PER_ORG,
+            "simulation organization has reached the active run limit"
+        );
         let resident_total = registry_resident_bytes(&state.databases)?;
         let reserved_total = registry_reserved_bytes(&state.reservations)?;
         ensure!(
@@ -478,10 +674,12 @@ impl SimulationRegistry {
             Entry::Vacant(entry) => {
                 entry.insert(SimulationRegistryEntry {
                     database: Some(database),
+                    liveness: SimulationLivenessKey::from(&source),
                     org_id: source.org_id,
                     owner_user_id: source.owner_user_id,
                     resident_bytes,
                     release_requested: false,
+                    last_used: Instant::now(),
                 });
             }
             Entry::Occupied(_) => unreachable!("simulation registry entry was checked above"),
@@ -494,6 +692,7 @@ impl SimulationRegistry {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("simulation registry lock is poisoned"))?;
+        evict_idle(&mut state, self.idle_ttl);
         let entry = state
             .databases
             .get_mut(simulation_id)
@@ -541,6 +740,7 @@ impl SimulationRegistry {
             .context("simulation identifier was removed concurrently")?;
         entry.database = Some(database);
         entry.resident_bytes = resident_bytes;
+        entry.last_used = Instant::now();
         Ok(())
     }
 
@@ -737,6 +937,10 @@ impl SimulationStartReservation {
             registry_owner_count(&state, &self.owner_user_id) <= MAX_SIMULATION_RUNS_PER_OWNER,
             "simulation owner has reached the active run limit"
         );
+        ensure!(
+            registry_org_count(&state, &self.org_id) <= MAX_SIMULATION_RUNS_PER_ORG,
+            "simulation organization has reached the active run limit"
+        );
         let reserved_total = registry_reserved_bytes(&state.reservations)?;
         let other_reserved = reserved_total
             .checked_sub(MAX_SIMULATION_DATABASE_BYTES)
@@ -759,10 +963,12 @@ impl SimulationStartReservation {
             simulation_id,
             SimulationRegistryEntry {
                 database: Some(database),
+                liveness: SimulationLivenessKey::from(&source),
                 org_id: source.org_id,
                 owner_user_id: source.owner_user_id,
                 resident_bytes,
                 release_requested: false,
+                last_used: Instant::now(),
             },
         );
         self.active = false;
@@ -785,6 +991,21 @@ fn registry_reserved_bytes(
         .context("simulation reservation count does not fit in resident-size accounting")?
         .checked_mul(MAX_SIMULATION_DATABASE_BYTES)
         .context("simulation registry reserved size overflow")
+}
+
+fn registry_org_count(state: &SimulationRegistryState, org_id: &str) -> usize {
+    state
+        .databases
+        .values()
+        .filter(|entry| entry.org_id == org_id)
+        .count()
+        .saturating_add(
+            state
+                .reservations
+                .values()
+                .filter(|reservation| reservation.org_id == org_id)
+                .count(),
+        )
 }
 
 fn registry_owner_count(state: &SimulationRegistryState, owner_user_id: &str) -> usize {
@@ -1013,6 +1234,8 @@ pub struct SimulationView {
     pub events: Vec<SimulationEventView>,
     pub trace_steps: Vec<SimulationTraceStep>,
     pub activity_io_witnesses: Vec<ActivityIoWitness>,
+    pub events_omitted: u64,
+    pub trace_steps_omitted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1505,7 +1728,7 @@ impl SimulationStore {
             )?,
             None => Vec::new(),
         };
-        Ok(SimulationView {
+        let mut view = SimulationView {
             simulation_id: self.simulation_id.clone(),
             source: self.source.clone(),
             clock: self.clock.clone(),
@@ -1524,13 +1747,36 @@ impl SimulationStore {
                 .as_ref()
                 .map(|snapshot| snapshot.incidents.clone())
                 .unwrap_or_default(),
-            events: self.load_events()?,
-            trace_steps: self.load_trace_steps()?,
+            events: Vec::new(),
+            trace_steps: Vec::new(),
             activity_io_witnesses: snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.activity_io_witnesses.clone())
                 .unwrap_or_default(),
-        })
+            events_omitted: 0,
+            trace_steps_omitted: 0,
+        };
+        // History only fills what the rest of the view leaves free in the frame.
+        let fixed_bytes = serde_json::to_vec(&view)
+            .context("measure simulation view")?
+            .len();
+        let history_bytes = MAX_VIEW_BYTES.checked_sub(fixed_bytes).context(
+            "simulation state is too large to display in one response; release this run",
+        )?;
+        let (events, events_omitted) =
+            self.load_events(MAX_VIEW_EVENT_BYTES.min(history_bytes / 2))?;
+        let used: usize = events
+            .iter()
+            .map(|event| event.data.to_string().len())
+            .sum();
+        let (trace_steps, trace_steps_omitted) = self.load_trace_steps(
+            MAX_VIEW_TRACE_BYTES.min(history_bytes.saturating_sub(used)),
+        )?;
+        view.events = events;
+        view.events_omitted = events_omitted;
+        view.trace_steps = trace_steps;
+        view.trace_steps_omitted = trace_steps_omitted;
+        Ok(view)
     }
 
     fn insert_identity(&self, input: &SimulationSourceInput) -> Result<()> {
@@ -1604,7 +1850,25 @@ impl SimulationStore {
             self.ids.borrow().error().is_none(),
             "simulation event identifier allocation failed"
         );
-        validate_plan_ids(&plan, &self.ids.borrow())?;
+        // Every request reopens the store with a fresh allocator, so a fork activation
+        // minted by an earlier request is known only through the persisted run.
+        let persisted_activations = self
+            .load_snapshot()?
+            .map(|snapshot| {
+                snapshot
+                    .tokens
+                    .iter()
+                    .flat_map(|token| token.fork_stack.iter().map(|frame| frame.activation_id.clone()))
+                    .chain(
+                        snapshot
+                            .receipts
+                            .iter()
+                            .map(|receipt| receipt.activation_id.clone()),
+                    )
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
         validate_supported_plan(&plan)?;
 
         let tx = self
@@ -1626,6 +1890,7 @@ impl SimulationStore {
             );
             repository::start_simulation_plan_on(
                 &tx,
+                PrivateSimulationMode::prove(&self.conn)?,
                 &self.actor,
                 instance_id,
                 &self.source.definition_id,
@@ -1651,7 +1916,7 @@ impl SimulationStore {
                 &plan,
                 at_ms,
                 false,
-                repository::ExecutionMode::Simulation,
+                repository::ExecutionMode::Simulation(PrivateSimulationMode::prove(&self.conn)?),
             )?
             .context("simulation timer changed before its private commit")?;
             ensure!(
@@ -1664,6 +1929,7 @@ impl SimulationStore {
                 .context("simulation plan has no instance")?;
             repository::apply_simulation_plan_on(
                 &tx,
+                PrivateSimulationMode::prove(&self.conn)?,
                 &self.actor,
                 &instance_id,
                 expected_revision,
@@ -1783,47 +2049,79 @@ impl SimulationStore {
         repository::runtime_snapshot_on(&self.conn, &self.actor, &instance_id).map(Some)
     }
 
-    fn load_events(&self) -> Result<Vec<SimulationEventView>> {
+    /// Newest events first until the count or byte budget is spent, returned in
+    /// ascending order with the number of older events that were left out.
+    fn load_events(&self, byte_budget: usize) -> Result<(Vec<SimulationEventView>, u64)> {
         let Some(instance_id) = load_instance_id(&self.conn, &self.simulation_id)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1",
+            [&instance_id],
+            |row| row.get(0),
+        )?;
         let mut stmt = self.conn.prepare(
             "SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id
-             FROM bpmn_events WHERE instance_id=?1 ORDER BY seq",
+             FROM bpmn_events WHERE instance_id=?1 ORDER BY seq DESC",
         )?;
-        let rows = stmt.query_map([instance_id], |row| {
-            Ok(SimulationEventView {
+        let mut rows = stmt.query([&instance_id])?;
+        let mut events = Vec::new();
+        let mut used = 0_usize;
+        while events.len() < MAX_VIEW_EVENTS {
+            let Some(row) = rows.next()? else { break };
+            let data_json: String = row.get(6)?;
+            used = used.saturating_add(data_json.len());
+            if used > byte_budget {
+                break;
+            }
+            events.push(SimulationEventView {
                 event_id: row.get(0)?,
                 seq: row.get::<_, i64>(1)? as u64,
                 at_ms: row.get(2)?,
                 kind: row.get(3)?,
                 node_id: row.get(4)?,
                 actor_user_id: row.get(5)?,
-                data: serde_json::from_str(&row.get::<_, String>(6)?)
+                data: serde_json::from_str(&data_json)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                 scope_id: row.get(7)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            });
+        }
+        events.reverse();
+        let omitted = u64::try_from(total)? - u64::try_from(events.len())?;
+        Ok((events, omitted))
     }
 
-    fn load_trace_steps(&self) -> Result<Vec<SimulationTraceStep>> {
-        let mut stmt = self.conn.prepare("SELECT trace_step_id,ordinal,action,at_ms,request_sha256,result_sha256,data_json FROM simulation_trace_steps WHERE simulation_id=?1 ORDER BY ordinal")?;
-        let rows = stmt.query_map([&self.simulation_id], |row| {
-            Ok(SimulationTraceStep {
+    fn load_trace_steps(&self, byte_budget: usize) -> Result<(Vec<SimulationTraceStep>, u64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM simulation_trace_steps WHERE simulation_id=?1",
+            [&self.simulation_id],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self.conn.prepare("SELECT trace_step_id,ordinal,action,at_ms,request_sha256,result_sha256,data_json FROM simulation_trace_steps WHERE simulation_id=?1 ORDER BY ordinal DESC")?;
+        let mut rows = stmt.query([&self.simulation_id])?;
+        let mut steps = Vec::new();
+        let mut used = 0_usize;
+        while steps.len() < MAX_VIEW_TRACE_STEPS {
+            let Some(row) = rows.next()? else { break };
+            let data_json: String = row.get(6)?;
+            used = used.saturating_add(data_json.len());
+            if used > byte_budget {
+                break;
+            }
+            steps.push(SimulationTraceStep {
                 trace_step_id: row.get(0)?,
                 ordinal: row.get::<_, i64>(1)? as u64,
                 action: row.get(2)?,
                 at_ms: row.get(3)?,
                 request_sha256: row.get(4)?,
                 result_sha256: row.get(5)?,
-                data: serde_json::from_str(&row.get::<_, String>(6)?)
+                data: serde_json::from_str(&data_json)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            });
+        }
+        steps.reverse();
+        let omitted = u64::try_from(total)? - u64::try_from(steps.len())?;
+        Ok((steps, omitted))
     }
 }
 
@@ -1994,7 +2292,11 @@ fn validate_captured_source(
     Ok((model, acl))
 }
 
-fn validate_plan_ids(plan: &RuntimePlan, ids: &SimulationIdSource) -> Result<()> {
+fn validate_plan_ids(
+    plan: &RuntimePlan,
+    ids: &SimulationIdSource,
+    persisted_activations: &HashSet<String>,
+) -> Result<()> {
     ensure!(
         plan.event_ids.len() == plan.events.len()
             && (0..plan.events.len()).all(|index| plan.event_ids.contains_key(&index)),
@@ -2006,43 +2308,46 @@ fn validate_plan_ids(plan: &RuntimePlan, ids: &SimulationIdSource) -> Result<()>
             "simulation plan contains an event identifier outside its event ledger"
         );
     }
-    for id in plan
+    let issued = plan
         .create_tokens
         .iter()
-        .map(|token| token.token_id.as_str())
+        .map(|token| ("token", token.token_id.as_str()))
         .chain(
             plan.create_user_tasks
                 .iter()
-                .map(|task| task.user_task_id.as_str()),
+                .map(|task| ("user task", task.user_task_id.as_str())),
         )
         .chain(
             plan.add_incidents
                 .iter()
-                .map(|incident| incident.incident_id.as_str()),
+                .map(|incident| ("incident", incident.incident_id.as_str())),
         )
-        .chain(plan.event_ids.values().map(String::as_str))
-        .chain(
-            plan.add_gateway_receipts
-                .iter()
-                .flat_map(|receipt| [receipt.activation_id.as_str(), receipt.token_id.as_str()]),
-        )
+        .chain(plan.event_ids.values().map(|id| ("event", id.as_str())))
+        .chain(plan.add_gateway_receipts.iter().flat_map(|receipt| {
+            [
+                ("gateway activation", receipt.activation_id.as_str()),
+                ("gateway receipt token", receipt.token_id.as_str()),
+            ]
+        }))
         .chain(
             plan.create_timers
                 .iter()
-                .map(|timer| timer.timer_id.as_str()),
+                .map(|timer| ("timer", timer.timer_id.as_str())),
         )
         .chain(plan.activity_io_inputs.iter().map(|fact| match fact {
             ActivityIoInputFact::Captured { witness_id, .. }
-            | ActivityIoInputFact::Failed { witness_id, .. } => witness_id.as_str(),
-        }))
-    {
+            | ActivityIoInputFact::Failed { witness_id, .. } => {
+                ("activity IO witness", witness_id.as_str())
+            }
+        }));
+    for (kind, id) in issued {
         ensure!(
             Uuid::parse_str(id).is_ok(),
             "simulation plan contains a malformed UUID"
         );
         ensure!(
-            ids.accepts(id),
-            "simulation plan contains an identifier not issued by its allocator"
+            ids.accepts(id) || kind == "gateway activation" && persisted_activations.contains(id),
+            "simulation plan contains a {kind} identifier not issued by its allocator: {id}"
         );
     }
     for id in plan
@@ -2218,25 +2523,25 @@ mod reservation_tests {
     fn reservation_token_collision_preserves_the_existing_owner_slot() {
         let registry = SimulationRegistry::new();
         let first = registry
-            .reserve_start_with_token("fixed-token".to_owned(), "owner-one")
+            .reserve_start_with_token("fixed-token".to_owned(), "org-one", "owner-one")
             .expect("reserve the fixed token");
         let second = registry
-            .reserve_start_with_token("owner-one-2".to_owned(), "owner-one")
+            .reserve_start_with_token("owner-one-2".to_owned(), "org-one", "owner-one")
             .expect("reserve the second owner slot");
         let third = registry
-            .reserve_start_with_token("owner-one-3".to_owned(), "owner-one")
+            .reserve_start_with_token("owner-one-3".to_owned(), "org-one", "owner-one")
             .expect("reserve the third owner slot");
         let fourth = registry
-            .reserve_start_with_token("owner-one-4".to_owned(), "owner-one")
+            .reserve_start_with_token("owner-one-4".to_owned(), "org-one", "owner-one")
             .expect("reserve the fourth owner slot");
 
         let collision = registry
-            .reserve_start_with_token("fixed-token".to_owned(), "owner-two")
+            .reserve_start_with_token("fixed-token".to_owned(), "org-two", "owner-two")
             .expect_err("a token collision must reject before replacing the reservation");
         assert!(format!("{collision:#}").contains("reservation collided"));
 
         let owner_limit = registry
-            .reserve_start("owner-one")
+            .reserve_start("org-one", "owner-one")
             .expect_err("the original owner must still occupy all four slots");
         assert!(format!("{owner_limit:#}").contains("owner has reached"));
 

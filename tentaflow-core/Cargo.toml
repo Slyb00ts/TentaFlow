@@ -183,7 +183,7 @@ toml = { workspace = true }
 ciborium = { workspace = true }
 
 # Database
-rusqlite = { workspace = true, features = ["bundled", "blob"] }
+rusqlite = { workspace = true, features = ["bundled", "blob", "backup"] }
 fjall = { workspace = true }
 
 # TentaBus (M0 log engine, standalone crate — no workspace, path dep per

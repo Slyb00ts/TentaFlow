@@ -955,7 +955,7 @@ test('simulation view response decodes its private clock, trace, and witnesses',
       actor_user_id: 'user-1', data: null, scope_id: 'scope-1' }],
     trace_steps: [{ trace_step_id: 'trace-1', ordinal: 0, action: 'start', at_ms: 10,
       request_sha256: 'b'.repeat(64), result_sha256: 'c'.repeat(64), data: null }],
-    activity_io_witnesses: [],
+    activity_io_witnesses: [], events_omitted: 7, trace_steps_omitted: 3,
   };
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     SimulationViewResponse: { view },
@@ -965,4 +965,6 @@ test('simulation view response decodes its private clock, trace, and witnesses',
   assert.equal(decoded.view.clock.tickDurationMs, 10);
   assert.equal(decoded.view.events[0].kind, 'instance_started');
   assert.equal(decoded.view.traceSteps[0].action, 'start');
+  assert.equal(decoded.view.eventsOmitted, 7);
+  assert.equal(decoded.view.traceStepsOmitted, 3);
 });

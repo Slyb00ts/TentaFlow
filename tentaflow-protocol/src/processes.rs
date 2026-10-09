@@ -1760,6 +1760,12 @@ pub struct ProcessSimulationView {
     pub events: Vec<ProcessSimulationEvent>,
     pub trace_steps: Vec<ProcessSimulationTraceStep>,
     pub activity_io_witnesses: Vec<Value>,
+    /// Oldest events dropped from `events` to keep the response within one frame.
+    #[serde(default)]
+    pub events_omitted: u64,
+    /// Oldest trace steps dropped from `trace_steps` for the same reason.
+    #[serde(default)]
+    pub trace_steps_omitted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

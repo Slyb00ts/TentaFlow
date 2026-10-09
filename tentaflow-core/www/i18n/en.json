@@ -15345,6 +15345,7 @@
     "simulation_events": "Trace events",
     "simulation_empty_tasks": "No open work",
     "simulation_empty_events": "No events yet",
+    "simulation_events_omitted": "{count} earlier {count|event|events} not shown",
     "simulation_complete_task": "Complete task",
     "simulation_acknowledge_task": "Acknowledge task",
     "simulation_outputs": "Task result (JSON)",

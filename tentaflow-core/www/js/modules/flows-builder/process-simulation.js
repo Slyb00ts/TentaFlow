@@ -114,6 +114,7 @@ function simulationWindow(view) {
       </section>
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_events'))}</h3>
         ${events.length ? `<ol class="fb-simulation-events">${events.slice(-50).map((event) => `<li><span>${escapeHtml(String(event.atMs))}</span> ${escapeHtml(event.kind)}${event.nodeId ? ` · ${escapeHtml(event.nodeId)}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
+        ${current.eventsOmitted > 0 ? `<p>${escapeHtml(text('simulation_events_omitted', { count: current.eventsOmitted }))}</p>` : ''}
       </section>`;
     content.querySelectorAll('tf-code-editor[data-simulation-output]').forEach((editor) => {
       editor.value = '{}';

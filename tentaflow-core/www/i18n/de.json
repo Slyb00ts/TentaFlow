@@ -14110,6 +14110,7 @@
     "simulation_events": "Trace-Ereignisse",
     "simulation_empty_tasks": "Keine offenen Aufgaben",
     "simulation_empty_events": "Noch keine Ereignisse",
+    "simulation_events_omitted": "{count} ältere {count|Ereignis|Ereignisse} nicht angezeigt",
     "simulation_complete_task": "Aufgabe abschließen",
     "simulation_acknowledge_task": "Aufgabe bestätigen",
     "simulation_outputs": "Aufgabenergebnis (JSON)",

@@ -4,7 +4,7 @@ use super::model::starter_model;
 use super::repository::{IoObservedValue, ProcessActor};
 use super::runtime::RuntimeIdSource;
 use super::simulation::{
-    set_simulation_transition_preflight, simulation_meta_status, simulation_scenario_sha256,
+    set_simulation_transition_preflight, PrivateSimulationMode, simulation_scenario_sha256,
     AuthenticatedSimulationAction, AuthenticatedSimulationSource, SimulationClock,
     SimulationDatabase, SimulationIdSource, SimulationRegistry, SimulationSourceInput,
     SimulationStore,
@@ -553,6 +553,8 @@ fn footprint_source_case(
     let mut input = source_input_for(model);
     let owner_user_id = format!("simulation-footprint-owner-{}", index % owner_count);
     input.owner_user_id = owner_user_id.clone();
+    // The registry caps each organization, so the sixteen-run case spreads across four.
+    input.org_id = format!("simulation-footprint-org-{}", index % owner_count);
     let mut permitted_user_ids = vec![input.actor_user_id.clone()];
     if owner_user_id != input.actor_user_id {
         permitted_user_ids.push(owner_user_id);
@@ -952,24 +954,24 @@ fn simulation_registry_rejects_a_fifth_run_without_evicting_the_existing_four() 
 fn simulation_registry_reserves_start_capacity_before_database_construction() {
     let registry = SimulationRegistry::new();
     let first = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect("reserve first pending start");
     let second = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect("reserve second pending start");
     let third = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect("reserve third pending start");
     let fourth = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect("reserve fourth pending start");
     let error = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect_err("per-owner pending start limit must reject the fifth reservation");
     assert!(format!("{error:#}").contains("owner has reached"));
     drop(first);
     let replacement = registry
-        .reserve_start("owner-one")
+        .reserve_start("org-one", "owner-one")
         .expect("dropping a failed start must release its owner slot");
     drop((second, third, fourth, replacement));
 
@@ -977,17 +979,17 @@ fn simulation_registry_reserves_start_capacity_before_database_construction() {
     for index in 0..16 {
         global_reservations.push(
             registry
-                .reserve_start(&format!("owner-{index}"))
+                .reserve_start(&format!("org-{index}"), &format!("owner-{index}"))
                 .expect("reserve start within global limit"),
         );
     }
     let error = registry
-        .reserve_start("owner-overflow")
+        .reserve_start("org-overflow", "owner-overflow")
         .expect_err("global pending start limit must reject the seventeenth reservation");
     assert!(format!("{error:#}").contains("active run limit"));
     drop(global_reservations.pop());
     let replacement = registry
-        .reserve_start("owner-overflow")
+        .reserve_start("org-overflow", "owner-overflow")
         .expect("dropping a failed global start must release its slot");
     global_reservations.push(replacement);
     drop(global_reservations);
@@ -1153,7 +1155,11 @@ fn simulation_timer_catch_date_and_working_duration_fire_from_pinned_rules_and_r
         working_started.timers[0].status,
         ProcessTimerStatus::Pending
     );
-    assert!(working_started.timers[0].due_at_ms.is_some());
+    // Every weekday is covered all day, so one working second is one wall-clock second.
+    assert_eq!(
+        working_started.timers[0].due_at_ms,
+        Some(coverage_start_ms + 1_000)
+    );
     assert_eq!(
         working_started.timers[0]
             .working_time
@@ -1227,6 +1233,58 @@ fn simulation_timer_catch_date_and_working_duration_fire_from_pinned_rules_and_r
     assert_eq!(working_reopened_view.clock, working_fired.clock);
     assert_eq!(working_reopened_view.events, working_fired.events);
     assert_eq!(working_reopened_view.timers, working_fired.timers);
+}
+
+#[test]
+fn simulation_working_duration_outside_pinned_coverage_parks_a_timer_incident() {
+    let calendar = tentaflow_protocol::processes::ProcessWorkCalendar {
+        name: "Simulation working hours".into(),
+        weekly_windows: (1..=7)
+            .map(|weekday| tentaflow_protocol::processes::WorkWindow {
+                weekday,
+                start_minute: 0,
+                end_minute: 1_440,
+            })
+            .collect(),
+        manual_days_off: Vec::new(),
+        holiday_policy: tentaflow_protocol::processes::HolidayPolicy::None,
+    };
+    let pin = super::calendar::mint_calendar_pin(&calendar, "UTC")
+        .expect("mint immutable simulation calendar pin");
+    let coverage_start =
+        chrono::NaiveDate::parse_from_str(&pin.legal_release.valid_from, "%Y-%m-%d")
+            .expect("pinned coverage start");
+    let coverage_start_ms = coverage_start
+        .and_hms_opt(12, 0, 0)
+        .expect("noon of the first covered day")
+        .and_utc()
+        .timestamp_millis();
+    let mut model = timer_catch_model(ProcessTimerSpec::WorkingDuration { seconds: 1 });
+    model.work_calendar = Some(calendar);
+    model.calendar_pin = Some(pin);
+    let mut input = source_input_for(model);
+    input.start_ms = coverage_start_ms - 30 * 86_400_000;
+    input.tick_duration_ms = 1_000;
+    input.horizon_ms = input.start_ms + 5_000;
+    let mut store = create_store(input).expect("capture source pin before coverage");
+    let started = store
+        .start(test_authorization(&store), json!({}))
+        .expect("Start parks an incident instead of failing the request");
+    let timer = &started.timers[0];
+    assert_eq!(timer.status, ProcessTimerStatus::Error);
+    assert_eq!(timer.due_at_ms, None, "no due time is invented outside the pinned coverage");
+    assert!(timer
+        .last_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("outside pinned timezone coverage")));
+    assert_eq!(
+        started.instance.as_ref().expect("instance").status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Incident
+    );
+    assert!(started
+        .incidents
+        .iter()
+        .any(|incident| incident.code == "TIMER_ERROR"));
 }
 
 #[test]
@@ -1486,14 +1544,6 @@ fn simulation_timer_catch_rolls_back_every_private_row_on_late_command_conflict(
     assert_eq!(reopened_view.clock, before.clock);
     assert_eq!(reopened_view.events, before.events);
     assert_eq!(reopened_view.timers, before.timers);
-}
-
-#[test]
-fn simulation_incident_keeps_the_private_run_open_for_peer_work() {
-    assert_eq!(
-        simulation_meta_status(&tentaflow_protocol::processes::ProcessInstanceStatus::Incident),
-        "running"
-    );
 }
 
 #[test]
@@ -1900,4 +1950,366 @@ fn simulation_reader_rejects_actor_outside_captured_acl() {
         },
     )
     .is_err());
+}
+
+#[test]
+fn simulation_registry_drops_runs_idle_past_the_ttl_but_never_an_in_flight_run() {
+    let registry = SimulationRegistry::with_idle_ttl(std::time::Duration::from_millis(200));
+    let idle = create_store(source_input()).expect("capture idle source pin");
+    let idle_id = idle.simulation_id().to_owned();
+    registry
+        .insert(idle_id.clone(), idle.into_database())
+        .expect("register idle run");
+    let busy = create_store(source_input_for(manual_model())).expect("capture busy source pin");
+    let busy_id = busy.simulation_id().to_owned();
+    registry
+        .insert(busy_id.clone(), busy.into_database())
+        .expect("register busy run");
+    let in_flight = registry.take(&busy_id).expect("a fresh run is taken within its TTL");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Any later registry use sweeps what has been idle past the deadline.
+    let _reservation = registry
+        .reserve_start("org-one", "owner-one")
+        .expect("reserve after the sweep");
+    let error = registry
+        .take(&idle_id)
+        .expect_err("an idle run past its TTL must be gone");
+    assert!(format!("{error:#}").contains("not found"));
+    registry
+        .put(busy_id.clone(), in_flight)
+        .expect("an in-flight run survives the sweep and returns to its slot");
+
+    let keeping = SimulationRegistry::new();
+    let fresh = create_store(source_input()).expect("capture fresh source pin");
+    let fresh_id = fresh.simulation_id().to_owned();
+    keeping
+        .insert(fresh_id.clone(), fresh.into_database())
+        .expect("register fresh run");
+    let _reservation = keeping
+        .reserve_start("org-one", "owner-one")
+        .expect("reserve with the default TTL");
+    keeping
+        .take(&fresh_id)
+        .expect("a recently used run stays within the default 30 minute TTL");
+}
+
+#[test]
+fn simulation_registry_caps_one_organization_without_starving_another() {
+    let registry = SimulationRegistry::new();
+    let mut reservations = Vec::new();
+    for index in 0..4 {
+        reservations.push(
+            registry
+                .reserve_start("org-greedy", &format!("greedy-owner-{index}"))
+                .expect("reserve within the organization share"),
+        );
+    }
+    let error = registry
+        .reserve_start("org-greedy", "greedy-owner-4")
+        .expect_err("a fifth reservation must exceed the organization share");
+    assert!(format!("{error:#}").contains("organization has reached"));
+    registry
+        .reserve_start("org-modest", "modest-owner")
+        .expect("another organization still has capacity");
+    drop(reservations.pop());
+    registry
+        .reserve_start("org-greedy", "greedy-owner-4")
+        .expect("releasing a reservation frees the organization slot");
+}
+
+#[test]
+fn simulation_view_returns_a_bounded_window_with_omitted_counts_and_stays_encodable() {
+    let mut input = source_input_for(timer_catch_model(ProcessTimerSpec::Duration {
+        seconds: 9,
+    }));
+    input.tick_duration_ms = 10;
+    input.horizon_ms = 20_000;
+    let mut store = create_store(input).expect("capture long TimerCatch source pin");
+    store
+        .start(test_authorization(&store), json!({}))
+        .expect("start long simulation");
+    let mut last = None;
+    for _ in 0..260 {
+        last = Some(
+            store
+                .advance(test_authorization(&store))
+                .expect("advance the long simulation"),
+        );
+    }
+    let view = last.expect("at least one advance");
+    assert_eq!(view.trace_steps.len(), 200, "trace is capped at its newest window");
+    assert!(view.trace_steps_omitted >= 61);
+    assert_eq!(
+        view.trace_steps.last().expect("newest trace step").ordinal,
+        view.trace_steps_omitted + 199,
+        "the window ends at the newest step and omits only older ones"
+    );
+    assert!(view
+        .trace_steps
+        .windows(2)
+        .all(|pair| pair[0].ordinal + 1 == pair[1].ordinal));
+    assert!(serde_json::to_vec(&view).expect("encode view").len() < tentaflow_transport::MAX_FRAME_SIZE);
+
+    // Pad the private history far past a frame; the view must still fit one.
+    let simulation_id = view.simulation_id.clone();
+    let connection = store.into_database().into_connection_for_test();
+    let instance_id: String = connection
+        .query_row("SELECT instance_id FROM bpmn_events LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("private instance");
+    let padding = json!({"padding": "p".repeat(300 * 1024)}).to_string();
+    for index in 0..40_i64 {
+        connection
+            .execute(
+                "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?2,?3,1000,'padding',NULL,NULL,?4)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    instance_id,
+                    10_000 + index,
+                    padding
+                ],
+            )
+            .expect("pad private history");
+    }
+    for index in 0..600_i64 {
+        connection
+            .execute(
+                "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?2,?3,1000,'small',NULL,NULL,'{}')",
+                params![uuid::Uuid::new_v4().to_string(), instance_id, 20_000 + index],
+            )
+            .expect("add small events");
+    }
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1",
+            [&instance_id],
+            |row| row.get(0),
+        )
+        .expect("count events");
+    let reopened = reopen_store(
+        SimulationDatabase::from_connection_for_test(connection),
+        &simulation_id,
+        ProcessActor {
+            org_id: "org-simulation".into(),
+            user_id: "user-simulation".into(),
+        },
+    )
+    .expect("reopen padded simulation");
+    let padded = reopened
+        .view(test_authorization(&reopened))
+        .expect("a padded run must still produce a view");
+    assert_eq!(padded.events.len(), 500);
+    assert_eq!(padded.events_omitted, u64::try_from(total).unwrap() - 500);
+    assert_eq!(padded.events.last().expect("newest event").seq, 20_599);
+    assert!(padded.events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(
+        serde_json::to_vec(&padded).expect("encode padded view").len()
+            < tentaflow_transport::MAX_FRAME_SIZE
+    );
+}
+
+#[test]
+fn production_transaction_is_refused_a_simulation_transition() {
+    let simulation = create_store(source_input()).expect("capture source pin");
+    let proof = PrivateSimulationMode::prove_for_test(
+        &simulation.into_database().into_connection_for_test(),
+    )
+    .expect("a private simulation database proves its mode");
+
+    let directory = tempfile::tempdir().expect("production fixture directory");
+    let production = crate::db::init(&directory.path().join("processes.db"))
+        .expect("production process database");
+    assert!(PrivateSimulationMode::prove_for_test(&production.read().expect("read")).is_err());
+    let mut connection = production.write().expect("production writer");
+    let transaction = connection.transaction().expect("production transaction");
+    let error = super::repository::apply_simulation_plan_on(
+        &transaction,
+        proof,
+        &ProcessActor {
+            org_id: "org-simulation".into(),
+            user_id: "user-simulation".into(),
+        },
+        "instance-1",
+        1,
+        &super::repository::RuntimePlan::initial(json!({})),
+        1_000,
+        None,
+        None,
+    )
+    .expect_err("a proof minted on a private database must not authorize a production write");
+    assert!(
+        format!("{error:#}").contains("private simulation database"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn simulation_incident_keeps_the_private_run_open_for_peer_work() {
+    let mut model = parallel_timer_model(1);
+    model
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "Work")
+        .expect("peer branch")
+        .kind = ProcessNodeKind::ScriptTask {
+        script: "1 / 0".into(),
+        output_mapping: BTreeMap::new(),
+    };
+    let mut input = source_input_for(model);
+    input.tick_duration_ms = 1_000;
+    input.horizon_ms = 5_000;
+    let mut store = create_store(input).expect("capture incident source pin");
+    let started = store
+        .start(test_authorization(&store), json!({}))
+        .expect("start simulation whose Script branch fails");
+    assert_eq!(
+        started.instance.as_ref().expect("instance").status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Incident
+    );
+    assert!(started
+        .incidents
+        .iter()
+        .any(|incident| incident.code == "SCRIPT_EVALUATION_FAILED"));
+    let simulation_id = started.simulation_id.clone();
+    let status_of = |store: SimulationStore| -> (String, SimulationStore) {
+        let connection = store.into_database().into_connection_for_test();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM simulation_meta WHERE simulation_id=?1",
+                [&simulation_id],
+                |row| row.get(0),
+            )
+            .expect("simulation status");
+        let reopened = reopen_store(
+            SimulationDatabase::from_connection_for_test(connection),
+            &simulation_id,
+            ProcessActor {
+                org_id: "org-simulation".into(),
+                user_id: "user-simulation".into(),
+            },
+        )
+        .expect("reopen after reading status");
+        (status, reopened)
+    };
+    let (status, mut store) = status_of(store);
+    assert_eq!(status, "running", "an incident does not close the private run");
+
+    let advanced = store
+        .advance(test_authorization(&store))
+        .expect("the incident run still advances its peer timer");
+    let fired = store
+        .advance(test_authorization(&store))
+        .expect("the peer timer reaches its due tick");
+    assert!(
+        advanced
+            .events
+            .iter()
+            .chain(fired.events.iter())
+            .any(|event| event.kind == "timer_fired"),
+        "the peer branch must keep running beside the incident"
+    );
+}
+
+#[test]
+fn simulation_databases_are_independent_page_copies_of_one_schema_template() {
+    use std::sync::atomic::Ordering;
+
+    drop(SimulationDatabase::open().expect("build or reuse the schema template"));
+    let builds = super::simulation::SCHEMA_TEMPLATE_BUILDS.load(Ordering::SeqCst);
+    let first = SimulationDatabase::open()
+        .expect("first private database")
+        .into_connection_for_test();
+    let second = SimulationDatabase::open()
+        .expect("second private database")
+        .into_connection_for_test();
+    assert_eq!(
+        super::simulation::SCHEMA_TEMPLATE_BUILDS.load(Ordering::SeqCst),
+        builds,
+        "opening a private database must not run the migration ladder again"
+    );
+    let mut versions = Vec::new();
+    for connection in [&first, &second] {
+        assert_eq!(
+            connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .expect("foreign key mode"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .expect("integrity"),
+            "ok"
+        );
+        versions.push(
+            connection
+                .query_row("SELECT MAX(version) FROM _migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migration ladder"),
+        );
+    }
+    assert!(versions[0] >= 197 && versions[0] == versions[1]);
+    first
+        .execute(
+            "INSERT INTO organizations(org_id,name,slug,status,created_at) VALUES('org-copy','Copy','copy','active',datetime('now'))",
+            [],
+        )
+        .expect("write to the first copy only");
+    let leaked: i64 = second
+        .query_row(
+            "SELECT COUNT(*) FROM organizations WHERE org_id='org-copy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the second copy");
+    assert_eq!(leaked, 0, "private databases must not share pages");
+}
+
+#[test]
+fn simulation_parallel_join_completes_when_each_branch_arrives_in_its_own_request() {
+    let actor = || ProcessActor {
+        org_id: "org-simulation".into(),
+        user_id: "user-simulation".into(),
+    };
+    let mut input = source_input_for(parallel_timer_model(1));
+    input.tick_duration_ms = 1_000;
+    input.horizon_ms = 10_000;
+    let mut store = create_store(input).expect("capture parallel source pin");
+    let started = store
+        .start(test_authorization(&store), json!({}))
+        .expect("start parallel simulation");
+    let simulation_id = started.simulation_id.clone();
+    let task_id = started
+        .user_tasks
+        .iter()
+        .find(|task| task.status == ProcessUserTaskStatus::Open)
+        .expect("Work branch is open")
+        .user_task_id
+        .clone();
+
+    // A served request reopens the store with a new identifier allocator, so the
+    // fork activation minted by Start is only known through the persisted run.
+    let mut store = reopen_store(store.into_database(), &simulation_id, actor())
+        .expect("reopen after Start");
+    store
+        .complete_user_task(test_authorization(&store), &task_id, json!({"answer": "ok"}))
+        .expect("the Work branch reaches the join in its own request");
+    let mut completed = false;
+    for _ in 0..4 {
+        store = reopen_store(store.into_database(), &simulation_id, actor())
+            .expect("reopen before advancing");
+        let view = store
+            .advance(test_authorization(&store))
+            .expect("the timer branch reaches the join in its own request");
+        completed = view.instance.as_ref().is_some_and(|instance| {
+            instance.status == tentaflow_protocol::processes::ProcessInstanceStatus::Completed
+        });
+        if completed {
+            break;
+        }
+    }
+    assert!(completed, "both branches joined across separate requests");
 }

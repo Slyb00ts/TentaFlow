@@ -15345,6 +15345,7 @@
     "simulation_events": "Zdarzenia śladu",
     "simulation_empty_tasks": "Brak otwartych zadań",
     "simulation_empty_events": "Brak zdarzeń",
+    "simulation_events_omitted": "Pominięto {count} {count|starsze zdarzenie|starsze zdarzenia|starszych zdarzeń}",
     "simulation_complete_task": "Zakończ zadanie",
     "simulation_acknowledge_task": "Potwierdź zadanie",
     "simulation_outputs": "Wynik zadania (JSON)",

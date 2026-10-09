@@ -152,6 +152,8 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
             .into_iter()
             .map(|witness| serde_json::to_value(witness).map_err(anyhow::Error::from))
             .collect::<Result<Vec<_>, _>>()?,
+        events_omitted: view.events_omitted,
+        trace_steps_omitted: view.trace_steps_omitted,
     })
 }
 
@@ -695,10 +697,14 @@ pub fn process_dispatch(
                 *tick_duration_ms,
             )
             .map_err(error)?;
+            ctx.state
+                .simulation_registry
+                .reclaim(pool)
+                .map_err(error)?;
             let start_reservation = ctx
                 .state
                 .simulation_registry
-                .reserve_start(&source.input().owner_user_id)
+                .reserve_start(&source.input().org_id, &source.input().owner_user_id)
                 .map_err(error)?;
             let mut store = simulation::SimulationStore::create(source).map_err(error)?;
             let source_pin = store.source().clone();
@@ -1135,6 +1141,203 @@ mod tests {
             .await
             .code,
             ProtocolErrorCode::NotFound
+        );
+    }
+
+    async fn save_and_publish(
+        ctx: &HandlerContext,
+        model: tentaflow_protocol::processes::ProcessModel,
+    ) -> tentaflow_protocol::processes::ProcessDefinitionSummary {
+        let definition = save(ctx, model).await;
+        let P::DefinitionPublishResponse { definition: published, .. } = request(
+            ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await
+        else {
+            panic!("published definition expected")
+        };
+        published
+    }
+
+    fn simulation_start(definition_id: &str) -> P {
+        P::SimulationStartRequest {
+            definition_id: definition_id.to_owned(),
+            version: 1,
+            selected_process_id: "Process_1".into(),
+            start_node_id: "Start_1".into(),
+            variables: json!({}),
+            start_ms: 10_000,
+            horizon_ms: 20_000,
+            tick_duration_ms: 500,
+        }
+    }
+
+    fn production_row_counts(state: &Arc<AppState>) -> std::collections::BTreeMap<String, i64> {
+        let conn = state.db.read().unwrap();
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'bpmn\\_%' ESCAPE '\\' OR name='audit_log' OR name LIKE 'simulation\\_%' ESCAPE '\\') ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(tables.iter().any(|name| name == "audit_log"));
+        assert!(tables.iter().any(|name| name == "bpmn_instances"));
+        tables
+            .into_iter()
+            .map(|table| {
+                let count = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| row.get(0))
+                    .unwrap();
+                (table, count)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_simulation_driven_through_dispatch_leaves_production_rows_unchanged() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-isolation-owner");
+        let ctx = context(&state, &actor);
+        let published = save_and_publish(&ctx, test_support::user_model(Some(&actor.user_id))).await;
+        let before = production_row_counts(&state);
+
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        let task_id = view
+            .user_tasks
+            .iter()
+            .find(|task| task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open)
+            .expect("the simulation opens its user task")
+            .user_task_id
+            .clone();
+        request(
+            &ctx,
+            P::SimulationAdvanceRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        let P::SimulationUserTaskCompleteResponse { view: completed } = request(
+            &ctx,
+            P::SimulationUserTaskCompleteRequest {
+                simulation_id: view.simulation_id.clone(),
+                user_task_id: task_id,
+                outputs: json!({"answer": "yes"}),
+            },
+        )
+        .await
+        else {
+            panic!("private simulation completion expected")
+        };
+        assert_eq!(
+            completed.instance.as_ref().expect("private instance").status,
+            ProcessInstanceStatus::Completed
+        );
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(
+            production_row_counts(&state),
+            before,
+            "a private run must not write a production process or audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_a_definition_frees_its_simulation_runs_on_the_next_start() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-reclaim-owner");
+        let ctx = context(&state, &actor);
+        let doomed = save_and_publish(&ctx, test_support::user_model(Some(&actor.user_id))).await;
+        let living = save_and_publish(&ctx, test_support::user_model(Some(&actor.user_id))).await;
+        let P::SimulationStartResponse { view: doomed_run } =
+            request(&ctx, simulation_start(&doomed.definition_id)).await
+        else {
+            panic!("doomed simulation start expected")
+        };
+        request(
+            &ctx,
+            P::DefinitionArchiveRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: doomed.definition_id.clone(),
+                expected_revision: doomed.draft_revision,
+                archived: true,
+            },
+        )
+        .await;
+        // The archived run is still releasable by hand until something needs its slot.
+        let P::SimulationStartResponse { view: living_run } =
+            request(&ctx, simulation_start(&living.definition_id)).await
+        else {
+            panic!("living simulation start expected")
+        };
+        assert_eq!(
+            refused(
+                &ctx,
+                P::SimulationReleaseRequest { simulation_id: doomed_run.simulation_id.clone() },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound,
+            "starting another run reclaimed the archived definition's run"
+        );
+        request(
+            &ctx,
+            P::SimulationViewRequest { simulation_id: living_run.simulation_id },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deactivating_the_owner_frees_the_retained_simulation_run() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-deactivated-owner");
+        let ctx = context(&state, &actor);
+        let published = save_and_publish(&ctx, test_support::user_model(Some(&actor.user_id))).await;
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        assert_eq!(
+            ctx.state.simulation_registry.reclaim(&state.db).unwrap(),
+            0,
+            "a live owner and published source keep their run"
+        );
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+                [&actor.user_id],
+            )
+            .unwrap();
+        assert_eq!(ctx.state.simulation_registry.reclaim(&state.db).unwrap(), 1);
+        let reactivated = state.db.write().unwrap().execute(
+            "UPDATE user_accounts SET is_active=1 WHERE id=?1",
+            [&actor.user_id],
+        );
+        assert_eq!(reactivated.unwrap(), 1);
+        assert_eq!(
+            refused(
+                &ctx,
+                P::SimulationViewRequest { simulation_id: view.simulation_id },
+            )
+            .await
+            .code,
+            ProtocolErrorCode::NotFound,
+            "the reclaimed run is gone even after the owner returns"
         );
     }
 

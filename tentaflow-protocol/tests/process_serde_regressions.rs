@@ -323,6 +323,8 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             request_sha256: "b".repeat(64), result_sha256: "c".repeat(64), data: json!({}),
         }],
         activity_io_witnesses: vec![json!({"phase": "output_applied"})],
+        events_omitted: 7,
+        trace_steps_omitted: 3,
     };
     let payloads = [
         json!({"SimulationStartRequest": {"definition_id": "definition-1", "version": 3,
@@ -350,4 +352,22 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
         let bytes = tentaflow_protocol::cbor::encode(&body).unwrap();
         assert_eq!(tentaflow_protocol::cbor::decode::<MessageBody>(&bytes).unwrap(), body);
     }
+}
+
+#[test]
+fn simulation_view_without_omitted_counts_decodes_with_zero_defaults() {
+    use tentaflow_protocol::processes::ProcessSimulationView;
+
+    let legacy = json!({
+        "simulation_id": "simulation-1",
+        "source": {"simulation_id": "simulation-1", "definition_id": "definition-1",
+            "version": 3, "model_sha256": "a".repeat(64),
+            "selected_process_id": "Process_1", "start_node_id": "Start_1"},
+        "clock": {"start_ms": 1, "now_ms": 1, "horizon_ms": 9, "tick_duration_ms": 1,
+            "step_index": 0, "revision": 1},
+        "instance": null, "user_tasks": [], "timers": [], "incidents": [],
+        "events": [], "trace_steps": [], "activity_io_witnesses": [],
+    });
+    let view: ProcessSimulationView = serde_json::from_value(legacy).unwrap();
+    assert_eq!((view.events_omitted, view.trace_steps_omitted), (0, 0));
 }

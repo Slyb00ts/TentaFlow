@@ -30,7 +30,8 @@ use uuid::Uuid;
 use super::model::{starter_model, validate_model, validate_variables, GatewayKind, MAX_MODEL_BYTES};
 use super::runtime::validate_output;
 use super::simulation::{
-    self, AuthenticatedSimulationAction, AuthenticatedSimulationSource, SimulationSourcePin,
+    self, AuthenticatedSimulationAction, AuthenticatedSimulationSource, PrivateSimulationMode,
+    SimulationSourcePin,
 };
 use crate::db::DbPool;
 
@@ -1757,7 +1758,8 @@ fn timer_current_authority_on(
             }
         }
     }
-    if mode == ExecutionMode::Simulation {
+    if let ExecutionMode::Simulation(proof) = mode {
+        proof.verify_on(conn)?;
         return Ok(true);
     }
     let snapshots_json: String = conn.query_row(
@@ -2573,6 +2575,9 @@ pub(crate) fn fire_timer_on(
     apply_canonical_call_steps: bool,
     mode: ExecutionMode,
 ) -> Result<Option<ProcessTransitionOutcome>> {
+    if let ExecutionMode::Simulation(proof) = mode {
+        proof.verify_on(tx)?;
+    }
     let timer = timer_on(tx, &candidate.timer_id)?;
     if !due_candidate_matches(&timer, candidate)
         || timer.next_check_at_ms > at_ms
@@ -3991,6 +3996,44 @@ pub(crate) fn authorize_simulation_release(
             "simulation cleanup access denied: only the retained simulation owner may release its private run"
         );
         Ok(())
+    })
+}
+
+/// Reports whether a retained private run can still be authorized by anyone: its
+/// owner is an active member of the organization and its pinned version is still
+/// the published, unarchived one with the same model digest. A run for which this
+/// is false only consumes the node-wide pool, so the registry reclaims it.
+pub(crate) fn simulation_source_is_live(
+    pool: &DbPool,
+    org_id: &str,
+    owner_user_id: &str,
+    definition_id: &str,
+    version: u32,
+    model_sha256: &str,
+) -> Result<bool> {
+    read_snapshot(pool, |conn| {
+        let owner = ProcessActor {
+            org_id: org_id.to_owned(),
+            user_id: owner_user_id.to_owned(),
+        };
+        if !actor_active_on(conn, &owner)? {
+            return Ok(false);
+        }
+        let definition_org: Option<String> = conn
+            .query_row(
+                "SELECT org_id FROM bpmn_definitions WHERE definition_id=?1",
+                [definition_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if definition_org.as_deref() != Some(org_id) {
+            return Ok(false);
+        }
+        let definition = definition_on(conn, definition_id)?;
+        if definition.archived || definition.published_version != Some(version) {
+            return Ok(false);
+        }
+        Ok(version_on(conn, definition_id, version)?.model_sha256 == model_sha256)
     })
 }
 
@@ -20577,6 +20620,7 @@ fn validate_closed_service_dispatches_on(
 
 pub(crate) fn start_simulation_plan_on(
     tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
     actor: &ProcessActor,
     instance_id: &str,
     definition_id: &str,
@@ -20608,12 +20652,13 @@ pub(crate) fn start_simulation_plan_on(
         None,
         None,
         accepted,
-        ExecutionMode::Simulation,
+        ExecutionMode::Simulation(mode),
     )
 }
 
 pub(crate) fn apply_simulation_plan_on(
     tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
     actor: &ProcessActor,
     instance_id: &str,
     expected_revision: u64,
@@ -20622,6 +20667,7 @@ pub(crate) fn apply_simulation_plan_on(
     accepted: Option<&AcceptedInputRef>,
     human_outputs: Option<&Value>,
 ) -> Result<ProcessInstance> {
+    mode.verify_on(tx)?;
     require_actor(tx, actor)?;
     let initiator = require_instance_reader(tx, actor, instance_id)?;
     if !initiator {
@@ -22698,7 +22744,8 @@ pub fn start_instance(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionMode {
     Durable,
-    Simulation,
+    /// Constructible only with the proof minted by the simulation store.
+    Simulation(PrivateSimulationMode),
 }
 
 fn start_instance_on(
@@ -22723,6 +22770,9 @@ fn start_instance_on(
         plan.start_instance_id.as_deref() == Some(instance_id),
         "start transition identity differs from the persisted instance"
     );
+    if let ExecutionMode::Simulation(proof) = mode {
+        proof.verify_on(tx)?;
+    }
     require_actor(tx, actor)?;
     if mode == ExecutionMode::Durable {
         require_owner(tx, actor, definition_id)?;
@@ -22800,7 +22850,7 @@ fn start_instance_on(
     }
     let mut vars = match mode {
         ExecutionMode::Durable => serde_json::to_value(body.variables)?,
-        ExecutionMode::Simulation => Value::Object(Default::default()),
+        ExecutionMode::Simulation(_) => Value::Object(Default::default()),
     };
     for (key, value) in initial_variables
         .as_object()
