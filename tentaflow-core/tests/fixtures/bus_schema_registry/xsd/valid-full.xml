@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- comments and processing instructions are ignored -->
+<patient xmlns="urn:example:patient" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="urn:example:patient patient.xsd" active="true">
+  <mrn>AB123456</mrn>
+  <name>
+    <family>Kowalski &amp; Sons</family>
+    <given>Jan</given>
+    <given>Adam</given>
+    <given><![CDATA[Maria]]></given>
+  </name>
+  <birthDate>1980-02-29</birthDate>
+  <sex>M</sex>
+  <email>jan@example.org</email>
+  <visit ward="12" at="2026-09-02T08:30:00Z">first contact</visit>
+  <visit ward="0013"/>
+</patient>

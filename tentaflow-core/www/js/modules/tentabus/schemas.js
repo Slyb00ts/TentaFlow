@@ -46,6 +46,18 @@ export function schemaKind(type) {
   return Object.keys(SCHEMA_TYPES_BY_KIND).find((k) => SCHEMA_TYPES_BY_KIND[k].includes(type)) || '';
 }
 
+/**
+ * The refusal of binding a pattern to a topic that carries another payload
+ * kind (`topics.rs`: "schema subject 'x' is xsd but this topic's content_type
+ * resolves to json"), in plain words; `''` for any other message.
+ */
+export function schemaKindMismatchText(message) {
+  const m = /schema subject '([^']*)' is (\w+) but this topic's content_type resolves to (\w+)/.exec(String(message || ''));
+  const kind = m ? schemaKind(m[2]) : '';
+  if (!kind) return '';
+  return T('errors.schema_kind_mismatch', { name: m[1], schemaKind: T(`fmt.content.${kind}`), topicKind: T(`fmt.content.${m[3]}`) });
+}
+
 const isDeprecated = (s) => s.deprecatedAtMs != null;
 const isUsed = (s) => (s.usedByTopics || []).length > 0;
 

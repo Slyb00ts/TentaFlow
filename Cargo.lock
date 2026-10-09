@@ -14895,6 +14895,7 @@ dependencies = [
  "rcgen 0.14.8",
  "readability",
  "regex",
+ "regex-automata",
  "reqwest 0.13.3",
  "rusqlite",
  "rust_xlsxwriter",

@@ -1010,6 +1010,16 @@ pub enum BusServiceError {
         mode: &'static str,
         detail: String,
     },
+    /// `registry::register`: the comparison with the subject's latest version
+    /// gave up (work budget, nesting depth) without proving the change
+    /// compatible or incompatible. Distinct from `SchemaIncompatible`, which
+    /// is a proven difference.
+    #[error("schema '{subject}' change cannot be compared under mode '{mode}': {detail}")]
+    SchemaCompareTooComplex {
+        subject: String,
+        mode: &'static str,
+        detail: String,
+    },
     /// `SchemaError::Unsupported` surfaced to a caller: the requested
     /// operation has no implementation for this schema type in this build
     /// (every operation but `compile`'s shape smoke-check, for
@@ -2382,12 +2392,44 @@ impl ConsumerCursor {
 struct ResolvedSchema {
     version: u32,
     schema_ref_id: u32,
-    /// `schema_registry::generation()` at the moment this was resolved —
-    /// still valid iff it matches the CURRENT value when looked up.
-    generation: u64,
+    /// Hash of the stored text this was compiled from; with `version`,
+    /// `schema_ref_id` and `schema_type` it is the identity of the compile.
+    content_hash: String,
+    /// `schema_registry::generation()` at the moment this was resolved (or
+    /// last confirmed unchanged) — still valid iff it matches the CURRENT
+    /// value when looked up. Re-stamped in place when a global bump proves
+    /// this subject's effective schema did not change.
+    generation: AtomicU64,
     schema_type: schema_registry::SchemaType,
     compiled: schema_registry::CompiledSchema,
+    /// Estimated resident bytes (`SCHEMA_CACHE_LIMITS` accounting).
+    weight: usize,
+    /// `BusService::schema_cache_clock` at the last lookup; the oldest entry
+    /// is evicted first.
+    last_used: AtomicU64,
 }
+
+/// `schema_cache` bounds: entries, and estimated resident bytes of the
+/// compiled schemas. A registry may hold far more subjects than a node ever
+/// publishes to, and one XSD alone can carry up to its 16 MiB pattern budget.
+///
+/// The cache is shared by every org, so each org also has a share of it: an
+/// org over its share evicts its own oldest entries, and when the whole cache
+/// is over its bounds the org using the most evicts first, so one tenant
+/// registering many large schemas cannot push the others out.
+struct SchemaCacheLimits {
+    entries: usize,
+    bytes: usize,
+    org_entries: usize,
+    org_bytes: usize,
+}
+
+const SCHEMA_CACHE_LIMITS: SchemaCacheLimits = SchemaCacheLimits {
+    entries: 1024,
+    bytes: 256 * 1024 * 1024,
+    org_entries: 128,
+    org_bytes: 64 * 1024 * 1024,
+};
 
 pub struct BusService {
     /// plan-app-platform §7 W4: the TentaBus instance every table this
@@ -2490,19 +2532,32 @@ pub struct BusService {
     /// counter and retires every entry at once.
     topic_config_cache: DashMap<TopicKey, (u64, Arc<topics::TopicConfig>)>,
     /// PLAN-F3 §4.2: compiled-validator cache, keyed `(org_id, subject)`.
-    /// `resolve_validator` treats an entry as stale (and recompiles) as soon
-    /// as its captured `ResolvedSchema::generation` no longer matches
+    /// `resolve_validator` re-reads the subject as soon as its captured
+    /// `ResolvedSchema::generation` no longer matches
     /// `schema_registry::generation()` — bumped by every local registry
-    /// write AND by `sync::core_materializer` applying a replicated one, so
-    /// a compile only ever happens at registration time, never on the
-    /// publish hot path for a topic whose schema hasn't changed. Purged for
-    /// an org by `purge_org`, same as `topic_config_cache`.
+    /// write AND by `sync::core_materializer` applying a replicated one —
+    /// and recompiles only when that subject's effective version or content
+    /// actually changed, so a compile never happens on the publish hot path
+    /// for a topic whose schema hasn't changed. Bounded by
+    /// `SCHEMA_CACHE_LIMITS` (overall and per org), least recently used
+    /// first. Purged for an org by `purge_org`, same as
+    /// `topic_config_cache`.
     schema_cache: DashMap<TopicKey, Arc<ResolvedSchema>>,
+    /// Source of `ResolvedSchema::last_used` stamps.
+    schema_cache_clock: AtomicU64,
+    /// One lock per subject being compiled, so concurrent misses on the same
+    /// subject wait for one compile instead of each running their own.
+    schema_flights: DashMap<TopicKey, Arc<std::sync::Mutex<()>>>,
+    schema_compiles_total: AtomicU64,
     /// PLAN-F3 §4.3: total records that failed schema validation across
     /// every mode (`warn` counts and keeps the record; `dlq` counts and
     /// quarantines it) — the schema-registry counterpart to
     /// `throttled_total`, next to it below.
     schema_violations_total: AtomicU64,
+    /// Records whose schema check gave up (work budget, nesting depth)
+    /// without finding them invalid; counted apart from
+    /// `schema_violations_total` because they are not known to be invalid.
+    schema_check_too_complex_total: AtomicU64,
     /// Count of failures to write a `dlq`-mode quarantine copy to
     /// `__dlq.<topic>` (topic creation or the nested `publish` call itself
     /// failing — e.g. the DLQ topic's own `max_inline_bytes`/quota). This is
@@ -2990,7 +3045,11 @@ impl BusService {
             org_stored_bytes: DashMap::new(),
             topic_config_cache: DashMap::new(),
             schema_cache: DashMap::new(),
+            schema_cache_clock: AtomicU64::new(0),
+            schema_flights: DashMap::new(),
+            schema_compiles_total: AtomicU64::new(0),
             schema_violations_total: AtomicU64::new(0),
+            schema_check_too_complex_total: AtomicU64::new(0),
             schema_dlq_write_failures_total: AtomicU64::new(0),
             derived_schema_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(256).expect("256 is nonzero"),
@@ -3615,6 +3674,17 @@ impl BusService {
         self.schema_violations_total.load(Ordering::Relaxed)
     }
 
+    /// Records the schema check gave up on since this service started; not
+    /// part of `schema_violations_total`.
+    /// Schema compiles the validator cache ran (misses that paid for one).
+    pub fn schema_compiles_total(&self) -> u64 {
+        self.schema_compiles_total.load(Ordering::Relaxed)
+    }
+
+    pub fn schema_check_too_complex_total(&self) -> u64 {
+        self.schema_check_too_complex_total.load(Ordering::Relaxed)
+    }
+
     /// Count of `dlq`-mode quarantine writes that themselves failed (see the
     /// field doc). Distinct from `schema_violations_total`: every violation
     /// increments that counter regardless of mode, while this one only ever
@@ -4130,7 +4200,8 @@ impl BusService {
         let key: TopicKey = (org_id.to_string(), subject.to_string());
         let current_generation = schema_registry::generation();
         if let Some(entry) = self.schema_cache.get(&key) {
-            if entry.generation == current_generation {
+            if entry.generation.load(Ordering::Acquire) == current_generation {
+                self.touch_schema(&entry);
                 return Ok(Some(entry.clone()));
             }
         }
@@ -4144,8 +4215,59 @@ impl BusService {
             self.schema_cache.remove(&key);
             return Ok(None);
         };
-        // Every schema that reached storage already compiled once at
-        // registration; a failure here means a corrupt row.
+        let content_hash = schema_registry::content_hash(&effective.schema_text);
+        // The generation is process-global, so it also moves for an
+        // unrelated subject or org. Re-reading this subject's row is cheap;
+        // recompiling every subject after each registry write is not.
+        let unchanged = |entry: &ResolvedSchema| {
+            entry.version == effective.version
+                && entry.schema_ref_id == effective.schema_ref_id
+                && entry.schema_type == effective.schema_type
+                && entry.content_hash == content_hash
+        };
+        let confirm = |entry: &Arc<ResolvedSchema>| {
+            entry
+                .generation
+                .store(current_generation, Ordering::Release);
+            self.touch_schema(entry);
+            entry.clone()
+        };
+        if let Some(entry) = self.schema_cache.get(&key) {
+            if unchanged(&entry) {
+                return Ok(Some(confirm(&entry)));
+            }
+        }
+        // Concurrent misses on one subject wait here: the first compiles, the
+        // rest find its entry. The map entry is created and cloned under the
+        // shard lock, so removing an unused flight below cannot race a joiner.
+        let flight = self.schema_flights.entry(key.clone()).or_default().clone();
+        let outcome = {
+            let _compiling = flight.lock().unwrap_or_else(|e| e.into_inner());
+            match self.schema_cache.get(&key).filter(|e| unchanged(e)) {
+                Some(entry) => Ok(confirm(&entry)),
+                None => {
+                    self.compile_schema(&key, subject, effective, content_hash, current_generation)
+                }
+            }
+        };
+        drop(flight);
+        self.schema_flights
+            .remove_if(&key, |_, f| Arc::strong_count(f) == 1);
+        outcome.map(Some)
+    }
+
+    /// Compiles `effective` and caches it. Every schema that reached storage
+    /// already compiled once at registration; a failure here means a corrupt
+    /// row.
+    fn compile_schema(
+        &self,
+        key: &TopicKey,
+        subject: &str,
+        effective: schema_registry::registry::EffectiveSchema,
+        content_hash: String,
+        current_generation: u64,
+    ) -> Result<Arc<ResolvedSchema>, BusServiceError> {
+        self.schema_compiles_total.fetch_add(1, Ordering::Relaxed);
         let compiled = effective
             .schema_type
             .ops()
@@ -4156,15 +4278,93 @@ impl BusService {
                     effective.version
                 ))
             })?;
+        let weight = effective
+            .schema_text
+            .len()
+            .saturating_mul(4)
+            .saturating_add(compiled.extra_bytes());
         let resolved = Arc::new(ResolvedSchema {
             version: effective.version,
             schema_ref_id: effective.schema_ref_id,
-            generation: current_generation,
+            content_hash,
+            generation: AtomicU64::new(current_generation),
             schema_type: effective.schema_type,
             compiled,
+            weight,
+            last_used: AtomicU64::new(self.schema_cache_clock.fetch_add(1, Ordering::Relaxed)),
         });
-        self.schema_cache.insert(key, resolved.clone());
-        Ok(Some(resolved))
+        self.schema_cache.insert(key.clone(), resolved.clone());
+        self.evict_schema_cache(key, &SCHEMA_CACHE_LIMITS);
+        Ok(resolved)
+    }
+
+    fn touch_schema(&self, entry: &ResolvedSchema) {
+        entry.last_used.store(
+            self.schema_cache_clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Drops entries until the cache fits `limits`, never `keep` (the one
+    /// just inserted). An org over its own share loses its least recently
+    /// used entry first; when only the overall bounds are exceeded, the org
+    /// holding the most loses its oldest entry. Runs only on a miss, which
+    /// already paid for a compile, so a scan is affordable.
+    fn evict_schema_cache(&self, keep: &TopicKey, limits: &SchemaCacheLimits) {
+        loop {
+            let mut total = (0usize, 0usize);
+            let mut per_org: std::collections::HashMap<String, (usize, usize)> =
+                std::collections::HashMap::new();
+            let mut oldest: std::collections::HashMap<String, (u64, TopicKey)> =
+                std::collections::HashMap::new();
+            for entry in self.schema_cache.iter() {
+                let weight = entry.value().weight;
+                total = (total.0 + 1, total.1.saturating_add(weight));
+                let used = per_org.entry(entry.key().0.clone()).or_default();
+                *used = (used.0 + 1, used.1.saturating_add(weight));
+                if entry.key() == keep {
+                    continue;
+                }
+                let stamp = entry.value().last_used.load(Ordering::Relaxed);
+                let slot = oldest.entry(entry.key().0.clone());
+                match slot {
+                    std::collections::hash_map::Entry::Occupied(mut o) if stamp < o.get().0 => {
+                        o.insert((stamp, entry.key().clone()));
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert((stamp, entry.key().clone()));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+            let over_share = per_org
+                .iter()
+                .filter(|(org, (n, b))| {
+                    oldest.contains_key(*org) && (*n > limits.org_entries || *b > limits.org_bytes)
+                })
+                .map(|(org, _)| org)
+                .next();
+            let victim_org = match over_share {
+                Some(org) => org.clone(),
+                None if total.0 > limits.entries || total.1 > limits.bytes => {
+                    let by_bytes = total.1 > limits.bytes;
+                    let heaviest = per_org
+                        .iter()
+                        .filter(|(org, _)| oldest.contains_key(*org))
+                        .max_by_key(|(org, (n, b))| {
+                            (if by_bytes { *b } else { *n }, (*org).clone())
+                        });
+                    match heaviest {
+                        Some((org, _)) => org.clone(),
+                        None => return,
+                    }
+                }
+                None => return,
+            };
+            if let Some((_, victim)) = oldest.remove(&victim_org) {
+                self.schema_cache.remove(&victim);
+            }
+        }
     }
 
     /// PLAN-F3 §5.4: derives the sub-schema `subject`/`version` (`None` =
@@ -5268,8 +5468,34 @@ impl BusService {
             let compiled = &resolved.compiled;
             let mut kept: Vec<PublishRecord> = Vec::with_capacity(batch.records.len());
             let mut violations: Vec<PublishRecord> = Vec::new();
+            // One allowance for the whole batch: per-record budgets would let
+            // N hostile records cost N times the per-document cap.
+            let mut work = schema_registry::ValidationBudget::for_batch(
+                &ctx.org_id,
+                batch.records.iter().map(|r| r.payload.len()).sum(),
+            );
             for mut r in std::mem::take(&mut batch.records) {
-                match ops.validate(compiled, &r.payload) {
+                // A document the check gave up on is quarantined or warned
+                // about like a violation, but under its own reason: it is
+                // not known to be invalid.
+                let verdict = match ops.validate_metered(compiled, &r.payload, &mut work) {
+                    Ok(()) => Ok(()),
+                    Err(schema_registry::SchemaError::Violation(detail)) => {
+                        Err((dlq::DlqReason::SchemaViolation, detail))
+                    }
+                    Err(schema_registry::SchemaError::LimitExceeded(detail)) => {
+                        Err((dlq::DlqReason::SchemaCheckTooComplex, detail))
+                    }
+                    Err(other) => {
+                        return Err(BusServiceError::SchemaViolation {
+                            topic: topic.to_string(),
+                            subject: subject.clone(),
+                            version: resolved.version,
+                            detail: other.to_string(),
+                        });
+                    }
+                };
+                match verdict {
                     Ok(()) => {
                         // Only a record that ran validation AND PASSED gets
                         // stamped — a `warn`-mode violation stays `0`
@@ -5277,15 +5503,27 @@ impl BusService {
                         r.schema_id = resolved.schema_ref_id;
                         kept.push(r);
                     }
-                    Err(schema_registry::SchemaError::Violation(detail)) => {
-                        self.schema_violations_total.fetch_add(1, Ordering::Relaxed);
+                    Err((reason, detail)) => {
+                        // A check that gave up is not a violation: it has
+                        // its own counter and audit action so a dashboard
+                        // rate of "invalid records" is not inflated by
+                        // documents that may well be valid.
+                        let (counter, action) = match reason {
+                            dlq::DlqReason::SchemaCheckTooComplex => (
+                                &self.schema_check_too_complex_total,
+                                "bus.schema.check_too_complex",
+                            ),
+                            _ => (&self.schema_violations_total, "bus.schema.violation"),
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
                         self.audit_windowed(
                             ctx,
-                            "bus.schema.violation",
+                            action,
                             Some(topic),
                             Some(&format!(
-                                "subject={subject} version={} {detail}",
-                                resolved.version
+                                "subject={subject} version={} reason={} {detail}",
+                                resolved.version,
+                                reason.as_str()
                             )),
                         );
                         match cfg.validation {
@@ -5305,7 +5543,7 @@ impl BusService {
                                 );
                                 violations.push(dlq::build_publish_violation_record(
                                     topic,
-                                    "schema_violation",
+                                    reason.as_str(),
                                     &detail,
                                     ctx,
                                     &r,
@@ -5315,14 +5553,6 @@ impl BusService {
                                 unreachable!("guarded by the `cfg.validation != Off` check above")
                             }
                         }
-                    }
-                    Err(other) => {
-                        return Err(BusServiceError::SchemaViolation {
-                            topic: topic.to_string(),
-                            subject: subject.clone(),
-                            version: resolved.version,
-                            detail: other.to_string(),
-                        });
                     }
                 }
             }
@@ -19235,6 +19465,13 @@ mod tests {
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
     }
 
+    const PATIENT_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="patient"><xs:complexType><xs:sequence>
+          <xs:element name="mrn" type="xs:string"/>
+        </xs:sequence></xs:complexType></xs:element></xs:schema>"#;
+
+    const ADT_PROFILE: &str = r#"{"required_segments":["PID"],"required_fields":["PID-3"]}"#;
+
     /// Registers a subject of a kind without a validator and tries to bind it
     /// to a fresh topic of `content_type` through `create_topic`; returns the
     /// resulting validation mode or the refusal.
@@ -19275,7 +19512,7 @@ mod tests {
         use schema_registry::SchemaType::Xsd;
         for ct in ["application/xml", "text/xml"] {
             assert_eq!(
-                bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap(),
+                bind_stored_subject_at_create(Xsd, PATIENT_XSD, ct, None).unwrap(),
                 topics::ValidationMode::Off,
                 "{ct}: an xsd subject binds to an XML topic with validation staying off"
             );
@@ -19285,7 +19522,7 @@ mod tests {
             "application/octet-stream",
             "application/hl7-v2",
         ] {
-            let err = bind_stored_subject_at_create(Xsd, "<xs:schema/>", ct, None).unwrap_err();
+            let err = bind_stored_subject_at_create(Xsd, PATIENT_XSD, ct, None).unwrap_err();
             assert!(
                 matches!(&err, BusServiceError::InvalidTopicConfig { reason }
                     if reason.contains("is xsd but")),
@@ -19359,62 +19596,729 @@ mod tests {
     }
 
     #[test]
-    fn enabling_validation_on_a_subject_without_a_validator_is_refused_for_the_new_kinds() {
-        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+    fn enabling_validation_is_accepted_for_xsd_and_profile_subjects_and_refused_for_binary_kinds() {
+        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Xsd};
         for (kind, text, ct) in [
-            (Xsd, "<xs:schema/>", "application/xml"),
+            (Xsd, PATIENT_XSD, "application/xml"),
             (
                 Hl7v2Profile,
                 r#"{"required_segments":[]}"#,
                 "application/hl7-v2",
             ),
         ] {
-            let err =
-                bind_stored_subject_at_create(kind, text, ct, Some(topics::ValidationMode::Warn))
-                    .unwrap_err();
+            for mode in [topics::ValidationMode::Warn, topics::ValidationMode::Dlq] {
+                assert_eq!(
+                    bind_stored_subject_at_create(kind, text, ct, Some(mode)).unwrap(),
+                    mode,
+                    "{kind:?}"
+                );
+            }
+        }
+        let err = bind_stored_subject_at_create(
+            Avro,
+            r#"{"type":"record","name":"X","fields":[]}"#,
+            "application/octet-stream",
+            Some(topics::ValidationMode::Warn),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                if reason.contains("no validator")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn xsd_and_profile_subjects_register_under_the_default_backward_check() {
+        let (_tmp, svc) = test_service();
+        let register = |subject: &str, kind: schema_registry::SchemaType, text: &str| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                subject,
+                kind,
+                text,
+                None,
+                None,
+            )
+        };
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        assert_eq!(
+            register("patients-xsd", Xsd, PATIENT_XSD).unwrap().version,
+            1
+        );
+        let stricter = PATIENT_XSD.replace(
+            r#"<xs:element name="mrn" type="xs:string"/>"#,
+            r#"<xs:element name="mrn" type="xs:string"/><xs:element name="extra" type="xs:string"/>"#,
+        );
+        let err = register("patients-xsd", Xsd, &stricter).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::SchemaIncompatible {
+                    mode: "backward",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let looser = PATIENT_XSD.replace(
+            r#"<xs:element name="mrn" type="xs:string"/>"#,
+            r#"<xs:element name="mrn" type="xs:string"/><xs:element name="extra" type="xs:string" minOccurs="0"/>"#,
+        );
+        assert_eq!(register("patients-xsd", Xsd, &looser).unwrap().version, 2);
+
+        assert_eq!(
+            register("adt", Hl7v2Profile, ADT_PROFILE).unwrap().version,
+            1
+        );
+        let err = register(
+            "adt",
+            Hl7v2Profile,
+            r#"{"required_segments":["PID"],"required_fields":["PID-3","PID-5"]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BusServiceError::SchemaIncompatible {
+                    mode: "backward",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            register("adt", Hl7v2Profile, r#"{"required_segments":["PID"]}"#)
+                .unwrap()
+                .version,
+            2
+        );
+    }
+
+    #[test]
+    fn registering_an_unsupported_xsd_or_a_malformed_profile_is_refused() {
+        let (_tmp, svc) = test_service();
+        use schema_registry::SchemaType::{Hl7v2Profile, Xsd};
+        for (kind, text) in [
+            (
+                Xsd,
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:include schemaLocation="a.xsd"/></xs:schema>"#,
+            ),
+            (Hl7v2Profile, r#"{"required_fields":["MSH-1"]}"#),
+        ] {
+            let err = schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "bad",
+                kind,
+                text,
+                Some(schema_registry::Compatibility::None),
+                None,
+            )
+            .unwrap_err();
             assert!(
-                matches!(&err, BusServiceError::InvalidTopicConfig { reason }
-                    if reason.contains("no validator")),
+                matches!(err, BusServiceError::InvalidArgument(_)),
                 "{kind:?}: {err:?}"
+            );
+        }
+    }
+
+    /// Creates a topic of `content_type` bound to a registered `kind` subject
+    /// in `mode`, publishes `payloads` as one batch, and returns the
+    /// service, the context, and the publish result.
+    fn publish_validated(
+        kind: schema_registry::SchemaType,
+        schema_text: &str,
+        content_type: &str,
+        mode: topics::ValidationMode,
+        payloads: &[&str],
+    ) -> (tempfile::TempDir, BusService, BusCallContext, PublishResult) {
+        let (tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "subject",
+            kind,
+            schema_text,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "validated.events",
+            topics::TopicOptions {
+                content_type: Some(content_type.to_string()),
+                schema_id: Some("subject".to_string()),
+                validation: Some(mode),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = svc
+            .publish(
+                &ctx,
+                "validated.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: payloads.iter().map(|p| record(p)).collect(),
+                },
+            )
+            .unwrap();
+        (tmp, svc, ctx, result)
+    }
+
+    fn fetch_all(svc: &BusService, ctx: &BusCallContext, topic: &str) -> Vec<Vec<u8>> {
+        let group = if topic.starts_with("__dlq.") {
+            "dlq-reader"
+        } else {
+            "topic-reader"
+        };
+        let handle = svc
+            .open_consumer(
+                ctx,
+                group,
+                &[topic.to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        handle
+            .fetch(1024, 20)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.payload.to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn xsd_dlq_mode_diverts_only_the_invalid_xml_record() {
+        let good = "<patient><mrn>AB1</mrn></patient>";
+        let bad = "<patient><mrn>SECRETVALUE</mrn><unexpected/></patient>";
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            PATIENT_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[good, bad],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        assert_eq!(
+            fetch_all(&svc, &ctx, "validated.events"),
+            vec![good.as_bytes().to_vec()]
+        );
+        assert_eq!(
+            fetch_all(&svc, &ctx, "__dlq.validated.events"),
+            vec![bad.as_bytes().to_vec()]
+        );
+
+        // The violation detail names the path, never the payload's text.
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-headers",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        for (name, value) in &dlq.records[0].headers {
+            assert!(
+                !String::from_utf8_lossy(value).contains("SECRETVALUE"),
+                "header {} leaks the payload",
+                String::from_utf8_lossy(name)
             );
         }
     }
 
     #[test]
-    fn xsd_and_profile_subjects_are_stored_only_like_the_binary_kinds() {
-        let (_tmp, svc) = test_service();
-        for (kind, text) in [
-            (schema_registry::SchemaType::Xsd, "<xs:schema/>"),
-            (
-                schema_registry::SchemaType::Hl7v2Profile,
-                r#"{"required_segments":["PID"]}"#,
-            ),
-        ] {
-            let register = |compat| {
-                schema_registry::registry::register(
-                    &svc.db,
-                    svc.instance_id(),
-                    "org-1",
-                    kind.as_str(),
-                    kind,
-                    text,
-                    compat,
-                    None,
-                )
-            };
-            // The default `backward` mode needs a compatibility check no
-            // stored-only kind can perform: refused, not waved through.
-            let err = register(None).unwrap_err();
-            assert!(
-                matches!(err, BusServiceError::SchemaTypeUnsupported { .. }),
-                "{kind:?}: {err:?}"
-            );
-            // Explicitly unchecked, the subject is stored and versioned.
-            let outcome = register(Some(schema_registry::Compatibility::None)).unwrap();
-            assert_eq!(outcome.version, 1, "{kind:?}");
-        }
+    fn xsd_warn_mode_keeps_the_invalid_record_unstamped() {
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            PATIENT_XSD,
+            "application/xml",
+            topics::ValidationMode::Warn,
+            &["<patient/>", "<patient><mrn>1</mrn></patient>"],
+        );
+        assert_eq!(result.accepted, 2);
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "warn-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let records = handle.fetch(1024, 20).unwrap().records;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].schema_id, 0,
+            "a warn-mode violation is never stamped"
+        );
+        assert_ne!(
+            records[1].schema_id, 0,
+            "a validated record carries the schema id"
+        );
     }
 
+    fn register_json_subject(svc: &BusService, subject: &str) {
+        register_json_subject_in(svc, "org-1", subject);
+    }
+
+    fn register_json_subject_in(svc: &BusService, org_id: &str, subject: &str) {
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            org_id,
+            subject,
+            schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_registry_write_elsewhere_does_not_recompile_an_unchanged_subject() {
+        let (_tmp, svc) = test_service();
+        register_json_subject(&svc, "alpha");
+        let first = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        // Another subject's registration bumps the process-global generation.
+        register_json_subject(&svc, "beta");
+        let again = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "an unchanged subject keeps its compiled schema across a global bump"
+        );
+        assert_eq!(
+            again.generation.load(Ordering::Acquire),
+            schema_registry::generation(),
+            "the entry is re-stamped, so the next lookup needs no database read"
+        );
+        // A new version of the subject itself does recompile.
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "alpha",
+            schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object","description":"second"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        let changed = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.version, 2);
+    }
+
+    #[test]
+    fn the_compiled_schema_cache_evicts_the_least_recently_used_entries() {
+        let (_tmp, svc) = test_service();
+        for name in ["s1", "s2", "s3", "s4"] {
+            register_json_subject(&svc, name);
+        }
+        for name in ["s1", "s2", "s3"] {
+            svc.resolve_validator("org-1", name).unwrap().unwrap();
+        }
+        // s1 is the oldest; touching it makes s2 the oldest.
+        svc.resolve_validator("org-1", "s1").unwrap().unwrap();
+        svc.resolve_validator("org-1", "s4").unwrap().unwrap();
+        let keep: TopicKey = ("org-1".to_string(), "s4".to_string());
+        let entries_only = |entries| SchemaCacheLimits {
+            entries,
+            bytes: usize::MAX,
+            org_entries: usize::MAX,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &entries_only(3));
+        let mut left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        left.sort();
+        assert_eq!(left, ["s1", "s3", "s4"]);
+        // A byte bound evicts too, but never the entry just inserted.
+        svc.evict_schema_cache(
+            &keep,
+            &SchemaCacheLimits {
+                bytes: 0,
+                ..entries_only(usize::MAX)
+            },
+        );
+        let left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        assert_eq!(left, ["s4"]);
+    }
+
+    #[test]
+    fn one_org_cannot_evict_another_orgs_compiled_schemas() {
+        let (_tmp, svc) = test_service();
+        register_json_subject_in(&svc, "org-2", "quiet");
+        for name in ["b1", "b2", "b3", "b4"] {
+            register_json_subject_in(&svc, "org-1", name);
+        }
+        // org-2's entry is the globally oldest: plain LRU would drop it first.
+        svc.resolve_validator("org-2", "quiet").unwrap().unwrap();
+        for name in ["b1", "b2", "b3", "b4"] {
+            svc.resolve_validator("org-1", name).unwrap().unwrap();
+        }
+        let keep: TopicKey = ("org-1".to_string(), "b4".to_string());
+        let roomy = SchemaCacheLimits {
+            entries: 3,
+            bytes: usize::MAX,
+            org_entries: usize::MAX,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &roomy);
+        let mut left: Vec<TopicKey> = svc.schema_cache.iter().map(|e| e.key().clone()).collect();
+        left.sort();
+        assert_eq!(
+            left.iter().map(|k| k.1.as_str()).collect::<Vec<_>>(),
+            ["b3", "b4", "quiet"],
+            "the org holding the most gives up its oldest entries"
+        );
+
+        // An org over its own share evicts from itself, whatever the total.
+        let share = SchemaCacheLimits {
+            entries: usize::MAX,
+            bytes: usize::MAX,
+            org_entries: 1,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &share);
+        let mut left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        left.sort();
+        assert_eq!(left, ["b4", "quiet"]);
+    }
+
+    /// An XSD with `patterns` distinct patterns: slow enough to compile that
+    /// concurrent callers overlap.
+    fn many_pattern_xsd(patterns: usize) -> String {
+        let facets: String = (0..patterns)
+            .map(|i| format!(r#"<xs:pattern value="P{i}\d{{26}}"/>"#))
+            .collect();
+        format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:simpleType name="T"><xs:restriction base="xs:string">{facets}</xs:restriction></xs:simpleType><xs:element name="r" type="T"/></xs:schema>"#
+        )
+    }
+
+    #[test]
+    fn concurrent_misses_on_one_subject_share_one_compile() {
+        let (_tmp, svc) = test_service();
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "slow",
+            schema_registry::SchemaType::Xsd,
+            &many_pattern_xsd(40),
+            None,
+            None,
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let resolved: Vec<Arc<ResolvedSchema>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        svc.resolve_validator("org-1", "slow").unwrap().unwrap()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert_eq!(svc.schema_compiles_total(), 1);
+        assert!(resolved.iter().all(|r| Arc::ptr_eq(r, &resolved[0])));
+        assert!(
+            svc.schema_flights.is_empty(),
+            "a finished compile leaves no flight behind"
+        );
+    }
+
+    fn wide_choice_xsd(alternatives: usize) -> String {
+        let alts: String = (0..alternatives)
+            .map(|i| format!(r#"<xs:element name="a{i}" type="xs:string"/>"#))
+            .collect();
+        format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="X"><xs:choice minOccurs="0">{alts}</xs:choice></xs:complexType><xs:element name="r"><xs:complexType><xs:sequence><xs:element name="x" type="X" minOccurs="0" maxOccurs="unbounded"/></xs:sequence></xs:complexType></xs:element></xs:schema>"#
+        )
+    }
+
+    #[test]
+    fn a_cached_xsd_is_weighed_with_its_content_model_automata() {
+        let (_tmp, svc) = test_service();
+        let text = wide_choice_xsd(4990);
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "wide",
+            schema_registry::SchemaType::Xsd,
+            &text,
+            None,
+            None,
+        )
+        .unwrap();
+        let entry = svc.resolve_validator("org-1", "wide").unwrap().unwrap();
+        assert!(
+            entry.weight >= text.len() * 4 + 400_000,
+            "weight {} must include ~10k automaton states",
+            entry.weight
+        );
+    }
+
+    #[test]
+    fn a_publish_batch_shares_one_validation_allowance() {
+        // Each document costs ~30M work units, under the per-document cap of
+        // 50M; five of them together are more than the batch may spend.
+        let doc = format!("<r>{}</r>", "<x/>".repeat(6_000));
+        let (_tmp, svc, _ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            &wide_choice_xsd(4990),
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[doc.as_str(); 5],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 4));
+        assert_eq!(svc.schema_check_too_complex_total(), 4);
+        assert_eq!(svc.schema_violations_total(), 0);
+    }
+
+    const TREE_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="node"><xs:sequence><xs:element name="child" type="node" minOccurs="0"/></xs:sequence></xs:complexType><xs:element name="tree" type="node"/></xs:schema>"#;
+
+    fn nested_tree(depth: usize) -> String {
+        format!(
+            "<tree>{}{}</tree>",
+            "<child>".repeat(depth),
+            "</child>".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn a_document_the_xsd_check_gave_up_on_is_diverted_under_its_own_reason() {
+        let fine = nested_tree(3);
+        // Deeper than the checker follows: not known to be invalid.
+        let too_deep = nested_tree(300);
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[fine.as_str(), too_deep.as_str()],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-reasons",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        assert_eq!(dlq.records.len(), 1);
+        let header = |name: &str| {
+            dlq.records[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        };
+        assert_eq!(header("dlq.reason").unwrap(), "schema_check_too_complex");
+        assert!(header("dlq.error_message")
+            .unwrap()
+            .contains("nested too deeply"));
+        // A check that gave up is counted and audited apart from violations.
+        assert_eq!(svc.schema_check_too_complex_total(), 1);
+        assert_eq!(svc.schema_violations_total(), 0);
+        svc.flush_audit_windows();
+        assert_eq!(count_audit_logs(&svc, "bus.schema.check_too_complex"), 1);
+        assert_eq!(count_audit_logs(&svc, "bus.schema.violation"), 0);
+
+        // A real violation keeps the old reason.
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &["<tree><other/></tree>"],
+        );
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(svc.schema_violations_total(), 1);
+        assert_eq!(svc.schema_check_too_complex_total(), 0);
+        svc.flush_audit_windows();
+        assert_eq!(count_audit_logs(&svc, "bus.schema.violation"), 1);
+        assert_eq!(count_audit_logs(&svc, "bus.schema.check_too_complex"), 0);
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-reasons",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        assert!(dlq.records[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k == "dlq.reason" && v.as_ref() == b"schema_violation"));
+    }
+
+    #[test]
+    fn warn_mode_accepts_a_document_the_xsd_check_gave_up_on_unstamped() {
+        let too_deep = nested_tree(300);
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Warn,
+            &[too_deep.as_str()],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 0));
+        let records = svc
+            .open_consumer(
+                &ctx,
+                "warn-limit-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap()
+            .records;
+        assert_eq!(
+            records[0].schema_id, 0,
+            "a record the check could not decide is never stamped"
+        );
+    }
+
+    #[test]
+    fn hl7_profile_dlq_mode_diverts_messages_missing_a_required_field() {
+        let good = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1||MRN1\r";
+        let bad = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1\r";
+        let not_hl7 = "{\"json\":true}";
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Hl7v2Profile,
+            ADT_PROFILE,
+            "application/hl7-v2",
+            topics::ValidationMode::Dlq,
+            &[good, bad, not_hl7],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 2));
+        assert_eq!(
+            fetch_all(&svc, &ctx, "validated.events"),
+            vec![good.as_bytes().to_vec()]
+        );
+        assert_eq!(
+            fetch_all(&svc, &ctx, "__dlq.validated.events"),
+            vec![bad.as_bytes().to_vec(), not_hl7.as_bytes().to_vec()]
+        );
+    }
+
+    #[test]
+    fn schema_derived_get_projects_xsd_and_profile_subjects_through_a_read_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="patient"><xs:complexType><xs:sequence>
+              <xs:element name="mrn" type="xs:string"/>
+              <xs:element name="ssn" type="xs:string"/>
+            </xs:sequence></xs:complexType></xs:element></xs:schema>"#;
+        for (subject, kind, text, topic, content_type, fields) in [
+            (
+                "p-xsd",
+                schema_registry::SchemaType::Xsd,
+                xsd,
+                "xml.events",
+                "application/xml",
+                ["mrn", "mrn"],
+            ),
+            (
+                "p-adt",
+                schema_registry::SchemaType::Hl7v2Profile,
+                ADT_PROFILE,
+                "hl7.events",
+                "application/hl7-v2",
+                ["PID-5", "PID-5"],
+            ),
+        ] {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                subject,
+                kind,
+                text,
+                None,
+                None,
+            )
+            .unwrap();
+            svc.create_topic(
+                &ctx,
+                topic,
+                topics::TopicOptions {
+                    content_type: Some(content_type.to_string()),
+                    schema_id: Some(subject.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            field_policies::set_policy(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                topic,
+                "any",
+                field_policies::SUBJECT_ANY,
+                field_policies::Direction::Read,
+                &set_field_set(&fields),
+                &set_field_set(&[]),
+                field_policies::BusFieldPolicyExpect::Any,
+            )
+            .unwrap();
+            let derived = svc
+                .schema_derived_get(
+                    &ctx,
+                    subject,
+                    None,
+                    topic,
+                    "any",
+                    field_policies::SUBJECT_ANY,
+                    field_policies::Direction::Read,
+                )
+                .unwrap();
+            if kind == schema_registry::SchemaType::Xsd {
+                assert!(
+                    derived.contains(r#"name="mrn""#) && !derived.contains("ssn"),
+                    "{derived}"
+                );
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&derived).unwrap();
+                assert_eq!(v["required_fields"], serde_json::json!([]), "{derived}");
+                assert_eq!(v["required_segments"], serde_json::json!(["PID"]));
+            }
+        }
+    }
     #[test]
     fn update_topic_rejects_binding_a_schema_to_a_dlq_topic() {
         let (_tmp, svc) = test_service();
@@ -19452,7 +20356,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         for (subject, kind, text) in [
-            ("patients-xsd", Xsd, "<xs:schema/>"),
+            ("patients-xsd", Xsd, PATIENT_XSD),
             (
                 "adt-profile",
                 Hl7v2Profile,
@@ -19513,7 +20417,7 @@ mod tests {
             "org-1",
             "patients-xsd",
             schema_registry::SchemaType::Xsd,
-            "<xs:schema/>",
+            PATIENT_XSD,
             Some(schema_registry::Compatibility::None),
             None,
         )

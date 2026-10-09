@@ -1,0 +1,6 @@
+<p:patient xmlns:p="urn:example:patient">
+  <p:mrn>CD000001</p:mrn>
+  <p:name><p:family>Nowak</p:family><p:given>Ewa</p:given></p:name>
+  <p:birthDate>2001-12-31+01:00</p:birthDate>
+  <p:phone>+48 600 000 000</p:phone>
+</p:patient>

@@ -19,15 +19,16 @@
 //   - `avro` / `protobuf` / `thrift` are storage-only until F4
 //     (`stored_only`): `compile` is a shape smoke-check, every other
 //     operation returns `SchemaError::Unsupported`.
-//   - `xsd` and `hl7v2_profile` (F4 B0) are stored-only the same way until
-//     their validators land: a hand-written XSD subset (no pure-Rust
-//     validator exists; libxml2 would be a native dependency) and a JSON
-//     profile over the HL7 v2 parser. Unlike the binary kinds they are
-//     bound to ONE payload format each (`required_payload_format`).
+//   - `xsd` (F4 B4) and `hl7v2_profile` (F4 B5) are a hand-written XSD subset
+//     (no pure-Rust validator exists; libxml2 would be a native dependency)
+//     and a JSON profile over the HL7 v2 parser. Unlike the binary kinds they
+//     are bound to ONE payload format each (`required_payload_format`).
+//     Both are fully implemented (validate, derive, compatibility).
 //
 // Everything expensive or rejectable happens in `compile` (admin time).
-// `validate` runs on the publish hot path for opted-in topics only and must
-// not allocate on the success path.
+// `validate` runs on the publish hot path for opted-in topics only: it never
+// re-parses the schema, its work is bounded by the payload size and a hard
+// budget, and it may allocate scratch space proportional to the payload.
 // =============================================================================
 
 use std::collections::BTreeSet;
@@ -35,9 +36,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bus::payload_format::PayloadFormat;
 
+mod hl7v2_profile;
 mod json_schema;
 pub mod registry;
 mod stored_only;
+mod xsd;
+
+#[cfg(test)]
+mod fixtures;
 
 /// Hard cap on registered schema text, checked before compile and before
 /// insert — an admin-supplied schema is a DoS surface (PLAN-F3 R2).
@@ -102,7 +108,10 @@ impl SchemaType {
     /// of this type — gates `bus_topics.validation != off` (PLAN-F3 §3
     /// rule 3). F4 flips each kind to `true` by adding its validator.
     pub fn has_validator(self) -> bool {
-        matches!(self, SchemaType::JsonSchema)
+        matches!(
+            self,
+            SchemaType::JsonSchema | SchemaType::Xsd | SchemaType::Hl7v2Profile
+        )
     }
 
     pub fn ops(self) -> &'static dyn SchemaKindOps {
@@ -111,8 +120,8 @@ impl SchemaType {
             SchemaType::Avro => &stored_only::AVRO_OPS,
             SchemaType::Protobuf => &stored_only::PROTOBUF_OPS,
             SchemaType::Thrift => &stored_only::THRIFT_OPS,
-            SchemaType::Xsd => &stored_only::XSD_OPS,
-            SchemaType::Hl7v2Profile => &stored_only::HL7V2_PROFILE_OPS,
+            SchemaType::Xsd => &xsd::XSD_OPS,
+            SchemaType::Hl7v2Profile => &hl7v2_profile::HL7V2_PROFILE_OPS,
         }
     }
 
@@ -170,6 +179,10 @@ pub enum SchemaError {
     Invalid(String),
     /// Payload does not conform to the compiled schema (publish path).
     Violation(String),
+    /// The check gave up on a document (work budget, nesting depth) without
+    /// finding it invalid, so it must not be reported as a violation: the
+    /// document may well be valid.
+    LimitExceeded(String),
     /// `old` -> `new` is not compatible under the requested mode.
     Incompatible(String),
     /// The operation is not implemented for this schema type in this build
@@ -185,6 +198,7 @@ impl std::fmt::Display for SchemaError {
         match self {
             SchemaError::Invalid(m) => write!(f, "invalid schema: {m}"),
             SchemaError::Violation(m) => write!(f, "schema violation: {m}"),
+            SchemaError::LimitExceeded(m) => write!(f, "schema check limit exceeded: {m}"),
             SchemaError::Incompatible(m) => write!(f, "incompatible schema change: {m}"),
             SchemaError::Unsupported {
                 schema_type,
@@ -205,10 +219,72 @@ impl std::fmt::Display for SchemaError {
 #[derive(Debug)]
 pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
+    Xsd(xsd::Compiled),
+    Hl7v2Profile(hl7v2_profile::Compiled),
     /// Kinds without a validator yet carry no compiled form — the variant exists so
     /// a stored-only subject still yields a `CompiledSchema` from
     /// `compile` and can be cached uniformly.
     StoredOnly(SchemaType),
+}
+
+impl CompiledSchema {
+    /// Resident bytes beyond what the schema text suggests (compiled
+    /// regexes and their caches), for cache accounting.
+    pub fn extra_bytes(&self) -> usize {
+        match self {
+            CompiledSchema::Xsd(c) => c.extra_bytes(),
+            _ => 0,
+        }
+    }
+}
+
+/// Work units a publish batch may spend validating all of its records, shared
+/// so a batch of many hostile documents costs what its bytes justify, not
+/// the per-document cap times its record count. One unit is about 10 ns.
+#[derive(Debug)]
+pub struct ValidationBudget {
+    remaining: u64,
+    /// Tenant the batch is published for; the XSD validation gate caps how
+    /// many of its slots one org holds and how many of its checks may queue.
+    org: String,
+}
+
+impl ValidationBudget {
+    /// A batch may spend one maximal document's worth of work plus this many
+    /// units per payload byte. Realistic documents use about 10 units per
+    /// byte, so the allowance is generous for them and tight for payloads
+    /// that are all expensive structure.
+    pub const BATCH_BASE_UNITS: u64 = 50_000_000;
+    pub const BATCH_UNITS_PER_BYTE: u64 = 64;
+
+    pub fn for_batch(org: &str, payload_bytes: usize) -> ValidationBudget {
+        ValidationBudget {
+            org: org.to_string(),
+            remaining: Self::BATCH_BASE_UNITS
+                .saturating_add(Self::BATCH_UNITS_PER_BYTE.saturating_mul(payload_bytes as u64)),
+        }
+    }
+
+    /// No shared limit: the kind's own per-document cap decides.
+    pub fn unshared() -> ValidationBudget {
+        ValidationBudget {
+            org: String::new(),
+            remaining: u64::MAX,
+        }
+    }
+
+    pub fn org(&self) -> &str {
+        &self.org
+    }
+
+    /// Units the next document may spend, at most `per_document_cap`.
+    pub fn allowance(&self, per_document_cap: u64) -> u64 {
+        self.remaining.min(per_document_cap)
+    }
+
+    pub fn spend(&mut self, units: u64) {
+        self.remaining = self.remaining.saturating_sub(units);
+    }
 }
 
 /// Implemented once per `SchemaType`. See the module header for the split
@@ -219,8 +295,23 @@ pub trait SchemaKindOps: Send + Sync {
     /// rejectable happens here, never on the publish path.
     fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError>;
 
-    /// Publish-path check; must not allocate on the success path.
-    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError>;
+    /// Publish-path check: bounded work, no schema re-parsing. A document
+    /// the check cannot decide within its budget is `LimitExceeded`, never
+    /// a `Violation`. The work it does is taken from `budget`, which a
+    /// publish batch shares across its records; a kind whose cost is linear
+    /// in the payload (already capped by `max_inline_bytes`) may leave it
+    /// untouched.
+    fn validate_metered(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError>;
+
+    /// One document against a budget of its own.
+    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+        self.validate_metered(compiled, payload, &mut ValidationBudget::unshared())
+    }
 
     /// Owner decision 1: the schema describing EXACTLY the projection a
     /// field policy's `allowed` top-level field set produces (F4's binary
@@ -398,13 +489,374 @@ mod tests {
     }
 
     #[test]
-    fn only_json_schema_has_a_validator_in_this_build() {
+    fn text_kinds_have_a_validator_and_binary_kinds_do_not_yet() {
         assert!(SchemaType::JsonSchema.has_validator());
+        assert!(SchemaType::Xsd.has_validator());
+        assert!(SchemaType::Hl7v2Profile.has_validator());
         assert!(!SchemaType::Avro.has_validator());
         assert!(!SchemaType::Protobuf.has_validator());
         assert!(!SchemaType::Thrift.has_validator());
-        assert!(!SchemaType::Xsd.has_validator());
-        assert!(!SchemaType::Hl7v2Profile.has_validator());
+    }
+
+    /// The dashboard explains a refused XSD or HL7 profile by matching these
+    /// phrases (`schema-windows.js` `textRefusalReason`, `unprocessed.js`
+    /// `plainCheckError`) and the XSD compatibility reason by
+    /// `requires element 'x'`. Rewording one here without the dashboard turns
+    /// a plain-language refusal back into a generic one.
+    #[test]
+    fn schema_error_phrases_are_stable() {
+        let xsd = |body: &str| {
+            format!(r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{body}</xs:schema>"#)
+        };
+        let element = r#"<xs:element name="a" type="xs:string"/>"#;
+        let invalid_with = |kind: SchemaType, text: &str, phrase: &str| {
+            let err = kind.ops().compile(text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.contains(phrase)),
+                "{text}: expected {phrase:?}, got {err:?}"
+            );
+        };
+        for (text, phrase) in [
+            (
+                r#"{"required_fields":["MSH-1"]}"#,
+                "'MSH-1' is the message's own field-separator",
+            ),
+            (
+                r#"{"required_fields":["MSH-2"]}"#,
+                "'MSH-2' is the message's own field-separator",
+            ),
+            (
+                r#"{"required_fields":["pid5"]}"#,
+                "'pid5' is not SEGMENT-N shaped",
+            ),
+            (
+                r#"{"required_fields":["PID-0"]}"#,
+                "is not a valid positive field number",
+            ),
+            (
+                r#"{"required_fields":["PID-1000"]}"#,
+                "exceeds the supported maximum of 999",
+            ),
+            (
+                r#"{"required_fields":["PACJENT-3"]}"#,
+                "'PACJENT' is not a valid 3-character segment id",
+            ),
+            (
+                r#"{"required_segments":["pid"]}"#,
+                "'pid' is not a valid 3-character segment id",
+            ),
+            (r#"{"required":[]}"#, "unknown field `required`"),
+            (
+                r#"{"required_fields":["PID-3","PID-3"]}"#,
+                "required_fields lists 'PID-3' more than once",
+            ),
+            (
+                r#"{"required_segments":["PID","PID"]}"#,
+                "required_segments lists 'PID' more than once",
+            ),
+            (r#"{"required_fields":"x"}"#, "not a valid HL7 v2 profile"),
+        ] {
+            invalid_with(SchemaType::Hl7v2Profile, text, phrase);
+        }
+        let many: Vec<String> = (0..=512).map(|i| format!("\"PID-{}\"", i + 1)).collect();
+        invalid_with(
+            SchemaType::Hl7v2Profile,
+            &format!("{{\"required_fields\":[{}]}}", many.join(",")),
+            "entries, exceeding the 512-entry limit",
+        );
+        invalid_with(
+            SchemaType::Hl7v2Profile,
+            &format!("{{\"description\":\"{}\"}}", "x".repeat(1001)),
+            "description exceeds 1000 characters",
+        );
+        for (body, phrase) in [
+            (r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:element ref="b"/></xs:sequence></xs:complexType></xs:element>"#.to_string(), " ref= is not supported"),
+            (format!(r#"<xs:key name="k"/>{element}"#), "identity constraints are not supported"),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:complexContent/></xs:complexType></xs:element>"#.to_string(),
+                "type derivation",
+            ),
+            (format!(r#"<xs:simpleType name="s"><xs:list itemType="xs:int"/></xs:simpleType>{element}"#), "list and union simple types are not supported"),
+            (format!(r#"<xs:attribute name="x" type="xs:string"/>{element}"#), "global attributes are not supported"),
+            (format!(r#"<xs:foo/>{element}"#), "xs:foo: this construct is not part of the supported XSD subset"),
+            (format!(r#"<xs:element name="a" type="p:x" xmlns:p="urn:p"/>"#), "namespace declarations are only supported on xs:schema"),
+            (format!(r#"<xs:element name="a" type="q:x"/>"#), "uses a namespace prefix that is not declared"),
+            (format!(r#"<xs:include schemaLocation="x.xsd"/>{element}"#), "xs:include: schema composition is not supported"),
+            (format!(r#"<xs:group name="g"><xs:sequence/></xs:group>{element}"#), "xs:group: named groups are not supported"),
+            (
+                r#"<xs:element name="a"><xs:complexType><xs:sequence><xs:any/></xs:sequence></xs:complexType></xs:element>"#.to_string(),
+                "xs:any: wildcards are not supported",
+            ),
+            (format!(r#"<xs:notation name="n" public="p"/>{element}"#), "xs:notation: notations are not supported"),
+            (r#"<xs:element name="a" type="xs:float"/>"#.to_string(), "built-in type xs:float is not supported"),
+            (
+                r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:totalDigits value="2"/></xs:restriction></xs:simpleType></xs:element>"#.to_string(),
+                "facet xs:totalDigits is not supported",
+            ),
+            (r#"<xs:simpleType name="s"><xs:restriction base="xs:string"/></xs:simpleType>"#.to_string(), "the schema declares no global element"),
+            (
+                r#"<xs:element name="a"><xs:complexType mixed="true"><xs:sequence/></xs:complexType></xs:element>"#.to_string(),
+                "mixed content (mixed=\"true\") is not supported",
+            ),
+        ] {
+            invalid_with(SchemaType::Xsd, &xsd(&body), phrase);
+        }
+        // A pattern the engine cannot build keeps the engine's reason, in the
+        // words the dashboard maps to plain language.
+        for (pattern, phrase) in [
+            (
+                "a{2,1}",
+                "regular expression: invalid repetition count range, the start must be <= the end",
+            ),
+            (
+                "a{,3}",
+                "regular expression: repetition quantifier expects a valid decimal",
+            ),
+            (
+                "a{99999999999}",
+                "regular expression: decimal literal invalid",
+            ),
+            (
+                "[z-a]",
+                "regular expression: invalid character class range, the start must be <= the end",
+            ),
+            (
+                "a|*",
+                "regular expression: repetition operator missing expression",
+            ),
+            (
+                &format!("{}a{}", "(".repeat(40), ")".repeat(40)),
+                "regular expression: exceed the maximum number of nested parentheses/brackets (32)",
+            ),
+        ] {
+            invalid_with(
+                SchemaType::Xsd,
+                &xsd(&format!(
+                    r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:pattern value="{pattern}"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#
+                )),
+                phrase,
+            );
+        }
+        // The dashboard anchors these at the start of the sentence, so each
+        // must begin with its phrase (after `invalid schema: `).
+        let begins = |kind: SchemaType, text: &str, prefix: &str| {
+            let err = kind.ops().compile(text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.starts_with(prefix)),
+                "{text}: expected a start of {prefix:?}, got {err:?}"
+            );
+        };
+        for (text, prefix) in [
+            (r#"{"required_fields":["MSH-1"]}"#, "hl7: "),
+            (
+                r#"{"required_fields":["pid5"]}"#,
+                "hl7: 'pid5' is not SEGMENT-N shaped",
+            ),
+            (r#"{"required_fields":["PID-0"]}"#, "hl7: "),
+            (r#"{"required_fields":["PID-1000"]}"#, "hl7: field number"),
+            (
+                r#"{"required_fields":["PID-3","PID-3"]}"#,
+                "required_fields lists",
+            ),
+            (
+                r#"{"required_segments":["PID","PID"]}"#,
+                "required_segments lists",
+            ),
+            (r#"{"required":[]}"#, "not a valid HL7 v2 profile"),
+            ("not json at all", "not a valid HL7 v2 profile"),
+            (r#"["PID-3"]"#, "not a valid HL7 v2 profile"),
+        ] {
+            begins(SchemaType::Hl7v2Profile, text, prefix);
+        }
+        invalid_with(
+            SchemaType::Hl7v2Profile,
+            r#"["PID-3"]"#,
+            "the profile must be a JSON object",
+        );
+        for (body, prefix) in [
+            (
+                r#"<xs:element name="a" type="xs:float"/>"#,
+                "built-in type xs:float is not supported",
+            ),
+            (
+                r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:totalDigits value="2"/></xs:restriction></xs:simpleType></xs:element>"#,
+                "facet xs:totalDigits is not supported",
+            ),
+            (
+                r#"<xs:simpleType name="s"><xs:restriction base="xs:string"/></xs:simpleType>"#,
+                "the schema declares no global element",
+            ),
+            (
+                r#"<xs:element name="a"><xs:complexType mixed="true"><xs:sequence/></xs:complexType></xs:element>"#,
+                "mixed content",
+            ),
+        ] {
+            begins(SchemaType::Xsd, &xsd(body), prefix);
+        }
+        begins(
+            SchemaType::Xsd,
+            r#"<schema xmlns="urn:nie-xsd"><element name="a"/></schema>"#,
+            "the root element must be xs:schema",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            &xsd(r#"<xs:element name="a" type="p:x" xmlns:p="urn:p"/>"#),
+            "namespace declarations are only supported on xs:schema",
+        );
+        let other_ns = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:p="urn:other" targetNamespace="urn:mine"><xs:element name="a" type="p:x"/></xs:schema>"#;
+        invalid_with(
+            SchemaType::Xsd,
+            other_ns,
+            "belongs to namespace 'urn:other'; types from other namespaces are not supported",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><a:foo xmlns:a="urn:x"/></xs:schema>"#,
+            "namespace declarations are only supported on xs:schema",
+        );
+        invalid_with(
+            SchemaType::Xsd,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:o="urn:o"><o:foo/><xs:element name="a" type="xs:string"/></xs:schema>"#,
+            "element 'foo' is not in the XML Schema namespace",
+        );
+
+        // Instance-side phrases of the XSD checker the dashboard translates
+        // for a message that reached the unprocessed list.
+        let instance_schema = xsd(
+            r#"<xs:simpleType name="s"><xs:restriction base="xs:string"><xs:minLength value="2"/><xs:maxLength value="3"/><xs:pattern value="[a-z]+"/></xs:restriction></xs:simpleType>
+               <xs:simpleType name="e"><xs:restriction base="xs:string"><xs:enumeration value="x"/></xs:restriction></xs:simpleType>
+               <xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:int"/>
+                 <xs:element name="b" type="s" minOccurs="0"/>
+                 <xs:element name="c" type="e" minOccurs="0"/>
+               </xs:sequence><xs:attribute name="id" type="xs:int" use="required"/></xs:complexType></xs:element>
+               <xs:element name="u"><xs:complexType><xs:all>
+                 <xs:element name="a" type="xs:string"/>
+                 <xs:element name="b" type="xs:string"/>
+               </xs:all></xs:complexType></xs:element>"#,
+        );
+        let xsd_ops = SchemaType::Xsd.ops();
+        let compiled = xsd_ops.compile(&instance_schema).unwrap();
+        for (payload, expected) in [
+            (r#"<r id="1"><x/></r>"#, "/r/x: element is not allowed here"),
+            (r#"<r id="1"/>"#, "/r: required child elements are missing"),
+            (
+                r#"<r id="1"><a>x</a></r>"#,
+                "/r/a: value is not a valid xs:int",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>a</b></r>"#,
+                "/r/b: value is shorter than minLength",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>abcd</b></r>"#,
+                "/r/b: value is longer than maxLength",
+            ),
+            (
+                r#"<r id="1"><a>1</a><b>ab1</b></r>"#,
+                "/r/b: value does not match the pattern",
+            ),
+            (
+                r#"<r id="1"><a>1</a><c>y</c></r>"#,
+                "/r/c: value is not one of the enumerated values",
+            ),
+            (
+                r#"<r id="x"><a>1</a></r>"#,
+                "/r: attribute 'id' is not a valid xs:int",
+            ),
+            (
+                r#"<r><a>1</a></r>"#,
+                "/r: required attribute 'id' is missing",
+            ),
+            (
+                r#"<r id="1" z="2"><a>1</a></r>"#,
+                "/r: attribute 'z' is not declared",
+            ),
+            (
+                r#"<r id="1" xsi:type="x"><a>1</a></r>"#,
+                "/r: attribute 'xsi:type' is not supported (xsi:type and xsi:nil are not honoured)",
+            ),
+            (r#"<q/>"#, "<root>: root element 'q' is not declared"),
+            (
+                r#"<r id="1">text<a>1</a></r>"#,
+                "/r: character data is not allowed in element-only content",
+            ),
+            (r#"<u><a/><a/></u>"#, "/u/a: element occurs more than once"),
+            (
+                r#"<u><a/></u>"#,
+                "/u: required child element 'b' is missing",
+            ),
+            (
+                r#"<r id="1"><a>1</a></r><r/>"#,
+                "<root>: more than one root element",
+            ),
+            (
+                r#"<!DOCTYPE r><r/>"#,
+                "<root>: DOCTYPE declarations are not allowed",
+            ),
+            ("", "<root>: document has no root element"),
+            (r#"<r id="1"><a>1</b></r>"#, "/r/a: not well-formed XML"),
+            (
+                r#"<r id="1"><a>&foo;</a></r>"#,
+                "/r/a: entity references other than the five predefined ones are not supported",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    xsd_ops.validate(&compiled, payload.as_bytes()),
+                    Err(SchemaError::Violation(ref m)) if m == expected
+                ),
+                "{payload}: expected {expected:?}, got {:?}",
+                xsd_ops.validate(&compiled, payload.as_bytes())
+            );
+        }
+
+        // Instance-side phrases of the HL7 parser.
+        let hl7_ops = SchemaType::Hl7v2Profile.ops();
+        let msh_only = hl7_ops.compile(r#"{"required_segments":["MSH"]}"#).unwrap();
+        for (payload, expected) in [
+            (
+                &b"PID|1"[..],
+                "hl7: message does not start with an MSH segment",
+            ),
+            (b"MSH", "hl7: MSH segment has no field separator"),
+            (b"MSH|^~\\&|a\rP!D|1", "hl7: segment id is not valid"),
+            (
+                b"MSH|^~\\&|a\rPIDx",
+                "hl7: a segment is missing the field separator after its id",
+            ),
+            (b"", "hl7: empty message"),
+        ] {
+            assert!(
+                matches!(
+                    hl7_ops.validate(&msh_only, payload),
+                    Err(SchemaError::Violation(ref m)) if m == expected
+                ),
+                "{payload:?}: expected {expected:?}, got {:?}",
+                hl7_ops.validate(&msh_only, payload)
+            );
+        }
+        assert!(matches!(
+            hl7_ops.validate(&msh_only, b"\xff\xfe"),
+            Err(SchemaError::Violation(m)) if m.starts_with("hl7: not valid utf-8")
+        ));
+
+        // Instance-side phrases the dashboard translates for an HL7 message.
+        let compiled = SchemaType::Hl7v2Profile
+            .ops()
+            .compile(r#"{"required_segments":["PV1"],"required_fields":["PID-3"]}"#)
+            .unwrap();
+        let ops = SchemaType::Hl7v2Profile.ops();
+        let no_pv1 = b"MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1||MRN1\r";
+        assert!(matches!(
+            ops.validate(&compiled, no_pv1),
+            Err(SchemaError::Violation(m)) if m == "required segment 'PV1' is missing"
+        ));
+        let empty_pid3 = b"MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rPID|1||\rPV1|1\r";
+        assert!(matches!(
+            ops.validate(&compiled, empty_pid3),
+            Err(SchemaError::Violation(m)) if m == "PID-3 is required but empty or missing (segment occurrence 1)"
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // =============================================================================
 // File: bus/schema_registry/stored_only.rs — kinds without a validator yet
 // =============================================================================
-// `avro` / `protobuf` / `thrift` / `xsd` / `hl7v2_profile` subjects can be
+// `avro` / `protobuf` / `thrift` subjects can be
 // registered and versioned so integrators can stage schemas ahead of F4, but
 // nothing in this build can evaluate a payload against them. `compile` is a
 // shape smoke-check only; every other operation returns
@@ -13,7 +13,9 @@
 
 use std::collections::BTreeSet;
 
-use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, SchemaType};
+use super::{
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, SchemaType, ValidationBudget,
+};
 
 pub struct StoredOnlyOps(pub SchemaType);
 
@@ -31,7 +33,12 @@ impl SchemaKindOps for StoredOnlyOps {
         Ok(CompiledSchema::StoredOnly(self.0))
     }
 
-    fn validate(&self, _compiled: &CompiledSchema, _payload: &[u8]) -> Result<(), SchemaError> {
+    fn validate_metered(
+        &self,
+        _compiled: &CompiledSchema,
+        _payload: &[u8],
+        _budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError> {
         Err(SchemaError::Unsupported {
             schema_type: self.0,
             operation: "validate",
@@ -68,8 +75,6 @@ impl SchemaKindOps for StoredOnlyOps {
 pub(super) static AVRO_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Avro);
 pub(super) static PROTOBUF_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Protobuf);
 pub(super) static THRIFT_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Thrift);
-pub(super) static XSD_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Xsd);
-pub(super) static HL7V2_PROFILE_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Hl7v2Profile);
 
 #[cfg(test)]
 mod tests {
@@ -89,33 +94,22 @@ mod tests {
 
     #[test]
     fn every_other_operation_is_unsupported_until_f4() {
-        for ops in [&PROTOBUF_OPS, &XSD_OPS, &HL7V2_PROFILE_OPS] {
-            let compiled = ops.compile("message X {}").unwrap();
-            assert!(matches!(
-                ops.validate(&compiled, b"{}"),
-                Err(SchemaError::Unsupported { .. })
-            ));
-            assert!(matches!(
-                ops.derive_subschema("message X {}", &BTreeSet::new()),
-                Err(SchemaError::Unsupported { .. })
-            ));
-            assert!(ops
-                .check_compatibility("a", "b", Compatibility::None)
-                .is_ok());
-            assert!(matches!(
-                ops.check_compatibility("a", "b", Compatibility::Backward),
-                Err(SchemaError::Unsupported { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn xsd_and_hl7_profile_smoke_check_rejects_blank_text() {
-        assert!(XSD_OPS.compile("<xs:schema/>").is_ok());
-        assert!(XSD_OPS.compile("  \n").is_err());
-        assert!(HL7V2_PROFILE_OPS
-            .compile("{\"required_segments\":[]}")
+        let ops = &PROTOBUF_OPS;
+        let compiled = ops.compile("message X {}").unwrap();
+        assert!(matches!(
+            ops.validate(&compiled, b"{}"),
+            Err(SchemaError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            ops.derive_subschema("message X {}", &BTreeSet::new()),
+            Err(SchemaError::Unsupported { .. })
+        ));
+        assert!(ops
+            .check_compatibility("a", "b", Compatibility::None)
             .is_ok());
-        assert!(HL7V2_PROFILE_OPS.compile("").is_err());
+        assert!(matches!(
+            ops.check_compatibility("a", "b", Compatibility::Backward),
+            Err(SchemaError::Unsupported { .. })
+        ));
     }
 }

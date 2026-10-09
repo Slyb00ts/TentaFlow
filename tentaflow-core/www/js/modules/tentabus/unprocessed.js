@@ -39,7 +39,7 @@ export const LIST_STEP = 10;
 /** What one "Ponów wszystkie" republishes at most (`DLQ_RETRY_ALL_MAX` on the server). */
 export const RETRY_ALL_MAX = 500;
 
-export const REASONS = ['schema_violation', 'consumer_error', 'consumer_timeout', 'permission_denied', 'payload_too_large', 'blob_missing'];
+export const REASONS = ['schema_violation', 'schema_check_too_complex', 'consumer_error', 'consumer_timeout', 'permission_denied', 'payload_too_large', 'blob_missing'];
 
 const asNumber = (text) => (text != null && /^\d+$/.test(text) ? Number(text) : null);
 
@@ -77,6 +77,110 @@ export function unprocessedRecord(topic, r) {
     isBlobRef: Boolean(r.isBlobRef),
     truncated: Boolean(r.truncated),
   };
+}
+
+// The sentences of the HL7 checks (hl7v2_profile.rs `validate`, payload_format/hl7v2.rs).
+const HL7_PHRASES = [
+  [/^hl7: message does not start with an MSH segment$/, 'hl7_not_msh'],
+  [/^hl7: MSH segment has no field separator$/, 'hl7_msh_separator'],
+  [/^hl7: segment id is not valid$/, 'hl7_bad_segment_id'],
+  [/^hl7: a segment is missing the field separator after its id$/, 'hl7_segment_separator'],
+  [/^hl7: empty message$/, 'hl7_empty'],
+  [/^hl7: not valid utf-8\b/, 'hl7_utf8'],
+];
+
+// What a value that fails its type says (xsd.rs `SimpleType::check`).
+const XSD_WHY = [
+  [/^is not a valid xs:(\w+)$/, 'xsd_why_type'],
+  [/^is shorter than minLength$/, 'xsd_why_short'],
+  [/^is longer than maxLength$/, 'xsd_why_long'],
+  [/^does not match the pattern$/, 'xsd_why_pattern'],
+  [/^is not one of the enumerated values$/, 'xsd_why_enum'],
+];
+
+// The XSD checks that name no element or value (xsd.rs `validate_document` and its helpers).
+const XSD_PHRASES = [
+  [/^element is not allowed here$/, 'xsd_not_allowed'],
+  [/^element occurs more than once$/, 'xsd_repeated'],
+  [/^required child elements are missing$/, 'xsd_children_missing'],
+  [/^character data is not allowed in element-only content$/, 'xsd_text_element_only'],
+  [/^character data outside the root element$/, 'xsd_text_outside'],
+  [/^(?:not well-formed XML|invalid text|invalid CDATA|malformed attribute|malformed attribute value|element name is not valid UTF-8|attribute name is not valid UTF-8|invalid character reference|entity reference is not valid text)$/, 'xsd_malformed'],
+  [/^entity references other than the five predefined ones are not supported$/, 'xsd_entity'],
+  [/^more than one root element$/, 'xsd_two_roots'],
+  [/^DOCTYPE declarations are not allowed$/, 'xsd_doctype'],
+  [/^document has no root element$/, 'xsd_no_root'],
+  [/^document ends inside an open element$/, 'xsd_unclosed'],
+  [/^unmatched end tag$/, 'xsd_unmatched_end'],
+  [/^document exceeds the validation work budget$/, 'xsd_budget'],
+];
+
+const PATH_MAX = 120;
+
+/**
+ * An element path of the checker (`/drzewo/dziecko/...`) as it fits a line:
+ * the first two and the last two elements around "…" when it is deep. The
+ * server shortens very deep paths the same way, so a "…" already there stays.
+ */
+export function shortPath(path) {
+  const parts = String(path).split('/').filter(Boolean);
+  const kept = parts.length > 5 && !parts.includes('…') ? [...parts.slice(0, 2), '…', ...parts.slice(-2)] : parts;
+  const text = `/${kept.join('/')}`;
+  // Cut by code points: slicing UTF-16 units could split a surrogate pair.
+  const points = Array.from(text);
+  return points.length > PATH_MAX ? `${points.slice(0, PATH_MAX).join('')}…` : text;
+}
+
+const upperFirst = (text) => (text ? text.charAt(0).toLocaleUpperCase(I18n.getLanguage()) + text.slice(1) : text);
+
+function valueWhy(why) {
+  for (const [re, key] of XSD_WHY) {
+    const m = re.exec(why);
+    if (m) return T(`unprocessed.plain.${key}`, { type: m[1] || '' });
+  }
+  return '';
+}
+
+function xsdSentence(path, message) {
+  const at = path === '<root>' ? '' : shortPath(path);
+  const say = (key, params) => T(`unprocessed.plain.${key}`, params);
+  const withPath = (sentence) => (at ? `${at}: ${sentence}` : upperFirst(sentence));
+  let m = /^document is nested too deeply(?: \(more than (\d+) levels\))?$/.exec(message);
+  if (m) return upperFirst(m[1] ? say('xsd_too_deep', { limit: m[1] }) : say('xsd_too_deep_plain'));
+  m = /^root element '([^']*)' is not declared$/.exec(message);
+  if (m) return upperFirst(say('xsd_root_undeclared', { name: m[1] }));
+  m = /^required child element '([^']*)' is missing$/.exec(message);
+  if (m) return withPath(say('xsd_child_missing', { name: m[1] }));
+  m = /^required attribute '([^']*)' is missing$/.exec(message);
+  if (m) return withPath(say('xsd_attr_missing', { name: m[1] }));
+  m = /^attribute '([^']*)' is not declared$/.exec(message);
+  if (m) return withPath(say('xsd_attr_undeclared', { name: m[1] }));
+  m = /^attribute '(xsi:[^']*)' is not supported/.exec(message);
+  if (m) return withPath(say('xsd_attr_xsi', { name: m[1] }));
+  m = /^attribute '([^']*)' (is .*|does .*)$/.exec(message);
+  if (m && valueWhy(m[2])) return withPath(say('xsd_attr_value', { name: m[1], why: valueWhy(m[2]) }));
+  m = /^value (is .*|does .*)$/.exec(message);
+  if (m && valueWhy(m[1])) return withPath(say('xsd_value', { why: valueWhy(m[1]) }));
+  const known = XSD_PHRASES.find(([re]) => re.test(message));
+  return known ? withPath(say(known[1])) : '';
+}
+
+/**
+ * The checker's sentence for one message in plain words — the HL7 profile's
+ * and message parser's sentences (hl7v2_profile.rs, payload_format/hl7v2.rs)
+ * and the XSD checker's (xsd.rs), the latter after its element path — or `''`
+ * for any other text, which the caller then shows as the server wrote it.
+ */
+export function plainCheckError(text) {
+  const message = String(text ?? '');
+  const field = /^([A-Z0-9]{3}-\d+) is required but empty or missing \(segment occurrence (\d+)\)$/.exec(message);
+  if (field) return T('unprocessed.plain.hl7_field', { field: field[1], segment: field[1].slice(0, 3), n: field[2] });
+  const segment = /^required segment '([A-Z0-9]{3})' is missing$/.exec(message);
+  if (segment) return T('unprocessed.plain.hl7_segment', { segment: segment[1] });
+  const hl7 = HL7_PHRASES.find(([re]) => re.test(message));
+  if (hl7) return T(`unprocessed.plain.${hl7[1]}`);
+  const xsd = /^(<root>|\/\S*): ([\s\S]+)$/.exec(message);
+  return xsd ? xsdSentence(xsd[1], xsd[2]) : '';
 }
 
 /** "Program odbiorcy zgłosił błąd". */

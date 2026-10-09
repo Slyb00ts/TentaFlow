@@ -2222,8 +2222,13 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   await schemasSlot(page).locator('[data-go="add"]').first().click();
   const win = schemaWindow(page);
   await expect(win.locator('[slot="body"]')).toBeVisible();
-  await expect(win.locator('tf-choice-card')).toHaveAttribute('heading', 'JSON Schema');
+  // The formats offered are the ones this server can validate.
+  await expect(win.locator('tf-choice-card')).toHaveCount(3);
+  await expect(win.locator('tf-choice-card').first()).toHaveAttribute('heading', 'JSON Schema');
+  await expect(win.locator('tf-choice-card[value="xsd"]')).toHaveAttribute('heading', 'XSD');
+  await expect(win.locator('tf-choice-card[value="hl7v2_profile"]')).toHaveAttribute('heading', 'profil HL7 v2');
   const save = win.locator('[data-act="save"]');
+
   await win.locator('[data-role="name"] input').fill('wizyta');
   await expect(win.locator('[data-role="name"]')).toHaveAttribute('error', /już jest/);
   await expect(win.locator('[data-role="impact"]')).toContainText('Popraw zaznaczone pole');
@@ -2479,6 +2484,290 @@ async function settled(page) {
 async function pickSegment(win, selector, label) {
   await win.locator(`${selector} .tf-seg-opt`, { hasText: label }).click();
 }
+
+const PROFILE_NAME = `profil-wyniku-${RUN}`;
+const XSD_NAME = `zgloszenie-${RUN}`;
+const PROFILE_V1 = JSON.stringify({ description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.', required_segments: ['MSH', 'PID', 'OBR', 'OBX'], required_fields: ['PID-3', 'PID-5', 'OBR-4', 'OBX-3', 'OBX-5'] });
+// The description differs from version 1, so removing OBX-8 still leaves a genuinely new version.
+const PROFILE_WITH_OBX8 = JSON.stringify({ ...JSON.parse(PROFILE_V1), description: 'Profil HL7 v2: wynik badania z odczytem.', required_fields: [...JSON.parse(PROFILE_V1).required_fields, 'OBX-8'] });
+const XSD_V1 = `<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:annotation><xs:documentation>Zgłoszenie pacjenta w rejestracji.</xs:documentation></xs:annotation>
+  <xs:element name="zgloszenie">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="pesel" type="xs:string"/>
+        <xs:element name="uwagi" type="xs:string" minOccurs="0"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>`;
+const HL7_GOOD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG1|P|2.5\rPID|1||MRN123||Kowalski^Jan\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
+const HL7_BAD = 'MSH|^~\\&|LIS|PRACOWNIA|||20260929101500||ORU^R01|MSG2|P|2.5\rPID|1\rOBR|1|||BADANIE\rOBX|1|NM|GLU||5.4\r';
+
+test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the page, a refused profile fixed in one click, topics that reject a bad message', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  const addPattern = async (name, format, text) => {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator(`tf-choice-card[value="${format}"]`).click();
+    await win.locator('[data-role="name"] input').fill(name);
+    await win.locator('[data-role="text"] textarea').fill(text);
+    return win.locator('[data-act="save"]');
+  };
+  const topics = [];
+  const cleanup = async () => {
+    for (const name of topics.splice(0)) await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name }).catch(() => {});
+    for (const name of [PROFILE_NAME, XSD_NAME]) {
+      await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
+    }
+  };
+  try {
+    // HL7 v2 profile: JSON text, checked before it is sent.
+    let save = await addPattern(PROFILE_NAME, 'hl7v2_profile', '{"required_segments": ');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('error', /To nie jest poprawny JSON/);
+    await expect(save).toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill(PROFILE_V1);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${PROFILE_NAME} (profil HL7 v2), wersja 1`);
+    await save.click();
+    await expect(win).toHaveCount(0);
+    await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', `Dodano wzór ${PROFILE_NAME}`);
+    await expect(schemaRow(page, PROFILE_NAME)).toContainText('profil HL7 v2');
+
+    // Its page spells the profile out with the dictionary names of the fields.
+    await schemaRow(page, PROFILE_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(PROFILE_NAME, { timeout: 15000 });
+    await expect(p.locator('[data-role="about"]')).toHaveText('Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+    await expect(p.locator('[data-role="profile-segments"] tf-chip')).toHaveCount(4);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr').first()).toContainText('PID-3');
+    await expect(p.locator('[data-role="profile-fields"] tbody tr').first()).toContainText('Lista identyfikatorów pacjenta');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-profil-hl7.png'), fullPage: true });
+
+    // A new required field breaks "nowe programy przeczytają stare wiadomości"; one click removes it.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(PROFILE_WITH_OBX8);
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowe, wymagane pole „OBX-8”.');
+    await win.locator('[data-act="save"]').click();
+    const refusal = win.locator('[data-role="error"]');
+    await expect(refusal).toContainText('a nowa wersja wymaga pola „OBX-8”, którego stare wiadomości mogą nie mieć. Usuń „OBX-8” z pól wymaganych albo zmień zgodność wzoru.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-profil-odmowa.png') });
+    const fix = refusal.locator('[data-act="drop-required"]');
+    await expect(fix).toHaveText('Usuń OBX-8 i dodaj wersję');
+    await fix.click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+    expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: PROFILE_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+    await expect(p.locator('[data-role="profile-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
+    await expect.poll(() => editorText(page)).not.toContain('OBX-8');
+    await expect(p.locator('[data-role="about"]')).toHaveText('Profil HL7 v2: wynik badania z odczytem.');
+
+    // XSD: the text is checked as XML, its documentation is the description.
+    await p.locator('[data-go="back"]').first().click();
+    await expect(schemaTable(page).locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+    save = await addPattern(XSD_NAME, 'xsd', '<xs:schema');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('error', /To nie jest poprawny dokument XML/);
+    await expect(save).toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill(XSD_V1);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${XSD_NAME} (XSD), wersja 1`);
+    await save.click();
+    await expect(win).toHaveCount(0);
+    await expect(schemaRow(page, XSD_NAME)).toContainText('XSD');
+    await schemaRow(page, XSD_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(XSD_NAME, { timeout: 15000 });
+    await expect(p.locator('[data-role="about"]')).toHaveText('Zgłoszenie pacjenta w rejestracji.');
+    await expect(p.locator('[data-role="profile"]')).toBeHidden();
+    await expect.poll(() => editorText(page)).toContain('<xs:element name="zgloszenie">');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-xsd.png'), fullPage: true });
+
+    // Unsupported XSD is refused by the server with a reason, not stored.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(XSD_V1.replace('<xs:element name="zgloszenie">', '<xs:import namespace="urn:x"/><xs:element name="zgloszenie">'));
+    await win.locator('[data-act="save"]').click();
+    await expect(win.locator('[data-role="error"]')).toContainText('Ten XSD jest poprawny, ale konstrukcja xs:import nie jest obsługiwana. Wklej wszystkie deklaracje do jednego pliku.', { timeout: 15000 });
+    await expect(win.locator('[data-role="error"] details pre')).toContainText('schema composition is not supported');
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+
+    // Topics of the right format take the new patterns and reject what does not fit.
+    const topicFor = async (name, contentType, subject) => {
+      topics.push(name);
+      await busCall(page, 'busTopicCreateRequest', { instanceId: instance, name, options: { partitions: 1, contentType, schemaId: subject, validation: 'dlq' } });
+      const detail = (await busCall(page, 'busTopicDetailRequest', { instanceId: instance, name })).topic;
+      expect(detail.schemaId).toBe(subject);
+      expect(detail.validation).toBe('dlq');
+    };
+    const hl7Topic = `e2e-hl7-${RUN}`;
+    const xmlTopic = `e2e-xml-${RUN}`;
+    await topicFor(hl7Topic, 'application/hl7-v2', PROFILE_NAME);
+    await topicFor(xmlTopic, 'application/xml', XSD_NAME);
+
+    // The dashboard cannot publish, so a key with the right to send does it over REST.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=topics&topic=${hl7Topic}&section=access`);
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji', { timeout: 20000 });
+    await s.locator('tf-button[data-go="key-issue"]').click();
+    const issue = accessWindow(page);
+    await issue.locator('[data-role="name"] input').fill(`Pracownia ${RUN}`);
+    await issue.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+    await issue.locator('[data-act="save"]').click();
+    const issued = page.locator('tf-window.tb-key-issued');
+    await expect(issued).toHaveCount(1);
+    const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+    const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+    const group = (await issued.locator('[data-role="group"]').textContent()).trim();
+    await issued.locator('[data-act="done"]').click();
+    const keyId = group.slice(2);
+    try {
+      const publish = async (target, text) => {
+        const line = JSON.stringify({ payload_b64: Buffer.from(text).toString('base64') });
+        const res = await request.post(target, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+        expect(res.status(), await res.text()).toBe(200);
+        return res.json();
+      };
+      expect(await publish(url, HL7_GOOD)).toMatchObject({ published: 1, schema_rejected: 0 });
+      expect(await publish(url, HL7_BAD)).toMatchObject({ published: 0, schema_rejected: 1 });
+      expect(await publish(url, 'to nie jest wiadomość HL7')).toMatchObject({ published: 0, schema_rejected: 1 });
+      expect(await serverUnprocessed(page, instance, hl7Topic)).toHaveLength(2);
+    } finally {
+      await page.evaluate(async (id) => {
+        const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+        await ApiBinary.action('apiKeyRevokeRequest', { keyId: id }).catch(() => {});
+      }, keyId);
+    }
+  } finally {
+    await cleanup();
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+const FAKTURA_XSD = (inner) => `<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="faktura">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="numer" type="xs:string"/>
+        <xs:element name="nabywca" type="xs:string"/>${inner}
+        <xs:element name="pozycja" type="xs:string" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>`;
+
+test('F4 refusals in plain words: a profile and an XSD that cannot be added, a stale refusal gone with the edit, the element a new XSD version needs, a fix that would add nothing', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  const profile = `profil-przyjecia-${RUN}`;
+  const invoice = `faktura-${RUN}`;
+  const openAdd = async (format) => {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator(`tf-choice-card[value="${format}"]`).click();
+  };
+  try {
+    // The hint follows the format: the shape of a profile, the XSD that work.
+    await openAdd('hl7v2_profile');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /"required_segments".*"required_fields"/);
+    await win.locator('[data-role="name"] input').fill(profile);
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["MSH-1", "PID-3"]}');
+    await win.locator('[data-act="save"]').click();
+    const error = win.locator('[data-role="error"]');
+    await expect(error).toContainText('„MSH-1” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „MSH-1” z pól wymaganych.', { timeout: 15000 });
+    await expect(error).not.toContainText('nie jest poprawny wzór');
+    await expect(error.locator('details pre')).toContainText("'MSH-1' is the message's own field-separator");
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-msh1.png') });
+    // The refusal belongs to the text that was refused.
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["PID-3"]}');
+    await expect(error).toBeHidden();
+    await expect(win.locator('[data-act="save"]')).not.toHaveAttribute('disabled', '');
+    await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["pid5"]}');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('„pid5” to nie adres pola. Adres ma postać SEGMENT-numer, np. PID-5.', { timeout: 15000 });
+    await win.locator('[data-role="text"] textarea').fill('to nie jest JSON');
+    await expect(error).toBeHidden();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta', required_segments: ['PID'], required_fields: ['PID-3', 'PV1-3'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+
+    // An XSD that is valid but uses what the checker does not support.
+    await openAdd('xsd');
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Zadziała zwykły wzór XSD zapisany w jednym pliku/);
+    await win.locator('[data-role="name"] input').fill(invoice);
+    const floatXsd = FAKTURA_XSD('').replace('type="xs:string" maxOccurs', 'type="xs:float" maxOccurs');
+    await win.locator('[data-role="text"] textarea').fill(floatXsd);
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('Typ xs:float nie jest obsługiwany. Obsługiwane są: string, int, integer, decimal, boolean, date i dateTime. Zamiast niego użyj xs:decimal.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-float.png') });
+    await win.locator('[data-role="text"] textarea').fill('<xs:schema');
+    await expect(error).toBeHidden();
+    await win.locator('[data-role="text"] textarea').fill(FAKTURA_XSD(''));
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+
+    // The XSD's page says which XSD work; the profile's chips are named and in message order.
+    await schemaRow(page, invoice).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(invoice, { timeout: 15000 });
+    await expect(p.locator('[data-role="xsd-help"]')).toContainText('Jakie wzory XSD zadziałają');
+    await expect(p.locator('[data-role="xsd-help"]')).toContainText('Nie zadziała wzór, który dołącza inne pliki');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-xsd-strona.png'), fullPage: true });
+
+    // A required element is refused with its name and the diff line; minOccurs="0" is accepted.
+    await p.locator('[data-role="new-version"]').click();
+    const required = FAKTURA_XSD('\n        <xs:element name="termin" type="xs:date"/>');
+    await win.locator('[data-role="text"] textarea').fill(required);
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowy, wymagany element „termin”.');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga elementu „termin”, którego stare wiadomości mogą nie mieć. Dodaj minOccurs="0" do elementu „termin” albo zmień zgodność wzoru.', { timeout: 15000 });
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-xsd-wersja-odmowa.png') });
+    await win.locator('[data-role="text"] textarea').fill(FAKTURA_XSD('\n        <xs:element name="termin" type="xs:date" minOccurs="0"/>'));
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowy, nieobowiązkowy element „termin”.');
+    await expect(error).toBeHidden();
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+
+    // Removing the only new requirement would bring back the newest version: nothing is offered to add.
+    await p.locator('[data-go="back"]').first().click();
+    await expect(schemaTable(page).locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+    await schemaRow(page, profile).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(profile, { timeout: 15000 });
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta', required_segments: ['PID'], required_fields: ['PID-3', 'PV1-3', 'PV1-7'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga pola „PV1-7”, którego stare wiadomości mogą nie mieć', { timeout: 15000 });
+    await expect(error).toContainText('Po usunięciu PV1-7 nowa wersja niczym nie różniłaby się od wersji 1, więc nie ma czego dodawać.');
+    await expect(error.locator('[data-act="drop-required"]')).toHaveCount(0);
+    await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-bez-zmiany.png') });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+
+    // A segment and a field are named apart, and the button lists them.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(JSON.stringify({ description: 'Przyjęcie pacjenta, rozszerzone', required_segments: ['PID', 'NK1'], required_fields: ['PID-3', 'PV1-3', 'PV1-7'] }));
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('a nowa wersja wymaga segmentu „NK1” i pola „PV1-7”, których stare wiadomości mogą nie mieć. Usuń „NK1” z wymaganych segmentów i „PV1-7” z pól wymaganych albo zmień zgodność wzoru.', { timeout: 15000 });
+    await expect(error.locator('[data-act="drop-required"]')).toHaveText('Usuń NK1, PV1-7 i dodaj wersję');
+    await expect(error).toContainText('Opis wzoru zostanie bez zmian');
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+  } finally {
+    for (const name of [profile, invoice]) {
+      await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
+    }
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
 
 test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {
   const errors = trackErrors(page);

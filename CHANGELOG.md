@@ -60,28 +60,160 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Walidacja XSD przy publikacji jest uczciwa: kolejka do czterech miejsc
+  walidacji węzła jest FIFO (wątek, który właśnie zwolnił miejsce, nie
+  wyprzedza czekającego), jedna organizacja zajmuje najwyżej 2 z 4 miejsc, a
+  czekający z organizacji na limicie nie blokuje kolejki innych organizacji.
+  Organizacja z 32 czekającymi sprawdzeniami dostaje natychmiast odmowę
+  `schema_check_too_complex` (rekord trafia do DLQ albo jest oznaczony
+  ostrzeżeniem jak każdy porzucony dokument) zamiast kolejnego zablokowanego
+  wątku. Bez nowych kodów w protokole.
 - Rejestr wzorców przyjmuje typy `xsd` i `hl7v2_profile` (migracja 179:
   `bus_schema_subjects.schema_type` poszerzony o oba typy, wiersze, wersje
-  i znaczniki usunięcia bez zmian). Na razie są tylko przechowywane, jak
-  `avro`/`protobuf`/`thrift`: nie mają walidatora, więc `GET capabilities`
-  nadal wymienia wyłącznie `json_schema`, włączenie walidacji na takim wzorcu
-  jest odrzucane, a druga wersja przy zgodności innej niż `none` także
-  (brak porównania, którego można by udawać). Rejestracja wersji `xsd` lub
-  `hl7v2_profile` wymaga `compatibility: none`: przy domyślnym `backward`
-  odrzucana jest już pierwsza wersja. Wzorzec `xsd` wiąże się tylko
-  z tematem `application/xml` albo `text/xml`, `hl7v2_profile` tylko
-  z `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema`
-  nadal tylko z JSON-em; formaty binarne wiążą się niezależnie od
-  `content_type`. Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego
-  typu (konflikt w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca
-  dociera do takiego węzła przy następnym zapisie po uaktualnieniu, ale
-  wersje zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
+  i znaczniki usunięcia bez zmian; pakiety walidatorów nie mają własnej
+  migracji). Oba typy mają walidator: `GET capabilities` wymienia
+  `json_schema`, `xsd` i `hl7v2_profile`, temat może mieć `validation =
+  warn|dlq` z takim wzorcem, podschemat dla polityki odczytu jest wyliczany,
+  a domyślna zgodność `backward` działa. `avro`/`protobuf`/`thrift` nadal są
+  tylko przechowywane. Wzorzec `xsd` wiąże się tylko z tematem
+  `application/xml` albo `text/xml`, `hl7v2_profile` tylko z
+  `application/hl7-v2` albo `x-application/hl7-v2+er7`, `json_schema` nadal
+  tylko z JSON-em; formaty binarne wiążą się niezależnie od `content_type`.
+  Węzeł bez migracji 179 odrzuca replikowany wzorzec nowego typu (konflikt
+  w skrzynce, bez zatrzymania synchronizacji). Wiersz wzorca dociera do
+  takiego węzła przy następnym zapisie po uaktualnieniu, ale wersje
+  zarejestrowane w międzyczasie nie dotrą bez resetu bazowego
   (`reseed_core_state_from_current_rows`). Rzadki przypadek: stary węzeł
   z podmiotem o tej samej nazwie z generacji 0 może podpiąć wersje nowego
   typu pod swój stary wiersz i zmienić `content_type` tematu powiązanego
-  z tym podmiotem. Uaktualnij wszystkie węzły sieci razem, zanim ktoś
-  zarejestruje wzorzec XSD lub profil HL7; B4 i B5 zakładają to jako warunek
-  wstępny.
+  z tym podmiotem. **Uaktualnij wszystkie węzły sieci razem, zanim ktoś
+  zarejestruje wzorzec XSD lub profil HL7** (migracja 179 na każdym węźle).
+- Profil HL7 v2 (`hl7v2_profile`) to JSON `{"description"?, "required_segments",
+  "required_fields"}`: wiadomość ER7 musi się dać odczytać tym samym parserem,
+  co polityki pól, zawierać każdy wymagany segment, a wymagane pole
+  (`PID-3`) musi być niepuste w każdym wystąpieniu swojego segmentu (pole
+  wymagane wymusza też swój segment). `MSH-1`/`MSH-2`, nieznane klucze,
+  powtórzenia i listy powyżej 512 wpisów są odrzucane przy rejestracji.
+  Zgodność: `backward` — nowa wersja nie wymaga niczego ponad starą,
+  `forward` — odwrotnie, `full` — równe zbiory.
+- Wzorzec XSD to własny podzbiór (na `quick-xml` i `regex`, bez nowych
+  zależności): `element` z `minOccurs`/`maxOccurs`, `complexType` z
+  `sequence`, `choice` i `all`, `simpleContent/extension`, `attribute`
+  (`required`/`optional`), typy `string`, `int`, `integer`, `decimal`,
+  `boolean`, `date`, `dateTime` oraz `restriction` z `minLength`, `maxLength`,
+  `pattern` i `enumeration`. `import`/`include`, `group`/`attributeGroup`,
+  `any`, `key`/`keyref`/`unique`, `complexContent`, `mixed`, `ref=` i inne
+  konstrukcje spoza podzbioru są odrzucane przy rejestracji z nazwą
+  konstrukcji. Dokument jest sprawdzany po lokalnych nazwach elementów
+  (przestrzenie nazw nie są rozstrzygane, tak jak w politykach pól XML);
+  `pattern` jest tłumaczony z dialektu XSD na `regex` z domyślnym
+  zakotwiczeniem (`^`/`$` są zwykłymi znakami, konstrukcje o innym
+  znaczeniu są odrzucane), a komunikaty naruszeń zawierają ścieżkę i
+  ograniczenie, nigdy wartość. Zgodność jest dowodzona zachowawczo
+  (inkluzja języków modeli zawartości, typów prostych i atrybutów):
+  `backward` — każdy dokument ważny w starym wzorcu jest ważny w nowym,
+  `forward` — odwrotnie; zmiana, której nie da się udowodnić, jest
+  odrzucana.
+- Dashboard: „Dodaj wzór” oferuje XSD i profil HL7 v2 (kafelki z listy
+  formatów serwera), strona wzorca opisuje profil HL7 w zwykłych słowach
+  (wymagane segmenty i pola z nazwami ze słownika), a opis XSD to jego
+  `xs:annotation/xs:documentation`. Odmowa nowej wersji profilu, która
+  wymaga czegoś ponad starą wersję, ma przycisk „Usuń OBX-8 i dodaj wersję”.
+- Poprawki walidatorów XSD i profilu HL7: numer pola w adresie (`PID-n`) ma
+  najwyżej 999 (dłuższy numer w profilu lub polityce pola jest odrzucany
+  zamiast zatrzymywać proces), drugi segment `MSH` w wiadomości jest numerowany
+  jak pierwszy (to zmienia też politykę pól na topikach z paczkami wiadomości:
+  reguły odczytu pokazują nazwane pole drugiego `MSH`, znaki podziału nie są już
+  zerowane, a reguły zapisu nie widzą `MSH-1`), a jawne `""` (usuń wartość) nie spełnia pola wymaganego.
+  Komunikaty naruszeń nie zawierają już treści wiadomości (nazwy encji
+  `&nazwa;`, błędy parsera, identyfikator błędnego segmentu). Zgodność XSD nie
+  dowodzi już wyliczenia typu liczbowego lub `boolean` względem wzorca albo typu
+  tekstowego (dozwolone `01`, `+1`, `1` jako `true`), ma budżet pracy dla
+  szerokich modeli i podaje element, którego nowa wersja wymaga (`the new
+  schema requires element 'x'`). `pattern` z nadmiarowym `)` jest odrzucany,
+  `maxOccurs="0"` w `xs:all` wyłącza element, a schemat wyprowadzony dla polityki
+  odczytu przyjmuje projekcję dokumentów z prefiksami przestrzeni nazw i tekstem
+  elementu głównego (wymagalność dzieci, których nazwy projekcja nie może
+  dopasować jednoznacznie, jest rozluźniana).
+- Sprawdzenie wzorca, które przekroczyło limit pracy (zbyt głęboki lub zbyt duży
+  dokument XML), nie jest już zgłaszane jako naruszenie: wiadomość trafia do
+  nieprzetworzonych (`validation = dlq`) lub jest przyjęta z ostrzeżeniem
+  (`warn`) z powodem `schema_check_too_complex`, odrębnym od
+  `schema_violation` (nowa wartość nagłówka `dlq.reason`; starsze programy
+  pokażą ją jako „nieznany powód”).
+- Dashboard: odmowa dodania profilu HL7 lub XSD mówi po polsku, co jest nie tak
+  (adres pola, `MSH-1`/`MSH-2`, nieznany klucz, nieobsługiwana konstrukcja albo
+  typ XSD); tekst serwera zostaje w zwiniętych szczegółach. Odmowa nowej wersji
+  XSD wskazuje wymagany element, odmowa profilu HL7 rozróżnia segmenty i pola,
+  a „Usuń … i dodaj wersję” nie jest oferowane, gdy wynik byłby taki sam jak
+  poprzednia wersja. Okno „Dodaj wzór” podaje kształt profilu HL7 i opis
+  obsługiwanego XSD, strona XSD ma kartę „Jakie wzory XSD zadziałają”, a okno
+  nowej wersji XSD pokazuje różnicę. Segmenty profilu mają nazwy i kolejność
+  wiadomości, błąd wiązania wzoru z topikiem o innej treści jest opisany, a
+  szczegół nieprzetworzonej wiadomości z profilu HL7 jest po polsku.
+- Druga runda poprawek wzorów XSD i profilu HL7: klasa znaków w `pattern` z
+  nieucieczonym `]` zaraz po `[` lub `[^` jest odrzucana (kończyłaby się w innym
+  miejscu niż rozumie ją `regex`), łańcuch ograniczeń typu prostego i porównanie
+  zgodności zagnieżdżonych typów złożonych mają limit głębokości, a budżet pracy
+  porównania liczy się globalnie. Porównanie, które przekroczyło budżet, nie jest
+  niezgodnością: odpowiedź ma osobny kod `bus.schema_compare_too_complex`, a
+  wiadomość, której sprawdzenie przekroczyło limit, nie zwiększa
+  `schema_violations_total` i jest audytowana jako `bus.schema.check_too_complex`.
+  Profil HL7 musi być obiektem JSON (tablica była czytana pozycyjnie i dawała
+  profil bez wymagań), a element `xs:all` z `maxOccurs="0"` nadal jest sprawdzany
+  przy rejestracji.
+- Koszt sprawdzania wzorów XSD jest liczony jednym licznikiem (`Budget`), który
+  przechodzi przez każdą kosztowną operację: sprawdzenie wartości (jedna
+  jednostka na bajt wartości dla każdego wzorca), przecięcie wyliczeń (naliczane przed
+  obliczeniem), automaty modeli treści, atrybuty i rejestrację wzoru. Walidacja
+  dokumentu ma limit 50 mln jednostek (`schema_check_too_complex`), porównanie
+  wersji 20 mln (`bus.schema_compare_too_complex`), a kompilacja 5 mln.
+  Wyliczenia są zbiorami haszowanymi, atrybuty typu mają indeks, a duplikaty
+  atrybutów w dokumencie wykrywa walidator w czasie liniowym. Przy dodawaniu
+  wzoru obowiązują twarde limity (zmieniają się razem z kartą „Jakie wzory XSD
+  zadziałają”): wartość wyliczenia do 1 KB, wszystkie wyliczenia razem do
+  128 KB i 4096 wartości, wzorzec `pattern` do 512 znaków, do 256 wzorców,
+  program jednego wzorca do 256 KB (cyfry `\d` są Unicode, więc PESEL `\d{11}`
+  potrzebuje 64 KB, a `\p{L}{60}` jest odrzucany) oraz 32 MB pamięci wszystkich
+  wzorców razem, najwyżej 1024 atrybuty w typie. Wzór przekraczający limit jest
+  odrzucany z opisem po polsku. Pamięć podręczna skompilowanych wzorów magistrali
+  ma granicę 1024 wpisów i 256 MB (najdawniej użyty wypada pierwszy), a zmiana
+  wzoru innego tematu nie wymusza już ponownej kompilacji niezmienionych.
+- Trzecia runda poprawek kosztu sprawdzania XSD. `pattern` jest dopasowywany
+  leniwym automatem (`regex-automata`, zależność tylko w głównym
+  `Cargo.toml`) i kosztuje jedną jednostkę na bajt; do tego płaci się
+  za stany zbudowane przez skanowanie oraz `liczba stanów` za każdą nową
+  pamięć podręczną automatu (każda równoległa walidacja ma własną z puli,
+  używaną ponownie). Gdy automat zrezygnuje (pamięć się trzęsie), płaci się z
+  góry `szerokość × długość` za maszynę Pike VM, gdzie szerokość to stany
+  plus wszystkie zakresy przejść (klasy Unicode są szerokie). Realistyczne paczki (kilkanaście tysięcy PESEL,
+  NIP, kodów pocztowych i IBAN) mieszczą się więc w budżecie, a wzorzec
+  `[01]*1[01]{200}` na megabajcie losowych bitów nadal jest odrzucany jako
+  `schema_check_too_complex`. Grupy XSD są niekapturujące (`(?:…)`), pamięć
+  wzorca liczy jego program i do 4 pamięci podręcznych automatu (każda
+  kolejna równoległa walidacja tego wzorca dokłada jedną), a waga wpisu
+  pamięci podręcznej uwzględnia automaty modeli treści (limit pamięci wzorców
+  jednego schematu: 32 MB). Tabela znaczników rekordu jest liczona z góry. Praca per element (kopia zbioru startowego,
+  flagi `xs:all`) jest liczona w budżecie, a akceptacja modelu to odczyt jednego
+  elementu. Pamięć podręczna skompilowanych wzorów ma udział na organizację
+  (128 wpisów i 64 MB; przekroczone ogólne granice zwalnia najpierw organizacja
+  zajmująca najwięcej), a równoczesne chybienia tego samego tematu czekają na
+  jedną kompilację. **Jedna paczka publikacji ma wspólny budżet walidacji
+  XSD**: 50 mln jednostek plus 64 na bajt ładunków paczki (limit 50 mln na
+  dokument obowiązuje nadal). Opłata, która się nie mieści, jest odrzucana bez
+  dopisywania, więc rekord obciąża paczkę tylko pracą, która faktycznie się
+  wykonała (najwyżej jego udziałem); rekordy, którym budżetu zabrakło, są
+  traktowane jak `schema_check_too_complex`, a kolejne uczciwe rekordy
+  przechodzą, dopóki budżet paczki nie zostanie realnie wyczerpany. Błąd
+  budowy wzorca podaje powód (zły zakres powtórzeń, zbyt głębokie
+  zagnieżdżenie, zakres znaków od końca) i dashboard opisuje go po polsku. Wybór efektywnej wersji tematu z
+  wycofaniami czyta tylko numery i skróty wersji, a tekst wybranej jednej.
+  **Węzeł waliduje XSD najwyżej czterema dokumentami naraz** (`POOLED_CACHES`,
+  wspólna bramka dla publikacji, REST, podglądu i synchronizacji): dalsze
+  walidacje czekają na wątku blokującym. Dzięki temu wzorzec ma w pamięci co
+  najwyżej cztery cache'e leniwego DFA (zachowane i chwilowe), tyle ile liczy
+  `pattern_memory`, niezależnie od rozmiaru puli wątków; pula cache'y ma stałą
+  pojemność i nadmiarowe cache'e są zwalniane.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

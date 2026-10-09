@@ -30,7 +30,7 @@ import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTI
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
-import { drawSchemas, listText, compatLabel } from '/js/modules/tentabus/schemas.js';
+import { drawSchemas, listText, compatLabel, schemaKindMismatchText } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
 import { addedNotice, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
@@ -1093,7 +1093,7 @@ const topicsContext = {
   },
 };
 
-const describeBusError = (err) => mapBusErrorMessage(err?.message, T);
+const describeBusError = (err) => schemaKindMismatchText(err?.message) || mapBusErrorMessage(err?.message, T);
 
 function topicByName(name) {
   return state.topics.find((t) => t.name === name) || null;

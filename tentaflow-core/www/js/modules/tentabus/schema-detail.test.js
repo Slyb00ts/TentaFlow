@@ -14,10 +14,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
+if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.DOMParser = window.DOMParser;
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText,
+  drawSchemaDetail, shareShownText, hl7ProfileView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -240,4 +241,102 @@ test('a reader\'s page of a withdrawn pattern gets the reader\'s warning', () =>
   const message = body.querySelector('[data-role="warning"] tf-alert').getAttribute('message');
   assert.match(message, /dopóki administrator nie wybierze w nim innego wzoru/);
   assert.doesNotMatch(message, /wybierzesz/);
+});
+
+const PROFILE = JSON.stringify({
+  description: 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.',
+  required_segments: ['MSH', 'PID'],
+  required_fields: ['PID-3', 'PID-5', 'OBX-8', 'ZZZ-1'],
+});
+const wynik = { ...wizyta, subject: 'wynik-badania', schemaType: 'hl7v2_profile', usedByTopics: ['wyniki-badan'] };
+
+test('an XSD\'s description is its schema-level documentation, an HL7 profile\'s its description', () => {
+  const xsd = (inner) => `<?xml version="1.0"?><xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">${inner}<xs:element name="a" type="xs:string"/></xs:schema>`;
+  assert.equal(schemaDescription('xsd', xsd('<xs:annotation><xs:documentation>  Zgłoszenie pacjenta.  </xs:documentation></xs:annotation>')), 'Zgłoszenie pacjenta.');
+  assert.equal(schemaDescription('xsd', xsd('')), '');
+  // Like the server (xsd.rs `documentation`), only elements in the XSD namespace count.
+  const foreign = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><annotation xmlns="urn:other"><documentation>Obcy opis.</documentation></annotation></xs:schema>';
+  assert.equal(schemaDescription('xsd', foreign), '', 'an annotation outside the XSD namespace is not the description');
+  const foreignDoc = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><documentation xmlns="urn:other">Obcy opis.</documentation></xs:annotation></xs:schema>';
+  assert.equal(schemaDescription('xsd', foreignDoc), '');
+  const wrongRoot = '<schema xmlns="urn:other"><annotation xmlns="http://www.w3.org/2001/XMLSchema"><documentation>Opis.</documentation></annotation></schema>';
+  assert.equal(schemaDescription('xsd', wrongRoot), '', 'a root outside the XSD namespace is not a schema');
+  assert.equal(schemaDescription('xsd', '<xs:schema'), '', 'text that is not XML has no description');
+  const nested = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a"><xs:annotation><xs:documentation>Tylko pole.</xs:documentation></xs:annotation><xs:complexType/></xs:element></xs:schema>';
+  assert.equal(schemaDescription('xsd', nested), '', 'documentation of an element is not the schema\'s');
+  assert.equal(schemaDescription('hl7v2_profile', PROFILE), 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+  assert.equal(schemaDescription('hl7v2_profile', '{"required_segments":[]}'), '');
+});
+
+test('file names and editor languages of an XSD and an HL7 profile', () => {
+  assert.equal(downloadName('zgloszenie', 2, 'xsd'), 'zgloszenie-v2.xsd');
+  assert.equal(downloadName('wynik', 4, 'hl7v2_profile'), 'wynik-v4.json');
+  assert.equal(editorLanguage('hl7v2_profile'), 'json');
+  assert.equal(editorLanguage('xsd'), 'html');
+  assert.equal(displayText('hl7v2_profile', '{"required_segments":["PID"]}'), '{\n  "required_segments": [\n    "PID"\n  ]\n}');
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>';
+  assert.equal(displayText('xsd', xsd), xsd, 'an XSD is shown as stored');
+});
+
+test('a profile spelled out: its segments (listed, then those only a field names) and fields with their names', () => {
+  const view = hl7ProfileView(PROFILE);
+  assert.deepEqual(view.segments, ['MSH', 'PID', 'OBX', 'ZZZ']);
+  assert.deepEqual(view.fields.map((f) => f.address), ['PID-3', 'PID-5', 'OBX-8', 'ZZZ-1']);
+  assert.equal(view.fields[0].label, 'Lista identyfikatorów pacjenta');
+  assert.equal(view.fields[3].label, '', 'a field outside the dictionary has no name');
+  assert.equal(hl7ProfileView('not json'), null);
+  assert.equal(hl7ProfileView('[1]'), null);
+  assert.deepEqual(hl7ProfileView('{}'), { segments: [], fields: [] });
+});
+
+test('an HL7 profile\'s page shows its segments and fields in plain words above the text', () => {
+  const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text: PROFILE, error: null } });
+  assert.deepEqual([...body.querySelectorAll('[data-role="chips"] tf-chip')].map((c) => c.getAttribute('label')).slice(0, 1), ['profil HL7 v2']);
+  assert.equal(body.querySelector('[data-role="about"]').textContent, 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+  const profile = body.querySelector('[data-role="profile"]');
+  assert.equal(profile.hidden, false);
+  assert.deepEqual([...profile.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')), ['MSH · nagłówek wiadomości', 'PID · dane pacjenta', 'OBX · wynik', 'ZZZ']);
+  assert.match(norm(profile.textContent), /Wymagane segmenty .* Segment to jeden wiersz wiadomości HL7 v2/);
+  const rows = body.querySelector('[data-role="profile-fields"]').rows;
+  assert.equal(rows.length, 4);
+  assert.match(rows[0].field, />PID-3</);
+  assert.equal(rows[0].contains, 'Lista identyfikatorów pacjenta');
+  assert.equal(body.querySelector('tf-code-editor').getAttribute('language'), 'json');
+  // Another format shows no profile.
+  const plain = mount({});
+  assert.equal(plain.body.querySelector('[data-role="profile"]').hidden, true);
+});
+
+test('segments of a profile follow the order of a message, with a name where the dictionary has one', () => {
+  const profile = JSON.stringify({ required_segments: ['IN1', 'ZPD', 'PID'], required_fields: ['IN1-2', 'ZPD-1', 'PID-19'] });
+  assert.deepEqual(hl7ProfileView(profile).segments, ['PID', 'IN1', 'ZPD']);
+  const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text: profile, error: null } });
+  assert.deepEqual(
+    [...body.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')),
+    ['PID · dane pacjenta', 'IN1 · ubezpieczenie', 'ZPD'],
+    'a segment outside the dictionary is shown as it is',
+  );
+});
+
+test('a reader is not told that versions can always be withdrawn', () => {
+  const admin = mount({});
+  assert.equal(admin.body.querySelector('[data-role="versions-sub"]').textContent, 'Wersji nie da się zmienić. Wycofać można zawsze.');
+  const reader = mount({ canAdmin: false });
+  assert.equal(reader.body.querySelector('[data-role="versions-sub"]').textContent, 'Wersji nie da się zmienić.');
+});
+
+test('an XSD\'s page says which XSD patterns work; no other format shows that card', () => {
+  const xsd = '<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a" type="xs:string"/></xs:schema>';
+  const { body } = mount({ name: 'faktura', info: { ...wizyta, subject: 'faktura', schemaType: 'xsd' }, shown: { version: 3, text: xsd, error: null } });
+  const card = body.querySelector('[data-role="xsd-help"]');
+  assert.equal(card.hidden, false);
+  assert.match(norm(card.textContent), /^Jakie wzory XSD zadziałają Zadziała zwykły wzór zapisany w jednym pliku: .* Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje\. Wzór ma też granice rozmiaru: .* 16 MB pamięci\.$/);
+  assert.equal(mount({}).body.querySelector('[data-role="xsd-help"]').hidden, true);
+});
+
+test('the description of an XSD is the documentation element\'s own text, like the server', () => {
+  const xsd = (doc) => `<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:annotation><xs:documentation>${doc}</xs:documentation></xs:annotation><xs:element name="a" type="xs:string"/></xs:schema>`;
+  assert.equal(schemaDescription('xsd', xsd('  Faktura  ')), 'Faktura');
+  assert.equal(schemaDescription('xsd', xsd('Faktura <b>pogrubiona</b> koniec')), 'Faktura  koniec', 'text of nested elements is not part of it');
+  assert.equal(schemaDescription('xsd', xsd('<b>tylko element</b>')), '');
 });

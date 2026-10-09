@@ -1,0 +1,5 @@
+{
+  "description": "ADT A01 admission: message type, control id, patient id and name are mandatory.",
+  "required_segments": ["MSH", "EVN", "PID"],
+  "required_fields": ["MSH-9", "MSH-10", "PID-3", "PID-5"]
+}
