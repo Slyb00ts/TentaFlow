@@ -25,9 +25,23 @@
 // their underlying type only (a `uuid` string is not parsed as a UUID).
 //
 // Resource bounds are structural, as in `xsd.rs`:
-//   - `compile` caps the text (`MAX_SCHEMA_TEXT_BYTES`), JSON nesting (the
-//     parser's recursion limit), types (`MAX_SCHEMA_NODES`), schema depth,
-//     fields per record, union branches, enum symbols and `fixed` size, and
+//   - `compile` first runs `prescan` on the parsed JSON, BEFORE the library
+//     sees it, because `Schema::parse` multiplies memory: it clones a named
+//     type's whole subtree once per name AND per alias (`register_parsed_schema`)
+//     and returns a full copy for an object that merely names an already
+//     parsed type `record`/`enum`/`fixed` (`parse_record` & co). The pre-scan
+//     caps JSON values (`MAX_JSON_VALUES`), named definitions, aliases per
+//     type and in total, fields, symbols, union branches, `fixed` size and
+//     name length; refuses a `record`/`enum`/`fixed` object without
+//     `fields`/`symbols`/`size`, a type named like a keyword or primitive, and
+//     a `"type"` that nests another type object; and bounds the clone work
+//     `sum((1 + aliases) x subtree values)` over named types by
+//     `MAX_CLONE_WORK`. With those caps the library's transient peak is about
+//     MAX_CLONE_WORK x ~70 bytes (~70 MiB), and the failed-default path
+//     (`names.values().cloned()`) at most twice that; type references stay
+//     small `Ref` values bounded by MAX_JSON_VALUES. Nothing else in the
+//     library parse copies a schema.
+//   - `compile` then caps types (`MAX_SCHEMA_NODES`) and schema depth, and
 //     refuses a schema that can have no value at all (a record that contains
 //     itself without an optional branch).
 //   - `validate` walks the datum against the lowered schema with NO per-value
@@ -63,10 +77,11 @@
 // =============================================================================
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use apache_avro::schema::{
-    Alias, ArraySchema, FixedSchema, InnerDecimalSchema, MapSchema, RecordField, RecordSchema,
-    Schema, UnionSchema, UuidSchema,
+    Alias, ArraySchema, FixedSchema, InnerDecimalSchema, MapSchema, Name, RecordField,
+    RecordSchema, Schema, UnionSchema, UuidSchema,
 };
 use serde_json::Value;
 
@@ -81,6 +96,16 @@ const MAX_RECORD_FIELDS: usize = 1024;
 const MAX_UNION_BRANCHES: usize = 64;
 const MAX_ENUM_SYMBOLS: usize = 1024;
 const MAX_FIXED_SIZE: usize = 16 * 1024 * 1024;
+/// Names, namespaces, aliases, field names and enum symbols. Compatibility
+/// messages quote them, so the cap bounds every message.
+const MAX_NAME_LEN: usize = 256;
+const MAX_JSON_VALUES: usize = 50_000;
+const MAX_NAMED_DEFINITIONS: usize = 4096;
+const MAX_ALIASES_PER_TYPE: usize = 64;
+const MAX_ALIASES_TOTAL: usize = 256;
+/// `sum((1 + aliases) x JSON values of the definition)` over named types: the
+/// number of value copies the library makes while registering them.
+const MAX_CLONE_WORK: usize = 1_000_000;
 
 /// Nesting of containers (records, arrays, maps; a union adds none) a datum
 /// may reach. Recursive schemas make the depth data-dependent, so it is capped
@@ -97,6 +122,7 @@ const INFINITE: u64 = u64::MAX;
 
 const TRUNCATED: &str = "payload ends before the value is complete";
 const INT_TOO_LONG: &str = "integer encoding is longer than 10 bytes or overflows 64 bits";
+const INT32_TOO_LONG: &str = "int encoding is longer than 5 bytes";
 const INT_RANGE: &str = "value does not fit the int type";
 const BAD_BOOLEAN: &str = "boolean is neither 0 nor 1";
 const NEGATIVE_LENGTH: &str = "length is negative";
@@ -143,12 +169,15 @@ enum Kind {
     String,
     Fixed {
         name: String,
+        /// Full names, for matching inside a union.
+        full_names: FullNames,
         aliases: Vec<String>,
         size: usize,
         decimal: Option<(usize, usize)>,
     },
     Enum {
         name: String,
+        full_names: FullNames,
         aliases: Vec<String>,
         symbols: Vec<String>,
         has_default: bool,
@@ -161,6 +190,27 @@ enum Kind {
         aliases: Vec<String>,
         fields: Vec<Field>,
     },
+}
+
+/// A named type's full name and the full names of its aliases.
+#[derive(Debug)]
+struct FullNames {
+    name: String,
+    aliases: Vec<String>,
+}
+
+impl FullNames {
+    fn new(name: &Name, aliases: &Option<Vec<Alias>>) -> FullNames {
+        FullNames {
+            name: name.fullname(None),
+            aliases: aliases.iter().flatten().map(|a| a.fullname(None)).collect(),
+        }
+    }
+
+    /// Whether a writer type with full name `writer` is this reader type.
+    fn accepts(&self, writer: &str) -> bool {
+        self.name == writer || self.aliases.iter().any(|a| a == writer)
+    }
 }
 
 #[derive(Debug)]
@@ -177,10 +227,19 @@ pub struct Compiled {
     root: NodeId,
 }
 
-struct Lowerer {
+struct Lowerer<'s> {
     nodes: Vec<Node>,
     /// Full name (and alias full names) of every named type seen so far.
     named: HashMap<String, NodeId>,
+    /// Field defaults, checked once every node is complete (a default may
+    /// describe a record that is still being lowered).
+    defaults: Vec<PendingDefault<'s>>,
+}
+
+struct PendingDefault<'s> {
+    field: &'s str,
+    node: NodeId,
+    default: &'s Value,
 }
 
 fn alias_names(aliases: &Option<Vec<Alias>>) -> Vec<String> {
@@ -191,7 +250,7 @@ fn alias_names(aliases: &Option<Vec<Alias>>) -> Vec<String> {
         .collect()
 }
 
-impl Lowerer {
+impl<'s> Lowerer<'s> {
     fn push(&mut self, kind: Kind) -> Result<NodeId, SchemaError> {
         if self.nodes.len() >= MAX_SCHEMA_NODES {
             return Err(invalid(format!(
@@ -219,14 +278,19 @@ impl Lowerer {
             )));
         }
         for alias in aliases.iter().flatten() {
-            self.named.entry(alias.fullname(None)).or_insert(id);
+            let alias = alias.fullname(None);
+            if self.named.insert(alias.clone(), id).is_some() {
+                return Err(invalid(format!(
+                    "alias '{alias}' of type '{full_name}' is also the name or alias of another type"
+                )));
+            }
         }
         Ok(())
     }
 
     fn fixed(
         &mut self,
-        fixed: &FixedSchema,
+        fixed: &'s FixedSchema,
         decimal: Option<(usize, usize)>,
     ) -> Result<NodeId, SchemaError> {
         if fixed.size > MAX_FIXED_SIZE {
@@ -237,6 +301,7 @@ impl Lowerer {
         }
         let id = self.push(Kind::Fixed {
             name: fixed.name.name().to_string(),
+            full_names: FullNames::new(&fixed.name, &fixed.aliases),
             aliases: alias_names(&fixed.aliases),
             size: fixed.size,
             decimal,
@@ -245,7 +310,7 @@ impl Lowerer {
         Ok(id)
     }
 
-    fn lower(&mut self, schema: &Schema, depth: usize) -> Result<NodeId, SchemaError> {
+    fn lower(&mut self, schema: &'s Schema, depth: usize) -> Result<NodeId, SchemaError> {
         if depth > MAX_SCHEMA_DEPTH {
             return Err(invalid(format!(
                 "the schema is nested deeper than {MAX_SCHEMA_DEPTH} levels"
@@ -287,6 +352,7 @@ impl Lowerer {
                 }
                 let id = self.push(Kind::Enum {
                     name: e.name.name().to_string(),
+                    full_names: FullNames::new(&e.name, &e.aliases),
                     aliases: alias_names(&e.aliases),
                     symbols: e.symbols.clone(),
                     has_default: e.default.is_some(),
@@ -336,19 +402,19 @@ impl Lowerer {
                 self.register(r.name.fullname(None), &r.aliases, id)?;
                 let mut fields = Vec::with_capacity(r.fields.len());
                 for f in &r.fields {
-                    if let (Some(default), Schema::Union(u)) = (&f.default, &f.schema) {
-                        if !union_default_fits(u, default) {
-                            return Err(invalid(format!(
-                                "the default of field '{}' does not fit the first branch of its union",
-                                f.name
-                            )));
-                        }
+                    let node = self.lower(&f.schema, depth + 1)?;
+                    if let Some(default) = &f.default {
+                        self.defaults.push(PendingDefault {
+                            field: &f.name,
+                            node,
+                            default,
+                        });
                     }
                     fields.push(Field {
                         name: f.name.clone(),
                         aliases: f.aliases.clone(),
                         has_default: f.default.is_some(),
-                        node: self.lower(&f.schema, depth + 1)?,
+                        node,
                     });
                 }
                 if let Kind::Record { fields: slot, .. } = &mut self.nodes[id].kind {
@@ -371,20 +437,68 @@ impl Lowerer {
     }
 }
 
-/// The parser checks a field default against its type except for a union,
-/// where Avro uses the FIRST branch; a default of the wrong kind would only
-/// surface when a reader fills the field. Named first branches are not
-/// inspected.
-fn union_default_fits(union: &UnionSchema, default: &Value) -> bool {
-    match union.variants().first() {
-        Some(Schema::Null) => default.is_null(),
-        Some(Schema::Boolean) => default.is_boolean(),
-        Some(Schema::Int | Schema::Long) => default.is_i64() || default.is_u64(),
-        Some(Schema::Float | Schema::Double) => default.is_number(),
-        Some(Schema::String | Schema::Bytes) => default.is_string(),
-        Some(Schema::Array(_)) => default.is_array(),
-        Some(Schema::Map(_)) => default.is_object(),
-        _ => true,
+impl Lowerer<'_> {
+    /// The parser checks a union default against ANY branch and a fixed default
+    /// not at all; Avro uses the FIRST branch (spec 1.11/1.12), and a default of
+    /// the wrong kind, range or length would only surface when a reader fills
+    /// the field.
+    fn check_defaults(&self) -> Result<(), SchemaError> {
+        for pending in &self.defaults {
+            if !default_fits(&self.nodes, pending.node, pending.default, 0) {
+                let target = if matches!(self.nodes[pending.node].kind, Kind::Union(_)) {
+                    "the first branch of its union"
+                } else {
+                    "its type"
+                };
+                return Err(invalid(format!(
+                    "the default of field '{}' does not fit {target}",
+                    pending.field
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a JSON default is a valid value of the node's type (a union: of its
+/// first branch). A record default may omit a field that has its own default.
+fn default_fits(nodes: &[Node], id: NodeId, default: &Value, depth: usize) -> bool {
+    if depth > MAX_SCHEMA_DEPTH * 2 {
+        return false;
+    }
+    match &nodes[id].kind {
+        Kind::Null => default.is_null(),
+        Kind::Boolean => default.is_boolean(),
+        Kind::Int => default.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+        Kind::Long => default.as_i64().is_some(),
+        Kind::Float | Kind::Double => default.is_number(),
+        Kind::Bytes { .. } | Kind::String => default.is_string(),
+        // A string of code points 0-255, one per byte.
+        Kind::Fixed { size, .. } => default
+            .as_str()
+            .is_some_and(|s| s.chars().all(|c| u32::from(c) <= 0xff) && s.chars().count() == *size),
+        Kind::Enum { symbols, .. } => default
+            .as_str()
+            .is_some_and(|s| symbols.iter().any(|symbol| symbol == s)),
+        Kind::Array(item) => default.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .all(|v| default_fits(nodes, *item, v, depth + 1))
+        }),
+        Kind::Map(value) => default.as_object().is_some_and(|entries| {
+            entries
+                .values()
+                .all(|v| default_fits(nodes, *value, v, depth + 1))
+        }),
+        Kind::Union(branches) => branches
+            .first()
+            .is_some_and(|first| default_fits(nodes, *first, default, depth + 1)),
+        Kind::Record { fields, .. } => default.as_object().is_some_and(|entries| {
+            fields.iter().all(|f| match entries.get(&f.name) {
+                Some(v) => default_fits(nodes, f.node, v, depth + 1),
+                None => f.has_default,
+            })
+        }),
     }
 }
 
@@ -421,40 +535,201 @@ fn compute_min_bytes(nodes: &mut [Node]) {
     }
 }
 
-/// The parser silently drops a record field that is not a JSON object, which
-/// would turn a typo into a schema that checks less than its author wrote.
-fn check_field_shapes(value: &Value) -> Result<(), SchemaError> {
+/// Names a type may not take: a definition named like a keyword or a primitive
+/// is shadowed or confused by the parser (`{"type": "record"}` then means "the
+/// type named record").
+const RESERVED_NAMES: [&str; 14] = [
+    "null", "boolean", "int", "long", "float", "double", "bytes", "string", "record", "error",
+    "enum", "fixed", "array", "map",
+];
+
+#[derive(Default)]
+struct Prescan {
+    named: usize,
+    aliases: usize,
+    clone_work: usize,
+}
+
+fn count_values(value: &Value) -> usize {
     match value {
-        Value::Array(branches) => branches.iter().try_for_each(check_field_shapes),
-        Value::Object(map) => match map.get("type") {
-            Some(Value::String(kind)) => match kind.as_str() {
-                "record" | "error" => {
-                    let Some(fields) = map.get("fields") else {
-                        return Ok(());
-                    };
-                    let Some(fields) = fields.as_array() else {
-                        return Err(invalid(
-                            "a record lists its fields in something that is not an array",
-                        ));
-                    };
-                    for field in fields {
-                        let Some(field) = field.as_object() else {
-                            return Err(invalid("a record lists a field that is not an object"));
-                        };
-                        if let Some(ty) = field.get("type") {
-                            check_field_shapes(ty)?;
-                        }
-                    }
-                    Ok(())
+        Value::Array(items) => 1 + items.iter().map(count_values).sum::<usize>(),
+        Value::Object(map) => 1 + map.values().map(|v| 1 + count_values(v)).sum::<usize>(),
+        _ => 1,
+    }
+}
+
+fn check_name_len(what: &str, name: &str) -> Result<(), SchemaError> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(invalid(format!(
+            "a {what} is longer than {MAX_NAME_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Structural checks on the JSON, run before the library parses it (see the
+/// header for why). It follows the shapes the library accepts, and leaves
+/// anything it does not recognise to the library to refuse.
+fn prescan(root: &Value) -> Result<(), SchemaError> {
+    if count_values(root) > MAX_JSON_VALUES {
+        return Err(invalid(format!(
+            "the schema has more than {MAX_JSON_VALUES} JSON values"
+        )));
+    }
+    Prescan::default().schema(root)
+}
+
+impl Prescan {
+    fn schema(&mut self, value: &Value) -> Result<(), SchemaError> {
+        match value {
+            Value::String(name) => check_name_len("type name", name),
+            Value::Array(branches) => {
+                if branches.len() > MAX_UNION_BRANCHES {
+                    return Err(invalid(format!(
+                        "a union has more than {MAX_UNION_BRANCHES} branches"
+                    )));
                 }
-                "array" => map.get("items").map_or(Ok(()), check_field_shapes),
-                "map" => map.get("values").map_or(Ok(()), check_field_shapes),
+                branches.iter().try_for_each(|b| self.schema(b))
+            }
+            Value::Object(map) => match map.get("type") {
+                Some(Value::String(kind)) => match kind.as_str() {
+                    "record" | "error" => self.record(value, map),
+                    "enum" => self.enumeration(value, map),
+                    "fixed" => self.fixed(value, map),
+                    "array" => map.get("items").map_or(Ok(()), |v| self.schema(v)),
+                    "map" => map.get("values").map_or(Ok(()), |v| self.schema(v)),
+                    other => check_name_len("type name", other),
+                },
+                Some(Value::Object(_) | Value::Array(_)) => Err(invalid(
+                    "a type object may not hold another type in its 'type'",
+                )),
                 _ => Ok(()),
             },
-            Some(nested @ (Value::Object(_) | Value::Array(_))) => check_field_shapes(nested),
             _ => Ok(()),
-        },
-        _ => Ok(()),
+        }
+    }
+
+    /// Checks shared by every named definition; returns its display name.
+    fn named<'v>(
+        &mut self,
+        value: &Value,
+        map: &'v serde_json::Map<String, Value>,
+    ) -> Result<&'v str, SchemaError> {
+        let name = map.get("name").and_then(Value::as_str).unwrap_or("?");
+        check_name_len("type name", name)?;
+        if let Some(Value::String(namespace)) = map.get("namespace") {
+            check_name_len("namespace", namespace)?;
+        }
+        let last = name.rsplit('.').next().unwrap_or(name);
+        if RESERVED_NAMES.contains(&last) {
+            return Err(invalid(format!("a type cannot be named '{last}'")));
+        }
+        self.named += 1;
+        if self.named > MAX_NAMED_DEFINITIONS {
+            return Err(invalid(format!(
+                "the schema defines more than {MAX_NAMED_DEFINITIONS} named types"
+            )));
+        }
+        let mut aliases = 0;
+        if let Some(Value::Array(list)) = map.get("aliases") {
+            aliases = list.len();
+            if aliases > MAX_ALIASES_PER_TYPE {
+                return Err(invalid(format!(
+                    "type '{name}' has more than {MAX_ALIASES_PER_TYPE} aliases"
+                )));
+            }
+            self.aliases += aliases;
+            if self.aliases > MAX_ALIASES_TOTAL {
+                return Err(invalid(format!(
+                    "the schema has more than {MAX_ALIASES_TOTAL} aliases"
+                )));
+            }
+            for alias in list.iter().filter_map(Value::as_str) {
+                check_name_len("alias", alias)?;
+            }
+        }
+        self.clone_work = self
+            .clone_work
+            .saturating_add((1 + aliases).saturating_mul(count_values(value)));
+        if self.clone_work > MAX_CLONE_WORK {
+            return Err(invalid(format!(
+                "type '{name}' and its aliases make the schema too expensive to parse"
+            )));
+        }
+        Ok(name)
+    }
+
+    fn record(
+        &mut self,
+        value: &Value,
+        map: &serde_json::Map<String, Value>,
+    ) -> Result<(), SchemaError> {
+        let name = self.named(value, map)?;
+        let Some(fields) = map.get("fields") else {
+            return Err(invalid(format!("record '{name}' has no fields")));
+        };
+        let Some(fields) = fields.as_array() else {
+            return Err(invalid(
+                "a record lists its fields in something that is not an array",
+            ));
+        };
+        if fields.len() > MAX_RECORD_FIELDS {
+            return Err(invalid(format!(
+                "record '{name}' has more than {MAX_RECORD_FIELDS} fields"
+            )));
+        }
+        for field in fields {
+            let Some(field) = field.as_object() else {
+                return Err(invalid("a record lists a field that is not an object"));
+            };
+            if let Some(Value::String(field_name)) = field.get("name") {
+                check_name_len("field name", field_name)?;
+            }
+            if let Some(ty) = field.get("type") {
+                self.schema(ty)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enumeration(
+        &mut self,
+        value: &Value,
+        map: &serde_json::Map<String, Value>,
+    ) -> Result<(), SchemaError> {
+        let name = self.named(value, map)?;
+        let Some(Value::Array(symbols)) = map.get("symbols") else {
+            return Err(invalid(format!("enum '{name}' has no symbols")));
+        };
+        if symbols.len() > MAX_ENUM_SYMBOLS {
+            return Err(invalid(format!(
+                "enum '{name}' has more than {MAX_ENUM_SYMBOLS} symbols"
+            )));
+        }
+        symbols
+            .iter()
+            .filter_map(Value::as_str)
+            .try_for_each(|symbol| check_name_len("enum symbol", symbol))
+    }
+
+    fn fixed(
+        &mut self,
+        value: &Value,
+        map: &serde_json::Map<String, Value>,
+    ) -> Result<(), SchemaError> {
+        let name = self.named(value, map)?;
+        match map.get("size") {
+            None => Err(invalid(format!("fixed '{name}' has no size"))),
+            Some(size) => match size.as_u64() {
+                Some(size) if size <= MAX_FIXED_SIZE as u64 => Ok(()),
+                Some(_) => Err(invalid(format!(
+                    "fixed '{name}' is larger than {MAX_FIXED_SIZE} bytes"
+                ))),
+                None => Err(invalid(format!(
+                    "fixed '{name}' has a size that is not a non-negative integer"
+                ))),
+            },
+        }
     }
 }
 
@@ -470,16 +745,18 @@ fn parse_text(schema_text: &str) -> Result<(Schema, Compiled), SchemaError> {
     }
     let value: Value = serde_json::from_str(schema_text)
         .map_err(|e| invalid(format!("the schema is not valid JSON: {e}")))?;
-    check_field_shapes(&value)?;
+    prescan(&value)?;
     let schema =
         Schema::parse(&value).map_err(|e| invalid(format!("not a valid Avro schema: {e}")))?;
     drop(value);
     let mut lowerer = Lowerer {
         nodes: Vec::new(),
         named: HashMap::new(),
+        defaults: Vec::new(),
     };
     let root = lowerer.lower(&schema, 0)?;
-    let mut nodes = lowerer.nodes;
+    lowerer.check_defaults()?;
+    let mut nodes = std::mem::take(&mut lowerer.nodes);
     compute_min_bytes(&mut nodes);
     if nodes[root].min_bytes == INFINITE {
         return Err(invalid(
@@ -551,9 +828,16 @@ impl<'a> Walker<'a> {
         Ok(bytes)
     }
 
-    fn varint(&mut self) -> Walk<u64> {
+    /// A zig-zag varint of at most `max_bytes` bytes: ten for a long, five for
+    /// an int, an enum index or a union index (Java's `readInt` stops there).
+    fn varint(&mut self, max_bytes: usize) -> Walk<u64> {
+        let too_long = if max_bytes == 10 {
+            INT_TOO_LONG
+        } else {
+            INT32_TOO_LONG
+        };
         let mut value = 0u64;
-        for i in 0..10 {
+        for i in 0..max_bytes {
             let byte = *self.data.get(self.pos).ok_or(Fail::Violation(TRUNCATED))?;
             self.pos += 1;
             // The tenth byte may only carry bit 63.
@@ -565,11 +849,18 @@ impl<'a> Walker<'a> {
                 return Ok(value);
             }
         }
-        Err(Fail::Violation(INT_TOO_LONG))
+        Err(Fail::Violation(too_long))
     }
 
     fn long(&mut self) -> Walk<i64> {
-        let n = self.varint()?;
+        let n = self.varint(10)?;
+        Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
+    }
+
+    /// An `int`, enum index or union index: the value may still be out of the
+    /// i32 range, which the caller checks.
+    fn int(&mut self) -> Walk<i64> {
+        let n = self.varint(5)?;
         Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
     }
 
@@ -606,7 +897,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Kind::Int => {
-                if i32::try_from(self.long()?).is_err() {
+                if i32::try_from(self.int()?).is_err() {
                     return Err(Fail::Violation(INT_RANGE));
                 }
             }
@@ -626,11 +917,14 @@ impl<'a> Walker<'a> {
             }
             Kind::String => self.string()?,
             Kind::Fixed { size, .. } => {
+                if *size > self.remaining() {
+                    return Err(Fail::Violation(TRUNCATED));
+                }
                 self.budget.charge(*size as u64 / 8)?;
                 self.take(*size)?;
             }
             Kind::Enum { symbols, .. } => {
-                let index = self.long()?;
+                let index = self.int()?;
                 if index < 0 || index as u64 >= symbols.len() as u64 {
                     return Err(Fail::Violation(BAD_ENUM));
                 }
@@ -638,7 +932,7 @@ impl<'a> Walker<'a> {
             Kind::Array(item) => self.blocks(*item, false, depth)?,
             Kind::Map(value) => self.blocks(*value, true, depth)?,
             Kind::Union(branches) => {
-                let index = self.long()?;
+                let index = self.int()?;
                 if index < 0 || index as u64 >= branches.len() as u64 {
                     return Err(Fail::Violation(BAD_UNION));
                 }
@@ -737,87 +1031,158 @@ fn validate_with(c: &Compiled, payload: &[u8], budget: &mut Budget) -> Result<()
 // Compatibility
 // =============================================================================
 
-#[derive(Clone)]
+/// One step of a failure path. It names a reader record and a field index, not
+/// the field's name, so a path costs nothing per character.
+#[derive(Clone, Copy)]
 enum Step {
-    Field(String),
+    Field { record: NodeId, index: usize },
     Item,
     Entry,
 }
 
-#[derive(Clone)]
+/// What differs. Node ids point into the writer / reader tables, strings are
+/// built in `render` only: a memoized refusal is cloned on every hit, and a
+/// message holding owned names would cost memory proportional to the names.
+#[derive(Clone, Copy)]
 enum Msg {
-    Type { writer: String, reader: String },
-    Names { writer: String, reader: String },
-    FixedSize { name: String },
+    Type {
+        writer: NodeId,
+        reader: NodeId,
+    },
+    Names {
+        writer: NodeId,
+        reader: NodeId,
+    },
+    FixedSize {
+        writer: NodeId,
+    },
     Decimal,
-    EnumSymbol { name: String, symbol: String },
-    MissingDefault { record: String, field: String },
-    UnionWriter { branch: String },
-    UnionReader { branch: String },
+    EnumSymbol {
+        writer: NodeId,
+        symbol: usize,
+    },
+    MissingDefault {
+        writer: NodeId,
+        reader: NodeId,
+        field: usize,
+    },
+    UnionWriter {
+        branch: NodeId,
+    },
+    UnionReader {
+        branch: NodeId,
+    },
+}
+
+/// The enclosing steps of a failure, outermost first, as a shared list: a
+/// clone is a reference count and `within` adds a step in constant time.
+#[derive(Clone, Default)]
+struct Trail(Option<Rc<Link>>);
+
+struct Link {
+    step: Step,
+    inner: Trail,
 }
 
 #[derive(Clone)]
 struct Why {
-    /// Innermost first.
-    steps: Vec<Step>,
+    trail: Trail,
     msg: Msg,
 }
 
 impl Why {
     fn new(msg: Msg) -> Why {
         Why {
-            steps: Vec::new(),
+            trail: Trail::default(),
             msg,
         }
     }
 
-    fn within(mut self, step: Step) -> Why {
-        self.steps.push(step);
-        self
+    fn within(self, step: Step) -> Why {
+        Why {
+            trail: Trail(Some(Rc::new(Link {
+                step,
+                inner: self.trail,
+            }))),
+            msg: self.msg,
+        }
     }
 
     /// `writer` / `reader` are the labels of the sides ("old" / "new").
-    fn render(&self, writer: &str, reader: &str) -> String {
+    fn render(&self, tables: (&[Node], &[Node]), writer: &str, reader: &str) -> String {
+        let (writer_nodes, reader_nodes) = tables;
         let mut path = String::new();
-        for step in self.steps.iter().rev() {
+        let mut at = &self.trail;
+        while let Some(link) = &at.0 {
             path.push('/');
-            match step {
-                Step::Field(name) => path.push_str(name),
+            match link.step {
+                Step::Field { record, index } => {
+                    if let Kind::Record { fields, .. } = &reader_nodes[record].kind {
+                        path.push_str(&fields[index].name);
+                    }
+                }
                 Step::Item => path.push_str("[]"),
                 Step::Entry => path.push_str("{}"),
             }
+            at = &link.inner;
         }
         if path.is_empty() {
             path.push_str("<root>");
         }
-        let text = match &self.msg {
+        let w = |id: NodeId| label(&writer_nodes[id]);
+        let r = |id: NodeId| label(&reader_nodes[id]);
+        let text = match self.msg {
             Msg::Type {
-                writer: w,
-                reader: r,
+                writer: wn,
+                reader: rn,
             } => format!(
-                "{w} written by the {writer} schema cannot be read as {r} by the {reader} schema"
+                "{} written by the {writer} schema cannot be read as {} by the {reader} schema",
+                w(wn),
+                r(rn)
             ),
             Msg::Names {
-                writer: w,
-                reader: r,
-            } => {
-                format!("{w} cannot be read as {r}: the names differ")
+                writer: wn,
+                reader: rn,
+            } => format!("{} cannot be read as {}: the names differ", w(wn), r(rn)),
+            Msg::FixedSize { writer: wn } => {
+                format!("{} has a different size", w(wn))
             }
-            Msg::FixedSize { name } => format!("fixed '{name}' has a different size"),
             Msg::Decimal => "the decimal precision or scale differs".to_string(),
-            Msg::EnumSymbol { name, symbol } => format!(
-                "enum '{name}': symbol '{symbol}' of the {writer} schema is unknown to the \
-                 {reader} schema, which has no default symbol"
-            ),
-            Msg::MissingDefault { record, field } => format!(
-                "the {reader} schema requires field '{field}' of record '{record}', which has no \
-                 default and is missing from the {writer} schema"
-            ),
+            Msg::EnumSymbol { writer: wn, symbol } => {
+                let (name, symbol) = match &writer_nodes[wn].kind {
+                    Kind::Enum { name, symbols, .. } => (name.as_str(), symbols[symbol].as_str()),
+                    _ => ("?", "?"),
+                };
+                format!(
+                    "enum '{name}': symbol '{symbol}' of the {writer} schema is unknown to the \
+                     {reader} schema, which has no default symbol"
+                )
+            }
+            Msg::MissingDefault {
+                writer: wn,
+                reader: rn,
+                field,
+            } => {
+                let record = match &writer_nodes[wn].kind {
+                    Kind::Record { name, .. } => name.as_str(),
+                    _ => "?",
+                };
+                let field = match &reader_nodes[rn].kind {
+                    Kind::Record { fields, .. } => fields[field].name.as_str(),
+                    _ => "?",
+                };
+                format!(
+                    "the {reader} schema requires field '{field}' of record '{record}', which has \
+                     no default and is missing from the {writer} schema"
+                )
+            }
             Msg::UnionWriter { branch } => format!(
-                "the {writer} schema may write {branch}, which the {reader} schema cannot read"
+                "the {writer} schema may write {}, which the {reader} schema cannot read",
+                w(branch)
             ),
             Msg::UnionReader { branch } => format!(
-                "no branch of the {reader} union can read {branch} written by the {writer} schema"
+                "no branch of the {reader} union can read {} written by the {writer} schema",
+                w(branch)
             ),
         };
         format!("{}: {text}", shorten_path(&path))
@@ -890,6 +1255,30 @@ fn promotes(writer: &Kind, reader: &Kind) -> bool {
     )
 }
 
+/// The reader branch a writer type is resolved against: Avro takes the FIRST
+/// reader branch that matches and resolves against that one alone, so a later
+/// branch never rescues an incompatible earlier one. A record matches by
+/// unqualified name (or a reader alias); an enum or fixed must match by full
+/// name, as Java's decoder requires; any other type by kind first, and only
+/// then by promotion.
+fn reader_branch(writer: &Kind, reader: &[Node], branches: &[NodeId]) -> Option<NodeId> {
+    let first =
+        |keep: &dyn Fn(&Kind) -> bool| branches.iter().copied().find(|&b| keep(&reader[b].kind));
+    match writer {
+        Kind::Record { .. } => {
+            first(&|r| matches!(r, Kind::Record { .. }) && names_match(writer, r))
+        }
+        Kind::Enum { full_names: w, .. } => {
+            first(&|r| matches!(r, Kind::Enum { full_names, .. } if full_names.accepts(&w.name)))
+        }
+        Kind::Fixed { full_names: w, .. } => {
+            first(&|r| matches!(r, Kind::Fixed { full_names, .. } if full_names.accepts(&w.name)))
+        }
+        _ => first(&|r| std::mem::discriminant(writer) == std::mem::discriminant(r))
+            .or_else(|| first(&|r| promotes(writer, r))),
+    }
+}
+
 struct Compat<'a> {
     writer: &'a [Node],
     reader: &'a [Node],
@@ -944,17 +1333,13 @@ impl Compat<'_> {
         verdict
     }
 
+    /// `w` read through a reader union: resolved against the one branch
+    /// `reader_branch` picks, and refused when there is none.
     fn any_reader_branch(&mut self, w: NodeId, branches: &[NodeId]) -> Verdict {
-        for &r in branches {
-            match self.reads(w, r) {
-                Ok(()) => return Ok(()),
-                Err(Stop::No(_)) => {}
-                Err(Stop::Complex) => return Err(Stop::Complex),
-            }
+        match reader_branch(&self.writer[w].kind, self.reader, branches) {
+            Some(branch) => self.reads(w, branch),
+            None => Err(Stop::No(Why::new(Msg::UnionReader { branch: w }))),
         }
-        Err(Stop::No(Why::new(Msg::UnionReader {
-            branch: label(&self.writer[w]),
-        })))
     }
 
     fn decide(&mut self, w: NodeId, r: NodeId) -> Verdict {
@@ -968,9 +1353,7 @@ impl Compat<'_> {
                     match self.any_reader_branch(branch, rb) {
                         Ok(()) => {}
                         Err(Stop::No(_)) => {
-                            return Err(Stop::No(Why::new(Msg::UnionWriter {
-                                branch: label(&writer_nodes[branch]),
-                            })))
+                            return Err(Stop::No(Why::new(Msg::UnionWriter { branch })))
                         }
                         Err(Stop::Complex) => return Err(Stop::Complex),
                     }
@@ -982,9 +1365,7 @@ impl Compat<'_> {
                     match self.reads(branch, r) {
                         Ok(()) => {}
                         Err(Stop::No(_)) => {
-                            return Err(Stop::No(Why::new(Msg::UnionWriter {
-                                branch: label(&writer_nodes[branch]),
-                            })))
+                            return Err(Stop::No(Why::new(Msg::UnionWriter { branch })))
                         }
                         Err(Stop::Complex) => return Err(Stop::Complex),
                     }
@@ -1001,22 +1382,20 @@ impl Compat<'_> {
             {
                 Err(Stop::No(Why::new(Msg::Decimal)))
             }
-            (Kind::Fixed { name, size: ws, .. }, Kind::Fixed { size: rs, .. }) => {
+            (Kind::Fixed { size: ws, .. }, Kind::Fixed { size: rs, .. }) => {
                 if !names_match(wk, rk) {
                     return Err(Stop::No(Why::new(Msg::Names {
-                        writer: label(&writer_nodes[w]),
-                        reader: label(&reader_nodes[r]),
+                        writer: w,
+                        reader: r,
                     })));
                 }
                 if ws != rs {
-                    return Err(Stop::No(Why::new(Msg::FixedSize { name: name.clone() })));
+                    return Err(Stop::No(Why::new(Msg::FixedSize { writer: w })));
                 }
                 Ok(())
             }
             (
-                Kind::Enum {
-                    name, symbols: ws, ..
-                },
+                Kind::Enum { symbols: ws, .. },
                 Kind::Enum {
                     symbols: rs,
                     has_default,
@@ -1025,8 +1404,8 @@ impl Compat<'_> {
             ) => {
                 if !names_match(wk, rk) {
                     return Err(Stop::No(Why::new(Msg::Names {
-                        writer: label(&writer_nodes[w]),
-                        reader: label(&reader_nodes[r]),
+                        writer: w,
+                        reader: r,
                     })));
                 }
                 if *has_default {
@@ -1034,12 +1413,9 @@ impl Compat<'_> {
                 }
                 self.charge((ws.len() + rs.len()) as u64)?;
                 let known: HashSet<&String> = rs.iter().collect();
-                match ws.iter().find(|s| !known.contains(s)) {
+                match ws.iter().position(|s| !known.contains(s)) {
                     None => Ok(()),
-                    Some(symbol) => Err(Stop::No(Why::new(Msg::EnumSymbol {
-                        name: name.clone(),
-                        symbol: symbol.clone(),
-                    }))),
+                    Some(symbol) => Err(Stop::No(Why::new(Msg::EnumSymbol { writer: w, symbol }))),
                 }
             }
             (Kind::Array(wi), Kind::Array(ri)) => self
@@ -1048,24 +1424,18 @@ impl Compat<'_> {
             (Kind::Map(wv), Kind::Map(rv)) => self
                 .reads(*wv, *rv)
                 .map_err(|stop| within(stop, Step::Entry)),
-            (
-                Kind::Record {
-                    fields: wf,
-                    name: record,
-                    ..
-                },
-                Kind::Record { fields: rf, .. },
-            ) => {
+            (Kind::Record { fields: wf, .. }, Kind::Record { fields: rf, .. }) => {
                 if !names_match(wk, rk) {
                     return Err(Stop::No(Why::new(Msg::Names {
-                        writer: label(&writer_nodes[w]),
-                        reader: label(&reader_nodes[r]),
+                        writer: w,
+                        reader: r,
                     })));
                 }
                 self.charge((wf.len() + rf.len()) as u64)?;
                 let by_name: HashMap<&str, &Field> =
                     wf.iter().map(|f| (f.name.as_str(), f)).collect();
-                for field in rf {
+                for (index, field) in rf.iter().enumerate() {
+                    let step = Step::Field { record: r, index };
                     // The reader's own name first, then its aliases; a writer
                     // alias never matches.
                     let source = std::iter::once(field.name.as_str())
@@ -1074,15 +1444,16 @@ impl Compat<'_> {
                     match source {
                         Some(from) => self
                             .reads(from.node, field.node)
-                            .map_err(|stop| within(stop, Step::Field(field.name.clone())))?,
+                            .map_err(|stop| within(stop, step))?,
                         None if field.has_default => {}
                         None => {
                             return Err(Stop::No(
                                 Why::new(Msg::MissingDefault {
-                                    record: record.clone(),
-                                    field: field.name.clone(),
+                                    writer: w,
+                                    reader: r,
+                                    field: index,
                                 })
-                                .within(Step::Field(field.name.clone())),
+                                .within(step),
                             ))
                         }
                     }
@@ -1091,8 +1462,8 @@ impl Compat<'_> {
             }
             _ if promotes(wk, rk) => Ok(()),
             _ => Err(Stop::No(Why::new(Msg::Type {
-                writer: label(&writer_nodes[w]),
-                reader: label(&reader_nodes[r]),
+                writer: w,
+                reader: r,
             }))),
         }
     }
@@ -1122,25 +1493,44 @@ fn reads(writer: &Compiled, reader: &Compiled) -> Verdict {
 // Projection
 // =============================================================================
 
-fn collect_definitions<'s>(schema: &'s Schema, out: &mut HashMap<String, &'s Schema>) {
+/// The name and aliases of a schema that defines a named type.
+fn definition_names(schema: &Schema) -> Option<(&Name, &Option<Vec<Alias>>)> {
     match schema {
-        Schema::Record(r) => {
-            out.entry(r.name.fullname(None)).or_insert(schema);
-            for f in &r.fields {
-                collect_definitions(&f.schema, out);
-            }
-        }
-        Schema::Enum(e) => {
-            out.entry(e.name.fullname(None)).or_insert(schema);
-        }
+        Schema::Record(r) => Some((&r.name, &r.aliases)),
+        Schema::Enum(e) => Some((&e.name, &e.aliases)),
         Schema::Fixed(f) | Schema::Uuid(UuidSchema::Fixed(f)) | Schema::Duration(f) => {
-            out.entry(f.name.fullname(None)).or_insert(schema);
+            Some((&f.name, &f.aliases))
         }
-        Schema::Decimal(d) => {
-            if let InnerDecimalSchema::Fixed(f) = &d.inner {
-                out.entry(f.name.fullname(None)).or_insert(schema);
-            }
+        Schema::Decimal(d) => match &d.inner {
+            InnerDecimalSchema::Fixed(f) => Some((&f.name, &f.aliases)),
+            InnerDecimalSchema::Bytes => None,
+        },
+        _ => None,
+    }
+}
+
+/// Every full name a definition answers to: its own and its aliases'.
+fn answers_to(name: &Name, aliases: &Option<Vec<Alias>>) -> impl Iterator<Item = String> {
+    std::iter::once(name.fullname(None)).chain(
+        aliases
+            .iter()
+            .flatten()
+            .map(|alias| alias.fullname(None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn collect_definitions<'s>(schema: &'s Schema, out: &mut HashMap<String, &'s Schema>) {
+    if let Some((name, aliases)) = definition_names(schema) {
+        for full in answers_to(name, aliases) {
+            out.entry(full).or_insert(schema);
         }
+    }
+    match schema {
+        Schema::Record(r) => r
+            .fields
+            .iter()
+            .for_each(|f| collect_definitions(&f.schema, out)),
         Schema::Array(a) => collect_definitions(&a.items, out),
         Schema::Map(m) => collect_definitions(&m.types, out),
         Schema::Union(u) => u
@@ -1153,12 +1543,19 @@ fn collect_definitions<'s>(schema: &'s Schema, out: &mut HashMap<String, &'s Sch
 
 /// `schema` as it stands in the projection: a named type is written in full
 /// at its first mention in the output and by reference afterwards, even when
-/// its original definition was in a field the projection dropped.
+/// its original definition was in a field the projection dropped (or an
+/// inline definition sits after a mention that already pulled it in).
 fn rebuild(
     schema: &Schema,
     definitions: &HashMap<String, &Schema>,
     written: &mut HashSet<String>,
 ) -> Result<Schema, SchemaError> {
+    if let Some((name, aliases)) = definition_names(schema) {
+        if written.contains(&name.fullname(None)) {
+            return Ok(Schema::Ref { name: name.clone() });
+        }
+        written.extend(answers_to(name, aliases));
+    }
     Ok(match schema {
         Schema::Ref { name } => {
             let full = name.fullname(None);
@@ -1171,27 +1568,12 @@ fn rebuild(
             }
         }
         Schema::Record(r) => {
-            written.insert(r.name.fullname(None));
             let fields = r
                 .fields
                 .iter()
                 .map(|f| rebuild_field(f, definitions, written))
                 .collect::<Result<Vec<_>, _>>()?;
             record_with(r, fields)
-        }
-        Schema::Enum(e) => {
-            written.insert(e.name.fullname(None));
-            schema.clone()
-        }
-        Schema::Fixed(f) | Schema::Uuid(UuidSchema::Fixed(f)) | Schema::Duration(f) => {
-            written.insert(f.name.fullname(None));
-            schema.clone()
-        }
-        Schema::Decimal(d) => {
-            if let InnerDecimalSchema::Fixed(f) = &d.inner {
-                written.insert(f.name.fullname(None));
-            }
-            schema.clone()
         }
         Schema::Array(a) => Schema::Array(ArraySchema {
             items: Box::new(rebuild(&a.items, definitions, written)?),
@@ -1285,7 +1667,7 @@ impl SchemaKindOps for AvroOps {
         let mut definitions = HashMap::new();
         collect_definitions(&schema, &mut definitions);
         let mut written = HashSet::new();
-        written.insert(root.name.fullname(None));
+        written.extend(answers_to(&root.name, &root.aliases));
         let fields = root
             .fields
             .iter()
@@ -1317,7 +1699,7 @@ impl SchemaKindOps for AvroOps {
                 Ok(()) => Ok(()),
                 Err(Stop::No(why)) => Err(SchemaError::Incompatible(format!(
                     "{lead} - {}",
-                    why.render(labels.0, labels.1)
+                    why.render((&writer.nodes, &reader.nodes), labels.0, labels.1)
                 ))),
                 Err(Stop::Complex) => Err(SchemaError::LimitExceeded(TOO_COMPLEX.to_string())),
             };
@@ -1875,7 +2257,8 @@ mod tests {
             let reason = refusal(&rec(field));
             assert!(
                 reason.contains("not a valid Avro schema")
-                    || reason.contains("does not fit the first branch of its union"),
+                    || reason.contains("does not fit the first branch of its union")
+                    || reason.contains("does not fit its type"),
                 "{field}: {reason}"
             );
         }
@@ -2188,24 +2571,24 @@ mod tests {
 
     #[test]
     fn a_comparison_that_runs_out_of_budget_is_not_called_compatible() {
-        // 64 records that share the unqualified name `Q` (so they are matched
-        // with each other), each with 8 fields that are a union of all the
-        // earlier ones: every pair of records pairs 8 unions of up to 64 x 64
-        // branches.
+        // 64 records X0..X63, each with 16 fields that are a union of all the
+        // earlier ones: a union is read through the one same-named branch, so
+        // every record pairs only with itself, but each of those pairs still
+        // weighs 16 unions of up to 64 x 64 branches.
         let mut fields = Vec::new();
         for i in 0..64 {
-            let earlier: Vec<String> = (0..i).map(|j| format!("\"n{j}.Q\"")).collect();
+            let earlier: Vec<String> = (0..i).map(|j| format!("\"X{j}\"")).collect();
             let ty = if earlier.is_empty() {
                 "\"int\"".to_string()
             } else {
                 format!("[\"null\",{}]", earlier.join(","))
             };
-            let inner = (0..8)
+            let inner = (0..16)
                 .map(|f| format!(r#"{{"name":"f{f}","type":{ty}}}"#))
                 .collect::<Vec<_>>()
                 .join(",");
             fields.push(format!(
-                r#"{{"name":"g{i}","type":{{"type":"record","name":"Q","namespace":"n{i}","fields":[{inner}]}}}}"#
+                r#"{{"name":"g{i}","type":{{"type":"record","name":"X{i}","fields":[{inner}]}}}}"#
             ));
         }
         let schema = rec(&fields.join(","));
@@ -2232,7 +2615,7 @@ mod tests {
         let (_, r) = parse_text(reader).unwrap();
         match reads(&w, &r) {
             Ok(()) => Ok(()),
-            Err(Stop::No(why)) => Err(why.render("writer", "reader")),
+            Err(Stop::No(why)) => Err(why.render((&w.nodes, &r.nodes), "writer", "reader")),
             Err(Stop::Complex) => panic!("too complex"),
         }
     }
@@ -2685,6 +3068,40 @@ mod tests {
     }
 
     #[test]
+    fn derive_writes_a_definition_once_whichever_way_it_is_reached() {
+        // `A` holds the definition of `B`; both are mentioned by name after
+        // their (dropped) definitions. `e` pulls `B` in, so the copy of `B`
+        // inside `A`, which `f` pulls in next, must become a reference.
+        let schema = rec(
+            r#"{"name":"d","type":{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[]}}]}},
+               {"name":"e","type":"B"},{"name":"f","type":"A"}"#,
+        );
+        let derived = AVRO_OPS
+            .derive_subschema(&schema, &allowed(&["e", "f"]))
+            .unwrap();
+        assert_eq!(derived.matches("\"name\":\"B\"").count(), 1, "{derived}");
+        assert_eq!(derived.matches("\"name\":\"A\"").count(), 1, "{derived}");
+        assert!(AVRO_OPS.compile(&derived).is_ok(), "{derived}");
+        assert!(check(&derived, b"").is_ok());
+
+        // A mention by alias reaches the definition too, and the real name
+        // is a reference afterwards.
+        let aliased = rec(
+            r#"{"name":"d","type":{"type":"record","name":"A","aliases":["Old"],"fields":[{"name":"z","type":"int"}]}},
+               {"name":"e","type":"Old"},{"name":"f","type":"A"},{"name":"g","type":"Old"}"#,
+        );
+        let derived = AVRO_OPS
+            .derive_subschema(&aliased, &allowed(&["e", "f", "g"]))
+            .unwrap();
+        assert_eq!(derived.matches("\"name\":\"A\"").count(), 1, "{derived}");
+        assert!(AVRO_OPS.compile(&derived).is_ok(), "{derived}");
+        assert!(check(&derived, &[2, 4, 6]).is_ok());
+        assert!(AVRO_OPS
+            .check_compatibility(&aliased, &derived, Compatibility::Backward)
+            .is_ok());
+    }
+
+    #[test]
     fn derive_refuses_a_root_that_is_not_a_record() {
         assert!(matches!(
             AVRO_OPS.derive_subschema(r#""string""#, &allowed(&["a"])),
@@ -2694,6 +3111,385 @@ mod tests {
             AVRO_OPS.derive_subschema("nope", &allowed(&[])),
             Err(SchemaError::Invalid(_))
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // The pre-scan: what the library would multiply, refused before it runs
+    // -------------------------------------------------------------------------
+
+    fn int_fields(n: usize) -> String {
+        (0..n)
+            .map(|i| format!(r#"{{"name":"f{i}","type":"int"}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn quick_refusal(what: &str, schema: &str) -> String {
+        assert!(
+            schema.len() <= MAX_SCHEMA_TEXT_BYTES,
+            "{what}: input too big"
+        );
+        quickly(what, Duration::from_millis(250), || refusal(schema))
+    }
+
+    #[test]
+    fn aliases_cannot_multiply_the_library_parse() {
+        // The library clones a named type once per alias: 18 000 aliases on a
+        // 1000-field record is ~190 KB of text and tens of GB of copies.
+        let aliases = (0..18_000)
+            .map(|i| format!("\"a{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bomb = format!(
+            r#"{{"type":"record","name":"R","aliases":[{aliases}],"fields":[{}]}}"#,
+            int_fields(1000)
+        );
+        assert!(quick_refusal("alias bomb", &bomb).contains("more than 64 aliases"));
+
+        let with = |n: usize, tag: &str| {
+            let list = (0..n)
+                .map(|i| format!("\"{tag}{i}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#""aliases":[{list}]"#)
+        };
+        let record = |name: &str, n: usize| {
+            format!(
+                r#"{{"name":"{name}","type":{{"type":"record","name":"{name}T",{},"fields":[{{"name":"x","type":"int"}}]}}}}"#,
+                with(n, name)
+            )
+        };
+        let spread = |each: usize, count: usize| {
+            let fields = (0..count)
+                .map(|k| record(&format!("t{k}"), each))
+                .collect::<Vec<_>>()
+                .join(",");
+            rec(&fields)
+        };
+        // 64 per type is allowed; 256 aliases in all are allowed, 260 are not.
+        assert!(AVRO_OPS.compile(&spread(64, 4)).is_ok());
+        assert!(AVRO_OPS.compile(&spread(65, 1)).is_err());
+        assert!(quick_refusal("alias total", &spread(52, 5)).contains("more than 256 aliases"));
+    }
+
+    #[test]
+    fn a_definition_copied_per_alias_is_weighed_by_its_size() {
+        let aliases = |tag: &str| {
+            (0..64)
+                .map(|i| format!("\"{tag}{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let record = |name: &str, tail: &str| {
+            format!(
+                r#"{{"type":"record","name":"{name}","aliases":[{}],"fields":[{}{tail}]}}"#,
+                aliases(&name.to_lowercase()),
+                int_fields(1024)
+            )
+        };
+        // One such record copies 65 x ~5k values; three nested in each other copy
+        // each inner definition once more per enclosing alias list.
+        assert!(AVRO_OPS.compile(&record("C", "")).is_ok());
+        let c = record("C", "");
+        let b = record("B", &format!(r#",{{"name":"c","type":{c}}}"#));
+        let a = record("A", &format!(r#",{{"name":"b","type":{b}}}"#));
+        assert!(quick_refusal("clone work", &a).contains("too expensive to parse"));
+    }
+
+    #[test]
+    fn a_type_named_like_a_keyword_cannot_make_the_parser_copy_itself() {
+        // `{"type":"record"}` without fields means "the type named record" to the
+        // library, which returns a full copy of it. Chained through types named
+        // record, enum and fixed, 40 references per level copy 40^3 times.
+        let refs = |kind: &str| {
+            (0..40)
+                .map(|i| format!(r#"{{"name":"r{i}","type":{{"type":"{kind}"}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let bomb = format!(
+            r#"{{"type":"record","name":"R","fields":[
+                {{"name":"a","type":{{"type":"record","name":"record","fields":[{}]}}}},
+                {{"name":"b","type":{{"type":"record","name":"enum","fields":[{}]}}}},
+                {{"name":"c","type":{{"type":"record","name":"fixed","fields":[{}]}}}},
+                {}]}}"#,
+            int_fields(5),
+            refs("record"),
+            refs("enum"),
+            refs("fixed")
+        );
+        assert!(quick_refusal("copy bomb", &bomb).contains("a type cannot be named 'record'"));
+
+        for name in [
+            "enum", "fixed", "array", "map", "error", "null", "int", "string", "p.record",
+        ] {
+            let schema = format!(r#"{{"type":"enum","name":"{name}","symbols":["A"]}}"#);
+            let reason = quick_refusal("keyword name", &schema);
+            assert!(
+                reason.contains("a type cannot be named"),
+                "{name}: {reason}"
+            );
+        }
+        assert!(AVRO_OPS
+            .compile(r#"{"type":"enum","name":"records","symbols":["A"]}"#)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_definition_missing_its_body_and_a_nested_type_object_are_refused() {
+        for (schema, expected) in [
+            (
+                r#"{"type":"record","name":"R"}"#,
+                "record 'R' has no fields",
+            ),
+            (r#"{"type":"record"}"#, "record '?' has no fields"),
+            (r#"{"type":"enum","name":"E"}"#, "enum 'E' has no symbols"),
+            (r#"{"type":"fixed","name":"F"}"#, "fixed 'F' has no size"),
+            (
+                r#"{"type":"fixed","name":"F","size":-1}"#,
+                "not a non-negative integer",
+            ),
+            (
+                r#"{"type":{"type":"array","items":"int"}}"#,
+                "may not hold another type",
+            ),
+        ] {
+            let reason = quick_refusal("bodiless", schema);
+            assert!(reason.contains(expected), "{schema}: {reason}");
+        }
+        let nested = rec(r#"{"name":"a","type":{"type":"enum","name":"E"}}"#);
+        assert!(quick_refusal("nested bodiless", &nested).contains("enum 'E' has no symbols"));
+    }
+
+    #[test]
+    fn a_decimal_fixed_cannot_be_big_enough_to_overflow_the_library() {
+        // In a debug build the library overflows computing the precision a
+        // `fixed` of 2^28 bytes can hold.
+        for size in ["268435456", "4294967296", "18446744073709551615"] {
+            let schema = format!(
+                r#"{{"type":"fixed","name":"F","size":{size},"logicalType":"decimal","precision":10}}"#
+            );
+            assert!(
+                quick_refusal("huge decimal fixed", &schema).contains("fixed 'F' is larger than"),
+                "{size}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_are_bounded_where_messages_quote_them() {
+        let long = "n".repeat(MAX_NAME_LEN + 1);
+        let at_limit = "n".repeat(MAX_NAME_LEN);
+        let schemas = |name: &str| {
+            [
+                format!(r#"{{"type":"enum","name":"{name}","symbols":["A"]}}"#),
+                format!(r#"{{"type":"enum","name":"E","namespace":"{name}","symbols":["A"]}}"#),
+                format!(r#"{{"type":"enum","name":"E","symbols":["{name}"]}}"#),
+                format!(r#"{{"type":"enum","name":"E","aliases":["{name}"],"symbols":["A"]}}"#),
+                rec(&format!(r#"{{"name":"{name}","type":"int"}}"#)),
+            ]
+        };
+        for schema in schemas(&at_limit) {
+            assert!(AVRO_OPS.compile(&schema).is_ok(), "{schema:.60}");
+        }
+        for schema in schemas(&long) {
+            let reason = quick_refusal("long name", &schema);
+            assert!(reason.contains("is longer than 256 bytes"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_alias_may_not_collide_with_another_name() {
+        let alias_of = |first: &str, second: &str| {
+            rec(&format!(
+                r#"{{"name":"a","type":{{"type":"enum","name":"E","aliases":[{first}],"symbols":["A"]}}}},
+                   {{"name":"b","type":{{"type":"enum","name":"G","aliases":[{second}],"symbols":["A"]}}}}"#
+            ))
+        };
+        // Two types sharing an alias, an alias that is another type's name
+        // (defined before or after), and the same alias listed twice.
+        assert!(refusal(&alias_of(r#""X""#, r#""X""#)).contains("alias 'X' of type 'G'"));
+        assert!(refusal(&alias_of("", r#""E""#)).contains("alias 'E' of type 'G'"));
+        assert!(refusal(&alias_of(r#""G""#, "")).contains("'G'"));
+        assert!(refusal(&alias_of(r#""X","X""#, "")).contains("alias 'X' of type 'E'"));
+        assert!(AVRO_OPS.compile(&alias_of(r#""X""#, r#""Y""#)).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // Compatibility details
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn a_memoized_refusal_is_constant_size() {
+        // A memo hit clones the refusal; a refusal that owned the names in the
+        // message would copy them every time.
+        assert!(
+            std::mem::size_of::<Why>() <= 48,
+            "{}",
+            std::mem::size_of::<Why>()
+        );
+        let name = "N".repeat(MAX_NAME_LEN);
+        let writer = format!(
+            r#"{{"type":"record","name":"{name}","fields":[{{"name":"a","type":"long"}}]}}"#
+        );
+        let reader = writer.replace("long", "int");
+        let message = reads_text(&writer, &reader).unwrap_err();
+        assert!(
+            message.starts_with("/a: long written by the writer schema"),
+            "{message}"
+        );
+        let renamed = writer.replace(&name, &"M".repeat(MAX_NAME_LEN));
+        let message = reads_text(&writer, &renamed).unwrap_err();
+        assert!(message.len() < 1024, "{}", message.len());
+    }
+
+    #[test]
+    fn a_reader_union_is_resolved_against_the_first_matching_branch_only() {
+        let writer = rec(r#"{"name":"a","type":"int"}"#);
+        let branch = |namespace: &str, ty: &str| {
+            format!(
+                r#"{{"type":"record","name":"R","namespace":"{namespace}","fields":[{{"name":"a","type":"{ty}"}}]}}"#
+            )
+        };
+        // The first branch named R cannot read the int; a later one could.
+        let reader = format!("[{},{}]", branch("n1", "string"), branch("n2", "int"));
+        let why = reads_text(&writer, &reader).unwrap_err();
+        assert!(why.contains("/a:"), "{why}");
+        // Swapped, the first match is the compatible one.
+        let reader = format!("[{},{}]", branch("n2", "int"), branch("n1", "string"));
+        assert!(reads_text(&writer, &reader).is_ok());
+        // No branch carries the name: nothing to resolve against.
+        let other = writer.replace("\"R\"", "\"S\"");
+        let why = reads_text(&other, &reader).unwrap_err();
+        assert!(why.contains("no branch of the reader union"), "{why}");
+
+        // Primitives: the exact type wins over an earlier promotion, and a
+        // promotion is taken only when no branch has the exact type.
+        assert!(reads_text(r#""int""#, r#"["long","int"]"#).is_ok());
+        assert!(reads_text(r#""long""#, r#"["int","float"]"#).is_ok());
+        assert!(reads_text(r#""string""#, r#"["int","bytes"]"#).is_ok());
+        assert!(reads_text(r#""string""#, r#"["int","long"]"#).is_err());
+    }
+
+    #[test]
+    fn an_enum_or_fixed_in_a_reader_union_must_match_by_full_name() {
+        let enum_in = |namespace: &str, aliases: &str| {
+            format!(
+                r#"{{"type":"enum","name":"E","namespace":"{namespace}","aliases":[{aliases}],"symbols":["A"]}}"#
+            )
+        };
+        let fixed_in = |namespace: &str| {
+            format!(r#"{{"type":"fixed","name":"F","namespace":"{namespace}","size":2}}"#)
+        };
+        let writer = enum_in("n1", "");
+        // Alone, namespaces do not matter (unqualified names are compared) ...
+        assert!(reads_text(&writer, &enum_in("n2", "")).is_ok());
+        assert!(reads_text(&fixed_in("n1"), &fixed_in("n2")).is_ok());
+        // ... through a union they do, unless the reader names the writer's
+        // full name as an alias.
+        let null = r#""null""#;
+        assert!(reads_text(&writer, &format!("[{null},{}]", enum_in("n1", ""))).is_ok());
+        assert!(reads_text(&writer, &format!("[{null},{}]", enum_in("n2", ""))).is_err());
+        assert!(reads_text(&writer, &format!("[{null},{}]", enum_in("n2", r#""n1.E""#))).is_ok());
+        assert!(reads_text(&fixed_in("n1"), &format!("[{null},{}]", fixed_in("n1"))).is_ok());
+        assert!(reads_text(&fixed_in("n1"), &format!("[{null},{}]", fixed_in("n2"))).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Defaults, integer encodings, truncation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn a_default_must_fit_its_type_fully() {
+        let field =
+            |ty: &str, default: &str| format!(r#"{{"name":"a","type":{ty},"default":{default}}}"#);
+        let fixed2 = r#"{"type":"fixed","name":"F","size":2}"#;
+        let record = r#"{"type":"record","name":"P","fields":[{"name":"x","type":"int"},{"name":"y","type":"string","default":""}]}"#;
+        let enumeration = r#"{"type":"enum","name":"E","symbols":["A","B"]}"#;
+        let accepted = [
+            field(fixed2, r#""ab""#),
+            field(fixed2, r#""ÿ\u0000""#),
+            field(&format!("[{fixed2},\"null\"]"), r#""ab""#),
+            field(r#"["int","long"]"#, "5"),
+            field(r#"["long","int"]"#, "5000000000"),
+            field(&format!("[{enumeration},\"null\"]"), r#""B""#),
+            field(&format!("[{record},\"null\"]"), r#"{"x":1}"#),
+            field(&format!("[{record},\"null\"]"), r#"{"x":1,"y":"s"}"#),
+            field(r#"[{"type":"array","items":"int"},"null"]"#, "[1,2]"),
+        ];
+        for default in &accepted {
+            assert!(AVRO_OPS.compile(&rec(default)).is_ok(), "{default}");
+        }
+        let refused = [
+            field(fixed2, r#""abc""#),
+            field(fixed2, r#""a""#),
+            field(fixed2, r#""Āa""#),
+            field(&format!("[{fixed2},\"null\"]"), r#""abc""#),
+            // The first branch is an int: an i64-only value does not fit it.
+            field(r#"["int","long"]"#, "5000000000"),
+            field(r#"["int","long"]"#, "-2147483649"),
+            // The first branch is the enum; "C" is only a valid string.
+            field(&format!("[{enumeration},\"string\"]"), r#""C""#),
+            field(&format!("[{record},\"null\"]"), "{}"),
+            field(&format!("[{record},\"null\"]"), r#"{"x":"s"}"#),
+            field(r#"[{"type":"array","items":"int"},"null"]"#, r#"["x"]"#),
+            field(r#"["int","string"]"#, "1.5"),
+        ];
+        for default in &refused {
+            let reason = refusal(&rec(default));
+            assert!(
+                reason.contains("does not fit") || reason.contains("not a valid Avro schema"),
+                "{default}: {reason}"
+            );
+        }
+        // These two are accepted by the library, so only the new check refuses them.
+        for default in [&refused[0], &refused[4]] {
+            assert!(refusal(&rec(default)).contains("does not fit"), "{default}");
+        }
+    }
+
+    #[test]
+    fn int_enum_and_union_encodings_stop_at_five_bytes() {
+        let int = rec(r#"{"name":"i","type":"int"}"#);
+        let long = rec(r#"{"name":"l","type":"long"}"#);
+        let enumeration = rec(r#"{"name":"e","type":{"type":"enum","name":"E","symbols":["A"]}}"#);
+        let union = rec(r#"{"name":"u","type":["null","int"]}"#);
+        // Zero padded with continuation bytes: five bytes are fine, six are not.
+        let padded = |n: usize| {
+            let mut bytes = vec![0x80; n - 1];
+            bytes.push(0);
+            bytes
+        };
+        for schema in [&int, &enumeration] {
+            assert!(check(schema, &padded(5)).is_ok(), "{schema}");
+            assert!(
+                violation(check(schema, &padded(6))).contains("longer than 5 bytes"),
+                "{schema}"
+            );
+        }
+        assert!(check(&union, &[&padded(5)[..]].concat()).is_ok());
+        assert!(violation(check(&union, &padded(6)))
+            .contains("/u: int encoding is longer than 5 bytes"));
+        // A long keeps its ten.
+        assert!(check(&long, &padded(10)).is_ok());
+        assert!(violation(check(&long, &padded(11))).contains("longer than 10 bytes"));
+        // Five bytes that overflow an int are out of range, not accepted.
+        assert!(violation(check(&int, &[0x80, 0x80, 0x80, 0x80, 0x20]))
+            .contains("/i: value does not fit"));
+    }
+
+    #[test]
+    fn a_truncated_fixed_is_a_violation_not_a_limit() {
+        let big = rec(r#"{"name":"f","type":{"type":"fixed","name":"F","size":16777216}}"#);
+        let (_, c) = parse_text(&big).unwrap();
+        // The charge for 16 MiB (2M units) would not fit this budget, but the
+        // payload is simply too short, which is the more useful answer.
+        let outcome = validate_with(&c, b"", &mut Budget::new(100));
+        assert!(violation(outcome).contains("/f: payload ends"));
+        // With the bytes present, the same budget does run out.
+        let payload = vec![0u8; 16 * 1024 * 1024];
+        let outcome = validate_with(&c, &payload, &mut Budget::new(100));
+        assert!(limit(outcome).contains("validation work budget"));
     }
 
     // -------------------------------------------------------------------------

@@ -1001,10 +1001,7 @@ mod tests {
         for (payload, expected) in [
             (&b""[..], "/id: payload ends before the value is complete"),
             (&[0, 0, 0, 0, 0][..], "<root>: bytes remain after the value"),
-            (
-                &[0xff; 11][..],
-                "/id: integer encoding is longer than 10 bytes or overflows 64 bits",
-            ),
+            (&[0xff; 11][..], "/id: int encoding is longer than 5 bytes"),
             (
                 &[0x80, 0x80, 0x80, 0x80, 0x10][..],
                 "/id: value does not fit the int type",

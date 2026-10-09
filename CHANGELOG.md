@@ -93,9 +93,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (parser Avro pomijał je po cichu), dwukrotna definicja tej samej nazwy
   (parser brał pierwszą) i wartość domyślna pola unii niepasująca do
   pierwszego wariantu.
+- Schemat Avro jest sprawdzany strukturalnie, zanim zobaczy go biblioteka:
+  `Schema::parse` kopiuje całe poddrzewo typu nazwanego raz na nazwę i raz na
+  alias, a obiekt bez `fields`/`symbols`/`size`, którego `type` nazywa już
+  sparsowany typ, zwraca jego pełną kopię (zagnieżdżone: m^k kopii z 20 KB
+  tekstu). Odrzucane są: ponad 50 000 wartości JSON, 64 aliasy na typ i 256 w
+  całym schemacie, 4096 typów nazwanych, praca kopiowania (aliasy x rozmiar
+  definicji) ponad milion wartości, nazwa/namespace/alias/pole/symbol dłuższe
+  niż 256 bajtów, `record`/`enum`/`fixed` bez treści, typ nazwany jak słowo
+  kluczowe lub typ prosty (`record`, `map`, `int`, ...), `type` zawierający
+  kolejny obiekt typu oraz alias równy nazwie lub aliasowi innego typu.
+  Wartość domyślna pola musi pasować do typu w całości: `fixed` ma dokładną
+  długość, unia jest sprawdzana względem pierwszej gałęzi (zakres `int`,
+  symbol enuma, kształt rekordu rekurencyjnie).
+- Wartości Avro: `int`, numer wyliczenia i numer gałęzi unii mają najwyżej 5
+  bajtów kodowania (jak `readInt` w Javie), `long` nadal 10; urwany `fixed`
+  jest naruszeniem, a nie przekroczeniem limitu pracy. Zgodność: unia
+  czytelnika jest rozwiązywana względem pierwszej pasującej gałęzi (rekord po
+  nazwie bez namespace, enum i `fixed` po pełnej nazwie lub aliasie, typ prosty
+  najpierw dokładnie, potem przez promocję), a powód odmowy w pamięci podręcznej
+  porównania ma stały rozmiar.
+- Łańcuch dostaw: `apache-avro` 0.22 zawsze ciągnie `miniz_oxide` 0.9.1 (kodek
+  deflate, którego nie używamy); crate nie ma cechy, która by to wyłączała, więc
+  zostaje jako jedyny jego użytkownik w drzewie normalnych zależności.
 - Wzór pochodny (`derive_subschema`) zostawia dozwolone pola rekordu
   najwyższego poziomu i przenosi definicję typu nazwanego do pierwszego
-  zachowanego miejsca, które go używa. Rzutowanie odczytu dla formatów
+  zachowanego miejsca, które go używa (także przez alias); definicja trafia do
+  wyniku dokładnie raz, kolejne wzmianki są odwołaniami. Rzutowanie odczytu dla formatów
   binarnych (polityki pól) to osobny pakiet B6.
 - Dashboard: kafel Avro w „Dodaj wzór” z podpowiedzią kształtu, odmowy po
   polsku (typy, limity, rekord bez wartości), powód odmowy wersji nazywa pole,

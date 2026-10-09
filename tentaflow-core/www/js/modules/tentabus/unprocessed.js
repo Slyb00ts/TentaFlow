@@ -120,6 +120,7 @@ const AVRO_PHRASES = [
   [/^payload ends before the value is complete$/, 'avro_truncated'],
   [/^bytes remain after the value$/, 'avro_trailing'],
   [/^integer encoding is longer than 10 bytes or overflows 64 bits$/, 'avro_int_long'],
+  [/^int encoding is longer than 5 bytes$/, 'avro_int_long'],
   [/^value does not fit the int type$/, 'avro_int_range'],
   [/^boolean is neither 0 nor 1$/, 'avro_boolean'],
   [/^length is negative$/, 'avro_negative'],

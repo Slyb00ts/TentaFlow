@@ -442,6 +442,7 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['/customer: payload ends before the value is complete', '/customer: wiadomość kończy się przed końcem wartości.'],
     ['<root>: bytes remain after the value', 'Po wartości zostały dodatkowe bajty (to nie jest pojedyncza wiadomość Avro bez nagłówka).'],
     ['/id: integer encoding is longer than 10 bytes or overflows 64 bits', '/id: liczba jest zapisana niepoprawnie (za długo).'],
+    ['/id: int encoding is longer than 5 bytes', '/id: liczba jest zapisana niepoprawnie (za długo).'],
     ['/lines/[]/qty: value does not fit the int type', '/lines/[]/qty: liczba nie mieści się w typie int.'],
     ['/paid: boolean is neither 0 nor 1', '/paid: wartość logiczna musi być równa 0 albo 1.'],
     ['/customer: length is negative', '/customer: długość jest ujemna.'],
