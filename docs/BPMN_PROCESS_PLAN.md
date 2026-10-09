@@ -305,8 +305,8 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   Zadanie `completed` bez przyjętego zdarzenia źródłowego, zadanie ponownie zakolejkowane po
   próbach (`queued`, `attempt>0`) i próba w zamkniętej aktywności są klasyfikowane tak samo:
   ponowne kolejkowanie po ręcznym „Ponów” daje `prepared`, reszta `uncertain` z incydentem
-  `SERVICE_HISTORY_UNPROVEN` (zaakceptowane z niezależnego dowodu) albo
-  `EXTERNAL_OUTCOME_UNCERTAIN`. Incydent jest otwarty tylko dla żywej aktywności; dla zamkniętej
+  `SERVICE_HISTORY_UNPROVEN` (zakończone zadanie bez przyjętego zdarzenia źródłowego) albo
+  `EXTERNAL_OUTCOME_UNCERTAIN` (próba bez znanego wyniku). Incydent jest otwarty tylko dla żywej aktywności; dla zamkniętej
   zostaje rozwiązanym zapisem historii, więc nie blokuje instancji. Liczniki
   `retained_bytes` grup powtórzeń są przeliczane dla dotkniętych zadań.
 - **Bramka oparta na zdarzeniach**: wejścia gałęzi Receive/Message/Signal są liczone przed
