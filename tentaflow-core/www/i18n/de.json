@@ -9859,7 +9859,6 @@
     "search_subject": "Benutzer oder Gruppe suchen…",
     "compare_title": "Vergleich: Modell × Knoten × Backend",
     "compare_hint": "Vergleich: {before} und {after}",
-    "compare_before_plan": "{date} · ohne die Reorganisation",
     "compare_foot": "der Knotenfilter grenzt beide Tabellen ein",
     "ns_production": "Tok. produziert",
     "ns_requests": "Anfragen",

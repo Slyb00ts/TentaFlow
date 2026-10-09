@@ -8,7 +8,9 @@
 // Example: <tf-video-stream stream-id="camera:cam_550e8400-e29b-41d4-a716-446655440000"
 //            label="Wejscie · online" height-px="320"></tf-video-stream>
 //          `fit="contain"` shows the whole frame (bars at the sides or top and
-//          bottom); the default `cover` fills the tile at the cost of cropped edges.
+//          bottom); `cover` fills the tile at the cost of cropped edges. Without
+//          `fit`, a recorded source (`src`) defaults to `contain` and a live
+//          stream to `cover`; an explicit `fit` always wins.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';

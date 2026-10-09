@@ -9859,7 +9859,6 @@
     "search_subject": "Rechercher un utilisateur ou un groupe…",
     "compare_title": "Comparaison : modèle × nœud × backend",
     "compare_hint": "Comparaison : {before} et {after}",
-    "compare_before_plan": "{date} · sans la réorganisation",
     "compare_foot": "le filtre Nœud restreint les deux tableaux",
     "ns_production": "tok produits",
     "ns_requests": "requêtes",

@@ -4833,7 +4833,6 @@
       "action_rerun_sudo": "Re-run with sudo",
       "compare_count": "{n}/2 selected",
       "compare_hint": "Comparing {before} and {after}",
-      "compare_before_plan": "{date} · without the reorganization",
       "compare_clear": "Clear",
       "compare_go": "Compare selected",
       "empty_title": "No profiling sessions yet",

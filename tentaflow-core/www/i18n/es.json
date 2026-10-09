@@ -9859,7 +9859,6 @@
     "search_subject": "Buscar usuario o grupo…",
     "compare_title": "Comparación: modelo × nodo × backend",
     "compare_hint": "Comparación: {before} y {after}",
-    "compare_before_plan": "{date} · sin la reorganización",
     "compare_foot": "el filtro Nodo acota ambas tablas",
     "ns_production": "tok producidos",
     "ns_requests": "solicitudes",

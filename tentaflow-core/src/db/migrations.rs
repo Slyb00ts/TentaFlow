@@ -120,6 +120,40 @@ fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i6
              than upgrading it."
         );
     }
+    reject_renumbered_ladder_database(conn)
+}
+
+/// First rung whose recorded name is verified against this build's ladder.
+/// Rungs 178-179 now come from main; the org-structure branch used to occupy
+/// them before it was renumbered to 180+, so a database from that branch
+/// records `178 = org_structure` and would skip main's 178/179 in silence.
+const RENUMBERED_LADDER_FIRST_VERSION: i64 = 178;
+
+fn reject_renumbered_ladder_database(conn: &Connection) -> Result<()> {
+    let ladder: std::collections::HashMap<i64, &'static str> = get_migrations()
+        .into_iter()
+        .map(|(version, name, _)| (version, name))
+        .collect();
+    let mut stmt = conn
+        .prepare("SELECT version, name FROM _migrations WHERE version >= ?1 ORDER BY version")?;
+    let recorded = stmt
+        .query_map([RENUMBERED_LADDER_FIRST_VERSION], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (version, name) in recorded {
+        if ladder.get(&version).copied() != Some(name.as_str()) {
+            anyhow::bail!(
+                "this database records migration {version} as '{name}', but this build ships \
+                 '{}' at that version. Migrations from {RENUMBERED_LADDER_FIRST_VERSION} up \
+                 were renumbered, so a database migrated by a build from before the \
+                 renumbering would skip the rungs it is missing and start on a schema this \
+                 build never produced. Reset this database (or remove it and let it be \
+                 recreated) rather than upgrading it.",
+                ladder.get(&version).copied().unwrap_or("<none>")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -6968,17 +7002,17 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("map_sites", "created_by", UserAccounts),
         f("map_scenes", "created_by", UserAccounts),
         f("map_device_placements", "set_by", UserAccounts),
-        // -- org structure (178): who holds a position, who proposed and who approved a reorganization --
+        // -- org structure (180): who holds a position, who proposed and who approved a reorganization --
         f("org_assignments", "user_id", UserAccounts),
         f("org_change_sets", "author_user_id", UserAccounts),
         f("org_change_sets", "approver_user_id", UserAccounts),
-        // -- org structure (179): who is covered, who covers, who was away --
+        // -- org structure (181): who is covered, who covers, who was away --
         f("org_deputies", "user_id", UserAccounts),
         f("org_deputies", "deputy_user_id", UserAccounts),
         f("org_deputies", "created_by", UserAccounts),
         f("org_absences", "user_id", UserAccounts),
         f("org_absences", "created_by", UserAccounts),
-        // -- org structure (180): who handed work over, from whom, to whom --
+        // -- org structure (182): who handed work over, from whom, to whom --
         f("org_handovers", "user_id", UserAccounts),
         f("org_handovers", "created_by", UserAccounts),
         f("org_handover_items", "from_user_id", UserAccounts),
@@ -14925,6 +14959,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bus_topics_and_groups"), "{msg}");
         assert!(msg.contains("reset this database"), "{msg}");
+    }
+
+    #[test]
+    fn a_database_from_the_old_branch_numbering_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (177, 'topic_acl_addon_subjects');
+            INSERT INTO _migrations (version, name) VALUES (178, 'org_structure');",
+        )
+        .unwrap();
+
+        let err = run(&conn).expect_err("old branch numbering must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("178") && msg.contains("org_structure"), "{msg}");
+        assert!(msg.contains("cameras_depth_camera_offset"), "{msg}");
+        assert!(msg.contains("Reset this database"), "{msg}");
     }
 
     /// The guard must not fire on an ordinary upgrade of a database that

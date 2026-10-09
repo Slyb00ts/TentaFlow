@@ -4884,7 +4884,6 @@
       "action_rerun_sudo": "Uruchom ponownie z sudo",
       "compare_count": "{n}/2 wybrane",
       "compare_hint": "Porównanie: {before} oraz {after}",
-      "compare_before_plan": "{date} · bez reorganizacji",
       "compare_clear": "Wyczyść",
       "compare_go": "Porównaj wybrane",
       "empty_title": "Brak sesji profilowania",
