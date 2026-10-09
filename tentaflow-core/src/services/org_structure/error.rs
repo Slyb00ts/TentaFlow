@@ -36,6 +36,11 @@ pub enum OrgStructureError {
     #[error("change dated {date} is before today ({today}); confirm_backdated is required")]
     BackdatedConfirmationRequired { date: String, today: String },
 
+    /// Only an administrator dates a change of an absence or a deputy before
+    /// today; for everybody else the first day is today.
+    #[error("change dated {date} is before today ({today}); only an administrator may date a change before today")]
+    BackdatingAdminOnly { date: String, today: String },
+
     #[error("{entity} {id} is not valid on {date}")]
     NotValidAt {
         entity: &'static str,
@@ -136,6 +141,7 @@ impl OrgStructureError {
             Self::InvalidValue { .. } => "invalid_value",
             Self::InvalidTimezone(_) => "invalid_timezone",
             Self::BackdatedConfirmationRequired { .. } => "backdated_confirmation_required",
+            Self::BackdatingAdminOnly { .. } => "backdating_admin_only",
             Self::NotValidAt { .. } => "not_valid_at",
             Self::OutsideValidity { .. } => "outside_validity",
             Self::PrimaryLineOverlap { .. } => "primary_line_overlap",

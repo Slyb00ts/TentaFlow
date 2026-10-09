@@ -6,16 +6,13 @@
 //! changes anything; a person adds, changes and deletes their OWN absences, but
 //! only those they entered by hand. Deputies are the administrator's.
 //!
-//! The reason of an absence is private (§6.3): it never goes into an audit
-//! summary or a sync log line, only into the row.
+//! An absence has no reason: none is asked, stored, synced or shown (docs §6.3,
+//! owner decision 2026-10-09).
 
 use super::*;
 use crate::services::org_structure::availability::{
     absences_where, deputies_where, Absence, AbsenceKind, Deputy, DeputyScope, SOURCE_MANUAL,
 };
-
-/// Longest reason a person may write.
-pub const MAX_REASON_CHARS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct NewDeputy {
@@ -40,41 +37,27 @@ pub struct NewAbsence {
     pub valid_from: NaiveDate,
     pub valid_to: Option<NaiveDate>,
     pub kind: AbsenceKind,
-    pub reason: Option<String>,
 }
 
-/// `Some(None)` clears the end or the reason.
+/// `Some(None)` clears the end.
 #[derive(Debug, Clone, Default)]
 pub struct AbsencePatch {
     pub valid_from: Option<NaiveDate>,
     pub valid_to: Option<Option<NaiveDate>>,
     pub kind: Option<AbsenceKind>,
-    pub reason: Option<Option<String>>,
+}
+
+/// Whether the actor of `ctx` holds `org.admin`: what decides who may date a deputy before today.
+fn is_admin(pool: &DbPool, ctx: &WriteCtx<'_>) -> bool {
+    crate::services::rbac::PermissionMatrix::global()
+        .has_permission(pool, ctx.actor_user_id, ctx.org_id, "org.admin")
+        .unwrap_or(false)
 }
 
 /// Who is asking, for the rules of `set_absence`.
 #[derive(Debug, Clone, Copy)]
 pub struct Actor {
     pub is_admin: bool,
-}
-
-fn normalize_reason(reason: Option<&str>) -> Result<Option<String>> {
-    let Some(raw) = reason.map(str::trim).filter(|r| !r.is_empty()) else {
-        return Ok(None);
-    };
-    if raw.chars().count() > MAX_REASON_CHARS {
-        return Err(E::InvalidValue {
-            field: "reason",
-            reason: format!("longer than {MAX_REASON_CHARS} characters"),
-        });
-    }
-    if raw.chars().any(|c| c.is_control() && c != '\n') {
-        return Err(E::InvalidValue {
-            field: "reason",
-            reason: "control characters".into(),
-        });
-    }
-    Ok(Some(raw.to_string()))
 }
 
 /// The earlier of two optional days, `None` only when both are open-ended.
@@ -149,14 +132,16 @@ fn ensure_no_overlapping_deputy(
 }
 
 pub fn set_deputy(pool: &DbPool, ctx: &WriteCtx<'_>, new: &NewDeputy) -> Result<Written<Deputy>> {
+    let admin = is_admin(pool, ctx);
     run(pool, ctx, "org.deputy.set", |s| {
-        set_deputy_in(s, ctx.actor_user_id, new)
+        set_deputy_in(s, ctx.actor_user_id, admin, new)
     })
 }
 
 pub(in crate::services::org_structure) fn set_deputy_in(
     s: &mut Session<'_>,
     actor: &str,
+    is_admin: bool,
     new: &NewDeputy,
 ) -> Result<Audited<Deputy>> {
     let interval = Interval::new(new.valid_from, new.valid_to)?;
@@ -166,9 +151,10 @@ pub(in crate::services::org_structure) fn set_deputy_in(
             reason: "a person cannot be their own deputy".into(),
         });
     }
-    s.ensure_not_backdated(new.valid_from)?;
+    s.ensure_not_backdated_by(new.valid_from, is_admin)?;
     s.require_user(&new.user_id)?;
     s.require_user(&new.deputy_user_id)?;
+    s.require_active_user("deputy_user_id", &new.deputy_user_id)?;
     ensure_no_overlapping_deputy(
         s,
         &new.user_id,
@@ -205,12 +191,18 @@ pub fn update_deputy(
     id: &str,
     patch: &DeputyPatch,
 ) -> Result<Written<Deputy>> {
+    let admin = is_admin(pool, ctx);
     run(pool, ctx, "org.deputy.update", |s| {
-        update_deputy_in(s, id, patch)
+        update_deputy_in(s, admin, id, patch)
     })
 }
 
-fn update_deputy_in(s: &mut Session<'_>, id: &str, patch: &DeputyPatch) -> Result<Audited<Deputy>> {
+fn update_deputy_in(
+    s: &mut Session<'_>,
+    is_admin: bool,
+    id: &str,
+    patch: &DeputyPatch,
+) -> Result<Audited<Deputy>> {
     s.require_in_org("org_deputies", "deputy", "id", id)?;
     let before = deputy_by_id(s, id)?;
     let scope = patch.scope.clone().unwrap_or_else(|| before.scope.clone());
@@ -224,11 +216,11 @@ fn update_deputy_in(s: &mut Session<'_>, id: &str, patch: &DeputyPatch) -> Resul
     }
     let interval = Interval::new(from, to)?;
     if from != before.valid_from {
-        s.ensure_not_backdated(from.min(before.valid_from))?;
+        s.ensure_not_backdated_by(from.min(before.valid_from), is_admin)?;
     }
     if to != before.valid_to {
         if let Some(day) = earliest(to, before.valid_to) {
-            s.ensure_not_backdated(day)?;
+            s.ensure_not_backdated_by(day, is_admin)?;
         }
     }
     ensure_no_overlapping_deputy(
@@ -267,11 +259,13 @@ pub fn end_deputy(
     id: &str,
     from: NaiveDate,
 ) -> Result<Written<()>> {
-    run(pool, ctx, "org.deputy.end", |s| end_deputy_in(s, id, from))
+    let admin = is_admin(pool, ctx);
+    run(pool, ctx, "org.deputy.end", |s| end_deputy_in(s, admin, id, from))
 }
 
 pub(in crate::services::org_structure) fn end_deputy_in(
     s: &mut Session<'_>,
+    is_admin: bool,
     id: &str,
     from: NaiveDate,
 ) -> Result<Audited<()>> {
@@ -284,7 +278,7 @@ pub(in crate::services::org_structure) fn end_deputy_in(
             date: fmt(from),
         });
     }
-    s.ensure_not_backdated(from)?;
+    s.ensure_not_backdated_by(from, is_admin)?;
     let removed = from <= row.valid_from;
     if removed {
         s.delete(&repl::DEPUTIES, id)?;
@@ -336,8 +330,7 @@ fn add_absence_in(
         return Err(E::NotPermitted("an absence of another person"));
     }
     Interval::new(new.valid_from, new.valid_to)?;
-    let reason = normalize_reason(new.reason.as_deref())?;
-    s.ensure_not_backdated(new.valid_from)?;
+    s.ensure_not_backdated_by(new.valid_from, who.is_admin)?;
     s.require_user(&new.user_id)?;
     let mut row = s.new_row(&repl::ABSENCES);
     let id = row.text("id");
@@ -345,7 +338,6 @@ fn add_absence_in(
     row.set("valid_from", date_value(new.valid_from));
     row.set("valid_to", opt_date_value(new.valid_to));
     row.set("kind", text(new.kind.as_str()));
-    row.set("reason", opt(reason.as_deref()));
     row.set("source", text(SOURCE_MANUAL));
     row.set("created_by", text(actor));
     s.insert(&repl::ABSENCES, &row)?;
@@ -355,7 +347,6 @@ fn add_absence_in(
         summary: json!({
             "user_id": new.user_id,
             "kind": new.kind.as_str(),
-            "has_reason": reason.is_some(),
             "valid_from": fmt(new.valid_from),
             "valid_to": opt_fmt(new.valid_to),
         }),
@@ -387,7 +378,6 @@ fn update_absence_in(
     if patch.valid_from.is_none()
         && patch.valid_to.is_none()
         && patch.kind.is_none()
-        && patch.reason.is_none()
     {
         return Err(E::InvalidValue {
             field: "patch",
@@ -398,16 +388,12 @@ fn update_absence_in(
     let to = patch.valid_to.unwrap_or(before.valid_to);
     Interval::new(from, to)?;
     let kind = patch.kind.unwrap_or(before.kind);
-    let reason = match &patch.reason {
-        Some(new) => normalize_reason(new.as_deref())?,
-        None => before.reason.clone(),
-    };
     if from != before.valid_from {
-        s.ensure_not_backdated(from.min(before.valid_from))?;
+        s.ensure_not_backdated_by(from.min(before.valid_from), who.is_admin)?;
     }
     if to != before.valid_to {
         if let Some(day) = earliest(to, before.valid_to) {
-            s.ensure_not_backdated(day)?;
+            s.ensure_not_backdated_by(day, who.is_admin)?;
         }
     }
     s.set_cols(
@@ -417,7 +403,6 @@ fn update_absence_in(
             ("valid_from", date_value(from)),
             ("valid_to", opt_date_value(to)),
             ("kind", text(kind.as_str())),
-            ("reason", opt(reason.as_deref())),
         ],
     )?;
     Ok(Audited {
@@ -425,7 +410,6 @@ fn update_absence_in(
         target: format!("org_absence:{id}"),
         summary: json!({
             "kind": kind.as_str(),
-            "has_reason": reason.is_some(),
             "valid_from": fmt(from),
             "valid_to": opt_fmt(to),
         }),
@@ -454,7 +438,7 @@ fn delete_absence_in(
     s.require_in_org("org_absences", "absence", "id", id)?;
     let row = absence_by_id(s, id)?;
     ensure_may_write_absence(actor, who.is_admin, &row)?;
-    s.ensure_not_backdated(row.valid_from)?;
+    s.ensure_not_backdated_by(row.valid_from, who.is_admin)?;
     s.delete(&repl::ABSENCES, id)?;
     Ok(Audited {
         value: (),

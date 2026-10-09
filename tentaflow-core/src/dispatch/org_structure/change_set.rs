@@ -402,7 +402,18 @@ async fn approve(ctx: &HandlerContext, id: &str) -> Result<P, ProtocolError> {
             })
         })
     };
-    let outcome = batch::dispatch_with(ctx, &ops, false, false, Some(before), Some(after)).await;
+    // The ids of the rows the plan makes follow from its own id and the operation's index: another
+    // administrator approving the same plan on another node at the same moment makes the SAME rows.
+    let outcome = batch::dispatch_with(
+        ctx,
+        &ops,
+        false,
+        false,
+        Some(before),
+        Some(after),
+        Some(id.to_string()),
+    )
+    .await;
     if let Some(e) = recorded.lock().expect("the slot is never poisoned").take() {
         return refused(ctx, &org_id, id, &e);
     }

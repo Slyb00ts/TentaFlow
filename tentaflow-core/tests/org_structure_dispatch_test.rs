@@ -2250,14 +2250,14 @@ async fn cover_of(ctx: &HandlerContext, payload: P) -> P {
 }
 
 #[tokio::test]
-async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the_right_people() {
+async fn a_person_writes_only_their_own_absences_and_others_learn_nothing_of_their_dates() {
     let w = world();
     let t = team(&w).await;
     let member = member_ctx(&w);
 
     let (added, _) = write_ok(
         &member,
-        absence_add(None, day(1), Some(day(4)), Some("private reason")),
+        absence_add(None, day(1), Some(day(4)), None),
     )
     .await;
     let absence = match added {
@@ -2265,11 +2265,11 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
         other => panic!("expected an absence, got {other:?}"),
     };
     assert_eq!(absence.user_id, t.worker);
-    assert_eq!(absence.reason.as_deref(), Some("private reason"));
+    assert_eq!(absence.reason, None, "an absence has no reason");
     assert_eq!(absence.source, "manual");
 
-    // The person, their manager on the primary line: dates and reason. A peer: nothing but "unavailable".
-    for (ctx, sees_reason) in [(&member, true), (&admin_ctx(&w), true)] {
+    // The person and an administrator: the dates. A peer: nothing about another day.
+    for ctx in [&member, &admin_ctx(&w)] {
         match cover_of(ctx, cover_request(Some(&t.worker), day(2))).await {
             P::CoverResponse {
                 available,
@@ -2280,9 +2280,9 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
             } => {
                 assert!(!available, "away on day(2)");
                 assert!(can_see_absences);
-                assert_eq!(can_see_reason, sees_reason);
+                assert!(!can_see_reason, "deprecated: there is no reason to see");
                 assert_eq!(absences.len(), 1);
-                assert_eq!(absences[0].reason.as_deref(), Some("private reason"));
+                assert_eq!(absences[0].reason, None);
             }
             other => panic!("{other:?}"),
         }
@@ -2297,8 +2297,8 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
             ..
         } => {
             assert!(
-                !available,
-                "the peer learns only that the person is unavailable"
+                available,
+                "the peer is not told that the person is away on another day"
             );
             assert!(absences.is_empty() && !can_see_absences && !can_see_reason);
             assert!(!can_edit_absences);
@@ -2337,7 +2337,7 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
                 valid_from: None,
                 valid_to: None,
                 kind: None,
-                reason: Some("x".into()),
+                reason: None,
                 clear: vec![],
                 confirm_backdated: false,
             },
@@ -2353,10 +2353,10 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
         P::AbsenceUpdateRequest {
             id: absence.id.clone(),
             valid_from: None,
-            valid_to: None,
+            valid_to: Some(day(3)),
             kind: None,
             reason: None,
-            clear: vec!["reason".into()],
+            clear: vec![],
             confirm_backdated: false,
         },
     )
@@ -2385,25 +2385,78 @@ async fn a_person_writes_only_their_own_absences_and_the_reason_reaches_only_the
 }
 
 #[tokio::test]
-async fn the_reason_never_leaves_in_an_event() {
+async fn an_absence_has_no_reason_a_client_that_sends_one_is_told_and_nothing_is_stored_or_published() {
     let w = world();
     team(&w).await;
-    write_ok(
-        &member_ctx(&w),
-        absence_add(None, day(20), Some(day(21)), Some("secret-reason-xyz")),
-    )
-    .await;
+    let member = member_ctx(&w);
+    assert_eq!(
+        write_refused(
+            &member,
+            absence_add(None, day(20), Some(day(21)), Some("secret-reason-xyz")),
+        )
+        .await,
+        "invalid_value"
+    );
+    // A blank reason is the same as none; and an old client clearing a reason is told it is gone.
+    write_ok(&member, absence_add(None, day(20), Some(day(21)), Some("  "))).await;
     let events = event_bus().recent_events(4096);
-    let mine: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "org.absence_added")
-        .collect();
-    assert!(!mine.is_empty(), "absence_added was published");
     assert!(
-        mine.iter()
+        events
+            .iter()
             .all(|e| !e.payload.to_string().contains("secret-reason-xyz")),
         "no event carries the reason"
     );
+    let stored: i64 = w
+        .state
+        .db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM org_absences WHERE user_id = ?1",
+            [&w.member],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 1, "only the request without a reason was stored");
+}
+
+#[tokio::test]
+async fn only_an_administrator_enters_an_absence_or_a_deputy_dated_before_today() {
+    let w = world();
+    let t = team(&w).await;
+    let member = member_ctx(&w);
+    let absence = |from: i64, confirm: bool| P::AbsenceAddRequest {
+        user_id: None,
+        valid_from: day(from),
+        valid_to: Some(day(from + 2)),
+        kind: tentaflow_protocol::org_structure_cover::OrgAbsenceKind::Leave,
+        reason: None,
+        confirm_backdated: confirm,
+    };
+    for confirm in [false, true] {
+        assert_eq!(
+            write_refused(&member, absence(-4, confirm)).await,
+            "backdating_admin_only",
+            "confirm_backdated={confirm}"
+        );
+    }
+    write_ok(&member, absence(0, false)).await;
+    let deputy = |from: i64, confirm: bool| P::DeputySetRequest {
+        user_id: t.worker.clone(),
+        deputy_user_id: t.peer.clone(),
+        scope: "all".into(),
+        valid_from: day(from),
+        valid_to: None,
+        confirm_backdated: confirm,
+    };
+    for confirm in [false, true] {
+        assert_eq!(
+            write_refused(&member, deputy(-4, confirm)).await,
+            "backdating_admin_only",
+            "confirm_backdated={confirm}"
+        );
+    }
+    write_ok(&member, deputy(0, false)).await;
 }
 
 #[tokio::test]
@@ -2415,7 +2468,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
 
     write_ok(
         &admin,
-        absence_add(Some(&t.boss), day(1), Some(day(10)), Some("x")),
+        absence_add(Some(&t.boss), day(1), Some(day(10)), None),
     )
     .await;
     let deputy = |scope: &str| P::DeputySetRequest {
@@ -2457,7 +2510,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         scope: scope.map(str::to_string),
         at: Some(day(2)),
     };
-    match run(&member, chain(None)).await.unwrap() {
+    match run(&admin, chain(None)).await.unwrap() {
         P::EscalationChainResponse {
             steps,
             skipped,
@@ -2472,14 +2525,14 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         other => panic!("{other:?}"),
     }
     // An escalations deputy does not stand in for approvals.
-    match run(&member, chain(Some("approvals"))).await.unwrap() {
+    match run(&admin, chain(Some("approvals"))).await.unwrap() {
         P::EscalationChainResponse { steps, skipped, .. } => {
             assert!(steps.is_empty());
             assert_eq!(skipped[0].reason, "unavailable");
         }
         other => panic!("{other:?}"),
     }
-    match run(&member, chain(Some("nonsense"))).await {
+    match run(&admin, chain(Some("nonsense"))).await {
         Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest, "{e:?}"),
         Ok(answer) => panic!("a bad scope was answered: {answer:?}"),
     }
@@ -2489,7 +2542,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         user_id: t.worker.clone(),
         at: Some(at),
     };
-    match run(&member, manager(day(2))).await.unwrap() {
+    match run(&admin, manager(day(2))).await.unwrap() {
         P::ManagerResponse { manager: Some(m) } => {
             assert_eq!(
                 (m.user_id.as_str(), m.source.as_str()),
@@ -2499,7 +2552,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         other => panic!("{other:?}"),
     }
     write_ok(&admin, deputy("all")).await;
-    match run(&member, manager(day(2))).await.unwrap() {
+    match run(&admin, manager(day(2))).await.unwrap() {
         P::ManagerResponse { manager: Some(m) } => {
             assert_eq!(
                 (m.user_id.as_str(), m.source.as_str()),
@@ -2508,7 +2561,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         }
         other => panic!("{other:?}"),
     }
-    match run(&member, P::AvailabilityRequest { at: Some(day(2)) })
+    match run(&admin, P::AvailabilityRequest { at: Some(day(2)) })
         .await
         .unwrap()
     {
@@ -2524,7 +2577,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         other => panic!("{other:?}"),
     }
     match run(
-        &member,
+        &admin,
         P::IsAvailableRequest {
             user_id: t.boss.clone(),
             at: Some(day(2)),
@@ -2559,7 +2612,7 @@ async fn deputies_are_the_administrators_and_they_change_who_the_chain_asks() {
         },
     )
     .await;
-    match run(&member, P::AvailabilityRequest { at: Some(day(6)) })
+    match run(&admin, P::AvailabilityRequest { at: Some(day(6)) })
         .await
         .unwrap()
     {
@@ -2595,10 +2648,14 @@ async fn visibility_answers_are_the_callers_own_unless_an_administrator_asks() {
             assert_eq!(user.user_id, t.worker);
             assert_eq!(manager.unwrap().user_id, t.boss);
             assert!(subtree.is_empty());
-            let reasons = rows.iter().find(|r| r.area == "absence_reasons").unwrap();
+            let dates = rows.iter().find(|r| r.area == "absence_dates").unwrap();
             assert_eq!(
-                (reasons.verdict.as_str(), reasons.rule.as_str()),
+                (dates.verdict.as_str(), dates.rule.as_str()),
                 ("own", "owner")
+            );
+            assert!(
+                !rows.iter().any(|r| r.area == "absence_reasons"),
+                "an absence has no reason to be seen"
             );
             let structure = rows.iter().find(|r| r.area == "structure").unwrap();
             assert_eq!(structure.rule, "every_member");
@@ -2679,13 +2736,18 @@ async fn visibility_answers_are_the_callers_own_unless_an_administrator_asks() {
         kind: kind.to_string(),
         at: Some(day(2)),
     };
-    match run(&member, can_view(None, &t.boss, "absence_reason"))
+    match run(&member, can_view(None, &t.boss, "absence_dates"))
         .await
         .unwrap()
     {
         P::CanViewPersonDataResponse { allowed, rule } => assert!(!allowed && rule == "none"),
         other => panic!("{other:?}"),
     }
+    expect_code(
+        run(&member, can_view(None, &t.boss, "absence_reason")).await,
+        ProtocolErrorCode::BadRequest,
+        "the kind of data that no longer exists",
+    );
     match run(&admin, can_view(Some(&t.worker), &t.boss, "absence_dates"))
         .await
         .unwrap()
@@ -2866,6 +2928,173 @@ async fn a_person_arranges_their_own_deputies_and_nobody_else_but_an_administrat
         P::MemberListResponse { members } => {
             assert!(members.iter().any(|m| m.user_id == t.peer));
             assert!(!members.iter().any(|m| m.user_id == w.outsider));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Past days and other days: what a member may read
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_past_day_names_who_held_each_position_then_and_is_the_administrators() {
+    let w = world();
+    let t = team(&w).await;
+    let admin = admin_ctx(&w);
+    let member = member_ctx(&w);
+    let past = Some(day(-3));
+    let reads_at = |at: Option<String>| -> Vec<(&'static str, P)> {
+        vec![
+            (
+                "reports chain",
+                P::ReportsChainRequest {
+                    target: OrgTarget::User(t.worker.clone()),
+                    direction: OrgDirection::Up,
+                    seat_scope: OrgSeatScope::Primary,
+                    at: at.clone(),
+                },
+            ),
+            (
+                "subordinates",
+                P::SubordinatesRequest {
+                    target: OrgTarget::User(t.boss.clone()),
+                    transitive: true,
+                    seat_scope: OrgSeatScope::Primary,
+                    at: at.clone(),
+                },
+            ),
+            ("integrity report", P::IntegrityReportRequest { at: at.clone() }),
+            (
+                "manager of somebody else",
+                P::ManagerRequest {
+                    user_id: t.boss.clone(),
+                    at: at.clone(),
+                },
+            ),
+            (
+                "assignment of somebody else",
+                P::AssignmentRequest {
+                    user_id: t.boss.clone(),
+                    at: at.clone(),
+                },
+            ),
+        ]
+    };
+    for (what, request) in reads_at(past.clone()) {
+        expect_code(
+            run(&member, request.clone()).await,
+            ProtocolErrorCode::PolicyDenied,
+            &format!("a member reads the {what} of a past day"),
+        );
+        run(&admin, request)
+            .await
+            .unwrap_or_else(|e| panic!("an administrator reads the {what} of a past day: {e:?}"));
+    }
+    // Today and the future are the structure everybody sees.
+    for at in [None, Some(day(0)), Some(day(5))] {
+        for (what, request) in reads_at(at) {
+            run(&member, request)
+                .await
+                .unwrap_or_else(|e| panic!("a member reads the {what} of today or later: {e:?}"));
+        }
+    }
+    // A person's own line of a past day is theirs to read.
+    for request in [
+        P::ManagerRequest {
+            user_id: t.worker.clone(),
+            at: past.clone(),
+        },
+        P::AssignmentRequest {
+            user_id: t.worker.clone(),
+            at: past,
+        },
+    ] {
+        run(&member, request).await.expect("own past line");
+    }
+}
+
+#[tokio::test]
+async fn presence_on_another_day_does_not_give_away_the_dates_of_a_person_the_asker_may_not_see() {
+    let w = world();
+    let t = team(&w).await;
+    let admin = admin_ctx(&w);
+    let member = member_ctx(&w);
+    write_ok(
+        &admin,
+        absence_add(Some(&t.boss), day(1), Some(day(10)), None),
+    )
+    .await;
+    write_ok(
+        &admin,
+        P::DeputySetRequest {
+            user_id: t.boss.clone(),
+            deputy_user_id: t.peer.clone(),
+            scope: "approvals".into(),
+            valid_from: day(0),
+            valid_to: Some(day(10)),
+            confirm_backdated: false,
+        },
+    )
+    .await;
+
+    let availability = |ctx: &HandlerContext| {
+        let ctx = ctx.clone();
+        async move {
+            match run(&ctx, P::AvailabilityRequest { at: Some(day(2)) })
+                .await
+                .unwrap()
+            {
+                P::AvailabilityResponse {
+                    absent_user_ids,
+                    deputies,
+                    ..
+                } => (absent_user_ids, deputies),
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let (absent, deputies) = availability(&admin).await;
+    assert_eq!(absent, vec![t.boss.clone()]);
+    assert_eq!(deputies[0].valid_to.as_deref(), Some(day(10).as_str()));
+
+    // The worker is below the boss: no absence on day 2, a cover that is in force today and has no dates.
+    let (absent, deputies) = availability(&member).await;
+    assert!(absent.is_empty(), "{absent:?}");
+    assert_eq!(deputies.len(), 1);
+    assert_eq!(deputies[0].valid_to, None);
+
+    let is_available = |ctx: &HandlerContext| {
+        let request = P::IsAvailableRequest {
+            user_id: t.boss.clone(),
+            at: Some(day(2)),
+        };
+        let ctx = ctx.clone();
+        async move {
+            match run(&ctx, request).await.unwrap() {
+                P::IsAvailableResponse { available } => available,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    assert!(!is_available(&admin).await);
+    assert!(is_available(&member).await);
+
+    match run(
+        &member,
+        P::EscalationChainRequest {
+            user_id: t.worker.clone(),
+            scope: None,
+            at: Some(day(2)),
+        },
+    )
+    .await
+    .unwrap()
+    {
+        P::EscalationChainResponse { steps, skipped, .. } => {
+            assert_eq!(steps[0].user_id, t.boss);
+            assert_eq!(steps[0].via, "holder");
+            assert!(skipped.is_empty());
         }
         other => panic!("{other:?}"),
     }

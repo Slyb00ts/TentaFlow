@@ -7,9 +7,8 @@
 //! permission; the escalation chain and `get_manager` read both.
 //!
 //! A person is AVAILABLE on a day when their account is an active member of
-//! the organization and no absence covers the day. The reason of an absence is
-//! never part of this type: everything here answers "unavailable", nothing
-//! says why (docs §6.3).
+//! the organization and no absence covers the day. An absence has no reason
+//! at all: everything here answers "unavailable", nothing says why (docs §6.3).
 
 use std::collections::{HashMap, HashSet};
 
@@ -132,8 +131,6 @@ pub struct Absence {
     /// Exclusive, like every end date of the structure; `None` = until ended.
     pub valid_to: Option<NaiveDate>,
     pub kind: AbsenceKind,
-    /// Private (docs §6.3). Handed out only after `privacy` allowed it.
-    pub reason: Option<String>,
     pub source: String,
     pub created_by: Option<String>,
 }
@@ -185,6 +182,38 @@ impl Availability {
             absent,
             usable,
         })
+    }
+
+    /// The picture for a day, where everybody `may_see` keeps the real state
+    /// of the day and everybody else shows only what is true TODAY: an
+    /// absence or a cover of a person whose dates are private must not be
+    /// readable by asking about another day. `today` is the same organization
+    /// loaded for the real today.
+    pub fn limited_to_today(mut self, today: &Availability, may_see: impl Fn(&str) -> bool) -> Self {
+        let people: Vec<String> = self
+            .absent
+            .union(&today.absent)
+            .filter(|user| !may_see(user))
+            .cloned()
+            .collect();
+        for user in people {
+            if today.absent.contains(&user) {
+                self.absent.insert(user);
+            } else {
+                self.absent.remove(&user);
+            }
+        }
+        self.deputies.retain(|d| may_see(&d.user_id));
+        self.deputies.extend(
+            today
+                .deputies
+                .iter()
+                .filter(|d| !may_see(&d.user_id))
+                .cloned(),
+        );
+        self.deputies
+            .sort_by(|a, b| (a.valid_from, &a.id).cmp(&(b.valid_from, &b.id)));
+        self
     }
 
     /// An active member with no absence on the day.
@@ -275,7 +304,7 @@ pub(super) fn absences_where<P: rusqlite::Params>(
     params: P,
 ) -> Result<Vec<Absence>> {
     let sql = format!(
-        "SELECT id, user_id, valid_from, valid_to, kind, reason, source, created_by \
+        "SELECT id, user_id, valid_from, valid_to, kind, source, created_by \
          FROM org_absences WHERE {predicate}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -287,22 +316,20 @@ pub(super) fn absences_where<P: rusqlite::Params>(
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
         .map(
-            |(id, user_id, from, to, kind, reason, source, created_by)| {
+            |(id, user_id, from, to, kind, source, created_by)| {
                 Ok(Absence {
                     id,
                     user_id,
                     valid_from: validate::parse_date(&from)?,
                     valid_to: to.as_deref().map(validate::parse_date).transpose()?,
                     kind: AbsenceKind::parse(&kind)?,
-                    reason,
                     source,
                     created_by,
                 })
@@ -497,7 +524,6 @@ mod scope_tests {
             valid_from: d(5),
             valid_to: Some(d(8)),
             kind: AbsenceKind::Leave,
-            reason: None,
             source: SOURCE_MANUAL.into(),
             created_by: None,
         };

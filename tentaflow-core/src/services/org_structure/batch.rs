@@ -293,6 +293,12 @@ impl Batch<'_, '_> {
         self.session.attempt(op.action(), |s| op.run_in(s))
     }
 
+    /// Makes the ids the following operations mint a function of `scope`
+    /// (the reorganization and the operation's index), not random.
+    pub fn scope_ids(&mut self, scope: Option<String>) {
+        self.session.scope_ids(scope);
+    }
+
     /// Runs `f` on the batch's own transaction, with the organization id. For a
     /// write that has to commit or roll back WITH the operations: approving a
     /// planned reorganization records its state this way (change_set.rs), so a

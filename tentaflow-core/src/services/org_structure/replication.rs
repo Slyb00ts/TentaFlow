@@ -175,7 +175,6 @@ pub(crate) const ABSENCES: TableSpec = TableSpec {
         "valid_from",
         "valid_to",
         "kind",
-        "reason",
         "source",
         "created_by",
     ],
@@ -295,18 +294,38 @@ fn to_sql_value(value: Option<&FieldValue>) -> LedgerResult<Value> {
 
 /// Applies one replicated operation. The whole row travels on every write, so
 /// an upsert is a full replace of the non-key columns.
+///
+/// The organization comes from the signed envelope (`body.org_id`), never from
+/// the row a peer sends: a row that names another organization is refused, an
+/// upsert never replaces a row that belongs to another organization, and a
+/// delete reaches only the organization's own row.
 pub fn apply(tx: &Transaction<'_>, kind: Kind, operation: &SyncOperation) -> LedgerResult<usize> {
     let spec = spec_for(kind);
     let id = &operation.body.resource_id;
+    let org_id = &operation.body.org_id;
     let sql_error = |e: rusqlite::Error| SyncLedgerError::Runtime(e.to_string());
     match operation.body.action {
         ActionType::Delete => tx
             .execute(
-                &format!("DELETE FROM {} WHERE {} = ?1", spec.table, spec.pk),
-                [id],
+                &format!(
+                    "DELETE FROM {} WHERE {} = ?1 AND org_id = ?2",
+                    spec.table, spec.pk
+                ),
+                [id, org_id],
             )
             .map_err(sql_error),
         ActionType::Insert | ActionType::Update => {
+            let stated = match operation.body.changed_fields.get("org_id") {
+                Some(FieldValue::String(stated)) => Some(stated.as_str()),
+                _ => None,
+            };
+            let key_matches = spec.pk != "org_id" || id == org_id;
+            if stated != Some(org_id.as_str()) || !key_matches {
+                return Err(SyncLedgerError::Runtime(format!(
+                    "{} row names a different organization than its operation",
+                    spec.table
+                )));
+            }
             let placeholders: Vec<String> =
                 (1..=spec.columns.len()).map(|n| format!("?{n}")).collect();
             let updates: Vec<String> = spec
@@ -316,7 +335,8 @@ pub fn apply(tx: &Transaction<'_>, kind: Kind, operation: &SyncOperation) -> Led
                 .map(|column| format!("{column} = excluded.{column}"))
                 .collect();
             let sql = format!(
-                "INSERT INTO {table} ({cols}) VALUES ({vals}) ON CONFLICT({pk}) DO UPDATE SET {updates}",
+                "INSERT INTO {table} ({cols}) VALUES ({vals}) ON CONFLICT({pk}) DO UPDATE SET {updates} \
+                 WHERE {table}.org_id = excluded.org_id",
                 table = spec.table,
                 cols = spec.columns.join(", "),
                 vals = placeholders.join(", "),

@@ -3,8 +3,8 @@
 //! §6.3).
 //!
 //! Reads are open to every member and FILTERED here by privacy: an absence is
-//! listed only to those who may see its dates and carries its reason only for
-//! the person, the manager on the primary line and administrators. Writes:
+//! listed only to those who may see its dates; it has no reason (none is
+//! stored, owner decision 2026-10-09). Writes:
 //! deputies need `org.admin`; an absence is written by its person or by an
 //! administrator (the service decides per row and answers `not_permitted`,
 //! which leaves this layer as `PolicyDenied`).
@@ -121,7 +121,7 @@ fn absence_to_wire(a: Absence) -> cover::OrgAbsence {
         valid_from: fmt(a.valid_from),
         valid_to: a.valid_to.map(fmt),
         kind: kind_to_wire(a.kind),
-        reason: a.reason,
+        reason: None,
         source: a.source,
     }
 }
@@ -162,7 +162,7 @@ fn person_cover(
             .map(|d| deputy_to_wire(d, &names))
             .collect(),
         can_see_absences: pc.can_see_absences,
-        can_see_reason: pc.can_see_reason,
+        can_see_reason: false,
         can_edit_absences: pc.can_edit_absences,
         can_edit_deputies: pc.can_edit_absences,
         is_admin: org.has(PERM_ADMIN),
@@ -185,14 +185,20 @@ fn member_list(ctx: &HandlerContext) -> Result<P, ProtocolError> {
 
 fn availability_of(ctx: &HandlerContext, at: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let (day, absent, deputies) =
-        availability::availability_on(&ctx.state.db, &org.org_id, opt_day(at)?)
-            .map_err(read_error)?;
+    let seen = privacy::visible_availability(
+        &ctx.state.db,
+        &org.org_id,
+        &org.user_id,
+        org.has(PERM_ADMIN),
+        opt_day(at)?,
+    )
+    .map_err(read_error)?;
     let names = names(ctx, org)?;
     Ok(P::AvailabilityResponse {
-        at: fmt(day),
-        absent_user_ids: absent,
-        deputies: deputies
+        at: fmt(seen.at),
+        absent_user_ids: seen.absent,
+        deputies: seen
+            .deputies
             .into_iter()
             .map(|d| deputy_to_wire(d, &names))
             .collect(),
@@ -201,8 +207,15 @@ fn availability_of(ctx: &HandlerContext, at: Option<&str>) -> Result<P, Protocol
 
 fn is_available(ctx: &HandlerContext, user_id: &str, at: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let available = availability::is_available(&ctx.state.db, &org.org_id, user_id, opt_day(at)?)
-        .map_err(read_error)?;
+    let available = privacy::is_available_for(
+        &ctx.state.db,
+        &org.org_id,
+        &org.user_id,
+        org.has(PERM_ADMIN),
+        user_id,
+        opt_day(at)?,
+    )
+    .map_err(read_error)?;
     Ok(P::IsAvailableResponse { available })
 }
 
@@ -232,7 +245,14 @@ fn escalation_chain(
         Some(raw) => DeputyScope::parse(raw).map_err(read_error)?,
         None => DeputyScope::Escalations,
     };
-    let (snap, avail) = load(ctx, org, at)?;
+    let (snap, avail, _) = privacy::limited_availability(
+        &ctx.state.db,
+        &org.org_id,
+        &org.user_id,
+        org.has(PERM_ADMIN),
+        opt_day(at)?,
+    )
+    .map_err(read_error)?;
     let chain = escalation::escalation_chain(&snap, &avail, user_id, &scope);
     let names = names(ctx, org)?;
     let position_name = |id: &str| {
@@ -485,10 +505,7 @@ fn notify_deputy(
         return;
     }
     let who = name_of(names, &deputy.user_id);
-    let until = deputy
-        .valid_to
-        .map(|d| format!(" do {}", fmt(d)))
-        .unwrap_or_default();
+    let until = deputy.valid_to.map(fmt);
     crate::project_studio::notifications::notify(
         &org.org_id,
         &deputy.deputy_user_id,
@@ -496,12 +513,38 @@ fn notify_deputy(
         kind,
         title,
         &format!(
-            "{who}: od {}{until}, zakres: {}.",
+            "{who}: from {}{}, scope: {}.",
             fmt(deputy.valid_from),
+            until
+                .as_deref()
+                .map(|d| format!(" until {d}"))
+                .unwrap_or_default(),
             deputy.scope.as_wire()
         ),
-        &json!({ "deputy_id": deputy.id, "user_id": deputy.user_id }).to_string(),
+        // The screen words it in the reader's language from these facts; title and body are the
+        // fallback of a client that does not know the kind.
+        &json!({
+            "deputy_id": deputy.id,
+            "user_id": deputy.user_id,
+            "who": who,
+            "from": fmt(deputy.valid_from),
+            "until": until,
+            "scope": deputy.scope.as_wire(),
+        })
+        .to_string(),
     );
+}
+
+/// The wire still carries `reason` (its fields are append-only), but an absence has none: a client that
+/// sends one learns that here instead of having it silently dropped.
+fn refuse_reason(reason: Option<&str>) -> Result<(), E> {
+    if reason.is_some_and(|text| !text.trim().is_empty()) {
+        return Err(E::InvalidValue {
+            field: "reason",
+            reason: "an absence has no reason; it is not stored".into(),
+        });
+    }
+    Ok(())
 }
 
 fn scope_of(raw: &str) -> Result<DeputyScope, E> {
@@ -549,7 +592,7 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                 org,
                 &w.value,
                 "deputy_appointed",
-                "Zostałeś zastępcą",
+                "You were appointed a deputy",
                 &names,
             );
             Ok(done(w, deputy_result).event("org.deputy_set", event))
@@ -596,7 +639,7 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                 org,
                 &before,
                 "deputy_ended",
-                "Zastępstwo zakończone",
+                "Your cover has ended",
                 &names,
             );
             Ok(done(w, |()| OrgWriteResult::Done).event("org.deputy_ended", event))
@@ -609,6 +652,7 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
             reason,
             confirm_backdated,
         } => {
+            refuse_reason(reason.as_deref())?;
             let user = user_id
                 .clone()
                 .filter(|u| !u.is_empty())
@@ -622,10 +666,9 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                     valid_from: super::day(valid_from)?,
                     valid_to: opt_day_write(valid_to)?,
                     kind: kind_from_wire(*kind),
-                    reason: reason.clone(),
                 },
             )?;
-            // Ids and dates only: neither the kind nor the reason goes on the bus.
+            // Ids and dates only: the kind does not go on the bus.
             let event = json!({
                 "id": w.value.id, "user_id": w.value.user_id,
                 "valid_from": fmt(w.value.valid_from), "valid_to": w.value.valid_to.map(fmt),
@@ -642,7 +685,8 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
             clear,
             confirm_backdated,
         } => {
-            let clear = clear_set(clear, &["valid_to", "reason"])?;
+            refuse_reason(reason.as_deref())?;
+            let clear = clear_set(clear, &["valid_to"])?;
             let w = svc::update_absence(
                 pool,
                 &wc(*confirm_backdated),
@@ -652,7 +696,6 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                     valid_from: opt_day_write(valid_from)?,
                     valid_to: tri("valid_to", &opt_day_write(valid_to)?, &clear)?,
                     kind: kind.map(kind_from_wire),
-                    reason: tri("reason", reason, &clear)?,
                 },
             )?;
             let event = json!({

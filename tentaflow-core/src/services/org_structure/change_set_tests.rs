@@ -505,3 +505,174 @@ fn a_deactivated_administrator_does_not_count() {
         .unwrap();
     assert!(cs::is_sole_admin(&w.f.pool, ORG).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Two nodes approving the same plan, and the take-back that already happened
+// ---------------------------------------------------------------------------
+
+/// The same structure on a fresh node, made with ids that follow from `scope`
+/// alone, so two nodes that start from it start from identical rows.
+fn node_with_base() -> World {
+    let w = world();
+    batch::run(&w.f.pool, &w.f.ctx(), true, |b| {
+        b.scope_ids(Some("base:0".into()));
+        let unit = match b.apply(&new_unit("Board", 0), false).unwrap() {
+            batch::OpValue::Unit(unit) => unit,
+            other => panic!("{other:?}"),
+        };
+        b.scope_ids(Some("base:1".into()));
+        let _ = b
+            .apply(
+                &Op::PositionCreate(NewPosition {
+                    unit_id: unit.unit_id.clone(),
+                    name: "CEO".into(),
+                    code: None,
+                    role_id: None,
+                    is_manager: None,
+                    is_staff: false,
+                    parent_position_id: None,
+                    valid_from: day(0),
+                    valid_to: None,
+                }),
+                false,
+            )
+            .unwrap();
+        Ok(Decision {
+            value: (),
+            keep: true,
+            summary: serde_json::json!({}),
+        })
+    })
+    .unwrap();
+    w
+}
+
+/// What the dispatcher does on approval: the plan's operations on one batch, ids scoped to the plan and
+/// the operation, the approval recorded with what it changed.
+fn approve_plan(w: &World, approver: &str, set_id: &str, scope: Option<&str>) {
+    batch::run(&w.f.pool, &ctx_as(approver), true, |b| {
+        let before = b
+            .with_transaction(|tx, org| {
+                cs::snapshot_in(tx, org).map_err(|e| OrgStructureError::Db(e.to_string()))
+            })
+            .unwrap();
+        let ids = |index: usize| scope.map(|plan| format!("{plan}:{index}"));
+        b.scope_ids(ids(0));
+        let unit = match b.apply(&new_unit("Quality", 30), true).unwrap() {
+            batch::OpValue::Unit(unit) => unit,
+            other => panic!("{other:?}"),
+        };
+        b.scope_ids(ids(1));
+        b.apply(
+            &Op::PositionCreate(NewPosition {
+                unit_id: unit.unit_id.clone(),
+                name: "Inspector".into(),
+                code: None,
+                role_id: None,
+                is_manager: None,
+                is_staff: false,
+                parent_position_id: None,
+                valid_from: day(30),
+                valid_to: None,
+            }),
+            true,
+        )
+        .unwrap();
+        b.scope_ids(ids(2));
+        b.apply(
+            &Op::ExternalPersonCreate(NewExternalPerson {
+                display_name: "Jan".into(),
+                email: None,
+                note: None,
+            }),
+            true,
+        )
+        .unwrap();
+        b.scope_ids(None);
+        b.with_transaction(|tx, org| {
+            let now = cs::snapshot_in(tx, org).map_err(|e| OrgStructureError::Db(e.to_string()))?;
+            cs::mark_applied_in(tx, org, approver, set_id, &cs::undo_between(&before, &now))
+                .map_err(|e| OrgStructureError::InvalidValue {
+                    field: "change_set",
+                    reason: e.to_string(),
+                })
+        })
+        .unwrap();
+        Ok(Decision {
+            value: (),
+            keep: true,
+            summary: serde_json::json!({}),
+        })
+    })
+    .unwrap();
+}
+
+fn rows_of(w: &World) -> cs::Snapshot {
+    let mut conn = w.f.pool.write().unwrap();
+    let tx = conn.transaction().unwrap();
+    cs::snapshot_in(&tx, ORG).unwrap()
+}
+
+#[test]
+fn two_nodes_approving_the_same_plan_at_once_make_the_same_rows() {
+    let (a, b) = (node_with_base(), node_with_base());
+    assert_eq!(rows_of(&a), rows_of(&b), "both nodes start from the same rows");
+    let (set_a, set_b) = (pending(&a, "Q4", 30), pending(&b, "Q4", 30));
+    approve_plan(&a, &a.second, &set_a.id, Some("plan-7"));
+    approve_plan(&b, &b.second, &set_b.id, Some("plan-7"));
+    let (rows_a, rows_b) = (rows_of(&a), rows_of(&b));
+    assert_eq!(rows_a, rows_b);
+    assert_eq!(rows_a["org_units"].len(), 2);
+    assert_eq!(rows_a["org_positions"].len(), 2);
+    assert_eq!(rows_a["org_external_persons"].len(), 1);
+}
+
+#[test]
+fn without_a_plan_scope_two_nodes_would_make_different_rows() {
+    let (a, b) = (node_with_base(), node_with_base());
+    let (set_a, set_b) = (pending(&a, "Q4", 30), pending(&b, "Q4", 30));
+    approve_plan(&a, &a.second, &set_a.id, None);
+    approve_plan(&b, &b.second, &set_b.id, None);
+    assert_ne!(rows_of(&a), rows_of(&b));
+}
+
+#[test]
+fn withdrawing_a_plan_whose_rows_another_node_already_took_back_only_records_the_state() {
+    let w = node_with_base();
+    let set = pending(&w, "Q4", 30);
+    approve_plan(&w, &w.second, &set.id, Some("plan-7"));
+    let applied = cs::get(&w.f.pool, ORG, &set.id).unwrap();
+    assert_eq!(applied.state, State::Applied);
+
+    // What the other node's withdrawal does here when it replicates: the rows the plan made are deleted.
+    {
+        let conn = w.f.pool.write().unwrap();
+        conn.execute("DELETE FROM org_positions WHERE name = 'Inspector'", [])
+            .unwrap();
+        conn.execute("DELETE FROM org_units WHERE name = 'Quality'", [])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM org_external_persons WHERE display_name = 'Jan'",
+            [],
+        )
+        .unwrap();
+    }
+    let withdrawn = cs::withdraw(&w.f.pool, ORG, &w.second, &set.id).unwrap();
+    assert_eq!(withdrawn.state, State::Withdrawn);
+    let rows = rows_of(&w);
+    assert_eq!(rows["org_units"].len(), 1, "only the base unit is left");
+}
+
+#[test]
+fn withdrawing_an_applied_plan_still_takes_back_what_it_made() {
+    let w = node_with_base();
+    let set = pending(&w, "Q4", 30);
+    approve_plan(&w, &w.second, &set.id, Some("plan-7"));
+    assert_eq!(rows_of(&w)["org_units"].len(), 2);
+    let withdrawn = cs::withdraw(&w.f.pool, ORG, &w.second, &set.id).unwrap();
+    assert_eq!(withdrawn.state, State::Withdrawn);
+    let rows = rows_of(&w);
+    assert_eq!(rows["org_units"].len(), 1);
+    assert_eq!(rows["org_positions"].len(), 1);
+    assert!(rows.get("org_external_persons").is_none_or(|t| t.is_empty()));
+}

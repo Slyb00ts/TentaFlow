@@ -170,7 +170,7 @@ pub async fn org_structure_dispatch(
         | P::HandoverApplyRequest { .. }
         | P::HandoverRetryRequest { .. }
         | P::HandoverPendingRequest { .. }
-        | P::HandoverRecordsRequest { .. } => return handover::dispatch(ctx, payload),
+        | P::HandoverRecordsRequest { .. } => return handover::dispatch(ctx, payload).await,
         P::CoverResponse { .. }
         | P::MemberListResponse { .. }
         | P::AvailabilityResponse { .. }
@@ -262,6 +262,31 @@ fn seat_scope_of(scope: wire::OrgSeatScope) -> svc::query::SeatScope {
     }
 }
 
+/// A past day names who held each position then: the person's history
+/// (docs §6.3), an administrator's. `own` is the one person whose history the
+/// caller may read anyway.
+fn require_admin_for_past_day(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    day: Option<NaiveDate>,
+    own: Option<&str>,
+) -> Result<(), ProtocolError> {
+    if org.has(PERM_ADMIN) || own == Some(org.user_id.as_str()) {
+        return Ok(());
+    }
+    let Some(day) = day else {
+        return Ok(());
+    };
+    let today = svc::org_today(&ctx.state.db, &org.org_id).map_err(read_error)?;
+    if day < today {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("{PERM_ADMIN} permission required to read a past day"),
+        ));
+    }
+    Ok(())
+}
+
 fn reports_chain(
     ctx: &HandlerContext,
     target: &wire::OrgTarget,
@@ -270,6 +295,8 @@ fn reports_chain(
     at: Option<&str>,
 ) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, None)?;
     let direction = match direction {
         wire::OrgDirection::Up => Direction::Up,
         wire::OrgDirection::Down => Direction::Down,
@@ -280,7 +307,7 @@ fn reports_chain(
         &target_of(target),
         direction,
         seat_scope_of(seat_scope),
-        opt_day(at)?,
+        at,
     )
     .map_err(read_error)?;
     Ok(P::ReportsChainResponse {
@@ -296,13 +323,15 @@ fn subordinates(
     at: Option<&str>,
 ) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, None)?;
     let links = svc::query::get_subordinates(
         &ctx.state.db,
         &org.org_id,
         &target_of(target),
         transitive,
         seat_scope_of(seat_scope),
-        opt_day(at)?,
+        at,
     )
     .map_err(read_error)?;
     Ok(P::SubordinatesResponse {
@@ -312,8 +341,18 @@ fn subordinates(
 
 fn manager(ctx: &HandlerContext, user_id: &str, at: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let manager = svc::query::get_manager(&ctx.state.db, &org.org_id, user_id, opt_day(at)?)
-        .map_err(read_error)?;
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, Some(user_id))?;
+    // Who stands in for a manager on a day gives away that the manager is away on it.
+    let (snap, avail, _) = svc::privacy::limited_availability(
+        &ctx.state.db,
+        &org.org_id,
+        &org.user_id,
+        org.has(PERM_ADMIN),
+        at,
+    )
+    .map_err(read_error)?;
+    let manager = svc::escalation::effective_manager(&snap, &avail, user_id);
     Ok(P::ManagerResponse {
         manager: manager.map(|m| wire::OrgManager {
             user_id: m.user_id,
@@ -330,8 +369,10 @@ fn manager(ctx: &HandlerContext, user_id: &str, at: Option<&str>) -> Result<P, P
 
 fn assignment(ctx: &HandlerContext, user_id: &str, at: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let held = svc::query::get_assignment(&ctx.state.db, &org.org_id, user_id, opt_day(at)?)
-        .map_err(read_error)?;
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, Some(user_id))?;
+    let held =
+        svc::query::get_assignment(&ctx.state.db, &org.org_id, user_id, at).map_err(read_error)?;
     Ok(P::AssignmentResponse {
         primary: held.primary.map(Into::into),
         others: held.others.into_iter().map(Into::into).collect(),
@@ -340,8 +381,9 @@ fn assignment(ctx: &HandlerContext, user_id: &str, at: Option<&str>) -> Result<P
 
 fn integrity_report(ctx: &HandlerContext, at: Option<&str>) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    let violations =
-        svc::integrity_report(&ctx.state.db, &org.org_id, opt_day(at)?).map_err(read_error)?;
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, None)?;
+    let violations = svc::integrity_report(&ctx.state.db, &org.org_id, at).map_err(read_error)?;
     Ok(P::IntegrityReportResponse {
         violations: violations.into_iter().map(Into::into).collect(),
     })
@@ -379,17 +421,8 @@ fn export(
     at: Option<&str>,
 ) -> Result<P, ProtocolError> {
     let org = require_member(ctx)?;
-    // A file of a past day lists who held each position then: the person's
-    // history (docs §6.3), an administrator's.
-    if !org.has(PERM_ADMIN) {
-        let today = svc::org_today(&ctx.state.db, &org.org_id).map_err(read_error)?;
-        if opt_day(at)?.is_some_and(|day| day < today) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PolicyDenied,
-                format!("{PERM_ADMIN} permission required to export a past day"),
-            ));
-        }
-    }
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, None)?;
     // Every member sees the structure, so every member may export it; the
     // logins and e-mail addresses of other people are an administrator's.
     let preferred = crate::db::repository::get_user_preferred_language(&ctx.state.db, &org.user_id)
@@ -398,7 +431,7 @@ fn export(
         &ctx.state.db,
         &org.org_id,
         format_of(format),
-        opt_day(at)?,
+        at,
         org.has(PERM_ADMIN),
         file::columns::HeaderLanguage::of_preference(preferred.as_deref()),
     )
@@ -1425,6 +1458,7 @@ fn op_error(e: &E) -> wire::OrgOpError {
             out.field = Some((*field).to_string());
         }
         E::BackdatedConfirmationRequired { date, .. }
+        | E::BackdatingAdminOnly { date, .. }
         | E::ReportingCycle { date }
         | E::UnitCycle { date } => {
             out.date = Some(date.clone());

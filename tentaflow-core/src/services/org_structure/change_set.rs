@@ -10,6 +10,17 @@
 //!     +-----withdraw-----+--> withdrawn
 //! ```
 //!
+//! Two administrators on two nodes may act on the same pending set at once.
+//! Approving it twice converges: the rows a plan makes get ids derived from the
+//! plan and the operation (`Session::scope_ids`), so both nodes write the same
+//! rows, and of the two `applied` states the later write wins. Approving on one
+//! node while withdrawing on the other converges on whichever write is later:
+//! `applied` keeps the rows and the record needed to take them back, and a set
+//! that ends `withdrawn` while the approval's rows arrived anyway carries no
+//! such record, so those rows are ended with ordinary writes. Withdrawing an
+//! applied plan whose rows another node already took back only records the
+//! state (`is_taken_back`).
+//!
 //! Saving a `draft` or a `pending` set puts it back to `draft` and makes the
 //! saver its author: whoever last changed the content may not approve it, so the
 //! approval is always somebody else's reading of it. `applied` and `withdrawn`
@@ -442,7 +453,11 @@ pub fn withdraw(pool: &DbPool, org_id: &str, actor: &str, id: &str) -> Result<Ch
                 }
                 let undo = undo_of(&current.payload)?.ok_or(ChangeSetError::NoUndo)?;
                 extra = json!({ "reverted": undo.counts() });
-                take_back_in(tx, org_id, actor, &undo)?;
+                // Another node may have withdrawn the same plan first: its take-back arrives as plain
+                // row writes, so what is left to do here is only the state.
+                if !is_taken_back(&snapshot_in(tx, org_id)?, &undo) {
+                    take_back_in(tx, org_id, actor, &undo)?;
+                }
                 // Only the operations stay: the record is spent.
                 tx.execute(
                     "UPDATE org_change_sets SET payload = ?3 WHERE org_id = ?1 AND id = ?2",
@@ -639,6 +654,25 @@ fn pk_of(spec: &repl::TableSpec, row: &Row) -> String {
         .and_then(Json::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// True when the rows are already as before the approval: what it made is gone,
+/// what it changed is as it was, what it removed is back.
+fn is_taken_back(current: &Snapshot, undo: &Undo) -> bool {
+    let empty = BTreeMap::new();
+    tables().into_iter().all(|spec| {
+        let now = current.get(spec.table).unwrap_or(&empty);
+        let Some(t) = undo.tables.get(spec.table) else {
+            return true;
+        };
+        t.inserted.iter().all(|row| !now.contains_key(&pk_of(spec, row)))
+            && t.updated
+                .iter()
+                .all(|u| now.get(&pk_of(spec, &u.before)) == Some(&u.before))
+            && t.deleted
+                .iter()
+                .all(|row| now.get(&pk_of(spec, row)) == Some(row))
+    })
 }
 
 /// Checks that nothing written since the approval touched what it made or

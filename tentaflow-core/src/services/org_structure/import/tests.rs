@@ -1764,6 +1764,35 @@ fn a_name_that_looks_like_a_formula_is_written_inert_and_read_back_as_typed() {
 }
 
 #[test]
+fn full_width_and_padded_formula_names_are_written_inert_and_read_back_as_typed() {
+    let f = Fixture::new();
+    f.unit("\u{ff1d}HYPERLINK(\"http://x\")", None);
+    f.unit("\u{ff20}SUM(A1)", None);
+    f.unit("\u{a0}+1", None);
+
+    let file = export(&f, FileFormat::Csv, true);
+    let text = String::from_utf8(file.bytes.clone()).unwrap();
+    assert!(
+        text.contains("'\u{ff1d}HYPERLINK") && text.contains("'\u{ff20}SUM"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(";\u{ff1d}HYPERLINK") && !text.contains(";\u{ff20}SUM"),
+        "{text}"
+    );
+
+    let report = apply(&f, &file.bytes);
+    assert_eq!(
+        report.counts.unchanged, report.counts.rows,
+        "{:?} {:?}",
+        report.rows, report.errors
+    );
+    let names: Vec<String> = units(&f).into_iter().map(|u| u.name).collect();
+    assert!(names.contains(&"\u{ff1d}HYPERLINK(\"http://x\")".to_string()), "{names:?}");
+    assert!(names.contains(&"\u{ff20}SUM(A1)".to_string()), "{names:?}");
+}
+
+#[test]
 fn the_error_report_lists_row_column_kind_and_suggestion() {
     let f = Fixture::new();
     member(&f, "j.kowalski", "Jan Kowalski");

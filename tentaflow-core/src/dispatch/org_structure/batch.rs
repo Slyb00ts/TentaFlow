@@ -343,7 +343,7 @@ pub(super) async fn dispatch(
     dry_run: bool,
     confirm_backdated: bool,
 ) -> Result<MessageBody, ProtocolError> {
-    dispatch_with(ctx, ops, dry_run, confirm_backdated, None, None).await
+    dispatch_with(ctx, ops, dry_run, confirm_backdated, None, None, None).await
 }
 
 pub(super) async fn dispatch_with(
@@ -353,6 +353,7 @@ pub(super) async fn dispatch_with(
     confirm_backdated: bool,
     before_ops: Option<AfterKept>,
     after_kept: Option<AfterKept>,
+    id_scope: Option<String>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
     let respond = |response: P| Ok(MessageBody::OrgStructureBody(response));
@@ -393,6 +394,7 @@ pub(super) async fn dispatch_with(
             let mut affected = Affected::default();
             let mut preview_at: Option<NaiveDate> = None;
             for (index, op) in ops.iter().enumerate() {
+                batch.scope_ids(id_scope.as_ref().map(|scope| format!("{scope}:{index}")));
                 let mut request = op.request.clone();
                 let outcome = (|| {
                     if !is_batch_op(&request) {

@@ -26,9 +26,7 @@ use crate::db::DbPool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersonDataKind {
-    /// Why the person is away.
-    AbsenceReason,
-    /// When the person is away — the dates, not the reason.
+    /// When the person is away. There is no reason to see: none is stored.
     AbsenceDates,
     /// Time tracking and utilization.
     TimeUtilization,
@@ -37,8 +35,7 @@ pub enum PersonDataKind {
 }
 
 impl PersonDataKind {
-    pub const ALL: [Self; 4] = [
-        Self::AbsenceReason,
+    pub const ALL: [Self; 3] = [
         Self::AbsenceDates,
         Self::TimeUtilization,
         Self::PositionHistory,
@@ -46,7 +43,6 @@ impl PersonDataKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::AbsenceReason => "absence_reason",
             Self::AbsenceDates => "absence_dates",
             Self::TimeUtilization => "time_utilization",
             Self::PositionHistory => "position_history",
@@ -115,7 +111,6 @@ pub fn can_view_person_data(
             .then_some(ViewRule::Supervisor)
     };
     let rule = match kind {
-        PersonDataKind::AbsenceReason => direct().or_else(admin),
         PersonDataKind::AbsenceDates => direct().or_else(above).or_else(admin),
         PersonDataKind::TimeUtilization => direct().or_else(above),
         PersonDataKind::PositionHistory => admin(),
@@ -153,9 +148,7 @@ pub fn who_can_view(
 
     let managers = matches!(
         kind,
-        PersonDataKind::AbsenceReason
-            | PersonDataKind::AbsenceDates
-            | PersonDataKind::TimeUtilization
+        PersonDataKind::AbsenceDates | PersonDataKind::TimeUtilization
     );
     if managers {
         let mut current = subject.to_string();
@@ -167,11 +160,7 @@ pub fn who_can_view(
             } else {
                 ViewRule::Supervisor
             };
-            // The reason is for the direct manager only; the dates and the
-            // utilization for everybody above.
-            if first || kind != PersonDataKind::AbsenceReason {
-                push(&manager.user_id, rule, &mut out);
-            }
+            push(&manager.user_id, rule, &mut out);
             first = false;
             if !walked.insert(manager.user_id.clone()) {
                 break;
@@ -181,9 +170,7 @@ pub fn who_can_view(
     }
     let admins_see = matches!(
         kind,
-        PersonDataKind::AbsenceReason
-            | PersonDataKind::AbsenceDates
-            | PersonDataKind::PositionHistory
+        PersonDataKind::AbsenceDates | PersonDataKind::PositionHistory
     );
     if admins_see {
         for admin in admins {
@@ -199,7 +186,6 @@ pub enum Area {
     Structure,
     Utilization,
     AbsenceDates,
-    AbsenceReasons,
     PositionHistory,
     EveryoneElse,
 }
@@ -262,13 +248,6 @@ pub fn visibility_of(snap: &Snapshot, viewer: &str, viewer_is_admin: bool) -> Vi
     } else {
         down(!subtree.is_empty(), ViewRule::PrimaryManager)
     };
-    let (reasons, reasons_rule) = if viewer_is_admin {
-        (Verdict::All, ViewRule::Administrator)
-    } else if !direct.is_empty() {
-        (Verdict::Direct, ViewRule::PrimaryManager)
-    } else {
-        (Verdict::Own, ViewRule::Owner)
-    };
     let (history, history_rule) = if viewer_is_admin {
         (Verdict::All, ViewRule::Administrator)
     } else {
@@ -291,11 +270,6 @@ pub fn visibility_of(snap: &Snapshot, viewer: &str, viewer_is_admin: bool) -> Vi
                 area: Area::AbsenceDates,
                 verdict: dates,
                 rule: dates_rule,
-            },
-            AreaRow {
-                area: Area::AbsenceReasons,
-                verdict: reasons,
-                rule: reasons_rule,
             },
             AreaRow {
                 area: Area::PositionHistory,
@@ -334,14 +308,102 @@ pub struct PersonCover {
     pub user_id: String,
     pub today: NaiveDate,
     pub available: bool,
-    /// Empty unless the viewer may see the dates; the reason is cleared unless
-    /// the viewer may see that too.
+    /// Empty unless the viewer may see the dates.
     pub absences: Vec<Absence>,
     pub covered_by: Vec<Deputy>,
     pub covering: Vec<Deputy>,
     pub can_see_absences: bool,
-    pub can_see_reason: bool,
     pub can_edit_absences: bool,
+}
+
+/// What `viewer` may read about presence on a day: the dates of an absence
+/// are private (docs §6.3), so for a person whose dates the viewer may not
+/// see, any other day than today shows today's state, and a cover shows no
+/// dates.
+pub struct VisibleAvailability {
+    pub at: NaiveDate,
+    pub absent: Vec<String>,
+    pub deputies: Vec<Deputy>,
+}
+
+/// The deputy as `viewer` may read it: the dates are withheld when they would
+/// give away the dates of an absence the viewer may not see.
+fn hide_cover_dates(deputy: &mut Deputy, today: NaiveDate) {
+    deputy.valid_from = today;
+    deputy.valid_to = None;
+}
+
+/// Who may see the absence dates of whom, for one viewer on one day.
+fn dates_visible<'a>(
+    snap: &'a Snapshot,
+    viewer: &'a str,
+    viewer_is_admin: bool,
+) -> impl Fn(&str) -> bool + 'a {
+    move |subject| {
+        can_view_person_data(
+            snap,
+            viewer,
+            subject,
+            PersonDataKind::AbsenceDates,
+            viewer_is_admin,
+        )
+        .allowed
+    }
+}
+
+/// The presence picture of a day for one viewer, see `VisibleAvailability`.
+pub fn limited_availability(
+    pool: &DbPool,
+    org_id: &str,
+    viewer: &str,
+    viewer_is_admin: bool,
+    at: Option<NaiveDate>,
+) -> Result<(Snapshot, Availability, NaiveDate)> {
+    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
+    let real_today = validate::today_in_zone(&timezone_of(&conn, org_id)?)?;
+    let day = at.unwrap_or(real_today);
+    let snap = Snapshot::load(&conn, org_id, day)?;
+    let mut avail = Availability::load(&conn, org_id, day)?;
+    if day != real_today {
+        let today = Availability::load(&conn, org_id, real_today)?;
+        avail = avail.limited_to_today(&today, dates_visible(&snap, viewer, viewer_is_admin));
+    }
+    Ok((snap, avail, real_today))
+}
+
+pub fn visible_availability(
+    pool: &DbPool,
+    org_id: &str,
+    viewer: &str,
+    viewer_is_admin: bool,
+    at: Option<NaiveDate>,
+) -> Result<VisibleAvailability> {
+    let (snap, avail, real_today) = limited_availability(pool, org_id, viewer, viewer_is_admin, at)?;
+    let may_see = dates_visible(&snap, viewer, viewer_is_admin);
+    let mut deputies = avail.deputies.clone();
+    for deputy in &mut deputies {
+        if !may_see(&deputy.user_id) && deputy.deputy_user_id != viewer {
+            hide_cover_dates(deputy, real_today);
+        }
+    }
+    Ok(VisibleAvailability {
+        at: avail.at,
+        absent: avail.absent_users().into_iter().map(str::to_string).collect(),
+        deputies,
+    })
+}
+
+/// `org.is_available(user, at)` as `viewer` may know it.
+pub fn is_available_for(
+    pool: &DbPool,
+    org_id: &str,
+    viewer: &str,
+    viewer_is_admin: bool,
+    user_id: &str,
+    at: Option<NaiveDate>,
+) -> Result<bool> {
+    let (_, avail, _) = limited_availability(pool, org_id, viewer, viewer_is_admin, at)?;
+    Ok(avail.is_available(user_id))
 }
 
 fn day_or_today(pool: &DbPool, org_id: &str, at: Option<NaiveDate>) -> Result<NaiveDate> {
@@ -369,28 +431,45 @@ pub fn person_cover(
             id: subject.to_string(),
         });
     }
-    let today = day_or_today(pool, org_id, at)?;
-    let (snap, avail) = {
+    let real_today = day_or_today(pool, org_id, None)?;
+    let day = at.unwrap_or(real_today);
+    let snap = {
         let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-        (
-            Snapshot::load(&conn, org_id, today)?,
-            Availability::load(&conn, org_id, today)?,
-        )
+        Snapshot::load(&conn, org_id, day)?
     };
     let decide = |kind| can_view_person_data(&snap, viewer, subject, kind, viewer_is_admin).allowed;
     let can_see_absences = decide(PersonDataKind::AbsenceDates);
-    let can_see_reason = decide(PersonDataKind::AbsenceReason);
-    let mut absences = if can_see_absences {
+    // Presence on another day is the dates of an absence in disguise: whoever may not see the dates
+    // is told about today only.
+    let today = if can_see_absences { day } else { real_today };
+    let avail = {
+        let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
+        Availability::load(&conn, org_id, today)?
+    };
+    let absences = if can_see_absences {
         availability::absences_of(pool, org_id, subject, today, include_past)?
     } else {
         Vec::new()
     };
-    if !can_see_reason {
-        for absence in &mut absences {
-            absence.reason = None;
+    let (mut covered_by, mut covering) = availability::deputies_around(pool, org_id, subject, today)?;
+    // A cover's dates are an absence's in disguise: of a person whose dates the viewer may not see,
+    // only the cover in force today is listed, without its dates.
+    let may_see = dates_visible(&snap, viewer, viewer_is_admin);
+    // The deputy knows the dates of the cover they were given.
+    let knows = |d: &Deputy| may_see(&d.user_id) || d.deputy_user_id == viewer;
+    let limit = |list: &mut Vec<Deputy>| {
+        list.retain(|d| {
+            knows(d)
+                || (d.valid_from <= real_today && d.valid_to.is_none_or(|end| end > real_today))
+        });
+        for deputy in list.iter_mut() {
+            if !knows(deputy) {
+                hide_cover_dates(deputy, real_today);
+            }
         }
-    }
-    let (covered_by, covering) = availability::deputies_around(pool, org_id, subject, today)?;
+    };
+    limit(&mut covered_by);
+    limit(&mut covering);
     Ok(PersonCover {
         user_id: subject.to_string(),
         today,
@@ -399,7 +478,6 @@ pub fn person_cover(
         covered_by,
         covering,
         can_see_absences,
-        can_see_reason,
         can_edit_absences: viewer == subject || viewer_is_admin,
     })
 }

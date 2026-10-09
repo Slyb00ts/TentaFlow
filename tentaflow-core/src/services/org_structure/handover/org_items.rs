@@ -242,7 +242,7 @@ impl OrgProvider for DeputyProvider {
                 id: id.clone(),
             })?;
         s.attempt("org.deputy.end", |s| {
-            cover::end_deputy_in(s, &row.id, cx.date)
+            cover::end_deputy_in(s, cx.actor_is_admin, &row.id, cx.date)
         })?;
         // Only the person who covers can hand the cover on; a covered person's deputies just stop.
         if let (Some(taker), true) = (&item.taker, row.deputy_user_id == cx.from_user) {
@@ -254,7 +254,7 @@ impl OrgProvider for DeputyProvider {
                 valid_to: row.valid_to,
             };
             s.attempt("org.deputy.set", |s| {
-                cover::set_deputy_in(s, cx.actor, &new)
+                cover::set_deputy_in(s, cx.actor, cx.actor_is_admin, &new)
             })?;
         }
         Ok(())

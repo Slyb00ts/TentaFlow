@@ -72,8 +72,13 @@ fn opt_date_value(date: Option<NaiveDate>) -> Value {
     date.map_or(Value::Null, date_value)
 }
 
-fn new_id() -> String {
-    Uuid::new_v4().to_string()
+/// Ids of the rows an operation makes. Random, except inside a scope (see
+/// `Session::scope_ids`): then the n-th id of a scope is a pure function of
+/// the scope, so two nodes that run the same operation make the same rows.
+const ID_NAMESPACE: Uuid = Uuid::from_u128(0x6f72_675f_7374_7275_6374_5f69_6473_0001);
+
+fn derived_id(scope: &str, ordinal: u32) -> String {
+    Uuid::new_v5(&ID_NAMESPACE, format!("{scope}#{ordinal}").as_bytes()).to_string()
 }
 
 pub(super) fn fmt(date: NaiveDate) -> String {
@@ -114,9 +119,31 @@ pub(super) struct Session<'a> {
     touched: Vec<(&'static TableSpec, String, SqlWriteAction)>,
     warnings: Vec<Warning>,
     audits: Vec<PendingAudit>,
+    /// Set while a planned reorganization runs: its operations mint ids from
+    /// (reorganization, operation index) instead of at random, so approving
+    /// the same plan on two nodes at once converges on the same rows.
+    id_scope: Option<String>,
+    id_ordinal: std::cell::Cell<u32>,
 }
 
 impl Session<'_> {
+    /// From now on ids are derived from `scope` (restarting at zero), or random again for `None`.
+    pub(super) fn scope_ids(&mut self, scope: Option<String>) {
+        self.id_scope = scope;
+        self.id_ordinal.set(0);
+    }
+
+    fn mint_id(&self) -> String {
+        match &self.id_scope {
+            Some(scope) => {
+                let ordinal = self.id_ordinal.get();
+                self.id_ordinal.set(ordinal + 1);
+                derived_id(scope, ordinal)
+            }
+            None => Uuid::new_v4().to_string(),
+        }
+    }
+
     /// Queues the audit entry of one operation and hands back its value. The
     /// entry is written by `finish`, after the captures and the projection.
     pub(super) fn record<T>(&mut self, action: &str, audited: Audited<T>) -> T {
@@ -175,6 +202,18 @@ impl Session<'_> {
                 Err(e)
             }
         }
+    }
+
+    /// Absences and deputies: a day before today is an administrator's to
+    /// enter (and to confirm); for anybody else the first day is today.
+    fn ensure_not_backdated_by(&mut self, date: NaiveDate, is_admin: bool) -> Result<()> {
+        if date < self.today && !is_admin {
+            return Err(E::BackdatingAdminOnly {
+                date: fmt(date),
+                today: fmt(self.today),
+            });
+        }
+        self.ensure_not_backdated(date)
     }
 
     fn ensure_not_backdated(&mut self, date: NaiveDate) -> Result<()> {
@@ -255,10 +294,28 @@ impl Session<'_> {
         }
     }
 
+    /// A person who is to ACT (a deputy) must be able to: an account that is
+    /// switched off would be asked and never answer.
+    fn require_active_user(&self, field: &'static str, user_id: &str) -> Result<()> {
+        let active: bool = self.tx.query_row(
+            "SELECT COALESCE(is_active, 0) FROM user_accounts WHERE id = ?1",
+            [user_id],
+            |r| r.get(0),
+        )?;
+        if active {
+            Ok(())
+        } else {
+            Err(E::InvalidValue {
+                field,
+                reason: "the person's account is not active".into(),
+            })
+        }
+    }
+
     fn new_row(&self, spec: &TableSpec) -> Row {
         let mut row = Row(BTreeMap::new());
         if spec.pk == "id" {
-            row.set("id", text(&new_id()));
+            row.set("id", text(&self.mint_id()));
         }
         row.set("org_id", text(self.org_id));
         row
@@ -420,7 +477,7 @@ impl Session<'_> {
                     return Ok(None);
                 };
                 let mut next = current.clone();
-                let next_id = new_id();
+                let next_id = self.mint_id();
                 next.set(spec.pk, text(&next_id));
                 next.set("valid_from", date_value(from));
                 next.set("valid_to", tail.map_or(Value::Null, Value::Text));
@@ -446,7 +503,7 @@ impl Session<'_> {
                         tail = Some(start);
                     }
                 }
-                let next_id = new_id();
+                let next_id = self.mint_id();
                 next.set(spec.pk, text(&next_id));
                 next.set("valid_from", date_value(from));
                 next.set("valid_to", opt_date_value(tail));
@@ -864,6 +921,8 @@ impl<'a> Session<'a> {
             touched: Vec::new(),
             warnings: Vec::new(),
             audits: Vec::new(),
+            id_scope: None,
+            id_ordinal: std::cell::Cell::new(0),
         })
     }
 
@@ -1436,7 +1495,7 @@ pub(super) fn create_unit_in(s: &mut Session<'_>, new: &NewUnit) -> Result<Audit
         s.require_in_org("org_units", "unit", "unit_id", parent)?;
         s.require_unit_covers(parent, &interval)?;
     }
-    let unit_id = new_id();
+    let unit_id = s.mint_id();
     let mut row = s.new_row(&repl::UNITS);
     row.set("unit_id", text(&unit_id));
     row.set("name", text(&name));
@@ -1958,7 +2017,7 @@ pub(super) fn create_position_in(
         s.require_position_covers(parent_id, &interval)?;
     }
     let mut row = s.new_row(&repl::POSITIONS);
-    let position_id = new_id();
+    let position_id = s.mint_id();
     row.set("position_id", text(&position_id));
     row.set("unit_id", text(&new.unit_id));
     row.set("name", text(&name));
@@ -3125,5 +3184,5 @@ fn group_by_refs<'a>(
 pub(super) mod cover;
 pub use cover::{
     add_absence, delete_absence, end_deputy, ensure_may_write_deputy, set_deputy, update_absence,
-    update_deputy, AbsencePatch, Actor, DeputyPatch, NewAbsence, NewDeputy, MAX_REASON_CHARS,
+    update_deputy, AbsencePatch, Actor, DeputyPatch, NewAbsence, NewDeputy,
 };

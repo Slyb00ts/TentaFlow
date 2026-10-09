@@ -8,7 +8,7 @@ use rust_xlsxwriter::{Format, Workbook};
 
 use super::codes;
 use super::columns::{Column, HeaderLanguage, COLUMNS};
-use super::parse::FORMULA_STARTS;
+use super::parse::leads_into_formula;
 use super::people::Directory;
 use super::report::Issue;
 use super::FileFormat;
@@ -49,12 +49,14 @@ fn yes_no(value: bool) -> Cell {
     Cell::text(if value { "tak" } else { "nie" })
 }
 
-/// A cell a spreadsheet would run as a formula (`=`, `+`, `-`, `@`) is written
-/// with a leading `'`, which a spreadsheet does not show and the import
-/// removes; a text that already starts with quotes before such a character
-/// gets one more, so removing one gives back what was typed. A name typed by a user is not trusted to be harmless.
+/// A cell a spreadsheet would run as a formula (it starts with `=`, `+`, `-`,
+/// `@`, a tab or a carriage return, in ASCII or full-width form, after any
+/// padding) is written with a leading `'`, which a spreadsheet does not show
+/// and the import removes; a text that already starts with quotes before such
+/// a character gets one more, so removing one gives back what was typed. A
+/// name typed by a user is not trusted to be harmless.
 pub fn guard_formula(text: &str) -> String {
-    if text.trim_start_matches('\'').starts_with(FORMULA_STARTS) {
+    if leads_into_formula(text) {
         format!("'{text}")
     } else {
         text.to_string()

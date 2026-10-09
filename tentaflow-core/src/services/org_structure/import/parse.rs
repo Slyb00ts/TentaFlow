@@ -46,19 +46,35 @@ pub fn read(format: FileFormat, bytes: &[u8]) -> Result<Table, FileError> {
     }
 }
 
-/// The characters that make a spreadsheet run a cell as a formula.
-pub const FORMULA_STARTS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+/// The characters that make a spreadsheet run a cell as a formula, the
+/// full-width forms (`＝ ＋ － ＠`) some spreadsheets fold into the ASCII ones included.
+pub const FORMULA_STARTS: [char; 10] = [
+    '=', '+', '-', '@', '\t', '\r', '\u{ff1d}', '\u{ff0b}', '\u{ff0d}', '\u{ff20}',
+];
+
+/// What a spreadsheet skips before it decides whether a cell is a formula. A tab
+/// or a carriage return is not padding: it is a start of its own.
+fn is_padding(c: char) -> bool {
+    (c.is_whitespace() && !matches!(c, '\t' | '\r' | '\n')) || matches!(c, '\u{200b}' | '\u{feff}')
+}
+
+/// True when a spreadsheet could read the cell as a formula: it starts with one
+/// of `FORMULA_STARTS`, after any quotes and padding the guard may have put or
+/// the user typed in front.
+pub fn leads_into_formula(text: &str) -> bool {
+    text.trim_start_matches(|c: char| c == '\'' || is_padding(c))
+        .starts_with(FORMULA_STARTS)
+}
 
 /// Spreadsheets pad cells with spaces, non-breaking spaces and zero-width
-/// marks; the export puts one `'` in front of a cell that starts like a
+/// marks; the export puts one `'` in front of a cell that leads into a
 /// formula, or like a quote and then a formula, which is undone here. The two
 /// rules are inverse of each other, so a name that really starts with `'=`
 /// comes back as typed.
 pub fn clean_cell(raw: &str) -> String {
     let trimmed =
         raw.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{200b}' | '\u{feff}'));
-    let unquoted = trimmed.trim_start_matches('\'');
-    if trimmed.starts_with('\'') && unquoted.starts_with(FORMULA_STARTS) {
+    if trimmed.starts_with('\'') && leads_into_formula(trimmed) {
         return trimmed[1..].to_string();
     }
     trimmed.to_string()
@@ -526,6 +542,18 @@ mod tests {
         // The export puts one quote in front; one is taken off.
         assert_eq!(clean_cell("''=x"), "'=x");
         assert_eq!(clean_cell("'=x"), "=x");
+    }
+
+    #[test]
+    fn padding_and_full_width_signs_lead_into_a_formula_too() {
+        for text in ["= 1", " =1", "\u{a0}+1", "\u{200b}@x", "\u{ff1d}1", "\u{ff0b}1", "\u{ff0d}1", "\u{ff20}x", "\t=1", "' =1"] {
+            assert!(leads_into_formula(text), "{text:?}");
+        }
+        for text in ["Kowalski", "'Kowalski", " Kowalski", "a=b", ""] {
+            assert!(!leads_into_formula(text), "{text:?}");
+        }
+        assert_eq!(clean_cell("' =x"), " =x");
+        assert_eq!(clean_cell("'\u{ff1d}x"), "\u{ff1d}x");
     }
 
     #[test]
