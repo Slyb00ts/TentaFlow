@@ -14111,6 +14111,7 @@
     "simulation_empty_tasks": "No hay tareas abiertas",
     "simulation_empty_events": "Aún no hay eventos",
     "simulation_events_omitted": "{count} {count|evento anterior no mostrado|eventos anteriores no mostrados}",
+    "simulation_trace_steps_omitted": "{count} {count|paso de traza anterior no mostrado|pasos de traza anteriores no mostrados}",
     "simulation_complete_task": "Completar tarea",
     "simulation_acknowledge_task": "Confirmar tarea",
     "simulation_outputs": "Resultado de tarea (JSON)",

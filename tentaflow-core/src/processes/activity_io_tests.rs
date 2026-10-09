@@ -1776,6 +1776,74 @@ fn event_based_gateway_branch_input_failure_parks_an_incident_without_arming_the
     }
 }
 
+fn two_failing_receive_branches_model() -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = race_model_with_input("1 / 0");
+    let mut io = serde_json::to_string(
+        &model.nodes.iter().find(|node| node.id == "Catch_1").unwrap().activity_io).unwrap();
+    for id in ["Input_Race", "Association_Race_Input", "Output_Receive", "InputSet_Receive",
+        "OutputSet_Receive", "Association_Receive"] {
+        io = io.replace(&format!("\"{id}\""), &format!("\"{id}_2\""));
+    }
+    let mut second = model.nodes.iter().find(|node| node.id == "Catch_1").unwrap().clone();
+    second.id = "Catch_2".into();
+    second.name = "Second failing receive".into();
+    second.activity_io = serde_json::from_str(&io).unwrap();
+    let ProcessNodeKind::ReceiveTask { message_ref, .. } = &mut second.kind else {
+        unreachable!("the race fixture branch is a Receive task");
+    };
+    *message_ref = "Message_2".into();
+    model.messages.push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+        message_id: "Message_2".into(),
+        name: "SecondEvidence".into(),
+    });
+    model.nodes.push(second);
+    model.sequence_flows.push(edge("RaceMessage2", "Race_1", "Catch_2"));
+    model.sequence_flows.push(edge("Message2End", "Catch_2", "End_1"));
+    model
+}
+
+#[test]
+fn writer_rejects_an_event_gateway_failure_reported_on_a_later_failing_branch() {
+    let fixture = Fixture::new();
+    let model = two_failing_receive_branches_model();
+    let version = runtime::test_support::publish_model(&fixture, &model);
+    // The same document with the second failing branch listed first plans honestly
+    // against Catch_2, which is not the first failing branch of the published order.
+    let mut reordered = version.model.clone();
+    let late = reordered.sequence_flows.iter().position(|flow| flow.id == "RaceMessage2").unwrap();
+    let late = reordered.sequence_flows.remove(late);
+    let early = reordered.sequence_flows.iter().position(|flow| flow.id == "RaceMessage").unwrap();
+    reordered.sequence_flows.insert(early, late);
+    let instance_id = Uuid::new_v4().to_string();
+    let command = stamp("forge a later failing event gateway branch");
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let variables = serde_json::to_value(&version.model.variables).unwrap();
+    let plan_for = |document: &tentaflow_protocol::processes::ProcessModel| {
+        runtime::plan_start(
+            document, &document.process_id, runtime::test_support::ordinary_start_id(document),
+            &instance_id, &fixture.owner, &version.definition_id, version.version,
+            variables.clone(), runtime::StartCause::Manual, at_ms,
+            runtime::test_support::manual_input(&command), None,
+        ).unwrap()
+    };
+    let forged = plan_for(&reordered);
+    assert!(forged.activity_io_inputs.iter().any(|fact| matches!(fact,
+        repository::ActivityIoInputFact::Failed { node_id, .. } if node_id == "Catch_2")));
+    let start = |plan: &repository::RuntimePlan| repository::start_instance(
+        &fixture.db, &fixture.owner, &command, &instance_id, &version.definition_id,
+        version.version, &variables, None, None,
+        repository::ProcessPlanInput::Supplied(plan), at_ms);
+    let before = super::call_tests::transition_rows(&fixture);
+    let error = start(&forged).unwrap_err();
+    assert!(format!("{error:#}").contains("skipped an earlier failing branch"), "{error:#}");
+    assert_eq!(super::call_tests::transition_rows(&fixture), before);
+
+    let honest = plan_for(&version.model);
+    assert!(honest.activity_io_inputs.iter().any(|fact| matches!(fact,
+        repository::ActivityIoInputFact::Failed { node_id, .. } if node_id == "Catch_1")));
+    start(&honest).expect("the first failing branch in edge order is accepted");
+}
+
 #[test]
 fn user_output_applies_only_after_one_accepted_result() {
     let fixture = Fixture::new();

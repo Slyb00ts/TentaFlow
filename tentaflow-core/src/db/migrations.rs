@@ -17950,10 +17950,35 @@ mod tests {
         }
     }
 
+    fn historical_actor() -> crate::processes::repository::ProcessActor {
+        crate::processes::repository::ProcessActor {
+            org_id: "org-default".into(), user_id: "selected-owner".into(),
+        }
+    }
+
+    /// The old binary parked an unclaimed failed job with an unresolved incident and an
+    /// active source flow; the instance was in `incident`.
+    fn failed_unclaimed_job_with_its_incident(conn: &Connection) {
+        conn.execute("INSERT INTO flows(id,name,version,flow_json,status) VALUES('historical-flow','Historical',1,'{}','active')", []).unwrap();
+        conn.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES('failed-incident','selected-instance','selected-instance','Service_1','failed-job','FLOW_NOT_FOUND','The flow is missing',1)", []).unwrap();
+        conn.execute("UPDATE bpmn_instances SET status='incident' WHERE instance_id='selected-instance'", []).unwrap();
+    }
+
+    fn command_stamp(label: &str) -> crate::processes::repository::CommandStamp {
+        use sha2::{Digest, Sha256};
+        crate::processes::repository::CommandStamp {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            request_hash: hex::encode(Sha256::digest(label.as_bytes())),
+        }
+    }
+
     #[test]
     fn service_invocation_migration_preserves_queued_and_proves_unclaimed_error_retryable() {
-        let conn = Connection::open_in_memory().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unclaimed.db");
+        let conn = Connection::open(&path).unwrap();
         service_invocation_history_fixture(&conn);
+        failed_unclaimed_job_with_its_incident(&conn);
         let before: Vec<(String,String,String)> = conn.prepare(
             "SELECT job_id,status,input_json FROM bpmn_jobs ORDER BY job_id").unwrap()
             .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
@@ -17979,6 +18004,149 @@ mod tests {
         assert_eq!(after,before);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_,String>(0)).unwrap(), "ok");
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let snapshot = crate::processes::repository::runtime_snapshot(
+            &pool, &historical_actor(), "selected-instance").unwrap();
+        let incident = snapshot.incidents.iter()
+            .find(|incident| incident.job_id.as_deref() == Some("failed-job")).unwrap();
+        assert!(incident.can_retry, "the proved unclaimed failure must stay directly retryable");
+    }
+
+    #[test]
+    fn service_invocation_migration_leaves_an_unclaimed_failed_job_directly_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retry.db");
+        let conn = Connection::open(&path).unwrap();
+        service_invocation_history_fixture(&conn);
+        failed_unclaimed_job_with_its_incident(&conn);
+        run(&conn).unwrap();
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let actor = historical_actor();
+        let revision = crate::processes::repository::runtime_snapshot(
+            &pool, &actor, "selected-instance").unwrap().instance.revision;
+        crate::processes::repository::retry_job(
+            &pool, &actor, &command_stamp("retry the converted job"),
+            "selected-instance", "failed-job", revision,
+        ).expect("a converted proved-no-effect job is retried through its incident");
+        let conn = pool.read().unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE job_id='failed-job' AND resolved_at_ms IS NULL", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0);
+        let fresh: (String,String,String) = conn.query_row(
+            "SELECT j.job_id,j.status,v.phase FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id WHERE j.job_id NOT IN ('failed-job','queued-job')",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!((&fresh.1[..],&fresh.2[..]),("queued","prepared"));
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "running");
+    }
+
+    #[test]
+    fn service_invocation_migration_claims_and_dispatches_a_converted_prepared_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dispatch.db");
+        let conn = Connection::open(&path).unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("INSERT INTO flows(id,name,version,flow_json,status) VALUES('historical-flow','Historical',1,'{}','active')", []).unwrap();
+        run(&conn).unwrap();
+        let stable: String = conn.query_row(
+            "SELECT stable_request_id FROM bpmn_service_invocations WHERE job_id='queued-job'",
+            [], |row| row.get(0)).unwrap();
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let claimed = crate::processes::repository::claim_job(&pool, "worker-one", now)
+            .unwrap().expect("the converted prepared job is claimable");
+        assert_eq!((claimed.job.job_id.as_str(), claimed.request_id.as_str()), ("queued-job", stable.as_str()));
+        assert!(crate::processes::repository::commit_job_dispatch_boundary(
+            &pool, &claimed, "worker-one", now).unwrap());
+        let row: (String,String,Option<i64>,Option<String>) = pool.read().unwrap().query_row(
+            "SELECT phase,dispatch_evidence,dispatch_attempt,dispatch_worker_id FROM bpmn_service_invocations WHERE job_id='queued-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(row, ("may_have_executed".into(),"committed_boundary".into(),Some(1),Some("worker-one".into())));
+    }
+
+    fn crashed_service_with_waiting_timer(path: &std::path::Path, terminate_sibling: bool) {
+        use tentaflow_protocol::processes::{ProcessNode, ProcessNodeKind, ProcessSequenceFlow, ProcessTimerSpec};
+
+        let conn = Connection::open(path).unwrap();
+        service_invocation_history_fixture(&conn);
+        conn.execute("INSERT INTO flows(id,name,version,flow_json,status) VALUES('historical-flow','Historical',1,'{}','active')", []).unwrap();
+        let model_json: String = conn.query_row(
+            "SELECT model_json FROM bpmn_versions WHERE definition_id='selected-definition'",
+            [], |row| row.get(0)).unwrap();
+        let mut model: tentaflow_protocol::processes::ProcessModel =
+            serde_json::from_str(&model_json).unwrap();
+        model.timer_timezone = Some("UTC".into());
+        let rule = ProcessTimerSpec::Duration { seconds: 60 };
+        let flow = |id: &str, source: &str, target: &str| ProcessSequenceFlow {
+            id: id.into(), source_id: source.into(), target_id: target.into(),
+            condition: None, call_start_node_id: None,
+        };
+        let (timer_node, timer_kind, timer_token) = if terminate_sibling {
+            model.nodes.push(ProcessNode { id: "Wait_1".into(), name: "Wait".into(),
+                kind: ProcessNodeKind::TimerCatch { timer: rule.clone() },
+                repeat: None, activity_io: None });
+            model.nodes.push(ProcessNode { id: "Stop_1".into(), name: "Stop".into(),
+                kind: ProcessNodeKind::TerminateEnd, repeat: None, activity_io: None });
+            model.sequence_flows.push(flow("Start_Wait", "Start_1", "Wait_1"));
+            model.sequence_flows.push(flow("Wait_Stop", "Wait_1", "Stop_1"));
+            conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('wait-token','selected-instance','selected-instance','Wait_1','Start_Wait','[]','waiting',1)", []).unwrap();
+            ("Wait_1", "catch", "wait-token")
+        } else {
+            model.nodes.push(ProcessNode { id: "Limit".into(), name: "Limit".into(),
+                kind: ProcessNodeKind::BoundaryTimer {
+                    attached_to_id: "Service_1".into(), cancel_activity: true, timer: rule.clone(),
+                }, repeat: None, activity_io: None });
+            model.sequence_flows.push(flow("Limit_End", "Limit", "End_1"));
+            ("Limit", "boundary", "failed-token")
+        };
+        let new_json = serde_json::to_string(&model).unwrap();
+        let new_sha = crate::processes::repository::request_hash(&model).unwrap();
+        conn.execute("UPDATE bpmn_versions SET model_json=?1,model_sha256=?2 WHERE definition_id='selected-definition'",
+            rusqlite::params![new_json,new_sha]).unwrap();
+        conn.execute("UPDATE bpmn_definitions SET model_json=?1 WHERE definition_id='selected-definition'",
+            [&new_json]).unwrap();
+        conn.execute("INSERT INTO bpmn_timers(timer_id,org_id,definition_id,version,node_id,kind,instance_id,scope_id,token_id,rule_json,timezone,anchor_at_ms,due_at_ms,occurrence,revision,status,next_check_at_ms,created_at_ms,updated_at_ms) VALUES('service-timer','org-default','selected-definition',1,?1,?2,'selected-instance','selected-instance',?3,?4,'UTC',1,60001,1,1,'pending',60001,1,1)",
+            rusqlite::params![timer_node,timer_kind,timer_token,serde_json::to_string(&rule).unwrap()]).unwrap();
+        conn.execute("UPDATE bpmn_jobs SET status='running',attempt=1,fence=1,worker_id='dead-worker',lease_until_ms=?1 WHERE job_id='failed-job'",
+            [i64::MAX]).unwrap();
+        conn.execute("UPDATE bpmn_instances SET status='running' WHERE instance_id='selected-instance'", []).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_service_invocations WHERE job_id='failed-job' AND phase='uncertain' AND dispatch_evidence='boundary_unknown'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
+    }
+
+    #[test]
+    fn converted_crashed_service_job_is_cancelled_by_boundary_timer_and_terminate_end() {
+        for terminate_sibling in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("crashed-timer.db");
+            crashed_service_with_waiting_timer(&path, terminate_sibling);
+            let pool = crate::db::init(&path).unwrap();
+            let drained = crate::processes::timers::drain_due(
+                &pool, chrono::Utc::now().timestamp_millis() + 3_600_000);
+            drained.completion.unwrap_or_else(|error| panic!(
+                "terminate={terminate_sibling}: {error:#}"));
+            let timer_state: (String,Option<String>) = pool.read().unwrap().query_row(
+                "SELECT status,last_reason FROM bpmn_timers WHERE timer_id='service-timer'", [],
+                |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(drained.fired, 1, "terminate={terminate_sibling}: {timer_state:?}");
+            let conn = pool.read().unwrap();
+            assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+                |row| row.get::<_,String>(0)).unwrap(),
+                // The terminate end closes the whole scope; the boundary leaves the
+                // unrelated queued activation of the fixture running.
+                if terminate_sibling { "completed" } else { "running" },
+                "terminate={terminate_sibling}");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='selected-instance' AND resolved_at_ms IS NULL", [],
+                |row| row.get::<_,i64>(0)).unwrap(), 0, "terminate={terminate_sibling}");
+            assert_eq!(conn.query_row("SELECT status FROM bpmn_tokens WHERE token_id='failed-token'", [],
+                |row| row.get::<_,String>(0)).unwrap(), "cancelled", "terminate={terminate_sibling}");
+            assert!(foreign_key_check(&conn).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -18106,8 +18274,10 @@ mod tests {
     }
 
     #[test]
-    fn service_invocation_migration_refuses_unreserved_live_service_history_atomically() {
-        let conn = Connection::open_in_memory().unwrap();
+    fn service_invocation_migration_latches_a_group_whose_history_exceeds_the_reserved_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capacity.db");
+        let conn = Connection::open(&path).unwrap();
         service_invocation_history_fixture(&conn);
         conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('reserve-source','selected-instance','selected-instance','Service_1','Start_Service','[]','consumed',1)", []).unwrap();
         conn.execute("INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('reserve-parent','selected-instance','selected-instance','Service_1','Start_Service','[]','waiting',1)", []).unwrap();
@@ -18131,23 +18301,39 @@ mod tests {
         assert!(retained <= 64 * 1024 * 1024 && retained + reserve > 64 * 1024 * 1024);
         conn.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE group_id='reserve-group'",
             [i64::try_from(retained).unwrap()]).unwrap();
-        let before: (i64, i64) = conn.query_row(
-            "SELECT g.retained_bytes,COUNT(e.event_id) FROM bpmn_repetition_groups g JOIN bpmn_events e ON json_extract(e.data_json,'$.group_id')=g.group_id WHERE g.group_id='reserve-group'",
-            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-        let error = run(&conn).unwrap_err();
-        assert!(format!("{error:#}").contains(
-            "historical repeated Service observation exceeds unlatched retained-byte capacity"),
-            "{error:#}");
+        run(&conn).unwrap();
+        let group: (String,i64,Option<String>,Option<String>) = conn.query_row(
+            "SELECT status,terminal_capacity,terminal_incident_id,terminal_event_id FROM bpmn_repetition_groups WHERE group_id='reserve-group'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!((group.0.as_str(),group.1),("incident",1));
+        let incident: (String,Option<String>,Option<i64>) = conn.query_row(
+            "SELECT code,job_id,resolved_at_ms FROM bpmn_incidents WHERE incident_id=?1",
+            [group.2.as_deref().unwrap()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(incident, ("REPETITION_LIMIT".into(),None,None));
+        let blocked: String = conn.query_row(
+            "SELECT data_json FROM bpmn_events WHERE event_id=?1 AND kind='repetition_group_blocked'",
+            [group.3.as_deref().unwrap()], |row| row.get(0)).unwrap();
+        let blocked: serde_json::Value = serde_json::from_str(&blocked).unwrap();
+        assert_eq!((blocked["phase"].as_str(),blocked["code"].as_str(),blocked["group_id"].as_str()),
+            (Some("capacity"),Some("REPETITION_LIMIT"),Some("reserve-group")));
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_, i64>(0)).unwrap(), 195);
-        assert!(!table_exists(&conn,"bpmn_service_invocations").unwrap());
-        let after: (i64, i64) = conn.query_row(
-            "SELECT g.retained_bytes,COUNT(e.event_id) FROM bpmn_repetition_groups g JOIN bpmn_events e ON json_extract(e.data_json,'$.group_id')=g.group_id WHERE g.group_id='reserve-group'",
-            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
-        assert_eq!(after,before);
-        assert_eq!(conn.query_row("PRAGMA foreign_keys", [],
-            |row| row.get::<_, i64>(0)).unwrap(),1);
+            |row| row.get::<_, i64>(0)).unwrap(), 197);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_,String>(0)).unwrap(), "ok");
+        drop(conn);
+        let pool = crate::db::init(&path).unwrap();
+        let actor = crate::processes::repository::ProcessActor {
+            org_id: "org-default".into(), user_id: "selected-owner".into(),
+        };
+        let snapshot = crate::processes::repository::runtime_snapshot(
+            &pool, &actor, "selected-instance").unwrap();
+        assert!(snapshot.repetition_groups.iter().any(|group|
+            group.group_id == "reserve-group" && group.terminal_capacity));
+        assert!(snapshot.incidents.iter().any(|incident| incident.code == "REPETITION_LIMIT"));
     }
 
     #[test]
@@ -18201,18 +18387,45 @@ mod tests {
     }
 
     #[test]
-    fn service_invocation_migration_prepares_a_requeued_retry_without_losing_its_history() {
+    fn service_invocation_migration_never_redispatches_a_requeued_job_without_retry_evidence() {
         let conn = Connection::open_in_memory().unwrap();
         service_invocation_history_fixture(&conn);
         conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1 WHERE job_id='queued-job'", []).unwrap();
+        conn.execute("UPDATE bpmn_instances SET status='running' WHERE instance_id='selected-instance'", []).unwrap();
         run(&conn).unwrap();
-        let row: (String,String,String) = conn.query_row(
-            "SELECT v.phase,v.dispatch_evidence,j.status FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id WHERE v.job_id='queued-job'",
-            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(row, ("prepared".into(),"no_boundary".into(),"queued".into()));
+        let row: (String,String,String,Option<String>) = conn.query_row(
+            "SELECT v.phase,v.dispatch_evidence,j.status,v.stable_request_id FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id WHERE v.job_id='queued-job'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(row, ("uncertain".into(),"boundary_unknown".into(),"error".into(),None));
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE job_id='queued-job' AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND resolved_at_ms IS NULL", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
+            |row| row.get::<_,String>(0)).unwrap(), "incident");
         assert_eq!(conn.query_row("SELECT attempt FROM bpmn_jobs WHERE job_id='queued-job'", [],
             |row| row.get::<_, i64>(0)).unwrap(), 1);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn service_invocation_migration_prepares_a_requeued_job_only_with_recorded_retry_evidence() {
+        for evidence in ["event", "resolved_incident"] {
+            let conn = Connection::open_in_memory().unwrap();
+            service_invocation_history_fixture(&conn);
+            conn.execute("UPDATE bpmn_jobs SET attempt=1,fence=1 WHERE job_id='queued-job'", []).unwrap();
+            if evidence == "event" {
+                conn.execute("INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) VALUES('retry-event','selected-instance','selected-instance',100,2,'job_retried','Service_1','{\"old_job_id\":\"older-job\",\"new_job_id\":\"queued-job\"}')", []).unwrap();
+            } else {
+                conn.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES('old-incident','selected-instance','selected-instance','Service_1','queued-job','SERVICE_FAILED','failed',1,2)", []).unwrap();
+            }
+            run(&conn).unwrap();
+            let row: (String,String,String) = conn.query_row(
+                "SELECT v.phase,v.dispatch_evidence,j.status FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id WHERE v.job_id='queued-job'",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(row, ("prepared".into(),"no_boundary".into(),"queued".into()), "{evidence}");
+            assert_eq!(conn.query_row("SELECT attempt FROM bpmn_jobs WHERE job_id='queued-job'", [],
+                |row| row.get::<_, i64>(0)).unwrap(), 1);
+            assert!(foreign_key_check(&conn).unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -18254,7 +18467,14 @@ mod tests {
         let codes: Vec<String> = conn.prepare(
             "SELECT code FROM bpmn_incidents WHERE job_id='failed-job' AND resolved_at_ms IS NULL ORDER BY code").unwrap()
             .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(codes, vec!["EXTERNAL_OUTCOME_UNCERTAIN","INTERRUPTED"]);
+        assert_eq!(codes, vec!["EXTERNAL_OUTCOME_UNCERTAIN"],
+            "one fact must produce exactly one incident, like fail_job");
+        let event: String = conn.query_row(
+            "SELECT data_json FROM bpmn_events WHERE kind='incident' AND json_extract(data_json,'$.job_id')='failed-job'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&event).unwrap()["reason"], "INTERRUPTED");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_events WHERE kind='job_interrupted'", [],
+            |row| row.get::<_,i64>(0)).unwrap(), 0);
         assert_eq!(conn.query_row("SELECT status FROM bpmn_instances WHERE instance_id='selected-instance'", [],
             |row| row.get::<_,String>(0)).unwrap(), "incident");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
@@ -19126,7 +19346,7 @@ struct HistoricalIncident<'a> {
     instance_id: &'a str,
     scope_id: &'a str,
     node_id: &'a str,
-    job_id: &'a str,
+    job_id: Option<&'a str>,
     code: &'a str,
     message: &'a str,
     event_kind: &'a str,
@@ -19171,6 +19391,56 @@ fn historical_incident(conn: &Connection, incident: &HistoricalIncident<'_>) -> 
             params![incident.at_ms, incident.instance_id, incident.scope_id])?;
     }
     Ok(id)
+}
+
+/// The previous binary could keep an instance's repeated activities above the
+/// retained-byte limit that the Service invocation reservations now enforce. The
+/// group holding the most retained bytes is latched exactly like a runtime
+/// capacity denial (open `REPETITION_LIMIT` incident, `repetition_group_blocked`
+/// fact, `terminal_capacity`), so the operator sees it instead of the node
+/// refusing to boot. Live activations are left parked for the operator.
+fn latch_historical_repetition_capacity(
+    conn: &Connection, instance_id: &str, at_ms: i64,
+) -> Result<()> {
+    use anyhow::Context;
+    use rusqlite::params;
+    use uuid::Uuid;
+
+    let (group_id, scope_id, node_id, completed): (String, String, String, i64) = conn.query_row(
+        "SELECT group_id,scope_id,node_id,completed_count FROM bpmn_repetition_groups
+         WHERE instance_id=?1 AND status='open' AND terminal_capacity=0
+         ORDER BY retained_bytes DESC,group_id LIMIT 1",
+        [instance_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .context("historical repetition capacity is exceeded without an open group to latch")?;
+    let last_source: Option<String> = conn.query_row(
+        "SELECT accepted_source_event_id FROM bpmn_repetition_occurrences
+         WHERE instance_id=?1 AND group_id=?2 AND accepted_source_event_id IS NOT NULL
+         ORDER BY ordinal DESC LIMIT 1",
+        params![instance_id, group_id], |row| row.get(0)).ok();
+    let incident_id = historical_incident(conn, &HistoricalIncident {
+        instance_id, scope_id: &scope_id, node_id: &node_id, job_id: None,
+        code: "REPETITION_LIMIT", message: "repetition_bytes", event_kind: "incident",
+        resolved: false, at_ms, extra: serde_json::json!({}),
+    })?;
+    let event_id = Uuid::new_v4().to_string();
+    let seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [instance_id], |row| row.get(0))?;
+    conn.execute(
+        "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,actor_user_id,data_json) VALUES(?1,?2,?3,?4,?5,'repetition_group_blocked',?6,NULL,?7)",
+        params![event_id, instance_id, scope_id, seq, at_ms, node_id,
+            serde_json::json!({
+                "group_id":group_id,
+                "last_completed_ordinal":completed.checked_sub(1).filter(|ordinal| *ordinal >= 0),
+                "last_source_event_id":last_source,
+                "incident_id":incident_id,
+                "phase":"capacity","code":"REPETITION_LIMIT","reason":"repetition_bytes",
+            }).to_string()])?;
+    let changed = conn.execute(
+        "UPDATE bpmn_repetition_groups SET status='incident',terminal_capacity=1,terminal_incident_id=?1,terminal_event_id=?2,revision=revision+1,updated_at_ms=?3 WHERE instance_id=?4 AND group_id=?5",
+        params![incident_id, event_id, at_ms, instance_id, group_id])?;
+    anyhow::ensure!(changed == 1, "historical repetition capacity latch lost its group");
+    Ok(())
 }
 
 fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
@@ -19303,30 +19573,29 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
              AND t.token_id=?3 AND t.node_id=?4 AND t.status='waiting' \
              AND i.status NOT IN ('completed','cancelled','error'))",
             params![instance_id,scope_id,token_id,node_id], |row| row.get(0))?;
-        // Nothing here may refuse a database for the shape of its job history: a
-        // refusal after a crash leaves the new binary unable to boot, so every job
-        // state the previous binary could write is converted to an explicit,
-        // operator-visible state instead.
+        // No job state the previous binary could write refuses the upgrade: each one
+        // is converted to an explicit, operator-visible state. Only corruption or
+        // tampering refuses (and rolls the whole migration back): a failing foreign
+        // key or integrity check, an inaccurate repetition counter, a pinned model
+        // whose hash or shape no longer parses, a job without its version, cyclic
+        // scope ancestry, a missing or non-Service pinned node or flow pin, a
+        // negative fence, and ambiguous or contradictory accepted-result events.
         let mut status = status;
         let mut fence = fence;
         let mut worker_id = worker_id;
+        let mut interrupted = false;
         if status == "running" {
             // The previous process owned this lease and is gone, so the lease is
-            // stale by construction. Reproduce its own boot-time recovery (job
-            // `error`, instance `incident`, INTERRUPTED incident) so that the
-            // common attempted-job path below classifies the outcome as unknown.
+            // stale by construction. Reproduce the job state of its own boot-time
+            // recovery (job `error`, fresh fence) and let the common attempted-job
+            // path below record the single EXTERNAL_OUTCOME_UNCERTAIN incident that
+            // `fail_job` records for an interrupted dispatch.
+            interrupted = true;
             fence += 1;
             worker_id = None;
             if live {
                 conn.execute("UPDATE bpmn_jobs SET status='error',fence=?1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE job_id=?3",
                     params![i64::try_from(fence)?,cutover_at_ms,job_id])?;
-                historical_incident(conn, &HistoricalIncident {
-                    instance_id: &instance_id, scope_id: &scope_id, node_id: &node_id,
-                    job_id: &job_id, code: "INTERRUPTED",
-                    message: "The worker stopped before the external effect was confirmed",
-                    event_kind: "job_interrupted", resolved: false, at_ms: cutover_at_ms,
-                    extra: serde_json::json!({}),
-                })?;
                 status = "error".into();
             } else {
                 conn.execute("UPDATE bpmn_jobs SET status='cancelled',fence=?1,worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?2 WHERE job_id=?3",
@@ -19336,12 +19605,18 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
             touched_jobs.push(job_id.clone());
         }
         let attempted = attempt > 0 || fence > 0 || worker_id.is_some() || result_json.is_some();
+        // No current writer re-queues an attempted job, so a queued job with earlier
+        // attempts is only trusted to be re-dispatchable when an operator retry
+        // is on record for it; otherwise it is treated like any attempted job.
+        let retry_evidence = attempted && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND kind='job_retried' AND ?2 IN (json_extract(data_json,'$.job_id'),json_extract(data_json,'$.old_job_id'),json_extract(data_json,'$.new_job_id'))) OR EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND job_id=?2 AND resolved_at_ms IS NOT NULL)",
+            params![instance_id,job_id], |row| row.get::<_, bool>(0))?;
         let unclaimed = !attempted && result_origin.is_none();
         let (phase, evidence, quarantine_code) = if accepted.is_some() {
             ("accepted", "boundary_unknown", None)
-        } else if status == "queued" && live {
-            // A queued job with earlier attempts was re-queued by an explicit
-            // operator retry; its next claim is a fresh, intended dispatch.
+        } else if status == "queued" && live && (!attempted || retry_evidence) {
+            // Never dispatched, or re-queued by an explicit operator retry (proved
+            // by its own history); either way the next claim is an intended dispatch.
             ("prepared", "no_boundary", None)
         } else if unclaimed && (status == "error" || !live) {
             if status == "queued" {
@@ -19352,8 +19627,10 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
             ("proved_no_effect", "no_boundary", None)
         } else if attempted && status != "completed" {
             if status == "queued" {
-                conn.execute("UPDATE bpmn_jobs SET status='cancelled',updated_at_ms=?1 WHERE job_id=?2",
-                    params![cutover_at_ms,job_id])?;
+                // A live activation keeps a terminal `error` job (like an interrupted
+                // dispatch); a closed one has nothing left to wait for.
+                conn.execute("UPDATE bpmn_jobs SET status=?1,updated_at_ms=?2 WHERE job_id=?3",
+                    params![if live { "error" } else { "cancelled" },cutover_at_ms,job_id])?;
                 touched_jobs.push(job_id.clone());
             }
             ("uncertain", "boundary_unknown", Some(("EXTERNAL_OUTCOME_UNCERTAIN",
@@ -19375,9 +19652,13 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
         let incident_id = if let Some((code, message)) = quarantine_code {
             let id = historical_incident(conn, &HistoricalIncident {
                 instance_id: &instance_id, scope_id: &scope_id, node_id: &node_id,
-                job_id: &job_id, code, message, event_kind: "incident",
+                job_id: Some(&job_id), code, message, event_kind: "incident",
                 resolved: !live, at_ms: cutover_at_ms,
-                extra: serde_json::json!({"invocation_id":invocation_id}),
+                extra: if interrupted {
+                    serde_json::json!({"invocation_id":invocation_id,"reason":"INTERRUPTED"})
+                } else {
+                    serde_json::json!({"invocation_id":invocation_id})
+                },
             })?;
             touched_jobs.push(job_id.clone());
             Some(id)
@@ -19472,9 +19753,12 @@ fn bpmn_service_invocations(conn: &Connection) -> Result<()> {
     for (instance_id, retained, terminal_capacity) in rows {
         let retained = u64::try_from(retained)?;
         let reserved = reservations.get(&instance_id).copied().unwrap_or_default();
-        ensure!(terminal_capacity == 1 || retained.checked_add(reserved)
-            .context("historical repeated Service capacity calculation overflow")? <= 64 * 1024 * 1024,
-            "historical repeated Service observation exceeds unlatched retained-byte capacity");
+        let over_capacity = retained.checked_add(reserved)
+            .context("historical repeated Service capacity calculation overflow")?
+            > 64 * 1024 * 1024;
+        if terminal_capacity != 1 && over_capacity {
+            latch_historical_repetition_capacity(conn, &instance_id, cutover_at_ms)?;
+        }
     }
     ensure!(foreign_key_check(conn)?.is_empty(),
         "service invocation migration created a foreign key violation");

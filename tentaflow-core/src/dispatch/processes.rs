@@ -697,32 +697,37 @@ pub fn process_dispatch(
                 *tick_duration_ms,
             )
             .map_err(error)?;
-            ctx.state
-                .simulation_registry
-                .reclaim(pool)
+            // Reclaiming scans every retained run and the first Start builds the
+            // schema template, so the section runs where the runtime may move other
+            // tasks off this worker.
+            super::ui_channel::run_blocking(|| -> Result<P, ProtocolError> {
+                ctx.state
+                    .simulation_registry
+                    .reclaim(pool)
+                    .map_err(error)?;
+                let start_reservation = ctx
+                    .state
+                    .simulation_registry
+                    .reserve_start(&source.input().org_id, &source.input().owner_user_id)
+                    .map_err(error)?;
+                let mut store = simulation::SimulationStore::create(source).map_err(error)?;
+                let source_pin = store.source().clone();
+                let authorization = repository::authorize_simulation_action(
+                    pool,
+                    &actor,
+                    &source_pin,
+                )
                 .map_err(error)?;
-            let start_reservation = ctx
-                .state
-                .simulation_registry
-                .reserve_start(&source.input().org_id, &source.input().owner_user_id)
-                .map_err(error)?;
-            let mut store = simulation::SimulationStore::create(source).map_err(error)?;
-            let source_pin = store.source().clone();
-            let authorization = repository::authorize_simulation_action(
-                pool,
-                &actor,
-                &source_pin,
-            )
-            .map_err(error)?;
-            let view = store.start(authorization, variables.clone()).map_err(error)?;
-            let simulation_id = view.simulation_id.clone();
-            let response_view = simulation_view(view).map_err(error)?;
-            start_reservation
-                .commit(simulation_id.clone(), store.into_database())
-                .map_err(error)?;
-            P::SimulationStartResponse {
-                view: response_view,
-            }
+                let view = store.start(authorization, variables.clone()).map_err(error)?;
+                let simulation_id = view.simulation_id.clone();
+                let response_view = simulation_view(view).map_err(error)?;
+                start_reservation
+                    .commit(simulation_id.clone(), store.into_database())
+                    .map_err(error)?;
+                Ok(P::SimulationStartResponse {
+                    view: response_view,
+                })
+            })?
         }
         P::SimulationViewRequest { simulation_id } => {
             let view = ctx

@@ -17006,6 +17006,27 @@ fn validate_activity_io_inputs_on(
                 let failure = failure.downcast_ref::<super::runtime::ActivityIoAssociationFailure>()
                     .context("activity IO input failure has no authored association")?;
                 let message = bounded_failure_message(&failure.to_string());
+                if race_branch {
+                    // The planner evaluates the branches in edge order and parks the
+                    // gateway on the first failure, so every earlier branch must pass.
+                    for flow in body.sequence_flows.iter()
+                        .filter(|flow| flow.source_id == source.node_id) {
+                        if activation.arrival_edge_id.as_deref() == Some(flow.id.as_str()) {
+                            break;
+                        }
+                        let earlier = body.nodes.iter().find(|candidate|
+                            candidate.id == flow.target_id)
+                            .context("event race branch target is outside its selected body")?;
+                        if let (Some(earlier_io), true) = (&earlier.activity_io,
+                            matches!(&earlier.kind, ProcessNodeKind::MessageCatch { .. }
+                                | ProcessNodeKind::ReceiveTask { .. }
+                                | ProcessNodeKind::SignalCatch { .. })) {
+                            ensure!(super::runtime::evaluate_activity_inputs(
+                                earlier_io, modeling, &local, &effective, &extra).is_ok(),
+                                "event race input failure skipped an earlier failing branch");
+                        }
+                    }
+                }
                 ensure!(failure.association_id == *association_id
                     && failure.position == *position
                     && event.kind == "incident"
@@ -20500,14 +20521,18 @@ fn validate_closed_service_dispatches_on(
             continue;
         }
         let row: (String, String, String, String, String, String, Option<u32>, Option<u64>,
-            Option<String>, Option<String>, Option<String>, String, String) = tx.query_row(
-            "SELECT v.invocation_id,v.job_id,v.scope_id,v.node_id,v.token_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.reserved_result_event_id,v.uncertainty_incident_id,j.status,t.status FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id WHERE v.job_id=?1 AND v.instance_id=?2",
+            Option<String>, Option<String>, Option<String>, String, String, String) = tx.query_row(
+            "SELECT v.invocation_id,v.job_id,v.scope_id,v.node_id,v.token_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.reserved_result_event_id,v.uncertainty_incident_id,j.status,t.status,v.dispatch_evidence FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id WHERE v.job_id=?1 AND v.instance_id=?2",
             params![job_id,instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,
                 row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row_optional_u64(row, 7)?,
-                row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)))?;
+                row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)))?;
         let (invocation_id, _, scope_id, node_id, token_id, phase, attempt, fence,
-            worker_id, result_id, uncertainty_incident_id, job_status, token_status) = row;
-        if !matches!(phase.as_str(), "may_have_executed" | "uncertain" | "observed") { continue }
+            worker_id, result_id, uncertainty_incident_id, job_status, token_status,
+            dispatch_evidence) = row;
+        // Rows without a committed boundary carry no dispatch tuple to close; their
+        // incident is resolved by the generic job-incident cancellation.
+        if dispatch_evidence != "committed_boundary"
+            || !matches!(phase.as_str(), "may_have_executed" | "uncertain" | "observed") { continue }
         let attempt = attempt.context("cancelled dispatch lacks its original attempt")?;
         let fence = fence.context("cancelled dispatch lacks its original fence")?;
         let worker_id = worker_id.context("cancelled dispatch lacks its original worker")?;

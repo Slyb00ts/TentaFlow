@@ -2213,6 +2213,31 @@ fn simulation_incident_keeps_the_private_run_open_for_peer_work() {
 }
 
 #[test]
+fn start_reservation_commit_requires_the_pinned_organization() {
+    let registry = SimulationRegistry::new();
+    let store = create_store(source_input()).expect("capture source pin");
+    let source = store.source().clone();
+    let simulation_id = store.simulation_id().to_owned();
+    let foreign = registry
+        .reserve_start("another-organization", &source.owner_user_id)
+        .expect("reserve under another organization");
+    let error = foreign
+        .commit(simulation_id.clone(), store.into_database())
+        .expect_err("a reservation counted under another organization must not commit");
+    assert!(format!("{error:#}").contains("organization changed"), "{error:#}");
+    assert!(registry.take(&simulation_id).is_err(), "nothing was registered");
+
+    let store = create_store(source_input()).expect("capture matching source pin");
+    let simulation_id = store.simulation_id().to_owned();
+    registry
+        .reserve_start(&source.org_id, &source.owner_user_id)
+        .expect("reserve under the pinned organization")
+        .commit(simulation_id.clone(), store.into_database())
+        .expect("the matching reservation commits");
+    registry.take(&simulation_id).expect("the committed run is registered");
+}
+
+#[test]
 fn simulation_databases_are_independent_page_copies_of_one_schema_template() {
     use std::sync::atomic::Ordering;
 

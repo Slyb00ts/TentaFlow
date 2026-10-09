@@ -29,6 +29,7 @@ const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
 const { processTemplates } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
+const { simulationWindow } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
 const { default: flows } = await import('../flows.js');
 localStorage.setItem('tentaflow_lang', 'en');
@@ -4586,4 +4587,23 @@ test('activity result inspector edits the localized CEL result and exposes no ou
     config.destroy();
     graph.destroy();
   }
+});
+
+test('simulation event list counts the server omissions and the rows the view itself drops', async () => {
+  fixtures({ processSimulationReleaseRequest: {} });
+  const events = Array.from({ length: 120 }, (_, index) => ({ atMs: index, kind: 'node_completed', nodeId: `Node_${index}` }));
+  const win = simulationWindow({ simulationId: 'simulation-one', clock: { nowMs: 5, horizonMs: 10, stepIndex: 2 },
+    instance: null, userTasks: [], timers: [], events, eventsOmitted: 7, traceStepsOmitted: 3 });
+  const content = win.querySelector('[data-simulation-content]');
+  assert.equal(content.querySelectorAll('.fb-simulation-events li').length, 50);
+  assert.match(content.querySelector('.fb-simulation-events li').textContent, /Node_70/);
+  assert.equal(content.querySelector('[data-simulation-events-omitted]').textContent.trim(), '77 earlier events not shown');
+  assert.equal(content.querySelector('[data-simulation-trace-omitted]').textContent.trim(), '3 earlier trace steps not shown');
+  win.remove();
+
+  const complete = simulationWindow({ simulationId: 'simulation-two', clock: { nowMs: 5, horizonMs: 10, stepIndex: 2 },
+    instance: null, userTasks: [], timers: [], events: events.slice(0, 3), eventsOmitted: 0, traceStepsOmitted: 0 });
+  assert.equal(complete.querySelector('[data-simulation-events-omitted]'), null);
+  assert.equal(complete.querySelector('[data-simulation-trace-omitted]'), null);
+  complete.remove();
 });

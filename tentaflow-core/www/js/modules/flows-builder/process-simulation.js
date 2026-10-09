@@ -11,6 +11,8 @@ import '/js/components/tf-chip.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-window.js';
 
+const SIMULATION_EVENTS_SHOWN = 50;
+
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 
 function jsonSection(label, value) {
@@ -38,7 +40,7 @@ function jsonSection(label, value) {
   return section;
 }
 
-function simulationWindow(view) {
+export function simulationWindow(view) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', text('simulation'));
   win.setAttribute('icon', 'play');
@@ -84,6 +86,10 @@ function simulationWindow(view) {
     const tasks = current.userTasks || [];
     const timers = current.timers || [];
     const events = current.events || [];
+    const shownEvents = events.slice(-SIMULATION_EVENTS_SHOWN);
+    // The server omits what does not fit one frame and this view shows only the
+    // newest rows of the rest, so the label counts both kinds of hidden events.
+    const hiddenEvents = (current.eventsOmitted || 0) + events.length - shownEvents.length;
     content.innerHTML = `
       <div class="fb-simulation-toolbar">
         <div><strong>${escapeHtml(text('simulation_clock'))}</strong>: ${escapeHtml(String(clock.nowMs))} / ${escapeHtml(String(clock.horizonMs))} ms · ${escapeHtml(String(clock.stepIndex))}</div>
@@ -113,8 +119,9 @@ function simulationWindow(view) {
         }).join('') : `<p>${escapeHtml(text('simulation_empty_timers'))}</p>`}
       </section>
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_events'))}</h3>
-        ${events.length ? `<ol class="fb-simulation-events">${events.slice(-50).map((event) => `<li><span>${escapeHtml(String(event.atMs))}</span> ${escapeHtml(event.kind)}${event.nodeId ? ` · ${escapeHtml(event.nodeId)}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
-        ${current.eventsOmitted > 0 ? `<p>${escapeHtml(text('simulation_events_omitted', { count: current.eventsOmitted }))}</p>` : ''}
+        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(String(event.atMs))}</span> ${escapeHtml(event.kind)}${event.nodeId ? ` · ${escapeHtml(event.nodeId)}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
+        ${hiddenEvents > 0 ? `<p data-simulation-events-omitted>${escapeHtml(text('simulation_events_omitted', { count: hiddenEvents }))}</p>` : ''}
+        ${current.traceStepsOmitted > 0 ? `<p data-simulation-trace-omitted>${escapeHtml(text('simulation_trace_steps_omitted', { count: current.traceStepsOmitted }))}</p>` : ''}
       </section>`;
     content.querySelectorAll('tf-code-editor[data-simulation-output]').forEach((editor) => {
       editor.value = '{}';

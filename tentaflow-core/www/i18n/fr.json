@@ -14111,6 +14111,7 @@
     "simulation_empty_tasks": "Aucune tâche ouverte",
     "simulation_empty_events": "Aucun événement",
     "simulation_events_omitted": "{count} {count|événement plus ancien non affiché|événements plus anciens non affichés}",
+    "simulation_trace_steps_omitted": "{count} {count|étape de trace plus ancienne non affichée|étapes de trace plus anciennes non affichées}",
     "simulation_complete_task": "Terminer la tâche",
     "simulation_acknowledge_task": "Accuser réception",
     "simulation_outputs": "Résultat de la tâche (JSON)",

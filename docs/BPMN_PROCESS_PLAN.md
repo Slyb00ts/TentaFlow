@@ -296,19 +296,34 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
 
 ### 10.2a Poprawki po przeglądzie (2026-10-09)
 
-- **Migracja 196 nie odmawia już rozruchu.** Historia zadań usługi, której poprzednia wersja nie
-  mogła „udowodnić”, jest przekształcana w jawny stan zamiast przerywać migrację (po awarii nowy
-  plik wykonywalny nigdy by nie wystartował). Zadanie `running` jest traktowane jak po
-  rozruchowym `recover_jobs` starej wersji: zadanie `error` z podbitym ogrodzeniem, incydent
-  `INTERRUPTED`, instancja w `incident`, a wywołanie przechodzi w `uncertain` /
-  `boundary_unknown` z incydentem `EXTERNAL_OUTCOME_UNCERTAIN` (bez bezpośredniego ponowienia).
-  Zadanie `completed` bez przyjętego zdarzenia źródłowego, zadanie ponownie zakolejkowane po
-  próbach (`queued`, `attempt>0`) i próba w zamkniętej aktywności są klasyfikowane tak samo:
-  ponowne kolejkowanie po ręcznym „Ponów” daje `prepared`, reszta `uncertain` z incydentem
-  `SERVICE_HISTORY_UNPROVEN` (zakończone zadanie bez przyjętego zdarzenia źródłowego) albo
-  `EXTERNAL_OUTCOME_UNCERTAIN` (próba bez znanego wyniku). Incydent jest otwarty tylko dla żywej aktywności; dla zamkniętej
-  zostaje rozwiązanym zapisem historii, więc nie blokuje instancji. Liczniki
-  `retained_bytes` grup powtórzeń są przeliczane dla dotkniętych zadań.
+- **Migracja 196 nie odmawia rozruchu z powodu kształtu historii zadań.** Historia zadań usługi,
+  której poprzednia wersja nie mogła „udowodnić”, jest przekształcana w jawny stan zamiast
+  przerywać migrację (po awarii nowy plik wykonywalny nigdy by nie wystartował). Zadanie
+  `running` jest traktowane jak po rozruchowym `recover_jobs`: zadanie `error` z podbitym
+  ogrodzeniem, instancja w `incident`, a wywołanie przechodzi w `uncertain` /
+  `boundary_unknown` z **jednym** incydentem `EXTERNAL_OUTCOME_UNCERTAIN` (bez bezpośredniego
+  ponowienia); przyczyna `INTERRUPTED` jest polem `reason` zdarzenia incydentu, tak jak w
+  `fail_job`. Zadanie `completed` bez przyjętego zdarzenia źródłowego dostaje
+  `SERVICE_HISTORY_UNPROVEN`, a próba bez znanego wyniku `EXTERNAL_OUTCOME_UNCERTAIN`.
+  Zadanie `queued` bez prób (`attempt=0`, bez ogrodzenia i pracownika) staje się `prepared`.
+  Zadanie `queued` z próbami staje się `prepared` tylko przy zapisanym dowodzie ręcznego
+  ponowienia (zdarzenie `job_retried` dla tego zadania albo rozwiązany incydent tego zadania);
+  bez dowodu jest `uncertain` + otwarty `EXTERNAL_OUTCOME_UNCERTAIN` i zadanie `error`
+  (żaden obecny zapis nie ponownie kolejkuje zadania z próbami, więc nigdy go nie
+  wysyłamy ponownie z nowym identyfikatorem żądania). Incydent jest otwarty tylko dla żywej
+  aktywności; dla zamkniętej zostaje rozwiązanym zapisem historii. Liczniki `retained_bytes` grup
+  powtórzeń są przeliczane dla dotkniętych zadań. Przekroczenie limitu zatrzymanych bajtów
+  przez grupę powtórzeń (stan osiągalny dla starej wersji) zatrzaskuje grupę jak odmowa
+  pojemności w czasie działania: otwarty incydent `REPETITION_LIMIT`, zdarzenie
+  `repetition_group_blocked` (faza `capacity`) i `terminal_capacity`; żywe aktywności zostają
+  zaparkowane dla operatora.
+  **Migracja nadal odmawia (i cofa się w całości) wyłącznie przy uszkodzeniu lub manipulacji
+  danymi**, czyli: niepusty `foreign_key_check` na wejściu lub na wyjściu oraz błąd
+  `integrity_check`; niedokładny licznik bajtów grupy powtórzeń; zmieniony przypięty model
+  (suma SHA-256) lub model, którego nie da się sparsować; zadanie bez przypiętej wersji; cykliczne
+  lub zbyt głębokie pochodzenie zakresów; brak jedynego przypiętego węzła Service, węzeł innego
+  rodzaju albo brak/niejednoznaczne przypięcie przepływu z poprawną sumą grafu; ujemne
+  ogrodzenie; wieloznaczne lub sprzeczne z zapisanym wynikiem zdarzenia przyjętego wyniku.
 - **Bramka oparta na zdarzeniach**: wejścia gałęzi Receive/Message/Signal są liczone przed
   uzbrojeniem czegokolwiek. Błąd skojarzenia (np. `1 / 0`, brakująca zmienna) parkuje token na
   gałęzi z incydentem `ACTIVITY_IO_INPUT_FAILED` (świadek `input_failed`), bez wyścigu,
@@ -343,6 +358,29 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   `PrivateSimulationMode`, który tworzy wyłącznie `simulation.rs`, a każdy punkt wejścia
   (`start_simulation_plan_on`, `apply_simulation_plan_on`, `fire_timer_on`) sprawdza, że
   transakcja działa na prywatnej bazie symulacji; transakcja produkcyjna jest odrzucana.
+
+- **Runda 2 po przeglądzie.**
+  - Anulowanie aktywacji z wierszem `uncertain` / `boundary_unknown` (bez krotki wysyłki) nie
+    kończy się już błędem zapisu: `validate_closed_service_dispatches_on` pomija wywołania bez
+    `committed_boundary`, tak jak migawka planera (ładuje tylko `committed_boundary`); ich incydent
+    zamyka zwykłe anulowanie zadań aktywacji. Dotyczy zegara granicznego przerywającego i
+    zakończenia terminującego w gałęzi siostrzanej.
+  - Bramka zdarzeń: zapis sprawdza, że zgłoszona nieudana gałąź jest pierwszą nieudaną w kolejności
+    krawędzi bramki (planer zatrzymuje się na pierwszej); wcześniejsza gałąź, która się powiedzie,
+    jest wymagana.
+  - `SimulationStartReservation::commit` porównuje także organizację przypiętego źródła.
+  - `Start` symulacji: szablon schematu leży w `OnceLock` budowanym pod osobnym zamkiem
+    budowy (równoległe pierwsze `Start` czekają na niego, nie na rejestr ani na zamek kopii);
+    nieudana budowa nie jest zapamiętywana. Całą ciężką sekcję (`reclaim` z do 16 migawkami,
+    pierwsza budowa szablonu, kopia) wykonuje `ui_channel::run_blocking`, czyli
+    `block_in_place` na wielowątkowym środowisku tokio — handler jest synchroniczny, więc
+    `spawn_blocking` nie ma tu zastosowania bez przebudowy sygnatury handlera. Nie zmierzono
+    wpływu na opóźnienie ogona; sama kopia strony ma 0,3 ms.
+  - `SimulationDatabase::open` jawnie włącza `PRAGMA foreign_keys=ON` (wbudowany SQLite ma to
+    domyślnie włączone, więc zmiana jest zabezpieczeniem, nie poprawką zachowania).
+  - Okno symulacji pokazuje łączną liczbę ukrytych zdarzeń (pominięte przez serwer plus
+    odcięte po stronie klienta do 50 ostatnich) i `traceStepsOmitted`; klucz
+    `bpmn.simulation_trace_steps_omitted` w pięciu językach.
 
 **Ponów dla zablokowanego mapowania wyjścia — decyzja.** Nie wdrożone, bo nie da się tego zrobić
 spójnie bez nowej migracji i nowej gałęzi walidatora:

@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -345,8 +345,14 @@ fn connection_resident_bytes(conn: &Connection) -> Result<u64> {
 /// The migrated production process schema plus the simulation schema, built once
 /// per process. Running the whole migration ladder for every Start would block the
 /// calling worker for the better part of a second, so each private database is a
-/// page copy of this template. The template is only ever read after it is built.
-static SCHEMA_TEMPLATE: Mutex<Option<Connection>> = Mutex::new(None);
+/// page copy of this template. The template is only ever read after it is built;
+/// the mutex around the connection exists because `Connection` is not `Sync` and
+/// is held only for the page copy.
+static SCHEMA_TEMPLATE: OnceLock<Mutex<Connection>> = OnceLock::new();
+
+/// Serializes the one-time build so concurrent first Starts wait here, outside the
+/// registry lock and outside the template's copy lock, and a failed build is retried.
+static SCHEMA_TEMPLATE_BUILD: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 pub(crate) static SCHEMA_TEMPLATE_BUILDS: std::sync::atomic::AtomicUsize =
@@ -361,23 +367,36 @@ fn build_schema_template() -> Result<Connection> {
     Ok(conn)
 }
 
+fn schema_template() -> Result<&'static Mutex<Connection>> {
+    if let Some(template) = SCHEMA_TEMPLATE.get() {
+        return Ok(template);
+    }
+    let _building = SCHEMA_TEMPLATE_BUILD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("simulation schema template build lock is poisoned"))?;
+    if let Some(template) = SCHEMA_TEMPLATE.get() {
+        return Ok(template);
+    }
+    let template_connection = build_schema_template()?;
+    Ok(SCHEMA_TEMPLATE.get_or_init(|| Mutex::new(template_connection)))
+}
+
 impl SimulationDatabase {
     pub(crate) fn open() -> Result<Self> {
         let mut conn =
             Connection::open_in_memory().context("open disposable simulation database")?;
-        let mut template = SCHEMA_TEMPLATE
-            .lock()
-            .map_err(|_| anyhow::anyhow!("simulation schema template lock is poisoned"))?;
-        if template.is_none() {
-            *template = Some(build_schema_template()?);
+        {
+            let source = schema_template()?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("simulation schema template lock is poisoned"))?;
+            rusqlite::backup::Backup::new(&source, &mut conn)
+                .and_then(|backup| backup.run_to_completion(1024, Duration::ZERO, None))
+                .context("copy the simulation schema template")?;
         }
-        let source = template
-            .as_ref()
-            .context("simulation schema template was not built")?;
-        rusqlite::backup::Backup::new(source, &mut conn)
-            .and_then(|backup| backup.run_to_completion(1024, Duration::ZERO, None))
-            .context("copy the simulation schema template")?;
-        drop(template);
+        // The page copy carries no connection settings, and the schema's cascades
+        // and references are only enforced with this switched on.
+        conn.pragma_update(None, "foreign_keys", true)
+            .context("enable foreign keys on the disposable simulation database")?;
         Ok(Self { conn })
     }
 
@@ -907,8 +926,8 @@ impl SimulationStartReservation {
             "simulation private database exceeds its resident size budget"
         );
         ensure!(
-            source.owner_user_id == self.owner_user_id,
-            "simulation owner changed before Start reservation commit"
+            source.owner_user_id == self.owner_user_id && source.org_id == self.org_id,
+            "simulation owner or organization changed before Start reservation commit"
         );
         let state = self
             .state
