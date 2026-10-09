@@ -4,8 +4,7 @@
 //   structure (mockup g01, "Nieobecności i zastępstwa"): the person's absences
 //   (add, change, delete — their own, entered by hand), who covers them and
 //   whom they cover. Everything is read through `orgCoverRequest`, which the
-//   server already filtered by privacy; the reason of an absence is shown only
-//   when the answer carries it.
+//   server already filtered by privacy; an absence has no reason to show.
 //   Deputies are set by administrators (docs §2.2): the button is drawn only
 //   when the answer says the caller may, and a person without that right gets
 //   a line saying who sets them.
@@ -38,11 +37,10 @@ function phaseChip(phase) {
   return `<tf-chip status="${PHASE_STATUS[phase]}">${escapeHtml(ct(`phase_${phase}`))}</tf-chip>`;
 }
 
-function absenceRowHtml({ absence, phase, manual }, canEdit, canSeeReason) {
+function absenceRowHtml({ absence, phase, manual }, canEdit) {
   const days = dayCount(absence);
   const kind = ct(`kind_${absence.kind}`);
   const meta = [kind, days == null ? ct('open_ended') : ct('days', { count: days })];
-  if (canSeeReason && absence.reason) meta.push(absence.reason);
   const source = manual ? ct('source_manual') : absence.source;
   return `
     <div class="org-cover-row" data-kind="absence" data-id="${escapeAttr(absence.id)}">
@@ -127,7 +125,7 @@ export async function mountProfileCover(host) {
       ? `<tf-button size="sm" icon="plus" data-act="absence-add">${escapeHtml(ct('absence_add'))}</tf-button>` : '';
     const absenceBody = `
       <p class="org-cover-note">${escapeHtml(ct('absence_privacy_note'))}</p>
-      ${absences.length ? absences.map((row) => absenceRowHtml(row, canEditAbsence(row), cover.can_see_reason)).join('') : empty(ct('absence_empty'))}`;
+      ${absences.length ? absences.map((row) => absenceRowHtml(row, canEditAbsence(row))).join('') : empty(ct('absence_empty'))}`;
 
     const covered = deputyRows(cover.covered_by, today);
     const covering = deputyRows(cover.covering, today);

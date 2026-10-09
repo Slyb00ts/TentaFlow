@@ -30,7 +30,6 @@ const seesFor = (id, name) => ({
     { area: 'structure', verdict: 'all', rule: 'every_member' },
     { area: 'utilization', verdict: 'subtree', rule: 'primary_manager' },
     { area: 'absence_dates', verdict: 'subtree', rule: 'primary_manager' },
-    { area: 'absence_reasons', verdict: 'direct', rule: 'primary_manager' },
     { area: 'position_history', verdict: 'own', rule: 'owner' },
     { area: 'everyone_else', verdict: 'none', rule: 'none' },
   ],
@@ -39,9 +38,9 @@ const seesFor = (id, name) => ({
 const whoFor = (id, name) => ({
   subject: person(id, name),
   viewers: [
-    { user_id: 'u-adm', display_name: 'Admin', rule: 'administrator', kinds: ['absence_reason', 'absence_dates', 'position_history'] },
-    { user_id: id, display_name: name, rule: 'owner', kinds: ['absence_reason'] },
-    { user_id: 'u-anna', display_name: 'Anna', rule: 'primary_manager', kinds: ['absence_reason', 'absence_dates', 'time_utilization'] },
+    { user_id: 'u-adm', display_name: 'Admin', rule: 'administrator', kinds: ['absence_dates', 'position_history'] },
+    { user_id: id, display_name: name, rule: 'owner', kinds: ['absence_dates'] },
+    { user_id: 'u-anna', display_name: 'Anna', rule: 'primary_manager', kinds: ['absence_dates', 'time_utilization'] },
   ],
 });
 
@@ -88,26 +87,25 @@ test('every area is a row with its verdict and the rule the server gave', async 
   await mount([]);
   const rows = [...document.querySelectorAll('#org-vis-sees tbody tr')];
   assert.deepEqual(rows.map((r) => r.querySelector('b').textContent), [
-    vt('area_structure'), vt('area_utilization'), vt('area_absence_dates'), vt('area_absence_reasons'),
+    vt('area_structure'), vt('area_utilization'), vt('area_absence_dates'),
     vt('area_position_history'), vt('area_everyone_else'),
   ]);
   const cells = (row) => [...row.querySelectorAll('td')].map(text);
   assert.equal(cells(rows[1])[1], vt('verdict_subtree', { count: 5 }));
-  assert.equal(cells(rows[3])[1], vt('verdict_direct', { count: 2 }));
-  assert.equal(cells(rows[4])[1], vt('verdict_own'));
-  assert.equal(cells(rows[5])[1], vt('verdict_none'));
+  assert.equal(cells(rows[3])[1], vt('verdict_own'));
+  assert.equal(cells(rows[4])[1], vt('verdict_none'));
   assert.equal(cells(rows[1])[2], vt('rule_primary_manager'));
-  assert.equal(cells(rows[5])[2], vt('rule_none'));
+  assert.equal(cells(rows[4])[2], vt('rule_none'));
   assert.equal(rows[1].querySelector('.org-vis-verdict').className.includes('org-vis-yes'), true);
-  assert.equal(rows[4].querySelector('.org-vis-verdict').className.includes('org-vis-part'), true);
-  assert.equal(rows[5].querySelector('.org-vis-verdict').className.includes('org-vis-no'), true);
+  assert.equal(rows[3].querySelector('.org-vis-verdict').className.includes('org-vis-part'), true);
+  assert.equal(rows[4].querySelector('.org-vis-verdict').className.includes('org-vis-no'), true);
 });
 
 test('the people a verdict reaches are named, the long list cut to a count', async () => {
   await mount([]);
   const rows = [...document.querySelectorAll('#org-vis-sees tbody tr')];
   assert.equal(text(rows[1].querySelector('.org-vis-sub')), vt('people_more', { names: 'Paweł, Marek, Piotr, Ewa', count: 5 }));
-  assert.equal(text(rows[3].querySelector('.org-vis-sub')), 'Paweł, Marek');
+  assert.equal(text(rows[2].querySelector('.org-vis-sub')), vt('people_more', { names: 'Paweł, Marek, Piotr, Ewa', count: 5 }));
   assert.equal(text(rows[0].querySelector('.org-vis-sub')), vt('area_structure_sub'));
 });
 
@@ -123,7 +121,7 @@ test('the viewers of the data list the person first and say what each may see', 
   assert.deepEqual(rows.map((r) => text(r.querySelector('.org-vis-who-name'))), ['Ja', 'Anna', 'Admin']);
   assert.equal(text(rows[0].querySelector('.org-vis-who-kinds')), vt('viewer_self'));
   assert.equal(text(rows[1].querySelector('.org-vis-who-kinds')),
-    [vt('kind_absence_reason'), vt('kind_absence_dates'), vt('kind_time_utilization')].join(', '));
+    [vt('kind_absence_dates'), vt('kind_time_utilization')].join(', '));
   assert.equal(text(rows[2].querySelector('.org-vis-rule')), vt('rule_administrator'));
   assert.match(text(document.getElementById('org-vis-who-card')), new RegExp(vt('who_note')));
 });

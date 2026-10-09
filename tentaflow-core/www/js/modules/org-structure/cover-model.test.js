@@ -89,27 +89,27 @@ test('the person picker lists accounts once, by name, and leaves out people with
 });
 
 test('the absence window turns its values into wire fields, or names the wrong one', () => {
-  const ok = absenceFields({ from: '2026-10-20', last: '2026-10-24', kind: 'leave', reason: 'dentist' });
-  assert.deepEqual(ok.fields, { validFrom: '2026-10-20', validTo: '2026-10-25', kind: 'leave', reason: 'dentist' });
-  assert.deepEqual(absenceFields({ from: '2026-10-20', last: '', kind: 'other', reason: '' }).fields,
-    { validFrom: '2026-10-20', validTo: null, kind: 'other', reason: null });
-  assert.equal(absenceFields({ from: '20.10.2026', last: '', kind: 'leave', reason: '' }).error, 'from');
-  assert.equal(absenceFields({ from: '2026-10-20', last: 'soon', kind: 'leave', reason: '' }).error, 'last');
-  assert.equal(absenceFields({ from: '2026-10-20', last: '2026-10-19', kind: 'leave', reason: '' }).error, 'order');
+  const ok = absenceFields({ from: '2026-10-20', last: '2026-10-24', kind: 'leave' });
+  assert.deepEqual(ok.fields, { validFrom: '2026-10-20', validTo: '2026-10-25', kind: 'leave' });
+  assert.deepEqual(absenceFields({ from: '2026-10-20', last: '', kind: 'other' }).fields,
+    { validFrom: '2026-10-20', validTo: null, kind: 'other' });
+  assert.equal(absenceFields({ from: '20.10.2026', last: '', kind: 'leave' }).error, 'from');
+  assert.equal(absenceFields({ from: '2026-10-20', last: 'soon', kind: 'leave' }).error, 'last');
+  assert.equal(absenceFields({ from: '2026-10-20', last: '2026-10-19', kind: 'leave' }).error, 'order');
   // A one-day absence: the last day is the first.
-  assert.equal(absenceFields({ from: '2026-10-20', last: '2026-10-20', kind: 'leave', reason: '' }).fields.validTo, '2026-10-21');
+  assert.equal(absenceFields({ from: '2026-10-20', last: '2026-10-20', kind: 'leave' }).fields.validTo, '2026-10-21');
 });
 
 test('an absence patch names only what changed, and lists the emptied fields to clear', () => {
-  const before = { valid_from: '2026-10-20', valid_to: '2026-10-25', kind: 'leave', reason: 'dentist' };
-  const same = absencePatch(before, { from: '2026-10-20', last: '2026-10-24', kind: 'leave', reason: 'dentist' });
+  const before = { valid_from: '2026-10-20', valid_to: '2026-10-25', kind: 'leave' };
+  const same = absencePatch(before, { from: '2026-10-20', last: '2026-10-24', kind: 'leave' });
   assert.equal(same.changed, false);
-  const moved = absencePatch(before, { from: '2026-10-21', last: '2026-10-24', kind: 'training', reason: '' });
+  const moved = absencePatch(before, { from: '2026-10-21', last: '2026-10-24', kind: 'training' });
   assert.deepEqual(moved.patch, { validFrom: '2026-10-21', kind: 'training' });
-  assert.deepEqual(moved.clear, ['reason']);
-  const open = absencePatch(before, { from: '2026-10-20', last: '', kind: 'leave', reason: 'dentist' });
+  assert.deepEqual(moved.clear, []);
+  const open = absencePatch(before, { from: '2026-10-20', last: '', kind: 'leave' });
   assert.deepEqual(open.clear, ['valid_to']);
-  assert.equal(absencePatch(before, { from: 'x', last: '', kind: 'leave', reason: '' }).error, 'from');
+  assert.equal(absencePatch(before, { from: 'x', last: '', kind: 'leave' }).error, 'from');
 });
 
 test('the visibility answer becomes rows in the mockup order with the people each verdict reaches', () => {
@@ -118,15 +118,15 @@ test('the visibility answer becomes rows in the mockup order with the people eac
     direct: [{ user_id: 'a', display_name: 'A' }],
     rows: [
       { area: 'everyone_else', verdict: 'none', rule: 'none' },
-      { area: 'absence_reasons', verdict: 'direct', rule: 'primary_manager' },
+      { area: 'absence_dates', verdict: 'subtree', rule: 'primary_manager' },
       { area: 'structure', verdict: 'all', rule: 'every_member' },
       { area: 'utilization', verdict: 'subtree', rule: 'primary_manager' },
       { area: 'position_history', verdict: 'own', rule: 'owner' },
     ],
   };
   const rows = visibilityRows(response);
-  assert.deepEqual(rows.map((r) => r.area), ['structure', 'utilization', 'absence_reasons', 'position_history', 'everyone_else']);
-  assert.deepEqual(rows.map((r) => r.count), [0, 2, 1, 0, 0]);
+  assert.deepEqual(rows.map((r) => r.area), ['structure', 'utilization', 'absence_dates', 'position_history', 'everyone_else']);
+  assert.deepEqual(rows.map((r) => r.count), [0, 2, 2, 0, 0]);
   assert.deepEqual(rows.map((r) => r.tone), ['yes', 'yes', 'yes', 'part', 'no']);
   assert.equal(verdictTone('unheard-of'), 'no');
 });

@@ -76,7 +76,7 @@ export function deputyRows(list, today) {
 
 /**
  * What the tree badges: the subject keys of people away on the day and of people who are a deputy in force.
- * A reason never reaches here — the answer does not carry one.
+ * An absence has no reason, so none reaches here.
  */
 export function treeBadges(availability) {
   const absentKeys = new Set((availability?.absent_user_ids ?? []).map((id) => subjectKey({ kind: 'user', id })));
@@ -102,18 +102,17 @@ export function verdictTone(verdict) {
 }
 
 /** The order the areas are shown in. */
-export const AREA_ORDER = ['structure', 'utilization', 'absence_dates', 'absence_reasons', 'position_history', 'everyone_else'];
+export const AREA_ORDER = ['structure', 'utilization', 'absence_dates', 'position_history', 'everyone_else'];
 
 /**
  * The rows of "X widzi": each area with the message keys of its verdict and rule and how many people
- * the verdict reaches (`utilization` and `absence_dates` the subtree, `absence_reasons` the direct reports).
+ * the verdict reaches (`utilization` and `absence_dates` the subtree).
  */
 export function visibilityRows(response) {
   const subtree = response?.subtree ?? [];
-  const direct = response?.direct ?? [];
   const rows = [...(response?.rows ?? [])].sort((a, b) => AREA_ORDER.indexOf(a.area) - AREA_ORDER.indexOf(b.area));
   return rows.map((row) => {
-    const people = row.area === 'absence_reasons' ? direct : row.area === 'utilization' || row.area === 'absence_dates' ? subtree : [];
+    const people = row.area === 'utilization' || row.area === 'absence_dates' ? subtree : [];
     const reach = row.verdict === 'subtree' || row.verdict === 'direct' ? people : [];
     return {
       area: row.area,
@@ -145,7 +144,7 @@ export function initials(name) {
 
 /**
  * Turns what the absence window collected into the wire's fields, or names the field that is wrong.
- * `values` = { from, last, kind, reason } with `last` the inclusive last day (empty = no end).
+ * `values` = { from, last, kind } with `last` the inclusive last day (empty = no end).
  */
 export function absenceFields(values) {
   if (!isIsoDay(values.from)) return { error: 'from' };
@@ -156,7 +155,6 @@ export function absenceFields(values) {
       validFrom: values.from,
       validTo: exclusiveEnd(values.last),
       kind: values.kind,
-      reason: values.reason || null,
     },
   };
 }
@@ -174,9 +172,5 @@ export function absencePatch(before, values) {
     else clear.push('valid_to');
   }
   if (fields.kind !== before.kind) patch.kind = fields.kind;
-  if ((fields.reason ?? null) !== (before.reason ?? null)) {
-    if (fields.reason) patch.reason = fields.reason;
-    else clear.push('reason');
-  }
   return { patch, clear, changed: Object.keys(patch).length + clear.length > 0 };
 }

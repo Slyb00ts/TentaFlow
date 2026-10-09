@@ -6,6 +6,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Struktura organizacyjna
+
+- Nieobecność nie ma już powodu: pole zniknęło z formularza, bazy (migracja 200
+  usuwa kolumnę `org_absences.reason` oraz kopie w dzienniku synchronizacji) i
+  widoczności („Powód nieobecności”). Pole `reason` zostaje w typach protokołu
+  jako przestarzałe (pola są dopisywane, nie usuwane): serwer odmawia niepustego
+  powodu i nigdy go nie wysyła. Węzeł, który kiedykolwiek zapisał lub odebrał
+  nieobecność, po aktualizacji odtwarza księgę synchronizacji (jednorazowy reset
+  bazowy); wpisy w kopiach zapasowych, w wolnych stronach sprzed aktualizacji i
+  w operacjach na węzłach, które nie zostały zaktualizowane, mogą jeszcze
+  zawierać stare powody. Dziennik audytu nigdy ich nie zawierał.
+- Nieobecność albo zastępstwo z datą początku wcześniejszą niż dziś wpisuje tylko
+  administrator; pozostali dostają odmowę `backdating_admin_only` także z
+  `confirm_backdated`.
+
 ### TentaNas
 
 - Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie

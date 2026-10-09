@@ -5,10 +5,11 @@
 //          (docs/ORG_STRUCTURE_PLAN.md §1, §2.1a, §6.3). The requests and
 //          responses themselves are variants of `OrgStructurePayload`.
 //
-//          Privacy is decided by the server: `OrgAbsence::reason` is filled only
-//          for the person, the manager on the primary line and administrators,
-//          and absences are listed at all only to those who may see their
-//          dates. Everybody else gets `available: false` and nothing more.
+//          Privacy is decided by the server: absences are listed only to those
+//          who may see their dates. Everybody else gets `available: false` and
+//          nothing more. An absence has no reason: `OrgAbsence::reason` is
+//          deprecated, kept only because wire fields are append-only, and is
+//          never sent.
 //
 //          Append-only, like the payload: a field added later MUST carry
 //          `#[serde(default)]`.
@@ -35,7 +36,7 @@ pub struct OrgAbsence {
     #[serde(default)]
     pub valid_to: Option<String>,
     pub kind: OrgAbsenceKind,
-    /// Private. Present only when the caller may see it.
+    /// Deprecated and always absent: an absence has no reason.
     #[serde(default)]
     pub reason: Option<String>,
     /// `manual` or the name of the integration that brought it.
@@ -103,7 +104,7 @@ pub struct OrgEscalationProblem {
 }
 
 /// One area of data and what the person sees of it. `area`: `structure`,
-/// `utilization`, `absence_dates`, `absence_reasons`, `position_history`,
+/// `utilization`, `absence_dates`, `position_history`,
 /// `everyone_else`. `verdict`: `all`, `subtree`, `direct`, `own`, `none`.
 /// `rule`: `owner`, `primary_manager`, `supervisor`, `administrator`,
 /// `every_member`, `none`.
@@ -115,7 +116,7 @@ pub struct OrgVisibilityRow {
 }
 
 /// One person who may see data of another, with the strongest rule that
-/// allows it and the kinds they may see (`absence_reason`, `absence_dates`,
+/// allows it and the kinds they may see (`absence_dates`,
 /// `time_utilization`, `position_history`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct OrgViewer {

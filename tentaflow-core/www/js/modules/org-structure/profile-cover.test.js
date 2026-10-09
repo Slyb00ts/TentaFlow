@@ -2,7 +2,7 @@
 // File: modules/org-structure/profile-cover.test.js
 // Description: The org sections of the profile page against a stubbed transport.
 //   What has to hold: absences, "who covers me" and "whom I cover" draw what the
-//   server answered (the reason only when the answer carries it); a person adds,
+//   server answered (an absence has no reason); a person adds,
 //   changes and deletes their own absences with the wire's exclusive end date
 //   while the window talks in the last day; an absence that came from another
 //   source has no menu for its person; deputies are offered to administrators
@@ -20,9 +20,9 @@ const { mountProfileCover } = await import('./profile-cover.js');
 
 const ct = (key, params) => I18n.t(`org_structure.cover.${key}`, params);
 
-const mine = { id: 'abs-1', user_id: 'u-me', valid_from: '2026-09-29', valid_to: '2026-10-03', kind: 'leave', reason: 'dentist', source: 'manual' };
-const later = { id: 'abs-2', user_id: 'u-me', valid_from: '2026-12-14', valid_to: '2026-12-15', kind: 'training', reason: null, source: 'manual' };
-const imported = { id: 'abs-3', user_id: 'u-me', valid_from: '2026-11-02', valid_to: '2026-11-09', kind: 'leave', reason: null, source: 'edokumenty' };
+const mine = { id: 'abs-1', user_id: 'u-me', valid_from: '2026-09-29', valid_to: '2026-10-03', kind: 'leave', source: 'manual' };
+const later = { id: 'abs-2', user_id: 'u-me', valid_from: '2026-12-14', valid_to: '2026-12-15', kind: 'training', source: 'manual' };
+const imported = { id: 'abs-3', user_id: 'u-me', valid_from: '2026-11-02', valid_to: '2026-11-09', kind: 'leave', source: 'edokumenty' };
 const deputy = {
   id: 'dep-1', user_id: 'u-me', user_name: 'Marek Nowak', deputy_user_id: 'u-pz', deputy_name: 'Piotr Zieliński',
   scope: 'approvals', valid_from: '2026-10-20', valid_to: '2026-10-25',
@@ -41,7 +41,7 @@ const cover = (over = {}) => ({
   covered_by: [deputy],
   covering: [covering],
   can_see_absences: true,
-  can_see_reason: true,
+  can_see_reason: false,
   can_edit_absences: true,
   can_edit_deputies: true,
   is_admin: false,
@@ -106,7 +106,7 @@ test('the three sections draw what the server answered, the running absence firs
   const absences = rows('org-cover-absences');
   assert.equal(absences.length, 3);
   assert.match(text(absences[0]), /leave|Leave/i);
-  assert.match(text(absences[0]), /dentist/, 'the reason is there because the answer carries it');
+  assert.doesNotMatch(text(absences[0]), /dentist/, 'an absence has no reason to draw');
   assert.match(text(absences[0]), new RegExp(ct('phase_current')));
   assert.match(text(absences[0]), /4 days/, 'the 29th to the 2nd, inclusive of the exclusive end');
   assert.match(text(absences[1]), new RegExp(ct('phase_upcoming')));
@@ -116,9 +116,16 @@ test('the three sections draw what the server answered, the running absence firs
   assert.match(text(rows('org-cover-covering')[0]), /Ewa Wiśniewska/);
 });
 
-test('without the reason in the answer none is drawn', async () => {
-  await mount({ can_see_reason: false, absences: [{ ...mine, reason: null }] });
+test('a reason an old server still sends is not drawn', async () => {
+  await mount({ absences: [{ ...mine, reason: 'dentist' }] });
   assert.doesNotMatch(text(section('org-cover-absences')), /dentist/);
+});
+
+test('the absence window asks for no reason', async () => {
+  await mount();
+  document.querySelector('[data-act="absence-add"]').click();
+  const win = lastWindow();
+  assert.equal([...win.querySelectorAll('[label]')].some((f) => /reason|powód/i.test(f.getAttribute('label'))), false);
 });
 
 test('an empty profile says so in each section', async () => {
@@ -177,12 +184,11 @@ test('add: the window asks for the last day, the wire gets the exclusive end, an
   field(win, `${ct('f_from')} *`).value = '2026-10-20';
   field(win, ct('f_last')).value = '2026-10-24';
   field(win, `${ct('f_kind')} *`).value = 'leave';
-  field(win, ct('f_reason')).value = 'family';
   submit(win);
   await closed();
 
   assert.deepEqual(calls.filter((c) => c.kind === 'orgAbsenceAddRequest').map((c) => c.payload), [{
-    userId: null, validFrom: '2026-10-20', validTo: '2026-10-25', kind: 'leave', reason: 'family',
+    userId: null, validFrom: '2026-10-20', validTo: '2026-10-25', kind: 'leave',
   }]);
   assert.equal(calls.filter((c) => c.kind === 'orgCoverRequest').length, 2, 'the section is read again');
 
@@ -204,19 +210,17 @@ test('add: a last day before the first stays in the window as a sentence and not
   assert.equal(calls.filter((c) => c.kind === 'orgAbsenceAddRequest').length, 0);
 });
 
-test('edit: the window shows the last day, only what changed is sent, an emptied reason is cleared', async () => {
+test('edit: the window shows the last day, only what changed is sent, the emptied end is cleared', async () => {
   await mount();
-  stubTransport({ orgAbsenceUpdateRequest: ok({ kind: 'absence', value: { ...mine, valid_to: '2026-10-05', reason: null } }) });
+  stubTransport({ orgAbsenceUpdateRequest: ok({ kind: 'absence', value: { ...mine, valid_to: '2026-10-05' } }) });
   choose(menuFor(rows('org-cover-absences')[0]), ct('menu_edit'));
   const win = lastWindow();
   assert.equal(field(win, ct('f_last')).value, '2026-10-02', 'the inclusive last day of [29th, 3rd)');
-  assert.equal(field(win, ct('f_reason')).value, 'dentist');
   field(win, ct('f_last')).value = '2026-10-04';
-  field(win, ct('f_reason')).value = '';
   submit(win);
   await closed();
   assert.deepEqual(calls.filter((c) => c.kind === 'orgAbsenceUpdateRequest').map((c) => c.payload), [
-    { id: 'abs-1', validTo: '2026-10-05', clear: ['reason'] },
+    { id: 'abs-1', validTo: '2026-10-05', clear: [] },
   ]);
 });
 
@@ -242,7 +246,7 @@ test('delete: confirming sends the delete and the undo adds the same absence aga
   toastUndo().click();
   await sleep(10);
   assert.deepEqual(calls.find((c) => c.kind === 'orgAbsenceAddRequest').payload, {
-    userId: 'u-me', validFrom: '2026-09-29', validTo: '2026-10-03', kind: 'leave', reason: 'dentist', confirmBackdated: false,
+    userId: 'u-me', validFrom: '2026-09-29', validTo: '2026-10-03', kind: 'leave', confirmBackdated: false,
   });
 });
 
@@ -313,7 +317,6 @@ test('a window\'s toast and the section survive the server refusing a change', a
   stubTransport({ orgAbsenceAddRequest: { ok: false, error: { code: 'invalid_value', message: 'x' }, warnings: [], result: null } });
   document.querySelector('[data-act="absence-add"]').click();
   const win = lastWindow();
-  field(win, ct('f_reason')).value = 'x';
   submit(win);
   await sleep(10);
   assert.equal(win.querySelector('.tf-act__error').getAttribute('message'), ct('errors.invalid_value'));
@@ -352,3 +355,15 @@ test('with no handover record the section says so and the rest of the profile is
 });
 
 void window;
+
+test('a backdated absence from a person who is not an administrator is refused in plain words, without a confirmation', async () => {
+  await mount();
+  stubTransport({ orgAbsenceAddRequest: { ok: false, error: { code: 'backdating_admin_only', message: 'x' }, warnings: [], result: null } });
+  document.querySelector('[data-act="absence-add"]').click();
+  const win = lastWindow();
+  field(win, `${ct('f_from')} *`).value = '2026-09-01';
+  submit(win);
+  await sleep(10);
+  assert.equal(win.querySelector('.tf-act__error').getAttribute('message'), ct('errors.backdating_admin_only'));
+  assert.equal(calls.filter((c) => c.kind === 'orgAbsenceAddRequest').length, 1, 'it is not sent again as confirmed');
+});

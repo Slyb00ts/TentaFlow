@@ -10440,7 +10440,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** Whether a viewer (default the caller) may see `kind` of a person's data: absence_reason | absence_dates | time_utilization | position_history. */
+  /** Whether a viewer (default the caller) may see `kind` of a person's data: absence_dates | time_utilization | position_history. */
   // wire: OrgStructureBody::CanViewPersonDataRequest
   orgCanViewPersonDataRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

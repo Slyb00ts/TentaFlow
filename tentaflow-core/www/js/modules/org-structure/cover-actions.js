@@ -44,7 +44,9 @@ export function rangeLabel(item) {
 }
 
 // The service answers with a code; the sentence has to fit THIS screen, not the position list's.
-const ERROR_KEYS = { duplicate: 'duplicate_deputy', invalid_value: 'invalid_value', invalid_interval: 'invalid_interval' };
+const ERROR_KEYS = {
+  duplicate: 'duplicate_deputy', invalid_value: 'invalid_value', invalid_interval: 'invalid_interval', backdating_admin_only: 'backdating_admin_only',
+};
 
 async function write(kind, payload) {
   try {
@@ -80,9 +82,6 @@ export function createCoverActions({ reload, people = async () => [] }) {
       { key: 'kind', label: ct('f_kind'), kind: 'select', value: initial.kind, options: kindOptions(), required: true },
       { key: 'from', label: ct('f_from'), kind: 'date', value: initial.from, required: true },
       { key: 'last', label: ct('f_last'), kind: 'date', value: initial.last ?? '', hint: ct('f_last_hint') },
-      {
-        key: 'reason', label: ct('f_reason'), kind: 'area', value: initial.reason ?? '', maxLength: 500, hint: ct('f_reason_hint'),
-      },
     ];
   }
 
@@ -122,7 +121,6 @@ export function createCoverActions({ reload, people = async () => [] }) {
         kind: absence.kind,
         from: absence.valid_from,
         last: lastDayOf(absence.valid_to),
-        reason: absence.reason,
       }),
       async onSubmit(values) {
         const result = absencePatch(absence, values);
@@ -145,14 +143,13 @@ export function createCoverActions({ reload, people = async () => [] }) {
       errorMessage: (err) => err.message,
       async onSubmit() {
         const body = await write('orgAbsenceDeleteRequest', { id: absence.id });
-        // Back: the same absence is added again (a person's own reason travels with it).
+        // Back: the same absence is added again.
         const undo = async () => {
           await write('orgAbsenceAddRequest', {
             userId: absence.user_id,
             validFrom: absence.valid_from,
             validTo: absence.valid_to,
             kind: absence.kind,
-            reason: absence.reason,
             confirmBackdated: body.confirmedBackdated,
           });
           await refresh();
@@ -186,7 +183,7 @@ export function createCoverActions({ reload, people = async () => [] }) {
         { key: 'last', label: ct('f_last'), kind: 'date', value: '', hint: ct('f_deputy_last_hint') },
       ],
       async onSubmit({ personId, person, fields }) {
-        const parsed = absenceFields({ from: fields.from, last: fields.last, kind: 'other', reason: '' });
+        const parsed = absenceFields({ from: fields.from, last: fields.last, kind: 'other' });
         if (parsed.error) throw new Error(ct(`errors.absence_${parsed.error}`, { format: dateFormatHint() }));
         const body = await write('orgDeputySetRequest', {
           userId,
@@ -230,7 +227,7 @@ export function createCoverActions({ reload, people = async () => [] }) {
       ],
       async onSubmit(values, { changed }) {
         if (!changed.length) throw new Error(ct('nothing_changed'));
-        const parsed = absenceFields({ from: values.from, last: values.last, kind: 'other', reason: '' });
+        const parsed = absenceFields({ from: values.from, last: values.last, kind: 'other' });
         if (parsed.error) throw new Error(ct(`errors.absence_${parsed.error}`, { format: dateFormatHint() }));
         const payload = { id: deputy.id };
         const clear = [];

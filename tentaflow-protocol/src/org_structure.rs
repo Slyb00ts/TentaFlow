@@ -1214,6 +1214,7 @@ pub enum OrgStructurePayload {
         covering: Vec<crate::org_structure_cover::OrgDeputy>,
         #[serde(default)]
         can_see_absences: bool,
+        /// Deprecated, always false: an absence has no reason.
         #[serde(default)]
         can_see_reason: bool,
         /// The caller may add, change and delete this person's absences.
@@ -1264,7 +1265,7 @@ pub enum OrgStructurePayload {
     IsAvailableResponse {
         available: bool,
     },
-    /// `org.can_view_person_data`. `kind`: `absence_reason`, `absence_dates`,
+    /// `org.can_view_person_data`. `kind`: `absence_dates`,
     /// `time_utilization`, `position_history`. Asking for a viewer other than
     /// the caller needs `org.admin`.
     CanViewPersonDataRequest {
@@ -1358,13 +1359,14 @@ pub enum OrgStructurePayload {
         #[serde(default)]
         valid_to: Option<String>,
         kind: crate::org_structure_cover::OrgAbsenceKind,
+        /// Deprecated: an absence has no reason; a non-empty value is refused.
         #[serde(default)]
         reason: Option<String>,
         #[serde(default)]
         confirm_backdated: bool,
     },
     /// The caller's own manual absence, or any for `org.admin`. `clear` names:
-    /// `valid_to`, `reason`.
+    /// `valid_to`.
     AbsenceUpdateRequest {
         id: String,
         #[serde(default)]
@@ -1373,6 +1375,7 @@ pub enum OrgStructurePayload {
         valid_to: Option<String>,
         #[serde(default)]
         kind: Option<crate::org_structure_cover::OrgAbsenceKind>,
+        /// Deprecated: an absence has no reason; a non-empty value is refused.
         #[serde(default)]
         reason: Option<String>,
         #[serde(default)]

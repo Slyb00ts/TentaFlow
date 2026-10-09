@@ -63,8 +63,8 @@
 | `org_positions` | id, unit_id, name, role_id (→ `role_catalog`), is_manager (z roli, nadpisywalne), **is_staff**, valid_from/to | stanowisko istnieje także jako **wakat**; `is_staff` = sztabowe, rysowane z boku |
 | `org_reporting_lines` | position_id, parent_position_id, **kind** (`primary` / `functional`), priority, valid_from/to | dokładnie jedna linia `primary` w danym dniu; `functional` = macierz (kropkowana) |
 | `org_assignments` | id, position_id, user_id **albo** external_person_id, type (`permanent` / `acting` / `contractor`), **share** (część etatu), **is_primary**, valid_from/to | historia; osoba może mieć kilka stanowisk; suma `share` = wymiar pracy dla planowania zasobów |
-| `org_deputies` | user_id (zastępowany), deputy_user_id, scope (`all` / `approvals` / `escalations` / `project:<id>`), valid_from/to, reason_visible_to | zastępstwo czasowe albo stałe |
-| `org_absences` | user_id, from/to, kind (`leave` / `training` / `other`), **reason** (prywatne), source (`manual` / `edokumenty` / …), external_id | pozostali widzą tylko „niedostępny” (§6.3) |
+| `org_deputies` | user_id (zastępowany), deputy_user_id, scope (`all` / `approvals` / `escalations` / `project:<id>`), valid_from/to | zastępstwo czasowe albo stałe |
+| `org_absences` | user_id, from/to, kind (`leave` / `training` / `other`), source (`manual` / `edokumenty` / …), external_id | powodu nieobecności **nie zapisujemy** (decyzja 2026-10-09); pozostali widzą tylko „niedostępny” (§6.3) |
 | `org_sources` + `org_field_provenance` | skąd pochodzi każda wartość, kiedy zsynchronizowana | pierwszeństwo źródeł i konflikty (§5) |
 | `org_change_requests` (opcjonalnie) | zaplanowana reorganizacja: zestaw zmian z datą wejścia, stan, zatwierdzający | §2.4 |
 
@@ -78,7 +78,10 @@
 - nakładanie się przedziałów tam, gdzie reguła mówi „dokładnie jeden” (linia `primary` stanowiska,
   kierownik jednostki), jest sprawdzane w **transakcji zapisu** (SQLite nie ma ograniczeń
   wykluczających), a zmiany wsteczne (data w przeszłości) wymagają potwierdzenia i trafiają
-  do audytu jako korekta.
+  do audytu jako korekta. **Nieobecności i zastępstwa z datą początku wcześniejszą niż dziś (w strefie
+  organizacji) wpisuje wyłącznie administrator** (decyzja 2026-10-09): pozostali zaczynają od dziś, a serwer
+  odmawia (`backdating_admin_only`) także z `confirm_backdated`; administrator nadal je potwierdza. Osoba
+  kończy trwającą nieobecność wcześniej, ustawiając koniec na dziś — nie usuwa jej.
 
 Walidacja:
 - brak cykli w liniach `primary` w żadnym dniu (sprawdzane dla przedziałów dat, nie tylko „dziś”),
@@ -175,8 +178,8 @@ eskaluj(osoba, dzień):
   - nieobecność **nie rusza rzutowania uprawnień**: `get_manager` zwraca zastępcę (zakres `all`), ale
     `manager_user_id` w profilu wynika wyłącznie ze struktury (przy wakacie na stanowisku kierownika
     jednostki — z jej pierwszego zastępcy kierownika);
-  - powód nieobecności widzi osoba, jej bezpośredni przełożony w linii głównej i administratorzy; daty —
-    także całe poddrzewo; ewidencję czasu — osoba i przełożeni (poddrzewo). Nie zamodelowani: PM projektu
+  - nieobecność **nie ma powodu** — nie jest pytany, zapisywany, synchronizowany ani pokazywany
+    (decyzja 2026-10-09); daty widzi osoba, jej przełożeni w linii głównej i administratorzy; ewidencję czasu — osoba i przełożeni (poddrzewo). Nie zamodelowani: PM projektu
     i zarząd (§6.3) oraz współprowadzący jednostkę (§1.1) — jednostka ma jeden `head_position_id`.
 
 ### 2.2 Zapis (tylko `org.admin`)
@@ -484,7 +487,7 @@ zdjęcie. Urlopy przychodzą z eDokumentów.
 
 | Dane | Kto widzi |
 |---|---|
-| powód nieobecności | osoba + przełożony w **linii głównej** (nie funkcjonalnej) + administratorzy; nigdy na drzewie, w historii zadań ani w eskalacjach — tam tylko „niedostępny” |
+| daty nieobecności | osoba + przełożeni w **linii głównej** (nie funkcjonalnej) + administratorzy; pozostali — tylko „niedostępny” dziś, nigdy daty ani stan na inny dzień. Powodu nieobecności nie przechowujemy wcale (migracja 200 usuwa dotychczasowe) |
 | ewidencja czasu i utylizacja | osoba + przełożeni (poddrzewo) + PM projektu (tylko w zakresie projektu) + zarząd |
 | historia stanowisk | administratorzy + osoba |
 

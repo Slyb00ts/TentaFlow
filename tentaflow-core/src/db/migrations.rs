@@ -259,6 +259,13 @@ pub fn run(conn: &Connection) -> Result<()> {
     // operation bodies that carried fleet secrets in plaintext. It costs a new
     // epoch and a fleet-wide reconcile, so only nodes whose ledger can hold such
     // a body pay for it.
+    //
+    // Absences lost their reason in v200. Operations that carried one are in the
+    // ledger as long as it holds them, so a node that ever recorded or received an
+    // absence pays the same reset to drop them.
+    let crossing_absence_reason_purge = current_version > 0
+        && current_version < ABSENCE_REASON_PURGE_VERSION
+        && ledger_may_hold_absences(conn)?;
     let crossing_ledger_secret_purge = current_version > 0
         && current_version < LEDGER_SECRET_PURGE_VERSION
         && ledger_may_hold_shared_secrets(conn)?;
@@ -270,7 +277,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
-    if crossing_identity_flip || crossing_ledger_secret_purge {
+    if crossing_identity_flip || crossing_ledger_secret_purge || crossing_absence_reason_purge {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
             rusqlite::params![CORE_BASELINE_RESET_PENDING_KEY],
@@ -285,6 +292,29 @@ pub fn run(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Migration version that dropped the reason of an absence.
+pub const ABSENCE_REASON_PURGE_VERSION: i64 = 200;
+
+/// Whether an absence was ever minted or materialized here: `core_resource_versions`
+/// is stamped for both, so a row means the local ledger may hold an operation body
+/// that carries the reason.
+fn ledger_may_hold_absences(conn: &Connection) -> Result<bool> {
+    let versions_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'core_resource_versions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !versions_exist {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM core_resource_versions WHERE resource_type = 'core.org_absence')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// Migration version of the INTEGER→UUID core identity flip. Crossing it arms
@@ -1230,7 +1260,46 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_activity_io_witnesses",
             MigrationStep::Rust(bpmn_activity_io_witnesses),
         ),
+        (
+            200,
+            "org_absences_drop_reason",
+            MigrationStep::Rust(org_absences_drop_reason),
+        ),
     ]
+}
+
+/// An absence has no reason (owner decision 2026-10-09): clears every stored
+/// reason, drops the column and removes the capture journal rows of absences,
+/// which hold the reason inside an opaque blob. With `secure_delete` the freed
+/// pages are zeroed. The ledger half lives in Fjall and is not reachable from a
+/// migration; `run` arms the baseline reset for it. Pages freed earlier, backups
+/// and operations already on peers that have not upgraded still hold the values.
+fn org_absences_drop_reason(conn: &Connection) -> Result<()> {
+    let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+    conn.query_row("PRAGMA secure_delete = ON", [], |_| Ok(()))?;
+    let outcome = (|| -> Result<()> {
+        if column_exists(conn, "org_absences", "reason")? {
+            conn.execute_batch(
+                "UPDATE org_absences SET reason = NULL WHERE reason IS NOT NULL;
+                 ALTER TABLE org_absences DROP COLUMN reason;",
+            )?;
+        }
+        let journal_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = '__tentaflow_core_sync_captures')",
+            [],
+            |row| row.get(0),
+        )?;
+        if journal_exists {
+            conn.execute(
+                "DELETE FROM __tentaflow_core_sync_captures WHERE resource_type = 'core.org_absence'",
+                [],
+            )?;
+        }
+        Ok(())
+    })();
+    conn.query_row(&format!("PRAGMA secure_delete = {secure_delete}"), [], |_| Ok(()))?;
+    outcome
 }
 
 const BPMN_MESSAGES_AND_EVENT_RACES: &str = r#"
@@ -16437,7 +16506,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 199);
+        assert_eq!(head, 200);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16456,9 +16525,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 20);
+        assert_eq!(applied_after_179.len(), 21);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
+        assert_eq!(applied_after_179[20], "org_absences_drop_reason");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -16468,6 +16538,75 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(tables(&fresh), tables(&upgraded));
+    }
+
+    /// v200: an absence has no reason. Every stored one is gone with the column, the capture journal
+    /// rows of absences (which hold it in a blob) are removed, and the ledger half is armed for the
+    /// baseline reset, but only on a node that ever recorded or received an absence.
+    #[test]
+    fn org_absences_lose_their_reason_and_the_journal_copies_on_v200() {
+        let seeded = |with_absence: bool| {
+            let conn = Connection::open_in_memory().unwrap();
+            run_ladder_up_to(&conn, 199);
+            if with_absence {
+                conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+                conn.execute(
+                    "INSERT INTO org_absences (id, org_id, user_id, valid_from, valid_to, kind, reason, source) \
+                     VALUES ('a-1', ?1, 'u-1', '2026-10-10', '2026-10-12', 'leave', 'dentist', 'manual')",
+                    [crate::services::org::DEFAULT_ORG_ID],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO __tentaflow_core_sync_captures (capture_id, org_id, table_name, resource_type, \
+                        resource_id, primary_key, action, changed_fields_blob, created_at_ms) \
+                     VALUES ('c-1', ?1, 'org_absences', 'core.org_absence', 'a-1', 'id', 'insert', x'6465', 1)",
+                    [crate::services::org::DEFAULT_ORG_ID],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+                     VALUES ('core.org_absence', 'a-1', 1, 0, 'n')",
+                    [],
+                )
+                .unwrap();
+                conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            }
+            run(&conn).unwrap();
+            conn
+        };
+        let pending = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [CORE_BASELINE_RESET_PENDING_KEY],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+
+        let conn = seeded(true);
+        let has_reason: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('org_absences') WHERE name = 'reason')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has_reason);
+        let kept: (String, String) = conn
+            .query_row("SELECT id, kind FROM org_absences", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(kept, ("a-1".into(), "leave".into()), "the absence itself stays");
+        let journal: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures WHERE resource_type = 'core.org_absence'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal, 0);
+        assert_eq!(pending(&conn).as_deref(), Some("1"));
+
+        assert_eq!(pending(&seeded(false)), None, "a node that never saw an absence pays no reset");
     }
 
     /// v179 on a database at v178: subjects (deprecations, generation) and
@@ -18327,7 +18466,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>().unwrap();
         run(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 199);
+            |row| row.get::<_,i64>(0)).unwrap(), 200);
         let rows: Vec<(String,String,String,Option<String>)> = conn.prepare(
             "SELECT job_id,phase,dispatch_evidence,stable_request_id FROM bpmn_service_invocations ORDER BY job_id").unwrap()
             .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
@@ -18636,7 +18775,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE code='REPETITION_LIMIT'", [],
             |row| row.get::<_,i64>(0)).unwrap(), 0);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 199);
+            |row| row.get::<_,i64>(0)).unwrap(), 200);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
     }
 
@@ -18778,7 +18917,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='selected-instance' AND resolved_at_ms IS NULL AND incident_id<>?1", [group.2.as_deref().unwrap()],
             |row| row.get::<_,i64>(0)).unwrap(), 0, "only the terminal capacity incident stays open");
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_, i64>(0)).unwrap(), 199);
+            |row| row.get::<_, i64>(0)).unwrap(), 200);
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(), "ok");
