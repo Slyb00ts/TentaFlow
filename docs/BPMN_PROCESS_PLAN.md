@@ -239,3 +239,85 @@ Odpowiednik Camunda Cockpit, dostępny w samym Flow Builderze:
    i wysyłania wiadomości), czy na początek tylko dla aplikacji natywnych.
 4. Czy przy imporcie procesów z NextApp (Camunda 7) utrzymujemy zgodność zmiennych `Static_*`,
    czy tylko czytamy diagram.
+
+---
+
+## 10. Stan realizacji (2026-10-08)
+
+Źródłem prawdy jest kod: `tentaflow-core/src/processes/` (model, parser, runtime, repozytorium,
+symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-protocol/src/processes.rs`
+(`ProcessPayload`) i Flow Builder (`www/js/modules/flows-builder/`).
+
+### 10.1 Zrealizowane
+
+| Faza | Zakres | Commit |
+|---|---|---|
+| B1 — rdzeń | definicje i wersje, instancje, tokeny, zadania użytkownika, zadania usługi → joby silnika flow, kontrakt wyniku, bramki XOR/AND, start/koniec, zmienne i mapowanie, historia, edytor w Flow Builderze | `7b899ef5e` |
+| B2 — czas | timery (start, zdarzenie pośrednie), zdarzenia brzegowe czasowe, kalendarz roboczy przypięty do wersji | `a455bd77d`, `3bf8a4a8f`, `27b399cc7` |
+| B2 — zdarzenia | wiadomości z korelacją, błędy biznesowe, eskalacja do człowieka, sygnały, terminate | `d8c5cc135`, `82153668f`, `6e154dd25`, `6afd162f3` |
+| B2 — struktura | podproces osadzony, call activity i koniec błędu, bramka inkluzywna, wielokrotne wykonanie (równoległe, sekwencyjne, pętla) | `42e4ba938`, `2607deacd`, `f739d3eb3`, `068e37617` |
+| B2/B3 — zadania | skrypt CEL, zadanie ręczne, wysłanie i odbiór wiadomości, granice zadania wysłania, bramka oparta na zdarzeniach i oczekiwania w zakresach | `2eeeb9213`, `c16ae5922`, `cf1c9c144`, `6fa372f21`, `1f494159f` |
+| B2/B3 — wynik aktywności, IO, symulacja | patrz 10.2 | `a7ca170bf` |
+
+### 10.2 Co dostarcza ostatni krok
+
+- **Blok „Wynik aktywności”** (`flow_engine/node_adapters/activity_result.rs`): przepływ jawnie
+  zwraca `Completed` / `Error` / `NeedsHuman` / `Cancelled` z kodem, podsumowaniem, wyjściami
+  i dowodami (§4.4). Walidacja grafu przy zapisie przepływu, szablon w palecie przepływów,
+  a wykonawca uznaje przebieg z takim blokiem za błąd (`ACTIVITY_RESULT_NOT_PRODUCED`), gdy
+  terminal się nie wykonał — brak wyniku nigdy nie jest sukcesem.
+- **Trwałe wywołania usług** (migracja 196, `bpmn_service_invocations`): wywołanie zadania
+  usługi ma fazy `prepared` → `may_have_executed` / `uncertain` → `observed` → `accepted` oraz
+  ogrodzenie próby, więc wynik zaobserwowany po zamknięciu aktywności nie jest ponownie
+  wykonywany ani cicho gubiony.
+- **Wejścia i wyjścia aktywności (IO)** (migracje 195–197): skojarzenia danych wejściowych
+  i wyjściowych na ośmiu rodzajach aktywności (użytkownika, skrypt, usługa, ręczna, wysłanie,
+  odbiór, podproces, wywołanie), z trwałym świadkiem (`bpmn_activity_io_witnesses`) dla fazy
+  przechwycenia wejść, zaakceptowanego wyniku i zastosowanych albo zablokowanych wyjść.
+  Właściciel fazy to aktywność zwykła, porządkowa albo koordynator powtórzeń. Zablokowane
+  mapowanie wyjścia zostawia aktywność oczekującą z incydentem, bez ponownego wykonania pracy.
+- **Zdarzenia brzegowe na powtarzanej aktywności**: zewnętrzny timer albo wiadomość jest
+  uzbrojony na koordynatorze i rozbrajany dopiero po zakończeniu całej grupy; migracja 194
+  (`bpmn_repetition_accepted_source_instance`) wiąże przyjęte źródło porządkowe z instancją.
+- **Dokumenty wieloprocesowe i modelowanie** (import i eksport BPMN XML, `processes/bpmn.rs`):
+  wiele wykonywalnych procesów w jednym dokumencie z katalogiem startów, wywołanie procesu
+  z tego samego dokumentu (`ProcessCallTarget::LocalBody`) obok opublikowanego, kolaboracja
+  (uczestnicy, przepływy wiadomości), tory, obiekty i magazyny danych, adnotacje i skojarzenia
+  zachowywane przy eksporcie, zdarzenia linku (throw/catch), przypięcie wybranego procesu
+  i startu do instancji (migracja 195).
+- **Symulacja procesu** (`processes/simulation.rs`, `SimulationRegistry`, okno w Flow
+  Builderze): deterministyczne uruchomienie w prywatnej bazie SQLite z zegarem symulacji,
+  stałymi identyfikatorami i śladem kroków. Obsługuje zadania skryptowe, użytkownika
+  i ręczne, bramki oraz timer-catch; autoryzacja według ACL przechwyconej przy starcie.
+  Limity: 16 uruchomień łącznie, 4 na właściciela, 16 MiB na uruchomienie. Protokół:
+  sześć par żądanie/odpowiedź `ProcessPayload::Simulation*` (dopisane na końcu enuma),
+  obsługa w `dispatch/processes.rs`, kodek JS i klucze i18n w pięciu językach.
+
+### 10.3 Co zostaje
+
+- **B3**: kategoria „Bloki TentaFlow” i upuszczanie bloku/agenta jako zadania usługi,
+  implementacje zadania usługi inne niż przepływ (blok, agent z ujściem `task.complete`,
+  narzędzie addonu), tryby weryfikacji „test” i „krytyk” (dziś: warunek CEL lub człowiek),
+  zakładka inspektora „Wynik i błędy”, import rozszerzeń `camunda:` (dziś kończy się jawną diagnostyką) wraz z tłumaczeniem
+  wyrażeń JUEL/FEEL,
+  symulacja poza profilem `script_user_manual` (usługi, wiadomości,
+  sygnały, podprocesy, powtórzenia).
+- **B4**: nakładka tokenów na diagramie instancji, ponowienia i powiadomienia o incydentach,
+  migracja instancji do nowej wersji definicji.
+- **B5**: podprocesy zdarzeniowe, kompensacja, zdarzenia warunkowe, bramka złożona,
+  transakcje.
+- Otwarte decyzje z §9 pozostają bez zmian.
+
+### 10.4 Ryzyka integracyjne
+
+- **Numeracja migracji.** Gałąź zajmuje 178–197 (178–180 to struktura organizacyjna, 181–197
+  BPMN), a `origin/main` ma już 178 (`cameras_depth_camera_offset`) i 179
+  (`bus_schema_registry_widen_types`). Przed scaleniem trzeba przesunąć numery gałęzi o dwa
+  (do 180–199) wraz z testami, które przypinają numery (`run_ladder_up_to(194)` i asercje
+  `MAX(version)` w `db/migrations.rs`, `call_pin_tests.rs`). Baza, która zastosowała numery
+  gałęzi, nie może przejść na numerację scaloną bez ręcznej reconcylacji.
+- **`SCHEMA_VERSION`.** Zmiany protokołu w tym kroku są addytywne: dopisane warianty
+  `ProcessPayload::Simulation*` (tagi po NAZWIE), pole `ProcessModel.data_stores` z
+  `#[serde(default)]` i serializacja `CallActivity` zgodna z dotychczasowym kształtem.
+  Nie zmieniają zakodowanych bajtów istniejących wiadomości, więc nie wymagają podniesienia
+  wersji; peer bez symulacji odrzuci tylko pojedyncze żądanie symulacji.
