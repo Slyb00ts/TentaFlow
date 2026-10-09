@@ -111,6 +111,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (wymagane segmenty i pola z nazwami ze słownika), a opis XSD to jego
   `xs:annotation/xs:documentation`. Odmowa nowej wersji profilu, która
   wymaga czegoś ponad starą wersję, ma przycisk „Usuń OBX-8 i dodaj wersję”.
+- Poprawki walidatorów XSD i profilu HL7: numer pola w adresie (`PID-n`) ma
+  najwyżej 999 (dłuższy numer w profilu lub polityce pola jest odrzucany
+  zamiast zatrzymywać proces), drugi segment `MSH` w wiadomości jest numerowany
+  jak pierwszy, a jawne `""` (usuń wartość) nie spełnia pola wymaganego.
+  Komunikaty naruszeń nie zawierają już treści wiadomości (nazwy encji
+  `&nazwa;`, błędy parsera, identyfikator błędnego segmentu). Zgodność XSD nie
+  dowodzi już wyliczenia typu liczbowego lub `boolean` względem wzorca albo typu
+  tekstowego (dozwolone `01`, `+1`, `1` jako `true`), ma budżet pracy dla
+  szerokich modeli i podaje element, którego nowa wersja wymaga (`the new
+  schema requires element 'x'`). `pattern` z nadmiarowym `)` jest odrzucany,
+  `maxOccurs="0"` w `xs:all` wyłącza element, a schemat wyprowadzony dla polityki
+  odczytu przyjmuje projekcję dokumentów z prefiksami przestrzeni nazw i tekstem
+  elementu głównego (wymagalność dzieci, których nazwy projekcja nie może
+  dopasować jednoznacznie, jest rozluźniana).
+- Sprawdzenie wzorca, które przekroczyło limit pracy (zbyt głęboki lub zbyt duży
+  dokument XML), nie jest już zgłaszane jako naruszenie: wiadomość trafia do
+  nieprzetworzonych (`validation = dlq`) lub jest przyjęta z ostrzeżeniem
+  (`warn`) z powodem `schema_check_too_complex`, odrębnym od
+  `schema_violation` (nowa wartość nagłówka `dlq.reason`; starsze programy
+  pokażą ją jako „nieznany powód”).
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

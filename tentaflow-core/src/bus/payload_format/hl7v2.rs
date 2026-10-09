@@ -18,6 +18,9 @@
 //     JSON's fail-closed fallback is `{}` (a valid, empty JSON value) and
 //     not literally zero bytes.
 //
+// A repeated MSH (batch files, some gateways) is addressed exactly like the
+// first one: its MSH-2 is structural, its first ordinary field is MSH-3.
+//
 // MSH-1 (the field separator character itself) and MSH-2 (the encoding
 // characters `^~\&`) are NOT addressable/filterable fields — they define
 // how the rest of the message is split at all, so blanking or hiding them
@@ -40,6 +43,22 @@ use super::{FormatError, PayloadFieldFormat};
 
 const SEGMENT_TERMINATOR: char = '\r';
 
+/// Largest field number an address may name. Real segments stay far below
+/// this (PID has 39 fields); the bound keeps every parsed number inside a
+/// small integer so address handling can never overflow.
+pub(crate) const MAX_FIELD_NUMBER: usize = 999;
+
+/// Number of the first element `segment_fields` returns: every segment starts
+/// at field 1 except MSH, whose first element is MSH-2 (MSH-1 is the
+/// separator itself).
+fn first_field_number(id: &str) -> usize {
+    if id == "MSH" {
+        2
+    } else {
+        1
+    }
+}
+
 fn split_segments(text: &str) -> Vec<&str> {
     text.split(['\r', '\n']).filter(|s| !s.is_empty()).collect()
 }
@@ -49,9 +68,7 @@ fn split_segments(text: &str) -> Vec<&str> {
 fn segment_fields<'a>(seg: &'a str, fsep: char) -> Result<(&'a str, Vec<&'a str>), FormatError> {
     let probe: String = seg.chars().take(3).collect();
     if probe.chars().count() != 3 || !probe.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(FormatError(format!(
-            "hl7: '{probe}' is not a valid segment id"
-        )));
+        return Err(FormatError("hl7: segment id is not valid".to_string()));
     }
     let (id, rest) = seg.split_at(3); // safe: the id is 3 single-byte ASCII chars
     let fields: Vec<&str> = if rest.is_empty() {
@@ -59,9 +76,9 @@ fn segment_fields<'a>(seg: &'a str, fsep: char) -> Result<(&'a str, Vec<&'a str>
     } else if let Some(stripped) = rest.strip_prefix(fsep) {
         stripped.split(fsep).collect()
     } else {
-        return Err(FormatError(format!(
-            "hl7: segment '{id}' is missing the field separator after its id"
-        )));
+        return Err(FormatError(
+            "hl7: a segment is missing the field separator after its id".to_string(),
+        ));
     };
     Ok((id, fields))
 }
@@ -106,7 +123,11 @@ pub(crate) fn for_each_segment<'a>(
     visit("MSH", &msh_fields[1..], 3)?;
     for seg in &segments[1..] {
         let (id, fields) = segment_fields(seg, fsep)?;
-        visit(id, &fields, 1)?;
+        // A repeated MSH is laid out like the first one: skip the structural
+        // MSH-2 so the numbering matches `list_fields` and `project`.
+        let first = first_field_number(id);
+        let skip = first - 1;
+        visit(id, fields.get(skip..).unwrap_or(&[]), first + skip)?;
     }
     Ok(())
 }
@@ -131,8 +152,12 @@ impl PayloadFieldFormat for Hl7V2Format {
         }
         for seg in &segments[1..] {
             let (id, fields) = segment_fields(seg, fsep)?;
+            let first = first_field_number(id);
             for (idx, _) in fields.iter().enumerate() {
-                out.insert(format!("{id}-{}", idx + 1));
+                // MSH-2 is structural wherever the segment repeats.
+                if first + idx > 2 || id != "MSH" {
+                    out.insert(format!("{id}-{}", first + idx));
+                }
             }
         }
         Ok(out)
@@ -166,12 +191,13 @@ impl PayloadFieldFormat for Hl7V2Format {
 
         for seg in &segments[1..] {
             let (id, fields) = segment_fields(seg, fsep)?;
+            let first = first_field_number(id);
             let rendered: Vec<String> = fields
                 .iter()
                 .enumerate()
                 .map(|(idx, v)| {
-                    let addr = format!("{id}-{}", idx + 1);
-                    if allowed.contains(&addr) {
+                    let addr = format!("{id}-{}", first + idx);
+                    if (id == "MSH" && idx == 0) || allowed.contains(&addr) {
                         v.to_string()
                     } else {
                         String::new()
@@ -226,6 +252,11 @@ impl PayloadFieldFormat for Hl7V2Format {
         {
             return Err(FormatError(format!(
                 "hl7: '{field_no}' is not a valid positive field number"
+            )));
+        }
+        if field_no.len() > 3 {
+            return Err(FormatError(format!(
+                "hl7: field number '{field_no}' exceeds the supported maximum of {MAX_FIELD_NUMBER}"
             )));
         }
         Ok(())
@@ -335,5 +366,28 @@ mod tests {
         assert!(HL7V2_FORMAT.validate_field_name("PID-05").is_err());
         assert!(HL7V2_FORMAT.validate_field_name("pid-5").is_err());
         assert!(HL7V2_FORMAT.validate_field_name("PIDX-5").is_err());
+    }
+
+    #[test]
+    fn validate_field_name_bounds_the_field_number() {
+        assert!(HL7V2_FORMAT.validate_field_name("ZPD-999").is_ok());
+        for name in ["ZPD-1000", "PID-99999999999999999999"] {
+            let err = HL7V2_FORMAT.validate_field_name(name).unwrap_err();
+            assert!(err.to_string().contains("maximum"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_msh_is_addressed_like_the_first() {
+        let msg = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1\rMSH|^~\\&|A|B|C|D|2026||ADT^A01|2\r";
+        let got = HL7V2_FORMAT.list_fields(msg.as_bytes()).unwrap();
+        assert!(!got.contains("MSH-1") && !got.contains("MSH-2"));
+        assert!(got.contains("MSH-10"));
+        // The encoding characters of the second MSH survive an empty policy.
+        let out = HL7V2_FORMAT
+            .project(msg.as_bytes(), &BTreeSet::new())
+            .unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert!(split_segments(&text)[1].starts_with("MSH|^~\\&|"));
     }
 }

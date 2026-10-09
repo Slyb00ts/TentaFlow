@@ -14,7 +14,8 @@
 //     parse is a violation.
 //   - A required segment must occur at least once.
 //   - A required field `SEG-N` must be NON-EMPTY (contain a character other
-//     than whitespace) in EVERY occurrence of segment `SEG`. Naming a field
+//     than whitespace, and not be the HL7 explicit null `""`, which means
+//     "delete the value") in EVERY occurrence of segment `SEG`. Naming a field
 //     therefore also requires its segment: the profile is normalized at
 //     compile time so `required_segments` always contains the segment of
 //     every required field. Component-level structure (`^`, `&`) is not
@@ -50,13 +51,22 @@ struct RawProfile {
     required_fields: Vec<String>,
 }
 
+/// A required field address already split into its segment and number, so
+/// nothing after `parse_profile` has to re-parse untrusted text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldRef {
+    segment: String,
+    number: usize,
+}
+
 /// Normalized profile: `segments` already includes the segment of every
 /// required field, so two profiles are compared and derived on sets alone.
+/// `fields` maps the canonical address to its parsed parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Profile {
     description: Option<String>,
     segments: BTreeSet<String>,
-    fields: BTreeSet<String>,
+    fields: BTreeMap<String, FieldRef>,
 }
 
 #[derive(Debug)]
@@ -115,27 +125,28 @@ fn parse_profile(schema_text: &str) -> Result<Profile, SchemaError> {
             .map_err(|_| invalid(format!("'{seg}' is not a valid 3-character segment id")))?;
         segments.insert(seg.clone());
     }
-    let mut fields = BTreeSet::new();
+    let mut fields = BTreeMap::new();
     for field in &raw.required_fields {
         codec
             .validate_field_name(field)
             .map_err(|e| invalid(e.to_string()))?;
-        let (seg, _) = field.split_once('-').expect("validated as SEGMENT-N");
-        segments.insert(seg.to_string());
-        fields.insert(field.clone());
+        let field_ref = field
+            .split_once('-')
+            .and_then(|(seg, n)| {
+                Some(FieldRef {
+                    segment: seg.to_string(),
+                    number: n.parse().ok()?,
+                })
+            })
+            .ok_or_else(|| invalid(format!("'{field}' is not a valid field address")))?;
+        segments.insert(field_ref.segment.clone());
+        fields.insert(field.clone(), field_ref);
     }
     Ok(Profile {
         description: raw.description,
         segments,
         fields,
     })
-}
-
-fn field_number(address: &str) -> usize {
-    address
-        .split_once('-')
-        .and_then(|(_, n)| n.parse().ok())
-        .expect("validated as SEGMENT-N")
 }
 
 fn render(profile: &Profile) -> String {
@@ -156,7 +167,7 @@ fn render(profile: &Profile) -> String {
     );
     map.insert(
         "required_fields".to_string(),
-        Value::Array(profile.fields.iter().cloned().map(Value::String).collect()),
+        Value::Array(profile.fields.keys().cloned().map(Value::String).collect()),
     );
     Value::Object(map).to_string()
 }
@@ -176,7 +187,13 @@ fn check_reader_requires_no_more(
             .join(", ")
     };
     let extra_segments = join(reader.segments.difference(&data.segments).collect());
-    let extra_fields = join(reader.fields.difference(&data.fields).collect());
+    let extra_fields = join(
+        reader
+            .fields
+            .keys()
+            .filter(|f| !data.fields.contains_key(*f))
+            .collect(),
+    );
     if extra_segments.is_empty() && extra_fields.is_empty() {
         return Ok(());
     }
@@ -193,18 +210,23 @@ fn check_reader_requires_no_more(
     )))
 }
 
+/// HL7 v2 sends `""` to mean "delete the value", so it carries no data.
+fn is_populated(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != "\"\""
+}
+
 pub struct Hl7v2ProfileOps;
 
 impl SchemaKindOps for Hl7v2ProfileOps {
     fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         let profile = parse_profile(schema_text)?;
         let mut fields_by_segment: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for field in &profile.fields {
-            let (seg, _) = field.split_once('-').expect("validated as SEGMENT-N");
+        for field in profile.fields.values() {
             fields_by_segment
-                .entry(seg.to_string())
+                .entry(field.segment.clone())
                 .or_default()
-                .push(field_number(field));
+                .push(field.number);
         }
         Ok(CompiledSchema::Hl7v2Profile(Compiled {
             segments: profile.segments.into_iter().collect(),
@@ -233,7 +255,7 @@ impl SchemaKindOps for Hl7v2ProfileOps {
                 let present = number
                     .checked_sub(first)
                     .and_then(|i| fields.get(i))
-                    .is_some_and(|v| !v.trim().is_empty());
+                    .is_some_and(|v| is_populated(v));
                 if !present {
                     return Err(FormatError(format!(
                         "{id}-{number} is required but empty or missing (segment occurrence {})",
@@ -262,7 +284,7 @@ impl SchemaKindOps for Hl7v2ProfileOps {
         let mut profile = parse_profile(schema_text)?;
         // A projected message keeps every segment and blanks the fields a
         // policy hides, so only field requirements can stop holding.
-        profile.fields.retain(|f| allowed.contains(f));
+        profile.fields.retain(|f, _| allowed.contains(f));
         Ok(render(&profile))
     }
 
@@ -354,6 +376,72 @@ mod tests {
             assert!(
                 matches!(&err, SchemaError::Invalid(m) if m.contains(needle)),
                 "{text}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_bounds_the_field_number_instead_of_panicking() {
+        for address in [
+            "PID-99999999999999999999",
+            "PID-1000",
+            "PID-18446744073709551616",
+        ] {
+            let text = format!(r#"{{"required_fields":["{address}"]}}"#);
+            let err = HL7V2_PROFILE_OPS.compile(&text).unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::Invalid(m) if m.contains("maximum")),
+                "{address}: {err:?}"
+            );
+        }
+        assert!(HL7V2_PROFILE_OPS
+            .compile(r#"{"required_fields":["PID-999"]}"#)
+            .is_ok());
+    }
+
+    #[test]
+    fn explicit_null_does_not_satisfy_a_required_field() {
+        let c = compile(PROFILE);
+        let nulled = ADT.replace("MRN123", "\"\"");
+        let err = HL7V2_PROFILE_OPS
+            .validate(&c, nulled.as_bytes())
+            .unwrap_err();
+        assert!(matches!(&err, SchemaError::Violation(m) if m.contains("PID-3 is required")));
+        // A value that merely contains quotes is data.
+        let quoted = ADT.replace("MRN123", "\"x\"");
+        assert!(HL7V2_PROFILE_OPS.validate(&c, quoted.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn every_msh_occurrence_is_numbered_from_msh_3() {
+        let c = compile(r#"{"required_fields":["MSH-9"]}"#);
+        let fine =
+            "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rMSH|^~\\&|A|B|C|D|2026||ADT^A01|2|P|2.5\r";
+        // The second MSH has MSH-9 empty but MSH-10 set: a shifted numbering
+        // would read MSH-10 as MSH-9 and let it through.
+        let shifted = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\rMSH|^~\\&|A|B|C|D|2026|||2|P|2.5\r";
+        assert!(HL7V2_PROFILE_OPS.validate(&c, fine.as_bytes()).is_ok());
+        let err = HL7V2_PROFILE_OPS
+            .validate(&c, shifted.as_bytes())
+            .unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::Violation(m) if m.contains("MSH-9") && m.contains("occurrence 2")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_segment_id_is_reported_without_echoing_it() {
+        let c = compile(PROFILE);
+        // One id with a character a segment id cannot have, one without a
+        // field separator after a well-formed id.
+        for segment in ["S-3CRET|x", "S3CRET9|x"] {
+            let msg = format!("MSH|^~\\&|A|B|C|D|2026||ADT^A01|1|P|2.5\r{segment}\r");
+            let err = HL7V2_PROFILE_OPS.validate(&c, msg.as_bytes()).unwrap_err();
+            assert!(matches!(&err, SchemaError::Violation(_)));
+            assert!(
+                !err.to_string().contains("S-3") && !err.to_string().contains("S3C"),
+                "{err}"
             );
         }
     }

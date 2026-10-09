@@ -6,10 +6,10 @@
   <xs:element name="patient">
     <xs:complexType>
       <xs:sequence>
-        <xs:element name="mrn" type="Mrn"/>
-        <xs:element name="birthDate" type="xs:date"/>
+        <xs:element name="mrn" type="Mrn" minOccurs="0"/>
+        <xs:element name="birthDate" type="xs:date" minOccurs="0"/>
         <xs:choice minOccurs="0">
-          <xs:element name="phone" type="xs:string"/>
+          <xs:element name="phone" type="xs:string" minOccurs="0"/>
         </xs:choice>
         <xs:element name="visit" minOccurs="0" maxOccurs="unbounded">
           <xs:complexType>

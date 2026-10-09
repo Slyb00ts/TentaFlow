@@ -5269,7 +5269,27 @@ impl BusService {
             let mut kept: Vec<PublishRecord> = Vec::with_capacity(batch.records.len());
             let mut violations: Vec<PublishRecord> = Vec::new();
             for mut r in std::mem::take(&mut batch.records) {
-                match ops.validate(compiled, &r.payload) {
+                // A document the check gave up on is quarantined or warned
+                // about like a violation, but under its own reason: it is
+                // not known to be invalid.
+                let verdict = match ops.validate(compiled, &r.payload) {
+                    Ok(()) => Ok(()),
+                    Err(schema_registry::SchemaError::Violation(detail)) => {
+                        Err((dlq::DlqReason::SchemaViolation, detail))
+                    }
+                    Err(schema_registry::SchemaError::LimitExceeded(detail)) => {
+                        Err((dlq::DlqReason::SchemaCheckTooComplex, detail))
+                    }
+                    Err(other) => {
+                        return Err(BusServiceError::SchemaViolation {
+                            topic: topic.to_string(),
+                            subject: subject.clone(),
+                            version: resolved.version,
+                            detail: other.to_string(),
+                        });
+                    }
+                };
+                match verdict {
                     Ok(()) => {
                         // Only a record that ran validation AND PASSED gets
                         // stamped — a `warn`-mode violation stays `0`
@@ -5277,15 +5297,16 @@ impl BusService {
                         r.schema_id = resolved.schema_ref_id;
                         kept.push(r);
                     }
-                    Err(schema_registry::SchemaError::Violation(detail)) => {
+                    Err((reason, detail)) => {
                         self.schema_violations_total.fetch_add(1, Ordering::Relaxed);
                         self.audit_windowed(
                             ctx,
                             "bus.schema.violation",
                             Some(topic),
                             Some(&format!(
-                                "subject={subject} version={} {detail}",
-                                resolved.version
+                                "subject={subject} version={} reason={} {detail}",
+                                resolved.version,
+                                reason.as_str()
                             )),
                         );
                         match cfg.validation {
@@ -5305,7 +5326,7 @@ impl BusService {
                                 );
                                 violations.push(dlq::build_publish_violation_record(
                                     topic,
-                                    "schema_violation",
+                                    reason.as_str(),
                                     &detail,
                                     ctx,
                                     &r,
@@ -5315,14 +5336,6 @@ impl BusService {
                                 unreachable!("guarded by the `cfg.validation != Off` check above")
                             }
                         }
-                    }
-                    Err(other) => {
-                        return Err(BusServiceError::SchemaViolation {
-                            topic: topic.to_string(),
-                            subject: subject.clone(),
-                            version: resolved.version,
-                            detail: other.to_string(),
-                        });
                     }
                 }
             }
@@ -19641,6 +19654,111 @@ mod tests {
         assert_ne!(
             records[1].schema_id, 0,
             "a validated record carries the schema id"
+        );
+    }
+
+    const TREE_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="node"><xs:sequence><xs:element name="child" type="node" minOccurs="0"/></xs:sequence></xs:complexType><xs:element name="tree" type="node"/></xs:schema>"#;
+
+    fn nested_tree(depth: usize) -> String {
+        format!(
+            "<tree>{}{}</tree>",
+            "<child>".repeat(depth),
+            "</child>".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn a_document_the_xsd_check_gave_up_on_is_diverted_under_its_own_reason() {
+        let fine = nested_tree(3);
+        // Deeper than the checker follows: not known to be invalid.
+        let too_deep = nested_tree(300);
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[fine.as_str(), too_deep.as_str()],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-reasons",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        assert_eq!(dlq.records.len(), 1);
+        let header = |name: &str| {
+            dlq.records[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        };
+        assert_eq!(header("dlq.reason").unwrap(), "schema_check_too_complex");
+        assert!(header("dlq.error_message")
+            .unwrap()
+            .contains("nested too deeply"));
+
+        // A real violation keeps the old reason.
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &["<tree><other/></tree>"],
+        );
+        assert_eq!(result.schema_rejected, 1);
+        let dlq = svc
+            .open_consumer(
+                &ctx,
+                "dlq-reasons",
+                &["__dlq.validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap();
+        assert!(dlq.records[0]
+            .headers
+            .iter()
+            .any(|(k, v)| k == "dlq.reason" && v.as_ref() == b"schema_violation"));
+    }
+
+    #[test]
+    fn warn_mode_accepts_a_document_the_xsd_check_gave_up_on_unstamped() {
+        let too_deep = nested_tree(300);
+        let (_tmp, svc, ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            TREE_XSD,
+            "application/xml",
+            topics::ValidationMode::Warn,
+            &[too_deep.as_str()],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 0));
+        let records = svc
+            .open_consumer(
+                &ctx,
+                "warn-limit-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap()
+            .records;
+        assert_eq!(
+            records[0].schema_id, 0,
+            "a record the check could not decide is never stamped"
         );
     }
 

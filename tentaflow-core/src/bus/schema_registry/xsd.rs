@@ -111,6 +111,7 @@ const PATTERN_NEST_LIMIT: u32 = 32;
 const MAX_DOC_DEPTH: usize = 128;
 const MAX_VALIDATION_STEPS: u64 = 20_000_000;
 const MAX_COMPAT_PAIRS: usize = 50_000;
+const MAX_COMPAT_WORK: u64 = 20_000_000;
 
 const SUPPORTED_BUILTINS: &str = "string, int, integer, decimal, boolean, date, dateTime";
 
@@ -375,6 +376,9 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
     let mut i = 0;
     let mut in_class = false;
     let mut prev_quantifier = false;
+    // Without this, `a)|(b` would close the anchoring group opened above and
+    // leave the two halves of the alternation unanchored.
+    let mut depth = 0usize;
     while i < chars.len() {
         let c = chars[i];
         match c {
@@ -476,6 +480,14 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
                     return Err("'(?' groups are not part of the XSD regex dialect".to_string());
                 }
                 out.push('(');
+                depth += 1;
+                prev_quantifier = false;
+            }
+            ')' if !in_class => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "unbalanced ')' in the pattern".to_string())?;
+                out.push(')');
                 prev_quantifier = false;
             }
             '?' | '*' | '+' if !in_class => {
@@ -500,6 +512,9 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
     }
     if in_class {
         return Err("unterminated character class".to_string());
+    }
+    if depth != 0 {
+        return Err("unterminated group in the pattern".to_string());
     }
     out.push_str(")\\z");
     Ok(out)
@@ -607,6 +622,9 @@ struct ComplexDef {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Doc {
+    /// The source declared a `targetNamespace`, so instances are likely to
+    /// spell element names with a prefix.
+    namespaced: bool,
     description: Option<String>,
     elements: Vec<ElementDef>,
     simple_types: Vec<(String, SimpleDef)>,
@@ -678,15 +696,21 @@ fn append_ref(r: &BytesRef, out: &mut String) -> Result<(), String> {
             return Ok(());
         }
         Ok(None) => {}
-        Err(e) => return Err(format!("invalid character reference: {e}")),
+        Err(_) => return Err("invalid character reference".to_string()),
     }
-    let name = r.decode().map_err(|e| e.to_string())?;
+    // Fixed wording: this also runs on instance documents, whose reference
+    // names must not reach audit rows and DLQ headers.
+    let name = r
+        .decode()
+        .map_err(|_| "entity reference is not valid text".to_string())?;
     match resolve_predefined_entity(&name) {
         Some(s) => {
             out.push_str(s);
             Ok(())
         }
-        None => Err(format!("entity reference '&{name};' is not supported")),
+        None => Err(
+            "entity references other than the five predefined ones are not supported".to_string(),
+        ),
     }
 }
 
@@ -834,7 +858,7 @@ fn build_tree(text: &str) -> Result<(XNode, Namespaces), SchemaError> {
         return Err(invalid("unexpected end of document inside an open element"));
     }
     let root = root.ok_or_else(|| invalid("no root element"))?;
-    let namespaces = namespaces.expect("set together with the root element");
+    let namespaces = namespaces.ok_or_else(|| invalid("no root element"))?;
     Ok((root, namespaces))
 }
 
@@ -1016,6 +1040,7 @@ impl Interpreter<'_> {
 
     fn schema(&self, root: &XNode) -> Result<Doc, SchemaError> {
         let mut doc = Doc {
+            namespaced: self.target_ns.is_some(),
             description: documentation(root),
             elements: Vec::new(),
             simple_types: Vec::new(),
@@ -1179,14 +1204,18 @@ impl Interpreter<'_> {
             match child.local.as_str() {
                 "element" => {
                     let el = self.element(child, false)?;
-                    if kind == GroupKind::All
-                        && el.max != Max::Bounded(1)
-                        && el.max != Max::Bounded(0)
-                    {
-                        return Err(invalid(format!(
-                            "element '{}' inside xs:all may occur at most once",
-                            el.name
-                        )));
+                    if kind == GroupKind::All {
+                        // maxOccurs="0" prohibits the element: it must never
+                        // match, so it is not part of the group at all.
+                        if el.max == Max::Bounded(0) {
+                            continue;
+                        }
+                        if el.max != Max::Bounded(1) {
+                            return Err(invalid(format!(
+                                "element '{}' inside xs:all may occur at most once",
+                                el.name
+                            )));
+                        }
                     }
                     items.push(Item::Element(el));
                 }
@@ -1853,7 +1882,7 @@ impl<'d> Compiler<'d> {
             .simple_types
             .iter()
             .find(|(n, _)| n == name)
-            .expect("caller checked the name")
+            .ok_or_else(|| invalid(format!("simple type '{name}' is not declared")))?
             .1;
         let compiled = self.simple_def(def, name)?;
         self.simple_pending.remove(name);
@@ -2034,7 +2063,7 @@ impl<'d> Compiler<'d> {
             let mut required = Vec::new();
             for item in &g.items {
                 let Item::Element(e) = item else {
-                    unreachable!("the parser only admits elements inside xs:all")
+                    return Err(invalid("xs:all can hold elements only"));
                 };
                 self.label(e, &mut labels)?;
                 required.push(e.min >= 1);
@@ -2128,6 +2157,11 @@ fn violation(path: &str, msg: &str) -> SchemaError {
     SchemaError::Violation(format!("{path}: {msg}"))
 }
 
+/// The check stopped before it could tell whether the document is valid.
+fn limit(path: &str, msg: &str) -> SchemaError {
+    SchemaError::LimitExceeded(format!("{path}: {msg}"))
+}
+
 enum State {
     None,
     Nfa(Vec<u32>),
@@ -2185,7 +2219,7 @@ fn check_attributes(
     let required_total = declared.iter().filter(|a| a.required).count();
     let mut required_seen = 0;
     for attr in e.attributes() {
-        let attr = attr.map_err(|e| violation(&path(), &format!("malformed attribute: {e}")))?;
+        let attr = attr.map_err(|_| violation(&path(), "malformed attribute"))?;
         let key = std::str::from_utf8(attr.key.as_ref())
             .map_err(|_| violation(&path(), "attribute name is not valid UTF-8"))?;
         if key == "xmlns" || key.starts_with("xmlns:") {
@@ -2210,7 +2244,7 @@ fn check_attributes(
         };
         let value = attr
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
-            .map_err(|e| violation(&path(), &format!("malformed attribute value: {e}")))?;
+            .map_err(|_| violation(&path(), "malformed attribute value"))?;
         if let Err(why) = c.simple(decl.ty).check(&value) {
             return Err(violation(&path(), &format!("attribute '{key}' {why}")));
         }
@@ -2299,7 +2333,9 @@ fn enter_child(
 }
 
 fn close_frame(c: &Compiled, stack: &mut Vec<Frame>) -> Result<(), SchemaError> {
-    let frame = stack.last().expect("caller checked the stack is non-empty");
+    let Some(frame) = stack.last() else {
+        return Err(violation("<root>", "unmatched end tag"));
+    };
     let fail = |msg: &str| violation(&path_of(stack, None), msg);
     match (&frame.state, &c.types[frame.ty]) {
         (State::Text(simple, text), _) => {
@@ -2372,21 +2408,21 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
 
     loop {
         if steps > MAX_VALIDATION_STEPS {
-            return Err(violation(
+            return Err(limit(
                 &path_of(&stack, None),
                 "document exceeds the validation work budget",
             ));
         }
         let event = reader
             .read_event()
-            .map_err(|e| violation(&path_of(&stack, None), &format!("not well-formed XML: {e}")))?;
+            .map_err(|_| violation(&path_of(&stack, None), "not well-formed XML"))?;
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 if root_closed {
                     return Err(violation("<root>", "more than one root element"));
                 }
                 if stack.len() >= MAX_DOC_DEPTH {
-                    return Err(violation(
+                    return Err(limit(
                         &path_of(&stack, None),
                         "document is nested too deeply",
                     ));
@@ -2417,15 +2453,15 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
                 root_closed = stack.is_empty();
             }
             Event::Text(ref t) => {
-                let s = t.decode().map_err(|e| {
-                    violation(&path_of(&stack, None), &format!("invalid text: {e}"))
-                })?;
+                let s = t
+                    .decode()
+                    .map_err(|_| violation(&path_of(&stack, None), "invalid text"))?;
                 on_text(&mut stack, &s)?;
             }
             Event::CData(ref t) => {
-                let s = t.decode().map_err(|e| {
-                    violation(&path_of(&stack, None), &format!("invalid CDATA: {e}"))
-                })?;
+                let s = t
+                    .decode()
+                    .map_err(|_| violation(&path_of(&stack, None), "invalid CDATA"))?;
                 on_text(&mut stack, &s)?;
             }
             Event::GeneralRef(ref r) => {
@@ -2459,6 +2495,12 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
 /// A policy field is the child's literal name as `payload_format::xml`
 /// addresses it; a prefixed entry (`ns:name`) also names the declared
 /// local `name`, since declarations are namespace-free.
+///
+/// The two sides disagree on spelling: validation matches LOCAL names while
+/// the projection keeps a child only under its LITERAL name. A kept child is
+/// therefore guaranteed to survive projection only when the policy names it
+/// unprefixed and the instance does too; `filter_group` relaxes requiredness
+/// of every child for which that cannot be promised.
 fn keeps(allowed: &BTreeSet<String>, name: &str) -> bool {
     allowed.contains(name)
         || allowed
@@ -2469,14 +2511,20 @@ fn keeps(allowed: &BTreeSet<String>, name: &str) -> bool {
 /// The group restricted to allowed child elements, or `None` when nothing
 /// is left. A `choice` that lost a whole alternative becomes optional: a
 /// document that picked the dropped alternative projects to no element.
-fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>) -> Option<GroupDef> {
+fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>, namespaced: bool) -> Option<GroupDef> {
     let mut items = Vec::new();
     let mut lost = false;
     for item in &g.items {
         match item {
-            Item::Element(e) if keeps(allowed, &e.name) => items.push(item.clone()),
+            Item::Element(e) if keeps(allowed, &e.name) => {
+                let mut kept = e.clone();
+                if namespaced || !allowed.contains(&e.name) {
+                    kept.min = 0;
+                }
+                items.push(Item::Element(kept));
+            }
             Item::Element(_) => lost = true,
-            Item::Group(sub) => match filter_group(sub, allowed) {
+            Item::Group(sub) => match filter_group(sub, allowed, namespaced) {
                 Some(f) => items.push(Item::Group(f)),
                 None => lost = true,
             },
@@ -2498,11 +2546,13 @@ fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>) -> Option<GroupDef> {
     })
 }
 
-fn project_complex(def: ComplexDef, allowed: &BTreeSet<String>) -> ComplexDef {
+fn project_complex(def: ComplexDef, allowed: &BTreeSet<String>, namespaced: bool) -> ComplexDef {
     let content = match def.content {
-        ComplexContent::Group(g) => {
-            filter_group(&g, allowed).map_or(ComplexContent::Empty, ComplexContent::Group)
-        }
+        ComplexContent::Group(g) => filter_group(&g, allowed, namespaced)
+            .map_or(ComplexContent::Empty, ComplexContent::Group),
+        // The projection drops the root's own character data, so whatever
+        // the text type demanded can no longer be promised.
+        ComplexContent::Text(_) => ComplexContent::Text(SimpleBase::Builtin(Builtin::String)),
         other => other,
     };
     ComplexDef {
@@ -2584,7 +2634,10 @@ fn derive_doc(doc: &Doc, allowed: &BTreeSet<String>) -> Doc {
         if let Some(def) = def {
             // A named type is inlined for the root only: other uses of it
             // (deeper in the tree) keep their full shape.
-            element.ty = TypeUse::Complex(Box::new(project_complex(def, allowed)));
+            element.ty = TypeUse::Complex(Box::new(project_complex(def, allowed, doc.namespaced)));
+        } else {
+            // A root of a simple type is all text, which the projection drops.
+            element.ty = TypeUse::Builtin(Builtin::String);
         }
     }
     prune_unreachable(&mut out);
@@ -2850,7 +2903,11 @@ struct Inclusion<'a> {
     visited: HashSet<(usize, usize)>,
     pairs: usize,
     max_pairs: usize,
+    /// NFA states touched by all product constructions so far.
+    work: u64,
 }
+
+const TOO_COMPLEX: &str = "the schemas are too complex to compare; compatibility cannot be proven";
 
 impl<'a> Inclusion<'a> {
     fn fail(&self, path: &[String], msg: &str) -> String {
@@ -2860,10 +2917,7 @@ impl<'a> Inclusion<'a> {
     fn budget(&mut self) -> Result<(), String> {
         self.pairs += 1;
         if self.pairs > self.max_pairs {
-            return Err(
-                "the schemas are too complex to compare; compatibility cannot be proven"
-                    .to_string(),
-            );
+            return Err(TOO_COMPLEX.to_string());
         }
         Ok(())
     }
@@ -2995,6 +3049,23 @@ impl<'a> Inclusion<'a> {
             return Ok(());
         }
         if let Some(members) = sub.effective_enumeration() {
+            // A member is the canonical value for numbers and booleans, but
+            // the instance may spell it many ways (`01`, `+1`, ` 1 `, `1` for
+            // true), and `sup.check` on the canonical form says nothing about
+            // those spellings against a pattern or against a string type
+            // (which sees the raw text). Provable are exact string literals,
+            // and values compared as values: a non-string target without a
+            // pattern.
+            let provable = sub.builtin == Builtin::String
+                || (sup.builtin != Builtin::String
+                    && sup.steps.iter().all(|s| s.patterns.is_empty()));
+            if !provable {
+                return Err(
+                    "an enumeration over a non-string type cannot be compared with a pattern or \
+                     a string type; compatibility cannot be proven"
+                        .to_string(),
+                );
+            }
             for member in members {
                 if sup.check(member).is_err() {
                     return Err(format!(
@@ -3125,17 +3196,26 @@ impl<'a> Inclusion<'a> {
         let mut typed: HashSet<u32> = HashSet::new();
         while let Some((s1, s2)) = queue.pop_front() {
             self.budget()?;
+            if self.work + steps > MAX_COMPAT_WORK {
+                return Err(TOO_COMPLEX.to_string());
+            }
             if sub.nfa.accepts(&s1) && !sup.nfa.accepts(&s2) {
                 return Err(self.fail(
                     path,
                     &format!(
                         "the {} schema accepts a sequence of child elements that ends where the \
-                         {} schema still requires more",
-                        self.sub_label, self.sup_label
+                         {} schema still requires {}",
+                        self.sub_label,
+                        self.sup_label,
+                        required_names(sup, &s2)
                     ),
                 ));
             }
+            steps += (s1.len() + s2.len()) as u64;
             for label in sub.nfa.labels_from(&s1) {
+                if self.work + steps > MAX_COMPAT_WORK {
+                    return Err(TOO_COMPLEX.to_string());
+                }
                 let child = &sub.children[label as usize];
                 let Some(&sup_label) = sup.by_name.get(&child.name) else {
                     return Err(self.fail(
@@ -3151,14 +3231,23 @@ impl<'a> Inclusion<'a> {
                 next_sub.sort_unstable();
                 next_sup.sort_unstable();
                 if next_sup.is_empty() {
-                    return Err(self.fail(
-                        path,
-                        &format!(
+                    let msg = if sup.nfa.accepts(&s2) {
+                        format!(
                             "child element '{}' may appear in the {} schema at a position where \
                              the {} schema does not allow it",
                             child.name, self.sub_label, self.sup_label
-                        ),
-                    ));
+                        )
+                    } else {
+                        format!(
+                            "the {} schema requires {} where the {} schema may have child \
+                             element '{}'",
+                            self.sup_label,
+                            required_names(sup, &s2),
+                            self.sub_label,
+                            child.name
+                        )
+                    };
+                    return Err(self.fail(path, &msg));
                 }
                 if typed.insert(label) {
                     path.push(child.name.clone());
@@ -3175,7 +3264,24 @@ impl<'a> Inclusion<'a> {
                 }
             }
         }
+        self.work += steps;
         Ok(())
+    }
+}
+
+/// Names of the child elements `sup` can take next from the state set `s2`,
+/// worded as the stable phrase the dashboard parses:
+/// `element 'a'` or `one of the elements 'a', 'b'`.
+fn required_names(sup: &NfaModel, s2: &[u32]) -> String {
+    let names: Vec<String> = sup
+        .nfa
+        .labels_from(s2)
+        .into_iter()
+        .map(|l| format!("'{}'", sup.children[l as usize].name))
+        .collect();
+    match names.as_slice() {
+        [one] => format!("element {one}"),
+        _ => format!("one of the elements {}", names.join(", ")),
     }
 }
 
@@ -3194,6 +3300,7 @@ fn included(
         visited: HashSet::new(),
         pairs: 0,
         max_pairs: MAX_COMPAT_PAIRS,
+        work: 0,
     }
     .roots()
 }
@@ -3345,6 +3452,61 @@ mod tests {
             "<a>x</a>",
         );
         assert!(!msg.contains("never-shown"), "{msg}");
+    }
+
+    #[test]
+    fn violations_never_echo_entity_references_or_parser_errors() {
+        let s = schema_with_attribute();
+        for doc in [
+            "<a>&SECRET;</a>",
+            r#"<a ward="&SECRET;">x</a>"#,
+            r#"<a ward="x"c="SECRET">x</a>"#,
+            "<a>x</SECRET>",
+            "<a SECRET>x</a>",
+            "<a>&#xSECRET;</a>",
+        ] {
+            let got = XSD_OPS.validate(&compiled(&s), doc.as_bytes());
+            let Err(SchemaError::Violation(m)) = got else {
+                panic!("{doc}: expected a violation, got {got:?}");
+            };
+            assert!(!m.contains("SECRET"), "{doc}: {m}");
+        }
+    }
+
+    fn schema_with_attribute() -> String {
+        schema(
+            r#"<xs:element name="a"><xs:complexType><xs:simpleContent><xs:extension base="xs:string"><xs:attribute name="ward" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType></xs:element>"#,
+        )
+    }
+
+    #[test]
+    fn a_closing_parenthesis_cannot_end_the_anchoring_group() {
+        let msg = rejected(
+            r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="[0-9]{3})|(.*"/></xs:restriction></xs:simpleType></xs:element>"#,
+        );
+        assert!(msg.contains("unbalanced"), "{msg}");
+        let msg = rejected(
+            r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="(ab"/></xs:restriction></xs:simpleType></xs:element>"#,
+        );
+        assert!(msg.contains("pattern"), "{msg}");
+        // Balanced groups still work and stay anchored.
+        let s = schema(
+            r#"<xs:element name="a"><xs:simpleType><xs:restriction base="xs:string"><xs:pattern value="(ab|cd)e"/></xs:restriction></xs:simpleType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<a>cde</a>"));
+        assert!(!accepts(&s, "<a>xcde</a>"));
+    }
+
+    #[test]
+    fn an_all_element_with_max_occurs_zero_never_matches() {
+        let s = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:all>
+                 <xs:element name="a" type="xs:string"/>
+                 <xs:element name="gone" type="xs:string" minOccurs="0" maxOccurs="0"/>
+               </xs:all></xs:complexType></xs:element>"#,
+        );
+        assert!(accepts(&s, "<r><a/></r>"));
+        assert!(violation_of(&s, "<r><a/><gone/></r>").contains("not allowed"));
     }
 
     // ---- compile: rejected constructs --------------------------------------
@@ -3708,7 +3870,7 @@ mod tests {
             (r"[abc", "unterminated"),
             (r"a\", "lone backslash"),
             (r"[a--b]", "'--'"),
-            (r"(a", "valid or supported"),
+            (r"(a", "unterminated group"),
         ] {
             let err = build_pattern(pattern).unwrap_err();
             assert!(err.contains(needle), "{pattern}: {err}");
@@ -3932,7 +4094,11 @@ mod tests {
             "<tree>{}</tree>",
             "<label>x</label><child>".repeat(MAX_DOC_DEPTH) + &"</child>".repeat(MAX_DOC_DEPTH)
         );
-        assert!(violation_of(&s, &deep).contains("nested too deeply"));
+        let got = XSD_OPS.validate(&compiled(&s), deep.as_bytes());
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("nested too deeply")),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -3949,7 +4115,7 @@ mod tests {
         let big = format!("<r>{}</r>", "<c1999/>".repeat(30_000));
         let got = XSD_OPS.validate(&compiled(&s), big.as_bytes());
         assert!(
-            matches!(&got, Err(SchemaError::Violation(m)) if m.contains("work budget")),
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("work budget")),
             "{got:?}"
         );
     }
@@ -4147,7 +4313,9 @@ mod tests {
         assert!(derived.contains("Patient registration message used by the admissions desk."));
         assert!(derived.contains(r#"<xs:attribute name="active" type="xs:boolean"/>"#));
         // parse(render(doc)) is the identity, including escaping.
-        let doc = parse_doc(&source).unwrap();
+        let mut doc = parse_doc(&source).unwrap();
+        // Rendering is namespace-free by design, so the flag is not carried.
+        doc.namespaced = false;
         assert_eq!(parse_doc(&render(&doc)).unwrap(), doc);
         let tricky = schema(
             r#"<xs:annotation><xs:documentation>a &lt; b &amp; "c"</xs:documentation></xs:annotation>
@@ -4463,6 +4631,29 @@ mod tests {
                 false,
                 true,
             ),
+            // The instance may spell the value `01`, `+1` or ` 1 `, which a
+            // pattern or a string type judges on its raw text.
+            (
+                "int enumeration against an int pattern",
+                restricted("xs:int", &pattern("[0-9]")),
+                restricted("xs:int", &enum_of(&["1"])),
+                false,
+                false,
+            ),
+            (
+                "int enumeration against a string enumeration",
+                restricted(string, &enum_of(&["1"])),
+                restricted("xs:int", &enum_of(&["1"])),
+                false,
+                false,
+            ),
+            (
+                "boolean enumeration against a string enumeration",
+                restricted(string, &enum_of(&["true"])),
+                restricted("xs:boolean", &enum_of(&["true"])),
+                false,
+                false,
+            ),
         ];
         for (label, old, new, backward, forward) in &cases {
             for (mode, expected) in [
@@ -4578,11 +4769,173 @@ mod tests {
             visited: HashSet::new(),
             pairs: 0,
             max_pairs: 1,
+            work: 0,
         };
         let err = tight.roots().unwrap_err();
         assert!(err.contains("too complex to compare"), "{err}");
         // The same schemas are proven compatible within the real budget.
         assert_eq!(included(&new, &old, "new", "old"), Ok(()));
+    }
+
+    #[test]
+    fn a_refused_new_required_element_is_named_in_a_stable_phrase() {
+        let old = seq(&format!(
+            "{}{}",
+            el("a", "xs:string", ""),
+            el("tail", "xs:string", r#"maxOccurs="unbounded""#)
+        ));
+        let new = seq(&format!(
+            "{}{}{}",
+            el("a", "xs:string", ""),
+            el("termin", "xs:date", ""),
+            el("tail", "xs:string", r#"maxOccurs="unbounded""#)
+        ));
+        let Err(SchemaError::Incompatible(msg)) =
+            XSD_OPS.check_compatibility(&old, &new, Compatibility::Backward)
+        else {
+            panic!("expected Incompatible");
+        };
+        assert!(msg.contains("requires element 'termin'"), "{msg}");
+        // Ending early while the other schema still wants an element.
+        let old = seq(&el("a", "xs:string", ""));
+        let new = seq(&format!(
+            "{}{}",
+            el("a", "xs:string", ""),
+            el("termin", "xs:date", "")
+        ));
+        let Err(SchemaError::Incompatible(msg)) =
+            XSD_OPS.check_compatibility(&old, &new, Compatibility::Backward)
+        else {
+            panic!("expected Incompatible");
+        };
+        assert!(msg.contains("requires element 'termin'"), "{msg}");
+        // Several candidates are listed together.
+        let new = element_with(&format!(
+            "<xs:sequence>{}<xs:choice>{}{}</xs:choice></xs:sequence>",
+            el("a", "xs:string", ""),
+            el("x", "xs:string", ""),
+            el("y", "xs:string", "")
+        ));
+        let Err(SchemaError::Incompatible(msg)) =
+            XSD_OPS.check_compatibility(&old, &new, Compatibility::Backward)
+        else {
+            panic!("expected Incompatible");
+        };
+        assert!(
+            msg.contains("requires one of the elements 'x', 'y'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_wide_optional_sequence_is_compared_within_a_work_budget() {
+        let items: String = (0..2000)
+            .map(|i| el(&format!("c{i}"), "xs:string", r#"minOccurs="0""#))
+            .collect();
+        let text = seq(&items);
+        let (old, new) = (compile_text(&text).unwrap(), compile_text(&text).unwrap());
+        let started = std::time::Instant::now();
+        let got = included(&new, &old, "new", "old");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "comparison ran for {:?}",
+            started.elapsed()
+        );
+        // Either proven within the budget or refused as too complex, never an
+        // unbounded run or a wrong refusal.
+        assert!(
+            got == Ok(()) || got.as_ref().is_err_and(|m| m.contains("too complex")),
+            "{got:?}"
+        );
+        // The budget really bites on the product construction.
+        let mut spent = Inclusion {
+            sup: &new,
+            sub: &old,
+            sup_label: "new",
+            sub_label: "old",
+            visited: HashSet::new(),
+            pairs: 0,
+            max_pairs: MAX_COMPAT_PAIRS,
+            work: MAX_COMPAT_WORK,
+        };
+        let err = spent.roots().unwrap_err();
+        assert!(err.contains("too complex to compare"), "{err}");
+    }
+
+    // ---- derived schema against the XML projection ----------------------------
+
+    fn projected_is_valid_under_derived(
+        schema_text: &str,
+        allowed: &[&str],
+        doc: &str,
+    ) -> Result<(), SchemaError> {
+        let original = compiled(schema_text);
+        XSD_OPS
+            .validate(&original, doc.as_bytes())
+            .expect("the source document must be valid before projection");
+        let allowed = set(allowed);
+        let projected = PayloadFormat::Xml
+            .codec()
+            .project(doc.as_bytes(), &allowed)
+            .unwrap();
+        let derived = XSD_OPS.derive_subschema(schema_text, &allowed).unwrap();
+        XSD_OPS.validate(&compiled(&derived), &projected)
+    }
+
+    #[test]
+    fn derived_schema_accepts_projections_of_prefixed_documents() {
+        let namespaced = format!(
+            r#"<xs:schema xmlns:xs="{XSD_NS}" targetNamespace="urn:x"><xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:string"/><xs:element name="b" type="xs:string"/>
+               </xs:sequence></xs:complexType></xs:element></xs:schema>"#
+        );
+        // The policy names `a` unprefixed; the document spells it `p:a`, so the
+        // projection drops it and the derived schema must not insist on it.
+        let doc = r#"<p:r xmlns:p="urn:x"><p:a>1</p:a><p:b>2</p:b></p:r>"#;
+        assert_eq!(
+            projected_is_valid_under_derived(&namespaced, &["a"], doc),
+            Ok(())
+        );
+
+        // A prefixed policy entry keeps only that exact spelling.
+        let plain = schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:string"/><xs:element name="b" type="xs:string"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        );
+        assert_eq!(
+            projected_is_valid_under_derived(&plain, &["p:a"], "<r><a>1</a><b>2</b></r>"),
+            Ok(())
+        );
+        // Without namespaces and with a bare entry the requirement is kept.
+        let derived = XSD_OPS.derive_subschema(&plain, &set(&["a"])).unwrap();
+        assert!(XSD_OPS.validate(&compiled(&derived), b"<r></r>").is_err());
+        assert_eq!(
+            projected_is_valid_under_derived(&plain, &["a"], "<r><a>1</a><b>2</b></r>"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn derived_schema_accepts_a_root_whose_text_the_projection_drops() {
+        let int_root = schema(r#"<xs:element name="r" type="xs:int"/>"#);
+        assert_eq!(
+            projected_is_valid_under_derived(&int_root, &[], "<r>5</r>"),
+            Ok(())
+        );
+        // Text restricted by its type, which the projection empties.
+        let with_attribute = schema_with_attribute()
+            .replace("name=\"a\"", "name=\"r\"")
+            .replace("base=\"xs:string\"", "base=\"xs:int\"");
+        assert_eq!(
+            projected_is_valid_under_derived(&with_attribute, &[], r#"<r ward="w">5</r>"#),
+            Ok(())
+        );
+        // The root's attributes survive the projection and stay declared.
+        let derived = XSD_OPS
+            .derive_subschema(&with_attribute, &set(&[]))
+            .unwrap();
+        assert!(derived.contains(r#"name="ward""#));
     }
 
     // ---- misc ---------------------------------------------------------------

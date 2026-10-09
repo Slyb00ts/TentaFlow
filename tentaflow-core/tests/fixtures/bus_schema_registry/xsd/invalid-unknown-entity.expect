@@ -1,1 +1,1 @@
-entity reference '&secret;' is not supported
+entity references other than the five predefined ones are not supported

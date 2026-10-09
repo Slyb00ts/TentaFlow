@@ -64,6 +64,9 @@ pub fn dlq_topic_name(source_topic: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DlqReason {
     SchemaViolation,
+    /// The schema check hit its work limit: the message is NOT known to be
+    /// invalid.
+    SchemaCheckTooComplex,
     ConsumerError,
     ConsumerTimeout,
     PermissionDenied,
@@ -75,6 +78,7 @@ impl DlqReason {
     pub fn as_str(self) -> &'static str {
         match self {
             DlqReason::SchemaViolation => "schema_violation",
+            DlqReason::SchemaCheckTooComplex => "schema_check_too_complex",
             DlqReason::ConsumerError => "consumer_error",
             DlqReason::ConsumerTimeout => "consumer_timeout",
             DlqReason::PermissionDenied => "permission_denied",
