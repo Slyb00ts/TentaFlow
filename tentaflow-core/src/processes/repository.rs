@@ -918,6 +918,14 @@ pub enum RepetitionDeniedBytes {
     ParentAggregate { final_ordinal: Option<u32>, source_event_id: Option<String> },
 }
 
+/// The persisted `repetition_group_blocked` fact a capacity closure cites on every
+/// event it writes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CapacityCause<'a> {
+    pub instance_id: &'a str,
+    pub event_id: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepetitionCapacitySource {
     pub instance_id: String,
@@ -6624,7 +6632,7 @@ pub(crate) fn simulation_timer_summaries_on(
 }
 
 fn insert_event_on(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     instance_id: &str,
     seq: u64,
     actor: Option<&str>,
@@ -7536,7 +7544,7 @@ fn call_subtree_ids_on(conn: &Connection, root: &str) -> Result<Vec<String>> {
 }
 
 fn cancel_call_children_on(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     instance_id: &str,
     token_ids: Option<&[String]>,
     scope_roots: &[String],
@@ -7544,7 +7552,8 @@ fn cancel_call_children_on(
     reason: &str,
     at_ms: i64,
     termination: Option<&TerminationSource>,
-    capacity: Option<&RepetitionCapacitySource>,
+    capacity: Option<CapacityCause<'_>>,
+    witnesses: bool,
 ) -> Result<Vec<CancelledJobClaim>> {
     if let Some(source) = termination {
         let found: bool = tx.query_row(
@@ -7602,7 +7611,7 @@ fn cancel_call_children_on(
         )?;
         if !matches!(status.as_str(), "completed" | "cancelled" | "error") {
             let actor = call_initiator_on(tx, child_id)?;
-            claims.extend(cancel_instance_on(tx, &actor, child_id, revision, at_ms, termination, capacity)?);
+            claims.extend(cancel_instance_on(tx, &actor, child_id, revision, at_ms, termination, capacity, witnesses)?);
         } else {
             claims.extend(cancel_call_children_on(
                 tx,
@@ -7614,6 +7623,7 @@ fn cancel_call_children_on(
                 at_ms,
                 termination,
                 capacity,
+                witnesses,
             )?);
         }
         if was_active {
@@ -18498,7 +18508,7 @@ pub(crate) fn measured_repetition_retained_bytes_on(
 }
 
 fn refresh_repetition_retained_bytes_on(
-    tx: &Transaction<'_>, instance_id: &str, group_id: &str,
+    tx: &Connection, instance_id: &str, group_id: &str,
 ) -> Result<u64> {
     let actual = measured_repetition_retained_bytes_on(tx, instance_id, group_id)?;
     tx.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE instance_id=?2 AND group_id=?3",
@@ -20293,7 +20303,7 @@ fn apply_repetition_plan_on(
 }
 
 fn script_infrastructure_incident_on(
-    tx: &Transaction<'_>, instance_id: &str, source: &ServiceDispatchFact,
+    tx: &Connection, instance_id: &str, source: &ServiceDispatchFact,
 ) -> Result<Option<String>> {
     let open_count: u64 = tx.query_row(
         "SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND job_id=?2 AND code='SCRIPT_INFRASTRUCTURE_FAILED' AND resolved_at_ms IS NULL",
@@ -20367,7 +20377,7 @@ fn script_infrastructure_incident_on(
 }
 
 fn close_cancelled_instance_dispatches_on(
-    tx: &Transaction<'_>, instance_id: &str, at_ms: i64,
+    tx: &Connection, instance_id: &str, at_ms: i64,
 ) -> Result<()> {
     let mut statement = tx.prepare("SELECT v.invocation_id,v.job_id,v.scope_id,v.node_id,v.token_id,v.phase,v.dispatch_attempt,v.dispatch_fence,v.dispatch_worker_id,v.reserved_result_event_id,v.uncertainty_incident_id,j.attempt,j.fence FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id AND j.instance_id=v.instance_id AND j.scope_id=v.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id WHERE v.instance_id=?1 AND v.dispatch_evidence='committed_boundary' AND v.phase IN ('may_have_executed','uncertain','observed') AND j.status='cancelled' AND t.status='cancelled' ORDER BY v.job_id")?;
     let rows = statement.query_map([instance_id], |row| Ok((ServiceDispatchFact {
@@ -20455,7 +20465,7 @@ fn close_cancelled_instance_dispatches_on(
 }
 
 fn close_cancelled_service_dispatch_on(
-    tx: &Transaction<'_>, instance_id: &str, source: &ServiceDispatchFact,
+    tx: &Connection, instance_id: &str, source: &ServiceDispatchFact,
     incident_id: &str, at_ms: i64,
 ) -> Result<()> {
     let expected_code = if source.phase == "observed" {
@@ -21371,11 +21381,13 @@ fn apply_plan_on(
         if plan.terminal_error.is_some() { "error_end" }
             else if plan.repetition_capacity.is_some() { "repetition_limit" }
             else { "call_interrupted" },
-        at_ms, None, plan.repetition_capacity.as_ref())?);
+        at_ms, None,
+        plan.repetition_capacity.as_ref().map(|source| CapacityCause {
+            instance_id: &source.instance_id, event_id: &source.event_id }), true)?);
     for source in &termination_sources {
         cancelled_claims.extend(cancel_call_children_on(tx, instance_id,
             Some(&[]), std::slice::from_ref(&source.source_scope_id), actor_id,
-            "terminate_end", at_ms, Some(*source), None)?);
+            "terminate_end", at_ms, Some(*source), None, true)?);
     }
     for update in &plan.scope_updates {
         if matches!(
@@ -23515,7 +23527,7 @@ pub fn cancel_instance(
             cancelled_claims: Vec::new(),
         });
     }
-    let cancelled_claims = cancel_instance_on(&tx, actor, instance_id, expected_revision, at_ms, None, None)?;
+    let cancelled_claims = cancel_instance_on(&tx, actor, instance_id, expected_revision, at_ms, None, None, true)?;
     if let Some(call) = calls_on(&tx, instance_id)?
         .into_iter()
         .find(|c| c.child_instance_id == instance_id && c.status == ProcessCallStatus::Waiting)
@@ -23539,14 +23551,17 @@ pub fn cancel_instance(
     })
 }
 
-fn cancel_instance_on(
-    tx: &Transaction<'_>,
+/// `witnesses` is false only while migration 196 runs, before the activity I/O
+/// witness table exists, so retained bytes are measured without it.
+pub(crate) fn cancel_instance_on(
+    tx: &Connection,
     actor: &ProcessActor,
     instance_id: &str,
     expected_revision: u64,
     at_ms: i64,
     termination: Option<&TerminationSource>,
-    capacity: Option<&RepetitionCapacitySource>,
+    capacity: Option<CapacityCause<'_>>,
+    witnesses: bool,
 ) -> Result<Vec<CancelledJobClaim>> {
     let reason = if termination.is_some() { "terminate_end" }
         else if capacity.is_some() { "repetition_limit" } else { "instance_cancelled" };
@@ -23570,8 +23585,10 @@ fn cancel_instance_on(
         changed == 1,
         "process instance revision conflict or already closed"
     );
-    let current = instance_state_on(tx, actor, instance_id, None, false)?;
-    let model = current_version_model_on(tx, &current.definition_id, current.version)?;
+    let (definition_id, version): (String, u32) = tx.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let model = current_version_model_on(tx, &definition_id, version)?;
     for link in boundary_incidents_on(tx, instance_id)? {
         tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND resolved_at_ms IS NULL",params![at_ms,link.incident_id,instance_id])?;
     }
@@ -23782,9 +23799,17 @@ fn cancel_instance_on(
         at_ms,
         termination,
         capacity,
+        witnesses,
     )?);
     for group in repetition_groups_on(tx, instance_id)? {
-        refresh_repetition_retained_bytes_on(tx, instance_id, &group.group_id)?;
+        if witnesses {
+            refresh_repetition_retained_bytes_on(tx, instance_id, &group.group_id)?;
+        } else {
+            let actual = measured_repetition_retained_bytes_before_witnesses_on(
+                tx, instance_id, &group.group_id)?;
+            tx.execute("UPDATE bpmn_repetition_groups SET retained_bytes=?1 WHERE instance_id=?2 AND group_id=?3",
+                params![sql_integer(actual)?,instance_id,group.group_id])?;
+        }
     }
     Ok(cancelled_claims)
 }

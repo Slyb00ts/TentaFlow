@@ -367,13 +367,19 @@ fn build_schema_template() -> Result<Connection> {
     Ok(conn)
 }
 
+/// The guarded value is `()`, so a build that panicked left no state to distrust;
+/// a poisoned lock must not fail every later Start.
+pub(crate) fn lock_schema_template_build() -> std::sync::MutexGuard<'static, ()> {
+    SCHEMA_TEMPLATE_BUILD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn schema_template() -> Result<&'static Mutex<Connection>> {
     if let Some(template) = SCHEMA_TEMPLATE.get() {
         return Ok(template);
     }
-    let _building = SCHEMA_TEMPLATE_BUILD
-        .lock()
-        .map_err(|_| anyhow::anyhow!("simulation schema template build lock is poisoned"))?;
+    let _building = lock_schema_template_build();
     if let Some(template) = SCHEMA_TEMPLATE.get() {
         return Ok(template);
     }

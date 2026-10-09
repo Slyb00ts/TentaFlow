@@ -2238,6 +2238,18 @@ fn start_reservation_commit_requires_the_pinned_organization() {
 }
 
 #[test]
+fn a_panicked_schema_template_build_does_not_block_later_starts() {
+    let poisoned = std::thread::spawn(|| {
+        let _building = super::simulation::lock_schema_template_build();
+        panic!("simulated schema template build failure");
+    })
+    .join();
+    assert!(poisoned.is_err(), "the build thread must have panicked holding the lock");
+    drop(super::simulation::lock_schema_template_build());
+    drop(SimulationDatabase::open().expect("a Start after a panicked build still succeeds"));
+}
+
+#[test]
 fn simulation_databases_are_independent_page_copies_of_one_schema_template() {
     use std::sync::atomic::Ordering;
 

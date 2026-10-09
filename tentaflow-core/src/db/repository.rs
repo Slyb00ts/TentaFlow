@@ -18454,7 +18454,7 @@ pub fn log_audit_full(
 /// więc nie ma wiersza ogłaszającego zmianę, która się nie odbyła.
 #[allow(clippy::too_many_arguments)]
 pub fn log_audit_scoped_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     user_id: Option<&str>,
     action: &str,
     resource: &str,

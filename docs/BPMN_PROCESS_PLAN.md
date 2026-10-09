@@ -306,17 +306,32 @@ symulacja), migracje 181–197 w `db/migrations.rs`, protokół `tentaflow-proto
   `fail_job`. Zadanie `completed` bez przyjętego zdarzenia źródłowego dostaje
   `SERVICE_HISTORY_UNPROVEN`, a próba bez znanego wyniku `EXTERNAL_OUTCOME_UNCERTAIN`.
   Zadanie `queued` bez prób (`attempt=0`, bez ogrodzenia i pracownika) staje się `prepared`.
-  Zadanie `queued` z próbami staje się `prepared` tylko przy zapisanym dowodzie ręcznego
-  ponowienia (zdarzenie `job_retried` dla tego zadania albo rozwiązany incydent tego zadania);
-  bez dowodu jest `uncertain` + otwarty `EXTERNAL_OUTCOME_UNCERTAIN` i zadanie `error`
+  Zadanie `queued` z próbami staje się `prepared` tylko wtedy, gdy zdarzenie `job_retried`
+  wymienia je jako NOWE zadanie (`new_job_id`); rozwiązany incydent dowodzi jedynie, że jakaś
+  wcześniejsza próba została obsłużona, a `old_job_id` oznacza, że zadanie zastąpiono ponowieniem
+  (jest wyparte, więc nie jest wysyłane ponownie). Bez dowodu zadanie jest `uncertain` + otwarty
+  `EXTERNAL_OUTCOME_UNCERTAIN` i zadanie `error`
   (żaden obecny zapis nie ponownie kolejkuje zadania z próbami, więc nigdy go nie
-  wysyłamy ponownie z nowym identyfikatorem żądania). Incydent jest otwarty tylko dla żywej
+  wysyłamy ponownie z nowym identyfikatorem żądania). Zadanie ma co najwyżej jeden otwarty
+  incydent: otwarty incydent starej wersji dla tego zadania (np. `SERVICE_FAILED`) jest
+  rozwiązywany zdarzeniem `incident_resolved` (`superseded_by_upgrade`), a jego miejsce zajmuje
+  incydent migracji. Incydent jest otwarty tylko dla żywej
   aktywności; dla zamkniętej zostaje rozwiązanym zapisem historii. Liczniki `retained_bytes` grup
-  powtórzeń są przeliczane dla dotkniętych zadań. Przekroczenie limitu zatrzymanych bajtów
-  przez grupę powtórzeń (stan osiągalny dla starej wersji) zatrzaskuje grupę jak odmowa
-  pojemności w czasie działania: otwarty incydent `REPETITION_LIMIT`, zdarzenie
-  `repetition_group_blocked` (faza `capacity`) i `terminal_capacity`; żywe aktywności zostają
-  zaparkowane dla operatora.
+  powtórzeń są przeliczane dla dotkniętych zadań. Limit zatrzymanych bajtów jest sprawdzany
+  wyłącznie dla żywych instancji (status inny niż `completed`/`cancelled`/`error`); zamknięta
+  instancja nigdy nie jest zatrzaskiwana, więc dodatkowa kopia przyjętego wyniku nie może
+  zablokować startu węzła. Gdy żywa instancja przekracza limit (stan osiągalny dla starej wersji),
+  migracja odtwarza to, co robi środowisko uruchomieniowe przy odmowie pojemności
+  (`latch_repetition_capacity`): zatrzaskuje najbardziej obciążoną otwartą grupę (otwarty
+  incydent `REPETITION_LIMIT`, zdarzenie `repetition_group_blocked` w fazie `capacity`,
+  `terminal_capacity`) i anuluje całą instancję tą samą ścieżką co zamknięcie pojemnościowe
+  w `cancel_instance_on` (powód `repetition_limit` z odwołaniem do zdarzenia blokady): tokeny,
+  zadania, zlecenia Service, zadania użytkownika, timery, subskrypcje i wyścigi są zamykane, incydenty
+  poza terminalnym incydentem grupy są rozwiązywane, a status instancji to `cancelled`. Dzięki temu
+  żadne późniejsze przejście nie trafia na zatrzaśniętą grupę żywej instancji. Gdy żywa instancja
+  przekracza limit, a nie ma już otwartej grupy do zatrzaśnięcia, migracja nie zawodzi: zapisuje
+  otwarty incydent `REPETITION_LIMIT` (`repetition_bytes`) i instancja zostaje w stanie
+  `incident` do decyzji operatora.
   **Migracja nadal odmawia (i cofa się w całości) wyłącznie przy uszkodzeniu lub manipulacji
   danymi**, czyli: niepusty `foreign_key_check` na wejściu lub na wyjściu oraz błąd
   `integrity_check`; niedokładny licznik bajtów grupy powtórzeń; zmieniony przypięty model
