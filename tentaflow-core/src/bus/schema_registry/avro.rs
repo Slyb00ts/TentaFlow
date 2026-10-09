@@ -32,15 +32,22 @@
 //     parsed type `record`/`enum`/`fixed` (`parse_record` & co). The pre-scan
 //     caps JSON values (`MAX_JSON_VALUES`), named definitions, aliases per
 //     type and in total, fields, symbols, union branches, `fixed` size and
-//     name length; refuses a `record`/`enum`/`fixed` object without
+//     name length, and `doc` / custom-attribute strings (`MAX_ATTRIBUTE_TEXT`);
+//     refuses a `record`/`enum`/`fixed` object without
 //     `fields`/`symbols`/`size`, a type named like a keyword or primitive, and
 //     a `"type"` that nests another type object; and bounds the clone work
-//     `sum((1 + aliases) x subtree values)` over named types by
-//     `MAX_CLONE_WORK`. With those caps the library's transient peak is about
-//     MAX_CLONE_WORK x ~70 bytes (~70 MiB), and the failed-default path
-//     (`names.values().cloned()`) at most twice that; type references stay
-//     small `Ref` values bounded by MAX_JSON_VALUES. Nothing else in the
-//     library parse copies a schema.
+//     `sum((1 + aliases) x subtree weight)` over named types by
+//     `MAX_CLONE_WORK`, where a weight unit is a JSON value, an object key or
+//     64 bytes of string content (so size, not just count). Worst case: 10^6
+//     units, each at most ~100 bytes resident (an object entry: key, value and
+//     map node; 64 string bytes cost less), i.e. about 100 MB of transient
+//     peak. Record-field defaults are taken out of the document before the
+//     library parses it (`STASHED_DEFAULT`): the library's own default check
+//     is exponential on a default nested through a recursive union, and its
+//     failed-default path copied every parsed type. Our `default_fits` is
+//     linear and the only check. Type references stay small `Ref` values
+//     bounded by MAX_JSON_VALUES. Nothing else in the library parse copies a
+//     schema.
 //   - `compile` then caps types (`MAX_SCHEMA_NODES`) and schema depth, and
 //     refuses a schema that can have no value at all (a record that contains
 //     itself without an optional branch).
@@ -106,6 +113,9 @@ const MAX_ALIASES_TOTAL: usize = 256;
 /// `sum((1 + aliases) x JSON values of the definition)` over named types: the
 /// number of value copies the library makes while registering them.
 const MAX_CLONE_WORK: usize = 1_000_000;
+/// Longest `doc` or custom-attribute string: free text the library copies once
+/// per name and alias of every enclosing definition.
+const MAX_ATTRIBUTE_TEXT: usize = 4096;
 
 /// Nesting of containers (records, arrays, maps; a union adds none) a datum
 /// may reach. Recursive schemas make the depth data-dependent, so it is capped
@@ -403,7 +413,8 @@ impl<'s> Lowerer<'s> {
                 let mut fields = Vec::with_capacity(r.fields.len());
                 for f in &r.fields {
                     let node = self.lower(&f.schema, depth + 1)?;
-                    if let Some(default) = &f.default {
+                    let default = f.custom_attributes.get(STASHED_DEFAULT);
+                    if let Some(default) = default {
                         self.defaults.push(PendingDefault {
                             field: &f.name,
                             node,
@@ -413,7 +424,7 @@ impl<'s> Lowerer<'s> {
                     fields.push(Field {
                         name: f.name.clone(),
                         aliases: f.aliases.clone(),
-                        has_default: f.default.is_some(),
+                        has_default: default.is_some(),
                         node,
                     });
                 }
@@ -490,9 +501,10 @@ fn default_fits(nodes: &[Node], id: NodeId, default: &Value, depth: usize) -> bo
                 .values()
                 .all(|v| default_fits(nodes, *value, v, depth + 1))
         }),
+        // A union adds no nesting of its own: its first branch is never a union.
         Kind::Union(branches) => branches
             .first()
-            .is_some_and(|first| default_fits(nodes, *first, default, depth + 1)),
+            .is_some_and(|first| default_fits(nodes, *first, default, depth)),
         Kind::Record { fields, .. } => default.as_object().is_some_and(|entries| {
             fields.iter().all(|f| match entries.get(&f.name) {
                 Some(v) => default_fits(nodes, f.node, v, depth + 1),
@@ -550,12 +562,74 @@ struct Prescan {
     clone_work: usize,
 }
 
+/// Size of a JSON value in clone-work units: a value or a key is one unit and
+/// every 64 bytes of string content one more, so a few huge strings weigh what
+/// they cost to copy rather than what they count as.
 fn count_values(value: &Value) -> usize {
     match value {
         Value::Array(items) => 1 + items.iter().map(count_values).sum::<usize>(),
-        Value::Object(map) => 1 + map.values().map(|v| 1 + count_values(v)).sum::<usize>(),
+        Value::Object(map) => {
+            1 + map
+                .iter()
+                .map(|(key, v)| 2 + key.len() / 64 + count_values(v))
+                .sum::<usize>()
+        }
+        Value::String(text) => 1 + text.len() / 64,
         _ => 1,
     }
+}
+
+/// Keys the parser reads itself; anything else on a definition, field, array
+/// or map object is a custom attribute the library keeps and copies verbatim.
+const STRUCTURAL_KEYS: [&str; 12] = [
+    "type",
+    "name",
+    "namespace",
+    "aliases",
+    "fields",
+    "symbols",
+    "size",
+    "default",
+    "items",
+    "values",
+    "precision",
+    "scale",
+];
+
+fn check_text_len(what: &str, text: &str) -> Result<(), SchemaError> {
+    if text.len() > MAX_ATTRIBUTE_TEXT {
+        return Err(invalid(format!(
+            "a {what} is longer than {MAX_ATTRIBUTE_TEXT} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn check_attribute_strings(value: &Value) -> Result<(), SchemaError> {
+    match value {
+        Value::String(text) => check_text_len("custom attribute", text),
+        Value::Array(items) => items.iter().try_for_each(check_attribute_strings),
+        Value::Object(map) => map.iter().try_for_each(|(key, v)| {
+            check_text_len("custom attribute", key)?;
+            check_attribute_strings(v)
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The free text of a schema object: `doc` and custom attributes.
+fn check_annotations(map: &serde_json::Map<String, Value>) -> Result<(), SchemaError> {
+    for (key, value) in map {
+        if key == "doc" {
+            if let Value::String(doc) = value {
+                check_text_len("doc", doc)?;
+            }
+        } else if !STRUCTURAL_KEYS.contains(&key.as_str()) {
+            check_text_len("custom attribute", key)?;
+            check_attribute_strings(value)?;
+        }
+    }
+    Ok(())
 }
 
 fn check_name_len(what: &str, name: &str) -> Result<(), SchemaError> {
@@ -565,6 +639,58 @@ fn check_name_len(what: &str, name: &str) -> Result<(), SchemaError> {
         )));
     }
     Ok(())
+}
+
+/// Where a record field's `default` waits while the library parses the schema.
+/// `Schema::parse` checks every default itself by resolving the value against
+/// the field type, and for a union that resolves the value twice per level, so
+/// a default nested through a recursive union takes 2^depth. The parsed
+/// schema keeps the default as this custom attribute; `default_fits` is the
+/// only check, and a projection writes the key back as `default`.
+const STASHED_DEFAULT: &str = "x-tentaflow-stashed-default";
+
+/// Renames the `from` key of every record field in a schema document to `to`
+/// (the document is walked by its structure, not searched). A field that
+/// already has a `to` key is refused: the name is ours.
+fn rename_field_key(value: &mut Value, from: &str, to: &str) -> Result<(), SchemaError> {
+    match value {
+        Value::Array(branches) => branches
+            .iter_mut()
+            .try_for_each(|b| rename_field_key(b, from, to)),
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(Value::as_str).map(str::to_owned);
+            match kind.as_deref() {
+                Some("record" | "error") => {
+                    let Some(Value::Array(fields)) = map.get_mut("fields") else {
+                        return Ok(());
+                    };
+                    for field in fields {
+                        let Some(field) = field.as_object_mut() else {
+                            continue;
+                        };
+                        if field.contains_key(to) {
+                            return Err(invalid(format!("a field may not use the key '{to}'")));
+                        }
+                        if let Some(moved) = field.remove(from) {
+                            field.insert(to.to_string(), moved);
+                        }
+                        if let Some(ty) = field.get_mut("type") {
+                            rename_field_key(ty, from, to)?;
+                        }
+                    }
+                    Ok(())
+                }
+                Some("array") => map
+                    .get_mut("items")
+                    .map_or(Ok(()), |v| rename_field_key(v, from, to)),
+                Some("map") => map
+                    .get_mut("values")
+                    .map_or(Ok(()), |v| rename_field_key(v, from, to)),
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Structural checks on the JSON, run before the library parses it (see the
@@ -596,8 +722,14 @@ impl Prescan {
                     "record" | "error" => self.record(value, map),
                     "enum" => self.enumeration(value, map),
                     "fixed" => self.fixed(value, map),
-                    "array" => map.get("items").map_or(Ok(()), |v| self.schema(v)),
-                    "map" => map.get("values").map_or(Ok(()), |v| self.schema(v)),
+                    "array" => {
+                        check_annotations(map)?;
+                        map.get("items").map_or(Ok(()), |v| self.schema(v))
+                    }
+                    "map" => {
+                        check_annotations(map)?;
+                        map.get("values").map_or(Ok(()), |v| self.schema(v))
+                    }
                     other => check_name_len("type name", other),
                 },
                 Some(Value::Object(_) | Value::Array(_)) => Err(invalid(
@@ -617,6 +749,7 @@ impl Prescan {
     ) -> Result<&'v str, SchemaError> {
         let name = map.get("name").and_then(Value::as_str).unwrap_or("?");
         check_name_len("type name", name)?;
+        check_annotations(map)?;
         if let Some(Value::String(namespace)) = map.get("namespace") {
             check_name_len("namespace", namespace)?;
         }
@@ -685,6 +818,7 @@ impl Prescan {
             if let Some(Value::String(field_name)) = field.get("name") {
                 check_name_len("field name", field_name)?;
             }
+            check_annotations(field)?;
             if let Some(ty) = field.get("type") {
                 self.schema(ty)?;
             }
@@ -743,9 +877,10 @@ fn parse_text(schema_text: &str) -> Result<(Schema, Compiled), SchemaError> {
     if schema_text.trim().is_empty() {
         return Err(invalid("schema text is empty"));
     }
-    let value: Value = serde_json::from_str(schema_text)
+    let mut value: Value = serde_json::from_str(schema_text)
         .map_err(|e| invalid(format!("the schema is not valid JSON: {e}")))?;
     prescan(&value)?;
+    rename_field_key(&mut value, "default", STASHED_DEFAULT)?;
     let schema =
         Schema::parse(&value).map_err(|e| invalid(format!("not a valid Avro schema: {e}")))?;
     drop(value);
@@ -1604,8 +1739,12 @@ fn rebuild_field(
     written: &mut HashSet<String>,
 ) -> Result<RecordField, SchemaError> {
     Ok(RecordField {
+        name: field.name.clone(),
+        doc: field.doc.clone(),
+        aliases: field.aliases.clone(),
+        default: field.default.clone(),
         schema: rebuild(&field.schema, definitions, written)?,
-        ..field.clone()
+        custom_attributes: field.custom_attributes.clone(),
     })
 }
 
@@ -1674,7 +1813,10 @@ impl SchemaKindOps for AvroOps {
             .filter(|f| allowed.contains(&f.name))
             .map(|f| rebuild_field(f, &definitions, &mut written))
             .collect::<Result<Vec<_>, _>>()?;
-        let derived = serde_json::to_string(&record_with(root, fields))
+        let mut document = serde_json::to_value(record_with(root, fields))
+            .map_err(|e| invalid(format!("the projection cannot be written: {e}")))?;
+        rename_field_key(&mut document, STASHED_DEFAULT, "default")?;
+        let derived = serde_json::to_string(&document)
             .map_err(|e| invalid(format!("the projection cannot be written: {e}")))?;
         // The projection must itself be a registrable schema.
         parse_text(&derived)?;
@@ -3446,6 +3588,141 @@ mod tests {
         for default in [&refused[0], &refused[4]] {
             assert!(refusal(&rec(default)).contains("does not fit"), "{default}");
         }
+    }
+
+    /// Compiles on a helper thread so a parser that never returns fails the
+    /// test instead of hanging the run.
+    fn compiled_within(what: &str, schema: String) -> Result<(), SchemaError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(AVRO_OPS.compile(&schema).map(|_| ()));
+        });
+        let started = Instant::now();
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: compile did not finish in 10 s"));
+        eprintln!("avro bound {what}: {:?}", started.elapsed());
+        out
+    }
+
+    fn nested_default(depth: usize, innermost: &str) -> String {
+        format!(
+            "{}{innermost}{}",
+            r#"{"next":"#.repeat(depth),
+            "}".repeat(depth)
+        )
+    }
+
+    #[test]
+    fn a_default_nested_through_a_recursive_union_is_checked_in_linear_time() {
+        let schema = |branches: &str, field_default: &str, default: &str| {
+            format!(
+                r#"{{"type":"record","name":"Outer","fields":[{{"name":"head","type":{{"type":"record","name":"L","fields":[{{"name":"next","type":{branches}{field_default}}}]}},"default":{default}}}]}}"#
+            )
+        };
+        // Valid: every level takes the first branch, the last one omits `next`.
+        let valid = schema(
+            r#"["L","null"]"#,
+            r#","default":{}"#,
+            &nested_default(118, "{}"),
+        );
+        assert!(valid.len() < 2048);
+        compiled_within("deep valid default", valid).unwrap();
+
+        // The first branch is null: nothing but null fits, and the check says
+        // so at the first level instead of resolving the subtree twice per level.
+        let wrong = schema(r#"["null","L"]"#, "", &nested_default(118, "null"));
+        let reason = compiled_within("deep wrong default", wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("does not fit"), "{reason}");
+
+        // A wrong value at the bottom of a valid chain is still found.
+        let bottom = schema(
+            r#"["L","null"]"#,
+            r#","default":{}"#,
+            &nested_default(118, r#""x""#),
+        );
+        let reason = compiled_within("deep bottom default", bottom)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("does not fit"), "{reason}");
+    }
+
+    #[test]
+    fn a_field_may_not_use_the_key_the_defaults_wait_under() {
+        let reason = refusal(&rec(&format!(
+            r#"{{"name":"a","type":"int","{STASHED_DEFAULT}":1}}"#
+        )));
+        assert!(reason.contains("may not use the key"), "{reason}");
+    }
+
+    #[test]
+    fn a_projection_keeps_field_defaults() {
+        let schema = rec(
+            r#"{"name":"a","type":"int","default":7},{"name":"b","type":{"type":"array","items":{"type":"record","name":"I","fields":[{"name":"c","type":"string","default":"z"}]}},"default":[]}"#,
+        );
+        let allowed = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let derived = AVRO_OPS.derive_subschema(&schema, &allowed).unwrap();
+        assert!(!derived.contains(STASHED_DEFAULT), "{derived}");
+        let value: Value = serde_json::from_str(&derived).unwrap();
+        assert_eq!(value["fields"][0]["default"], 7);
+        assert_eq!(value["fields"][1]["default"], serde_json::json!([]));
+        assert_eq!(
+            value["fields"][1]["type"]["items"]["fields"][0]["default"],
+            "z"
+        );
+    }
+
+    #[test]
+    fn clone_work_weighs_text_by_size() {
+        // 24 definitions nested in each other, 10 aliases each: the innermost
+        // subtree is copied ~264 times. The same shape is cheap with a short
+        // default and too expensive with a 250 KB one, which is only ~20 more
+        // JSON values.
+        let nested = |default: &str| {
+            let mut inner = format!(
+                r#"{{"type":"record","name":"T0","fields":[{{"name":"d","type":"string","default":"{default}"}}]}}"#
+            );
+            for level in 1..24 {
+                let aliases = (0..10)
+                    .map(|i| format!("\"t{level}a{i}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                inner = format!(
+                    r#"{{"type":"record","name":"T{level}","aliases":[{aliases}],"fields":[{{"name":"n","type":{inner}}}]}}"#
+                );
+            }
+            inner
+        };
+        assert!(AVRO_OPS.compile(&nested("x")).is_ok());
+        let heavy = nested(&"x".repeat(250 * 1024));
+        assert!(quick_refusal("heavy default", &heavy).contains("too expensive to parse"));
+    }
+
+    #[test]
+    fn doc_and_custom_attribute_text_is_capped() {
+        let doc = "d".repeat(MAX_ATTRIBUTE_TEXT);
+        let aliases = (0..64)
+            .map(|i| format!("\"a{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // One doc of 240 KB copied under 64 aliases and nested definitions.
+        let huge = "d".repeat(240 * 1024);
+        let doc_bomb = format!(
+            r#"{{"type":"record","name":"R","aliases":[{aliases}],"doc":"{huge}","fields":[{{"name":"x","type":"int"}}]}}"#
+        );
+        assert!(quick_refusal("doc bomb", &doc_bomb).contains("longer than 4096 bytes"));
+        let attribute = format!(
+            r#"{{"type":"record","name":"R","fields":[{{"name":"x","type":"int","note":{{"k":["{}"]}}}}]}}"#,
+            "n".repeat(MAX_ATTRIBUTE_TEXT + 1)
+        );
+        assert!(quick_refusal("attribute bomb", &attribute).contains("longer than 4096 bytes"));
+
+        // At the cap a doc is fine.
+        let at_cap = rec(&format!(r#"{{"name":"x","type":"int","doc":"{doc}"}}"#));
+        assert!(AVRO_OPS.compile(&at_cap).is_ok());
     }
 
     #[test]

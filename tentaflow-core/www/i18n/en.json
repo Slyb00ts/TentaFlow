@@ -11449,7 +11449,9 @@
         "avro_limit_symbols": "An enum has more than {limit} symbols.",
         "avro_limit_fixed": "A fixed type is larger than {limit} bytes.",
         "avro_limit_depth": "The types are nested deeper than {limit} levels.",
-        "avro_default": "A field's default value does not fit the first branch of its union. In an Avro union the default must be of the first branch's type (for example null when null comes first)."
+        "avro_default": "A field's default value does not fit the first branch of its union. In an Avro union the default must be of the first branch's type (for example null when null comes first).",
+        "avro_default_type": "A field's default value does not fit the type of that field. The default must be written like a value of that type (for example a number for int, text for string, one of the symbols for an enum).",
+        "avro_limit_text": "A description (doc) or a custom attribute is longer than {limit} bytes. Shorten the text."
       }
     },
     "topics": {

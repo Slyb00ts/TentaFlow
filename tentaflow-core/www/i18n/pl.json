@@ -11449,7 +11449,9 @@
         "avro_limit_symbols": "Typ wyliczeniowy ma więcej niż {limit} symboli.",
         "avro_limit_fixed": "Typ fixed jest większy niż {limit} bajtów.",
         "avro_limit_depth": "Typy są zagnieżdżone głębiej niż {limit} poziomów.",
-        "avro_default": "Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii. W unii Avro wartość domyślna musi być typu pierwszego wariantu (np. null, gdy null jest pierwszy)."
+        "avro_default": "Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii. W unii Avro wartość domyślna musi być typu pierwszego wariantu (np. null, gdy null jest pierwszy).",
+        "avro_default_type": "Wartość domyślna pola nie pasuje do typu tego pola. Wartość domyślna musi być zapisana tak, jak wartość tego typu (np. liczba dla int, tekst dla string, jeden z symboli dla typu wyliczeniowego).",
+        "avro_limit_text": "Opis (doc) albo własny atrybut ma więcej niż {limit} bajtów. Skróć tekst."
       }
     },
     "topics": {

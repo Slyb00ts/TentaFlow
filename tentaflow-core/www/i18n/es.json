@@ -10214,7 +10214,9 @@
         "avro_limit_symbols": "Un enum tiene más de {limit} símbolos.",
         "avro_limit_fixed": "Un tipo fixed es mayor que {limit} bytes.",
         "avro_limit_depth": "Los tipos están anidados a más de {limit} niveles.",
-        "avro_default": "El valor por defecto de un campo no encaja con la primera rama de su unión. En una unión de Avro el valor por defecto debe ser del tipo de la primera rama (por ejemplo null si null va primero)."
+        "avro_default": "El valor por defecto de un campo no encaja con la primera rama de su unión. En una unión de Avro el valor por defecto debe ser del tipo de la primera rama (por ejemplo null si null va primero).",
+        "avro_default_type": "El valor por defecto de un campo no encaja con el tipo de ese campo. Debe escribirse como un valor de ese tipo (por ejemplo un número para int, texto para string, uno de los símbolos para un enum).",
+        "avro_limit_text": "Una descripción (doc) o un atributo propio supera los {limit} bytes. Acorta el texto."
       }
     },
     "topics": {

@@ -10214,7 +10214,9 @@
         "avro_limit_symbols": "Un enum a plus de {limit} symboles.",
         "avro_limit_fixed": "Un type fixed dépasse {limit} octets.",
         "avro_limit_depth": "Les types sont imbriqués sur plus de {limit} niveaux.",
-        "avro_default": "La valeur par défaut d’un champ ne correspond pas à la première branche de son union. Dans une union Avro, la valeur par défaut doit être du type de la première branche (par exemple null si null vient en premier)."
+        "avro_default": "La valeur par défaut d’un champ ne correspond pas à la première branche de son union. Dans une union Avro, la valeur par défaut doit être du type de la première branche (par exemple null si null vient en premier).",
+        "avro_default_type": "La valeur par défaut d’un champ ne correspond pas au type de ce champ. Elle doit être écrite comme une valeur de ce type (par exemple un nombre pour int, du texte pour string, l’un des symboles pour un enum).",
+        "avro_limit_text": "Une description (doc) ou un attribut personnalisé dépasse {limit} octets. Raccourcis le texte."
       }
     },
     "topics": {

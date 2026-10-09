@@ -508,6 +508,7 @@ const AVRO_LIMIT_REFUSALS = [
   [/ has more than (\d+) symbols$/, 'symbols'],
   [/ is larger than (\d+) bytes$/, 'fixed'],
   [/^the schema is nested deeper than (\d+) levels/, 'depth'],
+  [/^a (?:doc|custom attribute) is longer than (\d+) bytes$/, 'text'],
 ];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
@@ -540,6 +541,7 @@ export function textRefusalReason(schemaType, serverText) {
     if (/^not a valid Avro schema/.test(text)) return T('schemas.refused.avro_invalid');
     if (/^the schema can never produce a value/.test(text)) return T('schemas.refused.avro_no_value');
     if (/does not fit the first branch of its union/.test(text)) return T('schemas.refused.avro_default');
+    if (/^the default of field '[^']*' does not fit its type/.test(text)) return T('schemas.refused.avro_default_type');
     if (/^a record lists (?:a field that is not an object|its fields in something that is not an array)/.test(text)) return T('schemas.refused.avro_fields_shape');
     for (const [re, key] of AVRO_LIMIT_REFUSALS) {
       const m = re.exec(text);

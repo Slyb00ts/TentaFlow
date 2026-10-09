@@ -10214,7 +10214,9 @@
         "avro_limit_symbols": "Ein Enum hat mehr als {limit} Symbole.",
         "avro_limit_fixed": "Ein fixed-Typ ist größer als {limit} Bytes.",
         "avro_limit_depth": "Die Typen sind tiefer als {limit} Ebenen verschachtelt.",
-        "avro_default": "Der Standardwert eines Feldes passt nicht zum ersten Zweig seiner Union. In einer Avro-Union muss der Standardwert den Typ des ersten Zweigs haben (z. B. null, wenn null zuerst steht)."
+        "avro_default": "Der Standardwert eines Feldes passt nicht zum ersten Zweig seiner Union. In einer Avro-Union muss der Standardwert den Typ des ersten Zweigs haben (z. B. null, wenn null zuerst steht).",
+        "avro_default_type": "Der Standardwert eines Feldes passt nicht zum Typ dieses Feldes. Der Standardwert muss wie ein Wert dieses Typs geschrieben sein (z. B. eine Zahl für int, Text für string, eines der Symbole bei einem Enum).",
+        "avro_limit_text": "Eine Beschreibung (doc) oder ein eigenes Attribut ist länger als {limit} Bytes. Kürze den Text."
       }
     },
     "topics": {

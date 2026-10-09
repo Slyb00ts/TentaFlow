@@ -978,6 +978,14 @@ mod tests {
                 record(r#"{"name":"a","type":["null","string"],"default":"x"}"#),
                 "the default of field 'a' does not fit the first branch of its union",
             ),
+            (
+                record(r#"{"name":"a","type":"int","default":"x"}"#),
+                "the default of field 'a' does not fit its type",
+            ),
+            (
+                record(&format!(r#"{{"name":"a","type":"int","doc":"{}"}}"#, "d".repeat(4097))),
+                "a doc is longer than 4096 bytes",
+            ),
             (too_deep, "the schema is nested deeper than 64 levels"),
             (
                 record(
