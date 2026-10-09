@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { projectKeySuggestion, taskTypeLabel, taskTypeDescription, activeTaskTypes, parentCandidates, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText } from './project-studio-tasks.js';
+import { projectKeySuggestion, taskTypeLabel, taskTypeDescription, activeTaskTypes, parentCandidates, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText, orgNotificationText } from './project-studio-tasks.js';
 
 const translate = (key, fields) => fields ? `${key}:${JSON.stringify(fields)}` : key;
 
@@ -143,4 +143,28 @@ test('current resolution and transfer history use localized human values in all 
       assert.equal(text.includes('task_transfer_reason_'), false);
     }
   }
+});
+
+test('organization notifications are worded from their facts in every supported language', () => {
+  for (const locale of ['pl', 'en', 'de', 'es', 'fr']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`../../i18n/${locale}.json`, import.meta.url))).project_studio;
+    const localized = (key, fields = {}) => {
+      assert.equal(typeof dictionary[key], 'string', `${locale}: ${key}`);
+      return dictionary[key].replace(/\{(\w+)\}/g, (match, name) => String(fields[name]));
+    };
+    const handover = orgNotificationText({ kind: 'work_handed_over', title: 'Server title', body: 'Server body', link_json: JSON.stringify({ from_name: 'Anna', count: 3, return_on: '', note: 'Back soon' }) }, localized);
+    assert.equal(handover.title, dictionary.nk_work_handed_over);
+    assert.ok(handover.body.includes('Anna') && handover.body.includes('Back soon'));
+    assert.equal(handover.body.includes('Server body'), false);
+    const until = orgNotificationText({ kind: 'work_handed_over', link_json: JSON.stringify({ from_name: 'Anna', count: 1, return_on: '2026-11-02', note: 'n' }) }, localized);
+    assert.ok(until.body.includes('2026-11-02'));
+    for (const kind of ['deputy_appointed', 'deputy_ended']) {
+      const open = orgNotificationText({ kind, link_json: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: null, scope: 'all' }) }, localized);
+      assert.equal(open.title, dictionary[`nk_${kind}`]);
+      assert.ok(open.body.includes('Boris') && open.body.includes('2026-10-10') && open.body.includes('all'));
+      const bounded = orgNotificationText({ kind, link_json: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: '2026-10-20', scope: 'all' }) }, localized);
+      assert.ok(bounded.body.includes('2026-10-20'));
+    }
+  }
+  assert.equal(orgNotificationText({ kind: 'task_assigned' }, (key) => key), null);
 });

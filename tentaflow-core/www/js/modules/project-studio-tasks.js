@@ -14,6 +14,22 @@ export function taskNotificationText(notification, translate) {
   return { title: translate(`nk_${notification.kind}`), body: translate(notification.kind === 'task_status_changed' ? 'task_notification_status' : 'task_notification_task', fields) };
 }
 
+const ORG_NOTIFICATION_KINDS = ['work_handed_over', 'deputy_appointed', 'deputy_ended'];
+
+// Notifications of the organizational structure carry their facts in link_json; the sentence is built
+// here so it follows the reader's language, not the language of the node that wrote it.
+export function orgNotificationText(notification, translate) {
+  if (!ORG_NOTIFICATION_KINDS.includes(notification.kind)) return null;
+  const link = JSON.parse(notification.link_json);
+  const title = translate(`nk_${notification.kind}`);
+  if (notification.kind === 'work_handed_over') {
+    const fields = { from: link.from_name, count: link.count, note: link.note, until: link.return_on };
+    return { title, body: translate(link.return_on ? 'org_notification_handover_until' : 'org_notification_handover', fields) };
+  }
+  const fields = { who: link.who, from: link.from, until: link.until, scope: link.scope };
+  return { title, body: translate(link.until ? 'org_notification_deputy_until' : 'org_notification_deputy', fields) };
+}
+
 export function projectKeySuggestion(name) {
   let prefix = name.replace(/[^a-z0-9]/gi, '').slice(0, 8).toUpperCase();
   if (!/^[A-Z]/.test(prefix)) prefix = `P${prefix}`;

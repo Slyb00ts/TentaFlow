@@ -30,7 +30,7 @@ import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 import { openActionMenu, openConfirmWindow, openHandoverWindow, showUndoToast } from '/js/lib/actions/index.js';
 import { openHandover } from '/js/modules/org-structure/handover-nav.js';
 import { PROJECT_AREAS, PERMISSION_LEVELS, BUILTIN_FUNCTIONS, allowsArea, canCreateTask, projectTabs, catalogueLabel, memberGroup, expiryToInstant, expiryToLocal } from './project-studio-access.js';
-import { TASK_LINK_KINDS, projectKeySuggestion, taskTypeLabel, taskTypeDescription, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText, activeTaskTypes, parentCandidates } from './project-studio-tasks.js';
+import { TASK_LINK_KINDS, projectKeySuggestion, taskTypeLabel, taskTypeDescription, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText, orgNotificationText, activeTaskTypes, parentCandidates } from './project-studio-tasks.js';
 import { projectAncestors, projectRoots, projectTreeNodes, readTaskScope, writeTaskScope } from './project-studio-tree.js';
 import { uploadProjectAttachment, pendingAttachmentUploads, cancelAttachmentUpload, refreshAttachmentUpload, acknowledgeAttachmentUploads, openAttachmentStream, downloadProjectAttachment } from './project-studio-media.js';
 import '/js/components/tf-button.js';
@@ -11605,7 +11605,7 @@ function installNotifListener() {
     .then((client) => {
       client.addUnsolicitedListener(({ body }) => {
         if (!body || body.variant !== 'UserNotification') return;
-        const text = taskNotificationText(body, t);
+        const text = taskNotificationText(body, t) ?? orgNotificationText(body, t);
         const title = text ? text.title : body.title || t('notif_title');
         const message = text ? text.body : body.body;
         toast(`${title}${message ? ` — ${message}` : ''}`, 'info');
@@ -11644,7 +11644,7 @@ async function openNotifWindow() {
     listEl.innerHTML = `
       ${nw.items.map((n, i) => {
         const unread = !fv(n, 'read_at');
-        const text = taskNotificationText(n, t);
+        const text = taskNotificationText(n, t) ?? orgNotificationText(n, t);
         return `
           <div class="ps-notif-item ${unread ? 'is-unread' : ''}" data-notif="${i}" role="button" tabindex="0">
             <div class="ps-notif-ico">${sprite(NOTIF_KIND_ICON[n.kind] || 'info')}</div>
