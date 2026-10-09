@@ -204,7 +204,6 @@ class TfVideoStream extends HTMLElement {
     this._video.autoplay = !recorded;
     this._video.muted = !recorded;
     this._video.preload = recorded ? 'metadata' : 'auto';
-    this._video.style.objectFit = recorded ? 'contain' : 'cover';
     const label = this.getAttribute('label') ?? '';
     if (label.length > 0) {
       this._labelEl.textContent = label;
@@ -217,7 +216,8 @@ class TfVideoStream extends HTMLElement {
     const height =
       Number.isFinite(heightRaw) && heightRaw > 0 ? Math.floor(heightRaw) : DEFAULT_HEIGHT_PX;
     this.style.setProperty('--tf-video-stream-height', `${height}px`);
-    this._video.style.objectFit = this.getAttribute('fit') === 'contain' ? 'contain' : 'cover';
+    const fit = this.getAttribute('fit') ?? (recorded ? 'contain' : 'cover');
+    this._video.style.objectFit = fit === 'contain' ? 'contain' : 'cover';
   }
 
   _startFileSource() {

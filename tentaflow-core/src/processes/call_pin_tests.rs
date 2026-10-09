@@ -629,7 +629,7 @@ fn migration_preserves_populated_legacy_call_free_rows_and_foreign_keys() {
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        197
+        199
     );
     let migrated_messages = table_rows(&conn, "bpmn_messages", "message_id");
     assert!(migrated_messages.iter().all(|row| {
@@ -698,7 +698,7 @@ fn migration_rejects_malformed_legacy_reference_atomically_and_restores_foreign_
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        185
+        187
     );
     assert_eq!(table_rows(&conn, "bpmn_messages", "message_id"), before);
     assert_eq!(

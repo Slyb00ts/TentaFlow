@@ -16373,6 +16373,48 @@ mod tests {
             .is_err());
     }
 
+    /// The ladder has no gaps and a database at main's v179 upgrades to the head,
+    /// applying exactly the org-structure and BPMN rungs after it.
+    #[test]
+    fn ladder_is_contiguous_and_upgrades_from_v179_to_the_head() {
+        let ladder = get_migrations();
+        for (index, (version, _, _)) in ladder.iter().enumerate() {
+            assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
+        }
+        let head = ladder.last().unwrap().0;
+        assert_eq!(head, 199);
+
+        let fresh = Connection::open_in_memory().unwrap();
+        run(&fresh).unwrap();
+        let fresh_max: i64 = fresh
+            .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fresh_max, head);
+
+        let upgraded = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&upgraded, 179);
+        run(&upgraded).unwrap();
+        let applied_after_179: Vec<String> = upgraded
+            .prepare("SELECT name FROM _migrations WHERE version > 179 ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(applied_after_179.len(), 20);
+        assert_eq!(applied_after_179[0], "org_structure");
+        assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
+        let tables = |conn: &Connection| -> Vec<String> {
+            conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(tables(&fresh), tables(&upgraded));
+    }
+
     /// v179 on a database at v178: subjects (deprecations, generation) and
     /// their versions survive the rebuild, the versions keep their foreign
     /// key to the rebuilt parent and its cascade, the tombstones stay, and
